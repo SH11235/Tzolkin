@@ -156,14 +156,23 @@ mod tests {
     fn test_calculate_food_day_corns_and_feed() {
         let mut player = Player::new("Player 1".to_string(), 1);
         player.corns = 6;
+        player.points = 0;
         assert_eq!(player.calculate_food_day_corns(), (6, 3));
         player.feed();
         assert_eq!(player.get_corns(), 0);
         
         player.corns = 3;
+        player.points = 0;
         assert_eq!(player.calculate_food_day_corns(), (2, 1));
         player.feed();
         assert_eq!(player.get_corns(), 1);
         assert_eq!(player.get_points(), -6);
+
+        player.corns = 0;
+        player.points = 0;
+        assert_eq!(player.calculate_food_day_corns(), (0, 0));
+        player.feed();
+        assert_eq!(player.get_corns(), 0);
+        assert_eq!(player.get_points(), -9);
     }
 }
