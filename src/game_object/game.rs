@@ -99,7 +99,7 @@ impl<
             generation,
             // number_of_playersの数だけplayerを作成する
             players: (1..=number_of_players)
-                .map(|i| player::Player::new(format!("Player {}", i), i))
+                .map(|i| player::Player::new(format!("Player {}", i), i.into()))
                 .collect(),
             corns,
             first_food_day_done: false,
