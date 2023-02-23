@@ -6,7 +6,7 @@ use super::{
 };
 
 #[derive(Debug)]
-enum Position {
+enum WorkerPosition {
     Hand,
     Palenque(u32),
     Yaxchilan(u32),
@@ -20,7 +20,12 @@ enum Position {
 
 #[derive(Debug)]
 pub struct Worker {
-    position: Position,
+    position: WorkerPosition,
+}
+impl Worker {
+    pub fn back_to_hand(&mut self) {
+        self.position = WorkerPosition::Hand;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -40,12 +45,42 @@ impl Increment for TechnologyLevel {
         }
     }
 }
+pub enum TechnologyType {
+    Agriculture,
+    Resource,
+    Construction,
+    Temple,
+}
+
+impl TechnologyLevel {
+    pub(crate) fn progress(&mut self, technology_type: TechnologyType, _player: &mut Player) {
+        if self.0 < 3 {
+            self.increment();
+        } else {
+            match technology_type {
+                TechnologyType::Agriculture => {
+                    todo!("Agriculture technology progress");
+                }
+                TechnologyType::Resource => {
+                    todo!("Resource technology progress");
+                }
+                TechnologyType::Construction => {
+                    todo!("Construction technology progress");
+                }
+                TechnologyType::Temple => {
+                    todo!("Temple technology progress");
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Technology {
-    agriculture: TechnologyLevel,
-    resource: TechnologyLevel,
-    construction: TechnologyLevel,
-    temple: TechnologyLevel,
+    pub agriculture: TechnologyLevel,
+    pub resource: TechnologyLevel,
+    pub construction: TechnologyLevel,
+    pub temple: TechnologyLevel,
 }
 
 #[derive(Debug, Default)]
@@ -56,7 +91,7 @@ pub struct TempleFaith {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Player {
+pub struct Player {
     pub(super) name: String,
     pub(super) order: u32,
     pub(super) workers: Vec<Worker>,
@@ -76,22 +111,22 @@ impl Player {
             order,
             workers: vec![
                 Worker {
-                    position: Position::Hand,
+                    position: WorkerPosition::Hand,
                 },
                 Worker {
-                    position: Position::Hand,
+                    position: WorkerPosition::Hand,
                 },
                 Worker {
-                    position: Position::Hand,
+                    position: WorkerPosition::Hand,
                 },
                 Worker {
-                    position: Position::Field,
+                    position: WorkerPosition::Field,
                 },
                 Worker {
-                    position: Position::Field,
+                    position: WorkerPosition::Field,
                 },
                 Worker {
-                    position: Position::Field,
+                    position: WorkerPosition::Field,
                 },
             ],
             technology: Technology {
@@ -130,7 +165,7 @@ impl Player {
         self.workers
             .iter()
             .filter(|worker| match worker.position {
-                Position::Field => false,
+                WorkerPosition::Field => false,
                 _ => true,
             })
             .count() as u32

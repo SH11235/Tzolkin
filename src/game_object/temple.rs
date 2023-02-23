@@ -3,7 +3,12 @@ use super::resources::{Gold, ResourceStock, Skull, Stone, Wood};
 pub trait Temple {
     fn resource_reward(&self) -> ResourceStock;
     fn point_reward(&self) -> i32;
-    fn top() -> u32;
+}
+
+pub enum TempleName {
+    Chaac,
+    Quetzalcoatl,
+    Kukulkan,
 }
 
 #[derive(Debug, Default)]
@@ -35,9 +40,6 @@ impl Temple for Chaac {
             5 => 8,
             _ => 0, // ありえない
         }
-    }
-    fn top() -> u32 {
-        5
     }
 }
 #[derive(Debug, Default)]
@@ -72,9 +74,6 @@ impl Temple for Quetzalcoatl {
             _ => 0, // ありえない
         }
     }
-    fn top() -> u32 {
-        7
-    }
 }
 #[derive(Debug, Default)]
 pub struct Kukulkan(pub i32);
@@ -107,8 +106,5 @@ impl Temple for Kukulkan {
             6 => 10,
             _ => 0, // ありえない
         }
-    }
-    fn top() -> u32 {
-        6
     }
 }
