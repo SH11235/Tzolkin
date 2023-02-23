@@ -16,11 +16,31 @@ use game_object::player::Player;
 
 fn main() {
     let mut game = Game::new(Round(1), Generation(1)).unwrap();
+    // start
+    print!("game start");
     let player1 = Player::new("Player 1".to_string(), 1);
     let player2 = Player::new("Player 2".to_string(), 2);
     let mut players = vec![player1, player2];
-    if game.is_food_day() {
-        players.iter_mut().for_each(|player| player.feed());
+
+    loop {
+        println!(
+            "Round: {}, Generation: {}, Corns: {}",
+            game.get_round().0,
+            game.get_generation().0,
+            game.get_corns()
+        );
+        // print players
+        players.iter().for_each(|player| {
+            println!(
+                "Name: {}, Acrive Workers: {}, Corns: {}",
+                player.get_name(),
+                player.get_active_workers(),
+                player.get_corns(),
+            );
+        });
+        let is_end = game.end_round(&mut players);
+        if is_end {
+            break;
+        }
     }
-    game.next_round();
 }

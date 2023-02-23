@@ -1,9 +1,9 @@
-use crate::utils::constants::{
-    FIRST_FOOD_DAY, FOURTH_FOOD_DAY, SECOND_FOOD_DAY, THIRD_FOOD_DAY,
-};
+use crate::utils::constants::{FIRST_FOOD_DAY, FOURTH_FOOD_DAY, SECOND_FOOD_DAY, THIRD_FOOD_DAY};
 use crate::utils::increment::Increment;
 
-#[derive(Debug)]
+use super::player;
+
+#[derive(Debug, PartialEq, PartialOrd)]
 pub struct Round(pub u32);
 pub trait ValidRound {
     fn is_valid(&self) -> bool;
@@ -25,13 +25,13 @@ impl std::cmp::PartialEq<u32> for Round {
         self.0 == *other
     }
 }
-impl Round {
-    pub fn as_u32(&self) -> u32 {
-        self.0
+impl std::cmp::PartialOrd<u32> for Round {
+    fn partial_cmp(&self, other: &u32) -> Option<std::cmp::Ordering> {
+        self.0.partial_cmp(other)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, PartialOrd)]
 pub struct Generation(pub u32);
 pub trait ValidGeneration {
     fn is_valid(&self) -> bool;
@@ -48,18 +48,26 @@ impl Increment for Generation {
         }
     }
 }
+impl std::cmp::PartialEq<i32> for Generation {
+    fn eq(&self, other: &i32) -> bool {
+        self.0 == *other as u32
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct Game<
-    T: ValidRound + Increment + std::cmp::PartialEq<u32>,
-    G: ValidGeneration + Increment,
+    T: ValidRound + Increment + std::cmp::PartialEq<u32> + std::cmp::PartialOrd<u32>,
+    G: ValidGeneration + Increment + std::cmp::PartialEq<i32>,
 > {
     round: T,
     generation: G,
+    corns: u32,
 }
 
-impl<T: ValidRound + Increment + std::cmp::PartialEq<u32>, G: ValidGeneration + Increment>
-    Game<T, G>
+impl<
+        T: ValidRound + Increment + std::cmp::PartialEq<u32> + std::cmp::PartialOrd<u32>,
+        G: ValidGeneration + Increment + std::cmp::PartialEq<i32>,
+    > Game<T, G>
 {
     pub fn new(round: T, generation: G) -> Result<Self, &'static str> {
         if !round.is_valid() {
@@ -68,14 +76,19 @@ impl<T: ValidRound + Increment + std::cmp::PartialEq<u32>, G: ValidGeneration + 
         if !generation.is_valid() {
             return Err("Invalid generation value");
         }
-        Ok(Self { round, generation })
+        let corns = 0;
+        Ok(Self {
+            round,
+            generation,
+            corns,
+        })
     }
 
     pub fn get_round(&self) -> &T {
         &self.round
     }
 
-    pub fn next_round(&mut self) {
+    fn next_round(&mut self) {
         self.round.increment();
     }
 
@@ -83,31 +96,65 @@ impl<T: ValidRound + Increment + std::cmp::PartialEq<u32>, G: ValidGeneration + 
         &self.generation
     }
 
-    pub fn next_generation(&mut self) {
+    fn next_generation(&mut self) {
         self.generation.increment();
     }
 
-    pub fn is_food_day(&self) -> bool {
+    fn add_corns(&mut self) {
+        self.corns += 1;
+    }
+
+    pub fn get_corns(&self) -> u32 {
+        self.corns
+    }
+
+    fn is_food_day(&self) -> bool {
         self.round == FIRST_FOOD_DAY
             || self.round == SECOND_FOOD_DAY
             || self.round == THIRD_FOOD_DAY
             || self.round == FOURTH_FOOD_DAY
     }
 
-    pub fn is_first_food_day(&self) -> bool {
+    fn is_first_food_day(&self) -> bool {
         self.round == FIRST_FOOD_DAY
     }
 
-    pub fn is_second_food_day(&self) -> bool {
+    fn is_second_food_day(&self) -> bool {
         self.round == SECOND_FOOD_DAY
     }
 
-    pub fn is_third_food_day(&self) -> bool {
+    fn is_third_food_day(&self) -> bool {
         self.round == THIRD_FOOD_DAY
     }
 
-    pub fn is_fourth_food_day(&self) -> bool {
+    fn is_fourth_food_day(&self) -> bool {
         self.round == FOURTH_FOOD_DAY
+    }
+
+    // round終了時の処理をまとめた関数
+    pub fn end_round(&mut self, players: &mut Vec<player::Player>) -> bool {
+        // food_day処理
+        if self.is_food_day() {
+            players.iter_mut().for_each(|player| player.feed());
+        }
+        // 神殿判定: 資源
+        if self.is_first_food_day() || self.is_third_food_day() {
+            // players.iter_mut().for_each(|player| player.check_temple());
+        }
+        // 神殿判定: 得点
+        if self.is_second_food_day() || self.is_fourth_food_day() {
+            // players.iter_mut().for_each(|player| player.check_temple());
+        }
+        if self.round >= FOURTH_FOOD_DAY {
+            true
+        } else {
+            self.next_round();
+            if (self.generation == 1) && (self.round >= SECOND_FOOD_DAY) {
+                self.next_generation();
+            }
+            self.add_corns();
+            false
+        }
     }
 }
 
