@@ -2,7 +2,6 @@ mod game_object;
 mod utils;
 
 use game_object::game::{Game, Generation, Round};
-use game_object::player::Player;
 
 // struct Jungle {
 //     second_corn_tiles: u32,
@@ -15,13 +14,10 @@ use game_object::player::Player;
 // }
 
 fn main() {
-    let mut game = Game::new(Round(1), Generation(1)).unwrap();
+    let number_of_players = 4; // TODO inputで受け取る
+    let mut game = Game::new(Round(1), Generation(1), number_of_players).unwrap();
     // start
     print!("game start");
-    let player1 = Player::new("Player 1".to_string(), 1);
-    let player2 = Player::new("Player 2".to_string(), 2);
-    let mut players = vec![player1, player2];
-
     loop {
         println!(
             "Round: {}, Generation: {}, Corns: {}",
@@ -29,16 +25,18 @@ fn main() {
             game.get_generation().0,
             game.get_corns()
         );
-        // print players
-        players.iter().for_each(|player| {
+        // players action
+        game.players.iter().for_each(|player| {
             println!(
-                "Name: {}, Acrive Workers: {}, Corns: {}",
+                "Name: {}, Acrive Workers: {}, Corns: {}, Points: {}",
                 player.get_name(),
                 player.get_active_workers(),
                 player.get_corns(),
+                player.get_points(),
             );
+            // TODO playerの行動を実装
         });
-        let is_end = game.end_round(&mut players);
+        let is_end = game.end_round();
         if is_end {
             break;
         }
