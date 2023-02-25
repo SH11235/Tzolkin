@@ -1,94 +1,15 @@
-use crate::utils::{constants::CORN_PER_WORKER, increment::Increment};
+pub mod resource_stock;
+pub mod technology;
+pub mod temple_faith;
+pub mod worker;
 
+use self::{technology::Technology, temple_faith::TempleFaith, worker::Worker, resource_stock::ResourceSkullStock};
 use super::{
-    resources::{Gold, ResourceStock, Skull, Stone, Wood},
-    temple::{Chaac, Kukulkan, Quetzalcoatl, Temple},
+    action_space::WorkerPosition,
+    resources::{Gold, Skull, Stone, Wood},
+    temple::Temple,
 };
-
-#[derive(Debug)]
-enum WorkerPosition {
-    Hand,
-    Palenque(u32),
-    Yaxchilan(u32),
-    Tikal(u32),
-    Uxmal(u32),
-    ChichenItza(u32),
-    StartPlayer,
-    Field,
-    // QuickActions,
-}
-
-#[derive(Debug)]
-pub struct Worker {
-    position: WorkerPosition,
-}
-impl Worker {
-    pub fn back_to_hand(&mut self) {
-        self.position = WorkerPosition::Hand;
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct TechnologyLevel(pub u32);
-pub trait ValidTechnologyLevel {
-    fn is_valid(&self) -> bool;
-}
-impl ValidTechnologyLevel for TechnologyLevel {
-    fn is_valid(&self) -> bool {
-        self.0 <= 3
-    }
-}
-impl Increment for TechnologyLevel {
-    fn increment(&mut self) {
-        if self.0 < 3 {
-            self.0.increment();
-        }
-    }
-}
-pub enum TechnologyType {
-    Agriculture,
-    Resource,
-    Construction,
-    Temple,
-}
-
-impl TechnologyLevel {
-    pub(crate) fn progress(&mut self, technology_type: TechnologyType, _player: &mut Player) {
-        if self.0 < 3 {
-            self.increment();
-        } else {
-            match technology_type {
-                TechnologyType::Agriculture => {
-                    todo!("Agriculture technology progress");
-                }
-                TechnologyType::Resource => {
-                    todo!("Resource technology progress");
-                }
-                TechnologyType::Construction => {
-                    todo!("Construction technology progress");
-                }
-                TechnologyType::Temple => {
-                    todo!("Temple technology progress");
-                }
-            }
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct Technology {
-    pub agriculture: TechnologyLevel,
-    pub resource: TechnologyLevel,
-    pub construction: TechnologyLevel,
-    pub temple: TechnologyLevel,
-}
-
-#[derive(Debug, Default)]
-pub struct TempleFaith {
-    pub chaac: Chaac,
-    pub quetzalcoatl: Quetzalcoatl,
-    pub kukulkan: Kukulkan,
-}
+use crate::utils::constants::CORN_PER_WORKER;
 
 #[derive(Debug, Default)]
 pub struct Player {
@@ -98,7 +19,7 @@ pub struct Player {
     pub(super) technology: Technology,
     pub(super) temple_faith: TempleFaith,
     pub(super) corns: u32,
-    pub(super) resource: ResourceStock,
+    pub(super) resource: ResourceSkullStock,
     pub(super) corn_tiles: u32,
     pub(super) wood_tiles: u32,
     pub(super) points: f32,
@@ -110,43 +31,17 @@ impl Player {
             name,
             order,
             workers: vec![
-                Worker {
-                    position: WorkerPosition::Hand,
-                },
-                Worker {
-                    position: WorkerPosition::Hand,
-                },
-                Worker {
-                    position: WorkerPosition::Hand,
-                },
-                Worker {
-                    position: WorkerPosition::Field,
-                },
-                Worker {
-                    position: WorkerPosition::Field,
-                },
-                Worker {
-                    position: WorkerPosition::Field,
-                },
+                Worker::new(),
+                Worker::new(),
+                Worker::new(),
+                Worker::locked_worker(),
+                Worker::locked_worker(),
+                Worker::locked_worker(),
             ],
-            technology: Technology {
-                agriculture: TechnologyLevel(0),
-                resource: TechnologyLevel(0),
-                construction: TechnologyLevel(0),
-                temple: TechnologyLevel(0),
-            },
-            temple_faith: TempleFaith {
-                chaac: Chaac(0),
-                quetzalcoatl: Quetzalcoatl(0),
-                kukulkan: Kukulkan(0),
-            },
+            technology: Technology::new(),
+            temple_faith: TempleFaith::new(),
             corns: 0,
-            resource: ResourceStock {
-                woods: Wood(0),
-                stones: Stone(0),
-                golds: Gold(0),
-                skulls: Skull(0),
-            },
+            resource: ResourceSkullStock::new(),
             corn_tiles: 0,
             wood_tiles: 0,
             points: 0.0,
@@ -164,8 +59,8 @@ impl Player {
     pub fn get_active_workers(&self) -> u32 {
         self.workers
             .iter()
-            .filter(|worker| match worker.position {
-                WorkerPosition::Field => false,
+            .filter(|worker| match worker.get_position() {
+                WorkerPosition::Locked => false,
                 _ => true,
             })
             .count() as u32
@@ -241,6 +136,8 @@ impl Player {
 
 #[cfg(test)]
 mod tests {
+    use crate::game_object::temple::{Chaac, Quetzalcoatl, Kukulkan};
+
     use super::*;
 
     #[test]

@@ -296,8 +296,7 @@ impl<
 #[cfg(test)]
 mod tests {
     use crate::game_object::{
-        player::TempleFaith,
-        temple::{Chaac, Kukulkan, Quetzalcoatl},
+        temple::{Chaac, Kukulkan, Quetzalcoatl}, player::temple_faith::TempleFaith,
     };
 
     use super::*;
