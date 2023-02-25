@@ -46,11 +46,3 @@ impl FieldSkulls {
         self.0 -= num;
     }
 }
-
-#[derive(Debug, Default)]
-pub struct ResourceStock {
-    pub woods: Wood,
-    pub stones: Stone,
-    pub golds: Gold,
-    pub skulls: Skull,
-}

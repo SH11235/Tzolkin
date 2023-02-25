@@ -1,7 +1,7 @@
-use super::resources::{Gold, ResourceStock, Skull, Stone, Wood};
+use super::{resources::{Gold, Skull, Stone, Wood}, player::resource_stock::ResourceSkullStock};
 
 pub trait Temple {
-    fn resource_reward(&self) -> ResourceStock;
+    fn resource_reward(&self) -> ResourceSkullStock;
     fn point_reward(&self) -> i32;
 }
 
@@ -14,7 +14,7 @@ pub enum TempleName {
 #[derive(Debug, Default)]
 pub struct Chaac(pub i32);
 impl Temple for Chaac {
-    fn resource_reward(&self) -> ResourceStock {
+    fn resource_reward(&self) -> ResourceSkullStock {
         let mut stone_reward = 0;
         if self.0 >= 1 {
             stone_reward += 1;
@@ -22,7 +22,7 @@ impl Temple for Chaac {
         if self.0 >= 3 {
             stone_reward += 1;
         }
-        ResourceStock {
+        ResourceSkullStock {
             woods: Wood(0),
             stones: Stone(stone_reward),
             golds: Gold(0),
@@ -45,7 +45,7 @@ impl Temple for Chaac {
 #[derive(Debug, Default)]
 pub struct Quetzalcoatl(pub i32);
 impl Temple for Quetzalcoatl {
-    fn resource_reward(&self) -> ResourceStock {
+    fn resource_reward(&self) -> ResourceSkullStock {
         let mut gold_reward = 0;
         if self.0 >= 2 {
             gold_reward += 1;
@@ -53,12 +53,7 @@ impl Temple for Quetzalcoatl {
         if self.0 >= 4 {
             gold_reward += 1;
         }
-        ResourceStock {
-            woods: Wood(0),
-            stones: Stone(0),
-            golds: Gold(gold_reward),
-            skulls: Skull(0),
-        }
+        ResourceSkullStock::new()
     }
     fn point_reward(&self) -> i32 {
         match self.0 {
@@ -78,7 +73,7 @@ impl Temple for Quetzalcoatl {
 #[derive(Debug, Default)]
 pub struct Kukulkan(pub i32);
 impl Temple for Kukulkan {
-    fn resource_reward(&self) -> ResourceStock {
+    fn resource_reward(&self) -> ResourceSkullStock {
         let mut wood_reward = 0;
         if self.0 >= 1 {
             wood_reward += 1;
@@ -87,7 +82,7 @@ impl Temple for Kukulkan {
             wood_reward += 1;
         }
         let skull_reward = if self.0 >= 4 { 1 } else { 0 };
-        ResourceStock {
+        ResourceSkullStock {
             woods: Wood(wood_reward),
             stones: Stone(0),
             golds: Gold(0),
