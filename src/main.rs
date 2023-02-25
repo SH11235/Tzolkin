@@ -5,7 +5,6 @@ use game_object::game::{Game, Generation, Round};
 
 fn main() {
     let number_of_players = 4; // TODO inputで受け取る
-    let mut jungle = game_object::action_space::Jungle::new(&number_of_players).unwrap();
     let mut game = Game::new(Round(1), Generation(1), number_of_players).unwrap();
     // start
     print!("game start");

@@ -221,6 +221,9 @@ impl Player {
 
         let kukulkan_resources = &self.temple_faith.kukulkan.resource_reward();
         self.resource.woods.0 += kukulkan_resources.woods.0;
+    }
+    pub fn get_skull_reward_from_kukulkan(&mut self) {
+        let kukulkan_resources = &self.temple_faith.kukulkan.resource_reward();
         self.resource.skulls.0 += kukulkan_resources.skulls.0;
     }
     // 神殿判定: 得点

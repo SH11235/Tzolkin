@@ -1,3 +1,5 @@
+use crate::utils::constants::MAX_SKULL_COUNT;
+
 pub trait Resource {
     fn convert_to_corns_rate(&self) -> u32;
 }
@@ -28,6 +30,20 @@ pub struct Skull(pub u32);
 impl Skull {
     pub fn convert_to_points(&self) -> u32 {
         self.0 * 3
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct FieldSkulls(u32);
+impl FieldSkulls {
+    pub fn new() -> Self {
+        Self(MAX_SKULL_COUNT)
+    }
+    pub fn get_remaining_skulls(&self) -> u32 {
+        self.0
+    }
+    pub fn decrease_skulls(&mut self, num: u32) {
+        self.0 -= num;
     }
 }
 
