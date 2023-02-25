@@ -6,7 +6,10 @@ use crate::utils::constants::{
 };
 use crate::utils::increment::Increment;
 
+use super::chichen_itza_skull::ChichenItzaSkull;
+use super::jungle::Jungle;
 use super::player;
+use super::resources::FieldSkulls;
 
 enum FoodDay {
     First,
@@ -75,6 +78,9 @@ pub(crate) struct Game<
     generation: G,
     pub players: Vec<player::Player>,
     corns: u32,
+    jungle: Jungle,
+    chichen_itza_skull: ChichenItzaSkull,
+    field_skull: FieldSkulls,
     first_food_day_done: bool,
     second_food_day_done: bool,
     third_food_day_done: bool,
@@ -102,6 +108,9 @@ impl<
                 .map(|i| player::Player::new(format!("Player {}", i), i.into()))
                 .collect(),
             corns,
+            jungle: Jungle::new(&number_of_players)?,
+            chichen_itza_skull: ChichenItzaSkull::new(),
+            field_skull: FieldSkulls::new(),
             first_food_day_done: false,
             second_food_day_done: false,
             third_food_day_done: false,
@@ -208,9 +217,19 @@ impl<
         match food_day {
             FoodDay::First => {
                 self.first_food_day_done = true;
+                let mut required_skulls =0;
+                self.players.iter().for_each(|player| {
+                    if player.get_kukulkan() >= 4 {
+                        required_skulls += 1;
+                    }
+                });
                 self.players.iter_mut().for_each(|player| {
                     player.feed();
                     player.get_resource_reward_from_temple();
+                    if self.field_skull.get_remaining_skulls() >= required_skulls {
+                        self.field_skull.decrease_skulls(required_skulls);
+                        player.get_skull_reward_from_kukulkan();
+                    }
                 });
             }
             FoodDay::Second => {

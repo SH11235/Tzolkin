@@ -18,3 +18,4 @@ pub const MAX_CHICHEN_ITZA_SPACES: u32 = 10;
 pub const MAX_CHAAC_RANK: i32 = 5;
 pub const MAX_QUETZALCOATL_RANK: i32 = 7;
 pub const MAX_KUKULKAN_RANK: i32 = 6;
+pub const MAX_SKULL_COUNT: u32 = 13;
