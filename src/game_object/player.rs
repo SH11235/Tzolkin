@@ -167,8 +167,8 @@ mod tests {
     fn test_get_resource_reward_from_temple() {
         let mut player = Player::new("Player 1".to_string(), 1);
         player.temple_faith.chaac = Chaac::new(0);
-        player.temple_faith.quetzalcoatl = Quetzalcoatl(0);
-        player.temple_faith.kukulkan = Kukulkan(0);
+        player.temple_faith.quetzalcoatl = Quetzalcoatl::new(0);
+        player.temple_faith.kukulkan = Kukulkan::new(0);
         player.get_resource_reward_from_temple();
         assert_eq!(player.resource.stones.0, 0);
         assert_eq!(player.resource.golds.0, 0);
@@ -177,8 +177,8 @@ mod tests {
 
         let mut player = Player::new("Player 1".to_string(), 1);
         player.temple_faith.chaac = Chaac::new(1);
-        player.temple_faith.quetzalcoatl = Quetzalcoatl(2);
-        player.temple_faith.kukulkan = Kukulkan(1);
+        player.temple_faith.quetzalcoatl = Quetzalcoatl::new(2);
+        player.temple_faith.kukulkan = Kukulkan::new(1);
         player.get_resource_reward_from_temple();
         assert_eq!(player.resource.stones.0, 1);
         assert_eq!(player.resource.golds.0, 1);
@@ -187,9 +187,10 @@ mod tests {
 
         let mut player = Player::new("Player 1".to_string(), 1);
         player.temple_faith.chaac = Chaac::new(3);
-        player.temple_faith.quetzalcoatl = Quetzalcoatl(4);
-        player.temple_faith.kukulkan = Kukulkan(4);
+        player.temple_faith.quetzalcoatl = Quetzalcoatl::new(4);
+        player.temple_faith.kukulkan = Kukulkan::new(4);
         player.get_resource_reward_from_temple();
+        player.get_skull_reward_from_kukulkan();
         assert_eq!(player.resource.stones.0, 2);
         assert_eq!(player.resource.golds.0, 2);
         assert_eq!(player.resource.woods.0, 2);
@@ -200,22 +201,22 @@ mod tests {
     fn test_get_point_reward_from_temple() {
         let mut player = Player::new("Player 1".to_string(), 1);
         player.temple_faith.chaac = Chaac::new(0);
-        player.temple_faith.quetzalcoatl = Quetzalcoatl(0);
-        player.temple_faith.kukulkan = Kukulkan(0);
+        player.temple_faith.quetzalcoatl = Quetzalcoatl::new(0);
+        player.temple_faith.kukulkan = Kukulkan::new(0);
         player.get_point_reward_from_temple();
         assert_eq!(player.points, 0.0);
 
         let mut player = Player::new("Player 1".to_string(), 1);
         player.temple_faith.chaac = Chaac::new(1);
-        player.temple_faith.quetzalcoatl = Quetzalcoatl(2);
-        player.temple_faith.kukulkan = Kukulkan(1);
+        player.temple_faith.quetzalcoatl = Quetzalcoatl::new(2);
+        player.temple_faith.kukulkan = Kukulkan::new(1);
         player.get_point_reward_from_temple();
         assert_eq!(player.points, 5.0);
 
         let mut player = Player::new("Player 1".to_string(), 1);
         player.temple_faith.chaac = Chaac::new(3);
-        player.temple_faith.quetzalcoatl = Quetzalcoatl(4);
-        player.temple_faith.kukulkan = Kukulkan(4);
+        player.temple_faith.quetzalcoatl = Quetzalcoatl::new(4);
+        player.temple_faith.kukulkan = Kukulkan::new(4);
         player.get_point_reward_from_temple();
         assert_eq!(player.points, 19.0);
     }

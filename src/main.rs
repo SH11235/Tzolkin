@@ -1,18 +1,18 @@
 mod game_object;
 mod utils;
 
-use game_object::game::{Game, Generation, Round};
+use game_object::game::Game;
 
 fn main() {
     let number_of_players = 4; // TODO inputで受け取る
-    let mut game = Game::new(Round(1), Generation(1), number_of_players).unwrap();
+    let mut game = Game::new(number_of_players).unwrap();
     // start
     print!("game start");
     loop {
         println!(
             "Round: {}, Generation: {}, Corns: {}",
-            game.get_round().0,
-            game.get_generation().0,
+            game.get_round(),
+            game.get_generation(),
             game.get_corns()
         );
         // players action
