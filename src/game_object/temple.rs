@@ -81,7 +81,12 @@ impl Temple for Quetzalcoatl {
         if self.0 >= 4 {
             gold_reward += 1;
         }
-        ResourceSkullStock::new()
+        ResourceSkullStock {
+            woods: Wood(0),
+            stones: Stone(0),
+            golds: Gold(gold_reward),
+            skulls: Skull(0),
+        }
     }
     fn point_reward(&self) -> i32 {
         match self.0 {
