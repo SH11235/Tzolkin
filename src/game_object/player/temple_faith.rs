@@ -1,4 +1,4 @@
-use crate::game_object::temple::{Chaac, Quetzalcoatl, Kukulkan};
+use crate::game_object::temple::{Chaac, Quetzalcoatl, Kukulkan, Temple};
 
 #[derive(Debug, Default)]
 pub struct TempleFaith {
@@ -9,9 +9,9 @@ pub struct TempleFaith {
 impl TempleFaith {
     pub fn new() -> Self {
         TempleFaith {
-            chaac: Chaac(0),
-            quetzalcoatl: Quetzalcoatl(0),
-            kukulkan: Kukulkan(0),
+            chaac: Chaac::new(0),
+            quetzalcoatl: Quetzalcoatl::new(0),
+            kukulkan: Kukulkan::new(0),
         }
     }
 }
