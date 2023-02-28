@@ -3,12 +3,11 @@ pub mod technology;
 pub mod temple_faith;
 pub mod worker;
 
-use self::{technology::Technology, temple_faith::TempleFaith, worker::Worker, resource_stock::ResourceSkullStock};
-use super::{
-    action_space::WorkerPosition,
-    resources::{Gold, Skull, Stone, Wood},
-    temple::Temple,
+use self::{
+    resource_stock::ResourceSkullStock, technology::Technology, temple_faith::TempleFaith,
+    worker::Worker,
 };
+use super::{action_space::WorkerPosition, temple::Temple};
 use crate::utils::constants::CORN_PER_WORKER;
 
 #[derive(Debug, Default)]
@@ -67,15 +66,15 @@ impl Player {
     }
 
     pub fn get_chaac(&self) -> i32 {
-        self.temple_faith.chaac.0
+        self.temple_faith.chaac.get_faith()
     }
 
     pub fn get_quetzalcoatl(&self) -> i32 {
-        self.temple_faith.quetzalcoatl.0
+        self.temple_faith.quetzalcoatl.get_faith()
     }
 
     pub fn get_kukulkan(&self) -> i32 {
-        self.temple_faith.kukulkan.0
+        self.temple_faith.kukulkan.get_faith()
     }
 
     pub fn add_points(&mut self, points: f32) {
@@ -136,7 +135,7 @@ impl Player {
 
 #[cfg(test)]
 mod tests {
-    use crate::game_object::temple::{Chaac, Quetzalcoatl, Kukulkan};
+    use crate::game_object::temple::{Chaac, Kukulkan, Quetzalcoatl};
 
     use super::*;
 
@@ -167,7 +166,7 @@ mod tests {
     #[test]
     fn test_get_resource_reward_from_temple() {
         let mut player = Player::new("Player 1".to_string(), 1);
-        player.temple_faith.chaac = Chaac(0);
+        player.temple_faith.chaac = Chaac::new(0);
         player.temple_faith.quetzalcoatl = Quetzalcoatl(0);
         player.temple_faith.kukulkan = Kukulkan(0);
         player.get_resource_reward_from_temple();
@@ -177,7 +176,7 @@ mod tests {
         assert_eq!(player.resource.skulls.0, 0);
 
         let mut player = Player::new("Player 1".to_string(), 1);
-        player.temple_faith.chaac = Chaac(1);
+        player.temple_faith.chaac = Chaac::new(1);
         player.temple_faith.quetzalcoatl = Quetzalcoatl(2);
         player.temple_faith.kukulkan = Kukulkan(1);
         player.get_resource_reward_from_temple();
@@ -187,7 +186,7 @@ mod tests {
         assert_eq!(player.resource.skulls.0, 0);
 
         let mut player = Player::new("Player 1".to_string(), 1);
-        player.temple_faith.chaac = Chaac(3);
+        player.temple_faith.chaac = Chaac::new(3);
         player.temple_faith.quetzalcoatl = Quetzalcoatl(4);
         player.temple_faith.kukulkan = Kukulkan(4);
         player.get_resource_reward_from_temple();
@@ -200,21 +199,21 @@ mod tests {
     #[test]
     fn test_get_point_reward_from_temple() {
         let mut player = Player::new("Player 1".to_string(), 1);
-        player.temple_faith.chaac = Chaac(0);
+        player.temple_faith.chaac = Chaac::new(0);
         player.temple_faith.quetzalcoatl = Quetzalcoatl(0);
         player.temple_faith.kukulkan = Kukulkan(0);
         player.get_point_reward_from_temple();
         assert_eq!(player.points, 0.0);
 
         let mut player = Player::new("Player 1".to_string(), 1);
-        player.temple_faith.chaac = Chaac(1);
+        player.temple_faith.chaac = Chaac::new(1);
         player.temple_faith.quetzalcoatl = Quetzalcoatl(2);
         player.temple_faith.kukulkan = Kukulkan(1);
         player.get_point_reward_from_temple();
         assert_eq!(player.points, 5.0);
 
         let mut player = Player::new("Player 1".to_string(), 1);
-        player.temple_faith.chaac = Chaac(3);
+        player.temple_faith.chaac = Chaac::new(3);
         player.temple_faith.quetzalcoatl = Quetzalcoatl(4);
         player.temple_faith.kukulkan = Kukulkan(4);
         player.get_point_reward_from_temple();

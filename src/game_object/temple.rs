@@ -1,6 +1,10 @@
 use super::{resources::{Gold, Skull, Stone, Wood}, player::resource_stock::ResourceSkullStock};
 
 pub trait Temple {
+    fn new(num: i32) -> Self;
+    fn get_faith(&self) -> i32;
+    fn raise_faith(&mut self);
+    fn lower_faith(&mut self);
     fn resource_reward(&self) -> ResourceSkullStock;
     fn point_reward(&self) -> i32;
 }
@@ -12,8 +16,20 @@ pub enum TempleName {
 }
 
 #[derive(Debug, Default)]
-pub struct Chaac(pub i32);
+pub struct Chaac(i32);
 impl Temple for Chaac {
+    fn new(num: i32) -> Self {
+        Self(num)
+    }
+    fn get_faith(&self) -> i32 {
+        self.0
+    }
+    fn raise_faith(&mut self) {
+        self.0 += 1;
+    }
+    fn lower_faith(&mut self) {
+        self.0 -= 1;
+    }
     fn resource_reward(&self) -> ResourceSkullStock {
         let mut stone_reward = 0;
         if self.0 >= 1 {
@@ -43,8 +59,20 @@ impl Temple for Chaac {
     }
 }
 #[derive(Debug, Default)]
-pub struct Quetzalcoatl(pub i32);
+pub struct Quetzalcoatl(i32);
 impl Temple for Quetzalcoatl {
+    fn new(num: i32) -> Self {
+        Self(num)
+    }
+    fn get_faith(&self) -> i32 {
+        self.0
+    }
+    fn raise_faith(&mut self) {
+        self.0 += 1;
+    }
+    fn lower_faith(&mut self) {
+        self.0 -= 1;
+    }
     fn resource_reward(&self) -> ResourceSkullStock {
         let mut gold_reward = 0;
         if self.0 >= 2 {
@@ -71,8 +99,20 @@ impl Temple for Quetzalcoatl {
     }
 }
 #[derive(Debug, Default)]
-pub struct Kukulkan(pub i32);
+pub struct Kukulkan(i32);
 impl Temple for Kukulkan {
+    fn new(num: i32) -> Self {
+        Self(num)
+    }
+    fn get_faith(&self) -> i32 {
+        self.0
+    }
+    fn raise_faith(&mut self) {
+        self.0 += 1;
+    }
+    fn lower_faith(&mut self) {
+        self.0 -= 1;
+    }
     fn resource_reward(&self) -> ResourceSkullStock {
         let mut wood_reward = 0;
         if self.0 >= 1 {

@@ -5,11 +5,9 @@ use crate::{
             Player,
         },
         resources::FieldSkulls,
-        temple::TempleName,
+        temple::{TempleName, Temple},
     },
-    utils::constants::{
-        MAX_CHAAC_RANK, MAX_KUKULKAN_RANK, MAX_QUETZALCOATL_RANK, MAX_TECHNOLOGY_LEVEL,
-    },
+    utils::constants::{MAX_CHAAC_RANK, MAX_KUKULKAN_RANK, MAX_QUETZALCOATL_RANK},
 };
 
 pub struct Tikal(u32);
@@ -46,24 +44,24 @@ impl Tikal {
                     };
                     match target_temple {
                         TempleName::Chaac => {
-                            if player.temple_faith.chaac.0 == MAX_CHAAC_RANK {
+                            if player.temple_faith.chaac.get_faith() == MAX_CHAAC_RANK {
                                 return Err("チャクの信仰は既に上限です".to_string());
                             } else {
-                                player.temple_faith.chaac.0 += 1;
+                                player.temple_faith.chaac.raise_faith();
                             }
                         }
                         TempleName::Quetzalcoatl => {
-                            if player.temple_faith.quetzalcoatl.0 == MAX_QUETZALCOATL_RANK {
+                            if player.temple_faith.quetzalcoatl.get_faith() == MAX_QUETZALCOATL_RANK {
                                 return Err("ケツァルコアトルの信仰は既に上限です".to_string());
                             } else {
-                                player.temple_faith.quetzalcoatl.0 += 1;
+                                player.temple_faith.quetzalcoatl.raise_faith();
                             }
                         }
                         TempleName::Kukulkan => {
-                            if player.temple_faith.kukulkan.0 == MAX_KUKULKAN_RANK {
+                            if player.temple_faith.kukulkan.get_faith() == MAX_KUKULKAN_RANK {
                                 return Err("ククルカンの信仰は既に上限です".to_string());
                             } else {
-                                player.temple_faith.kukulkan.0 += 1;
+                                player.temple_faith.kukulkan.raise_faith();
                             }
                         }
                     }
