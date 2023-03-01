@@ -53,7 +53,7 @@ impl Game {
             round: Round::new(1),
             generation: Generation::new(1),
             corns,
-            jungle: Jungle::new(&number_of_players)?,
+            jungle: Jungle::new(number_of_players)?,
             chichen_itza_skull: ChichenItzaSkull::new(),
         })
     }
@@ -88,7 +88,7 @@ impl Game {
         food_day_status: &mut FoodDayStatus,
         players: &mut Vec<Player>,
         field_skull: &mut FieldSkulls,
-    ) -> bool {
+    ) {
         if !food_day_status.first_food_day_done && self.get_round() >= FIRST_FOOD_DAY {
             food_day_status.food_day(FoodDay::First, players, field_skull);
         }
@@ -101,16 +101,11 @@ impl Game {
         if !food_day_status.fourth_food_day_done && self.get_round() >= FOURTH_FOOD_DAY {
             food_day_status.food_day(FoodDay::Fourth, players, field_skull);
         }
-        if self.round.0 >= FOURTH_FOOD_DAY {
-            true
-        } else {
-            self.next_round();
-            if (self.generation.0 == 1) && (self.round.0 >= SECOND_FOOD_DAY + 1) {
-                self.next_generation();
-            }
-            self.add_corns();
-            false
+        self.next_round();
+        if (self.generation.0 == 1) && (self.round.0 >= SECOND_FOOD_DAY + 1) {
+            self.next_generation();
         }
+        self.add_corns();
     }
 }
 
