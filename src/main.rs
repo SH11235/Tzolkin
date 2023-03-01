@@ -3,7 +3,7 @@ mod utils;
 
 use game_object::game::Game;
 
-use crate::game_object::{food_day::FoodDayStatus, player::Player, resources::FieldSkulls};
+use crate::{game_object::{food_day::FoodDayStatus, player::Player, resources::FieldSkulls}, utils::constants::FOURTH_FOOD_DAY};
 
 fn main() {
     let number_of_players = 4; // TODO inputで受け取る
@@ -33,9 +33,20 @@ fn main() {
             );
             // TODO playerの行動を実装
         });
-        let is_end = game.end_round(&mut food_day_status, &mut players, &mut field_skull);
-        if is_end {
+        game.end_round(&mut food_day_status, &mut players, &mut field_skull);
+        if game.get_round()>= FOURTH_FOOD_DAY + 1 {
             break;
         }
     }
+    print!("game end");
+    players.iter().for_each(|player| {
+        // TODO playerの資源、髑髏、モニュメントを得点に変換する
+        println!(
+            "Name: {}, Acrive Workers: {}, Corns: {}, Points: {}",
+            player.get_name(),
+            player.get_active_workers(),
+            player.get_corns(),
+            player.get_points(),
+        );
+    });
 }
