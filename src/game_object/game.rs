@@ -16,9 +16,7 @@ impl Round {
 }
 impl Increment for Round {
     fn increment(&mut self) {
-        if self.0 < FOURTH_FOOD_DAY {
-            self.0.increment();
-        }
+        self.0.increment();
     }
 }
 
