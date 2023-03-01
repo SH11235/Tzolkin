@@ -9,18 +9,18 @@ pub struct Jungle {
     fifth_corn_tiles: u32,
 }
 impl Jungle {
-    pub fn new(number_of_players: &u32) -> Result<Self, &'static str> {
-        if *number_of_players > 4 {
+    pub fn new(number_of_players: u32) -> Result<Self, &'static str> {
+        if number_of_players > 4 {
             return Err("プレイヤーの人数が不正です");
         }
         Ok(Self {
-            second_corn_tiles: *number_of_players,
-            third_wood_tiles: *number_of_players,
-            third_corn_tiles: *number_of_players,
-            fourth_wood_tiles: *number_of_players,
-            fourth_corn_tiles: *number_of_players,
-            fifth_wood_tiles: *number_of_players,
-            fifth_corn_tiles: *number_of_players,
+            second_corn_tiles: number_of_players,
+            third_wood_tiles: number_of_players,
+            third_corn_tiles: number_of_players,
+            fourth_wood_tiles: number_of_players,
+            fourth_corn_tiles: number_of_players,
+            fifth_wood_tiles: number_of_players,
+            fifth_corn_tiles: number_of_players,
         })
     }
 
