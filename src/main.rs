@@ -12,6 +12,8 @@ use crossterm::{
 use game_object::{food_day::FoodDayStatus, game::Game, player::Player, resources::FieldSkulls};
 use utils::constants::FOURTH_FOOD_DAY;
 
+use crate::game_object::{action_space::{WorkerPosition, palenque::PalenqueSpace}, player::get_color};
+
 fn view<T: std::io::Write>(
     output: &mut T,
     game: &Game,
@@ -36,7 +38,7 @@ fn main() -> Result<()> {
     let mut field_skull = FieldSkulls::new();
     let mut food_day_status = FoodDayStatus::new();
     let mut players: Vec<Player> = (1..=number_of_players)
-        .map(|i| Player::new(format!("Player {}", i), i.into()))
+        .map(|i| Player::new(format!("Player {}", i), get_color(i).unwrap(), i.into()))
         .collect();
 
     enable_raw_mode()?;
@@ -57,6 +59,11 @@ fn main() -> Result<()> {
                 game.get_corns()
             ))
         )?;
+
+        // サンプルコード
+        if game.get_round() == 1 {
+            players[0].workers[0].set_position(WorkerPosition::Palenque(PalenqueSpace(0)));
+        }
         // players action
         players.iter().for_each(|player| {
             // TODO playerの行動を実装
@@ -66,9 +73,9 @@ fn main() -> Result<()> {
             execute!(
                 std::io::stderr(),
                 Print(format!(
-                    "Name: {}, Acrive Workers: {}, Corns: {}, Points: {}\n",
+                    "Name: {}, Workers: {:?}, Corns: {}, Points: {}\n",
                     player.get_name(),
-                    player.get_active_workers(),
+                    player.workers,
                     player.get_corns(),
                     player.get_points(),
                 ))

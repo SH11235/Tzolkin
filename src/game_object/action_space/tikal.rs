@@ -5,18 +5,29 @@ use crate::{
             Player,
         },
         resources::FieldSkulls,
-        temple::{TempleName, Temple},
+        temple::{Temple, TempleName},
     },
     utils::constants::{MAX_CHAAC_RANK, MAX_KUKULKAN_RANK, MAX_QUETZALCOATL_RANK},
 };
 
-pub struct Tikal(u32);
+use super::ActionSpace;
+
+#[derive(Debug)]
+pub struct TikalSpace(u32);
 pub enum ResourceOption {
     Wood,
     Stone,
     Gold,
 }
-impl Tikal {
+impl ActionSpace for TikalSpace {
+    fn get_space(&self) -> u32 {
+        self.0
+    }
+    fn next_space(&mut self) {
+        self.0 += 1;
+    }
+}
+impl TikalSpace {
     fn technology_level_action(
         &self,
         player: &mut Player,
@@ -51,7 +62,8 @@ impl Tikal {
                             }
                         }
                         TempleName::Quetzalcoatl => {
-                            if player.temple_faith.quetzalcoatl.get_faith() == MAX_QUETZALCOATL_RANK {
+                            if player.temple_faith.quetzalcoatl.get_faith() == MAX_QUETZALCOATL_RANK
+                            {
                                 return Err("ケツァルコアトルの信仰は既に上限です".to_string());
                             } else {
                                 player.temple_faith.quetzalcoatl.raise_faith();

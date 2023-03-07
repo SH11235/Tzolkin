@@ -16,7 +16,9 @@ impl Round {
 }
 impl Increment for Round {
     fn increment(&mut self) {
-        self.0.increment();
+        if self.0 < FOURTH_FOOD_DAY {
+            self.0.increment();
+        }
     }
 }
 
@@ -99,6 +101,11 @@ impl Game {
         if !food_day_status.fourth_food_day_done && self.get_round() >= FOURTH_FOOD_DAY {
             food_day_status.food_day(FoodDay::Fourth, players, field_skull);
         }
+        players.iter_mut().for_each(|player| {
+            player.workers.iter_mut().for_each(|worker| {
+                worker.next_space();
+            });
+        });
         self.next_round();
         if (self.generation.0 == 1) && (self.round.0 >= SECOND_FOOD_DAY + 1) {
             self.next_generation();
@@ -109,6 +116,8 @@ impl Game {
 
 #[cfg(test)]
 mod tests {
+    use crate::game_object::player::get_color;
+
     use super::*;
 
     #[test]
@@ -129,7 +138,7 @@ mod tests {
         let mut field_skull = FieldSkulls::new();
         let mut food_day_status = FoodDayStatus::new();
         let mut players: Vec<Player> = (1..=number_of_players)
-            .map(|i| Player::new(format!("Player {}", i), i.into()))
+            .map(|i| Player::new(format!("Player {}", i), get_color(i).unwrap(), i.into()))
             .collect();
 
         // FoodDay::Firstの境界テスト

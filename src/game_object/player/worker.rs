@@ -16,6 +16,27 @@ impl Worker {
         }
     }
 
+    pub fn next_space(&mut self) {
+        if !self.position.next_space() {
+            self.back_to_hand();
+        }
+    }
+
+    pub fn can_pick_up_worker(&self) -> Result<(), String>{
+        match self.position {
+            WorkerPosition::Hand => {
+                Err("You can't pick up a worker from your hand".to_string())
+            }
+            WorkerPosition::StartPlayer => {
+                Err("You can't pick up a worker from your start player".to_string())
+            }
+            WorkerPosition::Locked => {
+                Err("You can't pick up a worker from your locked worker".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn back_to_hand(&mut self) {
         self.position = WorkerPosition::Hand;
     }

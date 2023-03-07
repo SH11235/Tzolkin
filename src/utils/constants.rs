@@ -3,6 +3,7 @@ pub const SECOND_FOOD_DAY: u32 = 14;
 pub const THIRD_FOOD_DAY: u32 = 21;
 pub const FOURTH_FOOD_DAY: u32 = 27;
 pub const CORN_PER_WORKER: u32 = 2; // food_dayでworker1人につき必要なコーン数
+pub const CORN_PER_POINT: u32 = 4; // 4コーンで1点
 pub const TOP_BONUS_SECOND_FOOD_DAY_CHAAC: u32 = 6;
 pub const TOP_BONUS_SECOND_FOOD_DAY_QUETZALCOATL: u32 = 2;
 pub const TOP_BONUS_SECOND_FOOD_DAY_KUKULKAN: u32 = 4;
