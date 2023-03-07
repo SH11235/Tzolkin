@@ -1,25 +1,33 @@
 use crate::{
-    game_object::{
-        jungle::Jungle,
-        player::{Player},
-    },
+    game_object::{jungle::Jungle, player::Player},
     utils::constants::MAX_TECHNOLOGY_LEVEL,
 };
+
+use super::ActionSpace;
 
 pub enum CornOrWood {
     Corn,
     Wood,
 }
 
-pub struct Palenque(u32);
-impl Palenque {
-    fn action(
+#[derive(Debug)]
+pub struct PalenqueSpace(pub u32);
+impl ActionSpace for PalenqueSpace {
+    fn get_space(&self) -> u32 {
+        self.0
+    }
+    fn next_space(&mut self) {
+        self.0 += 1;
+    }
+}
+impl PalenqueSpace {
+    pub fn action(
         &self,
+        action_space: u32,
         player: &mut Player,
         corn_or_wood: Option<CornOrWood>,
         jungle: Option<&mut Jungle>,
     ) -> Result<(), String> {
-        let action_space = self.0;
         let corn_or_wood = match corn_or_wood {
             Some(corn_or_wood) => corn_or_wood,
             None => return Err("コーンか木を選択してください".to_string()),
@@ -55,7 +63,9 @@ impl Palenque {
             }
             3 | 4 | 5 => match corn_or_wood {
                 CornOrWood::Corn => {
-                    if jungle.corn_tiles(self.0) == 0 && player.technology.get_agriculture_level() <= 2 {
+                    if jungle.corn_tiles(self.0) == 0
+                        && player.technology.get_agriculture_level() <= 2
+                    {
                         return Err("コーンタイルがありません".to_string());
                     }
                     if jungle.corn_tiles(action_space) > 0 {

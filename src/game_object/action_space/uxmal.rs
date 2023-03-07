@@ -2,8 +2,19 @@ use crate::game_object::{
     chichen_itza_skull::ChichenItzaSkull, jungle::Jungle, player::Player, temple::TempleName,
 };
 
-pub struct Uxmal(u32);
-impl Uxmal {
+use super::ActionSpace;
+
+#[derive(Debug)]
+pub struct UxmalSpace(u32);
+impl ActionSpace for UxmalSpace {
+    fn get_space(&self) -> u32 {
+        self.0
+    }
+    fn next_space(&mut self) {
+        self.0 += 1;
+    }
+}
+impl UxmalSpace {
     fn action(
         &self,
         player: &mut Player,

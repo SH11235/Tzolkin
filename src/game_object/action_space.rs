@@ -1,18 +1,126 @@
+use crate::utils::constants::{
+    MAX_CHICHEN_ITZA_SPACES, MAX_PALENQUE_SPACES, MAX_TIKAL_SPACES, MAX_UXMAL_SPACES,
+    MAX_YAXCHILAN_SPACES,
+};
+
+use self::{
+    chichen_itza::ChichenItzaSpace,
+    palenque::{CornOrWood, PalenqueSpace},
+    tikal::{ResourceOption, TikalSpace},
+    uxmal::UxmalSpace,
+    yaxchilan::YaxchilanSpace,
+};
+
+use super::{
+    chichen_itza_skull::ChichenItzaSkull,
+    game::Game,
+    player::{technology::TechnologyType, Player},
+    temple::TempleName,
+};
+
+pub mod chichen_itza;
 pub mod palenque;
-pub mod yaxchilan;
 pub mod tikal;
 pub mod uxmal;
-pub mod chichen_itza;
+pub mod yaxchilan;
+
+#[derive(Default)]
+pub struct UserOption {
+    // for palenque
+    corn_or_wood: Option<CornOrWood>,
+    // for tikal
+    technology_type: Option<TechnologyType>,
+    resources: Option<[ResourceOption; 2]>,
+    // for tikal and chichen_itza
+    target_temple: Option<TempleName>,
+    // for chichen_itza
+    chichen_itza_skull: Option<ChichenItzaSkull>,
+}
+
+pub trait ActionSpace {
+    fn get_space(&self) -> u32;
+    fn next_space(&mut self);
+}
 
 #[derive(Debug)]
 pub enum WorkerPosition {
     Hand,
-    Palenque(u32),
-    Yaxchilan(u32),
-    Tikal(u32),
-    Uxmal(u32),
-    ChichenItza(u32),
+    Palenque(PalenqueSpace),
+    Yaxchilan(YaxchilanSpace),
+    Tikal(TikalSpace),
+    Uxmal(UxmalSpace),
+    ChichenItza(ChichenItzaSpace),
     StartPlayer,
     Locked,
-    // QuickActions,
+}
+
+impl WorkerPosition {
+    pub fn next_space(&mut self) -> bool {
+        match self {
+            WorkerPosition::Hand => true,
+            WorkerPosition::Palenque(palenque_space) => {
+                palenque_space.next_space();
+                if palenque_space.get_space() > MAX_PALENQUE_SPACES {
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerPosition::Yaxchilan(yaxchilan_space) => {
+                yaxchilan_space.next_space();
+                if yaxchilan_space.get_space() > MAX_YAXCHILAN_SPACES {
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerPosition::Tikal(tikal_space) => {
+                tikal_space.next_space();
+                if tikal_space.get_space() > MAX_TIKAL_SPACES {
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerPosition::Uxmal(uxmal_space) => {
+                uxmal_space.next_space();
+                if uxmal_space.get_space() > MAX_UXMAL_SPACES {
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerPosition::ChichenItza(chichen_itza_space) => {
+                chichen_itza_space.next_space();
+                if chichen_itza_space.get_space() > MAX_CHICHEN_ITZA_SPACES {
+                    false
+                } else {
+                    true
+                }
+            }
+            WorkerPosition::StartPlayer => false,
+            WorkerPosition::Locked => true,
+        }
+    }
+    pub fn action(&self, num: u32, player: &mut Player, game: &mut Game, user_option: UserOption) {
+        match self {
+            WorkerPosition::Hand => {}
+            WorkerPosition::Palenque(palenque_space) => {
+                palenque_space
+                    .action(
+                        num,
+                        player,
+                        user_option.corn_or_wood,
+                        Some(&mut game.jungle),
+                    )
+                    .unwrap();
+            }
+            WorkerPosition::Yaxchilan(_) => {}
+            WorkerPosition::Tikal(_) => {}
+            WorkerPosition::Uxmal(_) => {}
+            WorkerPosition::ChichenItza(_) => {}
+            WorkerPosition::StartPlayer => {}
+            WorkerPosition::Locked => {}
+        }
+    }
 }
