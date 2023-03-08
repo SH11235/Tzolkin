@@ -102,25 +102,29 @@ impl WorkerPosition {
             WorkerPosition::Locked => true,
         }
     }
-    pub fn action(&self, num: u32, player: &mut Player, game: &mut Game, user_option: UserOption) {
+    pub fn action(
+        &self,
+        num: u32,
+        player: &mut Player,
+        game: &mut Game,
+        user_option: UserOption,
+    ) -> Result<(), String> {
         match self {
-            WorkerPosition::Hand => {}
-            WorkerPosition::Palenque(palenque_space) => {
-                palenque_space
-                    .action(
-                        num,
-                        player,
-                        user_option.corn_or_wood,
-                        Some(&mut game.jungle),
-                    )
-                    .unwrap();
+            WorkerPosition::Hand => Err("Hand space has no action".to_string()),
+            WorkerPosition::Palenque(palenque_space) => palenque_space.action(
+                num,
+                player,
+                user_option.corn_or_wood,
+                Some(&mut game.jungle),
+            ),
+            WorkerPosition::Yaxchilan(yaxchilan_space) => {
+                yaxchilan_space.action(num, player)
             }
-            WorkerPosition::Yaxchilan(_) => {}
-            WorkerPosition::Tikal(_) => {}
-            WorkerPosition::Uxmal(_) => {}
-            WorkerPosition::ChichenItza(_) => {}
-            WorkerPosition::StartPlayer => {}
-            WorkerPosition::Locked => {}
+            WorkerPosition::Tikal(_) => todo!("Tikal action"),
+            WorkerPosition::Uxmal(_) => todo!("Uxmal action"),
+            WorkerPosition::ChichenItza(_) => todo!("ChichenItza action"),
+            WorkerPosition::StartPlayer => Err("StartPlayer space has no action".to_string()),
+            WorkerPosition::Locked => Err("Locked space has no action".to_string()),
         }
     }
 }
