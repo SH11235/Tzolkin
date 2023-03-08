@@ -13,8 +13,7 @@ impl ActionSpace for YaxchilanSpace {
     }
 }
 impl YaxchilanSpace {
-    fn action(&self, player: &mut Player) -> Result<(), String> {
-        let action_space = self.0;
+    pub fn action(&self, action_space: u32, player: &mut Player) -> Result<(), String> {
         match action_space {
             1 => {
                 player.resource.woods.0 += 1;
