@@ -1,6 +1,6 @@
 use crate::game_object::action_space::WorkerPosition;
 
-pub const worker_set_cost: [u32; 6] = [0, 1, 2, 3, 4, 5];
+pub const WORKER_SET_COST: [u32; 6] = [0, 1, 2, 3, 4, 5];
 
 #[derive(Debug)]
 pub struct Worker {
@@ -26,7 +26,7 @@ impl Worker {
     }
 
     pub fn calculate_set_cost(number: u32, space_number: u32) -> u32 {
-        worker_set_cost[number as usize] + space_number
+        WORKER_SET_COST[number as usize] + space_number
     }
 
     pub fn can_pick_up_worker(&self) -> bool {
