@@ -1,0 +1,44 @@
+.temple-container {
+    margin-right: 2em;
+}
+.temple-table {
+    width: 100px;
+    border-collapse: collapse
+}
+
+.temple-cell {
+    width: 100px;
+    height: 25px;
+    border: 1px solid #000;
+    text-align: center;
+    vertical-align: middle;
+    position: relative;
+}
+
+/* style={{ backgroundColor: templeColor }} */
+.temple-brown {
+    background-color: #B67A48;
+}
+
+.temple-yellow {
+    background-color: #F1C614;
+}
+
+.temple-green {
+    background-color: #8BBF3D;
+}
+
+.circle {
+    background-color: #ffcc00;
+    /* 背景色 */
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    /* 円形にする */
+    
+    /* 左右中央 */
+    transform: translate(-50%, -50%);
+    /* 中央に配置 */
+    z-index: 1;
+    /* 背景よりも前面に */
+}
