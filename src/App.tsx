@@ -35,25 +35,28 @@ function App() {
 
       <p>Click on the Tauri, Vite, and React logos to learn more.</p>
 
-      <div className="temples">
-        <Temple
-          name="Chaac"
-          playerScores={[{ color: "red", index: 0 }]}
-          templeBonus={ChaacBonus}
-          templeColor="brown"
-        />
-        <Temple
-          name="Quetzalcoatl"
-          playerScores={[{ color: "red", index: 0 }]}
-          templeBonus={QuetzalcoatlBonus}
-          templeColor="yellow"
-        />
-        <Temple
-          name="Kukulkan"
-          playerScores={[{ color: "red", index: 0 }]}
-          templeBonus={KukulkanBonus}
-          templeColor="green"
-        />
+      <div className="row">
+        <img src="/gear_beige.png" alt="gear" />
+        <span className="temples">
+          <Temple
+            name="Chaac"
+            playerScores={[{ color: "red", index: 0 }]}
+            templeBonus={ChaacBonus}
+            templeColor="brown"
+          />
+          <Temple
+            name="Quetzalcoatl"
+            playerScores={[{ color: "red", index: 0 }]}
+            templeBonus={QuetzalcoatlBonus}
+            templeColor="yellow"
+          />
+          <Temple
+            name="Kukulkan"
+            playerScores={[{ color: "red", index: 0 }]}
+            templeBonus={KukulkanBonus}
+            templeColor="green"
+          />
+        </span>
       </div>
 
       <div className="row">
