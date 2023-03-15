@@ -1,4 +1,4 @@
-import { TempleBonus } from "./components/Temple";
+import { TempleBonus } from "./components/temple";
 
 export const ChaacBonus: TempleBonus = [
   {

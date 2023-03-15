@@ -1,4 +1,4 @@
-import "./Temple.css";
+import "./temple.css";
 
 type PlayerColor = "red" | "blue" | "green" | "yellow" | "orange";
 export type TempleBonus = {
