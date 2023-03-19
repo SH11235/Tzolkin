@@ -87,41 +87,6 @@
   justify-content: flex-end;
 }
 
-
-.palenque-space {
-  display: flex;
-  padding: 0.2vmin 0vmin 0.2vmin 0vmin;
-}
-
-.palenque-space span {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: end;
-}
-
-.palenque-space-container {
-  margin-right: 5px;
-}
-
-.palenque-space span p {
-  /* TODO ここいじる */
-  margin: 0; 
-}
-
-.wood-chip-space {
-  height: 20px;
-  width: 20px;
-  color: white;
-  background-color: #7F4D28;
-}
-
-.corn-chip-space {
-  height: 20px;
-  width: 20px;
-  background-color: #E7C605;
-}
-
 .temples {
   display: flex;
   flex-direction: row;
