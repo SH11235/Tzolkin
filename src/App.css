@@ -34,9 +34,14 @@
   justify-content: center;
 }
 
-.field-container {}
+.field-container {
+  margin-right: 10px;
+}
 
-.yaxchilan-space, .tikal-space, .uxmal-space, .chichen-itza-space {
+.yaxchilan-space,
+.tikal-space,
+.uxmal-space,
+.chichen-itza-space {
   display: flex;
   align-items: center;
 }
@@ -44,13 +49,37 @@
 .space-name {
   font-weight: bold;
   width: 120px;
-  margin: 0 5px 10px 0;
 }
 
 .space {
+  width: 35px;
   border: solid black 2px;
   padding: 0.2vmin 0vmin 0.2vmin 0vmin;
   margin-right: 5px;
+}
+
+.worker-space {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid; /* 枠線の色を指定 */
+  margin: auto; 
+}
+
+.player-red {
+  background-color: red;
+}
+
+.player-blue {
+  background-color: blue;
+}
+
+.player-green {
+  background-color: green;
+}
+
+.player-yellow {
+  background-color: yellow;
 }
 
 .space-container {
@@ -61,29 +90,34 @@
 
 .palenque-space {
   display: flex;
-  border: solid black 0.3vmin;
   padding: 0.2vmin 0vmin 0.2vmin 0vmin;
 }
 
 .palenque-space span {
   display: flex;
-  margin-right: 5px;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: end;
+}
+
+.palenque-space-container {
+  margin-right: 5px;
 }
 
 .palenque-space span p {
-  margin: 0;
-  height: 20px;
+  /* TODO ここいじる */
+  margin: 0; 
 }
 
 .wood-chip-space {
+  height: 20px;
   width: 20px;
+  color: white;
   background-color: #7F4D28;
 }
 
 .corn-chip-space {
+  height: 20px;
   width: 20px;
   background-color: #E7C605;
 }

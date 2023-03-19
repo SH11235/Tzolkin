@@ -35,7 +35,6 @@ export const Temple: React.FC<Props> = ({
       </tr>
     );
   });
-  console.log(additonalRows);
   const rows = templeBonus.map((row, rowIndex) => {
     if (rowIndex === 0) {
       return (

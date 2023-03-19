@@ -3,9 +3,15 @@ import "./App.css";
 import { invoke } from "@tauri-apps/api/tauri";
 import { Temple } from "./components/temple";
 import { ChaacBonus, QuetzalcoatlBonus, KukulkanBonus } from "./constant";
+import { Players } from "./components/players";
+import { PalenqueSpace } from "./components/PalenqueSpace";
 
 function App() {
-  const [numberOfPlayers, setNumberOfPlayers] = useState(0);
+  const [players, setPlayers] = useState<{
+    name: string;
+    index: number;
+    color: string;
+  }[]>([]);
   const [palenqueChips, setPalenqueChips] = useState<
     {
       wood: number;
@@ -29,20 +35,23 @@ function App() {
       corn: 0,
     },
   ]);
-
-  const numberOnChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    const newValue = event.target.value;
-    if (/^[1-4]$/.test(newValue)) {
-      setNumberOfPlayers(Number(newValue));
-    }
-  };
+  const [palenqueWorkers, setPalenqueWorkers] = useState<(null | string)[]>([
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+  ]);
 
   async function player() {
     try {
       const returnNumber = await invoke("set_number_of_players", {
-        number: numberOfPlayers,
+        number: players.length,
       });
-      if (returnNumber !== numberOfPlayers) {
+      if (returnNumber !== players.length) {
         throw new Error("プレイ人数の設定に失敗しました");
       }
       setPalenqueChips([
@@ -93,123 +102,144 @@ function App() {
       </div>
 
       <div className="row">
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            player();
-          }}
-        >
-          プレイ人数:{" "}
-          <input
-            id="number-of-players-input"
-            type="number"
-            value={numberOfPlayers}
-            onChange={numberOnChange}
-            placeholder="プレイ人数"
-          />
-          <button id="submit-button" type="submit">
-            決定
-          </button>
-        </form>
+        <Players
+          players={players}
+          setPlayers={setPlayers}
+          onSubmit={player}
+        />
       </div>
 
       <div className="row">
         <div className="field-container">
-          <div className="palenque-space">
-            <span className="space-name">Palanque</span>
-            <span>
-              <p></p>
-              <p></p>
-              <p className="space">P0</p>
-            </span>
-            <span>
-              <p></p>
-              <p className="corn-chip-space">{palenqueChips[0].corn}</p>
-              <p className="space">P1</p>
-            </span>
-            <span>
-              <p></p>
-              <p className="corn-chip-space">{palenqueChips[0].corn}</p>
-              <p className="space">P2</p>
-            </span>
-            <span>
-              <p className="wood-chip-space">{palenqueChips[1].wood}</p>
-              <p className="corn-chip-space">{palenqueChips[1].corn}</p>
-              <p className="space">P3</p>
-            </span>
-            <span>
-              <p className="wood-chip-space">{palenqueChips[2].wood}</p>
-              <p className="corn-chip-space">{palenqueChips[2].corn}</p>
-              <p className="space">P4</p>
-            </span>
-            <span>
-              <p className="wood-chip-space">{palenqueChips[3].wood}</p>
-              <p className="corn-chip-space">{palenqueChips[3].corn}</p>
-              <p className="space">P5</p>
-            </span>
-            <span>
-              <p></p>
-              <p></p>
-              <p className="space">P6</p>
-            </span>
-            <span>
-              <p></p>
-              <p></p>
-              <p className="space">P7</p>
-            </span>
-          </div>
+          <PalenqueSpace
+            palenqueChips={palenqueChips}
+            palenqueWorkers={palenqueWorkers}
+          />
           <div className="yaxchilan-space">
-            <span className="space-name">Yaxchilan</span><span className="space-container">
-            <span className="space">P0</span>
-            <span className="space">P1</span>
-            <span className="space">P2</span>
-            <span className="space">P3</span>
-            <span className="space">P4</span>
-            <span className="space">P5</span>
-            <span className="space">P6</span>
-            <span className="space">P7</span>
+            <span className="space-name">Yaxchilan</span>
+            <span className="space-container">
+              <span className="space">
+                0<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                1<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                2<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                3<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                4<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                5<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                6<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                7<div className="worker-space"></div>
+              </span>
             </span>
           </div>
           <div className="tikal-space">
             <span className="space-name">Tikal</span>
             <span className="space-container">
-              <span className="space">P0</span>
-              <span className="space">P1</span>
-              <span className="space">P2</span>
-              <span className="space">P3</span>
-              <span className="space">P4</span>
-              <span className="space">P5</span>
-              <span className="space">P6</span>
-              <span className="space">P7</span>
+              <span className="space">
+                0<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                1<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                2<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                3<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                4<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                5<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                6<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                7<div className="worker-space"></div>
+              </span>
             </span>
           </div>
           <div className="uxmal-space">
             <span className="space-name">Uxmal</span>
             <span className="space-container">
-              <span className="space">P0</span>
-              <span className="space">P1</span>
-              <span className="space">P2</span>
-              <span className="space">P3</span>
-              <span className="space">P4</span>
-              <span className="space">P5</span>
-              <span className="space">P6</span>
-              <span className="space">P7</span>
+              <span className="space">
+                0<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                1<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                2<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                3<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                4<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                5<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                6<div className="worker-space"></div>
+              </span>
+              <span className="space">
+                7<div className="worker-space"></div>
+              </span>
             </span>
           </div>
           <div className="chichen-itza-space">
             <span className="space-name">Chichen Itza</span>
-            <span className="space">P0</span>
-            <span className="space">P1</span>
-            <span className="space">P2</span>
-            <span className="space">P3</span>
-            <span className="space">P4</span>
-            <span className="space">P5</span>
-            <span className="space">P6</span>
-            <span className="space">P7</span>
-            <span className="space">P8</span>
-            <span className="space">P9</span>
-            <span className="space">P10</span>
-            <span className="space">P11</span>
+            <span className="space">
+              0<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              1<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              2<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              3<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              4<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              5<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              6<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              7<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              8<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              9<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              10<div className="worker-space"></div>
+            </span>
+            <span className="space">
+              11<div className="worker-space"></div>
+            </span>
           </div>
         </div>
         <span className="temples">
@@ -232,6 +262,10 @@ function App() {
             templeColor="green"
           />
         </span>
+      </div>
+
+      <div className="row">
+        <span>ターンプレイヤー: {players.length > 0 ? players[0].name : ""}</span>
       </div>
     </div>
   );
