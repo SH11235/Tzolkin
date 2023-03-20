@@ -1,78 +1,8 @@
 import styled from "@emotion/styled";
-import { Card, CardContent, CardHeader, Typography } from "@mui/material";
-import {
-  FirstResources,
-  ResourceTile,
-  WorkSpace,
-} from "../types/FirstResource";
-import { GamePlayers, Player } from "../types/GamePlayer";
-
-type ResourceTileCardProps = {
-  resourceTiles: [string, number | boolean | WorkSpace | null][];
-};
-
-const StyledResourceCardContent = styled(CardContent)`
-  white-space: pre-line;
-`;
-
-const ResourceTileCard = ({ resourceTiles }: ResourceTileCardProps) => {
-  return (
-    <Card>
-      <StyledResourceCardContent>
-        {resourceTiles.map(([key, value]) => {
-          if (key === "work_space") {
-            // 例：
-            // workSpace: {
-            //   "Yaxchilan": 7
-            // }
-            return (
-              <div key={key}>
-                {`${key}: ${Object.entries(value as WorkSpace).map(
-                  ([key, value]) => `${key} ${value}`
-                )}`}
-              </div>
-            );
-          } else {
-            return <div key={key}>{`${key}${value}`}</div>;
-          }
-        })}
-      </StyledResourceCardContent>
-    </Card>
-  );
-};
-
-type PlayerCardProps = {
-  player: Player;
-  resourceTiles: ResourceTile[];
-};
-
-const StyledPlayerCard = styled(Card)`
-  width: 250px;
-  margin: 8px;
-  box-shadow: 0px 4px 16px rgba(0, 0, 0, 0.2);
-`;
-
-const PlayerCard = ({ player, resourceTiles }: PlayerCardProps) => {
-  return (
-    <StyledPlayerCard>
-      <CardHeader title={player.name} />
-      <CardContent>
-        {resourceTiles.map((tile, index) => {
-          const resources = Object.entries(tile).filter(
-            ([_, value]) => value !== null && value !== false
-          );
-          return (
-            <div key={index}>
-              <Card>
-                <ResourceTileCard resourceTiles={resources} />
-              </Card>
-            </div>
-          );
-        })}
-      </CardContent>
-    </StyledPlayerCard>
-  );
-};
+import { Card, CardContent, CardHeader } from "@mui/material";
+import { FirstResources } from "../types/FirstResource";
+import { GamePlayers } from "../types/GamePlayer";
+import { PlayerCard } from "./PlayerCard";
 
 type FirstResourceProps = {
   firstResources: FirstResources;

@@ -3,7 +3,6 @@ export type WorkSpace = {
 };
 
 export type ResourceTile = {
-  work_space: WorkSpace;
   corn: number | null;
   wood: number | null;
   stone: number | null;
@@ -18,6 +17,7 @@ export type ResourceTile = {
   resource_skill: number | null;
   construction_skill: number | null;
   temple_skill: number | null;
+  work_space: WorkSpace;
 };
 
 export type FirstResources = ResourceTile[][];
