@@ -1,50 +1,70 @@
+import { invoke } from "@tauri-apps/api";
 import React from "react";
+import { GamePlayers } from "../types/GamePlayer";
 
 interface playersProps {
-  players: {
-    name: string;
-    index: number;
-    color: string;
-  }[];
-  setPlayers: React.Dispatch<
+  setPlayers: React.Dispatch<React.SetStateAction<GamePlayers>>;
+  setPalenqueChips: React.Dispatch<
     React.SetStateAction<
       {
-        name: string;
-        index: number;
-        color: string;
+        wood: number;
+        corn: number;
       }[]
     >
   >;
-  onSubmit: (numberOfPlayers: number) => void;
 }
 
-export const Players = ({
-  players,
-  setPlayers,
-  onSubmit,
-}: playersProps) => {
-  const playerColors = ["red", "blue", "green", "yellow"];
+export const Players = ({ setPlayers, setPalenqueChips }: playersProps) => {
+  const [playersNumber, setplayersNumber] = React.useState(0);
   const numberOnChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const newValue = event.target.value;
     if (/^[1-4]$/.test(newValue)) {
       const number = parseInt(newValue);
-      setPlayers(
-        Array(number)
-          .fill(0)
-          .map((_, index) => {
-            return {
-              name: `player${index + 1}`,
-              index: index + 1,
-              color: playerColors[index],
-            };
-          })
-      );
+      setplayersNumber(number);
     }
   };
 
-  const handleSubmit = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    onSubmit(players.length);
+    try {
+      const gamePlayers: GamePlayers = await invoke("set_players", {
+        number: playersNumber,
+      });
+      setPlayers(gamePlayers);
+      setPalenqueChips([
+        {
+          wood: 0,
+          corn: playersNumber,
+        },
+        {
+          wood: playersNumber,
+          corn: playersNumber,
+        },
+        {
+          wood: playersNumber,
+          corn: playersNumber,
+        },
+        {
+          wood: playersNumber,
+          corn: playersNumber,
+        },
+      ]);
+      const input = document.getElementById(
+        "number-of-players-input"
+      ) as HTMLInputElement;
+      if (input) {
+        input.disabled = true;
+      }
+      const button = document.getElementById(
+        "submit-button"
+      ) as HTMLButtonElement;
+      if (button) {
+        button.disabled = true;
+      }
+    } catch {
+      // ユーザーに警告を出す
+      // alert("プレイ人数の設定に失敗しました");
+    }
   };
 
   return (
@@ -53,7 +73,7 @@ export const Players = ({
       <input
         id="number-of-players-input"
         type="number"
-        value={players.length}
+        value={playersNumber}
         onChange={numberOnChange}
       />
       <button id="submit-button" type="submit">

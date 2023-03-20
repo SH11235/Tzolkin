@@ -1,8 +1,10 @@
+use serde::Serialize;
+
 use crate::{game_object::player::Player, utils::constants::MAX_TECHNOLOGY_LEVEL};
 
 use super::ActionSpace;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct YaxchilanSpace(u32);
 impl ActionSpace for YaxchilanSpace {
     fn get_space(&self) -> u32 {

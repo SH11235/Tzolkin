@@ -1,35 +1,48 @@
+use serde::Serialize;
+use std::sync::Mutex;
+use tauri::State;
+
 mod game_object;
 mod utils;
 
-use game_object::{food_day::FoodDayStatus, game::Game, player::Player, resources::FieldSkulls};
-use utils::constants::FOURTH_FOOD_DAY;
-
-use crate::game_object::{
-    action_space::{palenque::PalenqueSpace, WorkerPosition},
-    player::get_color,
+use game_object::{
+    food_day::FoodDayStatus,
+    game::Game,
+    player::{Player, PlayerColor},
+    resources::FieldSkulls,
 };
 
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
-static mut NUMBER_OF_PLAYERS: u8 = 0;
+#[derive(Serialize)]
+struct AppState {
+    game_players: Mutex<Vec<Player>>,
+}
 
 #[tauri::command]
-fn set_number_of_players(number: u8) -> Result<u8, String> {
+fn set_players(number: u8, app_state: State<AppState>) -> Result<Vec<Player>, String> {
     if (number > 0) && (number < 5) {
-        unsafe {
-            NUMBER_OF_PLAYERS = number;
-        }
         println!("number of players: {}", number);
-        Ok(number)
+        let players: Vec<Player> = (1..=number)
+            .map(|i| Player::new(format!("Player {}", i), PlayerColor::from(i), i.into()))
+            .collect();
+        let mut game_players = app_state.game_players.lock().unwrap();
+        *game_players = players.clone();
+        Ok(players)
     } else {
         Err("number of players must be between 1 and 4".to_string())
     }
 }
 
 fn main() {
+    let players: Vec<Player> = Vec::new();
+    let app_state = AppState {
+        game_players: Mutex::new(players),
+    };
+
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![set_number_of_players])
+        .manage(app_state)
+        .invoke_handler(tauri::generate_handler![set_players])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

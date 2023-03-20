@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use super::{resources::{Gold, Skull, Stone, Wood}, player::resource_stock::ResourceSkullStock};
 
 pub trait Temple {
@@ -15,7 +17,7 @@ pub enum TempleName {
     Kukulkan,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Chaac(i32);
 impl Temple for Chaac {
     fn new(num: i32) -> Self {
@@ -58,7 +60,7 @@ impl Temple for Chaac {
         }
     }
 }
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Quetzalcoatl(i32);
 impl Temple for Quetzalcoatl {
     fn new(num: i32) -> Self {
@@ -103,7 +105,7 @@ impl Temple for Quetzalcoatl {
         }
     }
 }
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Kukulkan(i32);
 impl Temple for Kukulkan {
     fn new(num: i32) -> Self {

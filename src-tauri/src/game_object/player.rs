@@ -3,6 +3,8 @@ pub mod technology;
 pub mod temple_faith;
 pub mod worker;
 
+use serde::Serialize;
+
 use self::{
     resource_stock::ResourceSkullStock, technology::Technology, temple_faith::TempleFaith,
     worker::Worker,
@@ -10,7 +12,7 @@ use self::{
 use super::{action_space::WorkerPosition, temple::Temple};
 use crate::utils::constants::CORN_PER_WORKER;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum PlayerColor {
     Red,
     Blue,
@@ -25,18 +27,20 @@ impl Default for PlayerColor {
     }
 }
 
-pub fn get_color(player_number: u32) -> Result<PlayerColor, String> {
-    match player_number {
-        0 => Ok(PlayerColor::Red),
-        1 => Ok(PlayerColor::Blue),
-        2 => Ok(PlayerColor::Green),
-        3 => Ok(PlayerColor::Yellow),
-        4 => Ok(PlayerColor::Orange),
-        _ => Err("Invalid player number".to_string()),
+impl From<u8> for PlayerColor {
+    fn from(num: u8) -> Self {
+        match num {
+            0 => Self::Red,
+            1 => Self::Blue,
+            2 => Self::Green,
+            3 => Self::Yellow,
+            4 => Self::Orange,
+            _ => Self::Red,
+        }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Player {
     pub(super) name: String,
     pub(super) color: PlayerColor,

@@ -2,9 +2,11 @@
 //     chichen_itza_skull::ChichenItzaSkull, player::Player, temple::TempleName,
 // };
 
+use serde::Serialize;
+
 use super::ActionSpace;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ChichenItzaSpace(u32);
 impl ActionSpace for ChichenItzaSpace {
     fn get_space(&self) -> u32 {

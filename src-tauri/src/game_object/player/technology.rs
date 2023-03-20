@@ -1,6 +1,8 @@
+use serde::Serialize;
+
 use crate::utils::{constants::MAX_TECHNOLOGY_LEVEL, increment::Increment};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct TechnologyLevel(u32);
 impl Increment for TechnologyLevel {
     fn increment(&mut self) {
@@ -30,7 +32,7 @@ impl TechnologyLevel {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Technology {
     agriculture: TechnologyLevel,
     resource: TechnologyLevel,

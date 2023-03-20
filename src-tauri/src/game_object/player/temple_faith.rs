@@ -1,6 +1,8 @@
+use serde::Serialize;
+
 use crate::game_object::temple::{Chaac, Quetzalcoatl, Kukulkan, Temple};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct TempleFaith {
     pub chaac: Chaac,
     pub quetzalcoatl: Quetzalcoatl,

@@ -1,10 +1,12 @@
+use serde::Serialize;
+
 use crate::game_object::{
     chichen_itza_skull::ChichenItzaSkull, jungle::Jungle, player::Player, temple::TempleName,
 };
 
 use super::ActionSpace;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct UxmalSpace(u32);
 impl ActionSpace for UxmalSpace {
     fn get_space(&self) -> u32 {

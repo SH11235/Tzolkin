@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use crate::{
     game_object::{
         player::{
@@ -12,7 +14,7 @@ use crate::{
 
 use super::ActionSpace;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct TikalSpace(u32);
 pub enum ResourceOption {
     Wood,

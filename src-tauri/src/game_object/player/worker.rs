@@ -1,8 +1,10 @@
+use serde::Serialize;
+
 use crate::game_object::action_space::WorkerPosition;
 
 pub const WORKER_SET_COST: [u32; 6] = [0, 1, 2, 3, 4, 5];
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Worker {
     position: WorkerPosition,
 }

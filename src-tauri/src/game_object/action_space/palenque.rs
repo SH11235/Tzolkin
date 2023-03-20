@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use crate::{
     game_object::{jungle::Jungle, player::Player},
     utils::constants::MAX_TECHNOLOGY_LEVEL,
@@ -10,7 +12,7 @@ pub enum CornOrWood {
     Wood,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct PalenqueSpace(pub u32);
 impl ActionSpace for PalenqueSpace {
     fn get_space(&self) -> u32 {

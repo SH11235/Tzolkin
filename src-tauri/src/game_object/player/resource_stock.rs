@@ -1,6 +1,8 @@
+use serde::Serialize;
+
 use crate::game_object::resources::{Gold, Skull, Stone, Wood};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct ResourceSkullStock {
     pub woods: Wood,
     pub stones: Stone,

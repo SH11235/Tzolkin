@@ -1,3 +1,5 @@
+use serde::Serialize;
+
 use crate::utils::constants::{
     MAX_CHICHEN_ITZA_SPACES, MAX_PALENQUE_SPACES, MAX_TIKAL_SPACES, MAX_UXMAL_SPACES,
     MAX_YAXCHILAN_SPACES,
@@ -42,7 +44,7 @@ pub trait ActionSpace {
     fn next_space(&mut self);
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum WorkerPosition {
     Hand,
     Palenque(PalenqueSpace),

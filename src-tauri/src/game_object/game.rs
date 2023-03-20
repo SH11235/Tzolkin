@@ -116,8 +116,7 @@ impl Game {
 
 #[cfg(test)]
 mod tests {
-    use crate::game_object::player::get_color;
-
+    use crate::game_object::player::PlayerColor;
     use super::*;
 
     #[test]
@@ -138,7 +137,7 @@ mod tests {
         let mut field_skull = FieldSkulls::new();
         let mut food_day_status = FoodDayStatus::new();
         let mut players: Vec<Player> = (1..=number_of_players)
-            .map(|i| Player::new(format!("Player {}", i), get_color(i).unwrap(), i.into()))
+            .map(|i| Player::new(format!("Player {}", i), PlayerColor::from(i), i.into()))
             .collect();
 
         // FoodDay::Firstの境界テスト

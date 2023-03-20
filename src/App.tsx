@@ -5,13 +5,11 @@ import { Temple } from "./components/temple";
 import { ChaacBonus, QuetzalcoatlBonus, KukulkanBonus } from "./constant";
 import { Players } from "./components/players";
 import { PalenqueSpace } from "./components/PalenqueSpace";
+import { GamePlayers } from "./types/GamePlayer";
 
 function App() {
-  const [players, setPlayers] = useState<{
-    name: string;
-    index: number;
-    color: string;
-  }[]>([]);
+  const [players, setPlayers] = useState<GamePlayers>([]);
+  const [round, setRound] = useState(1);
   const [palenqueChips, setPalenqueChips] = useState<
     {
       wood: number;
@@ -46,50 +44,6 @@ function App() {
     null,
   ]);
 
-  async function player() {
-    try {
-      const returnNumber = await invoke("set_number_of_players", {
-        number: players.length,
-      });
-      if (returnNumber !== players.length) {
-        throw new Error("プレイ人数の設定に失敗しました");
-      }
-      setPalenqueChips([
-        {
-          wood: 0,
-          corn: returnNumber,
-        },
-        {
-          wood: returnNumber,
-          corn: returnNumber,
-        },
-        {
-          wood: returnNumber,
-          corn: returnNumber,
-        },
-        {
-          wood: returnNumber,
-          corn: returnNumber,
-        },
-      ]);
-      const input = document.getElementById(
-        "number-of-players-input"
-      ) as HTMLInputElement;
-      if (input) {
-        input.disabled = true;
-      }
-      const button = document.getElementById(
-        "submit-button"
-      ) as HTMLButtonElement;
-      if (button) {
-        button.disabled = true;
-      }
-    } catch {
-      // ユーザーに警告を出す
-      alert("プレイ人数の設定に失敗しました");
-    }
-  }
-
   return (
     <div className="container">
       <div className="row">
@@ -102,12 +56,10 @@ function App() {
       </div>
 
       <div className="row">
-        <Players
-          players={players}
-          setPlayers={setPlayers}
-          onSubmit={player}
-        />
+        <Players setPlayers={setPlayers} setPalenqueChips={setPalenqueChips} />
       </div>
+
+      <div className="row">ラウンド：{round}</div>
 
       <div className="row">
         <div className="field-container">
@@ -265,7 +217,9 @@ function App() {
       </div>
 
       <div className="row">
-        <span>ターンプレイヤー: {players.length > 0 ? players[0].name : ""}</span>
+        <span>
+          ターンプレイヤー: {players.length > 0 ? players[0].name : ""}
+        </span>
       </div>
     </div>
   );
