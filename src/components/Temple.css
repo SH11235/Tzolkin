@@ -3,12 +3,11 @@
 }
 
 .temple-table {
-    width: 100px;
+    width: 210px;
     border-collapse: collapse
 }
 
 .temple-cell {
-    width: 100px;
     height: 25px;
     border: 1px solid #000;
     text-align: center;
@@ -16,7 +15,18 @@
     position: relative;
 }
 
-/* style={{ backgroundColor: templeColor }} */
+.temple-cell-resource {
+    width: 50px;
+}
+
+.temple-cell-player {
+    width: 120px;
+}
+
+.temple-cell-score {
+    width: 20px;
+}
+
 .temple-brown {
     background-color: #B67A48;
 }
@@ -29,17 +39,30 @@
     background-color: #8BBF3D;
 }
 
-.circle {
-    background-color: #ffcc00;
-    /* 背景色 */
-    width: 10px;
-    height: 10px;
+.circle-Red,
+.circle-Blue,
+.circle-Green,
+.circle-Yellow {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
     border-radius: 50%;
-    /* 円形にする */
-    
-    /* 左右中央 */
-    transform: translate(-50%, -50%);
-    /* 中央に配置 */
-    z-index: 1;
-    /* 背景よりも前面に */
+    vertical-align: middle;
+    text-align: center;
+}
+
+.circle-Red {
+    background-color: red;
+}
+
+.circle-Blue {
+    background-color: blue;
+}
+
+.circle-Green {
+    background-color: green;
+}
+
+.circle-Yellow {
+    background-color: yellow;
 }

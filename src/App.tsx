@@ -197,19 +197,40 @@ function App() {
         <span className="temples">
           <Temple
             name="Chaac"
-            playerScores={[{ color: "red", index: 0 }]}
+            playerScores={
+              players.map((player) => {
+                return {
+                  color: player.color,
+                  index: player.temple_faith.chaac,
+                };
+              }) || []
+            }
             templeBonus={ChaacBonus}
             templeColor="brown"
           />
           <Temple
             name="Quetzalcoatl"
-            playerScores={[{ color: "red", index: 0 }]}
+            playerScores={
+              players.map((player) => {
+                return {
+                  color: player.color,
+                  index: player.temple_faith.quetzalcoatl,
+                };
+              }) || []
+            }
             templeBonus={QuetzalcoatlBonus}
             templeColor="yellow"
           />
           <Temple
             name="Kukulkan"
-            playerScores={[{ color: "red", index: 0 }]}
+            playerScores={
+              players.map((player) => {
+                return {
+                  color: player.color,
+                  index: player.temple_faith.kukulkan,
+                };
+              }) || []
+            }
             templeBonus={KukulkanBonus}
             templeColor="green"
           />

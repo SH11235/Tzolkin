@@ -24,8 +24,10 @@ type TempleFaith = {
   quetzalcoatl: number;
 }
 
+export type PlayerColor = "red" | "blue" | "green" | "yellow" | "orange";
+
 type Player = {
-  color: string;
+  color: PlayerColor;
   corn_tiles: number;
   corns: number;
   name: string;

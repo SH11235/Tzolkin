@@ -1,6 +1,6 @@
+import { PlayerColor } from "../types/GamePlayer";
 import "./temple.css";
 
-type PlayerColor = "red" | "blue" | "green" | "yellow" | "orange";
 export type TempleBonus = {
   resource: "stone" | "gold" | "wood" | "skull" | null;
   point: number;
@@ -26,9 +26,9 @@ export const Temple: React.FC<Props> = ({
 }) => {
   const offset = 9 - templeBonus.length;
   const array = Array(offset).fill(0);
-  const additonalRows = array.map((_, index) => {
+  const offsetRows = array.map((_, index) => {
     return (
-      <tr key={`additonalRows-${index}`}>
+      <tr key={`offsetRows-${index}`}>
         <td className="temple-cell"></td>
         <td className="temple-cell"></td>
         <td className="temple-cell"></td>
@@ -36,32 +36,43 @@ export const Temple: React.FC<Props> = ({
     );
   });
   const rows = templeBonus.map((row, rowIndex) => {
-    if (rowIndex === 0) {
-      return (
-        <tr key={rowIndex}>
-          <td className="temple-cell"></td>
-          <td className="temple-cell">
-            {/* <span className="circle"></span> */}
-          </td>
-          <td className="temple-cell">{row.point}</td>
-        </tr>
-      );
-    } else {
-      return (
-        <tr key={rowIndex}>
-          <td className="temple-cell">{row.resource}</td>
-          <td className="temple-cell"></td>
-          <td className="temple-cell">{row.point}</td>
-        </tr>
-      );
-    }
+    const playerScoreElements = playerScores.map((playerScore) => {
+      const offset = templeBonus.length - 2;
+      // chaacのとき: playerScore.index + rowIndex === 5
+      // playerScore.index === -1 → rowIndex === 6
+      // playerScore.index === 0 → rowIndex === 5
+      // playerScore.index === 1 → rowIndex === 4
+      // playerScore.index === 2 → rowIndex === 3
+      // playerScore.index === 3 → rowIndex === 2
+      // playerScore.index === 4 → rowIndex === 1
+      // quetzalcoatlのとき playerScore.index + rowIndex === 7
+      // playerScore.index === 0 → rowIndex === 7
+      // playerScore.index === 1 → rowIndex === 6
+      // playerScore.index === 2 → rowIndex === 5
+      // playerScore.index === 3 → rowIndex === 4
+      // playerScore.index === 4 → rowIndex === 3
+      // playerScore.index === 5 → rowIndex === 2
+      // playerScore.index === 6 → rowIndex === 1
+      // playerScore.index === 7 → rowIndex === 0
+      if (playerScore.index + rowIndex === offset) {
+        let classNamePlayer = playerScore.color;
+        return <span key={`${classNamePlayer}-${rowIndex}`} className={`circle-${classNamePlayer}`}></span>;
+      }
+    });
+    return (
+      <tr key={rowIndex}>
+        <td className="temple-cell temple-cell-resource">{row.resource}</td>
+        <td className="temple-cell temple-cell-player">{playerScoreElements}</td>
+        <td className="temple-cell temple-cell-score">{row.point}</td>
+      </tr>
+    );
   });
   return (
     <div className="temple-container">
       <span>{name}</span>
       <table className={`temple-table temple-${templeColor}`} border={1}>
         <tbody>
-          {additonalRows}
+          {offsetRows}
           {rows}
         </tbody>
       </table>
