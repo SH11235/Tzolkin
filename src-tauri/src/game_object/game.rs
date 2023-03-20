@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_food_day_next_generation() {
-        let number_of_players = 3;
+        let number_of_players: u32 = 3;
         let mut game = Game::new(number_of_players).unwrap();
         let mut field_skull = FieldSkulls::new();
         let mut food_day_status = FoodDayStatus::new();

@@ -27,14 +27,14 @@ impl Default for PlayerColor {
     }
 }
 
-impl From<u8> for PlayerColor {
-    fn from(num: u8) -> Self {
+impl From<u32> for PlayerColor {
+    fn from(num: u32) -> Self {
         match num {
-            0 => Self::Red,
-            1 => Self::Blue,
-            2 => Self::Green,
-            3 => Self::Yellow,
-            4 => Self::Orange,
+            1 => Self::Red,
+            2 => Self::Blue,
+            3 => Self::Green,
+            4 => Self::Yellow,
+            5 => Self::Orange,
             _ => Self::Red,
         }
     }

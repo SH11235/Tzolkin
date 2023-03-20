@@ -20,11 +20,11 @@ struct AppState {
 }
 
 #[tauri::command]
-fn set_players(number: u8, app_state: State<AppState>) -> Result<Vec<Player>, String> {
+fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, String> {
     if (number > 0) && (number < 5) {
         println!("number of players: {}", number);
         let players: Vec<Player> = (1..=number)
-            .map(|i| Player::new(format!("Player {}", i), PlayerColor::from(i), i.into()))
+            .map(|i| Player::new(format!("Player {}", i), PlayerColor::from(i), i))
             .collect();
         let mut game_players = app_state.game_players.lock().unwrap();
         *game_players = players.clone();
@@ -32,6 +32,17 @@ fn set_players(number: u8, app_state: State<AppState>) -> Result<Vec<Player>, St
     } else {
         Err("number of players must be between 1 and 4".to_string())
     }
+}
+
+#[tauri::command]
+fn get_first_resource_tiles() -> Result<Vec<String>, String> {
+    let mut game = Game::new(4).unwrap();
+    let mut field_skull = FieldSkulls::new();
+    let mut food_day_status = FoodDayStatus::new();
+    let mut players: Vec<Player> = (1..=4)
+        .map(|i| Player::new(format!("Player {}", i), PlayerColor::from(i), i.into()))
+        .collect();
+    todo!()
 }
 
 fn main() {
