@@ -6,11 +6,14 @@ mod game_object;
 mod utils;
 
 use game_object::{
+    first_resource_tiles::Tile,
     food_day::FoodDayStatus,
     game::Game,
     player::{Player, PlayerColor},
     resources::FieldSkulls,
 };
+
+use crate::game_object::first_resource_tiles::shuffle_tile_list;
 
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -35,14 +38,21 @@ fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, S
 }
 
 #[tauri::command]
-fn get_first_resource_tiles() -> Result<Vec<String>, String> {
-    let mut game = Game::new(4).unwrap();
-    let mut field_skull = FieldSkulls::new();
-    let mut food_day_status = FoodDayStatus::new();
-    let mut players: Vec<Player> = (1..=4)
-        .map(|i| Player::new(format!("Player {}", i), PlayerColor::from(i), i.into()))
-        .collect();
-    todo!()
+fn get_first_resource_tiles(app_state: State<AppState>) -> Vec<Vec<&Tile>> {
+    let players = app_state.game_players.lock().unwrap();
+    let tile_list = shuffle_tile_list();
+    // TODO ダミーworker init処理
+
+    // プレイヤー数の長さのvecでtile_listから4つずつ取り出す
+    let mut tile_list_vec: Vec<Vec<&Tile>> = Vec::new();
+    for i in 0..players.len() {
+        let mut tile_list_slice: Vec<&Tile> = Vec::new();
+        for j in 0..4 {
+            tile_list_slice.push(&tile_list[i * 4 + j]);
+        }
+        tile_list_vec.push(tile_list_slice);
+    }
+    tile_list_vec
 }
 
 fn main() {
@@ -53,7 +63,10 @@ fn main() {
 
     tauri::Builder::default()
         .manage(app_state)
-        .invoke_handler(tauri::generate_handler![set_players])
+        .invoke_handler(tauri::generate_handler![
+            set_players,
+            get_first_resource_tiles
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

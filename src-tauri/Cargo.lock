@@ -2714,6 +2714,7 @@ checksum = "497961ef93d974e23eb6f433eb5fe1b7930b659f06d12dec6fc44a8f554c0bba"
 name = "tzolkin"
 version = "0.1.0"
 dependencies = [
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tauri",
