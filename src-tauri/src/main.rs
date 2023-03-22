@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::State;
 
@@ -9,8 +9,12 @@ use game_object::{
     first_resource_tiles::Tile,
     food_day::FoodDayStatus,
     game::Game,
-    player::{Player, PlayerColor},
-    resources::FieldSkulls,
+    player::{
+        technology::{TechnologyProgressReward, TechnologyType},
+        Player, PlayerColor,
+    },
+    resources::{FieldSkulls, Resource},
+    temple::Temple,
 };
 
 use crate::game_object::first_resource_tiles::shuffle_tile_list;
@@ -27,7 +31,7 @@ fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, S
     if (number > 0) && (number < 5) {
         println!("number of players: {}", number);
         let players: Vec<Player> = (1..=number)
-            .map(|i| Player::new(format!("Player {}", i), PlayerColor::from(i), i))
+            .map(|i| Player::new(i, format!("Player {}", i), PlayerColor::from(i), i))
             .collect();
         let mut game_players = app_state.game_players.lock().unwrap();
         *game_players = players.clone();
@@ -55,6 +59,100 @@ fn get_first_resource_tiles(app_state: State<AppState>) -> Vec<Vec<&Tile>> {
     tile_list_vec
 }
 
+#[derive(Deserialize)]
+struct RewardOption {
+    point: Option<u32>,
+    faith: Option<String>,
+    resource: Option<Vec<String>>,
+    skull: Option<u32>,
+}
+
+#[tauri::command]
+fn raise_technology_level(
+    player_id: u32,
+    technology_type: String,
+    reward_option: Option<RewardOption>,
+    app_state: State<AppState>,
+) -> Result<Player, String> {
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = players.iter_mut().find(|p| p.get_id() == player_id);
+    if let Some(player) = player {
+        let reward = match technology_type.as_str() {
+            "agriculture" => player.technology.progress(TechnologyType::Agriculture),
+            "resource" => player.technology.progress(TechnologyType::Resource),
+            "construction" => player.technology.progress(TechnologyType::Construction),
+            "temple" => player.technology.progress(TechnologyType::Temple),
+            _ => return Err("technology type not found".to_string()),
+        };
+        if let Some(reward) = reward {
+            match reward_option {
+                Some(reward_option) => match reward {
+                    TechnologyProgressReward::Point(point) => {
+                        if let Some(_reward_point) = reward_option.point {
+                            player.add_points(3.0);
+                        } else {
+                            return Err("reward point is not correct".to_string());
+                        }
+                        player.add_points(point);
+                    }
+                    TechnologyProgressReward::Faith => {
+                        if let Some(reward_faith) = reward_option.faith {
+                            match reward_faith.as_str() {
+                                "Chaac" => {
+                                    player.temple_faith.chaac.raise_faith();
+                                }
+                                "Quetzalcoatl" => {
+                                    player.temple_faith.quetzalcoatl.raise_faith();
+                                }
+                                "Kukulkan" => {
+                                    player.temple_faith.kukulkan.raise_faith();
+                                }
+                                _ => return Err("reward faith is not correct".to_string()),
+                            }
+                        } else {
+                            return Err("reward faith is not selected".to_string());
+                        }
+                    }
+                    TechnologyProgressReward::Resource => {
+                        if let Some(reward_resource) = reward_option.resource {
+                            if reward_resource.len() != 2 {
+                                return Err("reward resource is not correct".to_string());
+                            }
+                            for resource in reward_resource {
+                                match resource.as_str() {
+                                    "wood" => {
+                                        player.resource.woods.add(1);
+                                    }
+                                    "stone" => {
+                                        player.resource.stones.add(1);
+                                    }
+                                    "gold" => {
+                                        player.resource.golds.add(1);
+                                    }
+                                    _ => return Err("reward resource is not correct".to_string()),
+                                }
+                            }
+                        } else {
+                            return Err("reward resources are not selected".to_string());
+                        }
+                    }
+                    TechnologyProgressReward::Skull => {
+                        if let Some(_reward_skull) = reward_option.skull {
+                            player.resource.skulls.add(1);
+                        } else {
+                            return Err("reward skull is not correct".to_string());
+                        }
+                    }
+                },
+                None => return Err("reward option is not selected".to_string()),
+            }
+        }
+        Ok(player.clone())
+    } else {
+        Err(format!("player {} not found", player_id))
+    }
+}
+
 fn main() {
     let players: Vec<Player> = Vec::new();
     let app_state = AppState {
@@ -65,7 +163,8 @@ fn main() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             set_players,
-            get_first_resource_tiles
+            get_first_resource_tiles,
+            raise_technology_level
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

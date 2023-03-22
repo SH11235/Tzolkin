@@ -1,6 +1,13 @@
 use serde::Serialize;
 
+use crate::utils::constants::{MAX_CHAAC_RANK, MAX_QUETZALCOATL_RANK, MAX_KUKULKAN_RANK};
+
 use super::{resources::{Gold, Skull, Stone, Wood}, player::resource_stock::ResourceSkullStock};
+
+// pub const MAX_CHAAC_RANK: i32 = 5;
+// pub const MAX_QUETZALCOATL_RANK: i32 = 7;
+// pub const MAX_KUKULKAN_RANK: i32 = 6;
+
 
 pub trait Temple {
     fn new(num: i32) -> Self;
@@ -27,7 +34,9 @@ impl Temple for Chaac {
         self.0
     }
     fn raise_faith(&mut self) {
-        self.0 += 1;
+        if self.0 < MAX_CHAAC_RANK {
+            self.0 += 1;
+        }
     }
     fn lower_faith(&mut self) {
         self.0 -= 1;
@@ -70,7 +79,9 @@ impl Temple for Quetzalcoatl {
         self.0
     }
     fn raise_faith(&mut self) {
-        self.0 += 1;
+        if self.0 < MAX_QUETZALCOATL_RANK {
+            self.0 += 1;
+        }
     }
     fn lower_faith(&mut self) {
         self.0 -= 1;
@@ -115,7 +126,9 @@ impl Temple for Kukulkan {
         self.0
     }
     fn raise_faith(&mut self) {
-        self.0 += 1;
+        if self.0 < MAX_KUKULKAN_RANK {
+            self.0 += 1;
+        }
     }
     fn lower_faith(&mut self) {
         self.0 -= 1;

@@ -1,5 +1,6 @@
 import styled from "@emotion/styled";
 import { Button, Card, CardContent, CardHeader } from "@mui/material";
+import { invoke } from "@tauri-apps/api";
 import { FirstResourcesState } from "../types/FirstResource";
 import { GamePlayers } from "../types/GamePlayer";
 import { PlayerCard } from "./PlayerCard";
@@ -40,7 +41,59 @@ export const FirstResourceModal = ({
   players,
   setPlayers,
 }: FirstResourceProps) => {
-  const handleConfirm = () => {};
+  const handleConfirm = () => {
+    players.forEach((player, index) => {
+      const selectedResourceTiles = firstResources[index].filter(
+        (resourceTile) => {
+          return resourceTile.selected;
+        }
+      );
+      selectedResourceTiles.forEach(async (resourceTile) => {
+        // corn: number | null;
+        // wood: number | null;
+        // stone: number | null;
+        // gold: number | null;
+        // skull: number | null;
+        // worker: number | null;
+        // chaac: number | null;
+        // quetzalcoatl: number | null;
+        // kukulkan: number | null;
+        // save_corn: boolean;
+        // agriculture_skill: number | null;
+        // resource_skill: number | null;
+        // construction_skill: number | null;
+        // temple_skill: number | null;
+        if (resourceTile.agriculture_skill) {
+          await invoke("raise_technology_level", {
+            playerId: player.id,
+            technologyType: "agriculture",
+            rewardOption: null,
+          });
+        }
+        if (resourceTile.resource_skill) {
+          await invoke("raise_technology_level", {
+            playerId: player.id,
+            technologyType: "resource",
+            rewardOption: null,
+          });
+        }
+        if (resourceTile.construction_skill) {
+          await invoke("raise_technology_level", {
+            playerId: player.id,
+            technologyType: "construction",
+            rewardOption: null,
+          });
+        }
+        if (resourceTile.temple_skill) {
+          await invoke("raise_technology_level", {
+            playerId: player.id,
+            technologyType: "temple",
+            rewardOption: null,
+          });
+        }
+      });
+    });
+  };
 
   if (firstResources.length > 0) {
     return (

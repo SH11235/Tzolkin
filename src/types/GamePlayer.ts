@@ -27,6 +27,7 @@ type TempleFaith = {
 export type PlayerColor = "red" | "blue" | "green" | "yellow" | "orange";
 
 export type Player = {
+  id: number;
   color: PlayerColor;
   corn_tiles: number;
   corns: number;

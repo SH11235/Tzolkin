@@ -42,22 +42,24 @@ impl From<u32> for PlayerColor {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Player {
+    pub(super) id: u32,
     pub(super) name: String,
     pub(super) color: PlayerColor,
     pub(super) order: u32,
     pub workers: Vec<Worker>,
-    pub(super) technology: Technology,
-    pub(super) temple_faith: TempleFaith,
+    pub technology: Technology,
+    pub temple_faith: TempleFaith,
     pub(super) corns: u32,
-    pub(super) resource: ResourceSkullStock,
+    pub resource: ResourceSkullStock,
     pub(super) corn_tiles: u32,
     pub(super) wood_tiles: u32,
     pub(super) points: f32,
 }
 
 impl Player {
-    pub fn new(name: String, color: PlayerColor, order: u32) -> Self {
+    pub fn new(id: u32, name: String, color: PlayerColor, order: u32) -> Self {
         Player {
+            id,
             name,
             color,
             order,
@@ -77,6 +79,10 @@ impl Player {
             wood_tiles: 0,
             points: 0.0,
         }
+    }
+
+    pub fn get_id(&self) -> u32 {
+        self.id
     }
 
     pub fn get_name(&self) -> &str {
@@ -173,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_calculate_food_day_corns_and_feed() {
-        let mut player = Player::new("Player 1".to_string(), PlayerColor::Red, 1);
+        let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.corns = 6;
         player.points = 0.0;
         assert_eq!(player.calculate_food_day_corns(), (6, 3));
@@ -197,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_get_resource_reward_from_temple() {
-        let mut player = Player::new("Player 1".to_string(), PlayerColor::Red, 1);
+        let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(0);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(0);
         player.temple_faith.kukulkan = Kukulkan::new(0);
@@ -207,7 +213,7 @@ mod tests {
         assert_eq!(player.resource.woods.0, 0);
         assert_eq!(player.resource.skulls.0, 0);
 
-        let mut player = Player::new("Player 1".to_string(), PlayerColor::Red, 1);
+        let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(1);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(2);
         player.temple_faith.kukulkan = Kukulkan::new(1);
@@ -217,7 +223,7 @@ mod tests {
         assert_eq!(player.resource.woods.0, 1);
         assert_eq!(player.resource.skulls.0, 0);
 
-        let mut player = Player::new("Player 1".to_string(), PlayerColor::Red, 1);
+        let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(3);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(4);
         player.temple_faith.kukulkan = Kukulkan::new(4);
@@ -231,21 +237,21 @@ mod tests {
 
     #[test]
     fn test_get_point_reward_from_temple() {
-        let mut player = Player::new("Player 1".to_string(), PlayerColor::Red, 1);
+        let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(0);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(0);
         player.temple_faith.kukulkan = Kukulkan::new(0);
         player.get_point_reward_from_temple();
         assert_eq!(player.points, 0.0);
 
-        let mut player = Player::new("Player 1".to_string(), PlayerColor::Red, 1);
+        let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(1);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(2);
         player.temple_faith.kukulkan = Kukulkan::new(1);
         player.get_point_reward_from_temple();
         assert_eq!(player.points, 5.0);
 
-        let mut player = Player::new("Player 1".to_string(), PlayerColor::Red, 1);
+        let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(3);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(4);
         player.temple_faith.kukulkan = Kukulkan::new(4);
