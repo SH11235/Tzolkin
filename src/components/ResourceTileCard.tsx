@@ -1,9 +1,9 @@
 import styled from "@emotion/styled";
 import { Card, CardContent } from "@mui/material";
-import { WorkSpace } from "../types/FirstResource";
+import { ResourceTile, WorkSpace } from "../types/FirstResource";
 
 type ResourceTileCardProps = {
-  resourceTiles: [string, number | boolean | WorkSpace | null][];
+  resourceTile: ResourceTile;
   handleSelect?: () => void;
   selected?: boolean;
 };
@@ -29,7 +29,7 @@ const StyledResourceCardContent = styled(CardContent)`
 `;
 
 export const ResourceTileCard = ({
-  resourceTiles,
+  resourceTile,
   handleSelect,
   selected,
 }: ResourceTileCardProps) => {
@@ -51,7 +51,11 @@ export const ResourceTileCard = ({
     "work_space",
   ];
 
-  const sortedResourceTiles = resourceTiles.sort(([a], [b]) => {
+  const resources = Object.entries(resourceTile).filter(
+    ([_, value]) => value !== null && value !== false
+  );
+
+  const sortedResourceTiles = resources.sort(([a], [b]) => {
     return propertyOrder.indexOf(a) - propertyOrder.indexOf(b);
   });
 

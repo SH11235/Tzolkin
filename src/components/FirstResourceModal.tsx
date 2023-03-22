@@ -1,11 +1,12 @@
 import styled from "@emotion/styled";
-import { Card, CardContent, CardHeader } from "@mui/material";
-import { FirstResources } from "../types/FirstResource";
+import { Button, Card, CardContent, CardHeader } from "@mui/material";
+import { FirstResourcesState } from "../types/FirstResource";
 import { GamePlayers } from "../types/GamePlayer";
 import { PlayerCard } from "./PlayerCard";
 
 type FirstResourceProps = {
-  firstResources: FirstResources;
+  firstResources: FirstResourcesState;
+  setFirstResources: React.Dispatch<React.SetStateAction<FirstResourcesState>>;
   players: GamePlayers;
   setPlayers: React.Dispatch<React.SetStateAction<GamePlayers>>;
 };
@@ -35,21 +36,46 @@ const StyledCardContent = styled(CardContent)`
 
 export const FirstResourceModal = ({
   firstResources,
+  setFirstResources,
   players,
+  setPlayers,
 }: FirstResourceProps) => {
+  const handleConfirm = () => {};
+
   if (firstResources.length > 0) {
     return (
       <StyledCard>
         <StyledCardHeader title="初期資源" />
         <StyledCardContent>
-          {players.map((player, index) => (
-            <PlayerCard
-              key={player.name}
-              player={player}
-              resourceTiles={firstResources[index]}
-            />
-          ))}
+          {players.map((player, index) => {
+            return (
+              <PlayerCard
+                key={player.name}
+                player={player}
+                playerIndex={index}
+                firstResource={firstResources[index]}
+                setFirstResources={setFirstResources}
+              />
+            );
+          })}
         </StyledCardContent>
+        <Button
+          disabled={
+            // 全てのプレイヤーが2枚選択したらdisabledを解除
+            firstResources.every((firstResource) => {
+              return (
+                firstResource.filter((resourceTile) => {
+                  return resourceTile.selected;
+                }).length === 2
+              );
+            })
+              ? false
+              : true
+          }
+          onClick={handleConfirm}
+        >
+          決定
+        </Button>
       </StyledCard>
     );
   } else {

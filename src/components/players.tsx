@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api";
 import React from "react";
-import { FirstResources } from "../types/FirstResource";
+import { FirstResources, FirstResourcesState } from "../types/FirstResource";
 import { GamePlayers } from "../types/GamePlayer";
 
 interface playersProps {
@@ -13,10 +13,14 @@ interface playersProps {
       }[]
     >
   >;
-  setFirstResources: React.Dispatch<React.SetStateAction<FirstResources>>;
+  setFirstResources: React.Dispatch<React.SetStateAction<FirstResourcesState>>;
 }
 
-export const Players = ({ setPlayers, setPalenqueChips, setFirstResources }: playersProps) => {
+export const Players = ({
+  setPlayers,
+  setPalenqueChips,
+  setFirstResources,
+}: playersProps) => {
   const [playersNumber, setplayersNumber] = React.useState(0);
   const numberOnChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const newValue = event.target.value;
@@ -67,10 +71,21 @@ export const Players = ({ setPlayers, setPalenqueChips, setFirstResources }: pla
       const firstResourceTiles: FirstResources = await invoke(
         "get_first_resource_tiles"
       );
-      setFirstResources(firstResourceTiles);
-    } catch {
+      const firstResourceTilesState = firstResourceTiles.map(
+        (resourceTiles) => {
+          return resourceTiles.map((resourceTile) => {
+            return {
+              ...resourceTile,
+              selected: false,
+            };
+          });
+        }
+      );
+      setFirstResources(firstResourceTilesState);
+    } catch(e) {
       // ユーザーに警告を出す
       // alert("プレイ人数の設定に失敗しました");
+      console.error(e);
     }
   };
 

@@ -20,4 +20,6 @@ export type ResourceTile = {
   work_space: WorkSpace;
 };
 
+export type ResourceTileState = ResourceTile & { selected: boolean };
 export type FirstResources = ResourceTile[][];
+export type FirstResourcesState = ResourceTileState[][];

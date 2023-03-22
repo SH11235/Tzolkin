@@ -1,17 +1,16 @@
 import { useState } from "react";
 import "./App.css";
-import { invoke } from "@tauri-apps/api/tauri";
 import { Temple } from "./components/temple";
 import { ChaacBonus, QuetzalcoatlBonus, KukulkanBonus } from "./constant";
 import { Players } from "./components/players";
 import { PalenqueSpace } from "./components/PalenqueSpace";
 import { GamePlayers } from "./types/GamePlayer";
-import { FirstResources } from "./types/FirstResource";
+import { FirstResourcesState } from "./types/FirstResource";
 import { FirstResourceModal } from "./components/FirstResourceModal";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
-  const [firstResources, setFirstResources] = useState<FirstResources>([]);
+  const [firstResources, setFirstResources] = useState<FirstResourcesState>([]);
   const [round, setRound] = useState(1);
   const [palenqueChips, setPalenqueChips] = useState<
     {
@@ -251,7 +250,12 @@ function App() {
           </span>
         </div>
       </div>
-      <FirstResourceModal firstResources={firstResources} players={players} setPlayers={setPlayers} />
+      <FirstResourceModal
+        firstResources={firstResources}
+        setFirstResources={setFirstResources}
+        players={players}
+        setPlayers={setPlayers}
+      />
     </>
   );
 }

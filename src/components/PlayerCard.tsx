@@ -1,13 +1,14 @@
 import styled from "@emotion/styled";
 import { Card, CardContent, CardHeader } from "@mui/material";
-import { useState } from "react";
-import { ResourceTile } from "../types/FirstResource";
+import { FirstResourcesState, ResourceTileState } from "../types/FirstResource";
 import { Player } from "../types/GamePlayer";
 import { ResourceTileCard } from "./ResourceTileCard";
 
 type PlayerCardProps = {
   player: Player;
-  resourceTiles: ResourceTile[];
+  playerIndex: number;
+  firstResource: ResourceTileState[];
+  setFirstResources: React.Dispatch<React.SetStateAction<FirstResourcesState>>;
 };
 
 const StyledPlayerCard = styled(Card)`
@@ -16,36 +17,43 @@ const StyledPlayerCard = styled(Card)`
   box-shadow: 0px 4px 16px rgba(0, 0, 0, 0.2);
 `;
 
-export const PlayerCard = ({ player, resourceTiles }: PlayerCardProps) => {
-  const [selectedCards, setSelectedCards] = useState<number[]>([]);
+export const PlayerCard = ({
+  player,
+  playerIndex,
+  firstResource,
+  setFirstResources,
+}: PlayerCardProps) => {
   const handleClickCard = (index: number) => {
-    if (selectedCards.includes(index)) {
-      setSelectedCards(selectedCards.filter((i) => i !== index));
-    } else if (selectedCards.length < 2) {
-      setSelectedCards([...selectedCards, index]);
-      // TODO selectedCardsの全ての要素が2の時にボタンを活性化させる
-    }
+    const newResourceTilesStates = [...firstResource];
+    newResourceTilesStates[index].selected =
+      !newResourceTilesStates[index].selected;
+    setFirstResources((prevState) => {
+      const newState = [...prevState];
+      newState[playerIndex] = newResourceTilesStates;
+      return newState;
+    });
   };
 
-  return (
-    <StyledPlayerCard>
-      <CardHeader title={player.name} />
-      <CardContent>
-        {resourceTiles.map((tile, index) => {
-          const resources = Object.entries(tile).filter(
-            ([_, value]) => value !== null && value !== false
-          );
-          return (
-            <div key={index}>
-              <ResourceTileCard
-                resourceTiles={resources}
-                selected={selectedCards.includes(index)}
-                handleSelect={() => handleClickCard(index)}
-              />
-            </div>
-          );
-        })}
-      </CardContent>
-    </StyledPlayerCard>
-  );
+  if (firstResource && firstResource.length > 0) {
+    return (
+      <StyledPlayerCard>
+        <CardHeader title={player.name} />
+        <CardContent>
+          {firstResource.map((tile, index) => {
+            return (
+              <div key={index}>
+                <ResourceTileCard
+                  resourceTile={tile}
+                  selected={tile.selected}
+                  handleSelect={() => handleClickCard(index)}
+                />
+              </div>
+            );
+          })}
+        </CardContent>
+      </StyledPlayerCard>
+    );
+  } else {
+    return null;
+  }
 };
