@@ -49,7 +49,7 @@ pub struct Player {
     pub workers: Vec<Worker>,
     pub technology: Technology,
     pub temple_faith: TempleFaith,
-    pub(super) corns: u32,
+    pub corns: u32,
     pub resource: ResourceSkullStock,
     pub(super) corn_tiles: u32,
     pub(super) wood_tiles: u32,

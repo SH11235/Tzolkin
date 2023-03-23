@@ -67,7 +67,7 @@ export const ResourceTileCard = ({
     <StyledResourceCard onClick={handleSelect} selected={selected}>
       <StyledResourceCardContent>
         {sortedResourceTiles.map(([key, value]) => {
-          if (key === "work_space") {
+          if (key === "work_space" || key === "selected") {
             return null;
           } else {
             return <div key={key}>{`${key}${value}`}</div>;

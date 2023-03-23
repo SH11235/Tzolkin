@@ -27,6 +27,12 @@ struct AppState {
 }
 
 #[tauri::command]
+fn get_players(app_state: State<AppState>) -> Vec<Player> {
+    let players = app_state.game_players.lock().unwrap();
+    players.clone()
+}
+
+#[tauri::command]
 fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, String> {
     if (number > 0) && (number < 5) {
         println!("number of players: {}", number);
@@ -57,6 +63,40 @@ fn get_first_resource_tiles(app_state: State<AppState>) -> Vec<Vec<&Tile>> {
         tile_list_vec.push(tile_list_slice);
     }
     tile_list_vec
+}
+
+#[tauri::command]
+fn add_resource(
+    player_id: u32,
+    resource_type: String,
+    amount: u32,
+    app_state: State<AppState>,
+) -> Result<Player, String> {
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = players.iter_mut().find(|p| p.get_id() == player_id);
+    if let Some(player) = player {
+        match resource_type.as_str() {
+            "corn" => {
+                player.corns += amount;
+            }
+            "wood" => {
+                player.resource.woods.add(amount);
+            }
+            "stone" => {
+                player.resource.stones.add(amount);
+            }
+            "gold" => {
+                player.resource.golds.add(amount);
+            }
+            "skull" => {
+                player.resource.skulls.add(amount);
+            }
+            _ => return Err("resource type not found".to_string()),
+        }
+        Ok(player.clone())
+    } else {
+        Err(format!("player {} not found", player_id))
+    }
 }
 
 #[derive(Deserialize)]
@@ -162,8 +202,10 @@ fn main() {
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
+            get_players,
             set_players,
             get_first_resource_tiles,
+            add_resource,
             raise_technology_level
         ])
         .run(tauri::generate_context!())

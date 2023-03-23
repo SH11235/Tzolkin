@@ -49,11 +49,41 @@ export const FirstResourceModal = ({
         }
       );
       selectedResourceTiles.forEach(async (resourceTile) => {
-        // corn: number | null;
-        // wood: number | null;
-        // stone: number | null;
-        // gold: number | null;
-        // skull: number | null;
+        if (resourceTile.corn) {
+          await invoke("add_resource", {
+            playerId: player.id,
+            resourceType: "corn",
+            amount: resourceTile.corn,
+          });
+        }
+        if (resourceTile.wood) {
+          await invoke("add_resource", {
+            playerId: player.id,
+            resourceType: "wood",
+            amount: resourceTile.wood,
+          });
+        }
+        if (resourceTile.stone) {
+          await invoke("add_resource", {
+            playerId: player.id,
+            resourceType: "stone",
+            amount: resourceTile.stone,
+          });
+        }
+        if (resourceTile.gold) {
+          await invoke("add_resource", {
+            playerId: player.id,
+            resourceType: "gold",
+            amount: resourceTile.gold,
+          });
+        }
+        if (resourceTile.skull) {
+          await invoke("add_resource", {
+            playerId: player.id,
+            resourceType: "skull",
+            amount: resourceTile.skull,
+          });
+        }
         // worker: number | null;
         // chaac: number | null;
         // quetzalcoatl: number | null;
@@ -91,6 +121,8 @@ export const FirstResourceModal = ({
             rewardOption: null,
           });
         }
+        const players_state: GamePlayers = await invoke("get_players");
+        console.log(players_state);
       });
     });
   };
