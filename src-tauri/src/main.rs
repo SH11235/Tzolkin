@@ -51,9 +51,14 @@ fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, S
 
 #[tauri::command]
 fn add_worker(player_id: u32, app_state: State<AppState>) -> Result<Player, String> {
-    let mut player = get_player(player_id, app_state.clone())?;
-    player.add_worker();
-    Ok(player.clone())
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = players.iter_mut().find(|p| p.get_id() == player_id);
+    if let Some(player) = player {
+        player.add_worker();
+        Ok(player.clone())
+    } else {
+        Err(format!("player {} not found", player_id))
+    }
 }
 
 #[tauri::command]
@@ -81,28 +86,33 @@ fn add_resource(
     amount: u32,
     app_state: State<AppState>,
 ) -> Result<Player, String> {
-    let mut player = get_player(player_id, app_state.clone())?;
-    match resource_type.as_str() {
-        "corn" => {
-            player.corns += amount;
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = players.iter_mut().find(|p| p.get_id() == player_id);
+    if let Some(player) = player {
+        match resource_type.as_str() {
+            "corn" => {
+                player.corns += amount;
+            }
+            "wood" => {
+                player.resource.woods.add(amount);
+            }
+            "stone" => {
+                player.resource.stones.add(amount);
+            }
+            "gold" => {
+                player.resource.golds.add(amount);
+            }
+            "skull" => {
+                let mut field_skulls = app_state.field_skulls.lock().unwrap();
+                field_skulls.decrease_skulls(amount);
+                player.resource.skulls.add(amount);
+            }
+            _ => return Err("resource type not found".to_string()),
         }
-        "wood" => {
-            player.resource.woods.add(amount);
-        }
-        "stone" => {
-            player.resource.stones.add(amount);
-        }
-        "gold" => {
-            player.resource.golds.add(amount);
-        }
-        "skull" => {
-            let mut field_skulls = app_state.field_skulls.lock().unwrap();
-            field_skulls.decrease_skulls(amount);
-            player.resource.skulls.add(amount);
-        }
-        _ => return Err("resource type not found".to_string()),
+        Ok(player.clone())
+    } else {
+        Err(format!("player {} not found", player_id))
     }
-    Ok(player.clone())
 }
 
 #[tauri::command]
@@ -129,78 +139,83 @@ fn raise_technology_level(
     reward_option: Option<RewardOption>,
     app_state: State<AppState>,
 ) -> Result<Player, String> {
-    let mut player = get_player(player_id, app_state.clone())?;
-    let reward = match technology_type.as_str() {
-        "agriculture" => player.technology.progress(TechnologyType::Agriculture),
-        "resource" => player.technology.progress(TechnologyType::Resource),
-        "construction" => player.technology.progress(TechnologyType::Construction),
-        "temple" => player.technology.progress(TechnologyType::Temple),
-        _ => return Err("technology type not found".to_string()),
-    };
-    if let Some(reward) = reward {
-        match reward_option {
-            Some(reward_option) => match reward {
-                TechnologyProgressReward::Point(point) => {
-                    if let Some(_reward_point) = reward_option.point {
-                        player.add_points(3.0);
-                    } else {
-                        return Err("reward point is not correct".to_string());
-                    }
-                    player.add_points(point);
-                }
-                TechnologyProgressReward::Faith => {
-                    if let Some(reward_faith) = reward_option.faith {
-                        match reward_faith.as_str() {
-                            CHAAC => {
-                                player.temple_faith.chaac.raise_faith();
-                            }
-                            QUETZALCOATL => {
-                                player.temple_faith.quetzalcoatl.raise_faith();
-                            }
-                            KUKULKAN => {
-                                player.temple_faith.kukulkan.raise_faith();
-                            }
-                            _ => return Err("reward faith is not correct".to_string()),
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = players.iter_mut().find(|p| p.get_id() == player_id);
+    if let Some(player) = player {
+        let reward = match technology_type.as_str() {
+            "agriculture" => player.technology.progress(TechnologyType::Agriculture),
+            "resource" => player.technology.progress(TechnologyType::Resource),
+            "construction" => player.technology.progress(TechnologyType::Construction),
+            "temple" => player.technology.progress(TechnologyType::Temple),
+            _ => return Err("technology type not found".to_string()),
+        };
+        if let Some(reward) = reward {
+            match reward_option {
+                Some(reward_option) => match reward {
+                    TechnologyProgressReward::Point(point) => {
+                        if let Some(_reward_point) = reward_option.point {
+                            player.add_points(3.0);
+                        } else {
+                            return Err("reward point is not correct".to_string());
                         }
-                    } else {
-                        return Err("reward faith is not selected".to_string());
+                        player.add_points(point);
                     }
-                }
-                TechnologyProgressReward::Resource => {
-                    if let Some(reward_resource) = reward_option.resource {
-                        if reward_resource.len() != 2 {
-                            return Err("reward resource is not correct".to_string());
-                        }
-                        for resource in reward_resource {
-                            match resource.as_str() {
-                                "wood" => {
-                                    player.resource.woods.add(1);
+                    TechnologyProgressReward::Faith => {
+                        if let Some(reward_faith) = reward_option.faith {
+                            match reward_faith.as_str() {
+                                CHAAC => {
+                                    player.temple_faith.chaac.raise_faith();
                                 }
-                                "stone" => {
-                                    player.resource.stones.add(1);
+                                QUETZALCOATL => {
+                                    player.temple_faith.quetzalcoatl.raise_faith();
                                 }
-                                "gold" => {
-                                    player.resource.golds.add(1);
+                                KUKULKAN => {
+                                    player.temple_faith.kukulkan.raise_faith();
                                 }
-                                _ => return Err("reward resource is not correct".to_string()),
+                                _ => return Err("reward faith is not correct".to_string()),
                             }
+                        } else {
+                            return Err("reward faith is not selected".to_string());
                         }
-                    } else {
-                        return Err("reward resources are not selected".to_string());
                     }
-                }
-                TechnologyProgressReward::Skull => {
-                    if let Some(_reward_skull) = reward_option.skull {
-                        player.resource.skulls.add(1);
-                    } else {
-                        return Err("reward skull is not correct".to_string());
+                    TechnologyProgressReward::Resource => {
+                        if let Some(reward_resource) = reward_option.resource {
+                            if reward_resource.len() != 2 {
+                                return Err("reward resource is not correct".to_string());
+                            }
+                            for resource in reward_resource {
+                                match resource.as_str() {
+                                    "wood" => {
+                                        player.resource.woods.add(1);
+                                    }
+                                    "stone" => {
+                                        player.resource.stones.add(1);
+                                    }
+                                    "gold" => {
+                                        player.resource.golds.add(1);
+                                    }
+                                    _ => return Err("reward resource is not correct".to_string()),
+                                }
+                            }
+                        } else {
+                            return Err("reward resources are not selected".to_string());
+                        }
                     }
-                }
-            },
-            None => return Err("reward option is not selected".to_string()),
+                    TechnologyProgressReward::Skull => {
+                        if let Some(_reward_skull) = reward_option.skull {
+                            player.resource.skulls.add(1);
+                        } else {
+                            return Err("reward skull is not correct".to_string());
+                        }
+                    }
+                },
+                None => return Err("reward option is not selected".to_string()),
+            }
         }
+        Ok(player.clone())
+    } else {
+        Err(format!("player {} not found", player_id))
     }
-    Ok(player.clone())
 }
 
 #[tauri::command]
@@ -210,33 +225,28 @@ fn raise_temple_faith(
     amount: u32,
     app_state: State<AppState>,
 ) -> Result<Player, String> {
-    let mut player = get_player(player_id, app_state.clone())?;
-    match temple_type.as_str() {
-        CHAAC => {
-            for _ in 0..amount {
-                player.raise_chaac_faith();
-            }
-        }
-        QUETZALCOATL => {
-            for _ in 0..amount {
-                player.raise_quetzalcoatl_faith();
-            }
-        }
-        KUKULKAN => {
-            for _ in 0..amount {
-                player.raise_kukulkan_faith();
-            }
-        }
-        _ => return Err("temple type not found".to_string()),
-    }
-    println!("player: {:?}", player);
-    Ok(player.clone())
-}
-
-fn get_player(player_id: u32, app_state: State<AppState>) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
     let player = players.iter_mut().find(|p| p.get_id() == player_id);
     if let Some(player) = player {
+        match temple_type.as_str() {
+            CHAAC => {
+                for _ in 0..amount {
+                    player.raise_chaac_faith();
+                }
+            }
+            QUETZALCOATL => {
+                for _ in 0..amount {
+                    player.raise_quetzalcoatl_faith();
+                }
+            }
+            KUKULKAN => {
+                for _ in 0..amount {
+                    player.raise_kukulkan_faith();
+                }
+            }
+            _ => return Err("temple type not found".to_string()),
+        }
+        println!("player: {:?}", player);
         Ok(player.clone())
     } else {
         Err(format!("player {} not found", player_id))
