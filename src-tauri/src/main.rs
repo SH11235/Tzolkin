@@ -236,6 +236,28 @@ fn raise_temple_faith(
     Ok(player.clone())
 }
 
+#[tauri::command]
+fn save_corn(
+    player_id: u32,
+    save_type: String,
+    app_state: State<AppState>,
+) -> Result<Player, String> {
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = find_player_by_id(player_id, &mut players)?;
+    match save_type.as_str() {
+        "single" => {
+            player.corn_save.single += 1;
+        }
+        "triple" => {
+            player.corn_save.triple += 1;
+        }
+        "all" => {
+            player.corn_save.all += 1;
+        }
+        _ => return Err("save type not found".to_string()),
+    }
+    Ok(player.clone())
+}
 
 fn find_player_by_id<'a>(
     player_id: u32,
@@ -264,7 +286,8 @@ fn main() {
             add_resource,
             get_field_skulls,
             raise_technology_level,
-            raise_temple_faith
+            raise_temple_faith,
+            save_corn,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

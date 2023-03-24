@@ -117,11 +117,12 @@ export const FirstResourceModal = ({
                 amount: resourceTile.kukulkan,
               });
             }
-            // save_corn: boolean;
-            // agriculture_skill: number | null;
-            // resource_skill: number | null;
-            // construction_skill: number | null;
-            // temple_skill: number | null;
+            if (resourceTile.save_corn) {
+              await invoke("save_corn", {
+                playerId: player.id,
+                saveType: "single",
+              });
+            }
             if (resourceTile.agriculture_skill) {
               await invoke("raise_technology_level", {
                 playerId: player.id,
@@ -155,6 +156,7 @@ export const FirstResourceModal = ({
       })
     );
     const players_state: GamePlayers = await invoke("get_players");
+    console.log(players_state);
     setPlayers(players_state);
     const fieldSkulls: number = await invoke("get_field_skulls");
     setFieldSkulls(fieldSkulls);

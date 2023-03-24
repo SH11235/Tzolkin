@@ -43,12 +43,20 @@ impl From<u32> for PlayerColor {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+pub struct CornSave {
+    pub single: u32,
+    pub triple: u32,
+    pub all: u32,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Player {
     pub(super) id: u32,
     pub(super) name: String,
     pub(super) color: PlayerColor,
     pub(super) order: u32,
     pub accelerating_ability: bool,
+    pub corn_save: CornSave,
     pub workers: Vec<Worker>,
     pub technology: Technology,
     pub temple_faith: TempleFaith,
@@ -67,6 +75,7 @@ impl Player {
             color,
             order,
             accelerating_ability: true,
+            corn_save: CornSave::default(),
             workers: vec![
                 Worker::new(),
                 Worker::new(),
@@ -160,14 +169,15 @@ impl Player {
     // 必要なコーンと養えたworkerの数を返す
     pub fn calculate_food_day_corns(&self) -> (u32, u32) {
         // worker1人につき2コーン必要
-        let need_corns = self.get_active_workers() * CORN_PER_WORKER;
+        let corn_per_worker = CORN_PER_WORKER - self.corn_save.all;
+        let corn_save_number = self.corn_save.single + self.corn_save.triple * 3;
+        let need_corns = (self.get_active_workers() - corn_save_number) * corn_per_worker;
         if self.corns >= need_corns {
             (need_corns, self.get_active_workers())
         } else {
             // 足りない場合は、養えるだけ養う
-            // cornsが3の場合、worker1人分しか養えず、1コーンが余る
-            let can_feed_workers = self.corns / CORN_PER_WORKER;
-            (can_feed_workers * CORN_PER_WORKER, can_feed_workers)
+            let can_feed_workers = self.corns / corn_per_worker;
+            (can_feed_workers * corn_per_worker, can_feed_workers)
         }
     }
 
@@ -231,6 +241,62 @@ mod tests {
         player.feed();
         assert_eq!(player.get_corns(), 0);
         assert_eq!(player.get_points(), -9.0);
+
+        // 以下でcorn節約効果の確認
+
+        player.corns = 6;
+        player.points = 0.0;
+        player.corn_save = CornSave {
+            single: 1,
+            triple: 0,
+            all: 0,
+        };
+        assert_eq!(player.calculate_food_day_corns(), (4, 3));
+
+        player.corns = 6;
+        player.points = 0.0;
+        player.corn_save = CornSave {
+            single: 3,
+            triple: 0,
+            all: 0,
+        };
+        assert_eq!(player.calculate_food_day_corns(), (0, 3));
+
+        player.corns = 6;
+        player.points = 0.0;
+        player.corn_save = CornSave {
+            single: 0,
+            triple: 1,
+            all: 0,
+        };
+        assert_eq!(player.calculate_food_day_corns(), (0, 3));
+
+        player.corns = 6;
+        player.points = 0.0;
+        player.corn_save = CornSave {
+            single: 0,
+            triple: 0,
+            all: 1,
+        };
+        assert_eq!(player.calculate_food_day_corns(), (3, 3));
+
+        player.corns = 6;
+        player.points = 0.0;
+        player.corn_save = CornSave {
+            single: 1,
+            triple: 0,
+            all: 1,
+        };
+        assert_eq!(player.calculate_food_day_corns(), (2, 3));
+
+        player.corns = 6;
+        player.points = 0.0;
+        player.corn_save = CornSave {
+            single: 0,
+            triple: 0,
+            all: 2,
+        };
+        assert_eq!(player.calculate_food_day_corns(), (0, 3));
     }
 
     #[test]
