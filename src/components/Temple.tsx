@@ -15,6 +15,7 @@ type Props = {
     index: number;
   }[];
   templeBonus: TempleBonus;
+  templePoints: number[];
   templeColor: TempleColor;
 };
 
@@ -22,6 +23,7 @@ export const Temple: React.FC<Props> = ({
   name,
   playerScores,
   templeBonus,
+  templePoints,
   templeColor,
 }) => {
   const offset = 9 - templeBonus.length;
@@ -56,13 +58,20 @@ export const Temple: React.FC<Props> = ({
       // playerScore.index === 7 → rowIndex === 0
       if (playerScore.index + rowIndex === offset) {
         let classNamePlayer = playerScore.color;
-        return <span key={`${classNamePlayer}-${rowIndex}`} className={`circle-${classNamePlayer}`}></span>;
+        return (
+          <span
+            key={`${classNamePlayer}-${rowIndex}`}
+            className={`circle-${classNamePlayer}`}
+          ></span>
+        );
       }
     });
     return (
       <tr key={rowIndex}>
         <td className="temple-cell temple-cell-resource">{row.resource}</td>
-        <td className="temple-cell temple-cell-player">{playerScoreElements}</td>
+        <td className="temple-cell temple-cell-player">
+          {playerScoreElements}
+        </td>
         <td className="temple-cell temple-cell-score">{row.point}</td>
       </tr>
     );
@@ -70,6 +79,8 @@ export const Temple: React.FC<Props> = ({
   return (
     <div className="temple-container">
       <span>{name}</span>
+      <span className="temple-points">{templePoints[0]}</span>
+      <span className="temple-points">{templePoints[1]}</span>
       <table className={`temple-table temple-${templeColor}`} border={1}>
         <tbody>
           {offsetRows}

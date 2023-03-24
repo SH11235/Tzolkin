@@ -66,3 +66,9 @@
 .circle-Yellow {
     background-color: yellow;
 }
+
+.temple-points {
+    margin-left: 5px;
+    padding: 2px;
+    border: #000 solid 1px;
+}

@@ -1,7 +1,17 @@
 import { useState } from "react";
 import "./App.css";
 import { Temple } from "./components/Temple";
-import { ChaacBonus, QuetzalcoatlBonus, KukulkanBonus } from "./constant";
+import {
+  ChaacBonus,
+  QuetzalcoatlBonus,
+  KukulkanBonus,
+  CHAAC,
+  ChaacTopBonusPoints,
+  QuetzalcoatlTopBonusPoints,
+  KukulkanTopBonusPoints,
+  QUETZALCOATL,
+  KUKULKAN,
+} from "./constant";
 import { Players } from "./components/Players";
 import { PalenqueSpace } from "./components/PalenqueSpace";
 import { GamePlayers } from "./types/GamePlayer";
@@ -208,7 +218,7 @@ function App() {
           </div>
           <span className="temples">
             <Temple
-              name="Chaac"
+              name={`${CHAAC}`}
               playerScores={
                 players.map((player) => {
                   return {
@@ -218,10 +228,11 @@ function App() {
                 }) || []
               }
               templeBonus={ChaacBonus}
+              templePoints={ChaacTopBonusPoints}
               templeColor="brown"
             />
             <Temple
-              name="Quetzalcoatl"
+              name={QUETZALCOATL}
               playerScores={
                 players.map((player) => {
                   return {
@@ -231,10 +242,11 @@ function App() {
                 }) || []
               }
               templeBonus={QuetzalcoatlBonus}
+              templePoints={QuetzalcoatlTopBonusPoints}
               templeColor="yellow"
             />
             <Temple
-              name="Kukulkan"
+              name={KUKULKAN}
               playerScores={
                 players.map((player) => {
                   return {
@@ -244,6 +256,7 @@ function App() {
                 }) || []
               }
               templeBonus={KukulkanBonus}
+              templePoints={KukulkanTopBonusPoints}
               templeColor="green"
             />
           </span>
@@ -258,7 +271,6 @@ function App() {
         <div className="row">
           <TechnologyLevel players={players} />
         </div>
-
       </div>
       <FirstResourceModal
         firstResources={firstResources}

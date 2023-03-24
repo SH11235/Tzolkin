@@ -4,6 +4,9 @@ export const AGRICULTURE = "agriculture";
 export const RESOURCE = "resource";
 export const CONSTRUCTION = "construction";
 export const TEMPLE = "temple";
+export const CHAAC = "Chaac";
+export const QUETZALCOATL = "Quetzalcoatl";
+export const KUKULKAN = "Kukulkan";
 
 export const ChaacBonus: TempleBonus = [
   {
@@ -35,6 +38,8 @@ export const ChaacBonus: TempleBonus = [
     point: -1,
   },
 ];
+
+export const ChaacTopBonusPoints = [6, 2];
 
 export const QuetzalcoatlBonus: TempleBonus = [
   {
@@ -75,6 +80,8 @@ export const QuetzalcoatlBonus: TempleBonus = [
   },
 ];
 
+export const QuetzalcoatlTopBonusPoints = [2, 6];
+
 export const KukulkanBonus: TempleBonus = [
   {
     resource: null,
@@ -109,3 +116,5 @@ export const KukulkanBonus: TempleBonus = [
     point: -3,
   },
 ];
+
+export const KukulkanTopBonusPoints = [4, 4];
