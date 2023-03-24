@@ -81,7 +81,8 @@ impl Skull {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
+
 pub struct FieldSkulls(u32);
 impl FieldSkulls {
     pub fn new() -> Self {

@@ -24,6 +24,7 @@ use crate::game_object::first_resource_tiles::shuffle_tile_list;
 #[derive(Serialize)]
 struct AppState {
     game_players: Mutex<Vec<Player>>,
+    field_skulls: Mutex<FieldSkulls>,
 }
 
 #[tauri::command]
@@ -89,6 +90,8 @@ fn add_resource(
                 player.resource.golds.add(amount);
             }
             "skull" => {
+                let mut field_skulls = app_state.field_skulls.lock().unwrap();
+                field_skulls.decrease_skulls(amount);
                 player.resource.skulls.add(amount);
             }
             _ => return Err("resource type not found".to_string()),
@@ -97,6 +100,15 @@ fn add_resource(
     } else {
         Err(format!("player {} not found", player_id))
     }
+}
+
+#[tauri::command]
+fn get_field_skulls(app_state: State<AppState>) -> u32 {
+    app_state
+        .field_skulls
+        .lock()
+        .unwrap()
+        .get_remaining_skulls()
 }
 
 #[derive(Deserialize)]
@@ -197,6 +209,7 @@ fn main() {
     let players: Vec<Player> = Vec::new();
     let app_state = AppState {
         game_players: Mutex::new(players),
+        field_skulls: Mutex::new(FieldSkulls::new()),
     };
 
     tauri::Builder::default()
@@ -206,6 +219,7 @@ fn main() {
             set_players,
             get_first_resource_tiles,
             add_resource,
+            get_field_skulls,
             raise_technology_level
         ])
         .run(tauri::generate_context!())

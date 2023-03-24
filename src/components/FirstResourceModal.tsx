@@ -1,6 +1,7 @@
 import styled from "@emotion/styled";
 import { Button, Card, CardContent, CardHeader } from "@mui/material";
 import { invoke } from "@tauri-apps/api";
+import { useState } from "react";
 import { FirstResourcesState } from "../types/FirstResource";
 import { GamePlayers } from "../types/GamePlayer";
 import { PlayerCard } from "./PlayerCard";
@@ -10,6 +11,7 @@ type FirstResourceProps = {
   setFirstResources: React.Dispatch<React.SetStateAction<FirstResourcesState>>;
   players: GamePlayers;
   setPlayers: React.Dispatch<React.SetStateAction<GamePlayers>>;
+  setFieldSkulls: React.Dispatch<React.SetStateAction<number>>;
 };
 
 const StyledCard = styled(Card)`
@@ -40,8 +42,10 @@ export const FirstResourceModal = ({
   setFirstResources,
   players,
   setPlayers,
+  setFieldSkulls,
 }: FirstResourceProps) => {
-  const handleConfirm = () => {
+  const [done, setDone] = useState(false);
+  const handleConfirm = async () => {
     players.forEach((player, index) => {
       const selectedResourceTiles = firstResources[index].filter(
         (resourceTile) => {
@@ -84,7 +88,11 @@ export const FirstResourceModal = ({
             amount: resourceTile.skull,
           });
         }
-        // worker: number | null;
+        if (resourceTile.worker) {
+          await invoke("add_worker", {
+            playerId: player.id,
+          });
+        }
         // chaac: number | null;
         // quetzalcoatl: number | null;
         // kukulkan: number | null;
@@ -125,9 +133,12 @@ export const FirstResourceModal = ({
         console.log(players_state);
       });
     });
+    const fieldSkulls: number = await invoke("get_field_skulls");
+    setFieldSkulls(fieldSkulls);
+    setDone(true);
   };
 
-  if (firstResources.length > 0) {
+  if (firstResources.length > 0 && !done) {
     return (
       <StyledCard>
         <StyledCardHeader title="初期資源" />

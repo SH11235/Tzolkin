@@ -10,6 +10,7 @@ import { FirstResourceModal } from "./components/FirstResourceModal";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
+  const [fieldSkulls, setFieldSkulls] = useState(13);
   const [firstResources, setFirstResources] = useState<FirstResourcesState>([]);
   const [round, setRound] = useState(1);
   const [palenqueChips, setPalenqueChips] = useState<
@@ -66,7 +67,10 @@ function App() {
           />
         </div>
 
-        <div className="row">ラウンド：{round}</div>
+        <div className="row">
+          <span className="game-status">ラウンド：{round}</span>
+          <span className="game-status">スカル：{fieldSkulls}</span>
+        </div>
 
         <div className="row">
           <div className="field-container">
@@ -255,6 +259,7 @@ function App() {
         setFirstResources={setFirstResources}
         players={players}
         setPlayers={setPlayers}
+        setFieldSkulls={setFieldSkulls}
       />
     </>
   );
