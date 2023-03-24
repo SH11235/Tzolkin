@@ -2,6 +2,7 @@ import styled from "@emotion/styled";
 import { Button, Card, CardContent, CardHeader } from "@mui/material";
 import { invoke } from "@tauri-apps/api";
 import { useState } from "react";
+import { CHAAC, KUKULKAN, QUETZALCOATL } from "../constant";
 import { FirstResourcesState } from "../types/FirstResource";
 import { GamePlayers } from "../types/GamePlayer";
 import { PlayerCard } from "./PlayerCard";
@@ -46,91 +47,113 @@ export const FirstResourceModal = ({
 }: FirstResourceProps) => {
   const [done, setDone] = useState(false);
   const handleConfirm = async () => {
-    players.forEach((player, index) => {
-      const selectedResourceTiles = firstResources[index].filter(
-        (resourceTile) => {
-          return resourceTile.selected;
-        }
-      );
-      selectedResourceTiles.forEach(async (resourceTile) => {
-        if (resourceTile.corn) {
-          await invoke("add_resource", {
-            playerId: player.id,
-            resourceType: "corn",
-            amount: resourceTile.corn,
-          });
-        }
-        if (resourceTile.wood) {
-          await invoke("add_resource", {
-            playerId: player.id,
-            resourceType: "wood",
-            amount: resourceTile.wood,
-          });
-        }
-        if (resourceTile.stone) {
-          await invoke("add_resource", {
-            playerId: player.id,
-            resourceType: "stone",
-            amount: resourceTile.stone,
-          });
-        }
-        if (resourceTile.gold) {
-          await invoke("add_resource", {
-            playerId: player.id,
-            resourceType: "gold",
-            amount: resourceTile.gold,
-          });
-        }
-        if (resourceTile.skull) {
-          await invoke("add_resource", {
-            playerId: player.id,
-            resourceType: "skull",
-            amount: resourceTile.skull,
-          });
-        }
-        if (resourceTile.worker) {
-          await invoke("add_worker", {
-            playerId: player.id,
-          });
-        }
-        // chaac: number | null;
-        // quetzalcoatl: number | null;
-        // kukulkan: number | null;
-        // save_corn: boolean;
-        // agriculture_skill: number | null;
-        // resource_skill: number | null;
-        // construction_skill: number | null;
-        // temple_skill: number | null;
-        if (resourceTile.agriculture_skill) {
-          await invoke("raise_technology_level", {
-            playerId: player.id,
-            technologyType: "agriculture",
-            rewardOption: null,
-          });
-        }
-        if (resourceTile.resource_skill) {
-          await invoke("raise_technology_level", {
-            playerId: player.id,
-            technologyType: "resource",
-            rewardOption: null,
-          });
-        }
-        if (resourceTile.construction_skill) {
-          await invoke("raise_technology_level", {
-            playerId: player.id,
-            technologyType: "construction",
-            rewardOption: null,
-          });
-        }
-        if (resourceTile.temple_skill) {
-          await invoke("raise_technology_level", {
-            playerId: player.id,
-            technologyType: "temple",
-            rewardOption: null,
-          });
-        }
-      });
-    });
+    await Promise.all(
+      players.map(async (player, index) => {
+        const selectedResourceTiles = firstResources[index].filter(
+          (resourceTile) => {
+            return resourceTile.selected;
+          }
+        );
+        await Promise.all(
+          selectedResourceTiles.map(async (resourceTile) => {
+            if (resourceTile.corn) {
+              await invoke("add_resource", {
+                playerId: player.id,
+                resourceType: "corn",
+                amount: resourceTile.corn,
+              });
+            }
+            if (resourceTile.wood) {
+              await invoke("add_resource", {
+                playerId: player.id,
+                resourceType: "wood",
+                amount: resourceTile.wood,
+              });
+            }
+            if (resourceTile.stone) {
+              await invoke("add_resource", {
+                playerId: player.id,
+                resourceType: "stone",
+                amount: resourceTile.stone,
+              });
+            }
+            if (resourceTile.gold) {
+              await invoke("add_resource", {
+                playerId: player.id,
+                resourceType: "gold",
+                amount: resourceTile.gold,
+              });
+            }
+            if (resourceTile.skull) {
+              await invoke("add_resource", {
+                playerId: player.id,
+                resourceType: "skull",
+                amount: resourceTile.skull,
+              });
+            }
+            if (resourceTile.worker) {
+              await invoke("add_worker", {
+                playerId: player.id,
+              });
+            }
+            if (resourceTile.chaac) {
+              await invoke("raise_temple_faith", {
+                playerId: player.id,
+                templeType: CHAAC,
+                amount: resourceTile.chaac,
+              });
+            }
+            if (resourceTile.quetzalcoatl) {
+              await invoke("raise_temple_faith", {
+                playerId: player.id,
+                templeType: QUETZALCOATL,
+                amount: resourceTile.quetzalcoatl,
+              });
+            }
+            if (resourceTile.kukulkan) {
+              await invoke("raise_temple_faith", {
+                playerId: player.id,
+                templeType: KUKULKAN,
+                amount: resourceTile.kukulkan,
+              });
+            }
+            // save_corn: boolean;
+            // agriculture_skill: number | null;
+            // resource_skill: number | null;
+            // construction_skill: number | null;
+            // temple_skill: number | null;
+            if (resourceTile.agriculture_skill) {
+              await invoke("raise_technology_level", {
+                playerId: player.id,
+                technologyType: "agriculture",
+                rewardOption: null,
+              });
+            }
+            if (resourceTile.resource_skill) {
+              await invoke("raise_technology_level", {
+                playerId: player.id,
+                technologyType: "resource",
+                rewardOption: null,
+              });
+            }
+            if (resourceTile.construction_skill) {
+              await invoke("raise_technology_level", {
+                playerId: player.id,
+                technologyType: "construction",
+                rewardOption: null,
+              });
+            }
+            if (resourceTile.temple_skill) {
+              await invoke("raise_technology_level", {
+                playerId: player.id,
+                technologyType: "temple",
+                rewardOption: null,
+              });
+            }
+          })
+        );
+      })
+    );
     const players_state: GamePlayers = await invoke("get_players");
     setPlayers(players_state);
     const fieldSkulls: number = await invoke("get_field_skulls");

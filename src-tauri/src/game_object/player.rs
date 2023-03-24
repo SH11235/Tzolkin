@@ -46,6 +46,7 @@ pub struct Player {
     pub(super) name: String,
     pub(super) color: PlayerColor,
     pub(super) order: u32,
+    pub accelerating_ability: bool,
     pub workers: Vec<Worker>,
     pub technology: Technology,
     pub temple_faith: TempleFaith,
@@ -63,6 +64,7 @@ impl Player {
             name,
             color,
             order,
+            accelerating_ability: true,
             workers: vec![
                 Worker::new(),
                 Worker::new(),

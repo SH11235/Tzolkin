@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::State;
+use utils::constants::{CHAAC, KUKULKAN, QUETZALCOATL};
 
 mod game_object;
 mod utils;
@@ -162,13 +163,13 @@ fn raise_technology_level(
                     TechnologyProgressReward::Faith => {
                         if let Some(reward_faith) = reward_option.faith {
                             match reward_faith.as_str() {
-                                "Chaac" => {
+                                CHAAC => {
                                     player.temple_faith.chaac.raise_faith();
                                 }
-                                "Quetzalcoatl" => {
+                                QUETZALCOATL => {
                                     player.temple_faith.quetzalcoatl.raise_faith();
                                 }
-                                "Kukulkan" => {
+                                KUKULKAN => {
                                     player.temple_faith.kukulkan.raise_faith();
                                 }
                                 _ => return Err("reward faith is not correct".to_string()),
@@ -217,6 +218,41 @@ fn raise_technology_level(
     }
 }
 
+#[tauri::command]
+fn raise_temple_faith(
+    player_id: u32,
+    temple_type: String,
+    amount: u32,
+    app_state: State<AppState>,
+) -> Result<Player, String> {
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = players.iter_mut().find(|p| p.get_id() == player_id);
+    if let Some(player) = player {
+        match temple_type.as_str() {
+            CHAAC => {
+                for _ in 0..amount {
+                    player.temple_faith.chaac.raise_faith();
+                }
+            }
+            QUETZALCOATL => {
+                for _ in 0..amount {
+                    player.temple_faith.quetzalcoatl.raise_faith();
+                }
+            }
+            KUKULKAN => {
+                for _ in 0..amount {
+                    player.temple_faith.kukulkan.raise_faith();
+                }
+            }
+            _ => return Err("temple type not found".to_string()),
+        }
+        println!("player: {:?}", player);
+        Ok(player.clone())
+    } else {
+        Err(format!("player {} not found", player_id))
+    }
+}
+
 fn main() {
     let players: Vec<Player> = Vec::new();
     let app_state = AppState {
@@ -233,7 +269,8 @@ fn main() {
             get_first_resource_tiles,
             add_resource,
             get_field_skulls,
-            raise_technology_level
+            raise_technology_level,
+            raise_temple_faith
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
