@@ -231,17 +231,17 @@ fn raise_temple_faith(
         match temple_type.as_str() {
             CHAAC => {
                 for _ in 0..amount {
-                    player.temple_faith.chaac.raise_faith();
+                    player.raise_chaac_faith();
                 }
             }
             QUETZALCOATL => {
                 for _ in 0..amount {
-                    player.temple_faith.quetzalcoatl.raise_faith();
+                    player.raise_quetzalcoatl_faith();
                 }
             }
             KUKULKAN => {
                 for _ in 0..amount {
-                    player.temple_faith.kukulkan.raise_faith();
+                    player.raise_kukulkan_faith();
                 }
             }
             _ => return Err("temple type not found".to_string()),

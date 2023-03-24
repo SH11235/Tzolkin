@@ -10,7 +10,9 @@ use self::{
     worker::Worker,
 };
 use super::{action_space::WorkerPosition, temple::Temple};
-use crate::utils::constants::{CORN_PER_WORKER, MAX_WORKER_COUNT};
+use crate::utils::constants::{
+    CORN_PER_WORKER, MAX_CHAAC_RANK, MAX_QUETZALCOATL_RANK, MAX_WORKER_COUNT,
+};
 
 #[derive(Clone, Debug, Serialize)]
 pub enum PlayerColor {
@@ -116,12 +118,33 @@ impl Player {
         self.temple_faith.chaac.get_faith()
     }
 
+    pub fn raise_chaac_faith(&mut self) {
+        self.temple_faith.chaac.raise_faith();
+        if self.temple_faith.chaac.get_faith() == MAX_CHAAC_RANK {
+            self.accelerating_ability = true;
+        }
+    }
+
     pub fn get_quetzalcoatl(&self) -> i32 {
         self.temple_faith.quetzalcoatl.get_faith()
     }
 
+    pub fn raise_quetzalcoatl_faith(&mut self) {
+        self.temple_faith.quetzalcoatl.raise_faith();
+        if self.temple_faith.quetzalcoatl.get_faith() == MAX_QUETZALCOATL_RANK {
+            self.accelerating_ability = true;
+        }
+    }
+
     pub fn get_kukulkan(&self) -> i32 {
         self.temple_faith.kukulkan.get_faith()
+    }
+
+    pub fn raise_kukulkan_faith(&mut self) {
+        self.temple_faith.kukulkan.raise_faith();
+        if self.temple_faith.kukulkan.get_faith() == MAX_QUETZALCOATL_RANK {
+            self.accelerating_ability = true;
+        }
     }
 
     pub fn add_points(&mut self, points: f32) {
