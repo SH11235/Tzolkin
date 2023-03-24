@@ -49,6 +49,18 @@ fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, S
 }
 
 #[tauri::command]
+fn add_worker(player_id: u32, app_state: State<AppState>) -> Result<Player, String> {
+    let mut players = app_state.game_players.lock().unwrap();
+    let player = players.iter_mut().find(|p| p.get_id() == player_id);
+    if let Some(player) = player {
+        player.add_worker();
+        Ok(player.clone())
+    } else {
+        Err(format!("player {} not found", player_id))
+    }
+}
+
+#[tauri::command]
 fn get_first_resource_tiles(app_state: State<AppState>) -> Vec<Vec<&Tile>> {
     let players = app_state.game_players.lock().unwrap();
     let tile_list = shuffle_tile_list();
@@ -217,6 +229,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_players,
             set_players,
+            add_worker,
             get_first_resource_tiles,
             add_resource,
             get_field_skulls,

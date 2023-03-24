@@ -10,7 +10,7 @@ use self::{
     worker::Worker,
 };
 use super::{action_space::WorkerPosition, temple::Temple};
-use crate::utils::constants::CORN_PER_WORKER;
+use crate::utils::constants::{CORN_PER_WORKER, MAX_WORKER_COUNT};
 
 #[derive(Clone, Debug, Serialize)]
 pub enum PlayerColor {
@@ -101,6 +101,13 @@ impl Player {
                 _ => true,
             })
             .count() as u32
+    }
+
+    pub fn add_worker(&mut self) {
+        let active_workers = self.get_active_workers();
+        if active_workers < MAX_WORKER_COUNT {
+            self.workers[active_workers as usize] = Worker::new();
+        }
     }
 
     pub fn get_chaac(&self) -> i32 {

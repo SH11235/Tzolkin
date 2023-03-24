@@ -1,0 +1,27 @@
+.circle-Red,
+.circle-Blue,
+.circle-Green,
+.circle-Yellow {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    vertical-align: middle;
+    text-align: center;
+}
+
+.circle-Red {
+    background-color: red;
+}
+
+.circle-Blue {
+    background-color: blue;
+}
+
+.circle-Green {
+    background-color: green;
+}
+
+.circle-Yellow {
+    background-color: yellow;
+}

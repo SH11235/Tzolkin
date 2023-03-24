@@ -1,5 +1,5 @@
 import { PlayerColor } from "../types/GamePlayer";
-import "./temple.css";
+import "./Temple.css";
 
 export type TempleBonus = {
   resource: "stone" | "gold" | "wood" | "skull" | null;

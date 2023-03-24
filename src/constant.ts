@@ -1,4 +1,9 @@
-import { TempleBonus } from "./components/temple";
+import { TempleBonus } from "./components/Temple";
+
+export const AGRICULTURE = "agriculture";
+export const RESOURCE = "resource";
+export const CONSTRUCTION = "construction";
+export const TEMPLE = "temple";
 
 export const ChaacBonus: TempleBonus = [
   {

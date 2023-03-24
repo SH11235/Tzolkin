@@ -1,12 +1,13 @@
 import { useState } from "react";
 import "./App.css";
-import { Temple } from "./components/temple";
+import { Temple } from "./components/Temple";
 import { ChaacBonus, QuetzalcoatlBonus, KukulkanBonus } from "./constant";
-import { Players } from "./components/players";
+import { Players } from "./components/Players";
 import { PalenqueSpace } from "./components/PalenqueSpace";
 import { GamePlayers } from "./types/GamePlayer";
 import { FirstResourcesState } from "./types/FirstResource";
 import { FirstResourceModal } from "./components/FirstResourceModal";
+import { TechnologyLevel } from "./components/TechnologyLevel";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
@@ -249,10 +250,15 @@ function App() {
         </div>
 
         <div className="row">
-          <span>
+          <div className="turn-player">
             ターンプレイヤー: {players.length > 0 ? players[0].name : ""}
-          </span>
+          </div>
         </div>
+
+        <div className="row">
+          <TechnologyLevel players={players} />
+        </div>
+
       </div>
       <FirstResourceModal
         firstResources={firstResources}
