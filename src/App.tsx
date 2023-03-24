@@ -18,6 +18,7 @@ import { GamePlayers } from "./types/GamePlayer";
 import { FirstResourcesState } from "./types/FirstResource";
 import { FirstResourceModal } from "./components/FirstResourceModal";
 import { TechnologyLevel } from "./components/TechnologyLevel";
+import { PlayersTable } from "./components/PlayerStatus";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
@@ -269,6 +270,7 @@ function App() {
         </div>
 
         <div className="row">
+          <PlayersTable players={players}></PlayersTable>
           <TechnologyLevel players={players} />
         </div>
       </div>
