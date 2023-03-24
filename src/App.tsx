@@ -12,7 +12,7 @@ import {
   QUETZALCOATL,
   KUKULKAN,
 } from "./constant";
-import { Players } from "./components/Players";
+import { PlayersNumber } from "./components/PlayersNumber";
 import { PalenqueSpace } from "./components/PalenqueSpace";
 import { GamePlayers } from "./types/GamePlayer";
 import { FirstResourcesState } from "./types/FirstResource";
@@ -71,7 +71,7 @@ function App() {
         </div>
 
         <div className="row">
-          <Players
+          <PlayersNumber
             setPlayers={setPlayers}
             setPalenqueChips={setPalenqueChips}
             setFirstResources={setFirstResources}

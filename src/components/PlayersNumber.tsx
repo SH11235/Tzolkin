@@ -16,7 +16,7 @@ interface playersProps {
   setFirstResources: React.Dispatch<React.SetStateAction<FirstResourcesState>>;
 }
 
-export const Players = ({
+export const PlayersNumber = ({
   setPlayers,
   setPalenqueChips,
   setFirstResources,
