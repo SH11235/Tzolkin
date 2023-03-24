@@ -129,10 +129,10 @@ export const FirstResourceModal = ({
             rewardOption: null,
           });
         }
-        const players_state: GamePlayers = await invoke("get_players");
-        console.log(players_state);
       });
     });
+    const players_state: GamePlayers = await invoke("get_players");
+    setPlayers(players_state);
     const fieldSkulls: number = await invoke("get_field_skulls");
     setFieldSkulls(fieldSkulls);
     setDone(true);
