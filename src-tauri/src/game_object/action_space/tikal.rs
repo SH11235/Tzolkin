@@ -57,22 +57,21 @@ impl TikalSpace {
                     };
                     match target_temple {
                         TempleName::Chaac => {
-                            if player.temple_faith.chaac.get_faith() == MAX_CHAAC_RANK {
+                            if player.get_chaac_rank() == MAX_CHAAC_RANK {
                                 return Err("チャクの信仰は既に上限です".to_string());
                             } else {
                                 player.raise_chaac_faith();
                             }
                         }
                         TempleName::Quetzalcoatl => {
-                            if player.temple_faith.quetzalcoatl.get_faith() == MAX_QUETZALCOATL_RANK
-                            {
+                            if player.get_quetzalcoatl_rank() == MAX_QUETZALCOATL_RANK {
                                 return Err("ケツァルコアトルの信仰は既に上限です".to_string());
                             } else {
                                 player.raise_quetzalcoatl_faith();
                             }
                         }
                         TempleName::Kukulkan => {
-                            if player.temple_faith.kukulkan.get_faith() == MAX_KUKULKAN_RANK {
+                            if player.get_kukulkan_rank() == MAX_KUKULKAN_RANK {
                                 return Err("ククルカンの信仰は既に上限です".to_string());
                             } else {
                                 player.raise_kukulkan_faith();

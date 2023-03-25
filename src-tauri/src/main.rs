@@ -155,13 +155,13 @@ fn raise_technology_level(
                     if let Some(reward_faith) = reward_option.faith {
                         match reward_faith.as_str() {
                             CHAAC => {
-                                player.temple_faith.chaac.raise_faith();
+                                player.raise_chaac_faith();
                             }
                             QUETZALCOATL => {
-                                player.temple_faith.quetzalcoatl.raise_faith();
+                                player.raise_quetzalcoatl_faith();
                             }
                             KUKULKAN => {
-                                player.temple_faith.kukulkan.raise_faith();
+                                player.raise_kukulkan_faith();
                             }
                             _ => return Err("reward faith is not correct".to_string()),
                         }

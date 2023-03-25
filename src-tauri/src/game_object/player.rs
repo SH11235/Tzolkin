@@ -9,7 +9,12 @@ use self::{
     resource_stock::ResourceSkullStock, technology::Technology, temple_faith::TempleFaith,
     worker::Worker,
 };
-use super::{action_space::WorkerPosition, temple::Temple};
+use super::{
+    action_space::WorkerPosition,
+    construction_tiles::{ConstructionType, CONSTRUCTION_TILE_LIST},
+    monument_tiles::MONUMENT_TILE_LIST,
+    temple::Temple,
+};
 use crate::utils::constants::{
     CORN_PER_WORKER, MAX_CHAAC_RANK, MAX_QUETZALCOATL_RANK, MAX_WORKER_COUNT,
 };
@@ -51,20 +56,22 @@ pub struct CornSave {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Player {
-    pub(super) id: u32,
-    pub(super) name: String,
-    pub(super) color: PlayerColor,
-    pub(super) order: u32,
-    pub accelerating_ability: bool,
-    pub corn_save: CornSave,
-    pub workers: Vec<Worker>,
-    pub technology: Technology,
-    pub temple_faith: TempleFaith,
-    pub corns: u32,
-    pub resource: ResourceSkullStock,
-    pub(super) corn_tiles: u32,
-    pub(super) wood_tiles: u32,
-    pub(super) points: f32,
+    pub(crate) id: u32,
+    pub(crate) name: String,
+    pub(crate) color: PlayerColor,
+    pub(crate) order: u32,
+    pub(crate) accelerating_ability: bool,
+    pub(crate) corn_save: CornSave,
+    pub(crate) workers: Vec<Worker>,
+    pub(crate) technology: Technology,
+    pub(crate) temple_faith: TempleFaith,
+    pub(crate) corns: u32,
+    pub(crate) resource: ResourceSkullStock,
+    pub(crate) construction_ids: Vec<u32>,
+    pub(crate) monument_ids: Vec<u32>,
+    pub(crate) corn_tiles: u32,
+    pub(crate) wood_tiles: u32,
+    pub(crate) points: f32,
 }
 
 impl Player {
@@ -90,6 +97,8 @@ impl Player {
             resource: ResourceSkullStock::new(),
             corn_tiles: 0,
             wood_tiles: 0,
+            construction_ids: vec![],
+            monument_ids: vec![],
             points: 0.0,
         }
     }
@@ -123,7 +132,7 @@ impl Player {
         }
     }
 
-    pub fn get_chaac(&self) -> i32 {
+    pub fn get_chaac_rank(&self) -> i32 {
         self.temple_faith.chaac.get_faith()
     }
 
@@ -134,7 +143,7 @@ impl Player {
         }
     }
 
-    pub fn get_quetzalcoatl(&self) -> i32 {
+    pub fn get_quetzalcoatl_rank(&self) -> i32 {
         self.temple_faith.quetzalcoatl.get_faith()
     }
 
@@ -145,7 +154,7 @@ impl Player {
         }
     }
 
-    pub fn get_kukulkan(&self) -> i32 {
+    pub fn get_kukulkan_rank(&self) -> i32 {
         self.temple_faith.kukulkan.get_faith()
     }
 
@@ -156,8 +165,110 @@ impl Player {
         }
     }
 
+    pub fn agriculture_technology_level(&self) -> u32 {
+        self.technology.agriculture.get_level()
+    }
+
+    pub fn resource_technology_level(&self) -> u32 {
+        self.technology.resource.get_level()
+    }
+
+    pub fn construction_technology_level(&self) -> u32 {
+        self.technology.construction.get_level()
+    }
+
+    pub fn temple_technology_level(&self) -> u32 {
+        self.technology.temple.get_level()
+    }
+
     pub fn add_points(&mut self, points: f32) {
         self.points += points;
+    }
+
+    pub fn graveyard_tile_count(&self) -> u32 {
+        let construction_count = CONSTRUCTION_TILE_LIST
+            .iter()
+            .filter(|construction_tile| {
+                self.construction_ids
+                    .iter()
+                    .any(|id| id == &construction_tile.id)
+            })
+            .filter(
+                |construction_tile| match construction_tile.construction_type {
+                    ConstructionType::Graveyard => true,
+                    _ => false,
+                },
+            )
+            .count() as u32;
+        let monument_count = MONUMENT_TILE_LIST
+            .iter()
+            .filter(|monument_tile| self.monument_ids.iter().any(|id| id == &monument_tile.id))
+            .filter(|monument_tile| match monument_tile.construction_type {
+                ConstructionType::Graveyard => true,
+                _ => false,
+            })
+            .count() as u32;
+        construction_count + monument_count
+    }
+
+    pub fn municipal_tile_count(&self) -> u32 {
+        let construction_count = CONSTRUCTION_TILE_LIST
+            .iter()
+            .filter(|construction_tile| {
+                self.construction_ids
+                    .iter()
+                    .any(|id| id == &construction_tile.id)
+            })
+            .filter(
+                |construction_tile| match construction_tile.construction_type {
+                    ConstructionType::Municipal => true,
+                    _ => false,
+                },
+            )
+            .count() as u32;
+        let monument_count = MONUMENT_TILE_LIST
+            .iter()
+            .filter(|monument_tile| self.monument_ids.iter().any(|id| id == &monument_tile.id))
+            .filter(|monument_tile| match monument_tile.construction_type {
+                ConstructionType::Municipal => true,
+                _ => false,
+            })
+            .count() as u32;
+        construction_count + monument_count
+    }
+
+    pub fn shrine_tile_count(&self) -> u32 {
+        let construction_count = CONSTRUCTION_TILE_LIST
+            .iter()
+            .filter(|construction_tile| {
+                self.construction_ids
+                    .iter()
+                    .any(|id| id == &construction_tile.id)
+            })
+            .filter(
+                |construction_tile| match construction_tile.construction_type {
+                    ConstructionType::Shrine => true,
+                    _ => false,
+                },
+            )
+            .count() as u32;
+        let monument_count = MONUMENT_TILE_LIST
+            .iter()
+            .filter(|monument_tile| self.monument_ids.iter().any(|id| id == &monument_tile.id))
+            .filter(|monument_tile| match monument_tile.construction_type {
+                ConstructionType::Shrine => true,
+                _ => false,
+            })
+            .count() as u32;
+        construction_count + monument_count
+    }
+
+    pub fn construction_tile_count(&self) -> u32 {
+        self.construction_ids.len() as u32
+    }
+
+    pub fn monument_tile_count(&self) -> u32 {
+        self.monument_ids.len() as u32
     }
 
     pub fn feed(&mut self) {
@@ -201,15 +312,11 @@ impl Player {
         self.resource.skulls.0 += kukulkan_resources.skulls.0;
     }
     // 神殿判定: 得点
-    pub fn get_point_reward_from_temple(&mut self) {
+    pub fn get_point_reward_from_temple(&self) -> i32 {
         let chaac_points = &self.temple_faith.chaac.point_reward();
-        self.points += *chaac_points as f32;
-
         let quetzalcoatl_points = &self.temple_faith.quetzalcoatl.point_reward();
-        self.points += *quetzalcoatl_points as f32;
-
         let kukulkan_points = &self.temple_faith.kukulkan.point_reward();
-        self.points += *kukulkan_points as f32;
+        chaac_points + quetzalcoatl_points + kukulkan_points
     }
 }
 
@@ -339,21 +446,24 @@ mod tests {
         player.temple_faith.chaac = Chaac::new(0);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(0);
         player.temple_faith.kukulkan = Kukulkan::new(0);
-        player.get_point_reward_from_temple();
+        let points = player.get_point_reward_from_temple() as f32;
+        player.add_points(points);
         assert_eq!(player.points, 0.0);
 
         let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(1);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(2);
         player.temple_faith.kukulkan = Kukulkan::new(1);
-        player.get_point_reward_from_temple();
+        let points = player.get_point_reward_from_temple() as f32;
+        player.add_points(points);
         assert_eq!(player.points, 5.0);
 
         let mut player = Player::new(1, "Player 1".to_string(), PlayerColor::Red, 1);
         player.temple_faith.chaac = Chaac::new(3);
         player.temple_faith.quetzalcoatl = Quetzalcoatl::new(4);
         player.temple_faith.kukulkan = Kukulkan::new(4);
-        player.get_point_reward_from_temple();
+        let points = player.get_point_reward_from_temple() as f32;
+        player.add_points(points);
         assert_eq!(player.points, 19.0);
     }
 }

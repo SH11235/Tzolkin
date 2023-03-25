@@ -438,7 +438,6 @@ pub fn shuffle_tile_list() -> Vec<&'static Tile> {
     tile_list
 }
 
-// テスト
 #[cfg(test)]
 mod tests {
     use super::*;

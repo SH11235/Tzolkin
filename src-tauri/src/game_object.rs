@@ -1,9 +1,11 @@
 pub mod action_space;
 pub mod chichen_itza_skull;
+pub mod construction_tiles;
 pub mod first_resource_tiles;
 pub mod food_day;
 pub mod game;
 pub mod jungle;
+pub mod monument_tiles;
 pub mod player;
 pub mod resources;
 pub mod temple;

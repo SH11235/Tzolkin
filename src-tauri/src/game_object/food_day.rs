@@ -41,7 +41,7 @@ impl FoodDayStatus {
                 self.first_food_day_done = true;
                 let mut required_skulls = 0;
                 players.iter().for_each(|player| {
-                    if player.get_kukulkan() >= 4 {
+                    if player.get_kukulkan_rank() >= 4 {
                         required_skulls += 1;
                     }
                 });
@@ -109,14 +109,14 @@ pub fn get_temple_top_player_index(
     let mut max_quetzalcoatl = 0;
     let mut max_kukulkan = 0;
     players.iter().for_each(|player| {
-        if player.get_chaac() > max_chaac {
-            max_chaac = player.get_chaac();
+        if player.get_chaac_rank() > max_chaac {
+            max_chaac = player.get_chaac_rank();
         }
-        if player.get_quetzalcoatl() > max_quetzalcoatl {
-            max_quetzalcoatl = player.get_quetzalcoatl();
+        if player.get_quetzalcoatl_rank() > max_quetzalcoatl {
+            max_quetzalcoatl = player.get_quetzalcoatl_rank();
         }
-        if player.get_kukulkan() > max_kukulkan {
-            max_kukulkan = player.get_kukulkan();
+        if player.get_kukulkan_rank() > max_kukulkan {
+            max_kukulkan = player.get_kukulkan_rank();
         }
     });
     // 各神殿で信仰がトップのplayerを取得する
@@ -124,13 +124,13 @@ pub fn get_temple_top_player_index(
     let mut max_quetzalcoatl_player = vec![];
     let mut max_kukulkan_player = vec![];
     players.iter().enumerate().for_each(|(i, player)| {
-        if player.get_chaac() == max_chaac {
+        if player.get_chaac_rank() == max_chaac {
             max_chaac_player.push(i);
         }
-        if player.get_quetzalcoatl() == max_quetzalcoatl {
+        if player.get_quetzalcoatl_rank() == max_quetzalcoatl {
             max_quetzalcoatl_player.push(i);
         }
-        if player.get_kukulkan() == max_kukulkan {
+        if player.get_kukulkan_rank() == max_kukulkan {
             max_kukulkan_player.push(i);
         }
     });
