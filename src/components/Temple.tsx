@@ -1,5 +1,15 @@
+import {
+  Box,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Typography,
+} from "@mui/material";
+import { styled } from "@mui/material/styles";
 import { PlayerColor } from "../types/GamePlayer";
-import "./Temple.css";
 
 export type TempleBonus = {
   resource: "stone" | "gold" | "wood" | "skull" | null;
@@ -26,67 +36,130 @@ export const Temple: React.FC<Props> = ({
   templePoints,
   templeColor,
 }) => {
+  const ResourceCell = styled(TableCell)({
+    height: "25px",
+    width: "61px",
+    padding: "2px 5px",
+    border: "1px solid #000",
+    textAlign: "center",
+    verticalAlign: "middle",
+    position: "relative",
+  });
+
+  const PlayerCell = styled(TableCell)({
+    height: "25px",
+    width: "120px",
+    padding: "2px 5px",
+    border: "1px solid #000",
+    textAlign: "center",
+    verticalAlign: "middle",
+    position: "relative",
+  });
+
+  const ScoreCell = styled(TableCell)({
+    height: "25px",
+    width: "32px",
+    padding: "2px 5px",
+    border: "1px solid #000",
+    textAlign: "center",
+    verticalAlign: "middle",
+    position: "relative",
+  });
+
+  const templeBackGroundColor =
+    templeColor === "brown"
+      ? "#B67A48"
+      : templeColor === "yellow"
+      ? "#F1C614"
+      : "#8BBF3D";
+  const TempleTable = styled(Table)({
+    width: "210px",
+    backgroundColor: templeBackGroundColor,
+  });
+
   const offset = 9 - templeBonus.length;
   const array = Array(offset).fill(0);
   const offsetRows = array.map((_, index) => {
     return (
-      <tr key={`offsetRows-${index}`}>
-        <td className="temple-cell"></td>
-        <td className="temple-cell"></td>
-        <td className="temple-cell"></td>
-      </tr>
+      <TableRow key={`offsetRows-${index}`}>
+        <ResourceCell>✕</ResourceCell>
+        <PlayerCell>✕</PlayerCell>
+        <ScoreCell>✕</ScoreCell>
+      </TableRow>
     );
   });
+
   const rows = templeBonus.map((row, rowIndex) => {
     const playerScoreElements = playerScores.map((playerScore) => {
       const offset = templeBonus.length - 2;
-      // chaacのとき: playerScore.index + rowIndex === 5
-      // playerScore.index === -1 → rowIndex === 6
-      // playerScore.index === 0 → rowIndex === 5
-      // playerScore.index === 1 → rowIndex === 4
-      // playerScore.index === 2 → rowIndex === 3
-      // playerScore.index === 3 → rowIndex === 2
-      // playerScore.index === 4 → rowIndex === 1
-      // quetzalcoatlのとき playerScore.index + rowIndex === 7
-      // playerScore.index === 0 → rowIndex === 7
-      // playerScore.index === 1 → rowIndex === 6
-      // playerScore.index === 2 → rowIndex === 5
-      // playerScore.index === 3 → rowIndex === 4
-      // playerScore.index === 4 → rowIndex === 3
-      // playerScore.index === 5 → rowIndex === 2
-      // playerScore.index === 6 → rowIndex === 1
-      // playerScore.index === 7 → rowIndex === 0
       if (playerScore.index + rowIndex === offset) {
-        let classNamePlayer = playerScore.color;
         return (
-          <span
-            key={`${classNamePlayer}-${rowIndex}`}
-            className={`circle-${classNamePlayer}`}
-          ></span>
+          <Typography
+            sx={{
+              display: "inline-block",
+              width: "20px",
+              height: "20px",
+              borderRadius: "50%",
+              verticalAlign: "middle",
+              textAlign: "center",
+              backgroundColor: playerScore.color,
+            }}
+            key={`${playerScore.color}-${rowIndex}`}
+          ></Typography>
         );
       }
+      return null;
     });
+
     return (
-      <tr key={rowIndex}>
-        <td className="temple-cell temple-cell-resource">{row.resource}</td>
-        <td className="temple-cell temple-cell-player">
-          {playerScoreElements}
-        </td>
-        <td className="temple-cell temple-cell-score">{row.point}</td>
-      </tr>
+      <TableRow key={rowIndex}>
+        <ResourceCell>{row.resource}</ResourceCell>
+        <PlayerCell>{playerScoreElements}</PlayerCell>
+        <ScoreCell>{row.point}</ScoreCell>
+      </TableRow>
     );
   });
+
   return (
-    <div className="temple-container">
-      <span>{name}</span>
-      <span className="temple-points">{templePoints[0]}</span>
-      <span className="temple-points">{templePoints[1]}</span>
-      <table className={`temple-table temple-${templeColor}`} border={1}>
-        <tbody>
-          {offsetRows}
-          {rows}
-        </tbody>
-      </table>
-    </div>
+    <Box sx={{ m: 1 }}>
+      <Typography sx={{ display: "inline" }} variant="h6">
+        {name}
+      </Typography>
+      <Typography
+        sx={{
+          display: "inline",
+          border: "1px solid #000",
+          padding: "2px 5px",
+          marginLeft: "5px",
+        }}
+      >
+        {templePoints[0]}
+      </Typography>
+      <Typography
+        sx={{
+          display: "inline",
+          border: "1px solid #000",
+          padding: "2px 5px",
+          marginLeft: "5px",
+        }}
+      >
+        {templePoints[1]}
+      </Typography>
+      <TableContainer sx={{ mt: 2, marginTop: "4px" }}>
+        <TempleTable border={1} size="small">
+          <TableHead>
+            <TableRow>
+              <ResourceCell>Resource</ResourceCell>
+              <PlayerCell>Player</PlayerCell>
+              <ScoreCell>Point</ScoreCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {offsetRows}
+            {rows}
+          </TableBody>
+        </TempleTable>
+      </TableContainer>
+    </Box>
   );
 };
