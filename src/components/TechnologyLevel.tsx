@@ -5,6 +5,7 @@ import {
   TableContainer,
   TableHead,
   TableRow,
+  Typography,
 } from "@mui/material";
 import { AGRICULTURE, CONSTRUCTION, RESOURCE, TEMPLE } from "../constant";
 import { Player } from "../types/GamePlayer";
@@ -43,7 +44,9 @@ export const TechnologyLevel: React.FC<Props> = ({ players }) => {
         <TableBody>
           {technologyTypes.map((technologyType) => (
             <TableRow key={technologyType}>
-              <TableCell sx={{ borderRight: "1px solid #ddd" }}>{technologyType}</TableCell>
+              <TableCell sx={{ borderRight: "1px solid #ddd" }}>
+                {technologyType}
+              </TableCell>
               {[0, 1, 2, 3, 4].map((level) => (
                 <TableCell
                   key={level}
@@ -55,40 +58,72 @@ export const TechnologyLevel: React.FC<Props> = ({ players }) => {
                       case AGRICULTURE:
                         if (player.technology.agriculture === level) {
                           return (
-                            <span
-                              key={`${player.color}-${player.id}`}
-                              className={`circle-${player.color}`}
-                            ></span>
+                            <Typography
+                              sx={{
+                                display: "inline-block",
+                                width: "20px",
+                                height: "20px",
+                                borderRadius: "50%",
+                                verticalAlign: "middle",
+                                textAlign: "center",
+                                backgroundColor: player.color,
+                              }}
+                              key={`${player.color}`}
+                            ></Typography>
                           );
                         }
                         break;
                       case RESOURCE:
                         if (player.technology.resource === level) {
                           return (
-                            <span
-                              key={`${player.color}-${player.id}`}
-                              className={`circle-${player.color}`}
-                            ></span>
+                            <Typography
+                              sx={{
+                                display: "inline-block",
+                                width: "20px",
+                                height: "20px",
+                                borderRadius: "50%",
+                                verticalAlign: "middle",
+                                textAlign: "center",
+                                backgroundColor: player.color,
+                              }}
+                              key={`${player.color}`}
+                            ></Typography>
                           );
                         }
                         break;
                       case CONSTRUCTION:
                         if (player.technology.construction === level) {
                           return (
-                            <span
-                              key={`${player.color}-${player.id}`}
-                              className={`circle-${player.color}`}
-                            ></span>
+                            <Typography
+                              sx={{
+                                display: "inline-block",
+                                width: "20px",
+                                height: "20px",
+                                borderRadius: "50%",
+                                verticalAlign: "middle",
+                                textAlign: "center",
+                                backgroundColor: player.color,
+                              }}
+                              key={`${player.color}`}
+                            ></Typography>
                           );
                         }
                         break;
                       case TEMPLE:
                         if (player.technology.temple === level) {
                           return (
-                            <span
-                              key={`${player.color}-${player.id}`}
-                              className={`circle-${player.color}`}
-                            ></span>
+                            <Typography
+                              sx={{
+                                display: "inline-block",
+                                width: "20px",
+                                height: "20px",
+                                borderRadius: "50%",
+                                verticalAlign: "middle",
+                                textAlign: "center",
+                                backgroundColor: player.color,
+                              }}
+                              key={`${player.color}`}
+                            ></Typography>
                           );
                         }
                         break;
