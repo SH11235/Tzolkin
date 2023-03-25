@@ -58,7 +58,7 @@ impl FoodDayStatus {
                 self.second_food_day_done = true;
                 players.iter_mut().for_each(|player| {
                     player.feed();
-                    player.get_point_reward_from_temple();
+                    player.add_points(player.get_point_reward_from_temple() as f32);
                 });
                 get_food_day_point_reward(
                     players,
@@ -78,7 +78,7 @@ impl FoodDayStatus {
                 self.fourth_food_day_done = true;
                 players.iter_mut().for_each(|player| {
                     player.feed();
-                    player.get_point_reward_from_temple();
+                    player.add_points(player.get_point_reward_from_temple() as f32);
                 });
                 get_food_day_point_reward(
                     players,
@@ -180,7 +180,7 @@ mod tests {
     use crate::game_object::player::temple_faith::TempleFaith;
     use crate::game_object::player::Player;
     use crate::game_object::resources::FieldSkulls;
-    use crate::game_object::temple::{Chaac, Temple, Quetzalcoatl, Kukulkan};
+    use crate::game_object::temple::{Chaac, Kukulkan, Quetzalcoatl, Temple};
 
     #[test]
     fn test_get_temple_top_player_index_points() {
