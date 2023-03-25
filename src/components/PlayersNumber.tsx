@@ -82,7 +82,7 @@ export const PlayersNumber = ({
         }
       );
       setFirstResources(firstResourceTilesState);
-    } catch(e) {
+    } catch (e) {
       // ユーザーに警告を出す
       // alert("プレイ人数の設定に失敗しました");
       console.error(e);
@@ -91,7 +91,7 @@ export const PlayersNumber = ({
 
   return (
     <form onSubmit={handleSubmit}>
-      プレイ人数{"： "}
+      Number of players{"： "}
       <input
         id="number-of-players-input"
         type="number"
@@ -99,7 +99,7 @@ export const PlayersNumber = ({
         onChange={numberOnChange}
       />
       <button id="submit-button" type="submit">
-        決定
+        OK
       </button>
     </form>
   );

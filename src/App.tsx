@@ -80,8 +80,8 @@ function App() {
         </div>
 
         <div className="row">
-          <span className="game-status">ラウンド：{round}</span>
-          <span className="game-status">スカル：{fieldSkulls}</span>
+          <span className="game-status">Round：{round}</span>
+          <span className="game-status">Skull：{fieldSkulls}</span>
         </div>
 
         <div className="row">
@@ -265,7 +265,7 @@ function App() {
 
         <div className="row">
           <div className="turn-player">
-            ターンプレイヤー: {players.length > 0 ? players[0].name : ""}
+            Turn Player: {players.length > 0 ? players[0].name : ""}
           </div>
         </div>
 
