@@ -11,7 +11,7 @@ type ResourceTileCardProps = {
 const StyledResourceCard = styled(Card)<{ selected?: boolean }>`
   margin-bottom: 8px;
   border: ${({ selected }) =>
-    selected ? "3px solid #f8bbd0" : "3px solid #d8c289"};
+    selected ? "3px solid #0000ff" : "3px solid #d8c289"};
 `;
 
 const StyledWorkSpaceCard = styled(CardContent)`

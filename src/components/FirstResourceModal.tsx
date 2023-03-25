@@ -19,6 +19,8 @@ const StyledCard = styled(Card)`
   max-width: 90%;
   width: 100%;
   position: absolute;
+  text-align: center;
+  padding-bottom: 26px;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
@@ -194,6 +196,30 @@ export const FirstResourceModal = ({
               : true
           }
           onClick={handleConfirm}
+          sx={{
+            backgroundColor: firstResources.every((firstResource) => {
+              return (
+                firstResource.filter((resourceTile) => {
+                  return resourceTile.selected;
+                }).length === 2
+              );
+            })
+              ? "#1976d2"
+              : "#bdbdbd",
+            "&:hover": {
+              backgroundColor: firstResources.every((firstResource) => {
+                return (
+                  firstResource.filter((resourceTile) => {
+                    return resourceTile.selected;
+                  }).length === 2
+                );
+              })
+                ? "#0d47a1"
+                : "#bdbdbd",
+            },
+            color: "white",
+          }}
+          size="large"
         >
           決定
         </Button>
