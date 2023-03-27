@@ -83,8 +83,7 @@ export const PlayersNumber = ({
       );
       setFirstResources(firstResourceTilesState);
     } catch (e) {
-      // ユーザーに警告を出す
-      // alert("プレイ人数の設定に失敗しました");
+      // TODO error modal
       console.error(e);
     }
   };
