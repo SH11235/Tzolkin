@@ -52,6 +52,7 @@ pub enum ConstructionReward {
         temple_faith_type: TempleFaithType,
     },
 }
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ConstructionTile<'a, 'b> {
     pub id: u32,
@@ -61,6 +62,17 @@ pub struct ConstructionTile<'a, 'b> {
     pub construction_rewards: &'b [ConstructionReward],
     pub generation: Generation,
     pub expansion: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ConstructionTileId(u32);
+
+impl ConstructionTileId {
+    fn next(&mut self) -> u32 {
+        let id = self.0;
+        self.0 += 1;
+        id
+    }
 }
 
 static FARM_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
@@ -192,9 +204,23 @@ static GRAVEYARD_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: false,
 };
 
-// MUNICIPAL_1
-static MUNICIPAL_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile {
     id: 8,
+    name: "Graveyard First 3",
+    cost: Cost {
+        wood: 1,
+        stone: 0,
+        gold: 1,
+        skull: 0,
+    },
+    construction_type: ConstructionType::Graveyard,
+    construction_rewards: &[],
+    generation: Generation::First,
+    expansion: true,
+};
+
+static MUNICIPAL_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
+    id: 9,
     name: "Municipal First 1",
     cost: Cost {
         wood: 2,
@@ -211,7 +237,7 @@ static MUNICIPAL_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile 
 };
 
 static MUNICIPAL_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
-    id: 9,
+    id: 10,
     name: "Municipal First 2",
     cost: Cost {
         wood: 3,
@@ -237,7 +263,7 @@ static MUNICIPAL_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile 
 };
 
 static MUNICIPAL_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile {
-    id: 10,
+    id: 11,
     name: "Municipal First 3",
     cost: Cost {
         wood: 1,
@@ -263,7 +289,7 @@ static MUNICIPAL_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile 
 };
 
 static MUNICIPAL_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile {
-    id: 11,
+    id: 12,
     name: "Municipal First 4",
     cost: Cost {
         wood: 2,
@@ -289,7 +315,7 @@ static MUNICIPAL_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile 
 };
 
 static SHRINE_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
-    id: 12,
+    id: 13,
     name: "Shrine First 1",
     cost: Cost {
         wood: 0,
@@ -306,7 +332,7 @@ static SHRINE_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
 };
 
 static SHRINE_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
-    id: 13,
+    id: 14,
     name: "Shrine First 2",
     cost: Cost {
         wood: 0,
@@ -324,7 +350,7 @@ static SHRINE_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
 
 // TODO: 拡張タイルの効果の実装
 // static FARM_FIRST_6 : ConstructionTile<'static, 'static> = ConstructionTile {
-//     id: 14,
+//     id: 15,
 //     name: "Farm First 6",
 //     cost: Cost {
 //         wood: 3,
@@ -333,21 +359,6 @@ static SHRINE_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
 //         skull: 0,
 //     },
 //     construction_type: ConstructionType::Farm,
-//     construction_rewards: &[],
-//     generation: Generation::First,
-//     expansion: true,
-// };
-
-// static GRAVEYARD_FIRST_3 : ConstructionTile<'static, 'static> = ConstructionTile {
-//     id: 15,
-//     name: "Graveyard First 3",
-//     cost: Cost {
-//         wood: 1,
-//         stone: 0,
-//         gold: 1,
-//         skull: 0,
-//     },
-//     construction_type: ConstructionType::Graveyard,
 //     construction_rewards: &[],
 //     generation: Generation::First,
 //     expansion: true,
@@ -398,7 +409,7 @@ static SHRINE_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
 //     expansion: true,
 // };
 
-pub static CONSTRUCTION_FIRST_TILE_LIST: [&ConstructionTile; 13] = [
+pub static CONSTRUCTION_FIRST_TILE_LIST: [&ConstructionTile; 14] = [
     &FARM_FIRST_1,
     &FARM_FIRST_2,
     &FARM_FIRST_3,
@@ -406,6 +417,7 @@ pub static CONSTRUCTION_FIRST_TILE_LIST: [&ConstructionTile; 13] = [
     &FARM_FIRST_5,
     &GRAVEYARD_FIRST_1,
     &GRAVEYARD_FIRST_2,
+    &GRAVEYARD_FIRST_3,
     &MUNICIPAL_FIRST_1,
     &MUNICIPAL_FIRST_2,
     &MUNICIPAL_FIRST_3,
@@ -428,6 +440,6 @@ mod tests {
     #[test]
     fn test_shuffled_construction_first_tile_list() {
         let monument_tiles = shuffled_construction_first_tile_list();
-        assert_eq!(monument_tiles.len(), 13);
+        assert_eq!(monument_tiles.len(), 14);
     }
 }
