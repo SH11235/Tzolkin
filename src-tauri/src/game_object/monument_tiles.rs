@@ -1,10 +1,7 @@
 use rand::prelude::*;
 use serde::Serialize;
 
-use super::{
-    construction_tiles::{ConstructionType, Cost},
-    player::Player,
-};
+use super::construction_tiles::{ConstructionType, Cost};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CalculateParameters {
