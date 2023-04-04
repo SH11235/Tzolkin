@@ -39,20 +39,24 @@ impl FoodDayStatus {
         match food_day {
             FoodDay::First => {
                 self.first_food_day_done = true;
-                let mut required_skulls = 0;
-                players.iter().for_each(|player| {
+                // player.get_kukulkan_rank() >= 4 なplayerの数だけskullが必要
+                let required_skulls = players.iter().fold(0, |acc, player| {
                     if player.get_kukulkan_rank() >= 4 {
-                        required_skulls += 1;
+                        acc + 1
+                    } else {
+                        acc
                     }
                 });
                 players.iter_mut().for_each(|player| {
                     player.feed();
                     player.get_resource_reward_from_temple();
                     if field_skull.get_remaining_skulls() >= required_skulls {
-                        field_skull.decrease_skulls(required_skulls);
                         player.get_skull_reward_from_kukulkan();
                     }
                 });
+                if field_skull.get_remaining_skulls() >= required_skulls {
+                    field_skull.decrease_skulls(required_skulls);
+                }
             }
             FoodDay::Second => {
                 self.second_food_day_done = true;
@@ -69,10 +73,24 @@ impl FoodDayStatus {
             }
             FoodDay::Third => {
                 self.third_food_day_done = true;
+                // player.get_kukulkan_rank() >= 4 なplayerの数だけskullが必要
+                let required_skulls = players.iter().fold(0, |acc, player| {
+                    if player.get_kukulkan_rank() >= 4 {
+                        acc + 1
+                    } else {
+                        acc
+                    }
+                });
                 players.iter_mut().for_each(|player| {
                     player.feed();
                     player.get_resource_reward_from_temple();
+                    if field_skull.get_remaining_skulls() >= required_skulls {
+                        player.get_skull_reward_from_kukulkan();
+                    }
                 });
+                if field_skull.get_remaining_skulls() >= required_skulls {
+                    field_skull.decrease_skulls(required_skulls);
+                }
             }
             FoodDay::Fourth => {
                 self.fourth_food_day_done = true;
