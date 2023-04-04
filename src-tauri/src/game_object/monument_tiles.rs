@@ -298,7 +298,7 @@ pub static MONUMENT_TILE_LIST: [&MonumentTile; 13] = [
     &SHRINE_4,
 ];
 
-pub fn shuffle_monument_tiles() -> Vec<&'static MonumentTile<'static>> {
+pub fn shuffled_monument_tiles() -> Vec<&'static MonumentTile<'static>> {
     let mut rng = rand::thread_rng();
     let mut monument_tiles = MONUMENT_TILE_LIST.to_vec();
     monument_tiles.shuffle(&mut rng);
@@ -696,8 +696,8 @@ mod tests {
     }
 
     #[test]
-    fn test_shuffle_monument_tiles() {
-        let monument_tiles = shuffle_monument_tiles();
+    fn test_shuffled_monument_tiles() {
+        let monument_tiles = shuffled_monument_tiles();
         assert_eq!(monument_tiles.len(), 13);
     }
 }

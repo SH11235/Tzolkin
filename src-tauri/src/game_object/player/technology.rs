@@ -11,6 +11,8 @@ impl Increment for TechnologyLevel {
         }
     }
 }
+
+#[derive(Clone, Debug, Serialize)]
 pub enum TechnologyType {
     Agriculture,
     Resource,

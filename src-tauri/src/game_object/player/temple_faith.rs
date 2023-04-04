@@ -2,6 +2,13 @@ use serde::Serialize;
 
 use crate::game_object::temple::{Chaac, Quetzalcoatl, Kukulkan, Temple};
 
+#[derive(Clone, Debug, Serialize)]
+pub enum TempleFaithType {
+    Chaac,
+    Quetzalcoatl,
+    Kukulkan,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TempleFaith {
     pub chaac: Chaac,

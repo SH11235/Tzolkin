@@ -11,7 +11,7 @@ use self::{
 };
 use super::{
     action_space::WorkerPosition,
-    construction_tiles::{ConstructionType, CONSTRUCTION_TILE_LIST},
+    construction_tiles::{ConstructionType, CONSTRUCTION_FIRST_TILE_LIST},
     monument_tiles::MONUMENT_TILE_LIST,
     temple::Temple,
 };
@@ -186,7 +186,7 @@ impl Player {
     }
 
     pub fn graveyard_tile_count(&self) -> u32 {
-        let construction_count = CONSTRUCTION_TILE_LIST
+        let construction_first_count = CONSTRUCTION_FIRST_TILE_LIST
             .iter()
             .filter(|construction_tile| {
                 self.construction_ids
@@ -200,6 +200,7 @@ impl Player {
                 },
             )
             .count() as u32;
+        // TODO let construction_second_count
         let monument_count = MONUMENT_TILE_LIST
             .iter()
             .filter(|monument_tile| self.monument_ids.iter().any(|id| id == &monument_tile.id))
@@ -208,11 +209,11 @@ impl Player {
                 _ => false,
             })
             .count() as u32;
-        construction_count + monument_count
+        construction_first_count + monument_count
     }
 
     pub fn municipal_tile_count(&self) -> u32 {
-        let construction_count = CONSTRUCTION_TILE_LIST
+        let construction_count = CONSTRUCTION_FIRST_TILE_LIST
             .iter()
             .filter(|construction_tile| {
                 self.construction_ids
@@ -238,7 +239,7 @@ impl Player {
     }
 
     pub fn shrine_tile_count(&self) -> u32 {
-        let construction_count = CONSTRUCTION_TILE_LIST
+        let construction_count = CONSTRUCTION_FIRST_TILE_LIST
             .iter()
             .filter(|construction_tile| {
                 self.construction_ids
