@@ -1,17 +1,5 @@
 import { useState } from "react";
 import "./App.css";
-import { Temple } from "./components/Temple";
-import {
-  ChaacBonus,
-  QuetzalcoatlBonus,
-  KukulkanBonus,
-  CHAAC,
-  ChaacTopBonusPoints,
-  QuetzalcoatlTopBonusPoints,
-  KukulkanTopBonusPoints,
-  QUETZALCOATL,
-  KUKULKAN,
-} from "./constant";
 import { PlayersNumber } from "./components/PlayersNumber";
 import { FieldContainer } from "./components/FieldContainer";
 import { GamePlayers } from "./types/GamePlayer";
@@ -19,6 +7,7 @@ import { FirstResourcesState } from "./types/FirstResource";
 import { FirstResourceModal } from "./components/FirstResourceModal";
 import { TechnologyLevel } from "./components/TechnologyLevel";
 import { PlayersTable } from "./components/PlayerStatus";
+import { TemplesContainer } from "./components/TemplesContainer";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
@@ -85,51 +74,11 @@ function App() {
         </div>
 
         <div className="row">
-          <FieldContainer palenqueChips={palenqueChips} palenqueWorkers={palenqueWorkers} />
-          <span className="temples">
-            <Temple
-              name={`${CHAAC}`}
-              playerScores={
-                players.map((player) => {
-                  return {
-                    color: player.color,
-                    index: player.temple_faith.chaac,
-                  };
-                }) || []
-              }
-              templeBonus={ChaacBonus}
-              templePoints={ChaacTopBonusPoints}
-              templeColor="brown"
-            />
-            <Temple
-              name={QUETZALCOATL}
-              playerScores={
-                players.map((player) => {
-                  return {
-                    color: player.color,
-                    index: player.temple_faith.quetzalcoatl,
-                  };
-                }) || []
-              }
-              templeBonus={QuetzalcoatlBonus}
-              templePoints={QuetzalcoatlTopBonusPoints}
-              templeColor="yellow"
-            />
-            <Temple
-              name={KUKULKAN}
-              playerScores={
-                players.map((player) => {
-                  return {
-                    color: player.color,
-                    index: player.temple_faith.kukulkan,
-                  };
-                }) || []
-              }
-              templeBonus={KukulkanBonus}
-              templePoints={KukulkanTopBonusPoints}
-              templeColor="green"
-            />
-          </span>
+          <FieldContainer
+            palenqueChips={palenqueChips}
+            palenqueWorkers={palenqueWorkers}
+          />
+          <TemplesContainer players={players} />
         </div>
 
         <div className="row">
