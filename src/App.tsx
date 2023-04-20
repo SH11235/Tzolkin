@@ -78,7 +78,6 @@ function App() {
             palenqueChips={palenqueChips}
             palenqueWorkers={palenqueWorkers}
           />
-          <TemplesContainer players={players} />
         </div>
 
         <div className="row">
@@ -88,8 +87,12 @@ function App() {
         </div>
 
         <div className="row">
-          <PlayersTable players={players}></PlayersTable>
+          <TemplesContainer players={players} />
           <TechnologyLevel players={players} />
+        </div>
+
+        <div className="row">
+          <PlayersTable players={players}></PlayersTable>
         </div>
       </div>
       <FirstResourceModal
