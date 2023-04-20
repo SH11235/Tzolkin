@@ -33,6 +33,7 @@ export const PlayersTable = ({ players }: Props) => {
             <TableCell align="center">Woods</TableCell>
             <TableCell align="center">Stones</TableCell>
             <TableCell align="center">Golds</TableCell>
+            <TableCell align="center">Skulls</TableCell>
             <TableCell align="center">Corn Tiles</TableCell>
             <TableCell align="center">Wood Tiles</TableCell>
             <TableCell align="center">Points</TableCell>
@@ -64,6 +65,7 @@ export const PlayersTable = ({ players }: Props) => {
               <TableCell align="center">{player.resource.woods}</TableCell>
               <TableCell align="center">{player.resource.stones}</TableCell>
               <TableCell align="center">{player.resource.golds}</TableCell>
+              <TableCell align="center">{player.resource.skulls}</TableCell>
               <TableCell align="center">{player.corn_tiles}</TableCell>
               <TableCell align="center">{player.wood_tiles}</TableCell>
               <TableCell align="center">{player.points}</TableCell>
