@@ -7,6 +7,7 @@ mod game_object;
 mod utils;
 
 use game_object::{
+    construction_tiles::ConstructionTile,
     first_resource_tiles::Tile,
     food_day::FoodDayStatus,
     game::Game,
@@ -23,19 +24,19 @@ use crate::game_object::first_resource_tiles::shuffle_tile_list;
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #[derive(Serialize)]
-struct AppState {
+struct GameState {
     game_players: Mutex<Vec<Player>>,
     field_skulls: Mutex<FieldSkulls>,
 }
 
 #[tauri::command]
-fn get_players(app_state: State<AppState>) -> Vec<Player> {
+fn get_players(app_state: State<GameState>) -> Vec<Player> {
     let players = app_state.game_players.lock().unwrap();
     players.clone()
 }
 
 #[tauri::command]
-fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, String> {
+fn set_players(number: u32, app_state: State<GameState>) -> Result<Vec<Player>, String> {
     if (number > 0) && (number < 5) {
         println!("number of players: {}", number);
         let players: Vec<Player> = (1..=number)
@@ -50,7 +51,7 @@ fn set_players(number: u32, app_state: State<AppState>) -> Result<Vec<Player>, S
 }
 
 #[tauri::command]
-fn add_worker(player_id: u32, app_state: State<AppState>) -> Result<Player, String> {
+fn add_worker(player_id: u32, app_state: State<GameState>) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
     let player = find_player_by_id(player_id, &mut players)?;
     player.add_worker();
@@ -58,7 +59,7 @@ fn add_worker(player_id: u32, app_state: State<AppState>) -> Result<Player, Stri
 }
 
 #[tauri::command]
-fn get_first_resource_tiles(app_state: State<AppState>) -> Vec<Vec<&Tile>> {
+fn get_first_resource_tiles(app_state: State<GameState>) -> Vec<Vec<&Tile>> {
     let players = app_state.game_players.lock().unwrap();
     let tile_list = shuffle_tile_list();
     // TODO ダミーworker init処理
@@ -80,7 +81,7 @@ fn add_resource(
     player_id: u32,
     resource_type: String,
     amount: u32,
-    app_state: State<AppState>,
+    app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
     let player = find_player_by_id(player_id, &mut players)?;
@@ -108,7 +109,7 @@ fn add_resource(
 }
 
 #[tauri::command]
-fn get_field_skulls(app_state: State<AppState>) -> u32 {
+fn get_field_skulls(app_state: State<GameState>) -> u32 {
     app_state
         .field_skulls
         .lock()
@@ -129,7 +130,7 @@ fn raise_technology_level(
     player_id: u32,
     technology_type: String,
     reward_option: Option<RewardOption>,
-    app_state: State<AppState>,
+    app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
     let player = find_player_by_id(player_id, &mut players)?;
@@ -211,7 +212,7 @@ fn raise_temple_faith(
     player_id: u32,
     temple_type: String,
     amount: u32,
-    app_state: State<AppState>,
+    app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
     let player = find_player_by_id(player_id, &mut players)?;
@@ -240,7 +241,7 @@ fn raise_temple_faith(
 fn save_corn(
     player_id: u32,
     save_type: String,
-    app_state: State<AppState>,
+    app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
     let player = find_player_by_id(player_id, &mut players)?;
@@ -271,7 +272,7 @@ fn find_player_by_id<'a>(
 
 fn main() {
     let players: Vec<Player> = Vec::new();
-    let app_state = AppState {
+    let app_state = GameState {
         game_players: Mutex::new(players),
         field_skulls: Mutex::new(FieldSkulls::new()),
     };
