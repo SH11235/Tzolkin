@@ -1,6 +1,6 @@
 import { useState } from "react";
 import "./App.css";
-import { PlayersNumber } from "./components/PlayersNumber";
+import { GameCondition } from "./components/GameCondition";
 import { FieldContainer } from "./components/FieldContainer";
 import { GamePlayers } from "./types/GamePlayer";
 import { FirstResourcesState } from "./types/FirstResource";
@@ -61,7 +61,7 @@ function App() {
         </div>
 
         <div className="row">
-          <PlayersNumber
+          <GameCondition
             setPlayers={setPlayers}
             setPalenqueChips={setPalenqueChips}
             setFirstResources={setFirstResources}
