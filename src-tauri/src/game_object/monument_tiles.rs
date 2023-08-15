@@ -298,11 +298,32 @@ pub static MONUMENT_TILE_LIST: [&MonumentTile; 13] = [
     &SHRINE_4,
 ];
 
-pub fn shuffled_monument_tiles() -> Vec<&'static MonumentTile<'static>> {
+pub fn shuffled_monument_tiles(players_number: u32) -> Vec<MonumentTile<'static>> {
     let mut rng = rand::thread_rng();
-    let mut monument_tiles = MONUMENT_TILE_LIST.to_vec();
+    let mut monument_tiles: Vec<_> = MONUMENT_TILE_LIST
+        .iter()
+        .cloned()
+        .collect();
     monument_tiles.shuffle(&mut rng);
-    monument_tiles
+    if players_number == 1 || players_number == 2 {
+        return monument_tiles
+            .into_iter()
+            .take(4)
+            .map(|tile_ref| tile_ref.clone())
+            .collect();
+    } else if players_number == 3 {
+        return monument_tiles
+            .into_iter()
+            .take(5)
+            .map(|tile_ref| tile_ref.clone())
+            .collect();
+    } else {
+        return monument_tiles
+            .into_iter()
+            .take(6)
+            .map(|tile_ref| tile_ref.clone())
+            .collect();
+    }
 }
 
 #[cfg(test)]
@@ -697,7 +718,15 @@ mod tests {
 
     #[test]
     fn test_shuffled_monument_tiles() {
-        let monument_tiles = shuffled_monument_tiles();
-        assert_eq!(monument_tiles.len(), 13);
+        let monument_tiles = shuffled_monument_tiles(1);
+        assert_eq!(monument_tiles.len(), 4);
+        let monument_tiles = shuffled_monument_tiles(2);
+        assert_eq!(monument_tiles.len(), 4);
+        let monument_tiles = shuffled_monument_tiles(3);
+        assert_eq!(monument_tiles.len(), 5);
+        let monument_tiles = shuffled_monument_tiles(4);
+        assert_eq!(monument_tiles.len(), 6);
+        let monument_tiles = shuffled_monument_tiles(5);
+        assert_eq!(monument_tiles.len(), 6);
     }
 }

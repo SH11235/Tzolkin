@@ -7,10 +7,15 @@ mod game_object;
 mod utils;
 
 use game_object::{
-    construction_tiles::ConstructionTile,
+    construction_tiles::{
+        shuffled_construction_first_tile_expansion_list, shuffled_construction_first_tile_list,
+        shuffled_construction_second_tile_expansion_list, shuffled_construction_second_tile_list,
+        ConstructionTile,
+    },
     first_resource_tiles::Tile,
     food_day::FoodDayStatus,
     game::Game,
+    monument_tiles::{shuffled_monument_tiles, MonumentTile},
     player::{
         technology::{TechnologyProgressReward, TechnologyType},
         Player, PlayerColor,
@@ -24,9 +29,19 @@ use crate::game_object::first_resource_tiles::shuffle_tile_list;
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #[derive(Serialize)]
-struct GameState {
+struct GameState<'a> {
     game_players: Mutex<Vec<Player>>,
+    first_construction_tiles: Mutex<Vec<ConstructionTileState<'a>>>,
+    second_construction_tiles: Mutex<Vec<ConstructionTileState<'a>>>,
+    monument_tiles: Mutex<Vec<MonumentTile<'a>>>,
     field_skulls: Mutex<FieldSkulls>,
+}
+
+#[derive(Serialize)]
+struct ConstructionTileState<'a> {
+    is_placed: bool,
+    is_owned: bool,
+    construction_tile: ConstructionTile<'a>,
 }
 
 #[tauri::command]
@@ -59,7 +74,7 @@ fn add_worker(player_id: u32, app_state: State<GameState>) -> Result<Player, Str
 }
 
 #[tauri::command]
-fn get_first_resource_tiles(app_state: State<GameState>) -> Vec<Vec<&Tile>> {
+fn get_first_resource_tiles<'a>(app_state: State<GameState<'a>>) -> Vec<Vec<&'a Tile>> {
     let players = app_state.game_players.lock().unwrap();
     let tile_list = shuffle_tile_list();
     // TODO ダミーworker init処理
@@ -74,6 +89,76 @@ fn get_first_resource_tiles(app_state: State<GameState>) -> Vec<Vec<&Tile>> {
         tile_list_vec.push(tile_list_slice);
     }
     tile_list_vec
+}
+
+#[derive(Serialize)]
+struct InitialBuildings<'a> {
+    constructions: Vec<ConstructionTile<'a>>,
+    monunents: Vec<MonumentTile<'a>>,
+}
+
+#[tauri::command]
+fn set_constructions_and_monuments<'a>(
+    is_expansion: bool,
+    app_state: State<GameState<'a>>,
+) -> InitialBuildings<'a> {
+    let players_number = app_state.game_players.lock().unwrap().len();
+    let first_constructions = if is_expansion {
+        shuffled_construction_first_tile_list()
+    } else {
+        shuffled_construction_first_tile_expansion_list()
+    };
+    let second_constructions = if is_expansion {
+        shuffled_construction_second_tile_list()
+    } else {
+        shuffled_construction_second_tile_expansion_list()
+    };
+    let monuments = shuffled_monument_tiles(players_number.try_into().unwrap());
+    let mut first_construction_tiles_order = app_state.first_construction_tiles.lock().unwrap();
+    let mut second_construction_tiles_order = app_state.second_construction_tiles.lock().unwrap();
+    let mut monument_tiles = app_state.monument_tiles.lock().unwrap();
+    // GameStateに状態を保存
+    // 先頭6枚は公開されるのでis_placed: trueにする
+    let first_construction_tile_states: Vec<ConstructionTileState> = first_constructions
+        .clone()
+        .into_iter()
+        .enumerate()
+        .map(|(i, tile)| {
+            if i < 6 {
+                ConstructionTileState {
+                    is_placed: true,
+                    is_owned: false,
+                    construction_tile: tile,
+                }
+            } else {
+                ConstructionTileState {
+                    is_placed: false,
+                    is_owned: false,
+                    construction_tile: tile,
+                }
+            }
+        })
+        .collect();
+    *first_construction_tiles_order = first_construction_tile_states;
+    let second_construction_tile_states: Vec<ConstructionTileState> = second_constructions
+        .clone()
+        .into_iter()
+        .enumerate()
+        .map(|(_i, tile)| ConstructionTileState {
+            is_placed: false,
+            is_owned: false,
+            construction_tile: tile,
+        })
+        .collect();
+    *second_construction_tiles_order = second_construction_tile_states;
+    *monument_tiles = monuments.clone();
+    // フロントエンドにはオープンな枚数分の情報を返す
+    // first_constructionsから先頭6枚を取り出す
+    let return_first_constructions = first_constructions.clone().iter().take(6).cloned().collect();
+    InitialBuildings {
+        constructions: return_first_constructions,
+        monunents: monuments,
+    }
 }
 
 #[tauri::command]
@@ -272,8 +357,14 @@ fn find_player_by_id<'a>(
 
 fn main() {
     let players: Vec<Player> = Vec::new();
+    let first_construction_tiles: Vec<ConstructionTileState<'static>> = Vec::new();
+    let second_construction_tiles: Vec<ConstructionTileState<'static>> = Vec::new();
+    let monument_tiles: Vec<MonumentTile<'static>> = Vec::new();
     let app_state = GameState {
         game_players: Mutex::new(players),
+        first_construction_tiles: Mutex::new(first_construction_tiles),
+        second_construction_tiles: Mutex::new(second_construction_tiles),
+        monument_tiles: Mutex::new(monument_tiles),
         field_skulls: Mutex::new(FieldSkulls::new()),
     };
 
@@ -284,6 +375,7 @@ fn main() {
             set_players,
             add_worker,
             get_first_resource_tiles,
+            set_constructions_and_monuments,
             add_resource,
             get_field_skulls,
             raise_technology_level,

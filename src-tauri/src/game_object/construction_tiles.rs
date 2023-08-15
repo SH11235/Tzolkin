@@ -61,12 +61,12 @@ pub enum ConstructionReward {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct ConstructionTile<'a, 'b> {
+pub struct ConstructionTile<'a> {
     pub id: u32,
     pub name: &'a str,
     pub cost: Cost,
     pub construction_type: ConstructionType,
-    pub construction_rewards: &'b [ConstructionReward],
+    pub construction_rewards: &'a [ConstructionReward],
     pub generation: Generation,
     pub expansion: bool,
 }
@@ -82,7 +82,7 @@ impl ConstructionTileId {
     }
 }
 
-static FARM_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_FIRST_1: ConstructionTile<'static> = ConstructionTile {
     id: 1,
     name: "Farm First 1",
     cost: Cost {
@@ -99,7 +99,7 @@ static FARM_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static FARM_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_FIRST_2: ConstructionTile<'static> = ConstructionTile {
     id: 2,
     name: "Farm First 2",
     cost: Cost {
@@ -116,7 +116,7 @@ static FARM_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static FARM_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_FIRST_3: ConstructionTile<'static> = ConstructionTile {
     id: 3,
     name: "Farm First 3",
     cost: Cost {
@@ -133,7 +133,7 @@ static FARM_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static FARM_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_FIRST_4: ConstructionTile<'static> = ConstructionTile {
     id: 4,
     name: "Farm First 4",
     cost: Cost {
@@ -150,7 +150,7 @@ static FARM_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static FARM_FIRST_5: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_FIRST_5: ConstructionTile<'static> = ConstructionTile {
     id: 5,
     name: "Farm First 5",
     cost: Cost {
@@ -167,7 +167,7 @@ static FARM_FIRST_5: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static GRAVEYARD_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_FIRST_1: ConstructionTile<'static> = ConstructionTile {
     id: 6,
     name: "Graveyard First 1",
     cost: Cost {
@@ -189,7 +189,7 @@ static GRAVEYARD_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: false,
 };
 
-static GRAVEYARD_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_FIRST_2: ConstructionTile<'static> = ConstructionTile {
     id: 7,
     name: "Graveyard First 2",
     cost: Cost {
@@ -211,7 +211,7 @@ static GRAVEYARD_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: false,
 };
 
-static GRAVEYARD_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_FIRST_3: ConstructionTile<'static> = ConstructionTile {
     id: 8,
     name: "Graveyard First 3",
     cost: Cost {
@@ -226,7 +226,7 @@ static GRAVEYARD_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: true,
 };
 
-static MUNICIPAL_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_FIRST_1: ConstructionTile<'static> = ConstructionTile {
     id: 9,
     name: "Municipal First 1",
     cost: Cost {
@@ -243,7 +243,7 @@ static MUNICIPAL_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: false,
 };
 
-static MUNICIPAL_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_FIRST_2: ConstructionTile<'static> = ConstructionTile {
     id: 10,
     name: "Municipal First 2",
     cost: Cost {
@@ -269,7 +269,7 @@ static MUNICIPAL_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: false,
 };
 
-static MUNICIPAL_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_FIRST_3: ConstructionTile<'static> = ConstructionTile {
     id: 11,
     name: "Municipal First 3",
     cost: Cost {
@@ -295,7 +295,7 @@ static MUNICIPAL_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: false,
 };
 
-static MUNICIPAL_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_FIRST_4: ConstructionTile<'static> = ConstructionTile {
     id: 12,
     name: "Municipal First 4",
     cost: Cost {
@@ -321,7 +321,7 @@ static MUNICIPAL_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: false,
 };
 
-static SHRINE_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_FIRST_1: ConstructionTile<'static> = ConstructionTile {
     id: 13,
     name: "Shrine First 1",
     cost: Cost {
@@ -338,7 +338,7 @@ static SHRINE_FIRST_1: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static SHRINE_FIRST_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_FIRST_2: ConstructionTile<'static> = ConstructionTile {
     id: 14,
     name: "Shrine First 2",
     cost: Cost {
@@ -372,14 +372,17 @@ pub static CONSTRUCTION_FIRST_TILE_LIST: [&ConstructionTile; 14] = [
     &SHRINE_FIRST_2,
 ];
 
-pub fn shuffled_construction_first_tile_list() -> Vec<&'static ConstructionTile<'static, 'static>> {
+pub fn shuffled_construction_first_tile_list() -> Vec<ConstructionTile<'static>> {
     let mut rng = rand::thread_rng();
-    let mut shuffled_list = CONSTRUCTION_FIRST_TILE_LIST.to_vec();
+    let mut shuffled_list: Vec<_> = CONSTRUCTION_FIRST_TILE_LIST.iter().cloned().collect();
     shuffled_list.shuffle(&mut rng);
     shuffled_list
+        .into_iter()
+        .map(|tile_ref| tile_ref.clone())
+        .collect()
 }
 
-static FARM_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_SECOND_1: ConstructionTile<'static> = ConstructionTile {
     id: 15,
     name: "Farm Second 1",
     cost: Cost {
@@ -396,7 +399,7 @@ static FARM_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static FARM_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_SECOND_2: ConstructionTile<'static> = ConstructionTile {
     id: 16,
     name: "Farm Second 2",
     cost: Cost {
@@ -413,7 +416,7 @@ static FARM_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static FARM_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_SECOND_3: ConstructionTile<'static> = ConstructionTile {
     id: 17,
     name: "Farm Second 3",
     cost: Cost {
@@ -430,7 +433,7 @@ static FARM_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static GRAVEYARD_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_SECOND_1: ConstructionTile<'static> = ConstructionTile {
     id: 18,
     name: "Graveyard Second 1",
     cost: Cost {
@@ -448,7 +451,7 @@ static GRAVEYARD_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static GRAVEYARD_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_SECOND_2: ConstructionTile<'static> = ConstructionTile {
     id: 19,
     name: "Graveyard Second 2",
     cost: Cost {
@@ -466,7 +469,7 @@ static GRAVEYARD_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static GRAVEYARD_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_SECOND_3: ConstructionTile<'static> = ConstructionTile {
     id: 20,
     name: "Graveyard Second 3",
     cost: Cost {
@@ -484,7 +487,7 @@ static GRAVEYARD_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static GRAVEYARD_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_SECOND_4: ConstructionTile<'static> = ConstructionTile {
     id: 21,
     name: "Graveyard Second 4",
     cost: Cost {
@@ -502,7 +505,7 @@ static GRAVEYARD_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static GRAVEYARD_SECOND_5: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_SECOND_5: ConstructionTile<'static> = ConstructionTile {
     id: 22,
     name: "Graveyard Second 5",
     cost: Cost {
@@ -528,7 +531,7 @@ static GRAVEYARD_SECOND_5: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static MUNICIPAL_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_SECOND_1: ConstructionTile<'static> = ConstructionTile {
     id: 23,
     name: "Municipal Second 1",
     cost: Cost {
@@ -552,7 +555,7 @@ static MUNICIPAL_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static MUNICIPAL_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_SECOND_2: ConstructionTile<'static> = ConstructionTile {
     id: 24,
     name: "Municipal Second 2",
     cost: Cost {
@@ -576,7 +579,7 @@ static MUNICIPAL_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static MUNICIPAL_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_SECOND_3: ConstructionTile<'static> = ConstructionTile {
     id: 25,
     name: "Municipal Second 3",
     cost: Cost {
@@ -600,7 +603,7 @@ static MUNICIPAL_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static MUNICIPAL_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_SECOND_4: ConstructionTile<'static> = ConstructionTile {
     id: 26,
     name: "Municipal Second 4",
     cost: Cost {
@@ -624,7 +627,7 @@ static MUNICIPAL_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: false,
 };
 
-static SHRINE_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_SECOND_1: ConstructionTile<'static> = ConstructionTile {
     id: 27,
     name: "Shrine Second 1",
     cost: Cost {
@@ -647,7 +650,7 @@ static SHRINE_SECOND_1: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static SHRINE_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_SECOND_2: ConstructionTile<'static> = ConstructionTile {
     id: 28,
     name: "Shrine Second 2",
     cost: Cost {
@@ -667,7 +670,7 @@ static SHRINE_SECOND_2: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static SHRINE_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_SECOND_3: ConstructionTile<'static> = ConstructionTile {
     id: 29,
     name: "Shrine Second 3",
     cost: Cost {
@@ -690,7 +693,7 @@ static SHRINE_SECOND_3: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static SHRINE_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_SECOND_4: ConstructionTile<'static> = ConstructionTile {
     id: 30,
     name: "Shrine Second 4",
     cost: Cost {
@@ -715,7 +718,7 @@ static SHRINE_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static SHRINE_SECOND_5: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_SECOND_5: ConstructionTile<'static> = ConstructionTile {
     id: 31,
     name: "Shrine Second 5",
     cost: Cost {
@@ -733,7 +736,7 @@ static SHRINE_SECOND_5: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: false,
 };
 
-static SHRINE_SECOND_6: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_SECOND_6: ConstructionTile<'static> = ConstructionTile {
     id: 32,
     name: "Shrine Second 6",
     cost: Cost {
@@ -777,16 +780,18 @@ pub static CONSTRUCTION_SECOND_TILE_LIST: [&ConstructionTile; 18] = [
     &SHRINE_SECOND_6,
 ];
 
-pub fn shuffled_construction_second_tile_list() -> Vec<&'static ConstructionTile<'static, 'static>>
-{
+pub fn shuffled_construction_second_tile_list() -> Vec<ConstructionTile<'static>> {
     let mut rng = rand::thread_rng();
-    let mut shuffled_list = CONSTRUCTION_SECOND_TILE_LIST.to_vec();
+    let mut shuffled_list: Vec<_> = CONSTRUCTION_SECOND_TILE_LIST.iter().cloned().collect();
     shuffled_list.shuffle(&mut rng);
     shuffled_list
+        .into_iter()
+        .map(|tile_ref| tile_ref.clone())
+        .collect()
 }
 
 // TODO: 拡張タイルの効果の実装
-static FARM_FIRST_6: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_FIRST_6: ConstructionTile<'static> = ConstructionTile {
     id: 33,
     name: "Farm First 6",
     cost: Cost {
@@ -801,7 +806,7 @@ static FARM_FIRST_6: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: true,
 };
 
-static GRAVEYARD_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_FIRST_4: ConstructionTile<'static> = ConstructionTile {
     id: 34,
     name: "Graveyard First 4",
     cost: Cost {
@@ -816,7 +821,7 @@ static GRAVEYARD_FIRST_4: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: true,
 };
 
-static MUNICIPAL_FIRST_5: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_FIRST_5: ConstructionTile<'static> = ConstructionTile {
     id: 35,
     name: "Municipal First 5",
     cost: Cost {
@@ -831,7 +836,7 @@ static MUNICIPAL_FIRST_5: ConstructionTile<'static, 'static> = ConstructionTile 
     expansion: true,
 };
 
-static SHRINE_FIRST_3: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_FIRST_3: ConstructionTile<'static> = ConstructionTile {
     id: 36,
     name: "Shrine First 3",
     cost: Cost {
@@ -867,15 +872,20 @@ pub static CONSTRUCTION_FIRST_TILE_EXPANSION_LIST: [&ConstructionTile; 18] = [
     &SHRINE_FIRST_3,
 ];
 
-pub fn shuffled_construction_first_tile_expansion_list(
-) -> Vec<&'static ConstructionTile<'static, 'static>> {
+pub fn shuffled_construction_first_tile_expansion_list() -> Vec<ConstructionTile<'static>> {
     let mut rng = rand::thread_rng();
-    let mut shuffled_list = CONSTRUCTION_FIRST_TILE_EXPANSION_LIST.to_vec();
+    let mut shuffled_list: Vec<_> = CONSTRUCTION_FIRST_TILE_EXPANSION_LIST
+        .iter()
+        .cloned()
+        .collect();
     shuffled_list.shuffle(&mut rng);
     shuffled_list
+        .into_iter()
+        .map(|tile_ref| tile_ref.clone())
+        .collect()
 }
 
-static FARM_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile {
+static FARM_SECOND_4: ConstructionTile<'static> = ConstructionTile {
     id: 37,
     name: "Farm Second 4",
     cost: Cost {
@@ -896,7 +906,7 @@ static FARM_SECOND_4: ConstructionTile<'static, 'static> = ConstructionTile {
     expansion: true,
 };
 
-static GRAVEYARD_SECOND_6: ConstructionTile<'static, 'static> = ConstructionTile {
+static GRAVEYARD_SECOND_6: ConstructionTile<'static> = ConstructionTile {
     id: 38,
     name: "Graveyard Second 6",
     cost: Cost {
@@ -914,7 +924,7 @@ static GRAVEYARD_SECOND_6: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: true,
 };
 
-static MUNICIPAL_SECOND_5: ConstructionTile<'static, 'static> = ConstructionTile {
+static MUNICIPAL_SECOND_5: ConstructionTile<'static> = ConstructionTile {
     id: 39,
     name: "Municipal Second 5",
     cost: Cost {
@@ -931,7 +941,7 @@ static MUNICIPAL_SECOND_5: ConstructionTile<'static, 'static> = ConstructionTile
     expansion: true,
 };
 
-static SHRINE_SECOND_7: ConstructionTile<'static, 'static> = ConstructionTile {
+static SHRINE_SECOND_7: ConstructionTile<'static> = ConstructionTile {
     id: 40,
     name: "Shrine Second 7",
     cost: Cost {
@@ -974,12 +984,17 @@ pub static CONSTRUCTION_SECOND_TILE_EXPANSION_LIST: [&ConstructionTile; 22] = [
     &SHRINE_SECOND_7,
 ];
 
-pub fn shuffled_construction_second_tile_expansion_list(
-) -> Vec<&'static ConstructionTile<'static, 'static>> {
+pub fn shuffled_construction_second_tile_expansion_list() -> Vec<ConstructionTile<'static>> {
     let mut rng = rand::thread_rng();
-    let mut shuffled_list = CONSTRUCTION_SECOND_TILE_EXPANSION_LIST.to_vec();
+    let mut shuffled_list: Vec<_> = CONSTRUCTION_SECOND_TILE_EXPANSION_LIST
+        .iter()
+        .cloned()
+        .collect();
     shuffled_list.shuffle(&mut rng);
     shuffled_list
+        .into_iter()
+        .map(|tile_ref| tile_ref.clone())
+        .collect()
 }
 
 #[cfg(test)]
