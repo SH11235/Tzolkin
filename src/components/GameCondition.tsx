@@ -21,14 +21,14 @@ export const GameCondition = ({
   setPalenqueChips,
   setFirstResources,
 }: gameConditionProps) => {
-  const [playersNumber, setplayersNumber] = React.useState(0);
+  const [playersNumber, setPlayersNumber] = React.useState(0);
   const [isExpansion, setIsExpansion] = React.useState(false);
 
   const numberOnChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const newValue = event.target.value;
     if (/^[1-4]$/.test(newValue)) {
       const number = parseInt(newValue);
-      setplayersNumber(number);
+      setPlayersNumber(number);
     }
   };
 
