@@ -14,6 +14,7 @@ function App() {
   const [fieldSkulls, setFieldSkulls] = useState(13);
   const [firstResources, setFirstResources] = useState<FirstResourcesState>([]);
   const [round, setRound] = useState(1);
+  const [isStartIconHidden, setIsStartIconHidden] = useState(false);
   const [palenqueChips, setPalenqueChips] = useState<
     {
       wood: number;
@@ -51,22 +52,27 @@ function App() {
   return (
     <>
       <div className="container">
-        <div className="row">
-          <a
-            href="https://ja.boardgamearena.com/gamepanel?game=tzolkin"
-            target="_blank"
-          >
-            <img src="/gear_logo.png" className="logo gear" alt="Gear logo" />
-          </a>
-        </div>
+        {!isStartIconHidden && (
+          <div className="row">
+            <a
+              href="https://ja.boardgamearena.com/gamepanel?game=tzolkin"
+              target="_blank"
+            >
+              <img src="/gear_logo.png" className="logo gear" alt="Gear logo" />
+            </a>
+          </div>
+        )}
 
-        <div className="row">
-          <GameCondition
-            setPlayers={setPlayers}
-            setPalenqueChips={setPalenqueChips}
-            setFirstResources={setFirstResources}
-          />
-        </div>
+        {!isStartIconHidden && (
+          <div className="row">
+            <GameCondition
+              setPlayers={setPlayers}
+              setPalenqueChips={setPalenqueChips}
+              setFirstResources={setFirstResources}
+              hideIcon={() => setIsStartIconHidden(true)}
+            />
+          </div>
+        )}
 
         <div className="row">
           <span className="game-status">Round：{round}</span>

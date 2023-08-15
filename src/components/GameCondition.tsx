@@ -14,12 +14,14 @@ interface gameConditionProps {
     >
   >;
   setFirstResources: React.Dispatch<React.SetStateAction<FirstResourcesState>>;
+  hideIcon: () => void;
 }
 
 export const GameCondition = ({
   setPlayers,
   setPalenqueChips,
   setFirstResources,
+  hideIcon,
 }: gameConditionProps) => {
   const [playersNumber, setPlayersNumber] = React.useState(0);
   const [isExpansion, setIsExpansion] = React.useState(false);
@@ -73,6 +75,9 @@ export const GameCondition = ({
         }
       );
       setFirstResources(firstResourceTilesState);
+
+      // アイコンを隠す
+      hideIcon();
     } catch (e) {
       // TODO error modal
       console.error(e);
