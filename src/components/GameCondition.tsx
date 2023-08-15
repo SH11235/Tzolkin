@@ -3,7 +3,7 @@ import React from "react";
 import { FirstResources, FirstResourcesState } from "../types/FirstResource";
 import { GamePlayers } from "../types/GamePlayer";
 
-interface playersProps {
+interface gameConditionProps {
   setPlayers: React.Dispatch<React.SetStateAction<GamePlayers>>;
   setPalenqueChips: React.Dispatch<
     React.SetStateAction<
@@ -20,14 +20,20 @@ export const GameCondition = ({
   setPlayers,
   setPalenqueChips,
   setFirstResources,
-}: playersProps) => {
+}: gameConditionProps) => {
   const [playersNumber, setplayersNumber] = React.useState(0);
+  const [isExpansion, setIsExpansion] = React.useState(false);
+
   const numberOnChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     const newValue = event.target.value;
     if (/^[1-4]$/.test(newValue)) {
       const number = parseInt(newValue);
       setplayersNumber(number);
     }
+  };
+
+  const onRadioChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setIsExpansion(event.target.value === "yes");
   };
 
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -97,6 +103,26 @@ export const GameCondition = ({
         value={playersNumber}
         onChange={numberOnChange}
       />
+      <div>
+        <label>
+          <input
+            type="radio"
+            value="yes"
+            checked={isExpansion}
+            onChange={onRadioChange}
+          />
+          Expansion
+        </label>
+        <label>
+          <input
+            type="radio"
+            value="no"
+            checked={!isExpansion}
+            onChange={onRadioChange}
+          />
+          No Expansion
+        </label>
+      </div>
       <button id="submit-button" type="submit">
         OK
       </button>
