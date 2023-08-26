@@ -8,6 +8,7 @@ import { FirstResourceModal } from "./components/FirstResourceModal";
 import { TechnologyLevel } from "./components/TechnologyLevel";
 import { PlayersTable } from "./components/PlayerStatus";
 import { TemplesContainer } from "./components/TemplesContainer";
+import { TurnPlayer } from "./components/TurnPlayer";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
@@ -87,21 +88,7 @@ function App() {
           />
         </div>
 
-        <div className="row">
-          <div className="turn-player">
-            Turn Player:{" "}
-            <span
-              style={
-                players.length > 0
-                  ? { color: players[turnPlayerIndex].color }
-                  : {}
-              }
-            >
-              {players.length > 0 ? players[turnPlayerIndex].name : ""}
-            </span>
-            <span></span>
-          </div>
-        </div>
+        <TurnPlayer players={players} turnPlayerIndex={turnPlayerIndex} />
 
         <div className="row">
           <TemplesContainer players={players} />
