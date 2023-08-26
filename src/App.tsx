@@ -11,6 +11,7 @@ import { TemplesContainer } from "./components/TemplesContainer";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
+  const [turnPlayerIndex, setTurnPlayerIndex] = useState(0);
   const [fieldSkulls, setFieldSkulls] = useState(13);
   const [firstResources, setFirstResources] = useState<FirstResourcesState>([]);
   const [round, setRound] = useState(1);
@@ -88,7 +89,17 @@ function App() {
 
         <div className="row">
           <div className="turn-player">
-            Turn Player: {players.length > 0 ? players[0].name : ""}
+            Turn Player:{" "}
+            <span
+              style={
+                players.length > 0
+                  ? { color: players[turnPlayerIndex].color }
+                  : {}
+              }
+            >
+              {players.length > 0 ? players[turnPlayerIndex].name : ""}
+            </span>
+            <span></span>
           </div>
         </div>
 
