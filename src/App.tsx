@@ -9,6 +9,7 @@ import { TechnologyLevel } from "./components/TechnologyLevel";
 import { PlayersTable } from "./components/PlayerStatus";
 import { TemplesContainer } from "./components/TemplesContainer";
 import { TurnPlayer } from "./components/TurnPlayer";
+import { PassButton } from "./components/PassButton";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
@@ -89,6 +90,13 @@ function App() {
         </div>
 
         <TurnPlayer players={players} turnPlayerIndex={turnPlayerIndex} />
+        <PassButton
+          playersNumber={players.length}
+          playerIndex={turnPlayerIndex}
+          setTurnPlayerIndex={setTurnPlayerIndex}
+          round={round}
+          setRound={setRound}
+        />
 
         <div className="row">
           <TemplesContainer players={players} />
