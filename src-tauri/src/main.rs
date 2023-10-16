@@ -30,6 +30,8 @@ use crate::game_object::first_resource_tiles::shuffle_tile_list;
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #[derive(Serialize)]
 struct GameState<'a> {
+    round: u32,
+    turn_player_index: u32,
     game_players: Mutex<Vec<Player>>,
     first_construction_tiles: Mutex<Vec<ConstructionTileState<'a>>>,
     second_construction_tiles: Mutex<Vec<ConstructionTileState<'a>>>,
@@ -42,6 +44,11 @@ struct ConstructionTileState<'a> {
     is_placed: bool,
     is_owned: bool,
     construction_tile: ConstructionTile<'a>,
+}
+
+#[tauri::command]
+fn get_round(app_state: State<GameState>) -> u32 {
+    app_state.round
 }
 
 #[tauri::command]
@@ -66,9 +73,22 @@ fn set_players(number: u32, app_state: State<GameState>) -> Result<Vec<Player>, 
 }
 
 #[tauri::command]
+fn set_first_player(index: u32, app_state: State<GameState>) -> Result<Vec<Player>, String> {
+    let mut players = app_state.game_players.lock().unwrap();
+    let players_number = players.len();
+    let mut new_players: Vec<Player> = Vec::new();
+    for i in 0..players.len() {
+        let player = players.remove((i + index as usize) % players_number);
+        new_players.push(player);
+    }
+    *players = new_players.clone();
+    Ok(new_players)
+}
+
+#[tauri::command]
 fn add_worker(player_id: u32, app_state: State<GameState>) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
-    let player = find_player_by_id(player_id, &mut players)?;
+    let player = get_mut_player_by_id(player_id, &mut players)?;
     player.add_worker();
     Ok(player.clone())
 }
@@ -169,7 +189,7 @@ fn add_resource(
     app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
-    let player = find_player_by_id(player_id, &mut players)?;
+    let player = get_mut_player_by_id(player_id, &mut players)?;
     match resource_type.as_str() {
         "corn" => {
             player.corns += amount;
@@ -218,7 +238,7 @@ fn raise_technology_level(
     app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
-    let player = find_player_by_id(player_id, &mut players)?;
+    let player = get_mut_player_by_id(player_id, &mut players)?;
     let reward = match technology_type.as_str() {
         "agriculture" => player.technology.progress(TechnologyType::Agriculture),
         "resource" => player.technology.progress(TechnologyType::Resource),
@@ -300,7 +320,7 @@ fn raise_temple_faith(
     app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
-    let player = find_player_by_id(player_id, &mut players)?;
+    let player = get_mut_player_by_id(player_id, &mut players)?;
     match temple_type.as_str() {
         CHAAC => {
             for _ in 0..amount {
@@ -329,7 +349,7 @@ fn save_corn(
     app_state: State<GameState>,
 ) -> Result<Player, String> {
     let mut players = app_state.game_players.lock().unwrap();
-    let player = find_player_by_id(player_id, &mut players)?;
+    let player = get_mut_player_by_id(player_id, &mut players)?;
     match save_type.as_str() {
         "single" => {
             player.corn_save.single += 1;
@@ -345,7 +365,7 @@ fn save_corn(
     Ok(player.clone())
 }
 
-fn find_player_by_id<'a>(
+fn get_mut_player_by_id<'a>(
     player_id: u32,
     players: &'a mut Vec<Player>,
 ) -> Result<&'a mut Player, String> {
@@ -360,7 +380,10 @@ fn main() {
     let first_construction_tiles: Vec<ConstructionTileState<'static>> = Vec::new();
     let second_construction_tiles: Vec<ConstructionTileState<'static>> = Vec::new();
     let monument_tiles: Vec<MonumentTile<'static>> = Vec::new();
+    // let game = Game::new(0).unwrap();
     let app_state = GameState {
+        round: 1,
+        turn_player_index: 0,
         game_players: Mutex::new(players),
         first_construction_tiles: Mutex::new(first_construction_tiles),
         second_construction_tiles: Mutex::new(second_construction_tiles),
@@ -371,8 +394,10 @@ fn main() {
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
+            get_round,
             get_players,
             set_players,
+            set_first_player,
             add_worker,
             get_first_resource_tiles,
             set_constructions_and_monuments,
