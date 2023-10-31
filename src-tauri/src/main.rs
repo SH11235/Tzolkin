@@ -30,13 +30,14 @@ use crate::game_object::first_resource_tiles::shuffle_tile_list;
 #[cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #[derive(Serialize)]
 struct GameState<'a> {
-    round: u32,
-    turn_player_index: u32,
+    round: Mutex<u32>,
+    turn_player_index: Mutex<u32>,
     game_players: Mutex<Vec<Player>>,
     first_construction_tiles: Mutex<Vec<ConstructionTileState<'a>>>,
     second_construction_tiles: Mutex<Vec<ConstructionTileState<'a>>>,
     monument_tiles: Mutex<Vec<MonumentTile<'a>>>,
     field_skulls: Mutex<FieldSkulls>,
+    board_corns: Mutex<u32>,
 }
 
 #[derive(Serialize)]
@@ -48,7 +49,14 @@ struct ConstructionTileState<'a> {
 
 #[tauri::command]
 fn get_round(app_state: State<GameState>) -> u32 {
-    app_state.round
+    *app_state.round.lock().unwrap()
+}
+
+#[tauri::command]
+fn next_round(app_state: State<GameState>) -> u32 {
+    let mut round = app_state.round.lock().unwrap();
+    *round += 1;
+    *round
 }
 
 #[tauri::command]
@@ -365,6 +373,25 @@ fn save_corn(
     Ok(player.clone())
 }
 
+#[tauri::command]
+fn get_board_corns(app_state: State<GameState>) -> u32 {
+    app_state.board_corns.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn add_board_corns(app_state: State<GameState>) -> u32 {
+    let mut board_corns = app_state.board_corns.lock().unwrap();
+    *board_corns += 1;
+    *board_corns
+}
+
+#[tauri::command]
+fn reset_board_corns(app_state: State<GameState>) -> u32 {
+    let mut board_corns = app_state.board_corns.lock().unwrap();
+    *board_corns = 0;
+    0
+}
+
 fn get_mut_player_by_id<'a>(
     player_id: u32,
     players: &'a mut Vec<Player>,
@@ -382,19 +409,21 @@ fn main() {
     let monument_tiles: Vec<MonumentTile<'static>> = Vec::new();
     // let game = Game::new(0).unwrap();
     let app_state = GameState {
-        round: 1,
-        turn_player_index: 0,
+        round: Mutex::new(1),
+        turn_player_index: Mutex::new(0),
         game_players: Mutex::new(players),
         first_construction_tiles: Mutex::new(first_construction_tiles),
         second_construction_tiles: Mutex::new(second_construction_tiles),
         monument_tiles: Mutex::new(monument_tiles),
         field_skulls: Mutex::new(FieldSkulls::new()),
+        board_corns: Mutex::new(0),
     };
 
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             get_round,
+            next_round,
             get_players,
             set_players,
             set_first_player,
@@ -406,6 +435,9 @@ fn main() {
             raise_technology_level,
             raise_temple_faith,
             save_corn,
+            get_board_corns,
+            add_board_corns,
+            reset_board_corns,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

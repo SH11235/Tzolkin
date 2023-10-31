@@ -17,6 +17,9 @@ function App() {
   const [fieldSkulls, setFieldSkulls] = useState(13);
   const [firstResources, setFirstResources] = useState<FirstResourcesState>([]);
   const [round, setRound] = useState(1);
+  const [isGetFirstPlayer, setIsGetFirstPlayer] = useState(false);
+  const [nextFirstPlayerIndex, setNextFirstPlayerIndex] = useState(0);
+  const [boardCorns, setBoardCorns] = useState(0);
   const [isStartIconHidden, setIsStartIconHidden] = useState(false);
   const [palenqueChips, setPalenqueChips] = useState<
     {
@@ -93,7 +96,12 @@ function App() {
         <PassButton
           playersNumber={players.length}
           playerIndex={turnPlayerIndex}
+          isGetFirstPlayer={isGetFirstPlayer}
+          nextFirstPlayerIndex={nextFirstPlayerIndex}
+          boardCorns={boardCorns}
+          setBoardCorns={setBoardCorns}
           setTurnPlayerIndex={setTurnPlayerIndex}
+          setPlayers={setPlayers}
           round={round}
           setRound={setRound}
         />
