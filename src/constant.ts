@@ -1,5 +1,7 @@
 import { TempleBonus } from "./components/Temple";
 
+export const START_ROUND = 1;
+export const FOURTH_FOOD_DAY = 27;
 export const AGRICULTURE = "agriculture";
 export const RESOURCE = "resource";
 export const CONSTRUCTION = "construction";
@@ -7,6 +9,7 @@ export const TEMPLE = "temple";
 export const CHAAC = "Chaac";
 export const QUETZALCOATL = "Quetzalcoatl";
 export const KUKULKAN = "Kukulkan";
+export const MAX_SKULL_COUNT = 13;
 
 export const ChaacBonus: TempleBonus = [
   {
@@ -118,3 +121,4 @@ export const KukulkanBonus: TempleBonus = [
 ];
 
 export const KukulkanTopBonusPoints = [4, 4];
+

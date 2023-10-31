@@ -392,6 +392,11 @@ fn reset_board_corns(app_state: State<GameState>) -> u32 {
     0
 }
 
+#[tauri::command]
+fn finish_game(_app_state: State<GameState>) {
+    todo!()
+}
+
 fn get_mut_player_by_id<'a>(
     player_id: u32,
     players: &'a mut Vec<Player>,
@@ -438,6 +443,7 @@ fn main() {
             get_board_corns,
             add_board_corns,
             reset_board_corns,
+            finish_game,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

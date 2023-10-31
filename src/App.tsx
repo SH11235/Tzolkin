@@ -10,14 +10,16 @@ import { PlayersTable } from "./components/PlayerStatus";
 import { TemplesContainer } from "./components/TemplesContainer";
 import { TurnPlayer } from "./components/TurnPlayer";
 import { PassButton } from "./components/PassButton";
+import { MAX_SKULL_COUNT, START_ROUND } from "./constant";
 
 function App() {
   const [players, setPlayers] = useState<GamePlayers>([]);
   const [turnPlayerIndex, setTurnPlayerIndex] = useState(0);
-  const [fieldSkulls, setFieldSkulls] = useState(13);
+  const [fieldSkulls, setFieldSkulls] = useState(MAX_SKULL_COUNT);
   const [firstResources, setFirstResources] = useState<FirstResourcesState>([]);
-  const [round, setRound] = useState(1);
+  const [round, setRound] = useState(START_ROUND);
   const [isGotFirstPlayer, setIsGotFirstPlayer] = useState(false);
+  const [skipNextRound, setSkipNextRound] = useState(false);
   const [nextFirstPlayerIndex, setNextFirstPlayerIndex] = useState(0);
   const [boardCorns, setBoardCorns] = useState(0);
   const [isStartIconHidden, setIsStartIconHidden] = useState(false);
@@ -98,6 +100,8 @@ function App() {
           playerIndex={turnPlayerIndex}
           isGotFirstPlayer={isGotFirstPlayer}
           setIsGotFirstPlayer={setIsGotFirstPlayer}
+          skipNextRound={skipNextRound}
+          setSkipNextRound={setSkipNextRound}
           nextFirstPlayerIndex={nextFirstPlayerIndex}
           boardCorns={boardCorns}
           setBoardCorns={setBoardCorns}
