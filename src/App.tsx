@@ -20,6 +20,7 @@ function App() {
   const [round, setRound] = useState(START_ROUND);
   const [isGotFirstPlayer, setIsGotFirstPlayer] = useState(false);
   const [skipNextRound, setSkipNextRound] = useState(false);
+  const [passButtonDisabled, setPassButtonDisabled] = useState(true);
   const [nextFirstPlayerIndex, setNextFirstPlayerIndex] = useState(0);
   const [boardCorns, setBoardCorns] = useState(0);
   const [isStartIconHidden, setIsStartIconHidden] = useState(false);
@@ -96,6 +97,7 @@ function App() {
 
         <TurnPlayer players={players} turnPlayerIndex={turnPlayerIndex} />
         <PassButton
+          passButtonDisabled={passButtonDisabled}
           playersNumber={players.length}
           playerIndex={turnPlayerIndex}
           isGotFirstPlayer={isGotFirstPlayer}

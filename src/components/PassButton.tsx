@@ -4,6 +4,7 @@ import { Player } from "../types/GamePlayer";
 import { FOURTH_FOOD_DAY } from "../constant";
 
 type PassButtonProps = {
+  passButtonDisabled: boolean;
   playersNumber: number;
   playerIndex: number;
   isGotFirstPlayer: boolean;
@@ -19,6 +20,7 @@ type PassButtonProps = {
 };
 
 export const PassButton = ({
+  passButtonDisabled,
   playersNumber,
   playerIndex,
   isGotFirstPlayer,
@@ -67,13 +69,19 @@ export const PassButton = ({
       }
       const round: number = await invoke("get_round");
       setRound(round);
-    } else { // 最後意外の手番のプレイヤーの場合
+    } else {
+      // 最後意外の手番のプレイヤーの場合
       setTurnPlayerIndex(playerIndex + 1);
     }
   };
 
   return (
-    <Button variant="contained" color="primary" onClick={handleClick}>
+    <Button
+      variant="contained"
+      color="primary"
+      onClick={handleClick}
+      disabled={passButtonDisabled}
+    >
       Pass
     </Button>
   );
