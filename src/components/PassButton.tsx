@@ -5,32 +5,32 @@ import { Player } from "../types/GamePlayer";
 type PassButtonProps = {
   playersNumber: number;
   playerIndex: number;
-  isGetFirstPlayer: boolean;
+  isGotFirstPlayer: boolean;
+  setIsGotFirstPlayer: (isGotFirstPlayer: boolean) => void;
   nextFirstPlayerIndex: number;
   boardCorns: number;
   setBoardCorns: (corns: number) => void;
   setTurnPlayerIndex: (index: number) => void;
   setPlayers: (players: Player[]) => void;
-  round: number;
   setRound: (round: number) => void;
 };
 
 export const PassButton = ({
   playersNumber,
   playerIndex,
-  isGetFirstPlayer,
+  isGotFirstPlayer,
+  setIsGotFirstPlayer,
   nextFirstPlayerIndex,
   boardCorns,
   setBoardCorns,
   setTurnPlayerIndex,
   setPlayers,
-  round,
   setRound,
 }: PassButtonProps) => {
   const handleClick = async () => {
     // 最後手番のプレイヤーの場合
     if (playerIndex === playersNumber - 1) {
-      if (isGetFirstPlayer) {
+      if (isGotFirstPlayer) {
         // first playerを取ったプレイヤーにcornを追加
         await invoke("add_resource", {
           player_id: nextFirstPlayerIndex,
@@ -43,6 +43,7 @@ export const PassButton = ({
           index: nextFirstPlayerIndex,
         });
         setPlayers(players);
+        setIsGotFirstPlayer(false);
       } else {
         const corns: number = await invoke("add_board_corns");
         setBoardCorns(corns);
