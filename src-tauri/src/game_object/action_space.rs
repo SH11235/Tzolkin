@@ -119,9 +119,7 @@ impl WorkerPosition {
                 user_option.corn_or_wood,
                 Some(&mut game.jungle),
             ),
-            WorkerPosition::Yaxchilan(yaxchilan_space) => {
-                yaxchilan_space.action(num, player)
-            }
+            WorkerPosition::Yaxchilan(yaxchilan_space) => yaxchilan_space.action(num, player),
             WorkerPosition::Tikal(_) => todo!("Tikal action"),
             WorkerPosition::Uxmal(_) => todo!("Uxmal action"),
             WorkerPosition::ChichenItza(_) => todo!("ChichenItza action"),

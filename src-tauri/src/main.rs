@@ -182,7 +182,12 @@ fn set_constructions_and_monuments<'a>(
     *monument_tiles = monuments.clone();
     // フロントエンドにはオープンな枚数分の情報を返す
     // first_constructionsから先頭6枚を取り出す
-    let return_first_constructions = first_constructions.clone().iter().take(6).cloned().collect();
+    let return_first_constructions = first_constructions
+        .clone()
+        .iter()
+        .take(6)
+        .cloned()
+        .collect();
     InitialBuildings {
         constructions: return_first_constructions,
         monunents: monuments,

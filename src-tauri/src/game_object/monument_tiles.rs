@@ -300,10 +300,7 @@ pub static MONUMENT_TILE_LIST: [&MonumentTile; 13] = [
 
 pub fn shuffled_monument_tiles(players_number: u32) -> Vec<MonumentTile<'static>> {
     let mut rng = rand::thread_rng();
-    let mut monument_tiles: Vec<_> = MONUMENT_TILE_LIST
-        .iter()
-        .cloned()
-        .collect();
+    let mut monument_tiles: Vec<_> = MONUMENT_TILE_LIST.iter().cloned().collect();
     monument_tiles.shuffle(&mut rng);
     if players_number == 1 || players_number == 2 {
         return monument_tiles

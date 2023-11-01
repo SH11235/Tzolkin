@@ -1,13 +1,15 @@
 use serde::Serialize;
 
-use crate::utils::constants::{MAX_CHAAC_RANK, MAX_QUETZALCOATL_RANK, MAX_KUKULKAN_RANK};
+use crate::utils::constants::{MAX_CHAAC_RANK, MAX_KUKULKAN_RANK, MAX_QUETZALCOATL_RANK};
 
-use super::{resources::{Gold, Skull, Stone, Wood}, player::resource_stock::ResourceSkullStock};
+use super::{
+    player::resource_stock::ResourceSkullStock,
+    resources::{Gold, Skull, Stone, Wood},
+};
 
 // pub const MAX_CHAAC_RANK: i32 = 5;
 // pub const MAX_QUETZALCOATL_RANK: i32 = 7;
 // pub const MAX_KUKULKAN_RANK: i32 = 6;
-
 
 pub trait Temple {
     fn new(num: i32) -> Self;
