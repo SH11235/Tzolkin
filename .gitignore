@@ -22,3 +22,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Generated checks and native schemas
+src-tauri/gen/
+playwright-report/
+test-results/
+.playwright-cli/
+*.tsbuildinfo

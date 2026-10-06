@@ -1,0 +1,3 @@
+# Preserve downloaded and extracted reference text byte for byte.
+docs/rules/official/*.txt -text -whitespace
+docs/rules/supplementary/*.txt -text -whitespace
