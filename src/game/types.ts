@@ -8,6 +8,47 @@ export type TechnologyId = (typeof TECHNOLOGY_IDS)[number];
 export type Resource = (typeof RESOURCE_IDS)[number];
 export type Resources = Record<Resource, number>;
 export type BuildingCategory = 'farm' | 'graveyard' | 'municipal' | 'shrine';
+export type TribeId =
+  | 'ahChuyKak'
+  | 'ahauChamahez'
+  | 'ahmakiq'
+  | 'bacab'
+  | 'balam'
+  | 'citBolonTum'
+  | 'huracan'
+  | 'itzamna'
+  | 'ixtab'
+  | 'vacubCaquix'
+  | 'xamanEk'
+  | 'yaluk'
+  | 'yumkaax';
+export type ProphecyId =
+  | 'wrathfulGods'
+  | 'angryGodChaac'
+  | 'angryGodQuetzalcoatl'
+  | 'angryGodKukulkan'
+  | 'forestFires'
+  | 'drought'
+  | 'goldShortage'
+  | 'desecration'
+  | 'teacherShortage'
+  | 'forgottenLore'
+  | 'crowdedCities'
+  | 'hunger'
+  | 'highFloodwaters';
+export interface ExpansionCatalog {
+  tribes: Array<{ id: TribeId; name: string; description: string }>;
+  prophecies: Array<{
+    id: ProphecyId;
+    name: string;
+    description: string;
+    scoring: string;
+    bands: Array<{ minimum: number | null; maximum: number | null; points: number }>;
+  }>;
+  quickActions: Array<{ id: QuickActionId; name: string; description: string }>;
+}
+export type QuickActionId =
+  'corn' | 'woodCorn' | 'stone' | 'gold' | 'technology' | 'trade' | 'build';
 export type Effect =
   | { type: 'resources'; resources: Partial<Resources> }
   | { type: 'feed'; workers: number | 'all' }
@@ -70,6 +111,8 @@ export interface Player {
   buildingSkulls: number;
   doubleAdvanceAvailable: boolean;
   templePoints: number;
+  tribe?: TribeId | null;
+  tribeOffer?: TribeId[];
 }
 export interface GearWorker {
   playerId: number;
@@ -80,10 +123,18 @@ export interface JungleBox {
   wood: number;
 }
 export type Task =
+  | { type: 'chooseTribe' }
+  | { type: 'tribeSkipSpace' }
+  | { type: 'technologyBonus' }
+  | { type: 'quickAction'; tile: QuickActionId }
+  | { type: 'finishTurn'; doubleAdvance?: boolean }
+  | { type: 'prophecyGain'; playerId: number; resources: Resources }
+  | { type: 'prophecyTemple'; temple: TempleId }
+  | { type: 'foodDay'; day: number; stage: string; fedWorkers?: number[] }
   | { type: 'effects'; effects: Effect[] }
   | { type: 'action'; gear: GearId; position: number; free?: boolean }
-  | { type: 'technology'; remaining: number; free: boolean }
-  | { type: 'payTechnology'; technology: TechnologyId; amount: number }
+  | { type: 'technology'; remaining: number; free: boolean; mandatory?: boolean }
+  | { type: 'payTechnology'; technology: TechnologyId; amount: number; optional?: boolean }
   | { type: 'payResource'; amount: number }
   | {
       type: 'temple';
@@ -99,6 +150,7 @@ export type Task =
       allowMonument: boolean;
       cornPayment: boolean;
       architectureAvailable?: boolean;
+      mandatory?: boolean;
     }
   | { type: 'buildMonument' }
   | { type: 'technologyExchange' }
@@ -116,6 +168,11 @@ export interface Turn {
   mode: 'none' | 'place' | 'remove';
   count: number;
   begged: boolean;
+  placedWorkers?: Array<{ gear: GearId; position: number }>;
+  tribeAbilityUsed?: boolean;
+  placementDiscountUsed?: boolean;
+  skippedGear?: GearId;
+  skippedPosition?: number;
 }
 export interface FinalScore {
   playerId: number;
@@ -128,7 +185,7 @@ export interface FinalScore {
   rank: number;
 }
 export interface GameState {
-  version: 1;
+  version: 1 | 2;
   seed: number;
   additionalBuildings: boolean;
   phase: 'setup' | 'playing' | 'finished';
@@ -154,6 +211,19 @@ export interface GameState {
   log: string[];
   foodDays: number[];
   finalScores: FinalScore[];
+  expansion?: {
+    prophecies: ProphecyId[];
+    activeProphecy?: number | null;
+    quickActions?: {
+      age1: QuickActionId[];
+      age2: QuickActionId[];
+      current: QuickActionId;
+      spaces: Array<number | null>;
+      resolved: boolean;
+    } | null;
+    deferredDummyWorkers: number;
+    dummyGearsSeen: GearId[];
+  } | null;
 }
 export type GameMove =
   | { type: 'place'; gear: GearId }
@@ -161,6 +231,8 @@ export type GameMove =
   | { type: 'choose'; choiceId: string }
   | { type: 'firstPlayer' }
   | { type: 'beg' }
+  | { type: 'quickAction' }
+  | { type: 'tribeAbility'; ability: string }
   | { type: 'endTurn'; doubleAdvance?: boolean };
 export interface Choice {
   id: string;

@@ -24,9 +24,11 @@ export function ActionsSidebar({
 }) {
   const [revealed, setRevealed] = useState(false);
   const actor = game.players[game.currentPlayer]!;
+  const choosingTribe = game.phase === 'setup' && !actor.tribe && !!actor.tribeOffer?.length;
+  const setupHasTribes = !!actor.tribeOffer?.length;
   const actionTitle =
     game.phase === 'setup'
-      ? `${actor.name}の初期資源`
+      ? (game.pending?.title ?? `${actor.name}の${choosingTribe ? '部族' : '初期資源'}`)
       : game.phase === 'finished'
         ? '暦が巡りました'
         : (game.pending?.title ?? `${actor.name}の手番`);
@@ -38,10 +40,13 @@ export function ActionsSidebar({
           <h2 ref={choicesRef} tabIndex={-1}>
             {actor.name}の番です
           </h2>
-          <p>画面を渡してください。初期資源は、全員が選び終えるまで他の人に見せずに選びます。</p>
+          <p>
+            画面を渡してください。{setupHasTribes ? '部族と初期資源' : '初期資源'}
+            は、全員が選び終えるまで他の人に見せずに選びます。
+          </p>
         </div>
         <button className="primary-button handoff-button" onClick={() => setRevealed(true)}>
-          自分の初期資源を見る
+          {setupHasTribes ? '自分の部族と初期資源を見る' : '自分の初期資源を見る'}
           <Icon name="arrow" />
         </button>
       </aside>
@@ -61,13 +66,23 @@ export function ActionsSidebar({
         </h2>
         <p>
           {game.phase === 'setup'
-            ? '4枚のうち2枚を選びます。組み合わせを確認して決定してください。'
+            ? choosingTribe
+              ? '2つの部族から1つを選びます。公開されている盤面と、下の初期資源を見て決めてください。'
+              : game.pending
+                ? '初期資源や部族の効果を選んでください。'
+                : setupHasTribes
+                  ? '配られた初期資源から選びます。部族の能力と組み合わせを確認して決定してください。'
+                  : '4枚のうち2枚を選びます。組み合わせを確認して決定してください。'
             : game.pending
               ? '内容を確認して選択してください。'
               : game.turn.mode === 'none'
-                ? '配置か回収を選びます。同じ手番で両方はできません。'
+                ? actor.tribe
+                  ? '配置か回収、または部族の能力を選びます。使える操作が表示されます。'
+                  : '配置か回収を選びます。同じ手番で両方はできません。'
                 : game.turn.mode === 'place'
-                  ? `${game.turn.count}人配置しました。次の追加コストはコーン${game.turn.count}です。`
+                  ? actor.tribe
+                    ? `${game.turn.count}人配置しました。配置先ごとの費用は盤面に表示されます。`
+                    : `${game.turn.count}人配置しました。次の追加コストはコーン${game.turn.count}です。`
                   : `${game.turn.count}人回収しました。続けて回収できます。`}
         </p>
       </div>
@@ -89,11 +104,20 @@ export function ActionsSidebar({
           })}
         </div>
       )}
-      <div className="choices-list">
+      <div className={`choices-list ${choosingTribe ? 'tribe-choices' : ''}`}>
         {choices.map((c) => (
           <ChoiceButton key={c.id} choice={c} play={play} />
         ))}
       </div>
+      {game.pending && game.phase === 'playing' && (
+        <div className="turn-actions">
+          {moves
+            .filter((choice) => choice.move.type === 'tribeAbility')
+            .map((choice) => (
+              <ChoiceButton key={choice.id} choice={choice} play={play} />
+            ))}
+        </div>
+      )}
       {!game.pending && game.phase === 'playing' && (
         <>
           <div className="action-instruction">
@@ -102,7 +126,7 @@ export function ActionsSidebar({
           </div>
           <div className="turn-actions">
             {moves
-              .filter((c) => !['place', 'remove'].includes(c.move.type))
+              .filter((c) => !['place', 'remove', 'quickAction'].includes(c.move.type))
               .map((c) => (
                 <ChoiceButton key={c.id} choice={c} play={play} />
               ))}

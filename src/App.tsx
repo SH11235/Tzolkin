@@ -24,8 +24,11 @@ function App() {
   const [autosaveAvailable, setAutosaveAvailable] = useState(true);
   const [count, setCount] = useState(2);
   const [additionalBuildings, setAdditionalBuildings] = useState(false);
+  const [tribes, setTribes] = useState(false);
+  const [prophecies, setProphecies] = useState(false);
+  const [quickActions, setQuickActions] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [names, setNames] = useState(['翡翠の民', '黄金の民', '珊瑚の民', '藍の民']);
+  const [names, setNames] = useState(['翡翠の民', '黄金の民', '珊瑚の民', '藍の民', '紫水晶の民']);
   const [confirmReset, setConfirmReset] = useState(false);
   const importInput = useRef<HTMLInputElement>(null);
   const choicesRef = useRef<HTMLHeadingElement>(null);
@@ -34,7 +37,7 @@ function App() {
   const game = active?.snapshot.state;
   const actor = game?.players[game.currentPlayer];
   const choices = active?.snapshot.choices ?? [];
-  const moves = game?.phase === 'playing' && !game.pending ? (active?.snapshot.moves ?? []) : [];
+  const moves = game?.phase === 'playing' ? (active?.snapshot.moves ?? []) : [];
   useEffect(() => {
     let cancelled = false;
     void readSession()
@@ -130,7 +133,7 @@ function App() {
       const snapshot = await createGame(
         names.slice(0, count).map((n, i) => n.trim() || `プレイヤー ${i + 1}`),
         undefined,
-        { additionalBuildings },
+        { additionalBuildings, tribes, prophecies, quickActions: quickActions || count === 5 },
       );
       updateSession(
         {
@@ -242,7 +245,7 @@ function App() {
             </p>
           </div>
           <span className="welcome-footnote">
-            2–4 PLAYERS <i /> LOCAL MULTIPLAYER
+            2–5 PLAYERS <i /> LOCAL MULTIPLAYER
           </span>
         </section>
         <section className="welcome-form">
@@ -254,17 +257,27 @@ function App() {
             <p className="muted">一つの画面を囲んで、交代で遊べます。</p>
             <fieldset className="player-count">
               <legend>プレイヤー数</legend>
-              {[2, 3, 4].map((n) => (
+              {[2, 3, 4, 5].map((n) => (
                 <button
                   key={n}
                   className={count === n ? 'selected' : ''}
                   aria-pressed={count === n}
+                  disabled={n === 5 && !quickActions}
+                  title={
+                    n === 5 && !quickActions
+                      ? '5人対局はクイックアクションを選ぶと遊べます'
+                      : undefined
+                  }
+                  aria-describedby={n === 5 ? 'five-player-note' : undefined}
                   onClick={() => setCount(n)}
                 >
                   {n}人
                 </button>
               ))}
             </fieldset>
+            <p className="player-count-note" id="five-player-note">
+              5人で遊ぶときは、クイックアクションを選んでください。
+            </p>
             <div className="name-fields">
               {names.slice(0, count).map((name, i) => (
                 <label key={i}>
@@ -280,14 +293,55 @@ function App() {
                 </label>
               ))}
             </div>
-            <label className="extra-buildings-option">
-              <input
-                type="checkbox"
-                checked={additionalBuildings}
-                onChange={(e) => setAdditionalBuildings(e.target.checked)}
-              />
-              追加建物8枚を混ぜる
-            </label>
+            <fieldset className="expansion-options">
+              <legend>
+                拡張ルール <span>好きな組み合わせで追加できます</span>
+              </legend>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={tribes}
+                  onChange={(e) => setTribes(e.target.checked)}
+                />
+                <span>
+                  部族<small>2枚から1枚を選び、それぞれの特殊能力を使います。</small>
+                </span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={prophecies}
+                  onChange={(e) => setProphecies(e.target.checked)}
+                />
+                <span>
+                  予言<small>公開される3つの災厄に備え、食料日に追加得点を狙います。</small>
+                </span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={quickActions}
+                  onChange={(e) => {
+                    setQuickActions(e.target.checked);
+                    if (!e.target.checked && count === 5) setCount(4);
+                  }}
+                />
+                <span>
+                  クイックアクション・5人対局
+                  <small>その手番で実行できる配置先を追加します。2〜4人でも使えます。</small>
+                </span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={additionalBuildings}
+                  onChange={(e) => setAdditionalBuildings(e.target.checked)}
+                />
+                <span>
+                  追加建物8枚を混ぜる<small>各時代に4枚ずつ、新しい効果の建物を加えます。</small>
+                </span>
+              </label>
+            </fieldset>
             <button
               className="primary-button start-button"
               onClick={start}
@@ -318,7 +372,7 @@ function App() {
               保存ファイルを読み込む
             </button>
             <div className="welcome-notes">
-              <p>基本ゲームのルールで遊びます。進行は自動保存されます。</p>
+              <p>拡張を選ばなければ基本ゲームで遊べます。進行は自動保存されます。</p>
               <p>Daniele Tascini & Simone Lucianiによるボードゲームの非公式実装。</p>
             </div>
           </div>
@@ -394,7 +448,11 @@ function App() {
         ))}
       </div>
       <div className="game-layout" inert={busy}>
-        <PlayersSidebar game={game} availableWorkers={active!.snapshot.availableWorkers} />
+        <PlayersSidebar
+          game={game}
+          availableWorkers={active!.snapshot.availableWorkers}
+          expansionCatalog={active!.snapshot.expansionCatalog}
+        />
         <GameBoardView
           game={game}
           costs={active!.snapshot.placementCosts}
@@ -402,6 +460,7 @@ function App() {
           play={play}
           view={view}
           setView={setView}
+          expansionCatalog={active!.snapshot.expansionCatalog}
         />
         <ActionsSidebar
           key={game.phase === 'setup' ? `setup-${game.currentPlayer}` : 'playing'}

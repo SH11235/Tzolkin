@@ -154,6 +154,12 @@
   background: #e0e6db;
   box-shadow: inset 0 0 0 1px var(--green);
 }
+.player-count-note {
+  margin: -16px 0 22px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.7;
+}
 .name-fields {
   display: flex;
   flex-direction: column;
@@ -1726,16 +1732,40 @@ thead th {
   color: var(--muted);
   line-height: 1.9;
 }
-.extra-buildings-option {
-  display: flex;
-  gap: 9px;
-  align-items: center;
-  font-size: 11px;
-  color: var(--muted);
+.expansion-options {
+  padding: 0;
+  border: 0;
   margin: 0 0 24px;
+  display: grid;
+  gap: 12px;
 }
-.extra-buildings-option input {
+.expansion-options legend {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 12px;
+}
+.expansion-options legend span {
+  margin-left: 8px;
+  font-size: 10px;
+}
+.expansion-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 12px;
+  line-height: 1.6;
+}
+.expansion-options input {
   accent-color: var(--green);
+  flex-shrink: 0;
+  margin-top: 4px;
+  width: 15px;
+  height: 15px;
+}
+.expansion-options small {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
 }
 .technology-reference {
   margin-top: 30px;
@@ -1811,4 +1841,277 @@ thead th {
 }
 .autosave.unavailable > span {
   background: #a3663e;
+}
+
+.player-tribe {
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+  background: #e9e5d940;
+  font-size: 10px;
+}
+.player-tribe summary {
+  cursor: pointer;
+  font-family: var(--serif);
+  font-weight: 600;
+}
+.player-tribe p {
+  line-height: 1.8;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+.tribe-choices .choice-button {
+  background: #f6f0e1;
+  border-color: #bfa774;
+}
+.tribe-choices .choice-button small {
+  font-size: 11px;
+  line-height: 1.8;
+  white-space: normal;
+}
+.expansion-board {
+  display: grid;
+  gap: 20px;
+  margin-bottom: 24px;
+  min-width: 0;
+}
+.expansion-heading {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 14px;
+}
+.expansion-heading h2,
+.quick-action-board h2 {
+  font-size: 20px;
+  margin: 4px 0 0;
+}
+.expansion-heading p {
+  flex: 1;
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.8;
+  margin: 0;
+}
+.prophecy-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+.prophecy-card {
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #f8f5eb;
+  padding: 15px;
+  min-width: 0;
+}
+.prophecy-card.active {
+  border-color: #b58b45;
+  box-shadow: inset 0 3px 0 #b58b45;
+  background: #f9f0da;
+}
+.prophecy-status {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 9px;
+  margin-bottom: 10px;
+}
+.prophecy-status b {
+  font-weight: 500;
+}
+.prophecy-card.active .prophecy-status b {
+  color: #856024;
+}
+.prophecy-card h3 {
+  font-size: 16px;
+  margin-bottom: 9px;
+}
+.prophecy-card p {
+  font-size: 10px;
+  line-height: 1.8;
+  margin-bottom: 12px;
+}
+.prophecy-scoring {
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+.prophecy-scoring > span {
+  color: var(--muted);
+  font-size: 9px;
+}
+.prophecy-scoring p {
+  margin: 4px 0 10px;
+}
+.prophecy-bands {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+}
+.prophecy-bands > div {
+  text-align: center;
+  padding: 5px 0;
+  border-right: 1px solid var(--line);
+}
+.prophecy-bands > div:last-child {
+  border-right: 0;
+}
+.prophecy-bands dt {
+  font-size: 8px;
+  color: var(--muted);
+}
+.prophecy-bands dd {
+  margin: 3px 0 0;
+  font-weight: 600;
+  font-size: 12px;
+}
+.prophecy-bands small {
+  font-size: 8px;
+  margin-left: 2px;
+  font-weight: 400;
+}
+.quick-action-board {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.3fr);
+  gap: 24px;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #e6ebe14d;
+}
+.quick-action-board h3 {
+  font-size: 15px;
+  margin: 14px 0 6px;
+}
+.quick-action-intro p {
+  font-size: 11px;
+  line-height: 1.8;
+  margin-bottom: 9px;
+}
+.quick-action-intro > small {
+  font-size: 9px;
+  line-height: 1.8;
+  color: var(--muted);
+  display: block;
+}
+.quick-action-controls {
+  align-self: center;
+  min-width: 0;
+}
+.quick-action-spaces {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.quick-action-space {
+  flex: 1;
+  min-width: 0;
+  background: #f8f5eb;
+  border: 1px dashed var(--line);
+  border-radius: 3px;
+  text-align: center;
+  padding: 12px 5px;
+}
+.quick-action-space.occupied {
+  border-style: solid;
+  border-color: var(--player-color);
+}
+.quick-action-space > .icon {
+  display: block;
+  margin: 0 auto 7px;
+  color: var(--player-color);
+}
+.quick-action-space b,
+.quick-action-space span,
+.quick-action-space small {
+  display: block;
+  font-size: 9px;
+  line-height: 1.8;
+  overflow-wrap: anywhere;
+}
+.quick-action-space small {
+  color: var(--muted);
+  font-size: 8px;
+}
+.quick-action-controls .place-button {
+  min-width: 0;
+  gap: 8px;
+}
+.quick-action-controls .place-button > span {
+  flex: 1;
+  display: block;
+  white-space: normal;
+  text-align: left;
+}
+.quick-action-controls .place-button small {
+  display: block;
+  font-size: 9px;
+  font-weight: 400;
+  margin-top: 4px;
+  line-height: 1.6;
+}
+.quick-action-schedule {
+  grid-column: 1 / -1;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+}
+.quick-action-schedule ol {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 6px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.quick-action-schedule li {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 9px 7px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 10px;
+}
+.quick-action-schedule li[aria-current] {
+  background: #f9f0da;
+  border-color: #b58b45;
+}
+.quick-action-schedule li span,
+.quick-action-schedule > p {
+  color: var(--muted);
+  font-size: 9px;
+}
+.quick-action-schedule > p {
+  margin: 12px 0 0;
+}
+@media (max-width: 900px) {
+  .expansion-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .quick-action-board {
+    gap: 15px;
+  }
+}
+@media (max-width: 600px) {
+  .prophecy-cards,
+  .quick-action-board {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .prophecy-card {
+    padding: 13px;
+  }
+  .quick-action-board {
+    padding: 15px;
+  }
+  .tribe-choices {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .tribe-choices .choice-button {
+    font-size: 12px;
+  }
 }

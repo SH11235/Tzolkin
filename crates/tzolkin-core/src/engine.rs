@@ -1,4 +1,7 @@
 use crate::catalog::{CATALOG, building, monument, wealth};
+use crate::prophecies::{self, FoodDayStage, ProphecyId};
+use crate::quick_actions::{QuickActionId, QuickActionState};
+use crate::tribes::{self, TribeId};
 use crate::types::*;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,21 +77,17 @@ fn pay(s: &mut GameState, cost: &Resources, retain_skulls: bool) -> Result<(), S
     }
     Ok(())
 }
-fn gain_to(s: &mut GameState, values: &Resources, pid: usize) {
-    for r in RESOURCE_IDS {
-        let n = values.get(&r).copied().unwrap_or(0);
-        let actual = if r == Resource::Skull {
-            n.min(s.skull_supply)
-        } else {
-            n
-        };
-        *s.players[pid].resources.entry(r).or_default() += actual;
-        if r == Resource::Skull {
-            s.skull_supply -= actual;
-        }
+fn gain_to(s: &mut GameState, values: &Resources, pid: usize) -> Vec<Task> {
+    if prophecies::gain_is_taxed(s, values) {
+        return vec![Task::ProphecyGain {
+            player_id: pid,
+            resources: values.clone(),
+        }];
     }
+    prophecies::apply_gain_plan(s, pid, values, 0).expect("untaxed reward has one valid plan");
+    vec![]
 }
-fn gain(s: &mut GameState, values: &Resources) {
+fn gain(s: &mut GameState, values: &Resources) -> Vec<Task> {
     gain_to(s, values, s.current_player)
 }
 fn shuffle<T>(mut values: Vec<T>, seed: &mut u32) -> Vec<T> {
@@ -109,7 +108,25 @@ pub fn create_game(
     seed: u32,
     additional_buildings: bool,
 ) -> Result<GameState, String> {
-    if !(2..=4).contains(&names.len())
+    create_game_with_options(
+        names,
+        seed,
+        GameOptions {
+            additional_buildings,
+            ..GameOptions::default()
+        },
+    )
+}
+pub fn create_game_with_options(
+    names: Vec<String>,
+    seed: u32,
+    mut options: GameOptions,
+) -> Result<GameState, String> {
+    if names.len() == 5 {
+        options.quick_actions = true;
+    }
+    let additional_buildings = options.additional_buildings;
+    if !(2..=5).contains(&names.len())
         || names.iter().any(|n| {
             crate::validation::trim_player_name(n).is_empty()
                 || crate::validation::trim_player_name(n)
@@ -118,7 +135,7 @@ pub fn create_game(
                     > 100
         })
     {
-        return Err("100 文字以内の名前を入力した 2〜4 人で始めてください。".into());
+        return Err("100 文字以内の名前を入力した 2〜5 人で始めてください。".into());
     }
     let mut rng = seed;
     let mut tiles = shuffle(
@@ -150,8 +167,8 @@ pub fn create_game(
             .collect(),
         &mut rng,
     );
-    let colors = ["#378575", "#c6953e", "#c76050", "#53729d"];
-    let players: Vec<Player> = names
+    let colors = ["#378575", "#c6953e", "#c76050", "#53729d", "#8b6095"];
+    let mut players: Vec<Player> = names
         .into_iter()
         .enumerate()
         .map(|(id, name)| Player {
@@ -176,6 +193,8 @@ pub fn create_game(
             building_skulls: 0,
             double_advance_available: true,
             temple_points: 0,
+            tribe: None,
+            tribe_offer: vec![],
         })
         .collect();
     let mut gears: BTreeMap<GearId, Vec<Option<GearWorker>>> = GEAR_IDS
@@ -187,7 +206,16 @@ pub fn create_game(
             )
         })
         .collect();
-    let mut count = (4 - players.len()) * 6;
+    let blockers = if options.quick_actions {
+        match players.len() {
+            2 => 2,
+            3 | 4 => 1,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    let mut count = (if options.quick_actions { 5 } else { 4 } - players.len()) * 6 - blockers;
     let mut first_dummy = BTreeSet::new();
     for id in tiles {
         if count == 0 {
@@ -214,7 +242,7 @@ pub fn create_game(
         }
         first_dummy.insert(tile.gear);
     }
-    if count > 0 {
+    if count > 0 && !options.quick_actions {
         return Err("ダミーワーカーの初期配置に失敗しました。".into());
     }
     let n = players.len();
@@ -225,10 +253,48 @@ pub fn create_game(
     .into_iter()
     .take(n + 2)
     .collect();
+    let mut expansion = if options.tribes || options.prophecies || options.quick_actions {
+        Some(ExpansionState {
+            deferred_dummy_workers: count,
+            dummy_gears_seen: first_dummy.into_iter().collect(),
+            ..ExpansionState::default()
+        })
+    } else {
+        None
+    };
+    if options.tribes {
+        let mut tribes = shuffle(TribeId::ALL.to_vec(), &mut rng);
+        for p in &mut players {
+            p.tribe_offer = tribes.drain(..2).collect();
+        }
+    }
+    if options.prophecies {
+        expansion.as_mut().unwrap().prophecies =
+            shuffle(crate::prophecies::ProphecyId::ALL.to_vec(), &mut rng)
+                .into_iter()
+                .take(3)
+                .collect();
+    }
+    if options.quick_actions {
+        let age1 = shuffle(QuickActionId::AGE1.to_vec(), &mut rng);
+        let age2 = shuffle(QuickActionId::AGE2.to_vec(), &mut rng);
+        let mut spaces = vec![None; 3];
+        for space in spaces.iter_mut().take(blockers) {
+            *space = Some(-1);
+        }
+        expansion.as_mut().unwrap().quick_actions = Some(QuickActionState {
+            current: age1[0],
+            age1,
+            age2,
+            spaces,
+            resolved: false,
+        });
+    }
     Ok(GameState {
-        version: 1,
+        version: if expansion.is_some() { 2 } else { 1 },
         seed,
         additional_buildings,
+        expansion,
         phase: Phase::Setup,
         round: 1,
         age: 1,
@@ -266,6 +332,266 @@ pub fn create_game(
         final_scores: vec![],
     })
 }
+
+fn start_turn(s: &mut GameState) {
+    if tribes::has(current(s), TribeId::Bacab) {
+        let corn = current(s).resources[&Resource::Corn].max(2);
+        current_mut(s).resources.insert(Resource::Corn, corn);
+    }
+}
+fn place_deferred_dummies(s: &mut GameState) {
+    let Some(expansion) = s.expansion.as_ref() else {
+        return;
+    };
+    let mut remaining = expansion.deferred_dummy_workers;
+    let mut seen: BTreeSet<GearId> = expansion.dummy_gears_seen.iter().copied().collect();
+    let discards: Vec<String> = s
+        .players
+        .iter()
+        .flat_map(|p| {
+            p.wealth_offer
+                .iter()
+                .filter(|id| !p.wealth.contains(id))
+                .cloned()
+        })
+        .collect();
+    for id in discards {
+        if remaining == 0 {
+            break;
+        }
+        let tile = wealth(&id).unwrap();
+        let slots = s.gears.get_mut(&tile.gear).unwrap();
+        if slots[tile.position as usize].is_none() {
+            slots[tile.position as usize] = Some(GearWorker {
+                player_id: -1,
+                dummy: true,
+            });
+            remaining -= 1;
+        }
+        if !seen.contains(&tile.gear) && tile.gear != GearId::ChichenItza && remaining > 0 {
+            let opposite = (tile.position as usize + 5) % 10;
+            if slots[opposite].is_none() {
+                slots[opposite] = Some(GearWorker {
+                    player_id: -1,
+                    dummy: true,
+                });
+                remaining -= 1;
+            }
+        }
+        seen.insert(tile.gear);
+    }
+    let expansion = s.expansion.as_mut().unwrap();
+    expansion.deferred_dummy_workers = remaining;
+    expansion.dummy_gears_seen = seen.into_iter().collect();
+}
+fn technology_bonus(s: &mut GameState, t: TechnologyId) -> Vec<Task> {
+    match t {
+        TechnologyId::Agriculture => vec![temple_task(1)],
+        TechnologyId::Extraction => vec![Task::Resource { remaining: 2 }],
+        TechnologyId::Architecture => {
+            current_mut(s).score += 3.0;
+            vec![]
+        }
+        TechnologyId::Theology => gain(s, &resources(&[(Resource::Skull, 1)])),
+    }
+}
+fn quick_state(s: &GameState) -> Option<&QuickActionState> {
+    s.expansion.as_ref()?.quick_actions.as_ref()
+}
+fn quick_action_available(s: &GameState, placement_cost: i64) -> bool {
+    let Some(q) = quick_state(s) else {
+        return false;
+    };
+    let mut projected = s.clone();
+    if current(s).resources[&Resource::Corn] < placement_cost {
+        return false;
+    }
+    let available = current(s).resources[&Resource::Corn] - placement_cost
+        + if s.first_player_claimed == Some(s.current_player) {
+            s.accumulated_corn
+        } else {
+            0
+        };
+    if available < 0 {
+        return false;
+    }
+    current_mut(&mut projected)
+        .resources
+        .insert(Resource::Corn, available);
+    match q.current {
+        QuickActionId::Technology => TECHNOLOGY_IDS.into_iter().any(|t| {
+            MATERIALS
+                .iter()
+                .map(|r| current(s).resources[r])
+                .sum::<i64>()
+                >= tribes::technology_cost(current(s), t) + prophecies::technology_surcharge(s)
+        }),
+        QuickActionId::Build => {
+            available >= 1
+                && build_options(&projected, 1, false, Some(false))
+                    .iter()
+                    .any(|o| {
+                        let mut cost = o.cost.clone();
+                        *cost.entry(Resource::Corn).or_default() += 1;
+                        can_pay(current(&projected), &cost)
+                    })
+        }
+        QuickActionId::Trade => {
+            available >= 2 || MATERIALS.iter().any(|r| current(s).resources[r] > 0)
+        }
+        QuickActionId::Gold => available >= gold_purchase_tax(s, Resource::Gold),
+        _ => true,
+    }
+}
+fn quick_action_tasks(s: &mut GameState, tile: QuickActionId) -> Vec<Task> {
+    match tile {
+        QuickActionId::Corn => {
+            gain(s, &resources(&[(Resource::Corn, 3)]));
+            vec![]
+        }
+        QuickActionId::WoodCorn => {
+            gain(s, &resources(&[(Resource::Wood, 1), (Resource::Corn, 1)]));
+            vec![]
+        }
+        QuickActionId::Stone => {
+            gain(s, &resources(&[(Resource::Stone, 1)]));
+            vec![]
+        }
+        QuickActionId::Gold => {
+            let tax = gold_purchase_tax(s, Resource::Gold);
+            *current_mut(s).resources.entry(Resource::Corn).or_default() -= tax;
+            *current_mut(s).resources.entry(Resource::Gold).or_default() += 1;
+            vec![]
+        }
+        QuickActionId::Technology => vec![Task::Technology {
+            remaining: 1,
+            free: false,
+
+            mandatory: true,
+        }],
+        QuickActionId::Trade => vec![Task::Trade],
+        QuickActionId::Build => {
+            *current_mut(s).resources.get_mut(&Resource::Corn).unwrap() -= 1;
+            vec![Task::Build {
+                remaining: 1,
+                allow_monument: false,
+                corn_payment: false,
+                architecture_available: Some(false),
+
+                mandatory: true,
+            }]
+        }
+    }
+}
+fn place_worker(s: &mut GameState, gear: GearId, discount: bool) -> Result<(), String> {
+    if s.turn.mode == TurnMode::Remove {
+        return Err("同じ手番に配置と回収はできません。".into());
+    }
+    if available_workers(s, s.current_player) < 1 {
+        return Err("手元にワーカーがありません。".into());
+    }
+    let pos = lowest_position(s, gear).ok_or("この歯車に配置できる空きがありません。")?;
+    if discount
+        && (!tribes::has(current(s), TribeId::CitBolonTum) || s.turn.placement_discount_used)
+    {
+        return Err("配置割引は使えません。".into());
+    }
+    let base = get_placement_cost(s, &gear.to_string()).unwrap();
+    let cost = base - if discount { (pos as i64).min(2) } else { 0 };
+    let pity = pity_placement(s, Some(gear));
+    let amount = if pity {
+        current(s).resources[&Resource::Corn]
+    } else {
+        cost
+    };
+    pay(s, &resources(&[(Resource::Corn, amount)]), false)?;
+    s.gears.get_mut(&gear).unwrap()[pos] = Some(GearWorker {
+        player_id: s.current_player as i64,
+        dummy: false,
+    });
+    s.turn.mode = TurnMode::Place;
+    s.turn.count += 1;
+    if current(s).tribe.is_some() {
+        s.turn.placed_workers.push(PlacedWorker {
+            gear,
+            position: pos as i64,
+        });
+    }
+    if discount {
+        s.turn.placement_discount_used = true;
+    }
+    log(
+        s,
+        format!(
+            "{} が {} {pos} に配置（{}）",
+            current(s).name,
+            CATALOG.gear_labels[&gear],
+            if pity {
+                "神の慈悲".into()
+            } else {
+                format!("{cost} コーン")
+            }
+        ),
+    );
+    Ok(())
+}
+fn finish_turn(s: &mut GameState, double_advance: Option<bool>) -> Result<(), String> {
+    let pid = s.current_player;
+    if s.turn.count == 0 && !tribes::has(current(s), TribeId::Ahmakiq) {
+        return Err("ワーカーを 1 人以上配置するか回収してください。".into());
+    }
+    if s.first_player_claimed == Some(pid) {
+        let n = s.accumulated_corn;
+        gain(s, &resources(&[(Resource::Corn, n)]));
+        s.accumulated_corn = 0;
+    }
+    if let Some(q) = quick_state(s)
+        && q.spaces.contains(&Some(pid as i64))
+        && !q.resolved
+    {
+        if !quick_action_available(s, 0) {
+            return Err("選んだクイックアクションの費用を残してください。".into());
+        }
+        let tile = q.current;
+        s.expansion
+            .as_mut()
+            .unwrap()
+            .quick_actions
+            .as_mut()
+            .unwrap()
+            .resolved = true;
+        next_tasks(
+            s,
+            vec![
+                Task::QuickAction { tile },
+                Task::FinishTurn { double_advance },
+            ],
+        );
+        return Ok(());
+    }
+    refill_buildings(s);
+    if s.turn_index == s.turn_order.len() - 1 {
+        finish_round(s)?;
+    } else {
+        s.turn_index += 1;
+        s.current_player = s.turn_order[s.turn_index];
+        s.turn = Turn::default();
+        start_turn(s);
+    }
+    if let Some(double) = double_advance
+        && s.pending
+            .as_ref()
+            .is_some_and(|p| matches!(p.task, Task::Rotation))
+    {
+        if s.current_player != pid {
+            return Err(
+                "カレンダーを進める日数はスタートプレイヤー枠を選んだ人が決めます。".into(),
+            );
+        }
+        rotate(s, if double { 2 } else { 1 })?;
+    }
+    Ok(())
+}
 pub fn available_workers(s: &GameState, pid: usize) -> i64 {
     let Some(p) = s.players.get(pid) else {
         return 0;
@@ -276,14 +602,25 @@ pub fn available_workers(s: &GameState, pid: usize) -> i64 {
         .flat_map(|x| x.iter().flatten())
         .filter(|w| !w.dummy && w.player_id == pid as i64)
         .count();
-    p.workers - n as i64 - i64::from(s.first_player_claimed == Some(pid))
+    let quick = s
+        .expansion
+        .as_ref()
+        .and_then(|e| e.quick_actions.as_ref())
+        .map_or(0, |q| {
+            q.spaces.iter().filter(|x| **x == Some(pid as i64)).count()
+        });
+    p.workers - n as i64 - quick as i64 - i64::from(s.first_player_claimed == Some(pid))
 }
 fn lowest_position(s: &GameState, g: GearId) -> Option<usize> {
     s.gears
         .get(&g)?
         .iter()
         .enumerate()
-        .find(|(i, w)| *i <= max_position(g) as usize && w.is_none())
+        .find(|(i, w)| {
+            *i <= tribes::worker_limit(current(s), g) as usize
+                && w.is_none()
+                && !(s.turn.skipped_gear == Some(g) && s.turn.skipped_position == Some(*i as i64))
+        })
         .map(|(i, _)| i)
 }
 pub fn get_placement_cost(s: &GameState, gear: &str) -> Option<i64> {
@@ -291,10 +628,11 @@ pub fn get_placement_cost(s: &GameState, gear: &str) -> Option<i64> {
     Some(
         lowest_position(s, g)? as i64
             + if s.turn.mode == TurnMode::Place {
-                s.turn.count
+                tribes::placement_surcharge(current(s), s.turn.count)
             } else {
                 0
-            },
+            }
+            + prophecies::placement_surcharge(s, g),
     )
 }
 fn temple_max(t: TempleId) -> i64 {
@@ -309,13 +647,30 @@ fn can_raise(s: &GameState, t: TempleId) -> bool {
                 .iter()
                 .any(|p| p.id != s.current_player && p.temples[&t] == temple_max(t)))
 }
-fn raise(s: &mut GameState, t: TempleId) {
+fn raise_unpaid(s: &mut GameState, t: TempleId) {
     if can_raise(s, t) {
         *current_mut(s).temples.get_mut(&t).unwrap() += 1;
         if current(s).temples[&t] == temple_max(t) {
             current_mut(s).double_advance_available = true;
         }
     }
+}
+fn raise(s: &mut GameState, t: TempleId) -> Vec<Task> {
+    if !can_raise(s, t) {
+        return vec![];
+    }
+    if prophecies::temple_costs(s, t)
+        .iter()
+        .any(|cost| !cost.is_empty())
+    {
+        vec![Task::ProphecyTemple { temple: t }]
+    } else {
+        raise_unpaid(s, t);
+        vec![]
+    }
+}
+fn gold_purchase_tax(s: &GameState, r: Resource) -> i64 {
+    i64::from(r == Resource::Gold && prophecies::active(s) == Some(ProphecyId::GoldShortage))
 }
 fn resource_payments(amount: i64) -> Vec<Resources> {
     let mut out = vec![];
@@ -347,11 +702,21 @@ fn cost_label(cost: &Resources) -> String {
 }
 fn task_title(t: &Task) -> String {
     match t {
+        Task::ChooseTribe => "部族を選択".into(),
+        Task::TribeSkipSpace => "この手番に飛ばす空き枠を選択".into(),
+        Task::TechnologyBonus => "任意の技術の最終ボーナスを選択".into(),
+        Task::QuickAction { .. } => "クイックアクション".into(),
+        Task::FinishTurn { .. } => "手番を終了".into(),
+        Task::ProphecyGain { .. } => "予言の費用と報酬を選択".into(),
+        Task::ProphecyTemple { .. } => "予言による神殿の費用".into(),
+        Task::FoodDay { .. } => "食糧の日".into(),
         Task::Action { gear, .. } => {
             format!("{}：実行するアクションを選択", CATALOG.gear_labels[gear])
         }
         Task::Technology { remaining, .. } => format!("技術を進める（残り {remaining} 回）"),
-        Task::PayTechnology { technology, amount } => format!(
+        Task::PayTechnology {
+            technology, amount, ..
+        } => format!(
             "{}：資源 {amount} 個を支払う",
             CATALOG.technology_labels[technology]
         ),
@@ -393,30 +758,44 @@ fn build_task(n: i64, mon: bool, corn: bool) -> Task {
         allow_monument: mon,
         corn_payment: corn,
         architecture_available: None,
+
+        mandatory: false,
     }
 }
-fn advance_technology(s: &mut GameState, t: TechnologyId, steps: i64) -> Vec<Task> {
+fn advance_technology_unpaid(s: &mut GameState, t: TechnologyId, steps: i64) -> Vec<Task> {
     let mut out = vec![];
     for _ in 0..steps {
         if current(s).technologies[&t] < 3 {
             *current_mut(s).technologies.get_mut(&t).unwrap() += 1;
+        } else if tribes::has(current(s), TribeId::Itzamna) {
+            out.push(Task::TechnologyBonus);
         } else {
             match t {
                 TechnologyId::Agriculture => out.push(temple_task(1)),
                 TechnologyId::Extraction => out.push(Task::Resource { remaining: 2 }),
                 TechnologyId::Architecture => current_mut(s).score += 3.0,
-                TechnologyId::Theology => gain(s, &resources(&[(Resource::Skull, 1)])),
+                TechnologyId::Theology => out.extend(gain(s, &resources(&[(Resource::Skull, 1)]))),
             }
         }
     }
     out
 }
+fn advance_technology(s: &mut GameState, t: TechnologyId, steps: i64) -> Vec<Task> {
+    if prophecies::technology_surcharge(s) == 0 {
+        return advance_technology_unpaid(s, t, steps);
+    }
+    (0..steps)
+        .map(|_| Task::PayTechnology {
+            technology: t,
+            amount: 1,
+
+            optional: true,
+        })
+        .collect()
+}
 fn effect_tasks(s: &mut GameState, e: Effect) -> Vec<Task> {
     match e {
-        Effect::Resources { resources: r } => {
-            gain(s, &r);
-            vec![]
-        }
+        Effect::Resources { resources: r } => gain(s, &r),
         Effect::Points { amount } => {
             current_mut(s).score += amount as f64;
             vec![]
@@ -440,16 +819,19 @@ fn effect_tasks(s: &mut GameState, e: Effect) -> Vec<Task> {
             Target::Any(_) => vec![Task::Technology {
                 remaining: steps.unwrap_or(1),
                 free: true,
+
+                mandatory: false,
             }],
             Target::Specific(t) => advance_technology(s, t, steps.unwrap_or(1)),
         },
         Effect::Temple { temple, steps } => match temple {
             Target::Any(_) => vec![temple_task(steps.unwrap_or(1))],
             Target::Specific(t) => {
+                let mut tasks = vec![];
                 for _ in 0..steps.unwrap_or(1) {
-                    raise(s, t);
+                    tasks.extend(raise(s, t));
                 }
-                vec![]
+                tasks
             }
         },
         Effect::Trade => vec![Task::Trade],
@@ -461,9 +843,10 @@ fn effect_tasks(s: &mut GameState, e: Effect) -> Vec<Task> {
             let mut out = vec![];
             match temple {
                 Target::Any(_) => out.push(temple_task(1)),
-                Target::Specific(t) => raise(s, t),
+                Target::Specific(t) => out.extend(raise(s, t)),
             }
-            if current(s).technologies[&TechnologyId::Theology] >= 2 {
+            if prophecies::technology_effect_enabled(s, s.current_player, TechnologyId::Theology, 2)
+            {
                 out.push(Task::Theology { position: None });
             }
             out
@@ -479,6 +862,40 @@ fn next_tasks(s: &mut GameState, mut tasks: Vec<Task>) {
     s.pending = None;
     while !tasks.is_empty() {
         let task = tasks.remove(0);
+        if let Task::FoodDay {
+            day,
+            stage,
+            fed_workers,
+        } = task
+        {
+            let mut front = food_day_tasks(s, day, stage, fed_workers);
+            front.extend(tasks);
+            tasks = front;
+            continue;
+        }
+        if let Task::ProphecyTemple { temple } = task
+            && !can_raise(s, temple)
+        {
+            continue;
+        }
+        if let Task::ProphecyGain { player_id, .. } = &task
+            && tasks.iter().any(|t| matches!(t, Task::FoodDay { .. }))
+        {
+            s.current_player = *player_id;
+        }
+        if let Task::FinishTurn { double_advance } = task {
+            // This task only follows a mandatory quick action. All its choices finish first.
+            if let Err(error) = finish_turn(s, double_advance) {
+                log(s, error);
+            }
+            return;
+        }
+        if let Task::QuickAction { tile } = task {
+            let mut front = quick_action_tasks(s, tile);
+            front.extend(tasks);
+            tasks = front;
+            continue;
+        }
         if let Task::Effects { mut effects } = task {
             if !effects.is_empty() {
                 let first = effects.remove(0);
@@ -502,12 +919,14 @@ fn next_tasks(s: &mut GameState, mut tasks: Vec<Task>) {
         });
         return;
     }
-    if s.phase == Phase::Setup && current(s).wealth.len() == 2 {
+    if s.phase == Phase::Setup && current(s).wealth.len() == tribes::wealth_count(current(s)) {
         if s.current_player < s.players.len() - 1 {
             s.current_player += 1;
         } else {
+            place_deferred_dummies(s);
             s.phase = Phase::Playing;
             s.current_player = s.first_player;
+            start_turn(s);
             log(s, "初期財産が決まりました。ゲーム開始。".into());
         }
     }
@@ -573,7 +992,13 @@ fn basic_action_available(s: &GameState, g: GearId, pos: i64, extra: i64) -> boo
             && s.skull_spaces.get(pos as usize) == Some(&None);
     }
     if g == GearId::Tikal {
-        if pos == 1 || pos == 3 || pos == 5 {
+        if pos == 1 || pos == 3 {
+            return TECHNOLOGY_IDS.iter().any(|t| {
+                MATERIALS.iter().map(|r| p.resources[r]).sum::<i64>()
+                    >= tribes::technology_cost(p, *t) + prophecies::technology_surcharge(s)
+            });
+        }
+        if pos == 5 {
             return MATERIALS.iter().any(|r| p.resources[r] > 0);
         }
         if pos == 2 || pos == 4 {
@@ -585,7 +1010,14 @@ fn basic_action_available(s: &GameState, g: GearId, pos: i64, extra: i64) -> boo
     }
     if g == GearId::Palenque && pos >= 2 {
         return s.jungle.get(&pos).is_some_and(|b| {
-            b.corn > 0 || b.wood > 0 || p.technologies[&TechnologyId::Agriculture] >= 2
+            b.corn > 0
+                || b.wood > 0
+                || prophecies::technology_effect_enabled(
+                    s,
+                    s.current_player,
+                    TechnologyId::Agriculture,
+                    2,
+                )
         });
     }
     true
@@ -596,17 +1028,27 @@ fn action_choices(s: &GameState, g: GearId, pos: i64, free: Option<bool>) -> Vec
     let highest = if free_choice { max } else { pos.min(max) };
     let mut out = vec![];
     for position in (1..=highest).rev() {
-        let cost = if free_choice || free == Some(true) {
+        let backward = tribes::has(current(s), TribeId::Balam) && position < pos;
+        let cost = if backward || free_choice || free == Some(true) {
             0
         } else {
             pos - position
         };
+        let mut projection = s.clone();
+        if backward {
+            *current_mut(&mut projection)
+                .resources
+                .get_mut(&Resource::Corn)
+                .unwrap() += 1;
+        }
         out.push(choice(
             format!("action:{position}"),
             format!("{position} · {}", action_label(g, position)),
             current(s).resources[&Resource::Corn] < cost
-                || !basic_action_available(s, g, position, cost),
-            Some(if cost != 0 {
+                || !basic_action_available(&projection, g, position, cost),
+            Some(if backward {
+                "前のアクションを使いコーン 1 を獲得".into()
+            } else if cost != 0 {
                 format!("前のアクションを使うためにコーン {cost} を先払い")
             } else {
                 "追加コーンなし".into()
@@ -630,6 +1072,70 @@ fn action_choices(s: &GameState, g: GearId, pos: i64, free: Option<bool>) -> Vec
                 Some("神学技術で 1 つ先のアクション".into()),
             ),
         );
+    }
+    if tribes::has(current(s), TribeId::Huracan)
+        && let Some(other) = tribes::paired_gear(g)
+    {
+        for position in (1..=highest).rev() {
+            let cost = if free_choice || free == Some(true) {
+                0
+            } else {
+                pos - position
+            };
+            out.push(choice(
+                format!("other:{position}"),
+                format!(
+                    "{} {position} · {}",
+                    CATALOG.gear_labels[&other],
+                    action_label(other, position)
+                ),
+                current(s).resources[&Resource::Corn] < cost
+                    || !basic_action_available(s, other, position, cost),
+                Some(if cost == 0 {
+                    "部族能力で対になる都市のアクション".into()
+                } else {
+                    format!("部族能力で対になる都市の前のアクション · コーン {cost}")
+                }),
+            ));
+        }
+    }
+    if tribes::has(current(s), TribeId::AhauChamahez) && pos < max_position(g) {
+        for steps in 1..=if g == GearId::ChichenItza
+            && current(s).technologies[&TechnologyId::Theology] >= 1
+        {
+            2
+        } else {
+            1
+        } {
+            let position = pos + steps;
+            if position > max_position(g) {
+                continue;
+            }
+            let threshold = if g == GearId::ChichenItza { 10 } else { 6 };
+            let mut projection = s.clone();
+            *current_mut(&mut projection)
+                .resources
+                .get_mut(&Resource::Corn)
+                .unwrap() -= 1;
+            let available = if position >= threshold {
+                (1..=max).any(|a| basic_action_available(&projection, g, a, 0))
+            } else {
+                basic_action_available(&projection, g, position, 0)
+            };
+            out.insert(
+                0,
+                choice(
+                    format!("tribeAhead:{position}"),
+                    format!(
+                        "{position} · {}（部族{}）",
+                        action_label(g, position),
+                        if steps == 2 { "・神学" } else { "" }
+                    ),
+                    current(s).resources[&Resource::Corn] < 1 || !available,
+                    Some("部族能力でコーン 1 を払い先のアクション".into()),
+                ),
+            );
+        }
     }
     out.push(choice("skip", "アクションを行わず戻す", false, None));
     out
@@ -782,19 +1288,33 @@ fn build_options(
                         cost.insert(r, 0);
                     }
                 }
-                out.push(BuildOption {
-                    id: format!(
-                        "build:{id}:{mode}{}",
-                        renovation
-                            .as_ref()
-                            .map(|r| format!(":{r}"))
-                            .unwrap_or_default()
-                    ),
-                    building: b.clone(),
-                    cost,
-                    architecture: mode != "none",
-                    renovation: renovation.clone(),
-                });
+                for (tax_index, tax) in prophecies::building_surcharges(s, corn_payment, false)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let mut taxed_cost = cost.clone();
+                    for (r, n) in tax {
+                        *taxed_cost.entry(r).or_default() += n;
+                    }
+                    let tax_suffix = if prophecies::active(s) == Some(ProphecyId::CrowdedCities) {
+                        format!(":tax:{tax_index}")
+                    } else {
+                        String::new()
+                    };
+                    out.push(BuildOption {
+                        id: format!(
+                            "build:{id}:{mode}{}{tax_suffix}",
+                            renovation
+                                .as_ref()
+                                .map(|r| format!(":{r}"))
+                                .unwrap_or_default()
+                        ),
+                        building: b.clone(),
+                        cost: taxed_cost,
+                        architecture: mode != "none",
+                        renovation: renovation.clone(),
+                    });
+                }
             }
         }
     }
@@ -806,10 +1326,12 @@ fn can_double_advance(s: &GameState) -> bool {
             .get(pid)
             .is_some_and(|p| p.double_advance_available)
     }) && !GEAR_IDS.iter().any(|g| {
-        s.gears[g]
-            .get((max_position(*g) - 1) as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|w| !w.dummy)
+        s.gears[g].iter().enumerate().any(|(pos, w)| {
+            w.as_ref().is_some_and(|w| {
+                !w.dummy
+                    && pos as i64 + 1 == tribes::worker_limit(&s.players[w.player_id as usize], *g)
+            })
+        })
     })
 }
 fn wealth_description(id: &str) -> String {
@@ -863,28 +1385,209 @@ fn wealth_description(id: &str) -> String {
     format!("{}: {}", tile.name, values.join("、"))
 }
 
+fn has_reserved_quick_action(s: &GameState) -> bool {
+    quick_state(s).is_some_and(|q| !q.resolved && q.spaces.contains(&Some(s.current_player as i64)))
+}
+
+fn preserves_quick_action(s: &GameState) -> bool {
+    quick_continuation_available(s, 12)
+}
+
+fn quick_continuation_available(s: &GameState, depth: usize) -> bool {
+    if !has_reserved_quick_action(s) {
+        return true;
+    }
+    let required_payment = s.pending.as_ref().is_some_and(|pending| {
+        matches!(
+            pending.task,
+            Task::PayResource { .. } | Task::PayTechnology { .. }
+        )
+    });
+    if !required_payment && quick_action_available(s, 0) {
+        return true;
+    }
+    if depth == 0 {
+        return false;
+    }
+    let finite_continuation = s.pending.as_ref().is_some_and(|pending| {
+        matches!(
+            pending.task,
+            Task::PayResource { .. }
+                | Task::PayTechnology { .. }
+                | Task::Resource { .. }
+                | Task::ProphecyGain { .. }
+                | Task::TechnologyBonus
+                | Task::Temple { .. }
+                | Task::ProphecyTemple { .. }
+                | Task::Theology { .. }
+                | Task::Technology { .. }
+                | Task::Build { .. }
+                | Task::BuildMonument
+                | Task::TechnologyExchange
+                | Task::Action { .. }
+                | Task::AnyAction { .. }
+                | Task::Palenque { .. }
+        )
+    });
+    if finite_continuation {
+        return choices_without_reservation(s)
+            .into_iter()
+            .filter(|choice| choice.disabled != Some(true))
+            .any(|choice| {
+                let mut projected = s.clone();
+                choose_pending(&mut projected, &choice.id).is_ok()
+                    && quick_continuation_available(&projected, depth - 1)
+            });
+    }
+    if s.pending
+        .as_ref()
+        .is_some_and(|p| matches!(p.task, Task::Trade))
+    {
+        let mut projected = s.clone();
+        return (choose_pending(&mut projected, "skip").is_ok()
+            && quick_continuation_available(&projected, depth - 1))
+            || market_can_fund_quick_action(s);
+    }
+    false
+}
+
+fn market_can_fund_quick_action(s: &GameState) -> bool {
+    let Some(q) = quick_state(s) else {
+        return true;
+    };
+    let p = current(s);
+    let corn = p.resources[&Resource::Corn];
+    let wealth = corn
+        + MATERIALS
+            .iter()
+            .map(|r| p.resources[r] * rate(*r))
+            .sum::<i64>();
+    match q.current {
+        QuickActionId::Technology => {
+            let needed = TECHNOLOGY_IDS
+                .into_iter()
+                .map(|t| tribes::technology_cost(p, t) + prophecies::technology_surcharge(s))
+                .min()
+                .unwrap_or(0);
+            (0..=needed.min(p.resources[&Resource::Wood])).any(|wood| {
+                (0..=(needed - wood).min(p.resources[&Resource::Stone])).any(|stone| {
+                    (0..=(needed - wood - stone).min(p.resources[&Resource::Gold])).any(|gold| {
+                        wealth - wood * 2 - stone * 3 - gold * 4
+                            >= (needed - wood - stone - gold) * 2
+                    })
+                })
+            })
+        }
+        QuickActionId::Build => build_options(s, 1, false, Some(false))
+            .into_iter()
+            .any(|option| {
+                if p.resources[&Resource::Skull]
+                    < option.cost.get(&Resource::Skull).copied().unwrap_or(0)
+                {
+                    return false;
+                }
+                let mut budget = corn;
+                for r in MATERIALS {
+                    let required = option.cost.get(&r).copied().unwrap_or(0);
+                    let owned = p.resources[&r];
+                    if owned >= required {
+                        budget += (owned - required) * rate(r);
+                    } else {
+                        budget -= (required - owned) * (rate(r) + gold_purchase_tax(s, r));
+                    }
+                }
+                let future_corn = if s.first_player_claimed == Some(s.current_player) {
+                    s.accumulated_corn
+                } else {
+                    0
+                };
+                budget >= 0
+                    && budget + future_corn > option.cost.get(&Resource::Corn).copied().unwrap_or(0)
+            }),
+        QuickActionId::Gold => wealth >= gold_purchase_tax(s, Resource::Gold),
+        QuickActionId::Trade => wealth >= 2,
+        _ => true,
+    }
+}
+
 pub fn get_choices(s: &GameState) -> Vec<Choice> {
+    let mut choices = choices_without_reservation(s);
+    if has_reserved_quick_action(s) {
+        for choice in &mut choices {
+            if choice.disabled != Some(true) {
+                let mut projected = s.clone();
+                if choose_pending(&mut projected, &choice.id).is_err()
+                    || !preserves_quick_action(&projected)
+                {
+                    choice.disabled = Some(true);
+                }
+            }
+        }
+    }
+    choices
+}
+
+fn choices_without_reservation(s: &GameState) -> Vec<Choice> {
     if s.phase == Phase::Finished {
         return vec![];
     }
     if s.phase == Phase::Setup && s.pending.is_none() {
-        let offer = &current(s).wealth_offer;
+        let p = current(s);
+        if p.tribe.is_none() && !p.tribe_offer.is_empty() {
+            return p
+                .tribe_offer
+                .iter()
+                .map(|t| {
+                    let d = tribes::definitions()
+                        .into_iter()
+                        .find(|d| d.id == *t)
+                        .unwrap();
+                    choice(
+                        format!("tribe:{t}"),
+                        d.name,
+                        false,
+                        Some(d.description.into()),
+                    )
+                })
+                .collect();
+        }
+        let offer = &p.wealth_offer;
+        let count = tribes::wealth_count(p);
         let mut out = vec![];
-        for (i, a) in offer.iter().enumerate() {
-            for b in &offer[i + 1..] {
-                let (Some(ta), Some(tb)) = (wealth(a), wealth(b)) else {
-                    continue;
+        for a in 0..offer.len() {
+            for b in a + 1..offer.len() {
+                let tails: Vec<Option<usize>> = if count == 3 {
+                    (b + 1..offer.len()).map(Some).collect()
+                } else {
+                    vec![None]
                 };
-                out.push(choice(
-                    format!("wealth:{a}:{b}"),
-                    format!("{} ＋ {}", ta.name, tb.name),
-                    false,
-                    Some(format!(
-                        "{} / {}",
-                        wealth_description(a),
-                        wealth_description(b)
-                    )),
-                ));
+                for c in tails {
+                    let ids: Vec<&String> = [Some(a), Some(b), c]
+                        .into_iter()
+                        .flatten()
+                        .map(|i| &offer[i])
+                        .collect();
+                    out.push(choice(
+                        format!(
+                            "wealth:{}",
+                            ids.iter()
+                                .map(|id| id.as_str())
+                                .collect::<Vec<_>>()
+                                .join(":")
+                        ),
+                        ids.iter()
+                            .filter_map(|id| wealth(id).map(|w| w.name.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(" ＋ "),
+                        false,
+                        Some(
+                            ids.iter()
+                                .map(|id| wealth_description(id))
+                                .collect::<Vec<_>>()
+                                .join(" / "),
+                        ),
+                    ));
+                }
             }
         }
         return out;
@@ -894,16 +1597,108 @@ pub fn get_choices(s: &GameState) -> Vec<Choice> {
     };
     let p = current(s);
     match &pending.task {
+        Task::ChooseTribe => p
+            .tribe_offer
+            .iter()
+            .map(|t| choice(format!("tribe:{t}"), t.to_string(), false, None))
+            .collect(),
+        Task::TechnologyBonus => TECHNOLOGY_IDS
+            .into_iter()
+            .map(|t| {
+                choice(
+                    format!("bonus:{t}"),
+                    format!("{} 最終ボーナス", CATALOG.technology_labels[&t]),
+                    false,
+                    None,
+                )
+            })
+            .collect(),
+        Task::TribeSkipSpace => GEAR_IDS
+            .into_iter()
+            .flat_map(|g| {
+                s.gears[&g]
+                    .iter()
+                    .enumerate()
+                    .filter(move |(pos, w)| {
+                        w.is_none() && *pos <= tribes::worker_limit(p, g) as usize
+                    })
+                    .map(move |(pos, _)| {
+                        choice(
+                            format!("space:{g}:{pos}"),
+                            format!("{} {pos}", CATALOG.gear_labels[&g]),
+                            false,
+                            None,
+                        )
+                    })
+            })
+            .collect(),
+        Task::ProphecyGain {
+            player_id,
+            resources,
+        } => prophecies::gain_plans(s, *player_id, resources)
+            .into_iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                let losses: Vec<String> = TEMPLE_IDS
+                    .iter()
+                    .filter_map(|t| {
+                        let n = plan.temple_losses.get(t).copied().unwrap_or(0);
+                        (n > 0).then(|| format!("{} −{n}", CATALOG.temple_labels[t]))
+                    })
+                    .collect();
+                let mut costs = losses;
+                if plan.corn_cost > 0 {
+                    costs.push(format!("コーン {}", plan.corn_cost));
+                }
+                choice(
+                    format!("prophecyGain:{index}"),
+                    format!(
+                        "{}：{}",
+                        s.players[*player_id].name,
+                        cost_label(&plan.resources)
+                    ),
+                    false,
+                    (!costs.is_empty()).then(|| format!("予言の支払：{}", costs.join("・"))),
+                )
+            })
+            .collect(),
+        Task::ProphecyTemple { temple } => {
+            let mut out: Vec<Choice> = prophecies::temple_costs(s, *temple)
+                .into_iter()
+                .enumerate()
+                .map(|(index, cost)| {
+                    choice(
+                        format!("prophecyTemple:{index}"),
+                        format!(
+                            "{} +1 · {}",
+                            CATALOG.temple_labels[temple],
+                            cost_label(&cost)
+                        ),
+                        !can_pay(p, &cost),
+                        None,
+                    )
+                })
+                .collect();
+            out.push(choice("skip", "支払わず、寺院を上げない", false, None));
+            out
+        }
+        Task::QuickAction { .. } | Task::FinishTurn { .. } | Task::FoodDay { .. } => vec![],
         Task::Action {
             gear,
             position,
             free,
         } => action_choices(s, *gear, *position, *free),
-        Task::Technology { free, .. } => {
+        Task::Technology {
+            free, mandatory, ..
+        } => {
             let mut out = vec![];
             for t in TECHNOLOGY_IDS {
                 let level = p.technologies[&t];
-                let amount = if level == 3 { 1 } else { level + 1 };
+                let amount = if *free {
+                    0
+                } else {
+                    tribes::technology_cost(p, t)
+                } + prophecies::technology_surcharge(s);
                 out.push(choice(
                     format!("tech:{t}"),
                     format!(
@@ -915,25 +1710,29 @@ pub fn get_choices(s: &GameState) -> Vec<Choice> {
                             format!("Lv {}", level + 1)
                         }
                     ),
-                    !*free && MATERIALS.iter().map(|r| p.resources[r]).sum::<i64>() < amount,
-                    Some(if *free {
+                    MATERIALS.iter().map(|r| p.resources[r]).sum::<i64>() < amount,
+                    Some(if amount == 0 {
                         "資源の支払いなし".into()
                     } else {
                         format!("資源 {amount} 個を支払う")
                     }),
                 ));
             }
-            if !free {
+            if (!free || prophecies::technology_surcharge(s) > 0) && !mandatory {
                 out.push(choice("skip", "技術の発展を終了", false, None));
             }
             out
         }
         Task::PayTechnology { amount, .. } | Task::PayResource { amount } => {
-            resource_payments(*amount)
+            let mut out: Vec<Choice> = resource_payments(*amount)
                 .into_iter()
                 .enumerate()
                 .map(|(i, c)| choice(format!("pay:{i}"), cost_label(&c), !can_pay(p, &c), None))
-                .collect()
+                .collect();
+            if matches!(&pending.task, Task::PayTechnology { optional: true, .. }) {
+                out.push(choice("skip", "支払わず、技術を上げない", false, None));
+            }
+            out
         }
         Task::Temple {
             distinct,
@@ -975,6 +1774,8 @@ pub fn get_choices(s: &GameState) -> Vec<Choice> {
             allow_monument,
             corn_payment,
             architecture_available,
+
+            mandatory,
         } => {
             let mut out: Vec<Choice> =
                 build_options(s, *remaining, *corn_payment, *architecture_available)
@@ -1021,7 +1822,9 @@ pub fn get_choices(s: &GameState) -> Vec<Choice> {
                     )
                 }));
             }
-            out.push(choice("skip", "建設を終了", false, None));
+            if !mandatory {
+                out.push(choice("skip", "建設を終了", false, None));
+            }
             out
         }
         Task::BuildMonument => {
@@ -1070,8 +1873,12 @@ pub fn get_choices(s: &GameState) -> Vec<Choice> {
             for r in MATERIALS {
                 out.push(choice(
                     format!("buy:{r}"),
-                    format!("{} 1 を買う · コーン {}", resource_label(r), rate(r)),
-                    p.resources[&Resource::Corn] < rate(r),
+                    format!(
+                        "{} 1 を買う · コーン {}",
+                        resource_label(r),
+                        rate(r) + gold_purchase_tax(s, r)
+                    ),
+                    p.resources[&Resource::Corn] < rate(r) + gold_purchase_tax(s, r),
                     None,
                 ));
                 out.push(choice(
@@ -1139,7 +1946,13 @@ pub fn get_choices(s: &GameState) -> Vec<Choice> {
                     Some("木材タイルを捨て、神殿を 1 段下げる".into()),
                 ));
             }
-            if p.technologies[&TechnologyId::Agriculture] >= 2 && !can_corn {
+            if prophecies::technology_effect_enabled(
+                s,
+                s.current_player,
+                TechnologyId::Agriculture,
+                2,
+            ) && !can_corn
+            {
                 out.push(choice(
                     "emptyCorn",
                     "農業技術でコーンを得る",
@@ -1193,7 +2006,12 @@ fn execute_action(s: &mut GameState, g: GearId, pos: i64) -> Result<Vec<Task>, S
                 s,
                 &resources(&[(
                     Resource::Corn,
-                    3 + i64::from(current(s).technologies[&TechnologyId::Agriculture] >= 2),
+                    3 + i64::from(prophecies::technology_effect_enabled(
+                        s,
+                        s.current_player,
+                        TechnologyId::Agriculture,
+                        2,
+                    )),
                 )]),
             );
             return Ok(vec![]);
@@ -1202,12 +2020,20 @@ fn execute_action(s: &mut GameState, g: GearId, pos: i64) -> Result<Vec<Task>, S
     }
     if g == GearId::Yaxchilan {
         let ex = current(s).technologies[&TechnologyId::Extraction];
-        match pos {
+        let tasks = match pos {
             1 => gain(s, &resources(&[(Resource::Wood, 1 + i64::from(ex >= 1))])),
             2 => gain(
                 s,
                 &resources(&[
-                    (Resource::Stone, 1 + i64::from(ex >= 2)),
+                    (
+                        Resource::Stone,
+                        1 + i64::from(prophecies::technology_effect_enabled(
+                            s,
+                            s.current_player,
+                            TechnologyId::Extraction,
+                            2,
+                        )),
+                    ),
                     (Resource::Corn, 1),
                 ]),
             ),
@@ -1228,20 +2054,30 @@ fn execute_action(s: &mut GameState, g: GearId, pos: i64) -> Result<Vec<Task>, S
             5 => gain(
                 s,
                 &resources(&[
-                    (Resource::Stone, 1 + i64::from(ex >= 2)),
+                    (
+                        Resource::Stone,
+                        1 + i64::from(prophecies::technology_effect_enabled(
+                            s,
+                            s.current_player,
+                            TechnologyId::Extraction,
+                            2,
+                        )),
+                    ),
                     (Resource::Gold, 1 + i64::from(ex >= 3)),
                     (Resource::Corn, 2),
                 ]),
             ),
-            _ => {}
-        }
-        return Ok(vec![]);
+            _ => vec![],
+        };
+        return Ok(tasks);
     }
     if g == GearId::Tikal {
         return Ok(match pos {
             1 | 3 => vec![Task::Technology {
                 remaining: if pos == 3 { 2 } else { 1 },
                 free: false,
+
+                mandatory: false,
             }],
             2 | 4 => vec![build_task(if pos == 4 { 2 } else { 1 }, pos == 4, false)],
             5 => vec![
@@ -1290,12 +2126,11 @@ fn execute_action(s: &mut GameState, g: GearId, pos: i64) -> Result<Vec<Task>, S
             .get(&pos)
             .ok_or("髑髏を置く場所が不正です。")?;
         current_mut(s).score += reward.points as f64;
-        raise(s, reward.temple);
-        let mut out = vec![];
+        let mut out = raise(s, reward.temple);
         if reward.resource {
             out.push(Task::Resource { remaining: 1 });
         }
-        if current(s).technologies[&TechnologyId::Theology] >= 2 {
+        if prophecies::technology_effect_enabled(s, s.current_player, TechnologyId::Theology, 2) {
             out.push(Task::Theology {
                 position: Some(pos),
             });
@@ -1324,54 +2159,117 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
         return Ok(());
     }
     match task {
+        Task::TribeSkipSpace => {
+            s.turn.skipped_gear = Some(parse_part(&parts, 1)?);
+            s.turn.skipped_position = Some(parse_part(&parts, 2)?);
+            s.turn.tribe_ability_used = true;
+            next_tasks(s, after);
+        }
+        Task::TechnologyBonus => {
+            let technology: TechnologyId = parse_part(&parts, 1)?;
+            let tasks = technology_bonus(s, technology);
+            next_tasks(s, prepend(tasks, after));
+        }
+        Task::ProphecyGain {
+            player_id,
+            resources,
+        } => {
+            prophecies::apply_gain_plan(s, player_id, &resources, parse_part(&parts, 1)?)?;
+            next_tasks(s, after);
+        }
+        Task::ProphecyTemple { temple } => {
+            let costs = prophecies::temple_costs(s, temple);
+            let index: usize = parse_part(&parts, 1)?;
+            pay(
+                s,
+                costs.get(index).ok_or("この支払いは現在利用できません。")?,
+                false,
+            )?;
+            raise_unpaid(s, temple);
+            next_tasks(s, after);
+        }
+        Task::ChooseTribe
+        | Task::QuickAction { .. }
+        | Task::FinishTurn { .. }
+        | Task::FoodDay { .. } => return Err("この選択は現在利用できません。".into()),
         Task::Action {
             gear,
             position,
             free,
         } => {
             let pos: i64 = parse_part(&parts, 1)?;
+            let target_gear = if parts[0] == "other" {
+                tribes::paired_gear(gear).ok_or("都市が不正です。")?
+            } else {
+                gear
+            };
             let free_choice = position >= if gear == GearId::ChichenItza { 10 } else { 6 };
-            let cost = if parts[0] == "ahead" || free_choice || free == Some(true) {
+            let backward = tribes::has(current(s), TribeId::Balam) && pos < position;
+            let cost = if parts[0] == "tribeAhead" {
+                1
+            } else if backward || parts[0] == "ahead" || free_choice || free == Some(true) {
                 0
             } else {
                 position - pos
             };
+            if backward {
+                gain(s, &resources(&[(Resource::Corn, 1)]));
+            }
             pay(s, &resources(&[(Resource::Corn, cost)]), false)?;
-            let tasks = if parts[0] == "ahead" && gear == GearId::ChichenItza && pos == 10 {
+            let threshold = if target_gear == GearId::ChichenItza {
+                10
+            } else {
+                6
+            };
+            let tasks = if (parts[0] == "ahead" || parts[0] == "tribeAhead") && pos >= threshold {
                 vec![Task::Action {
-                    gear,
-                    position: 10,
+                    gear: target_gear,
+                    position: pos,
                     free: Some(true),
                 }]
             } else {
-                execute_action(s, gear, pos)?
+                execute_action(s, target_gear, pos)?
             };
             next_tasks(s, prepend(tasks, after));
         }
-        Task::Technology { remaining, free } => {
+        Task::Technology {
+            remaining,
+            free,
+            mandatory,
+        } => {
             let t: TechnologyId = parse_part(&parts, 1)?;
             let following = Task::Technology {
                 remaining: remaining - 1,
                 free,
+
+                mandatory,
             };
             let mut tasks = if free {
                 advance_technology(s, t, 1)
             } else {
-                let level = current(s).technologies[&t];
-                vec![Task::PayTechnology {
-                    technology: t,
-                    amount: if level == 3 { 1 } else { level + 1 },
-                }]
+                let amount =
+                    tribes::technology_cost(current(s), t) + prophecies::technology_surcharge(s);
+                if amount == 0 {
+                    advance_technology_unpaid(s, t, 1)
+                } else {
+                    vec![Task::PayTechnology {
+                        technology: t,
+                        amount,
+                        optional: false,
+                    }]
+                }
             };
             tasks.push(following);
             next_tasks(s, prepend(tasks, after));
         }
-        Task::PayTechnology { technology, amount } => {
+        Task::PayTechnology {
+            technology, amount, ..
+        } => {
             let i: usize = parse_part(&parts, 1)?;
             let payments = resource_payments(amount);
             let cost = payments.get(i).ok_or("この選択は現在利用できません。")?;
             pay(s, cost, false)?;
-            let tasks = advance_technology(s, technology, 1);
+            let tasks = advance_technology_unpaid(s, technology, 1);
             next_tasks(s, prepend(tasks, after));
         }
         Task::PayResource { amount } => {
@@ -1394,47 +2292,49 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
             if direction == Some(-1) {
                 *current_mut(s).temples.get_mut(&t).unwrap() -= 1;
                 if reason == Some(TempleReason::Beg) {
-                    current_mut(s).resources.insert(Resource::Corn, 3);
+                    let begging_corn = if tribes::has(current(s), TribeId::Bacab) {
+                        4
+                    } else {
+                        3
+                    };
+                    current_mut(s)
+                        .resources
+                        .insert(Resource::Corn, begging_corn);
                     s.turn.begged = true;
                 }
-            } else {
-                raise(s, t);
             }
+            let mut tasks = if direction == Some(-1) {
+                vec![]
+            } else {
+                raise(s, t)
+            };
             let distinct = distinct.map(|mut d| {
                 d.push(t);
                 d
             });
-            next_tasks(
-                s,
-                prepend(
-                    vec![Task::Temple {
-                        remaining: remaining - 1,
-                        distinct,
-                        direction,
-                        reason,
-                    }],
-                    after,
-                ),
-            );
+            tasks.push(Task::Temple {
+                remaining: remaining - 1,
+                distinct,
+                direction,
+                reason,
+            });
+            next_tasks(s, prepend(tasks, after));
         }
         Task::Resource { remaining } => {
             let r: Resource = parse_part(&parts, 1)?;
-            gain(s, &resources(&[(r, 1)]));
-            next_tasks(
-                s,
-                prepend(
-                    vec![Task::Resource {
-                        remaining: remaining - 1,
-                    }],
-                    after,
-                ),
-            );
+            let mut tasks = gain(s, &resources(&[(r, 1)]));
+            tasks.push(Task::Resource {
+                remaining: remaining - 1,
+            });
+            next_tasks(s, prepend(tasks, after));
         }
         Task::Build {
             remaining,
             allow_monument: _,
             corn_payment,
             architecture_available,
+
+            mandatory,
         } => {
             if parts[0] == "monument" {
                 let o = monument_options(s)
@@ -1478,7 +2378,12 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                 if current(s).technologies[&TechnologyId::Architecture] >= 1 {
                     gain(s, &resources(&[(Resource::Corn, 1)]));
                 }
-                if current(s).technologies[&TechnologyId::Architecture] >= 2 {
+                if prophecies::technology_effect_enabled(
+                    s,
+                    s.current_player,
+                    TechnologyId::Architecture,
+                    2,
+                ) {
                     current_mut(s).score += 2.0;
                 }
             }
@@ -1493,6 +2398,8 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                 architecture_available: Some(
                     architecture_available != Some(false) && !o.architecture,
                 ),
+
+                mandatory,
             };
             next_tasks(
                 s,
@@ -1540,8 +2447,9 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
         Task::Trade => {
             let r: Resource = parse_part(&parts, 1)?;
             if parts[0] == "buy" {
-                pay(s, &resources(&[(Resource::Corn, rate(r))]), false)?;
-                gain(s, &resources(&[(r, 1)]));
+                let tax = gold_purchase_tax(s, r);
+                pay(s, &resources(&[(Resource::Corn, rate(r) + tax)]), false)?;
+                *current_mut(s).resources.entry(r).or_default() += 1;
             } else {
                 pay(s, &resources(&[(r, 1)]), false)?;
                 gain(s, &resources(&[(Resource::Corn, rate(r))]));
@@ -1566,8 +2474,10 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                     s,
                     &resources(&[(
                         Resource::Wood,
-                        position - 1
-                            + i64::from(current(s).technologies[&TechnologyId::Extraction] >= 1),
+                        (position - 1
+                            + i64::from(current(s).technologies[&TechnologyId::Extraction] >= 1)
+                            + prophecies::harvest_adjustment(s, Resource::Wood, position))
+                        .max(0),
                     )]),
                 );
             } else {
@@ -1589,7 +2499,16 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                     .ok_or("収穫場所が不正です。")?;
                 let agriculture = current(s).technologies[&TechnologyId::Agriculture];
                 let bonus = i64::from(agriculture >= 1) + if agriculture >= 3 { 2 } else { 0 };
-                gain(s, &resources(&[(Resource::Corn, base + bonus)]));
+                gain(
+                    s,
+                    &resources(&[(
+                        Resource::Corn,
+                        (base
+                            + bonus
+                            + prophecies::harvest_adjustment(s, Resource::Corn, position))
+                        .max(0),
+                    )]),
+                );
             }
             next_tasks(
                 s,
@@ -1619,114 +2538,163 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn feed_and_reward(s: &mut GameState, day: i64) {
-    s.food_days.push(day);
-    for pid in 0..s.players.len() {
-        let ids = s.players[pid].buildings.clone();
-        for id in ids {
-            if let Some(b) = building(&id) {
-                for e in &b.effects {
-                    match e {
-                        Effect::FoodReward { resources } => gain_to(s, resources, pid),
-                        Effect::FoodRewardSwitch => gain_to(
-                            s,
-                            &resources(&[if day <= 14 {
-                                (Resource::Wood, 1)
-                            } else {
-                                (Resource::Skull, 1)
-                            }]),
-                            pid,
-                        ),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-    for pid in 0..s.players.len() {
-        let p = &mut s.players[pid];
-        let per = if p.feed_all {
-            0
-        } else {
-            (2 - p.feed_discount).max(0)
-        };
-        let needing = (p.workers - p.feed_workers).max(0);
-        let fed = if per == 0 {
-            needing
-        } else {
-            needing.min(p.resources[&Resource::Corn] / per)
-        };
-        let cost = fed * per;
-        let penalty = (needing - fed) * 3;
-        *p.resources.get_mut(&Resource::Corn).unwrap() -= cost;
-        p.score -= penalty as f64;
-        let text = format!(
-            "食糧の日：{} はコーン {cost} を支払い{}",
-            p.name,
-            if penalty != 0 {
-                format!("、未給食で −{penalty} 点")
-            } else {
-                String::new()
-            }
-        );
-        log(s, text);
-    }
-    if day == 14 {
-        s.age = 2;
-        s.building_deck = std::mem::take(&mut s.age2_deck);
-        let n = s.building_deck.len().min(6);
-        s.buildings = s.building_deck.drain(..n).collect();
-    }
-    if day == 8 || day == 21 {
-        let mut rewards: Vec<Resources> = s
-            .players
-            .iter()
-            .map(|p| {
-                let mut r = zero_resources();
-                for t in TEMPLE_IDS {
-                    for step in -1..=p.temples[&t] {
-                        if let Some(values) = CATALOG.temple_tracks[&t]
-                            .resource_rewards
-                            .get((step + 1) as usize)
-                        {
-                            for resource in RESOURCE_IDS {
-                                *r.get_mut(&resource).unwrap() +=
-                                    values.get(&resource).copied().unwrap_or(0);
+fn food_day_tasks(
+    s: &mut GameState,
+    day: i64,
+    stage: FoodDayStage,
+    fed_workers: Vec<i64>,
+) -> Vec<Task> {
+    match stage {
+        FoodDayStage::Buildings => {
+            s.food_days.push(day);
+            let mut tasks = vec![];
+            for pid in 0..s.players.len() {
+                let mut reward = zero_resources();
+                for id in &s.players[pid].buildings {
+                    if let Some(b) = building(id) {
+                        for effect in &b.effects {
+                            match effect {
+                                Effect::FoodReward { resources } => {
+                                    for (r, n) in resources {
+                                        *reward.entry(*r).or_default() += n;
+                                    }
+                                }
+                                Effect::FoodRewardSwitch => {
+                                    let r = if day <= 14 {
+                                        Resource::Wood
+                                    } else {
+                                        Resource::Skull
+                                    };
+                                    *reward.entry(r).or_default() += 1;
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
-                r
-            })
-            .collect();
-        let total: i64 = rewards.iter().map(|r| r[&Resource::Skull]).sum();
-        if total > s.skull_supply {
-            for r in &mut rewards {
-                r.insert(Resource::Skull, 0);
+                tasks.extend(gain_to(s, &reward, pid));
             }
+            tasks.push(Task::FoodDay {
+                day,
+                stage: FoodDayStage::Feeding,
+                fed_workers: vec![],
+            });
+            tasks
         }
-        for (pid, r) in rewards.iter().enumerate() {
-            gain_to(s, r, pid);
+        FoodDayStage::Feeding => {
+            let hunger = prophecies::active(s) == Some(ProphecyId::Hunger);
+            let mut fed_workers = Vec::with_capacity(s.players.len());
+            for pid in 0..s.players.len() {
+                let p = &mut s.players[pid];
+                let extra = i64::from(tribes::has(p, TribeId::Yaluk));
+                let result = prophecies::feeding(p, hunger, extra);
+                *p.resources.get_mut(&Resource::Corn).unwrap() -= result.corn_cost;
+                let penalty = result.unfed_workers * if extra > 0 { 5 } else { 3 };
+                p.score -= penalty as f64;
+                fed_workers.push(result.fed_workers);
+                let text = format!(
+                    "食糧の日：{} はコーン {} を支払い{}",
+                    p.name,
+                    result.corn_cost,
+                    if penalty != 0 {
+                        format!("、未給食で −{penalty} 点")
+                    } else {
+                        String::new()
+                    }
+                );
+                log(s, text);
+            }
+            if day == 14 {
+                s.age = 2;
+                s.building_deck = std::mem::take(&mut s.age2_deck);
+                let n = s.building_deck.len().min(6);
+                s.buildings = s.building_deck.drain(..n).collect();
+            }
+            vec![Task::FoodDay {
+                day,
+                stage: FoodDayStage::Temples,
+                fed_workers,
+            }]
         }
-    } else {
-        for t in TEMPLE_IDS {
-            let track = &CATALOG.temple_tracks[&t];
-            let highest = s.players.iter().map(|p| p.temples[&t]).max().unwrap_or(0);
-            let leaders = s
-                .players
-                .iter()
-                .filter(|p| p.temples[&t] == highest)
-                .count();
-            let bonus = (if day == 14 {
-                track.age1_bonus
+        FoodDayStage::Temples => {
+            let mut tasks = vec![];
+            if day == 8 || day == 21 {
+                let mut rewards: Vec<Resources> = s
+                    .players
+                    .iter()
+                    .map(|p| {
+                        let mut r = zero_resources();
+                        for t in TEMPLE_IDS {
+                            for step in -1..=p.temples[&t] {
+                                if let Some(values) = CATALOG.temple_tracks[&t]
+                                    .resource_rewards
+                                    .get((step + 1) as usize)
+                                {
+                                    for resource in RESOURCE_IDS {
+                                        *r.get_mut(&resource).unwrap() +=
+                                            values.get(&resource).copied().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                        r
+                    })
+                    .collect();
+                let total: i64 = rewards.iter().map(|r| r[&Resource::Skull]).sum();
+                if total > s.skull_supply {
+                    for r in &mut rewards {
+                        r.insert(Resource::Skull, 0);
+                    }
+                }
+                for (pid, r) in rewards.iter().enumerate() {
+                    tasks.extend(gain_to(s, r, pid));
+                }
             } else {
-                track.age2_bonus
-            }) as f64
-                / if leaders > 1 { 2.0 } else { 1.0 };
-            for p in &mut s.players {
-                let points = track.points[(p.temples[&t] + 1) as usize];
-                p.temple_points += points;
-                p.score += points as f64 + if p.temples[&t] == highest { bonus } else { 0.0 };
+                for t in TEMPLE_IDS {
+                    let track = &CATALOG.temple_tracks[&t];
+                    let highest = s.players.iter().map(|p| p.temples[&t]).max().unwrap_or(0);
+                    let leaders = s
+                        .players
+                        .iter()
+                        .filter(|p| p.temples[&t] == highest)
+                        .count();
+                    let bonus = (if day == 14 {
+                        track.age1_bonus
+                    } else {
+                        track.age2_bonus
+                    }) as f64
+                        / if leaders > 1 { 2.0 } else { 1.0 };
+                    for p in &mut s.players {
+                        let points = track.points[(p.temples[&t] + 1) as usize];
+                        p.temple_points += points;
+                        p.score +=
+                            points as f64 + if p.temples[&t] == highest { bonus } else { 0.0 };
+                    }
+                }
+            }
+            tasks.push(Task::FoodDay {
+                day,
+                stage: FoodDayStage::Scoring,
+                fed_workers,
+            });
+            tasks
+        }
+        FoodDayStage::Scoring => {
+            if let Some(id) = prophecies::active(s) {
+                let points = prophecies::score_food_day(s, &fed_workers);
+                for (pid, points) in points.into_iter().enumerate() {
+                    log(
+                        s,
+                        format!("予言 {id}：{} は {points:+} 点", s.players[pid].name),
+                    );
+                }
+            }
+            if let Some(claimed) = s.first_player_claimed {
+                s.current_player = claimed;
+                vec![Task::Rotation]
+            } else {
+                rotate(s, 1).expect("normal calendar rotation is always available");
+                vec![]
             }
         }
     }
@@ -1757,7 +2725,9 @@ fn rotate(s: &mut GameState, days: i64) -> Result<(), String> {
                     let next = pos + 1;
                     if w.dummy {
                         rotated[next % old.len()] = Some(w.clone());
-                    } else if next <= max_position(g) as usize {
+                    } else if next
+                        <= tribes::worker_limit(&s.players[w.player_id as usize], g) as usize
+                    {
                         rotated[next] = Some(w.clone());
                     }
                 }
@@ -1765,10 +2735,14 @@ fn rotate(s: &mut GameState, days: i64) -> Result<(), String> {
             s.gears.insert(g, rotated);
         }
     }
+    prophecies::activate_after_rotation(s);
     let finished = s.food_days.contains(&27);
     s.round = 27.min(s.round + days);
     s.pending = None;
     if finished {
+        if let Some(q) = s.expansion.as_mut().and_then(|e| e.quick_actions.as_mut()) {
+            q.clear_workers();
+        }
         finalize(s);
         return Ok(());
     }
@@ -1778,6 +2752,11 @@ fn rotate(s: &mut GameState, days: i64) -> Result<(), String> {
     s.turn_index = 0;
     s.current_player = s.first_player;
     s.turn = Turn::default();
+    if let Some(q) = s.expansion.as_mut().and_then(|e| e.quick_actions.as_mut()) {
+        q.clear_workers();
+        q.update(s.round);
+    }
+    start_turn(s);
     log(
         s,
         format!("第 {} 日：{} から開始", s.round, current(s).name),
@@ -1789,7 +2768,15 @@ fn finish_round(s: &mut GameState) -> Result<(), String> {
         .into_iter()
         .find(|d| s.round >= *d && !s.food_days.contains(d))
     {
-        feed_and_reward(s, day);
+        next_tasks(
+            s,
+            vec![Task::FoodDay {
+                day,
+                stage: FoodDayStage::Buildings,
+                fed_workers: vec![],
+            }],
+        );
+        return Ok(());
     }
     if let Some(claimed) = s.first_player_claimed {
         s.current_player = claimed;
@@ -1806,6 +2793,9 @@ fn refill_buildings(s: &mut GameState) {
 }
 fn pity_placement(s: &GameState, gear: Option<GearId>) -> bool {
     let p = current(s);
+    if gear.is_some_and(|g| prophecies::placement_surcharge(s, g) > 0) {
+        return false;
+    }
     if s.turn.mode != TurnMode::None
         || TEMPLE_IDS.iter().any(|t| p.temples[t] > -1)
         || available_workers(s, s.current_player) != p.workers
@@ -1839,14 +2829,21 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
         }
         if s.phase == Phase::Setup && s.pending.is_none() {
             let parts: Vec<&str> = choice_id.split(':').collect();
-            let first: &str = parts.get(1).ok_or("初期財産が不正です。")?;
-            let second: &str = parts.get(2).ok_or("初期財産が不正です。")?;
-            let tiles = [
-                wealth(first).ok_or("初期財産が不正です。")?,
-                wealth(second).ok_or("初期財産が不正です。")?,
-            ];
+            if parts[0] == "tribe" {
+                let tribe: TribeId = parse_part(&parts, 1)?;
+                current_mut(&mut s).tribe = Some(tribe);
+                if tribe == TribeId::Yaluk {
+                    current_mut(&mut s).workers = 5;
+                }
+                return Ok(s);
+            }
+            let tiles: Vec<_> = parts
+                .iter()
+                .skip(1)
+                .map(|id| wealth(id).ok_or("初期財産が不正です。"))
+                .collect::<Result<_, _>>()?;
             current_mut(&mut s).wealth = tiles.iter().map(|t| t.id.clone()).collect();
-            for tile in tiles {
+            for tile in &tiles {
                 gain(&mut s, &tile.resources);
             }
             let text = format!(
@@ -1860,7 +2857,16 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
             );
             log(&mut s, text);
             let effects = tiles.iter().flat_map(|t| t.effects.clone()).collect();
-            next_tasks(&mut s, vec![Task::Effects { effects }]);
+            let mut tasks = vec![Task::Effects { effects }];
+            if tribes::has(current(&s), TribeId::Ixtab) {
+                tasks.push(Task::Temple {
+                    remaining: 1,
+                    distinct: None,
+                    direction: Some(-1),
+                    reason: None,
+                });
+            }
+            next_tasks(&mut s, tasks);
         } else if s.pending.is_some() {
             choose_pending(&mut s, &choice_id)?;
         } else {
@@ -1868,45 +2874,75 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
         }
         return Ok(s);
     }
+    if let GameMove::TribeAbility { ref ability } = mv
+        && ability.starts_with("sell:")
+        && s.phase == Phase::Playing
+    {
+        if !tribe_ability_moves(&s)
+            .iter()
+            .any(|m| m.id == format!("tribeAbility:{ability}") && m.disabled != Some(true))
+        {
+            return Err("この部族能力は使えません。".into());
+        }
+        let resource: Resource = ability[5..].parse()?;
+        pay(&mut s, &resources(&[(resource, 1)]), false)?;
+        gain(&mut s, &resources(&[(Resource::Corn, rate(resource))]));
+        s.turn.tribe_ability_used = true;
+        return Ok(s);
+    }
     if s.phase != Phase::Playing || s.pending.is_some() {
         return Err("先に表示されている選択を完了してください。".into());
     }
     let pid = s.current_player;
     match mv {
-        GameMove::Place { gear } => {
-            if s.turn.mode == TurnMode::Remove {
-                return Err("同じ手番に配置と回収はできません。".into());
+        GameMove::Place { gear } => place_worker(&mut s, gear, false)?,
+        GameMove::QuickAction => {
+            let q = quick_state(&s).ok_or("クイックアクションは使えません。")?;
+            let cost = 1 + tribes::placement_surcharge(current(&s), s.turn.count);
+            if s.turn.mode == TurnMode::Remove
+                || q.spaces.contains(&Some(pid as i64))
+                || !q.spaces.contains(&None)
+                || available_workers(&s, pid) < 1
+                || !quick_action_available(&s, cost)
+            {
+                return Err("このクイックアクションは選べません。".into());
             }
-            if available_workers(&s, pid) < 1 {
-                return Err("手元にワーカーがありません。".into());
-            }
-            let pos = lowest_position(&s, gear).ok_or("この歯車に配置できる空きがありません。")?;
-            let cost = get_placement_cost(&s, &gear.to_string())
-                .ok_or("この歯車に配置できる空きがありません。")?;
-            let pity = pity_placement(&s, Some(gear));
-            let amount = if pity {
-                current(&s).resources[&Resource::Corn]
-            } else {
-                cost
-            };
-            pay(&mut s, &resources(&[(Resource::Corn, amount)]), false)?;
-            s.gears.get_mut(&gear).ok_or("都市が不正です。")?[pos] = Some(GearWorker {
-                player_id: pid as i64,
-                dummy: false,
-            });
+            pay(&mut s, &resources(&[(Resource::Corn, cost)]), false)?;
+            let q = s
+                .expansion
+                .as_mut()
+                .unwrap()
+                .quick_actions
+                .as_mut()
+                .unwrap();
+            *q.spaces.iter_mut().find(|x| x.is_none()).unwrap() = Some(pid as i64);
+            q.resolved = false;
             s.turn.mode = TurnMode::Place;
             s.turn.count += 1;
-            let text = format!(
-                "{} が {} {pos} に配置（{}）",
-                current(&s).name,
-                CATALOG.gear_labels[&gear],
-                if pity {
-                    "神の慈悲".into()
-                } else {
-                    format!("{cost} コーン")
-                }
+            log(
+                &mut s,
+                "クイックアクション枠に配置しました。配置終了時に実行します。".into(),
             );
-            log(&mut s, text);
+        }
+        GameMove::TribeAbility { ability } => {
+            if !tribe_ability_moves(&s)
+                .iter()
+                .any(|m| m.id == format!("tribeAbility:{ability}") && m.disabled != Some(true))
+            {
+                return Err("この部族能力は使えません。".into());
+            }
+            let parts: Vec<&str> = ability.split(':').collect();
+            match parts[0] {
+                "discount" => place_worker(&mut s, parse_part(&parts, 1)?, true)?,
+                "skipSpace" => next_tasks(&mut s, vec![Task::TribeSkipSpace]),
+                "sell" => {
+                    let resource: Resource = parse_part(&parts, 1)?;
+                    pay(&mut s, &resources(&[(resource, 1)]), false)?;
+                    gain(&mut s, &resources(&[(Resource::Corn, rate(resource))]));
+                    s.turn.tribe_ability_used = true;
+                }
+                _ => return Err("部族能力が不正です。".into()),
+            }
         }
         GameMove::FirstPlayer => {
             if s.turn.mode == TurnMode::Remove {
@@ -1918,7 +2954,7 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
             if available_workers(&s, pid) < 1 {
                 return Err("手元にワーカーがありません。".into());
             }
-            let cost = s.turn.count;
+            let cost = tribes::placement_surcharge(current(&s), s.turn.count);
             pay(&mut s, &resources(&[(Resource::Corn, cost)]), false)?;
             s.first_player_claimed = Some(pid);
             s.turn.mode = TurnMode::Place;
@@ -1927,10 +2963,19 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
             log(&mut s, text);
         }
         GameMove::Remove { gear, position } => {
-            if position < 0 || position > max_position(gear) {
+            if position < 0 || position > tribes::worker_limit(current(&s), gear) {
                 return Err("ワーカーの場所が不正です。".into());
             }
-            if s.turn.mode == TurnMode::Place {
+            let mixed = s.turn.mode == TurnMode::Place
+                && tribes::has(current(&s), TribeId::AhChuyKak)
+                && s.turn.placed_workers.len() >= 2
+                && !s.turn.tribe_ability_used
+                && !s
+                    .turn
+                    .placed_workers
+                    .iter()
+                    .any(|w| w.gear == gear && w.position == position);
+            if s.turn.mode == TurnMode::Place && !mixed {
                 return Err("同じ手番に配置と回収はできません。".into());
             }
             let worker = s
@@ -1942,8 +2987,12 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
                 return Err("自分のワーカーを選んでください。".into());
             }
             s.gears.get_mut(&gear).ok_or("都市が不正です。")?[position as usize] = None;
-            s.turn.mode = TurnMode::Remove;
-            s.turn.count += 1;
+            if mixed {
+                s.turn.tribe_ability_used = true;
+            } else {
+                s.turn.mode = TurnMode::Remove;
+                s.turn.count += 1;
+            }
             next_tasks(
                 &mut s,
                 vec![Task::Action {
@@ -1956,7 +3005,12 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
         GameMove::Beg => {
             if s.turn.mode != TurnMode::None
                 || s.turn.begged
-                || current(&s).resources[&Resource::Corn] > 2
+                || current(&s).resources[&Resource::Corn]
+                    > if tribes::has(current(&s), TribeId::Bacab) {
+                        3
+                    } else {
+                        2
+                    }
             {
                 return Err("物乞いは手番の開始時、コーンが 2 以下の場合だけです。".into());
             }
@@ -1973,47 +3027,102 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
                 }],
             );
         }
-        GameMove::EndTurn { double_advance } => {
-            if s.turn.count == 0 {
-                return Err("ワーカーを 1 人以上配置するか回収してください。".into());
-            }
-            refill_buildings(&mut s);
-            if s.first_player_claimed == Some(pid) {
-                let n = s.accumulated_corn;
-                gain(&mut s, &resources(&[(Resource::Corn, n)]));
-                s.accumulated_corn = 0;
-            }
-            if s.turn_index == s.turn_order.len() - 1 {
-                finish_round(&mut s)?;
-            } else {
-                s.turn_index += 1;
-                s.current_player = s.turn_order[s.turn_index];
-                s.turn = Turn::default();
-            }
-            if let Some(double) = double_advance
-                && s.pending
-                    .as_ref()
-                    .is_some_and(|p| matches!(p.task, Task::Rotation))
-            {
-                if s.current_player != pid {
-                    return Err(
-                        "カレンダーを進める日数はスタートプレイヤー枠を選んだ人が決めます。".into(),
-                    );
-                }
-                rotate(&mut s, if double { 2 } else { 1 })?;
-            }
-        }
+        GameMove::EndTurn { double_advance } => finish_turn(&mut s, double_advance)?,
         GameMove::Choose { .. } => return Err("操作が不正です。".into()),
+    }
+    if !preserves_quick_action(&s) {
+        return Err("選んだクイックアクションの費用を残してください。".into());
     }
     Ok(s)
 }
 
+fn tribe_ability_moves(s: &GameState) -> Vec<Choice> {
+    let p = current(s);
+    let mut out = vec![];
+    if s.pending.as_ref().is_some_and(|pending| {
+        matches!(pending.task, Task::FoodDay { .. } | Task::Rotation)
+            || pending
+                .after
+                .iter()
+                .any(|t| matches!(t, Task::FoodDay { .. }))
+    }) {
+        return out;
+    }
+    let mut add = |ability: String, label: String, disabled: bool, description: Option<String>| {
+        out.push(Choice {
+            id: format!("tribeAbility:{ability}"),
+            label,
+            description,
+            disabled: Some(disabled),
+            r#move: GameMove::TribeAbility { ability },
+        })
+    };
+    if tribes::has(p, TribeId::XamanEk) && !s.turn.tribe_ability_used {
+        for r in MATERIALS {
+            let mut projected = s.clone();
+            *projected.players[s.current_player]
+                .resources
+                .entry(r)
+                .or_default() -= 1;
+            *projected.players[s.current_player]
+                .resources
+                .entry(Resource::Corn)
+                .or_default() += rate(r);
+            projected.turn.tribe_ability_used = true;
+            let stranded = projected.pending.is_some()
+                && choices_without_reservation(&projected)
+                    .iter()
+                    .all(|c| c.disabled == Some(true));
+            add(
+                format!("sell:{r}"),
+                format!(
+                    "部族能力：{} 1 をコーン {} に交換",
+                    resource_label(r),
+                    rate(r)
+                ),
+                p.resources[&r] < 1 || stranded || !preserves_quick_action(&projected),
+                None,
+            );
+        }
+    }
+    if s.pending.is_none() && s.turn.mode != TurnMode::Remove {
+        if tribes::has(p, TribeId::VacubCaquix)
+            && !s.turn.tribe_ability_used
+            && s.turn.placed_workers.is_empty()
+        {
+            add(
+                "skipSpace".into(),
+                "部族能力：配置時に空き枠を 1 つ飛ばす".into(),
+                available_workers(s, p.id) == 0,
+                None,
+            );
+        }
+        if tribes::has(p, TribeId::CitBolonTum) && !s.turn.placement_discount_used {
+            for g in GEAR_IDS {
+                if let Some(pos) = lowest_position(s, g) {
+                    let cost = get_placement_cost(s, &g.to_string()).unwrap() - (pos as i64).min(2);
+                    add(
+                        format!("discount:{g}"),
+                        format!("{}に配置（部族の割引）", CATALOG.gear_labels[&g]),
+                        available_workers(s, p.id) == 0 || p.resources[&Resource::Corn] < cost,
+                        Some(format!("コーン {cost} · この手番の配置割引を使用")),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
 pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
     if s.phase == Phase::Finished {
         return vec![];
     }
     if s.pending.is_some() || s.phase == Phase::Setup {
-        return get_choices(s);
+        let mut choices = get_choices(s);
+        if s.phase == Phase::Playing {
+            choices.extend(tribe_ability_moves(s));
+        }
+        return choices;
     }
     let p = current(s);
     let mut out = vec![];
@@ -2042,21 +3151,54 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
             label: "スタートプレイヤー枠".into(),
             description: Some(format!(
                 "コーン {} · 手番終了後に蓄積コーン {} を獲得",
-                s.turn.count, s.accumulated_corn
+                tribes::placement_surcharge(p, s.turn.count),
+                s.accumulated_corn
             )),
             disabled: Some(
                 available_workers(s, s.current_player) == 0
                     || s.first_player_claimed.is_some()
-                    || p.resources[&Resource::Corn] < s.turn.count,
+                    || p.resources[&Resource::Corn] < tribes::placement_surcharge(p, s.turn.count),
             ),
             r#move: GameMove::FirstPlayer,
         });
     }
-    if s.turn.mode != TurnMode::Place {
+    if s.turn.mode != TurnMode::Remove
+        && let Some(q) = quick_state(s)
+    {
+        let cost = 1 + tribes::placement_surcharge(p, s.turn.count);
+        let definition = crate::quick_actions::definitions()
+            .into_iter()
+            .find(|d| d.id == q.current)
+            .unwrap();
+        out.push(Choice {
+            id: "quickAction".into(),
+            label: format!("クイックアクション：{}", definition.name),
+            description: Some(format!("コーン {cost} · {}", definition.description)),
+            disabled: Some(
+                available_workers(s, p.id) == 0
+                    || q.spaces.contains(&Some(p.id as i64))
+                    || !q.spaces.contains(&None)
+                    || !quick_action_available(s, cost),
+            ),
+            r#move: GameMove::QuickAction,
+        });
+    }
+    out.extend(tribe_ability_moves(s));
+    let mixed_remove = s.turn.mode == TurnMode::Place
+        && tribes::has(p, TribeId::AhChuyKak)
+        && s.turn.placed_workers.len() >= 2
+        && !s.turn.tribe_ability_used;
+    if s.turn.mode != TurnMode::Place || mixed_remove {
         for gear in GEAR_IDS {
             for (pos, w) in s.gears[&gear].iter().enumerate() {
                 if w.as_ref()
                     .is_some_and(|w| !w.dummy && w.player_id == p.id as i64)
+                    && (!mixed_remove
+                        || !s
+                            .turn
+                            .placed_workers
+                            .iter()
+                            .any(|w| w.gear == gear && w.position == pos as i64))
                 {
                     out.push(Choice {
                         id: format!("remove:{gear}:{pos}"),
@@ -2072,10 +3214,16 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
             }
         }
     }
-    if s.turn.mode == TurnMode::None && !s.turn.begged && p.resources[&Resource::Corn] <= 2 {
+    if s.turn.mode == TurnMode::None
+        && !s.turn.begged
+        && p.resources[&Resource::Corn] <= if tribes::has(p, TribeId::Bacab) { 3 } else { 2 }
+    {
         out.push(Choice {
             id: "beg".into(),
-            label: "物乞いしてコーンを 3 にする".into(),
+            label: format!(
+                "物乞いしてコーンを {} にする",
+                if tribes::has(p, TribeId::Bacab) { 4 } else { 3 }
+            ),
             description: Some("神殿を 1 段下がります".into()),
             disabled: Some(!TEMPLE_IDS.iter().any(|t| p.temples[t] > -1)),
             r#move: GameMove::Beg,
@@ -2085,11 +3233,18 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
         id: "endTurn".into(),
         label: "手番を終了".into(),
         description: None,
-        disabled: Some(s.turn.count == 0),
+        disabled: Some(s.turn.count == 0 && !tribes::has(p, TribeId::Ahmakiq)),
         r#move: GameMove::EndTurn {
             double_advance: None,
         },
     });
+    if has_reserved_quick_action(s) {
+        for choice in &mut out {
+            if choice.disabled != Some(true) && apply_move(s, choice.r#move.clone()).is_err() {
+                choice.disabled = Some(true);
+            }
+        }
+    }
     out
 }
 pub fn score_monument(s: &GameState, p: &Player, id: &str) -> f64 {

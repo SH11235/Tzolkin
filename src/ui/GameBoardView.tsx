@@ -10,11 +10,13 @@ import {
   TEMPLE_IDS,
   TECHNOLOGY_IDS,
   type Choice,
+  type ExpansionCatalog,
   type GameMove,
   type GameState,
   type GearId,
 } from '../game/types';
 import { Board } from './Board';
+import { ExpansionBoard } from './ExpansionBoard';
 import { Icon } from './Icons';
 import {
   effectText,
@@ -32,6 +34,7 @@ export function GameBoardView({
   play,
   view: requestedView,
   setView,
+  expansionCatalog,
 }: {
   game: GameState;
   costs: Record<GearId, number | null>;
@@ -39,6 +42,7 @@ export function GameBoardView({
   play: (move: GameMove) => void;
   view: View;
   setView: (view: View) => void;
+  expansionCatalog?: ExpansionCatalog;
 }) {
   const view =
     game.phase === 'setup' && (requestedView === 'log' || requestedView === 'temples')
@@ -112,7 +116,12 @@ export function GameBoardView({
           </div>
         </section>
       )}
-      {view === 'board' && <Board game={game} moves={moves} play={play} costs={costs} />}
+      {view === 'board' && (
+        <>
+          <ExpansionBoard game={game} catalog={expansionCatalog} moves={moves} play={play} />
+          <Board game={game} moves={moves} play={play} costs={costs} />
+        </>
+      )}
       {view === 'temples' && (
         <section className="temples-view">
           <div className="page-intro">
@@ -259,11 +268,11 @@ function Rules() {
   const rules = [
     [
       '初期資源を選ぶ',
-      '各プレイヤーは配られた4枚から2枚を選びます。ワーカーは3人で開始し、最大6人まで増やせます。2〜3人対局のダミーワーカーは配置場所をふさぎます。',
+      '通常は配られた4枚から2枚を選び、ワーカー3人で開始します。部族によって初期資源の枚数やワーカー数が変わります。ワーカーは最大6人まで増やせます。少人数対局のダミーワーカーは配置場所をふさぎます。',
     ],
     [
       '配置するか、回収するか',
-      '手番では1人以上を配置、または1人以上を回収します。配置と回収は同じ手番でできません。配置は歯車で最も低い空き位置に入り、位置の数字と、同じ手番で配置する人数による追加コストをコーンで支払います。回収するとその位置のアクションを使います。より低い位置を使う場合は差分のコーンを支払い、実行を見送ることもできます。',
+      '通常の手番では1人以上を配置、または1人以上を回収し、同じ手番で両方は行いません。配置は歯車で最も低い空き位置に入り、位置の数字と、同じ手番で配置する人数による追加コストをコーンで支払います。回収するとその位置のアクションを使います。より低い位置を使う場合は差分のコーンを支払い、実行を見送ることもできます。部族による例外は、各プレイヤーの部族欄で確認できます。',
     ],
     [
       '歯車が回る',
@@ -278,6 +287,10 @@ function Rules() {
       '最終食料日後、資源をコーンへ換算し、コーン4につき1点、残った髑髏1につき3点、記念碑の得点を加えます。同点は歯車に残ったワーカーの数で比較します。',
     ],
     [
+      '拡張ルールを選ぶ',
+      '部族は準備時に2枚から1枚を選び、固有の能力を使います。予言は3枚とも最初から公開され、最初の食料日の翌日から順番に災厄が発生し、次の食料日に条件に応じて得点します。クイックアクションは1手番に1か所まで配置でき、配置を終えたその手番で実行します。追加建物は各時代に4枚ずつ混ざります。拡張は個別に組み合わせて使えます。',
+    ],
+    [
       'このアプリでの操作',
       '歯車のワーカーを押すと回収できます。技術・建築・交易などの選択はアクション欄に表示されます。「1つ戻す」で操作を取り消せます。進行は端末内へ自動保存され、保存ファイルを使って別のブラウザでも続きを遊べます。',
     ],
@@ -287,7 +300,7 @@ function Rules() {
       <div className="page-intro">
         <span className="eyebrow">時を味方にする</span>
         <h1>遊び方</h1>
-        <p>2〜4人で同じ画面を使う、基本ゲームの対局です。</p>
+        <p>2〜5人で同じ画面を使って遊べます。5人対局にはクイックアクションが必要です。</p>
       </div>
       {rules.map(([title, text], i) => (
         <section key={title}>
@@ -300,7 +313,7 @@ function Rules() {
       ))}
       <p className="source-note">
         公式ルールの日本語・英語PDFと、補助資料のWikiはリポジトリの docs/rules
-        に保存しています。部族・予言などの拡張ルールは含みません。
+        に保存しています。新しい対局では、部族・予言・クイックアクション・追加建物をそれぞれ選べます。
       </p>
     </article>
   );

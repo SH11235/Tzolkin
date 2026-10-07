@@ -1,3 +1,6 @@
+use crate::prophecies::{FoodDayStage, ProphecyId};
+use crate::quick_actions::{QuickActionId, QuickActionState};
+use crate::tribes::TribeId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
@@ -46,6 +49,36 @@ pub const MATERIALS: [Resource; 3] = [Resource::Wood, Resource::Stone, Resource:
 pub type Resources = BTreeMap<Resource, i64>;
 pub type TempleLevels = BTreeMap<TempleId, i64>;
 pub type TechnologyLevels = BTreeMap<TechnologyId, i64>;
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GameOptions {
+    pub additional_buildings: bool,
+    pub tribes: bool,
+    pub prophecies: bool,
+    pub quick_actions: bool,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpansionState {
+    pub prophecies: Vec<ProphecyId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_prophecy: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick_actions: Option<QuickActionState>,
+    pub deferred_dummy_workers: usize,
+    pub dummy_gears_seen: Vec<GearId>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacedWorker {
+    pub gear: GearId,
+    pub position: i64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum Target<T> {
@@ -157,6 +190,10 @@ pub struct Player {
     pub building_skulls: i64,
     pub double_advance_available: bool,
     pub temple_points: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tribe: Option<TribeId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tribe_offer: Vec<TribeId>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -170,8 +207,35 @@ pub struct JungleBox {
     pub wood: i64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Task {
+    ChooseTribe,
+    TribeSkipSpace,
+    TechnologyBonus,
+    QuickAction {
+        tile: QuickActionId,
+    },
+    FinishTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        double_advance: Option<bool>,
+    },
+    ProphecyGain {
+        player_id: usize,
+        resources: Resources,
+    },
+    ProphecyTemple {
+        temple: TempleId,
+    },
+    FoodDay {
+        day: i64,
+        stage: FoodDayStage,
+        #[serde(default)]
+        fed_workers: Vec<i64>,
+    },
     Effects {
         effects: Vec<Effect>,
     },
@@ -184,10 +248,14 @@ pub enum Task {
     Technology {
         remaining: i64,
         free: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        mandatory: bool,
     },
     PayTechnology {
         technology: TechnologyId,
         amount: i64,
+        #[serde(default, skip_serializing_if = "is_false")]
+        optional: bool,
     },
     PayResource {
         amount: i64,
@@ -216,6 +284,8 @@ pub enum Task {
             skip_serializing_if = "Option::is_none"
         )]
         architecture_available: Option<bool>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        mandatory: bool,
     },
     BuildMonument,
     TechnologyExchange,
@@ -246,10 +316,21 @@ pub struct Pending {
     pub after: Vec<Task>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Turn {
     pub mode: TurnMode,
     pub count: i64,
     pub begged: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placed_workers: Vec<PlacedWorker>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tribe_ability_used: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub placement_discount_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_gear: Option<GearId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_position: Option<i64>,
 }
 impl Default for Turn {
     fn default() -> Self {
@@ -257,6 +338,11 @@ impl Default for Turn {
             mode: TurnMode::None,
             count: 0,
             begged: false,
+            placed_workers: vec![],
+            tribe_ability_used: false,
+            placement_discount_used: false,
+            skipped_gear: None,
+            skipped_position: None,
         }
     }
 }
@@ -278,6 +364,8 @@ pub struct GameState {
     pub version: u32,
     pub seed: u32,
     pub additional_buildings: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<ExpansionState>,
     pub phase: Phase,
     pub round: i64,
     pub age: i64,
@@ -305,6 +393,10 @@ pub struct GameState {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum GameMove {
+    QuickAction,
+    TribeAbility {
+        ability: String,
+    },
     Place {
         gear: GearId,
     },

@@ -164,6 +164,9 @@ svg {
 .player-dot-3 {
   background: #53729d;
 }
+.player-dot-4 {
+  background: #8b6095;
+}
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

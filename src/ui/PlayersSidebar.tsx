@@ -1,14 +1,22 @@
 import type { CSSProperties } from 'react';
 import { ALL_BUILDINGS as BUILDINGS, MONUMENTS, MONUMENT_DESCRIPTIONS } from '../game/catalog';
-import { RESOURCE_IDS, TECHNOLOGY_IDS, TEMPLE_IDS, type GameState } from '../game/types';
+import {
+  RESOURCE_IDS,
+  TECHNOLOGY_IDS,
+  TEMPLE_IDS,
+  type ExpansionCatalog,
+  type GameState,
+} from '../game/types';
 import { Icon } from './Icons';
 import { effectText, formatScore, resourceNames, technologyNames, templeNames } from './content';
 export function PlayersSidebar({
   game,
   availableWorkers,
+  expansionCatalog,
 }: {
   game: GameState;
   availableWorkers: number[];
+  expansionCatalog?: ExpansionCatalog;
 }) {
   return (
     <aside className="players-sidebar" aria-label="プレイヤーの状況">
@@ -31,10 +39,28 @@ export function PlayersSidebar({
           </header>
           {game.phase === 'setup' ? (
             <p className="setup-player-note">
-              {player.wealth.length === 2 ? '選択を終えました' : '初期資源を選びます'}
+              {player.wealth.length > 0
+                ? '選択を終えました'
+                : player.tribeOffer?.length
+                  ? '部族と初期資源を選びます'
+                  : '初期資源を選びます'}
             </p>
           ) : (
             <>
+              {player.tribe && (
+                <details className="player-tribe">
+                  <summary>
+                    {expansionCatalog?.tribes.find((tribe) => tribe.id === player.tribe)?.name ??
+                      player.tribe}
+                  </summary>
+                  <p>
+                    {
+                      expansionCatalog?.tribes.find((tribe) => tribe.id === player.tribe)
+                        ?.description
+                    }
+                  </p>
+                </details>
+              )}
               <div className="resource-grid">
                 {RESOURCE_IDS.map((r) => (
                   <div key={r} className={`resource resource-${r}`} title={resourceNames[r]}>

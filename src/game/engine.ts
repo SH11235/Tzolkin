@@ -1,5 +1,5 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
-import type { Choice, GameMove, GameState, GearId } from './types';
+import type { Choice, ExpansionCatalog, GameMove, GameState, GearId } from './types';
 
 export interface GameSnapshot {
   state: GameState;
@@ -7,6 +7,14 @@ export interface GameSnapshot {
   moves: Choice[];
   placementCosts: Record<GearId, number | null>;
   availableWorkers: number[];
+  expansionCatalog?: ExpansionCatalog;
+}
+
+export interface GameOptions {
+  additionalBuildings?: boolean;
+  tribes?: boolean;
+  prophecies?: boolean;
+  quickActions?: boolean;
 }
 
 type Dispatch = (request: string) => string | Promise<string>;
@@ -39,7 +47,7 @@ async function dispatch<T>(request: Record<string, unknown>): Promise<T> {
 export async function createGame(
   names: string[],
   seed = Date.now() >>> 0,
-  options: { additionalBuildings?: boolean } = {},
+  options: GameOptions = {},
 ): Promise<GameSnapshot> {
   if (!Number.isFinite(seed)) throw new Error('シード値が不正です。');
   return dispatch<GameSnapshot>({
@@ -47,6 +55,9 @@ export async function createGame(
     names,
     seed: seed >>> 0,
     additionalBuildings: options.additionalBuildings ?? false,
+    tribes: options.tribes ?? false,
+    prophecies: options.prophecies ?? false,
+    quickActions: options.quickActions ?? false,
   });
 }
 

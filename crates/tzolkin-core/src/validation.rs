@@ -144,20 +144,47 @@ fn valid_task(value: &Value) -> bool {
         Some("effects") => value["effects"]
             .as_array()
             .is_some_and(|effects| effects.len() <= 12 && effects.iter().all(valid_effect)),
+        Some("chooseTribe" | "tribeSkipSpace" | "technologyBonus") => true,
+        Some("quickAction") => {
+            serde_json::from_value::<crate::quick_actions::QuickActionId>(value["tile"].clone())
+                .is_ok()
+        }
+        Some("finishTurn") => optional(value, "doubleAdvance", Value::is_boolean),
+        Some("prophecyGain") => {
+            integer(&value["playerId"], 0, 4) && resource_record(&value["resources"], true)
+        }
+        Some("prophecyTemple") => has(&TEMPLES, &value["temple"]),
+        Some("foodDay") => {
+            has(
+                &["buildings", "feeding", "temples", "scoring"],
+                &value["stage"],
+            ) && [8.0, 14.0, 21.0, 27.0].contains(&number(&value["day"]))
+                && optional(value, "fedWorkers", |workers| {
+                    workers.as_array().is_some_and(|workers| {
+                        workers.len() <= 5 && workers.iter().all(|n| integer(n, 0, 6))
+                    })
+                })
+        }
         Some("action") => {
             has(&GEARS, &value["gear"])
                 && integer(
                     &value["position"],
                     0,
-                    maximum_position(value["gear"].as_str().unwrap_or("")),
+                    maximum_position(value["gear"].as_str().unwrap_or("")) + 1,
                 )
                 && optional(value, "free", Value::is_boolean)
         }
-        Some("technology") => integer(&value["remaining"], 0, 2) && value["free"].is_boolean(),
-        Some("payTechnology") => {
-            has(&TECHNOLOGIES, &value["technology"]) && integer(&value["amount"], 1, 3)
+        Some("technology") => {
+            integer(&value["remaining"], 0, 2)
+                && value["free"].is_boolean()
+                && optional(value, "mandatory", Value::is_boolean)
         }
-        Some("payResource") => integer(&value["amount"], 1, 3),
+        Some("payTechnology") => {
+            has(&TECHNOLOGIES, &value["technology"])
+                && integer(&value["amount"], 1, 4)
+                && optional(value, "optional", Value::is_boolean)
+        }
+        Some("payResource") => integer(&value["amount"], 1, 4),
         Some("temple") => {
             integer(&value["remaining"], 0, 2)
                 && optional(value, "distinct", |distinct| {
@@ -178,6 +205,7 @@ fn valid_task(value: &Value) -> bool {
                 && value["allowMonument"].is_boolean()
                 && value["cornPayment"].is_boolean()
                 && optional(value, "architectureAvailable", Value::is_boolean)
+                && optional(value, "mandatory", Value::is_boolean)
         }
         Some("trade" | "rotation" | "buildMonument" | "technologyExchange") => true,
         Some("anyAction") => {
@@ -240,7 +268,7 @@ pub fn normalize_json_integers(value: &mut Value) {
 /// Validate untrusted v1 save data before restoring it, including component conservation
 /// and at least one enabled choice for every active pending task.
 pub fn validate_game_state(value: &Value) -> bool {
-    if !valid_shape(value) || !valid_components(value) {
+    if !valid_shape(value) || !valid_expansion(value) || !valid_components(value) {
         return false;
     }
     let mut normalized = value.clone();
@@ -259,7 +287,7 @@ pub fn validate_game_state(value: &Value) -> bool {
 
 fn valid_shape(value: &Value) -> bool {
     if !value.is_object()
-        || number(&value["version"]) != 1.0
+        || ![1.0, 2.0].contains(&number(&value["version"]))
         || !value["additionalBuildings"].is_boolean()
         || !integer(&value["seed"], 0, u32::MAX.into())
         || !has(&["setup", "playing", "finished"], &value["phase"])
@@ -270,7 +298,7 @@ fn valid_shape(value: &Value) -> bool {
     }
     let Some(players) = value["players"]
         .as_array()
-        .filter(|players| (2..=4).contains(&players.len()))
+        .filter(|players| (2..=5).contains(&players.len()))
     else {
         return false;
     };
@@ -304,10 +332,10 @@ fn valid_shape(value: &Value) -> bool {
             return false;
         }
         if !ids(&player["buildings"], "ALL_BUILDINGS", 40)
-            || !ids(&player["monuments"], "MONUMENTS", 6)
+            || !ids(&player["monuments"], "MONUMENTS", 7)
             || !ids(&player["wealthOffer"], "STARTING_WEALTH", 4)
             || player["wealthOffer"].as_array().unwrap().len() != 4
-            || !ids(&player["wealth"], "STARTING_WEALTH", 2)
+            || !ids(&player["wealth"], "STARTING_WEALTH", 3)
             || !player["wealth"]
                 .as_array()
                 .unwrap()
@@ -319,8 +347,8 @@ fn valid_shape(value: &Value) -> bool {
         if !integer(&player["feedWorkers"], 0, 32)
             || !player["feedAll"].is_boolean()
             || !integer(&player["feedDiscount"], 0, 32)
-            || !integer(&player["cornTiles"], 0, 16)
-            || !integer(&player["woodTiles"], 0, 12)
+            || !integer(&player["cornTiles"], 0, 20)
+            || !integer(&player["woodTiles"], 0, 15)
             || !integer(&player["skullsPlaced"], 0, 10)
             || !integer(&player["buildingSkulls"], 0, 1)
             || !player["doubleAdvanceAvailable"].is_boolean()
@@ -377,7 +405,12 @@ fn valid_shape(value: &Value) -> bool {
                 &worker["playerId"],
                 if dummy { -1 } else { 0 },
                 if dummy { -1 } else { player_count as i64 - 1 },
-            ) || (!dummy && position as i64 > maximum_position(gear))
+            ) || (!dummy
+                && position as i64
+                    > maximum_position(gear)
+                        + i64::from(
+                            players[number(&worker["playerId"]) as usize]["tribe"] == "citBolonTum",
+                        ))
             {
                 return false;
             }
@@ -490,6 +523,232 @@ fn valid_shape(value: &Value) -> bool {
     true
 }
 
+fn valid_expansion(value: &Value) -> bool {
+    use crate::quick_actions::{QuickActionId, QuickActionState};
+    use crate::tribes::TribeId;
+    use crate::types::ExpansionState;
+
+    let players = value["players"].as_array().unwrap();
+    let mut tribes = HashSet::new();
+    let mut offers = HashSet::new();
+    let tribal = players
+        .iter()
+        .any(|player| player.get("tribeOffer").is_some());
+    for player in players {
+        let Some(offer) = player.get("tribeOffer") else {
+            if tribal || player.get("tribe").is_some() {
+                return false;
+            }
+            continue;
+        };
+        let Some(offer) = offer.as_array().filter(|offer| offer.len() == 2) else {
+            return false;
+        };
+        for id in offer {
+            if serde_json::from_value::<TribeId>(id.clone()).is_err()
+                || !offers.insert(id.as_str().unwrap())
+            {
+                return false;
+            }
+        }
+        if let Some(tribe) = player.get("tribe") {
+            if !offer.contains(tribe) || !tribes.insert(tribe.as_str().unwrap()) {
+                return false;
+            }
+        } else if value["phase"] != "setup" || !player["wealth"].as_array().unwrap().is_empty() {
+            return false;
+        }
+    }
+
+    let turn = &value["turn"];
+    if !["tribeAbilityUsed", "placementDiscountUsed"]
+        .iter()
+        .all(|key| optional(turn, key, Value::is_boolean))
+        || !optional(turn, "skippedGear", |gear| has(&GEARS, gear))
+        || !optional(turn, "skippedPosition", |position| integer(position, 0, 11))
+        || turn.get("skippedGear").is_some() != turn.get("skippedPosition").is_some()
+        || !optional(turn, "placedWorkers", |workers| {
+            workers.as_array().is_some_and(|workers| {
+                workers.len() <= 6
+                    && unique_values(workers)
+                    && workers.iter().all(|worker| {
+                        has(&GEARS, &worker["gear"])
+                            && integer(
+                                &worker["position"],
+                                0,
+                                maximum_position(worker["gear"].as_str().unwrap_or("")) + 1,
+                            )
+                    })
+            })
+        })
+    {
+        return false;
+    }
+
+    let Some(expansion) = value.get("expansion") else {
+        return number(&value["version"]) == 1.0
+            && players.len() <= 4
+            && !tribal
+            && optional(turn, "placedWorkers", |workers| {
+                workers == &serde_json::json!([])
+            })
+            && optional(turn, "tribeAbilityUsed", |used| used == false)
+            && optional(turn, "placementDiscountUsed", |used| used == false)
+            && turn.get("skippedGear").is_none()
+            && !pending_tasks(value).iter().any(|task| {
+                expansion_task(task)
+                    || (task["type"] == "action"
+                        && number(&task["position"])
+                            > maximum_position(task["gear"].as_str().unwrap()) as f64)
+                    || (matches!(task["type"].as_str(), Some("payResource" | "payTechnology"))
+                        && number(&task["amount"]) > 3.0)
+                    || task["mandatory"] == true
+                    || task["optional"] == true
+            });
+    };
+    if number(&value["version"]) != 2.0 || !expansion.is_object() {
+        return false;
+    }
+    let mut normalized = expansion.clone();
+    normalize_json_integers(&mut normalized);
+    let Ok(expansion) = serde_json::from_value::<ExpansionState>(normalized) else {
+        return false;
+    };
+    let prophecies = &expansion.prophecies;
+    if ![0, 3].contains(&prophecies.len())
+        || prophecies.iter().collect::<HashSet<_>>().len() != prophecies.len()
+        || expansion.active_prophecy.is_some_and(|index| {
+            index >= prophecies.len() || index >= value["foodDays"].as_array().unwrap().len()
+        })
+        || expansion.deferred_dummy_workers > 18
+        || (value["phase"] != "setup" && expansion.deferred_dummy_workers != 0)
+        || expansion.dummy_gears_seen.len() > 5
+        || expansion
+            .dummy_gears_seen
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != expansion.dummy_gears_seen.len()
+    {
+        return false;
+    }
+    fn same_tiles(tiles: &[QuickActionId], expected: &[QuickActionId]) -> bool {
+        let mut actual: Vec<String> = tiles
+            .iter()
+            .map(|id| serde_json::to_string(id).unwrap())
+            .collect();
+        let mut expected: Vec<String> = expected
+            .iter()
+            .map(|id| serde_json::to_string(id).unwrap())
+            .collect();
+        actual.sort();
+        expected.sort();
+        actual == expected
+    }
+    if let Some(quick) = &expansion.quick_actions {
+        let dummy_count = match players.len() {
+            2 => 2,
+            3 | 4 => 1,
+            _ => 0,
+        };
+        let mut scheduled: QuickActionState = quick.clone();
+        if !same_tiles(&quick.age1, &QuickActionId::AGE1)
+            || !same_tiles(&quick.age2, &QuickActionId::AGE2)
+            || quick.spaces.len() != 3
+            || quick
+                .spaces
+                .iter()
+                .filter(|owner| **owner == Some(-1))
+                .count()
+                != dummy_count
+            || quick
+                .spaces
+                .iter()
+                .flatten()
+                .any(|owner| *owner < -1 || *owner >= players.len() as i64)
+        {
+            return false;
+        }
+        let owners: Vec<i64> = quick
+            .spaces
+            .iter()
+            .flatten()
+            .filter(|id| **id >= 0)
+            .copied()
+            .collect();
+        if owners.iter().copied().collect::<HashSet<_>>().len() != owners.len() {
+            return false;
+        }
+        scheduled.update(number(&value["round"]) as i64);
+        if scheduled.current != quick.current {
+            return false;
+        }
+    } else if players.len() == 5 || expansion.deferred_dummy_workers != 0 {
+        return false;
+    }
+    if !tribal && prophecies.is_empty() && expansion.quick_actions.is_none() {
+        return false;
+    }
+    for task in pending_tasks(value) {
+        if task["type"] == "prophecyGain"
+            && (!integer(&task["playerId"], 0, players.len() as i64 - 1)
+                || task["resources"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|amount| number(amount) > 100.0))
+        {
+            return false;
+        }
+        if matches!(
+            task["type"].as_str(),
+            Some("prophecyGain" | "prophecyTemple" | "foodDay")
+        ) && prophecies.is_empty()
+        {
+            return false;
+        }
+        if task["type"] == "quickAction" && expansion.quick_actions.is_none() {
+            return false;
+        }
+        if task["type"] == "effects"
+            && task["effects"].as_array().unwrap().iter().any(|effect| {
+                effect["resources"].as_object().is_some_and(|resources| {
+                    resources.values().any(|amount| number(amount) > 100.0)
+                })
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn pending_tasks(value: &Value) -> Vec<&Value> {
+    if value["pending"].is_null() {
+        vec![]
+    } else {
+        std::iter::once(&value["pending"]["task"])
+            .chain(value["pending"]["after"].as_array().unwrap())
+            .collect()
+    }
+}
+
+fn expansion_task(task: &Value) -> bool {
+    matches!(
+        task["type"].as_str(),
+        Some(
+            "chooseTribe"
+                | "tribeSkipSpace"
+                | "technologyBonus"
+                | "quickAction"
+                | "finishTurn"
+                | "prophecyGain"
+                | "prophecyTemple"
+                | "foodDay"
+        )
+    )
+}
+
 fn valid_components(value: &Value) -> bool {
     let players = value["players"].as_array().unwrap();
     let player_count = players.len();
@@ -549,22 +808,32 @@ fn valid_components(value: &Value) -> bool {
             return false;
         }
     }
-    if value["phase"] != "setup"
-        && players
-            .iter()
-            .any(|player| player["wealth"].as_array().unwrap().len() != 2)
-    {
-        return false;
+    for player in players {
+        let count = if player["tribe"] == "ixtab" { 3 } else { 2 };
+        let actual = player["wealth"].as_array().unwrap().len();
+        if actual > count || (value["phase"] != "setup" && actual != count) {
+            return false;
+        }
     }
     let gear_workers: Vec<&Value> = GEARS
         .iter()
         .flat_map(|gear| value["gears"][gear].as_array().unwrap())
         .collect();
+    let quick_spaces = value["expansion"]["quickActions"]["spaces"].as_array();
+    let blocked_quick = quick_spaces.map_or(0, |spaces| {
+        spaces.iter().filter(|id| number(id) == -1.0).count()
+    });
+    let deferred = value["expansion"]["deferredDummyWorkers"]
+        .as_f64()
+        .unwrap_or(0.0) as usize;
+    let target = if quick_spaces.is_some() { 5 } else { 4 };
     if gear_workers
         .iter()
         .filter(|worker| worker["dummy"] == true)
         .count()
-        != (4 - player_count) * 6
+        + blocked_quick
+        + deferred
+        != (target - player_count) * 6
     {
         return false;
     }
@@ -587,7 +856,10 @@ fn valid_components(value: &Value) -> bool {
         let first_player_worker = usize::from(
             !value["firstPlayerClaimed"].is_null() && number(&value["firstPlayerClaimed"]) == id,
         );
-        if number(&player["workers"]) - ((on_gears + first_player_worker) as f64) < 0.0
+        let on_quick = quick_spaces.map_or(0, |spaces| {
+            spaces.iter().filter(|owner| number(owner) == id).count()
+        });
+        if number(&player["workers"]) - ((on_gears + first_player_worker + on_quick) as f64) < 0.0
             || number(&player["skullsPlaced"])
                 != skull_spaces
                     .iter()
@@ -635,7 +907,10 @@ fn valid_components(value: &Value) -> bool {
     {
         return false;
     }
-    if value["phase"] == "playing" && !rotation {
+    let food_day = pending_tasks(value)
+        .iter()
+        .any(|task| task["type"] == "foodDay");
+    if value["phase"] == "playing" && !rotation && !food_day {
         let turn_index = number(&value["turnIndex"]) as usize;
         if number(&value["currentPlayer"]) != number(&value["turnOrder"][turn_index]) {
             return false;
@@ -643,7 +918,10 @@ fn valid_components(value: &Value) -> bool {
     }
     let food_days = value["foodDays"].as_array().unwrap();
     let passed_age_one = food_days.iter().any(|day| number(day) == 14.0);
-    if (number(&value["age"]) == 2.0) != passed_age_one {
+    let awaiting_age_change = pending_tasks(value).iter().any(|task| {
+        task["type"] == "foodDay" && number(&task["day"]) == 14.0 && task["stage"] == "feeding"
+    });
+    if (number(&value["age"]) == 2.0) != (passed_age_one && !awaiting_age_change) {
         return false;
     }
     if value["phase"] == "finished"

@@ -1,8 +1,8 @@
 use crate::engine::{
-    apply_move, available_workers, create_game, get_available_moves, get_choices,
+    apply_move, available_workers, create_game_with_options, get_available_moves, get_choices,
     get_placement_cost, score_monument,
 };
-use crate::types::{Choice, GEAR_IDS, GameMove, GameState, GearId, Player};
+use crate::types::{Choice, GEAR_IDS, GameMove, GameOptions, GameState, GearId, Player};
 use crate::validation::{normalize_json_integers, validate_game_state};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +16,8 @@ pub struct GameSnapshot {
     pub moves: Vec<Choice>,
     pub placement_costs: BTreeMap<GearId, Option<i64>>,
     pub available_workers: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion_catalog: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,8 +26,8 @@ enum Request {
     Create {
         names: Vec<String>,
         seed: u32,
-        #[serde(rename = "additionalBuildings", default)]
-        additional_buildings: bool,
+        #[serde(flatten)]
+        options: GameOptions,
     },
     Apply {
         state: Value,
@@ -47,6 +49,13 @@ enum Request {
 
 fn snapshot(state: GameState) -> GameSnapshot {
     GameSnapshot {
+        expansion_catalog: state.expansion.as_ref().map(|_| {
+            serde_json::json!({
+                "tribes": crate::tribes::definitions(),
+                "prophecies": crate::prophecies::definitions(),
+                "quickActions": crate::quick_actions::definitions(),
+            })
+        }),
         choices: get_choices(&state),
         moves: get_available_moves(&state),
         placement_costs: GEAR_IDS
@@ -87,8 +96,8 @@ fn dispatch(request: &str, checked: bool) -> Result<String, String> {
         Request::Create {
             names,
             seed,
-            additional_buildings,
-        } => result_snapshot(create_game(names, seed, additional_buildings)?, checked),
+            options,
+        } => result_snapshot(create_game_with_options(names, seed, options)?, checked),
         Request::Apply { state, r#move } => {
             let state = state_from_json(state, checked)?;
             result_snapshot(apply_move(&state, r#move)?, checked)

@@ -86,12 +86,13 @@ export function Board({
                     c.move.position === position,
                 );
                 const owner = worker && !worker.dummy ? game.players[worker.playerId] : null;
-                const action = gearActions[gear][position] ?? '歯車の裏側';
+                const action =
+                  gearActions[gear][position] ?? (remove ? remove.label : '歯車の裏側');
                 const label = `${gearNames[gear]} ${position}：${action}${worker ? `、${worker.dummy ? 'ダミー' : owner?.name}のワーカー` : '、空き'}`;
                 return (
                   <button
                     key={position}
-                    className={`gear-slot ${position >= visible ? 'hidden-slot' : ''} ${worker ? 'occupied' : ''} ${remove ? 'can-remove' : ''} ${worker?.dummy ? 'dummy' : ''}`}
+                    className={`gear-slot ${position >= visible && !remove ? 'hidden-slot' : ''} ${worker ? 'occupied' : ''} ${remove ? 'can-remove' : ''} ${worker?.dummy ? 'dummy' : ''}`}
                     aria-label={label}
                     title={label}
                     disabled={!remove || remove.disabled}
