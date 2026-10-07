@@ -29,3 +29,7 @@ playwright-report/
 test-results/
 .playwright-cli/
 *.tsbuildinfo
+
+# Generated Rust and WebAssembly build output
+/target/
+/generated/

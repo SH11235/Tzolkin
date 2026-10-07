@@ -8,10 +8,10 @@ import {
   getPlacementCost,
   scoreMonument,
   validateGameState,
-} from './engine';
-import { BUILDINGS, BUILDING_BY_ID, EXPANSION_BUILDINGS, MONUMENTS } from './catalog';
-import { GEAR_IDS } from './types';
-import type { GameState, GearId } from './types';
+} from '../helpers/core';
+import { BUILDINGS, BUILDING_BY_ID, EXPANSION_BUILDINGS, MONUMENTS } from '../../src/game/catalog';
+import { GEAR_IDS } from '../../src/game/types';
+import type { GameState, GearId } from '../../src/game/types';
 
 function start(count = 4, seed = 42, additionalBuildings = false): GameState {
   let state = createGame(['赤', '緑', '黄', '青'].slice(0, count), seed, { additionalBuildings });

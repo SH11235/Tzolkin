@@ -7,3 +7,5 @@ package-lock.json
 .playwright-cli/
 playwright-report/
 test-results/
+target/
+generated/

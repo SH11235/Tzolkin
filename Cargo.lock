@@ -3653,6 +3653,23 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
+ "tzolkin-core",
+]
+
+[[package]]
+name = "tzolkin-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tzolkin-wasm"
+version = "0.1.0"
+dependencies = [
+ "tzolkin-core",
+ "wasm-bindgen",
 ]
 
 [[package]]

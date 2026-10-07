@@ -1,4 +1,3 @@
-import { getPlacementCost } from '../game/engine';
 import {
   ALL_BUILDINGS as BUILDINGS,
   MONUMENTS,
@@ -8,12 +7,12 @@ import {
   TECHNOLOGY_LABELS,
 } from '../game/catalog';
 import {
-  GEAR_IDS,
   TEMPLE_IDS,
   TECHNOLOGY_IDS,
   type Choice,
   type GameMove,
   type GameState,
+  type GearId,
 } from '../game/types';
 import { Board } from './Board';
 import { Icon } from './Icons';
@@ -28,12 +27,14 @@ import {
 export type View = 'board' | 'temples' | 'buildings' | 'log' | 'rules';
 export function GameBoardView({
   game,
+  costs,
   moves,
   play,
   view: requestedView,
   setView,
 }: {
   game: GameState;
+  costs: Record<GearId, number | null>;
   moves: Choice[];
   play: (move: GameMove) => void;
   view: View;
@@ -111,19 +112,7 @@ export function GameBoardView({
           </div>
         </section>
       )}
-      {view === 'board' && (
-        <Board
-          game={game}
-          moves={moves}
-          play={play}
-          costs={
-            Object.fromEntries(GEAR_IDS.map((g) => [g, getPlacementCost(game, g)])) as Record<
-              (typeof GEAR_IDS)[number],
-              number | null
-            >
-          }
-        />
-      )}
+      {view === 'board' && <Board game={game} moves={moves} play={play} costs={costs} />}
       {view === 'temples' && (
         <section className="temples-view">
           <div className="page-intro">

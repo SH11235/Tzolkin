@@ -10,7 +10,7 @@ export default defineConfig({
     port: 1420,
     strictPort: true,
     host: host || false,
-    watch: { ignored: ['**/src-tauri/**'] },
+    watch: { ignored: ['**/src-tauri/**', '**/target/**'] },
   },
   build: {
     target: 'es2022',
@@ -19,6 +19,7 @@ export default defineConfig({
   },
   test: {
     environment: 'node',
-    include: ['src/**/*.test.ts', 'src/**/*.test.tsx'],
+    include: ['src/**/*.test.ts', 'src/**/*.test.tsx', 'tests/unit/**/*.test.ts'],
+    setupFiles: ['scripts/wasm-test-setup.ts'],
   },
 });

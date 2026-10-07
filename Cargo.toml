@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/tzolkin-core", "crates/tzolkin-wasm", "src-tauri"]
+default-members = ["crates/tzolkin-core"]
+resolver = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

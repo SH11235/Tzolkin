@@ -1,0 +1,2260 @@
+{
+  "GEAR_LABELS": {
+    "palenque": "パレンケ",
+    "yaxchilan": "ヤシュチラン",
+    "tikal": "ティカル",
+    "uxmal": "ウズマル",
+    "chichenItza": "チチェン・イツァ"
+  },
+  "TECHNOLOGY_LABELS": {
+    "agriculture": "農業",
+    "extraction": "資源採掘",
+    "architecture": "建築",
+    "theology": "信仰"
+  },
+  "TECHNOLOGY_DESCRIPTIONS": {
+    "agriculture": [
+      "森の収穫（パレンケ 2〜5）でコーンを追加で 1 得る。",
+      "公開コーンタイルがない森でもコーンを収穫できる（タイルは得ない）。漁業（パレンケ 1）でコーンを追加で 1 得る。",
+      "森の収穫でコーンをさらに 2 得る。レベル 1 と合わせて追加で 3。",
+      "任意の寺院を 1 段上る。"
+    ],
+    "extraction": [
+      "ヤシュチラン 1、パレンケ 3〜5 で木材を得ると、木材を追加で 1 得る。",
+      "ヤシュチラン 2・5 で石を得ると、石を追加で 1 得る。",
+      "ヤシュチラン 3・5 で金を得ると、金を追加で 1 得る。",
+      "任意の資源（木材・石・金）を合計 2 得る。"
+    ],
+    "architecture": [
+      "建物を建てるとコーンを 1 得る。記念碑には適用しない。",
+      "建物を建てると 2 点を得る。ティカル 4 では 2 軒のうち 1 軒だけに技術を適用する。",
+      "ティカルでの建物建設は任意の資源 1 個、ウズマルでの建物建設はコーン 2 個を割り引く。",
+      "3 点を得る。"
+    ],
+    "theology": [
+      "チチェン・イツァから回収するとき、1 マス先のアクションも追加コーンなしで選べる。",
+      "チチェン・イツァのアクション後、資源 1 個を支払って任意の寺院を 1 段上れる。",
+      "ヤシュチラン 4 で水晶髑髏を得ると、水晶髑髏を追加で 1 得る。",
+      "水晶髑髏を 1 得る。"
+    ]
+  },
+  "TEMPLE_LABELS": {
+    "chaac": "チャク",
+    "quetzalcoatl": "ケツァルコアトル",
+    "kukulkan": "ククルカン"
+  },
+  "GEAR_DESCRIPTIONS": {
+    "palenque": "漁業と収穫でコーンを集め、森を切り開いて木材を得る。",
+    "yaxchilan": "木材、石、金、水晶髑髏を採掘する。",
+    "tikal": "技術を発展させ、建物や記念碑を建設する。",
+    "uxmal": "コーンを使い、交易、信仰、労働者の追加を行う。",
+    "chichenItza": "水晶髑髏を捧げて勝利点を獲得し、寺院を登る。"
+  },
+  "GEAR_ACTIONS": {
+    "palenque": [
+      "待機",
+      "漁業：コーン 3",
+      "収穫：コーン 4",
+      "収穫：コーン 5 / 木材 2",
+      "収穫：コーン 7 / 木材 3",
+      "収穫：コーン 9 / 木材 4",
+      "パレンケの 1〜5 を選ぶ",
+      "パレンケの 1〜5 を選ぶ",
+      "歯車の裏側",
+      "歯車の裏側"
+    ],
+    "yaxchilan": [
+      "待機",
+      "木材 1",
+      "石 1 ＋ コーン 1",
+      "金 1 ＋ コーン 2",
+      "水晶髑髏 1",
+      "石 1 ＋ 金 1 ＋ コーン 2",
+      "ヤシュチランの 1〜5 を選ぶ",
+      "ヤシュチランの 1〜5 を選ぶ",
+      "歯車の裏側",
+      "歯車の裏側"
+    ],
+    "tikal": [
+      "待機",
+      "技術を 1 段階上げる",
+      "建物を 1 軒建てる",
+      "技術を 2 段階上げる",
+      "建物を 2 軒 / 記念碑を 1 基",
+      "資源 1：異なる寺院を 1 段ずつ",
+      "ティカルの 1〜5 を選ぶ",
+      "ティカルの 1〜5 を選ぶ",
+      "歯車の裏側",
+      "歯車の裏側"
+    ],
+    "uxmal": [
+      "待機",
+      "コーン 3：寺院を 1 段上る",
+      "市場で資源を売買",
+      "労働者を 1 人増やす",
+      "コーンで建物を 1 軒建てる",
+      "コーン 1：髑髏以外のアクション",
+      "ウズマルの 1〜5 を選ぶ",
+      "ウズマルの 1〜5 を選ぶ",
+      "歯車の裏側",
+      "歯車の裏側"
+    ],
+    "chichenItza": [
+      "待機",
+      "髑髏：4 点 ＋ チャク",
+      "髑髏：5 点 ＋ チャク",
+      "髑髏：6 点 ＋ チャク",
+      "髑髏：7 点 ＋ ククルカン",
+      "髑髏：8 点 ＋ ククルカン",
+      "髑髏：8 点 ＋ ククルカン ＋ 資源",
+      "髑髏：10 点 ＋ ケツァルコアトル",
+      "髑髏：11 点 ＋ ケツァルコアトル ＋ 資源",
+      "髑髏：13 点 ＋ ケツァルコアトル ＋ 資源",
+      "チチェン・イツァの 1〜9 を選ぶ",
+      "歯車の裏側",
+      "歯車の裏側"
+    ]
+  },
+  "TEMPLE_TRACKS": {
+    "chaac": {
+      "name": "チャク",
+      "max": 5,
+      "points": [-1, 0, 2, 4, 6, 7, 8],
+      "resourceRewards": [
+        {},
+        {},
+        {
+          "stone": 1
+        },
+        {},
+        {
+          "stone": 1
+        },
+        {},
+        {}
+      ],
+      "age1Bonus": 6,
+      "age2Bonus": 2
+    },
+    "quetzalcoatl": {
+      "name": "ケツァルコアトル",
+      "max": 7,
+      "points": [-2, 0, 1, 2, 4, 6, 9, 12, 13],
+      "resourceRewards": [
+        {},
+        {},
+        {},
+        {
+          "gold": 1
+        },
+        {},
+        {
+          "gold": 1
+        },
+        {},
+        {},
+        {}
+      ],
+      "age1Bonus": 2,
+      "age2Bonus": 6
+    },
+    "kukulkan": {
+      "name": "ククルカン",
+      "max": 6,
+      "points": [-3, 0, 1, 3, 5, 7, 9, 10],
+      "resourceRewards": [
+        {},
+        {},
+        {
+          "wood": 1
+        },
+        {},
+        {
+          "wood": 1
+        },
+        {
+          "skull": 1
+        },
+        {},
+        {}
+      ],
+      "age1Bonus": 4,
+      "age2Bonus": 4
+    }
+  },
+  "SKULL_REWARDS": {
+    "1": {
+      "points": 4,
+      "temple": "chaac",
+      "resource": false
+    },
+    "2": {
+      "points": 5,
+      "temple": "chaac",
+      "resource": false
+    },
+    "3": {
+      "points": 6,
+      "temple": "chaac",
+      "resource": false
+    },
+    "4": {
+      "points": 7,
+      "temple": "kukulkan",
+      "resource": false
+    },
+    "5": {
+      "points": 8,
+      "temple": "kukulkan",
+      "resource": false
+    },
+    "6": {
+      "points": 8,
+      "temple": "kukulkan",
+      "resource": true
+    },
+    "7": {
+      "points": 10,
+      "temple": "quetzalcoatl",
+      "resource": false
+    },
+    "8": {
+      "points": 11,
+      "temple": "quetzalcoatl",
+      "resource": true
+    },
+    "9": {
+      "points": 13,
+      "temple": "quetzalcoatl",
+      "resource": true
+    }
+  },
+  "STARTING_WEALTH": [
+    {
+      "id": "w01",
+      "name": "パレンケ 1",
+      "gear": "palenque",
+      "position": 1,
+      "resources": {
+        "corn": 3
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 1
+        },
+        {
+          "type": "technology",
+          "technology": "agriculture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w02",
+      "name": "パレンケ 3",
+      "gear": "palenque",
+      "position": 3,
+      "resources": {
+        "corn": 5,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w03",
+      "name": "パレンケ 5",
+      "gear": "palenque",
+      "position": 5,
+      "resources": {
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "agriculture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w04",
+      "name": "パレンケ 7",
+      "gear": "palenque",
+      "position": 7,
+      "resources": {
+        "corn": 9,
+        "stone": 1
+      },
+      "effects": []
+    },
+    {
+      "id": "w05",
+      "name": "ヤシュチラン 1",
+      "gear": "yaxchilan",
+      "position": 1,
+      "resources": {},
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        },
+        {
+          "type": "technology",
+          "technology": "extraction",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w06",
+      "name": "ヤシュチラン 3",
+      "gear": "yaxchilan",
+      "position": 3,
+      "resources": {
+        "corn": 2,
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w07",
+      "name": "ヤシュチラン 5",
+      "gear": "yaxchilan",
+      "position": 5,
+      "resources": {
+        "corn": 4,
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "extraction",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w08",
+      "name": "ヤシュチラン 7",
+      "gear": "yaxchilan",
+      "position": 7,
+      "resources": {
+        "corn": 3,
+        "wood": 2,
+        "stone": 1
+      },
+      "effects": []
+    },
+    {
+      "id": "w09",
+      "name": "ティカル 1",
+      "gear": "tikal",
+      "position": 1,
+      "resources": {
+        "corn": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "technology",
+          "technology": "architecture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w10",
+      "name": "ティカル 3",
+      "gear": "tikal",
+      "position": 3,
+      "resources": {
+        "corn": 6,
+        "stone": 2
+      },
+      "effects": []
+    },
+    {
+      "id": "w11",
+      "name": "ティカル 5",
+      "gear": "tikal",
+      "position": 5,
+      "resources": {
+        "corn": 3,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "architecture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w12",
+      "name": "ティカル 7",
+      "gear": "tikal",
+      "position": 7,
+      "resources": {
+        "corn": 6,
+        "wood": 1,
+        "stone": 1
+      },
+      "effects": []
+    },
+    {
+      "id": "w13",
+      "name": "ウズマル 1",
+      "gear": "uxmal",
+      "position": 1,
+      "resources": {
+        "corn": 5,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w14",
+      "name": "ウズマル 3",
+      "gear": "uxmal",
+      "position": 3,
+      "resources": {
+        "corn": 3,
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 1
+        }
+      ]
+    },
+    {
+      "id": "w15",
+      "name": "ウズマル 5",
+      "gear": "uxmal",
+      "position": 5,
+      "resources": {},
+      "effects": [
+        {
+          "type": "worker"
+        }
+      ]
+    },
+    {
+      "id": "w16",
+      "name": "ウズマル 7",
+      "gear": "uxmal",
+      "position": 7,
+      "resources": {
+        "corn": 8,
+        "gold": 1
+      },
+      "effects": []
+    },
+    {
+      "id": "w17",
+      "name": "チチェン・イツァ 0",
+      "gear": "chichenItza",
+      "position": 0,
+      "resources": {
+        "corn": 4,
+        "wood": 1,
+        "skull": 1
+      },
+      "effects": []
+    },
+    {
+      "id": "w18",
+      "name": "チチェン・イツァ 3",
+      "gear": "chichenItza",
+      "position": 3,
+      "resources": {
+        "corn": 5,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "theology",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w19",
+      "name": "チチェン・イツァ 5",
+      "gear": "chichenItza",
+      "position": 5,
+      "resources": {
+        "corn": 4,
+        "wood": 3
+      },
+      "effects": []
+    },
+    {
+      "id": "w20",
+      "name": "チチェン・イツァ 7",
+      "gear": "chichenItza",
+      "position": 7,
+      "resources": {
+        "corn": 2,
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "theology",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "w21",
+      "name": "チチェン・イツァ 10",
+      "gear": "chichenItza",
+      "position": 10,
+      "resources": {
+        "corn": 7,
+        "wood": 2
+      },
+      "effects": []
+    }
+  ],
+  "BUILDINGS": [
+    {
+      "id": "b01",
+      "name": "小農場 I",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 1
+        }
+      ]
+    },
+    {
+      "id": "b02",
+      "name": "小農場 II",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 1
+        }
+      ]
+    },
+    {
+      "id": "b03",
+      "name": "小農場 III",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 1
+        }
+      ]
+    },
+    {
+      "id": "b04",
+      "name": "共同農場 I",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 4
+      },
+      "effects": [
+        {
+          "type": "feedDiscount",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "b05",
+      "name": "共同農場 II",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 4
+      },
+      "effects": [
+        {
+          "type": "feedDiscount",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "b06",
+      "name": "雨と太陽の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 2,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b07",
+      "name": "雨と風の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b08",
+      "name": "建設者の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "any",
+          "steps": 1
+        },
+        {
+          "type": "build"
+        }
+      ]
+    },
+    {
+      "id": "b09",
+      "name": "農業学校",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "agriculture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b10",
+      "name": "農業工房",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 3
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "agriculture",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "stone": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b11",
+      "name": "採掘学校",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 1,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "extraction",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "corn": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b12",
+      "name": "採掘工房",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "extraction",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "gold": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b13",
+      "name": "建築の社",
+      "age": 1,
+      "category": "shrine",
+      "cost": {
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "architecture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b14",
+      "name": "信仰の社",
+      "age": 1,
+      "category": "shrine",
+      "cost": {
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "theology",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b15",
+      "name": "大農場 I",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 3
+        }
+      ]
+    },
+    {
+      "id": "b16",
+      "name": "大農場 II",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 3
+        }
+      ]
+    },
+    {
+      "id": "b17",
+      "name": "大農場 III",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 3
+        }
+      ]
+    },
+    {
+      "id": "b18",
+      "name": "商人の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "stone": 3
+      },
+      "effects": [
+        {
+          "type": "trade"
+        },
+        {
+          "type": "points",
+          "amount": 6
+        }
+      ]
+    },
+    {
+      "id": "b19",
+      "name": "労働者の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "worker"
+        },
+        {
+          "type": "points",
+          "amount": 6
+        }
+      ]
+    },
+    {
+      "id": "b20",
+      "name": "指導者の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "points",
+          "amount": 8
+        }
+      ]
+    },
+    {
+      "id": "b21",
+      "name": "行動者の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 2,
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "action"
+        },
+        {
+          "type": "points",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "id": "b22",
+      "name": "三神の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 2,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        },
+        {
+          "type": "points",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "id": "b23",
+      "name": "石の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 3
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "stone": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b24",
+      "name": "金の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "gold": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b25",
+      "name": "豊穣の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 3,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "corn": 6
+          }
+        }
+      ]
+    },
+    {
+      "id": "b26",
+      "name": "髑髏の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "skull": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b27",
+      "name": "チャクの社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 2
+        },
+        {
+          "type": "points",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "id": "b28",
+      "name": "建築家の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "architecture",
+          "steps": 1
+        },
+        {
+          "type": "points",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "id": "b29",
+      "name": "ククルカンの社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 2
+        },
+        {
+          "type": "points",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "id": "b30",
+      "name": "信仰者の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 2,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "theology",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b31",
+      "name": "知恵の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 1,
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 2
+        }
+      ]
+    },
+    {
+      "id": "b32",
+      "name": "ケツァルコアトルの社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "gold": 3
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 2
+        },
+        {
+          "type": "points",
+          "amount": 4
+        }
+      ]
+    }
+  ],
+  "EXPANSION_BUILDINGS": [
+    {
+      "id": "b33",
+      "name": "食糧庫",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 3
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodReward",
+          "resources": {
+            "corn": 3
+          }
+        }
+      ]
+    },
+    {
+      "id": "b34",
+      "name": "季節の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 2,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodRewardSwitch"
+        }
+      ]
+    },
+    {
+      "id": "b35",
+      "name": "金の工房",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 1,
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodReward",
+          "resources": {
+            "gold": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b36",
+      "name": "石の社",
+      "age": 1,
+      "category": "shrine",
+      "cost": {
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodReward",
+          "resources": {
+            "stone": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b37",
+      "name": "豊作の農場",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "resources",
+          "resources": {
+            "corn": 8
+          }
+        }
+      ]
+    },
+    {
+      "id": "b38",
+      "name": "記念碑の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "buildMonument"
+        },
+        {
+          "type": "points",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "b39",
+      "name": "知識交換所",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 1,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technologyExchange"
+        }
+      ]
+    },
+    {
+      "id": "b40",
+      "name": "髑髏の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "gold": 1,
+        "skull": 1
+      },
+      "effects": [
+        {
+          "type": "skullBuilding",
+          "points": 7,
+          "temple": "any"
+        }
+      ]
+    }
+  ],
+  "ALL_BUILDINGS": [
+    {
+      "id": "b01",
+      "name": "小農場 I",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 1
+        }
+      ]
+    },
+    {
+      "id": "b02",
+      "name": "小農場 II",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 1
+        }
+      ]
+    },
+    {
+      "id": "b03",
+      "name": "小農場 III",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 1
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 1
+        }
+      ]
+    },
+    {
+      "id": "b04",
+      "name": "共同農場 I",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 4
+      },
+      "effects": [
+        {
+          "type": "feedDiscount",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "b05",
+      "name": "共同農場 II",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 4
+      },
+      "effects": [
+        {
+          "type": "feedDiscount",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "b06",
+      "name": "雨と太陽の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 2,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b07",
+      "name": "雨と風の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b08",
+      "name": "建設者の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "any",
+          "steps": 1
+        },
+        {
+          "type": "build"
+        }
+      ]
+    },
+    {
+      "id": "b09",
+      "name": "農業学校",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "agriculture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b10",
+      "name": "農業工房",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 3
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "agriculture",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "stone": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b11",
+      "name": "採掘学校",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 1,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "extraction",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "corn": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b12",
+      "name": "採掘工房",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "extraction",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "gold": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b13",
+      "name": "建築の社",
+      "age": 1,
+      "category": "shrine",
+      "cost": {
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "architecture",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b14",
+      "name": "信仰の社",
+      "age": 1,
+      "category": "shrine",
+      "cost": {
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "theology",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b15",
+      "name": "大農場 I",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 3
+        }
+      ]
+    },
+    {
+      "id": "b16",
+      "name": "大農場 II",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 3
+        }
+      ]
+    },
+    {
+      "id": "b17",
+      "name": "大農場 III",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "feed",
+          "workers": 3
+        }
+      ]
+    },
+    {
+      "id": "b18",
+      "name": "商人の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "stone": 3
+      },
+      "effects": [
+        {
+          "type": "trade"
+        },
+        {
+          "type": "points",
+          "amount": 6
+        }
+      ]
+    },
+    {
+      "id": "b19",
+      "name": "労働者の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "worker"
+        },
+        {
+          "type": "points",
+          "amount": 6
+        }
+      ]
+    },
+    {
+      "id": "b20",
+      "name": "指導者の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "points",
+          "amount": 8
+        }
+      ]
+    },
+    {
+      "id": "b21",
+      "name": "行動者の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 2,
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "action"
+        },
+        {
+          "type": "points",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "id": "b22",
+      "name": "三神の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 2,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        },
+        {
+          "type": "points",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "id": "b23",
+      "name": "石の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 3
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "stone": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b24",
+      "name": "金の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "gold": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b25",
+      "name": "豊穣の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 3,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "corn": 6
+          }
+        }
+      ]
+    },
+    {
+      "id": "b26",
+      "name": "髑髏の学堂",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 1
+        },
+        {
+          "type": "resources",
+          "resources": {
+            "skull": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b27",
+      "name": "チャクの社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 2
+        },
+        {
+          "type": "points",
+          "amount": 2
+        }
+      ]
+    },
+    {
+      "id": "b28",
+      "name": "建築家の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "architecture",
+          "steps": 1
+        },
+        {
+          "type": "points",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "id": "b29",
+      "name": "ククルカンの社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 2
+        },
+        {
+          "type": "points",
+          "amount": 3
+        }
+      ]
+    },
+    {
+      "id": "b30",
+      "name": "信仰者の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 2,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "theology",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "chaac",
+          "steps": 1
+        },
+        {
+          "type": "temple",
+          "temple": "kukulkan",
+          "steps": 1
+        }
+      ]
+    },
+    {
+      "id": "b31",
+      "name": "知恵の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "stone": 1,
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "technology",
+          "technology": "any",
+          "steps": 2
+        }
+      ]
+    },
+    {
+      "id": "b32",
+      "name": "ケツァルコアトルの社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "gold": 3
+      },
+      "effects": [
+        {
+          "type": "temple",
+          "temple": "quetzalcoatl",
+          "steps": 2
+        },
+        {
+          "type": "points",
+          "amount": 4
+        }
+      ]
+    },
+    {
+      "id": "b33",
+      "name": "食糧庫",
+      "age": 1,
+      "category": "farm",
+      "cost": {
+        "wood": 3
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodReward",
+          "resources": {
+            "corn": 3
+          }
+        }
+      ]
+    },
+    {
+      "id": "b34",
+      "name": "季節の墓所",
+      "age": 1,
+      "category": "graveyard",
+      "cost": {
+        "wood": 2,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodRewardSwitch"
+        }
+      ]
+    },
+    {
+      "id": "b35",
+      "name": "金の工房",
+      "age": 1,
+      "category": "municipal",
+      "cost": {
+        "wood": 1,
+        "stone": 2
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodReward",
+          "resources": {
+            "gold": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b36",
+      "name": "石の社",
+      "age": 1,
+      "category": "shrine",
+      "cost": {
+        "gold": 2
+      },
+      "effects": [
+        {
+          "type": "renovation"
+        },
+        {
+          "type": "foodReward",
+          "resources": {
+            "stone": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "b37",
+      "name": "豊作の農場",
+      "age": 2,
+      "category": "farm",
+      "cost": {
+        "wood": 2
+      },
+      "effects": [
+        {
+          "type": "resources",
+          "resources": {
+            "corn": 8
+          }
+        }
+      ]
+    },
+    {
+      "id": "b38",
+      "name": "記念碑の墓所",
+      "age": 2,
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "gold": 1
+      },
+      "effects": [
+        {
+          "type": "buildMonument"
+        },
+        {
+          "type": "points",
+          "amount": 1
+        }
+      ]
+    },
+    {
+      "id": "b39",
+      "name": "知識交換所",
+      "age": 2,
+      "category": "municipal",
+      "cost": {
+        "wood": 1,
+        "stone": 1
+      },
+      "effects": [
+        {
+          "type": "technologyExchange"
+        }
+      ]
+    },
+    {
+      "id": "b40",
+      "name": "髑髏の社",
+      "age": 2,
+      "category": "shrine",
+      "cost": {
+        "gold": 1,
+        "skull": 1
+      },
+      "effects": [
+        {
+          "type": "skullBuilding",
+          "points": 7,
+          "temple": "any"
+        }
+      ]
+    }
+  ],
+  "MONUMENTS": [
+    {
+      "id": "m01",
+      "name": "墓所の記念碑",
+      "category": "graveyard",
+      "cost": {
+        "wood": 3,
+        "stone": 2,
+        "gold": 1
+      },
+      "scoreKey": "graveyards"
+    },
+    {
+      "id": "m02",
+      "name": "建設の記念碑",
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 3,
+        "gold": 2
+      },
+      "scoreKey": "constructions"
+    },
+    {
+      "id": "m03",
+      "name": "コーンの記念碑",
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "stone": 1,
+        "gold": 4
+      },
+      "scoreKey": "cornTiles"
+    },
+    {
+      "id": "m04",
+      "name": "森の記念碑",
+      "category": "graveyard",
+      "cost": {
+        "wood": 1,
+        "gold": 4
+      },
+      "scoreKey": "woodTiles"
+    },
+    {
+      "id": "m05",
+      "name": "文明の記念碑",
+      "category": "graveyard",
+      "cost": {
+        "wood": 2,
+        "stone": 2,
+        "gold": 2
+      },
+      "scoreKey": "allMonuments"
+    },
+    {
+      "id": "m06",
+      "name": "市民の記念碑",
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 3,
+        "gold": 1
+      },
+      "scoreKey": "municipals"
+    },
+    {
+      "id": "m07",
+      "name": "技術の頂の記念碑",
+      "category": "municipal",
+      "cost": {
+        "wood": 1,
+        "stone": 1,
+        "gold": 3
+      },
+      "scoreKey": "maxTechnologies"
+    },
+    {
+      "id": "m08",
+      "name": "技術の記念碑",
+      "category": "municipal",
+      "cost": {
+        "wood": 2,
+        "stone": 1,
+        "gold": 3
+      },
+      "scoreKey": "technologyLevels"
+    },
+    {
+      "id": "m09",
+      "name": "労働者の記念碑",
+      "category": "municipal",
+      "cost": {
+        "wood": 3,
+        "gold": 3
+      },
+      "scoreKey": "workers"
+    },
+    {
+      "id": "m10",
+      "name": "社の記念碑",
+      "category": "shrine",
+      "cost": {
+        "stone": 2,
+        "gold": 3
+      },
+      "scoreKey": "shrines"
+    },
+    {
+      "id": "m11",
+      "name": "三神の記念碑",
+      "category": "shrine",
+      "cost": {
+        "stone": 4,
+        "gold": 3
+      },
+      "scoreKey": "templePoints"
+    },
+    {
+      "id": "m12",
+      "name": "信仰の頂の記念碑",
+      "category": "shrine",
+      "cost": {
+        "stone": 3,
+        "gold": 3
+      },
+      "scoreKey": "highestTemple"
+    },
+    {
+      "id": "m13",
+      "name": "髑髏の記念碑",
+      "category": "shrine",
+      "cost": {
+        "gold": 4,
+        "skull": 1
+      },
+      "scoreKey": "allSkulls"
+    }
+  ],
+  "MONUMENT_DESCRIPTIONS": {
+    "graveyards": "自分の墓所の建物と記念碑 1 枚につき 4 点。この記念碑も数える。",
+    "constructions": "自分の建物と記念碑 1 枚につき 2 点。",
+    "cornTiles": "収穫したコーンタイル 1 枚につき 4 点。",
+    "woodTiles": "収穫した木材タイル 1 枚につき 4 点。焼き払った森は数えない。",
+    "allMonuments": "全員が建てた記念碑 1 枚につき、2 人戦は 6 点、3 人戦は 5 点、4 人戦は 4 点。",
+    "municipals": "自分の市民の建物と記念碑 1 枚につき 4 点。この記念碑も数える。",
+    "maxTechnologies": "レベル 3 の技術が 1 / 2 / 3 以上なら、9 / 20 / 33 点。",
+    "technologyLevels": "自分の技術レベルの合計 × 3 点。",
+    "workers": "労働者が 3 / 4 / 5 / 6 人なら、0 / 6 / 12 / 18 点。",
+    "shrines": "自分の社の建物と記念碑 1 枚につき 4 点。この記念碑も数える。",
+    "templePoints": "3 つの寺院の現在の段の勝利点をもう一度得る。首位ボーナスは含まない。",
+    "highestTemple": "自分が最も高く登った寺院の開始位置からの段数 × 3 点。",
+    "allSkulls": "チチェン・イツァに全員が置いた髑髏 1 個につき 3 点。"
+  }
+}

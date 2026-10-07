@@ -1,10 +1,15 @@
 import type { CSSProperties } from 'react';
-import { availableWorkers } from '../game/engine';
 import { ALL_BUILDINGS as BUILDINGS, MONUMENTS, MONUMENT_DESCRIPTIONS } from '../game/catalog';
 import { RESOURCE_IDS, TECHNOLOGY_IDS, TEMPLE_IDS, type GameState } from '../game/types';
 import { Icon } from './Icons';
 import { effectText, formatScore, resourceNames, technologyNames, templeNames } from './content';
-export function PlayersSidebar({ game }: { game: GameState }) {
+export function PlayersSidebar({
+  game,
+  availableWorkers,
+}: {
+  game: GameState;
+  availableWorkers: number[];
+}) {
   return (
     <aside className="players-sidebar" aria-label="プレイヤーの状況">
       <div className="section-label">
@@ -42,7 +47,7 @@ export function PlayersSidebar({ game }: { game: GameState }) {
               <div className="worker-count">
                 <Icon name="worker" size={16} />
                 <span>
-                  手元 <b>{availableWorkers(game, player.id)}</b> / {player.workers}人
+                  手元 <b>{availableWorkers[player.id]}</b> / {player.workers}人
                 </span>
                 <span className="double-token" title="2日進める権利">
                   {player.doubleAdvanceAvailable ? '☀' : '○'}

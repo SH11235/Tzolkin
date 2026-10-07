@@ -16,8 +16,16 @@
     "test:e2e": "playwright test",
     "preview": "vite preview",
     "tauri": "tauri",
-    "format": "prettier --write src tests *.ts *.js *.json index.html README.md .github/workflows/*.yml",
-    "format:check": "prettier --check src tests *.ts *.js *.json index.html README.md .github/workflows/*.yml"
+    "format": "prettier --write src tests scripts *.ts *.js *.json index.html README.md .github/workflows/*.yml",
+    "format:check": "prettier --check src tests scripts *.ts *.js *.json index.html README.md .github/workflows/*.yml",
+    "build:wasm": "node scripts/build-wasm.mjs",
+    "predev": "npm run build:wasm",
+    "prebuild": "npm run build:wasm",
+    "pretypecheck": "npm run build:wasm",
+    "pretest": "node scripts/build-wasm.mjs --test",
+    "pretest:watch": "node scripts/build-wasm.mjs --test",
+    "pretest:e2e": "node scripts/build-wasm.mjs --test",
+    "test:core": "cargo test --locked -p tzolkin-core"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",

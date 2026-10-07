@@ -8,6 +8,8 @@ import tseslint from 'typescript-eslint';
 export default defineConfig([
   globalIgnores([
     'dist',
+    'generated',
+    'target',
     'node_modules',
     'src-tauri/target',
     'src-tauri/gen',

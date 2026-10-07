@@ -2,7 +2,7 @@
 import { readFile } from 'node:fs/promises';
 import { expect, test, type Page } from '@playwright/test';
 import { GEAR_LABELS } from '../src/game/catalog';
-import { createGame, getAvailableMoves, getChoices } from '../src/game/engine';
+import { createGame, getAvailableMoves, getChoices } from './helpers/core';
 import { GEAR_IDS, type Choice, type GameMove, type GameState } from '../src/game/types';
 
 const SAVE_KEY = 'tzolkin.game.v1';
@@ -213,6 +213,35 @@ test('undo, JSON export, reload and resume preserve the actual turn and history'
   await expect(page.locator('.actions-sidebar')).toContainText('1人配置しました');
   await page.getByRole('button', { name: '1つ戻す', exact: true }).click();
   await expect.poll(() => gameState(page)).toEqual(initial);
+});
+
+test('a temporary core load failure preserves the saved game and offers a retry', async ({
+  page,
+}) => {
+  const state = createGame(['保存済みA', '保存済みB'], 42);
+  const original = JSON.stringify({ state, history: [] });
+  await page.evaluate(({ key, text }) => localStorage.setItem(key, text), {
+    key: SAVE_KEY,
+    text: original,
+  });
+  await page.route('**/*.wasm', (route) => route.abort('failed'));
+  await page.reload();
+  await expect(page.getByRole('alert')).toContainText('保存した対局を読み込めませんでした');
+  await expect(page.getByRole('button', { name: '対局をはじめる', exact: true })).toBeDisabled();
+  expect(await savedText(page)).toBe(original);
+  await page.unroute('**/*.wasm');
+  await page.getByRole('button', { name: '保存した対局の読み込みを再試行', exact: true }).click();
+  await page.getByRole('button', { name: /^保存した対局を続ける/ }).click();
+  expect(await gameState(page)).toEqual(state);
+  expect(await savedText(page)).toBe(original);
+  await expect(page.locator('.actions-sidebar h2')).toContainText('保存済みA');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  errors.set(
+    page,
+    (errors.get(page) ?? []).filter(
+      (message) => message !== 'Failed to load resource: net::ERR_FAILED',
+    ),
+  );
 });
 
 test('invalid imported states cannot replace the ongoing game or its autosave', async ({

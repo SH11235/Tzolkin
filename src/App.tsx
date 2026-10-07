@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { applyMove, createGame, getAvailableMoves, getChoices } from './game/engine';
+import { applyMove, createGame, inspectGame, type GameSnapshot } from './game/engine';
 import type { GameMove } from './game/types';
 import { CalendarArt, Icon } from './ui/Icons';
 import { PlayersSidebar } from './ui/PlayersSidebar';
@@ -11,8 +11,12 @@ import { saveGameFile } from './game/files';
 import './App.css';
 
 function App() {
-  const [saved, setSaved] = useState<Session | null>(readSession);
-  const [session, setSession] = useState<Session | null>(null);
+  const [saved, setSaved] = useState<Session | null>(null);
+  const [active, setActive] = useState<{ session: Session; snapshot: GameSnapshot } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [startupError, setStartupError] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
   const [view, setView] = useState<View>('board');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -25,15 +29,63 @@ function App() {
   const importInput = useRef<HTMLInputElement>(null);
   const choicesRef = useRef<HTMLHeadingElement>(null);
   const [resetOpener, setResetOpener] = useState<HTMLElement | null>(null);
-  const game = session?.state;
+  const session = active?.session;
+  const game = active?.snapshot.state;
   const actor = game?.players[game.currentPlayer];
-  const choices = game ? getChoices(game) : [];
-  const moves = game?.phase === 'playing' && !game.pending ? getAvailableMoves(game) : [];
+  const choices = active?.snapshot.choices ?? [];
+  const moves = game?.phase === 'playing' && !game.pending ? (active?.snapshot.moves ?? []) : [];
+  useEffect(() => {
+    let cancelled = false;
+    void readSession()
+      .then((data) => {
+        if (!cancelled) {
+          setSaved(data);
+          setLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setStartupError(true);
+          setError('保存した対局を読み込めませんでした。再試行してください。');
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  function retryRead() {
+    setStartupError(false);
+    setError('');
+    void readSession()
+      .then((data) => {
+        setSaved(data);
+        setLoading(false);
+      })
+      .catch(() => {
+        setStartupError(true);
+        setError('保存した対局を読み込めませんでした。再試行してください。');
+      });
+  }
+  async function run(action: () => Promise<void>) {
+    if (busyRef.current || loading) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      await action();
+      setError('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '操作を実行できませんでした。');
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
+    }
+  }
   function openReset() {
+    if (busyRef.current) return;
     setResetOpener(document.activeElement instanceof HTMLElement ? document.activeElement : null);
     setConfirmReset(true);
   }
-  function updateSession(next: Session) {
+  function updateSession(next: Session, snapshot: GameSnapshot) {
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(next));
       setSaved(next);
@@ -42,46 +94,57 @@ function App() {
       setAutosaveAvailable(false);
       setNotice('自動保存を利用できません。保存ファイルを書き出して対局を残せます。');
     }
-    setSession(next);
+    setActive({ session: next, snapshot });
   }
   useEffect(() => {
-    if (game?.pending || game?.phase === 'setup') choicesRef.current?.focus();
-  }, [game?.pending, game?.phase, game?.currentPlayer]);
+    if (!busy && (game?.pending || game?.phase === 'setup')) choicesRef.current?.focus();
+  }, [busy, game?.pending, game?.phase, game?.currentPlayer]);
   function play(move: GameMove) {
     if (!session) return;
-    try {
-      updateSession({
-        state: applyMove(session.state, move),
-        history: [...session.history, session.state].slice(-60),
-      });
-      setError('');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'アクションを実行できませんでした。');
-    }
+    void run(async () => {
+      const snapshot = await applyMove(session.state, move);
+      updateSession(
+        {
+          state: snapshot.state,
+          history: [...session.history, session.state].slice(-60),
+        },
+        snapshot,
+      );
+    });
   }
   function start() {
-    try {
-      updateSession({
-        state: createGame(
-          names.slice(0, count).map((n, i) => n.trim() || `プレイヤー ${i + 1}`),
-          undefined,
-          { additionalBuildings },
-        ),
-        history: [],
-      });
+    void run(async () => {
+      const snapshot = await createGame(
+        names.slice(0, count).map((n, i) => n.trim() || `プレイヤー ${i + 1}`),
+        undefined,
+        { additionalBuildings },
+      );
+      updateSession(
+        {
+          state: snapshot.state,
+          history: [],
+        },
+        snapshot,
+      );
       setView('board');
-      setError('');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '対局を開始できませんでした。');
-    }
+    });
   }
   function undo() {
     if (!session?.history.length) return;
     const state = session.history.at(-1);
-    if (state) {
-      updateSession({ state, history: session.history.slice(0, -1) });
-      setError('');
-    }
+    if (state)
+      void run(async () => {
+        const snapshot = await inspectGame(state);
+        updateSession({ state: snapshot.state, history: session.history.slice(0, -1) }, snapshot);
+      });
+  }
+  function resume() {
+    if (!saved) return;
+    void run(async () => {
+      const snapshot = await inspectGame(saved.state);
+      setActive({ session: { ...saved, state: snapshot.state }, snapshot });
+      setView('board');
+    });
   }
   async function exportSave() {
     const data = session ?? saved;
@@ -101,17 +164,18 @@ function App() {
   }
   async function importSave(file?: File) {
     if (!file) return;
-    try {
-      if (file.size > 5_000_000) throw new Error('保存ファイルが大きすぎます（上限5MB）。');
-      updateSession(parseSession(await file.text()));
-      setView('board');
-      setError('');
-      setNotice('保存した対局を読み込みました。');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '保存ファイルを読み込めませんでした。');
-    } finally {
-      if (importInput.current) importInput.current.value = '';
-    }
+    await run(async () => {
+      try {
+        if (file.size > 5_000_000) throw new Error('保存ファイルが大きすぎます（上限5MB）。');
+        const imported = await parseSession(await file.text());
+        const snapshot = await inspectGame(imported.state);
+        updateSession({ ...imported, state: snapshot.state }, snapshot);
+        setView('board');
+        setNotice('保存した対局を読み込みました。');
+      } finally {
+        if (importInput.current) importInput.current.value = '';
+      }
+    });
   }
   const common = (
     <>
@@ -211,18 +275,21 @@ function App() {
               />
               追加建物8枚を混ぜる
             </label>
-            <button className="primary-button start-button" onClick={start}>
+            <button
+              className="primary-button start-button"
+              onClick={start}
+              disabled={loading || busy}
+            >
               対局をはじめる
               <Icon name="arrow" />
             </button>
+            {startupError && (
+              <button className="resume-button" onClick={retryRead}>
+                保存した対局の読み込みを再試行
+              </button>
+            )}
             {saved && (
-              <button
-                className="resume-button"
-                onClick={() => {
-                  setSession(saved);
-                  setView('board');
-                }}
-              >
+              <button className="resume-button" onClick={resume} disabled={loading || busy}>
                 保存した対局を続ける
                 <span>
                   第{saved.state.round}日 · {saved.state.players.length}人
@@ -231,6 +298,7 @@ function App() {
             )}
             <button
               className="text-button import-start"
+              disabled={loading || busy}
               onClick={() => importInput.current?.click()}
             >
               <Icon name="save" size={16} />
@@ -246,7 +314,7 @@ function App() {
     );
   const nextFood = [8, 14, 21, 27].find((day) => !game.foodDays.includes(day));
   return (
-    <div className="game-app">
+    <div className="game-app" aria-busy={busy}>
       {common}
       <header className="app-header">
         <div className="brand">
@@ -283,7 +351,7 @@ function App() {
           <button
             title="1つ戻す"
             aria-label="1つ戻す"
-            disabled={!session?.history.length}
+            disabled={!session?.history.length || busy}
             onClick={undo}
           >
             <Icon name="undo" size={18} />
@@ -292,11 +360,11 @@ function App() {
             title="保存ファイルを書き出す"
             aria-label="保存ファイルを書き出す"
             onClick={() => void exportSave()}
-            disabled={saving}
+            disabled={saving || busy}
           >
             <Icon name="save" size={18} />
           </button>
-          <button title="新しい対局" aria-label="新しい対局" onClick={openReset}>
+          <button title="新しい対局" aria-label="新しい対局" onClick={openReset} disabled={busy}>
             <Icon name="sun" size={18} />
           </button>
         </div>
@@ -312,9 +380,16 @@ function App() {
           </span>
         ))}
       </div>
-      <div className="game-layout">
-        <PlayersSidebar game={game} />
-        <GameBoardView game={game} moves={moves} play={play} view={view} setView={setView} />
+      <div className="game-layout" inert={busy}>
+        <PlayersSidebar game={game} availableWorkers={active!.snapshot.availableWorkers} />
+        <GameBoardView
+          game={game}
+          costs={active!.snapshot.placementCosts}
+          moves={moves}
+          play={play}
+          view={view}
+          setView={setView}
+        />
         <ActionsSidebar
           key={game.phase === 'setup' ? `setup-${game.currentPlayer}` : 'playing'}
           game={game}
@@ -332,7 +407,7 @@ function App() {
           returnFocus={resetOpener}
           onCancel={() => setConfirmReset(false)}
           onConfirm={() => {
-            setSession(null);
+            setActive(null);
             setSaved(null);
             try {
               localStorage.removeItem(SAVE_KEY);
