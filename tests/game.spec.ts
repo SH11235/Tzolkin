@@ -1,5 +1,7 @@
 /// <reference lib="dom" />
+import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
 import { GEAR_LABELS } from '../src/game/catalog';
 import { createGame, getAvailableMoves, getChoices } from './helpers/core';
@@ -117,6 +119,49 @@ async function importState(page: Page, state: unknown): Promise<void> {
     mimeType: 'application/json',
     buffer: Buffer.from(JSON.stringify({ state, history: [] })),
   });
+}
+
+async function useNativeCore(page: Page): Promise<void> {
+  const metadata = JSON.parse(
+    execFileSync('cargo', ['metadata', '--no-deps', '--format-version', '1'], {
+      cwd: new URL('..', import.meta.url),
+      encoding: 'utf8',
+    }),
+  ) as { target_directory: string };
+  const dispatch = join(
+    metadata.target_directory,
+    'debug',
+    'examples',
+    process.platform === 'win32' ? 'dispatch.exe' : 'dispatch',
+  );
+  await page.exposeFunction(
+    'dispatchNativeGame',
+    async (command: string, args: { request: string }) => {
+      if (command !== 'dispatch_game') throw new Error(`Unexpected native command: ${command}`);
+      // Let React commit the busy/inert state, as it does while native IPC is pending.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const response = JSON.parse(
+        execFileSync(dispatch, { input: `${args.request}\n`, encoding: 'utf8' }),
+      ) as { result: unknown } | { error: string };
+      if ('error' in response) throw new Error(response.error);
+      return JSON.stringify(response.result);
+    },
+  );
+  await page.addInitScript(() => {
+    const nativeWindow = window as typeof window & {
+      isTauri: boolean;
+      dispatchNativeGame: (command: string, args: { request: string }) => Promise<string>;
+      __TAURI_INTERNALS__: {
+        invoke: (command: string, args: { request: string }) => Promise<string>;
+      };
+    };
+    nativeWindow.isTauri = true;
+    nativeWindow.__TAURI_INTERNALS__ = {
+      invoke: (command, args) => nativeWindow.dispatchNativeGame(command, args),
+    };
+  });
+  await page.reload();
+  await expect(page.getByRole('button', { name: '対局をはじめる', exact: true })).toBeEnabled();
 }
 
 for (const count of [2, 3, 4]) {
@@ -464,6 +509,68 @@ test('keyboard input selects players, resolves setup and activates semantic navi
   await page.keyboard.press('Enter');
   await expect(temples).toHaveAttribute('aria-current', 'page');
   await expect(page.getByRole('heading', { name: '三つの神殿', exact: true })).toBeVisible();
+});
+
+test('native IPC restores placement focus for repeated Enter and falls back when disabled', async ({
+  page,
+}) => {
+  await useNativeCore(page);
+  await startGame(page, 4);
+  const placement = page
+    .getByRole('region', { name: GEAR_LABELS.palenque, exact: true })
+    .getByRole('button', { name: /^配置する/ });
+  await placement.focus();
+  for (let count = 1; count <= 3; count++) {
+    await page.keyboard.press('Enter');
+    await expect.poll(async () => (await gameState(page)).turn.count).toBe(count);
+    await expect(page.locator('.game-app')).toHaveAttribute('aria-busy', 'false');
+    if (count < 3) {
+      await expect(placement).toBeEnabled();
+      await expect(placement).toBeFocused();
+    }
+  }
+  await expect(placement).toBeDisabled();
+  await expect(page.locator('.actions-sidebar h2')).toBeFocused();
+});
+
+test('native IPC preserves focus moved during busy and falls back after a pending skip', async ({
+  page,
+}) => {
+  await useNativeCore(page);
+  await startGame(page, 4);
+  for (let player = 0; player < 4; player++) {
+    await perform(page, { type: 'place', gear: 'palenque' });
+    await perform(page, { type: 'endTurn' });
+  }
+  const outside = page.locator('.header-day');
+  await outside.evaluate((target) => {
+    target.tabIndex = 0;
+    const layout = document.querySelector('.game-layout')!;
+    const observer = new MutationObserver(() => {
+      if (layout.hasAttribute('inert')) {
+        target.focus();
+        target.dataset.focusedDuringBusy = 'true';
+        observer.disconnect();
+      }
+    });
+    observer.observe(layout, { attributes: true, attributeFilter: ['inert'] });
+  });
+  const state = await perform(page, { type: 'remove', gear: 'palenque', position: 1 });
+  expect(state.pending?.task.type).toBe('action');
+  await expect(page.locator('.game-app')).toHaveAttribute('aria-busy', 'false');
+  await expect(outside).toHaveAttribute('data-focused-during-busy', 'true');
+  await expect(outside).toBeFocused();
+  const choice = getChoices(state).find((candidate) => candidate.id === 'skip')!;
+  const skip = page
+    .locator('.choices-list')
+    .getByRole('button', { name: new RegExp(`^${escapeRegex(choice.label)}`) });
+  await skip.focus();
+  const before = await savedText(page);
+  await page.keyboard.press('Enter');
+  await expect.poll(() => savedText(page)).not.toBe(before);
+  expect((await gameState(page)).pending).toBeNull();
+  await expect(skip).toHaveCount(0);
+  await expect(page.locator('.actions-sidebar h2')).toBeFocused();
 });
 
 test('the reset dialog keeps keyboard focus inside and Escape returns to the game', async ({

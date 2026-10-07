@@ -17,6 +17,7 @@ function App() {
   const [startupError, setStartupError] = useState(false);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
+  const actionFocus = useRef<HTMLElement | null>(null);
   const [view, setView] = useState<View>('board');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -68,6 +69,8 @@ function App() {
   }
   async function run(action: () => Promise<void>) {
     if (busyRef.current || loading) return;
+    actionFocus.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
     busyRef.current = true;
     setBusy(true);
     try {
@@ -97,7 +100,17 @@ function App() {
     setActive({ session: next, snapshot });
   }
   useEffect(() => {
-    if (!busy && (game?.pending || game?.phase === 'setup')) choicesRef.current?.focus();
+    if (busy) return;
+    const opener = actionFocus.current;
+    actionFocus.current = null;
+    if (opener && document.activeElement !== document.body && document.activeElement !== opener)
+      return;
+    if (game?.pending || game?.phase === 'setup') {
+      choicesRef.current?.focus();
+    } else if (opener) {
+      if (opener.isConnected) opener.focus();
+      if (document.activeElement === document.body) choicesRef.current?.focus();
+    }
   }, [busy, game?.pending, game?.phase, game?.currentPlayer]);
   function play(move: GameMove) {
     if (!session) return;
