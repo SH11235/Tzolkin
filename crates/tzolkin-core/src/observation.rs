@@ -687,11 +687,44 @@ struct CanonicalObservation<'a>(&'a Observation);
 impl Serialize for CanonicalObservation<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
+        // Exhaustive borrowing makes a future Observation field a compile error here,
+        // so it cannot silently disappear from the canonical key. Keep schema-1 order.
+        let Observation {
+            observation_key: _,
+            schema,
+            move_schema,
+            actor,
+            turn_player,
+            phase,
+            round,
+            age,
+            additional_buildings,
+            players,
+            private,
+            first_player,
+            turn_order,
+            turn_index,
+            turn,
+            gears,
+            jungle,
+            skull_supply,
+            skull_spaces,
+            first_player_claimed,
+            accumulated_corn,
+            buildings,
+            building_deck_count,
+            age2_deck_count,
+            monuments,
+            pending_task,
+            food_days,
+            expansion,
+            legal_actions,
+        } = self.0;
         let mut object = serializer.serialize_struct("Observation", 29)?;
         object.serialize_field("observationKey", "")?;
         macro_rules! fields {
             ($($name:ident => $key:literal),* $(,)?) => {
-                $(object.serialize_field($key, &self.0.$name)?;)*
+                $(object.serialize_field($key, $name)?;)*
             };
         }
         fields! {
