@@ -9,6 +9,7 @@ pub mod observation;
 pub mod prophecies;
 pub mod public_replay;
 pub mod quick_actions;
+pub mod rollout;
 pub mod tribes;
 pub mod types;
 pub mod validation;
