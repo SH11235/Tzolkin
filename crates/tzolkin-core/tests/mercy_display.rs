@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 use tzolkin_core::api::dispatch_game;
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{PublicState, inspect_public};
+use tzolkin_core::tribes::TribeId;
 use tzolkin_core::{
     GEAR_IDS, GameMove, GameState, GearId, GearWorker, Phase, Resource, TEMPLE_IDS, apply_move,
     create_game, get_choices, get_placement_cost,
@@ -179,4 +180,66 @@ fn ordinary_and_full_gear_display_keep_their_existing_payment() {
         "空きがありません"
     );
     assert_eq!(place(&full, "chichenItza")["disabled"], true);
+}
+
+#[test]
+fn unaffordable_tribal_discount_keeps_nominal_description_without_mercy() {
+    let mut state = fixture(0);
+    state.version = 2;
+    state.expansion = Some(Default::default());
+    let offers = [
+        [TribeId::CitBolonTum, TribeId::Huracan],
+        [TribeId::Bacab, TribeId::Balam],
+        [TribeId::Itzamna, TribeId::Ahmakiq],
+        [TribeId::Yumkaax, TribeId::AhauChamahez],
+    ];
+    for (player, offer) in state.players.iter_mut().zip(offers) {
+        player.tribe = Some(offer[0]);
+        player.tribe_offer = offer.to_vec();
+    }
+    for (index, gear) in GEAR_IDS.into_iter().enumerate() {
+        state.gears.get_mut(&gear).unwrap()[2] = Some(GearWorker {
+            player_id: (1 + (index + 1) % 3) as i64,
+            dummy: false,
+        });
+    }
+    let snapshot = inspect(&state);
+    assert_eq!(get_placement_cost(&state, "yaxchilan"), Some(3));
+    assert_eq!(snapshot["placementCosts"]["yaxchilan"], 0);
+    assert_eq!(place(&snapshot, "yaxchilan")["disabled"], false);
+    let discount = snapshot["moves"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|choice| choice["id"] == "tribeAbility:discount:yaxchilan")
+        .unwrap();
+    assert_eq!(discount["disabled"], true);
+    assert_eq!(
+        discount["description"],
+        "コーン 1 · この手番の配置割引を使用"
+    );
+    assert!(
+        apply_move(
+            &state,
+            GameMove::TribeAbility {
+                ability: "discount:yaxchilan".into()
+            },
+        )
+        .is_err()
+    );
+    let placed = apply_move(
+        &state,
+        GameMove::Place {
+            gear: GearId::Yaxchilan,
+        },
+    )
+    .unwrap();
+    assert_eq!(placed.players[0].resources[&Resource::Corn], 0);
+    assert_eq!(
+        placed.gears[&GearId::Yaxchilan][3]
+            .as_ref()
+            .unwrap()
+            .player_id,
+        0
+    );
 }

@@ -3119,8 +3119,13 @@ fn tribe_ability_moves(s: &GameState) -> Vec<Choice> {
             for g in GEAR_IDS {
                 if let Some(pos) = lowest_position(s, g) {
                     let cost = get_placement_cost(s, &g.to_string()).unwrap() - (pos as i64).min(2);
-                    let payment = placement_payment(s, g, true).unwrap();
-                    let mercy = if pity_placement(s, Some(g)) {
+                    let can_afford = p.resources[&Resource::Corn] >= cost;
+                    let payment = if can_afford {
+                        placement_payment(s, g, true).unwrap()
+                    } else {
+                        cost
+                    };
+                    let mercy = if can_afford && pity_placement(s, Some(g)) {
                         " · 神の慈悲（所持コーンすべて）"
                     } else {
                         ""
