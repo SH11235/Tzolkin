@@ -42,7 +42,7 @@ npm run tauri build
 
 各席の「操作」で人間または CPU を選べます。CPU は未学習のヒューリスティックで、公開情報と自分の初期選択だけを使います。CPU の操作は別 Worker で実行し、上部の停止ボタンで一時停止できます。「1つ戻す」を使った後は停止したままなので、続けるときは再開ボタンを押してください。操作設定も保存ファイルに含まれます。設定のない旧保存は全席を人間として読み込みます。対局はローカルで行います。
 
-内部構造、情報境界、再現・性能・棋力の分離、次段階の学習方針は [CPU 設計](docs/ai-design.md) に記載しています。学習ツールと学習済みモデルは今回の範囲に含みません。
+内部構造、情報境界、再現・性能・棋力の分離、次段階の学習方針は [CPU 設計](docs/ai-design.md) に記載しています。native CLI では、[検証済み自己対戦の学習データ生成](docs/ml-dataset.md)と[policy/value モデルの学習・再開・評価](docs/ml-training.md)を実行できます。画面上の既定 CPU はヒューリスティックを使います。
 
 native CPU の自己対局、版付きログの再現、全設定の完走検証、性能計測は [CPU CLI](docs/cpu-cli.md) を参照してください。
 
@@ -74,7 +74,7 @@ TypeScript は ESLint の解析器が公式に対応する最新安定版を使�
 ## 構成
 
 - `crates/tzolkin-core/`: Tauri・ブラウザに依存しないゲーム状態、ルール、合法手、得点計算、保存データ検証。
-- `crates/tzolkin-ai/`: 公開情報だけを使う未学習 policy と native CLI。
+- `crates/tzolkin-ai/`: 判断者の観測情報を使う policy、検証済みデータ生成、policy/value 学習、native CLI。
 - `crates/tzolkin-core/data/catalog.json`: 出版社の資料と照合した共通カタログ。Rust のルール処理と UI が同じデータを参照。
 - `crates/tzolkin-wasm/`: ブラウザ用の Wasm 接続部分。
 - `src/game/engine.ts`: Wasm／Tauri を選ぶ非同期接続部分。ゲームのルール処理は Rust に委譲。

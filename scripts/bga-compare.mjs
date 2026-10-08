@@ -12,7 +12,7 @@ const increment = (counts, key) => {
 export function nativeProfiles(replay) {
   if (!replay.verifiedComplete || replay.header?.replaySchema !== 1 || !Array.isArray(replay.steps))
     throw new Error('Expected native replay schema 1');
-  if (replay.header.source?.kind !== 'selfPlay')
+  if (!['selfPlay', 'policySelfPlay'].includes(replay.header.source?.kind))
     throw new Error('CPU comparison requires a selfPlay replay');
   const players = replay.header.names;
   return players.map((player, actor) => {
@@ -63,6 +63,7 @@ export function compareProfiles(profiles, replay) {
   return {
     schema: 'tzolkin-bga-comparison-v1',
     cpu: {
+      generationSource: replay.header.source,
       seed: replay.header.seed,
       options: replay.header.options,
       playerCount: cpu.length,
