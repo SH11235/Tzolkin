@@ -347,7 +347,8 @@ fn export_sources<'a>(
                 for policy in policies {
                     policy.validate()?;
                 }
-                // The complete replay keeps explicit per-seat model SHA/heuristic metadata;
+                // The complete replay keeps explicit per-seat model SHA, heuristic,
+                // or Search configuration/key metadata (including fallback traces).
                 // strata use a content-bound identifier for that exact composition.
                 format!(
                     "policy-selfplay-v1:{}",

@@ -55,7 +55,9 @@ impl SearchConfig {
         self.validate()?;
         let bytes = serde_json::to_vec(&(
             SEARCH_POLICY_VERSION,
-            "scoreMargin",
+            Objective::ScoreMargin,
+            crate::replay::RULES_VERSION,
+            crate::replay::RULES_BASELINE,
             LEAF_VERSION,
             SAMPLING_VERSION,
             crate::POLICY_VERSION,
@@ -79,7 +81,7 @@ pub enum DecisionScoreKind {
     RolloutMargin,
     HeuristicActionPriority,
 }
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub enum FallbackReason {
     Setup,
@@ -94,7 +96,7 @@ pub enum SearchStatus {
     Searched,
     Fallback { reason: FallbackReason },
 }
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "camelCase")]
 pub enum DiscardReason {
     RolloutStepCap,
@@ -148,19 +150,35 @@ pub struct SearchOutcome {
 }
 
 pub fn choose_move(o: &Observation, config: &SearchConfig) -> Result<SearchOutcome, String> {
-    choose_using(o, config, crate::choose_move)
+    PreparedSearch::new(config)?.choose(o)
 }
 
-fn choose_using<F>(
-    o: &Observation,
-    config: &SearchConfig,
-    mut rollout_policy: F,
-) -> Result<SearchOutcome, String>
-where
-    F: FnMut(&Observation) -> Result<Decision, String>,
-{
-    let configuration_key = config.configuration_key()?;
-    let unsupported = if !(3..=4).contains(&o.players.len()) {
+/// Immutable native handle: validate and freeze the public configuration once.
+#[derive(Clone)]
+pub struct PreparedSearch {
+    config: SearchConfig,
+    configuration_key: String,
+}
+impl PreparedSearch {
+    pub fn new(config: &SearchConfig) -> Result<Self, String> {
+        Ok(Self {
+            configuration_key: config.configuration_key()?,
+            config: config.clone(),
+        })
+    }
+    pub fn config(&self) -> &SearchConfig {
+        &self.config
+    }
+    pub fn configuration_key(&self) -> &str {
+        &self.configuration_key
+    }
+    pub fn choose(&self, o: &Observation) -> Result<SearchOutcome, String> {
+        choose_prepared(o, &self.config, &self.configuration_key, crate::choose_move)
+    }
+}
+
+pub(crate) fn unsupported_reason(o: &Observation) -> Option<FallbackReason> {
+    if !(3..=4).contains(&o.players.len()) {
         Some(FallbackReason::UnsupportedPlayerCount)
     } else if o.additional_buildings || o.expansion.is_some() {
         Some(FallbackReason::UnsupportedRules)
@@ -170,7 +188,32 @@ where
         Some(FallbackReason::PendingContinuationUnavailable)
     } else {
         None
-    };
+    }
+}
+
+#[cfg(test)]
+fn choose_using<F>(
+    o: &Observation,
+    config: &SearchConfig,
+    rollout_policy: F,
+) -> Result<SearchOutcome, String>
+where
+    F: FnMut(&Observation) -> Result<Decision, String>,
+{
+    let configuration_key = config.configuration_key()?;
+    choose_prepared(o, config, &configuration_key, rollout_policy)
+}
+fn choose_prepared<F>(
+    o: &Observation,
+    config: &SearchConfig,
+    configuration_key: &str,
+    mut rollout_policy: F,
+) -> Result<SearchOutcome, String>
+where
+    F: FnMut(&Observation) -> Result<Decision, String>,
+{
+    let configuration_key = configuration_key.to_owned();
+    let unsupported = unsupported_reason(o);
     if let Some(reason) = unsupported {
         // Fallback consumes only the supplied observation, too. Feature shape
         // checks protect the fixed heuristic's indexing on malformed inputs.
@@ -204,7 +247,7 @@ where
         .collect();
     let mut sums = vec![0.0; candidates.len()];
     for world_index in 0..config.worlds_per_action {
-        if stats.atomic_steps == config.max_total_steps {
+        if stats.atomic_steps >= config.max_total_steps {
             break;
         }
         stats.attempted_worlds += 1;

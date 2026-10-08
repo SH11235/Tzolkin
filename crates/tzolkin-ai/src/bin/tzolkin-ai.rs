@@ -1,6 +1,6 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use tzolkin_ai::{choose_move, dispatch_cpu, replay};
@@ -76,11 +76,40 @@ fn checked_flags(args: &[String], allowed: &[&str], switches: &[&str]) -> Result
     }
     Ok(())
 }
+fn search_policy(args: &[String]) -> Result<Option<tzolkin_ai::search::PreparedSearch>, String> {
+    if !args.iter().any(|arg| arg == "--search-config") {
+        if args.iter().any(|arg| arg == "--search-seat") {
+            return Err("--search-seat requires --search-config".into());
+        }
+        return Ok(None);
+    }
+    if args
+        .iter()
+        .any(|arg| ["--model", "--kernel", "--model-seat"].contains(&arg.as_str()))
+    {
+        return Err("Search and model/kernel flags are mutually exclusive".into());
+    }
+    let path = value(args, "--search-config", "")?;
+    if path.is_empty() {
+        return Err("Missing Search configuration path".into());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|error| error.to_string())?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 64 * 1024 {
+        return Err("Search configuration exceeds 64 KiB".into());
+    }
+    let config = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(Some(tzolkin_ai::search::PreparedSearch::new(&config)?))
+}
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
     match command {
-        "choose" => checked_flags(&args, &["--model", "--kernel"], &[])?,
+        "choose" => checked_flags(&args, &["--model", "--kernel", "--search-config"], &[])?,
         "dispatch" => checked_flags(&args, &[], &[])?,
         "arena" => checked_flags(&args, &["--config", "--output"], &[])?,
         "arena-seeds" => checked_flags(&args, &["--partition", "--start", "--count"], &[])?,
@@ -115,6 +144,8 @@ fn run() -> Result<(), String> {
                 "--model-seat",
                 "--kernel",
                 "--fast",
+                "--search-config",
+                "--search-seat",
             ],
             &["--fast"],
         )?,
@@ -197,6 +228,7 @@ fn run() -> Result<(), String> {
         return output(&report);
     }
     if command == "choose" {
+        let search = search_policy(&args)?;
         let mut request = String::new();
         std::io::stdin()
             .take(16 * 1024 * 1024 + 1)
@@ -204,6 +236,17 @@ fn run() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         if request.len() > 16 * 1024 * 1024 {
             return Err("CPU input exceeds 16 MiB".into());
+        }
+        if let Some(policy) = search {
+            let observation: tzolkin_core::observation::Observation =
+                serde_json::from_str(&request).map_err(|error| error.to_string())?;
+            if !(3..=4).contains(&observation.players.len())
+                || observation.additional_buildings
+                || observation.expansion.is_some()
+            {
+                return Err("Native Search requires base 3..4p".into());
+            }
+            return output(&policy.choose(&observation)?);
         }
         let model_path = value(&args, "--model", "")?;
         if !model_path.is_empty() {
@@ -388,15 +431,49 @@ fn run() -> Result<(), String> {
         )?);
     }
     if command == "selfplay" {
+        let search_policy = search_policy(&args)?;
         let path = args
             .iter()
             .position(|s| s == "--output")
             .map(|i| args.get(i + 1).ok_or("Missing output path"))
             .transpose()?;
+        if path.is_some_and(|path| std::path::Path::new(path).exists()) {
+            return Err("Replay output already exists".into());
+        }
         let started = Instant::now();
+        let mut search_summary = None;
         let model_path = value(&args, "--model", "")?;
         let fast = args.iter().any(|arg| arg == "--fast");
-        let (state, decisions, record) = if model_path.is_empty() {
+        let (state, decisions, record) = if let Some(policy) = &search_policy {
+            let seat = value(&args, "--search-seat", "all")?;
+            let seats = if seat == "all" {
+                (0..players).collect::<Vec<_>>()
+            } else {
+                vec![seat.parse::<usize>().map_err(|_| "Invalid Search seat")?]
+            };
+            let result = tzolkin_ai::search_native::play_game(
+                players,
+                seed,
+                options,
+                &seats,
+                path.is_some(),
+                fast,
+                policy,
+            )?;
+            search_summary = Some(result.search);
+            match result.game {
+                Ok(game) => game,
+                Err(error) => {
+                    output(
+                        &serde_json::json!({"players":players,"seed":seed,"flags":flags,
+                        "complete":false,"decisions":null,"finalScores":[],"search":search_summary,
+                        "searchPolicy":tzolkin_ai::search_native::provenance(policy),"error":error,
+                        "elapsedMs":started.elapsed().as_secs_f64()*1000.0}),
+                    )?;
+                    return Err(error);
+                }
+            }
+        } else if model_path.is_empty() {
             if args.iter().any(|arg| arg == "--kernel") {
                 return Err("--kernel requires --model".into());
             }
@@ -426,28 +503,27 @@ fn run() -> Result<(), String> {
                 },
             )?
         };
-        if let Some(path) = path {
-            if std::path::Path::new(path).exists() {
-                return Err("Replay output already exists".into());
-            }
-            let replay = record.ok_or("Missing replay")?;
-            replay::verify_replay(&replay)?;
-            let temporary = format!("{path}.tmp-{}", std::process::id());
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(|e| e.to_string())?;
-            file.write_all(&serde_json::to_vec(&replay).map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-            let published = std::fs::hard_link(&temporary, path).map_err(|e| e.to_string());
-            let cleanup = std::fs::remove_file(&temporary).map_err(|e| e.to_string());
-            published.and(cleanup)?;
+        let publication_error = path.and_then(|path| {
+            let saved = record
+                .as_ref()
+                .ok_or_else(|| "Missing replay".to_owned())
+                .and_then(|record| replay::save_replay_new(std::path::Path::new(path), record));
+            saved.err().map(|error| (path, error))
+        });
+        let mut summary = serde_json::json!({"players":players,"seed":seed,"flags":flags,"decisions":decisions,"elapsedMs":started.elapsed().as_secs_f64()*1000.0,"finalScores":state.final_scores});
+        if let Some(search) = search_summary {
+            summary["search"] = serde_json::to_value(search).map_err(|error| error.to_string())?;
+            summary["searchPolicy"] = serde_json::to_value(tzolkin_ai::search_native::provenance(
+                search_policy.as_ref().unwrap(),
+            ))
+            .map_err(|error| error.to_string())?;
         }
-        return output(
-            &serde_json::json!({"players":players,"seed":seed,"flags":flags,"decisions":decisions,"elapsedMs":started.elapsed().as_secs_f64()*1000.0,"finalScores":state.final_scores}),
-        );
+        if let Some((path, error)) = publication_error {
+            summary["publication"] = serde_json::json!({"success":false,"path":path,"error":error});
+            output(&summary)?;
+            return Err(error);
+        }
+        return output(&summary);
     }
     if command == "bench" {
         let iterations: usize = number(&args, "--iterations", "10")?;
@@ -578,9 +654,10 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "tzolkin-ai choose [--model PATH [--kernel KERNEL]]\n\
+        "tzolkin-ai choose [--model PATH [--kernel KERNEL] | --search-config CONFIG.json]\n\
          tzolkin-ai dispatch (validated JSON on stdin)\n\
          tzolkin-ai selfplay [--players 2..5 --seed N --flags 0..15 --fast --output PATH] [--model PATH --model-seat all|SEAT --kernel KERNEL]\n\
+         tzolkin-ai selfplay --players 3|4 --flags 0 --search-config CONFIG.json [--search-seat all|SEAT --seed N --fast --output PATH]\n\
          tzolkin-ai selfplay-batch --output NEW_DIRECTORY [--players 2..5 --seed FIRST --games 1..10000 --threads 1..32 --flags 0..15] [--model PATH --kernel KERNEL]\n\
          tzolkin-ai replay PATH\n\
          tzolkin-ai dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY\n\
@@ -592,6 +669,7 @@ fn run() -> Result<(), String> {
          tzolkin-ai bench [--players 2..5 --seed N --flags 0..15 --iterations 10]\n\
          Kernels: scalar|auto|avx2|sse2|neon|simd128; default {DEFAULT_INFERENCE_KERNEL}; --kernel requires --model. Explicit unsupported backends fail; auto resolves available SIMD or scalar.\n\
          Selfplay/batch defaults: players=2, seed=0, flags=0. Selfplay model-seat=all; batch uses all model seats. Batch games={DEFAULT_BATCH_GAMES}, threads=min(available CPUs,4).\n\
+         Search: explicit bounded configuration, base 3|4 only, search-seat=all; model/kernel flags are mutually exclusive. choose returns SearchOutcome; selfplay/Arena preserve fallback and budget statistics.\n\
          Flags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\n\
          Bench measures correctness-neutral baseline operations; it does not measure playing strength."
     );

@@ -1,4 +1,6 @@
 //! Versioned, validated replay and corpus tools. Training shards are a separate future layer.
+use crate::search::{SEARCH_POLICY_VERSION, SearchConfig};
+use crate::search_native::SearchTrace;
 use crate::{POLICY_VERSION, choose_move, policy::HeuristicWeights};
 use serde::{Deserialize, Serialize};
 use tzolkin_core::observation::{
@@ -40,6 +42,11 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    Search {
+        policy_version: String,
+        config: SearchConfig,
+        configuration_key: String,
+    },
     Heuristic {
         policy_version: String,
         weights: HeuristicWeights,
@@ -55,6 +62,15 @@ pub enum SeatPolicy {
 impl SeatPolicy {
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::Search {
+                policy_version,
+                config,
+                configuration_key,
+            } if policy_version == SEARCH_POLICY_VERSION
+                && config.configuration_key()? == *configuration_key =>
+            {
+                Ok(())
+            }
             Self::Heuristic {
                 policy_version,
                 weights,
@@ -104,6 +120,8 @@ pub struct ReplayStep {
     pub state_before: String,
     pub state_after: String,
     pub validated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchTrace>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -184,9 +202,17 @@ pub fn play_game_using(
     options: GameOptions,
     record: bool,
     source: ReplaySource,
-    decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
+    mut decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
-    play_game_internal(players, seed, options, record, source, decide, true)
+    play_game_internal(
+        players,
+        seed,
+        options,
+        record,
+        source,
+        |o| Ok((decide(o)?, None)),
+        true,
+    )
 }
 /// Native games start from a validated seed/options and use checked legal operations.
 /// Avoids per-transition saved-JSON roundtrips; terminal validation remains mandatory.
@@ -215,9 +241,53 @@ pub fn play_game_using_fast(
     options: GameOptions,
     record: bool,
     source: ReplaySource,
-    decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
+    mut decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
-    play_game_internal(players, seed, options, record, source, decide, false)
+    play_game_internal(
+        players,
+        seed,
+        options,
+        record,
+        source,
+        |o| Ok((decide(o)?, None)),
+        false,
+    )
+}
+/// Additive controlled runner. Search diagnostics never receive authority state.
+pub fn play_game_using_diagnostics(
+    players: usize,
+    seed: u32,
+    options: GameOptions,
+    record: bool,
+    source: ReplaySource,
+    fast: bool,
+    decide: impl FnMut(&Observation) -> Result<(crate::Decision, Option<SearchTrace>), String>,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_internal(players, seed, options, record, source, decide, !fast)
+}
+
+fn validate_search_trace(
+    source: &ReplaySource,
+    observation: &Observation,
+    trace: &Option<SearchTrace>,
+) -> Result<(), String> {
+    let policy = match source {
+        ReplaySource::PolicySelfPlay { policies } => policies.get(observation.actor),
+        _ => None,
+    };
+    match (policy, trace) {
+        (
+            Some(SeatPolicy::Search {
+                config,
+                configuration_key,
+                ..
+            }),
+            Some(trace),
+        ) => trace.validate(observation, config, configuration_key),
+        (Some(SeatPolicy::Search { .. }), None) => Err("Missing Search seat diagnostics".into()),
+        (_, Some(_)) => Err("Search diagnostics on a non-Search seat".into()),
+        (_, None) => Ok(()),
+    }
 }
 fn play_game_internal(
     players: usize,
@@ -225,7 +295,7 @@ fn play_game_internal(
     mut options: GameOptions,
     record: bool,
     source: ReplaySource,
-    mut decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
+    mut decide: impl FnMut(&Observation) -> Result<(crate::Decision, Option<SearchTrace>), String>,
     check_every_step: bool,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
     if !(2..=5).contains(&players) {
@@ -237,6 +307,13 @@ fn play_game_internal(
         }
         for policy in policies {
             policy.validate()?;
+        }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::Search { .. }))
+            && (!(3..=4).contains(&players) || options != GameOptions::default())
+        {
+            return Err("Search provenance requires base 3..4p".into());
         }
     }
     if players == 5 {
@@ -256,7 +333,13 @@ fn play_game_internal(
             ));
         }
         let observation = observe(&state, state.current_player)?;
-        let decision = decide(&observation)?;
+        let (decision, search) = decide(&observation)?;
+        validate_search_trace(&source, &observation, &search)?;
+        if search.as_ref().is_some_and(|trace| {
+            decision.policy_version != trace.policy_version || decision.score != trace.score
+        }) {
+            return Err("Search decision/diagnostics mismatch".into());
+        }
         if decision.actor != observation.actor
             || decision.observation_key != observation.observation_key
         {
@@ -287,6 +370,7 @@ fn play_game_internal(
                 state_before: before,
                 state_after: state_key(&state)?,
                 validated: true,
+                search,
             });
         }
         decisions += 1;
@@ -345,6 +429,13 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
         for policy in policies {
             policy.validate()?;
         }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::Search { .. }))
+            && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
+        {
+            return Err("Search provenance requires base 3..4p".into());
+        }
     }
     let mut state = create_game_with_options(h.names.clone(), h.seed, h.options.clone())?;
     check_state(&state)?;
@@ -353,6 +444,7 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
             return Err("Replay contains operations after the game ended".into());
         }
         let observation = observe(&state, state.current_player)?;
+        validate_search_trace(&h.source, &observation, &step.search)?;
         if step.index != index
             || step.actor != observation.actor
             || step.turn_player != observation.turn_player
@@ -378,6 +470,11 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
         return Err("Replay terminal result mismatch".into());
     }
     Ok(state)
+}
+/// Independently verify, then publish a new bounded replay without replacing files.
+pub fn save_replay_new(path: &std::path::Path, replay: &GameReplay) -> Result<(), String> {
+    verify_replay(replay)?;
+    crate::model::write_new_json_bounded(path, replay, crate::dataset::MAX_REPLAY_BYTES as usize)
 }
 /// All 56 effective configurations, including the forced quick action setting for five seats.
 pub fn verify_corpus(seeds: u32) -> Result<RunSummary, String> {
