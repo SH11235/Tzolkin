@@ -31,9 +31,25 @@ test('a calculated ending without a source score is visibly unconfirmed', async 
 test('navigating during CPU comparison aborts the worker and discards a delayed reply', async ({
   page,
 }) => {
+  type DelayedWorkerControl = {
+    terminatedReplayWorkers: number;
+    pendingReplayReplies: number;
+    dispatchedReplayReplies: number;
+    releaseReplayReply: () => void;
+  };
   await page.addInitScript(() => {
-    const state = window as unknown as { terminatedReplayWorkers: number };
+    const state = window as unknown as DelayedWorkerControl;
+    const replies: Array<() => void> = [];
     state.terminatedReplayWorkers = 0;
+    state.pendingReplayReplies = 0;
+    state.dispatchedReplayReplies = 0;
+    state.releaseReplayReply = () => {
+      const reply = replies.shift();
+      if (!reply) throw new Error('No pending replay worker reply');
+      state.pendingReplayReplies = replies.length;
+      state.dispatchedReplayReplies++;
+      reply();
+    };
     class DelayedWorker extends EventTarget {
       postMessage(message: { requestId: number; observationJson: string }) {
         const observation = JSON.parse(message.observationJson) as {
@@ -41,23 +57,22 @@ test('navigating during CPU comparison aborts the worker and discards a delayed 
           observationKey: string;
           legalActions: Array<{ move: unknown }>;
         };
-        setTimeout(
-          () =>
-            this.dispatchEvent(
-              new MessageEvent('message', {
-                data: {
-                  ...message,
-                  decision: {
-                    actor: observation.actor,
-                    observationKey: observation.observationKey,
-                    move: observation.legalActions[0]!.move,
-                    policyVersion: 'test-delayed',
-                  },
+        replies.push(() =>
+          this.dispatchEvent(
+            new MessageEvent('message', {
+              data: {
+                ...message,
+                decision: {
+                  actor: observation.actor,
+                  observationKey: observation.observationKey,
+                  move: observation.legalActions[0]!.move,
+                  policyVersion: 'test-delayed',
                 },
-              }),
-            ),
-          350,
+              },
+            }),
+          ),
         );
+        state.pendingReplayReplies = replies.length;
       }
       terminate() {
         state.terminatedReplayWorkers++;
@@ -76,14 +91,36 @@ test('navigating during CPU comparison aborts the worker and discards a delayed 
   await expect(button).toBeEnabled();
   await button.click();
   await expect(button).toBeDisabled();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const state = window as unknown as DelayedWorkerControl;
+        return {
+          pending: state.pendingReplayReplies,
+          dispatched: state.dispatchedReplayReplies,
+          terminated: state.terminatedReplayWorkers,
+        };
+      }),
+    )
+    .toEqual({ pending: 1, dispatched: 0, terminated: 0 });
   await page.getByRole('button', { name: '次', exact: true }).click();
   await expect(button).toBeEnabled();
-  await page.waitForTimeout(400);
   expect(
-    await page.evaluate(
-      () => (window as unknown as { terminatedReplayWorkers: number }).terminatedReplayWorkers,
-    ),
+    await page.evaluate(() => (window as unknown as DelayedWorkerControl).terminatedReplayWorkers),
   ).toBe(1);
+  await page.evaluate(() => (window as unknown as DelayedWorkerControl).releaseReplayReply());
+  expect(
+    await page.evaluate(() => {
+      const state = window as unknown as DelayedWorkerControl;
+      return {
+        pending: state.pendingReplayReplies,
+        dispatched: state.dispatchedReplayReplies,
+        terminated: state.terminatedReplayWorkers,
+      };
+    }),
+  ).toEqual({ pending: 0, dispatched: 1, terminated: 1 });
+  await expect(page.getByLabel('リプレイの再生位置')).toHaveValue('1');
+  await expect(button).toBeEnabled();
   await expect(page.locator('.replay-cpu-result')).toHaveCount(0);
   await expect(page.getByRole('alert')).toHaveCount(0);
   await expect.poll(() => savedText(page)).toBeNull();
