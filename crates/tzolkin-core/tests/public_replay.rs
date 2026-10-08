@@ -152,6 +152,61 @@ fn checked_api_rejects_hidden_fields_unsupported_rules_and_initial_corruption() 
 }
 
 #[test]
+fn initial_dummy_board_must_be_reachable_without_selected_wealth_tiles() {
+    let mut invalid = partial(3);
+    for slots in invalid.initial.gears.values_mut() {
+        slots.fill(None);
+    }
+    for position in 0..6 {
+        invalid.initial.gears.get_mut(&GearId::ChichenItza).unwrap()[position] = Some(GearWorker {
+            player_id: -1,
+            dummy: true,
+        });
+    }
+    // Counts and ownership alone are valid, but this six-skull-city setup has
+    // unsupported positions and cannot be created by any unused tile ordering.
+    assert!(validate_public_state(&invalid.initial).is_ok());
+    assert!(
+        verify_public_replay(&invalid)
+            .unwrap_err()
+            .contains("initial.gears")
+    );
+
+    let mut invalid = partial(3);
+    let selected = tzolkin_core::catalog::wealth(&invalid.initial.players[0].wealth[0]).unwrap();
+    assert!(invalid.initial.gears[&selected.gear][selected.position as usize].is_none());
+    let (gear, position) = invalid
+        .initial
+        .gears
+        .iter()
+        .find_map(|(gear, slots)| {
+            slots
+                .iter()
+                .position(Option::is_some)
+                .map(|position| (*gear, position))
+        })
+        .unwrap();
+    invalid.initial.gears.get_mut(&gear).unwrap()[position] = None;
+    invalid.initial.gears.get_mut(&selected.gear).unwrap()[selected.position as usize] =
+        Some(GearWorker {
+            player_id: -1,
+            dummy: true,
+        });
+    assert!(validate_public_state(&invalid.initial).is_ok());
+    assert!(
+        verify_public_replay(&invalid)
+            .unwrap_err()
+            .contains("initial.gears")
+    );
+
+    for seed in 0..64 {
+        let mut valid = partial(3);
+        valid.initial = PublicState::from_game_state(&native_initial(3, seed)).unwrap();
+        assert!(verify_public_replay(&valid).is_ok(), "native seed {seed}");
+    }
+}
+
+#[test]
 fn source_checkpoints_have_field_errors_and_are_not_replaced_by_hashes() {
     let mut record = partial(4);
     record.initial_checkpoint = Some(Checkpoint {

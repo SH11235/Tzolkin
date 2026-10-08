@@ -385,6 +385,96 @@ pub fn validate_public_state(state: &PublicState) -> Result<(), String> {
     Ok(())
 }
 
+/// Check existence of a compatible base setup, without choosing or exporting
+/// the unknown offers/unused order. Players' selected wealth cannot occur in the
+/// unused tile stream. Its prefix must place exactly the observed dummies using
+/// the same first-city/opposite-position rule as create_game_with_options.
+fn initial_dummies_reachable(state: &PublicState) -> bool {
+    fn slot_bit(gear: GearId, position: usize) -> u64 {
+        let offset = match gear {
+            GearId::Palenque => 0,
+            GearId::Yaxchilan => 10,
+            GearId::Tikal => 20,
+            GearId::Uxmal => 30,
+            GearId::ChichenItza => 40,
+        };
+        1_u64 << (offset + position)
+    }
+    struct Search<'a> {
+        tiles: Vec<&'a StartingWealth>,
+        target: u64,
+        unused_count: u32,
+        failed: HashSet<(u64, u32, u8)>,
+    }
+    impl Search<'_> {
+        fn reaches(&mut self, placed: u64, used: u32, seen_gears: u8) -> bool {
+            if placed == self.target {
+                return true;
+            }
+            let key = (placed, used, seen_gears);
+            if used.count_ones() == self.unused_count || self.failed.contains(&key) {
+                return false;
+            }
+            for index in 0..self.tiles.len() {
+                let tile_bit = 1_u32 << index;
+                if used & tile_bit != 0 {
+                    continue;
+                }
+                let tile = self.tiles[index];
+                let gear_bit = 1_u8 << GEAR_IDS.iter().position(|gear| *gear == tile.gear).unwrap();
+                let position = tile.position as usize;
+                let mut next = placed | slot_bit(tile.gear, position);
+                if seen_gears & gear_bit == 0
+                    && tile.gear != GearId::ChichenItza
+                    && next.count_ones() < self.target.count_ones()
+                {
+                    next |= slot_bit(tile.gear, (position + 5) % 10);
+                }
+                if next & !self.target == 0
+                    && self.reaches(next, used | tile_bit, seen_gears | gear_bit)
+                {
+                    return true;
+                }
+            }
+            self.failed.insert(key);
+            false
+        }
+    }
+    let selected: HashSet<&str> = state
+        .players
+        .iter()
+        .flat_map(|player| player.wealth.iter().map(String::as_str))
+        .collect();
+    let target = state
+        .gears
+        .iter()
+        .flat_map(|(gear, slots)| {
+            slots
+                .iter()
+                .enumerate()
+                .filter_map(move |(position, worker)| {
+                    worker
+                        .as_ref()
+                        .filter(|worker| worker.dummy)
+                        .map(|_| slot_bit(*gear, position))
+                })
+        })
+        .fold(0, |mask, bit| mask | bit);
+    // Each compatible prefix leaves enough distinct tiles to allocate the two
+    // unknown rejected offers per player and the rest of the unused stream.
+    Search {
+        tiles: CATALOG
+            .starting_wealth
+            .iter()
+            .filter(|tile| !selected.contains(tile.id.as_str()))
+            .collect(),
+        target,
+        unused_count: (CATALOG.starting_wealth.len() - 4 * state.players.len()) as u32,
+        failed: HashSet::new(),
+    }
+    .reaches(0, 0, 0)
+}
+
 fn validate_initial(state: &PublicState) -> Result<(), String> {
     validate_public_state(state).map_err(|error| format!("initial {error}"))?;
     if state.phase != Phase::Playing
@@ -427,6 +517,9 @@ fn validate_initial(state: &PublicState) -> Result<(), String> {
         })
     {
         return Err("initial gears/jungle/skullSpaces: board contains prior play".into());
+    }
+    if !initial_dummies_reachable(state) {
+        return Err("initial.gears: dummy board cannot result from base setup using unselected wealth tiles".into());
     }
     for p in &state.players {
         let mut resources: Resources = RESOURCE_IDS.into_iter().map(|r| (r, 0)).collect();
