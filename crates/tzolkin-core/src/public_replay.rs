@@ -358,7 +358,7 @@ impl PublicState {
         Ok(public)
     }
 
-    fn projection(&self) -> Result<GameState, String> {
+    pub(crate) fn projection(&self) -> Result<GameState, String> {
         let mut value = serde_json::to_value(self).map_err(|e| e.to_string())?;
         let object = value
             .as_object_mut()
@@ -426,6 +426,15 @@ pub fn validate_public_state(state: &PublicState) -> Result<(), String> {
 /// unused tile stream. Its prefix must place exactly the observed dummies using
 /// the same first-city/opposite-position rule as create_game_with_options.
 fn initial_dummies_reachable(state: &PublicState) -> bool {
+    initial_dummies_reachable_excluding(state, &[])
+}
+
+/// A policy actor may additionally know its rejected offers. They cannot have
+/// placed dummy workers. The witness itself remains private to this check.
+pub(crate) fn initial_dummies_reachable_excluding(
+    state: &PublicState,
+    known_offers: &[String],
+) -> bool {
     fn slot_bit(gear: GearId, position: usize) -> u64 {
         let offset = match gear {
             GearId::Palenque => 0,
@@ -480,6 +489,7 @@ fn initial_dummies_reachable(state: &PublicState) -> bool {
         .players
         .iter()
         .flat_map(|player| player.wealth.iter().map(String::as_str))
+        .chain(known_offers.iter().map(String::as_str))
         .collect();
     let target = state
         .gears
