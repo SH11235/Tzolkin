@@ -1,5 +1,11 @@
 import type { CSSProperties } from 'react';
-import { GEAR_IDS, type Choice, type GameMove, type GameState, type GearId } from '../game/types';
+import {
+  GEAR_IDS,
+  type Choice,
+  type GameMove,
+  type GameViewState,
+  type GearId,
+} from '../game/types';
 import { CalendarArt, Icon } from './Icons';
 import { gearActions, gearNames, gearSubtitles } from './content';
 
@@ -9,7 +15,7 @@ export function Board({
   play,
   costs,
 }: {
-  game: GameState;
+  game: GameViewState;
   moves: Choice[];
   play: (move: GameMove) => void;
   costs: Record<GearId, number | null>;

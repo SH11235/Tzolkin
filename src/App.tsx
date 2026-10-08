@@ -15,6 +15,7 @@ import {
   type Session,
 } from './game/storage';
 import { ResetDialog } from './ui/ResetDialog';
+import { ReplayViewer } from './ui/ReplayViewer';
 import { saveGameFile } from './game/files';
 import './App.css';
 
@@ -46,6 +47,8 @@ function App() {
   ]);
   const [cpuPaused, setCpuPaused] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [replayOpen, setReplayOpen] = useState(false);
+  const replayOpenRef = useRef(false);
   const importInput = useRef<HTMLInputElement>(null);
   const choicesRef = useRef<HTMLHeadingElement>(null);
   const [resetOpener, setResetOpener] = useState<HTMLElement | null>(null);
@@ -116,6 +119,14 @@ function App() {
     setResetOpener(document.activeElement instanceof HTMLElement ? document.activeElement : null);
     setConfirmReset(true);
   }
+  function openReplay() {
+    replayOpenRef.current = true;
+    setReplayOpen(true);
+  }
+  function closeReplay() {
+    replayOpenRef.current = false;
+    setReplayOpen(false);
+  }
   function updateSession(next: Session, snapshot: GameSnapshot) {
     try {
       localStorage.setItem(SAVE_KEY, JSON.stringify(next));
@@ -155,7 +166,7 @@ function App() {
     });
   }
   useEffect(() => {
-    if (!active || !cpuTurn || cpuPaused || busy || confirmReset) return;
+    if (!active || !cpuTurn || cpuPaused || busy || confirmReset || replayOpen) return;
     const controller = new AbortController();
     const expected = active;
     // Keep each decision on its own task so pause, undo and reset stay responsive.
@@ -166,16 +177,18 @@ function App() {
             expected.session.state,
             expected.session.state.currentPlayer,
           );
-          if (controller.signal.aborted) return;
+          if (controller.signal.aborted || replayOpenRef.current) return;
           const decision = await chooseCpu(observation, controller.signal);
-          if (controller.signal.aborted || activeRef.current !== expected) return;
+          if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
+            return;
           const legal = [...expected.snapshot.choices, ...expected.snapshot.moves].some(
             (choice) =>
               !choice.disabled && JSON.stringify(choice.move) === JSON.stringify(decision.move),
           );
           if (!legal) throw new Error('CPUが合法でない操作を返しました。');
           const snapshot = await applyMove(expected.session.state, decision.move);
-          if (controller.signal.aborted || activeRef.current !== expected) return;
+          if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
+            return;
           updateSession(
             {
               ...expected.session,
@@ -185,7 +198,8 @@ function App() {
             snapshot,
           );
         } catch (failure) {
-          if (controller.signal.aborted || activeRef.current !== expected) return;
+          if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
+            return;
           setCpuPaused(true);
           setError(
             failure instanceof Error ? failure.message : 'CPUの操作を実行できませんでした。',
@@ -197,7 +211,7 @@ function App() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [active, cpuTurn, cpuPaused, busy, confirmReset]);
+  }, [active, cpuTurn, cpuPaused, busy, confirmReset, replayOpen]);
   function start() {
     void run(async () => {
       const snapshot = await createGame(
@@ -300,6 +314,7 @@ function App() {
       )}
     </>
   );
+  if (replayOpen) return <ReplayViewer onClose={closeReplay} />;
   if (!game || !actor)
     return (
       <main className="welcome">
@@ -468,6 +483,13 @@ function App() {
               <Icon name="save" size={16} />
               保存ファイルを読み込む
             </button>
+            <button
+              className="text-button import-start"
+              disabled={loading || busy}
+              onClick={openReplay}
+            >
+              公開リプレイを読み込む
+            </button>
             <div className="welcome-notes">
               <p>拡張を選ばなければ基本ゲームで遊べます。進行は自動保存されます。</p>
               <p>Daniele Tascini & Simone Lucianiによるボードゲームの非公式実装。</p>
@@ -512,6 +534,14 @@ function App() {
           </span>
         </div>
         <div className="header-tools">
+          <button
+            title="公開リプレイを読み込む"
+            aria-label="公開リプレイを読み込む"
+            onClick={openReplay}
+            disabled={busy}
+          >
+            ▷
+          </button>
           {session && controllersFor(session).includes('cpu') && game.phase !== 'finished' && (
             <button
               className="cpu-toggle"

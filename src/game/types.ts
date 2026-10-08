@@ -225,6 +225,10 @@ export interface GameState {
     dummyGearsSeen: GearId[];
   } | null;
 }
+/** Board rendering needs public fields only. This type is never accepted by the live-game engine. */
+export type GameViewState = Omit<GameState, 'seed' | 'players' | 'buildingDeck' | 'age2Deck'> & {
+  players: Array<Omit<Player, 'wealthOffer'>>;
+};
 export type GameMove =
   | { type: 'place'; gear: GearId }
   | { type: 'remove'; gear: GearId; position: number }

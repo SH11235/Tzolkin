@@ -1,0 +1,124 @@
+.replay-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.25rem 2rem;
+  border-bottom: 1px solid var(--line);
+}
+.replay-header h1 {
+  margin: 0.2rem 0 0;
+  font-size: 1.5rem;
+}
+.replay-header-tools {
+  display: flex;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+.replay-header-tools button,
+.replay-navigation button {
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  padding: 0.6rem 0.85rem;
+  background: var(--paper);
+}
+.replay-intro,
+.replay-controls {
+  padding: 1.25rem 2rem;
+  max-width: 110rem;
+  margin: 0 auto;
+}
+.replay-intro {
+  max-width: 48rem;
+  line-height: 1.8;
+}
+.replay-summary b {
+  overflow-wrap: anywhere;
+}
+.replay-status {
+  display: inline-block;
+  margin: 0.4rem 0.8rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid currentColor;
+  border-radius: 0.4rem;
+  font-weight: 600;
+}
+.replay-status-partial {
+  color: #895619;
+}
+.replay-status-complete {
+  color: #27664c;
+}
+.replay-summary p,
+.replay-readonly {
+  font-size: 0.85rem;
+}
+.replay-navigation {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+.replay-navigation label {
+  flex: 1;
+  min-width: 12rem;
+  max-width: 48rem;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 0.4rem;
+}
+.replay-navigation output {
+  text-align: right;
+}
+.replay-navigation input {
+  width: 100%;
+  grid-column: 1 / -1;
+}
+.replay-position {
+  font-weight: 600;
+}
+.replay-cpu {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  margin-top: 1rem;
+}
+.replay-cpu button {
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  padding: 0.6rem 0.85rem;
+  background: var(--paper);
+}
+.replay-cpu-result {
+  margin: 0;
+  font-weight: 600;
+}
+.replay-cpu-result small {
+  display: block;
+  font-weight: 400;
+}
+.game-layout.replay-layout {
+  grid-template-columns: 260px minmax(0, 1fr);
+}
+.replay-error,
+.replay-loading {
+  position: static;
+  margin: 1rem 2rem;
+}
+@media (max-width: 850px) {
+  .replay-header {
+    align-items: start;
+    flex-direction: column;
+  }
+  .game-layout.replay-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .replay-header,
+  .replay-controls {
+    padding: 1rem;
+  }
+  .replay-status {
+    margin-left: 0;
+  }
+}

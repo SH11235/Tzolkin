@@ -5,7 +5,7 @@ import {
   TECHNOLOGY_IDS,
   TEMPLE_IDS,
   type ExpansionCatalog,
-  type GameState,
+  type GameViewState,
 } from '../game/types';
 import { Icon } from './Icons';
 import { effectText, formatScore, resourceNames, technologyNames, templeNames } from './content';
@@ -16,7 +16,7 @@ export function PlayersSidebar({
   expansionCatalog,
   controllers,
 }: {
-  game: GameState;
+  game: GameViewState;
   availableWorkers: number[];
   expansionCatalog?: ExpansionCatalog;
   controllers?: Controller[];

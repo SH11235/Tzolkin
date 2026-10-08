@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import type { Choice, ExpansionCatalog, GameMove, GameState } from '../game/types';
+import type { Choice, ExpansionCatalog, GameMove, GameViewState } from '../game/types';
 import { Icon } from './Icons';
 import { formatScore } from './content';
 
@@ -9,7 +9,7 @@ export function ExpansionBoard({
   moves,
   play,
 }: {
-  game: GameState;
+  game: GameViewState;
   catalog?: ExpansionCatalog;
   moves: Choice[];
   play: (move: GameMove) => void;
