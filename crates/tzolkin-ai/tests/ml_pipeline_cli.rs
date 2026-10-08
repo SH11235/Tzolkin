@@ -143,6 +143,24 @@ fn native_cli_trains_resumes_selects_legal_moves_and_enforces_evaluation_provena
             .iter()
             .all(|game| game.utility.is_some() != game.error.is_some())
     );
+    assert!(
+        report
+            .games
+            .iter()
+            .all(|game| game.decisions.is_some() == game.error.is_none())
+    );
+    let unfinished = report
+        .games
+        .iter()
+        .find(|game| {
+            game.error
+                .as_ref()
+                .is_some_and(|error| error.contains("Game did not finish"))
+        })
+        .expect("Fixture must exercise the bounded unfinished-game path");
+    assert_eq!(unfinished.decisions, None);
+    let json = serde_json::to_value(unfinished).unwrap();
+    assert!(json["decisions"].is_null());
 }
 
 #[test]

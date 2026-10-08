@@ -71,7 +71,8 @@ pub fn learned_game(
 pub struct EvaluationGame {
     pub seed: u32,
     pub learned_seat: usize,
-    pub decisions: usize,
+    /// Complete-game transitions; unavailable progress is null, never a fabricated zero.
+    pub decisions: Option<usize>,
     pub elapsed_ms: f64,
     pub utility: Option<f64>,
     pub scores: Vec<FinalScore>,
@@ -168,7 +169,7 @@ pub fn evaluate_model(
                     games.push(EvaluationGame {
                         seed: *seed,
                         learned_seat,
-                        decisions,
+                        decisions: Some(decisions),
                         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                         utility: Some(utility),
                         scores: state.final_scores,
@@ -178,7 +179,7 @@ pub fn evaluate_model(
                 Err(error) => games.push(EvaluationGame {
                     seed: *seed,
                     learned_seat,
-                    decisions: 0,
+                    decisions: None,
                     elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                     utility: None,
                     scores: vec![],
