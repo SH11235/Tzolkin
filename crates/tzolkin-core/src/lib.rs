@@ -1,9 +1,11 @@
 //! Platform independent Tzolkin game rules and saved game types.
 pub mod api;
 pub mod catalog;
+pub mod compact;
 pub mod engine;
 #[cfg(test)]
 mod expansion_tests;
+pub mod observation;
 pub mod prophecies;
 pub mod quick_actions;
 pub mod tribes;

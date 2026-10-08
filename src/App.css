@@ -184,6 +184,27 @@
   color: var(--ink);
   font-size: 13px;
 }
+.seat-fields .controller-field {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  margin-top: 6px;
+}
+.controller-field select {
+  padding: 6px 10px;
+  color: var(--ink);
+  background: #faf8f1;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font: inherit;
+}
+.cpu-badge {
+  margin-left: 7px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: normal;
+  letter-spacing: 0.06em;
+}
 .start-button {
   width: 100%;
 }

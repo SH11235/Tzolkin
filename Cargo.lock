@@ -3657,6 +3657,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tzolkin-ai"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tzolkin-core",
+]
+
+[[package]]
 name = "tzolkin-core"
 version = "0.1.0"
 dependencies = [
@@ -3668,6 +3677,7 @@ dependencies = [
 name = "tzolkin-wasm"
 version = "0.1.0"
 dependencies = [
+ "tzolkin-ai",
  "tzolkin-core",
  "wasm-bindgen",
 ]

@@ -36,6 +36,10 @@ enum Request {
     Inspect {
         state: Value,
     },
+    Observe {
+        state: Value,
+        actor: usize,
+    },
     Validate {
         value: Value,
     },
@@ -103,6 +107,11 @@ fn dispatch(request: &str, checked: bool) -> Result<String, String> {
             result_snapshot(apply_move(&state, r#move)?, checked)
         }
         Request::Inspect { state } => result_snapshot(state_from_json(state, checked)?, checked),
+        Request::Observe { state, actor } => {
+            let state = state_from_json(state, true)?;
+            serde_json::to_string(&crate::observation::observe(&state, actor)?)
+                .map_err(|error| error.to_string())
+        }
         Request::Validate { value } => Ok(validate_game_state(&value).to_string()),
         Request::Catalog => Ok(include_str!("../data/catalog.json").into()),
         Request::Score { state, player, id } => {

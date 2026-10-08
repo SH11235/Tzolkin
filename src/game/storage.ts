@@ -2,7 +2,11 @@ import { validateGameState } from './engine';
 import type { GameState } from './types';
 
 export const SAVE_KEY = 'tzolkin.game.v1';
-export type Session = { state: GameState; history: GameState[] };
+export type Controller = 'human' | 'cpu';
+export type Session = { state: GameState; history: GameState[]; controllers?: Controller[] };
+export function controllersFor(session: Session): Controller[] {
+  return session.controllers ?? session.state.players.map(() => 'human');
+}
 class InvalidSaveError extends Error {}
 export async function parseSession(text: string): Promise<Session> {
   let value: unknown;
@@ -22,7 +26,17 @@ export async function parseSession(text: string): Promise<Session> {
     'history' in value && Array.isArray(value.history) ? value.history : [];
   const valid = await Promise.all(candidates.map((entry) => validateGameState(entry)));
   const history = candidates.filter((_, index) => valid[index]).slice(-60) as GameState[];
-  return { state: value.state as GameState, history };
+  const state = value.state as GameState;
+  if ('controllers' in value) {
+    if (
+      !Array.isArray(value.controllers) ||
+      value.controllers.length !== state.players.length ||
+      !value.controllers.every((controller) => controller === 'human' || controller === 'cpu')
+    )
+      throw new InvalidSaveError('プレイヤーの操作設定が不正です。');
+    return { state, history, controllers: value.controllers as Controller[] };
+  }
+  return { state, history };
 }
 export async function readSession(): Promise<Session | null> {
   let saved: string | null;

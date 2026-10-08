@@ -12,6 +12,8 @@ export function ActionsSidebar({
   autosaveAvailable,
   showRules,
   newGame,
+  cpuTurn = false,
+  cpuPaused = false,
 }: {
   game: GameState;
   choices: Choice[];
@@ -21,9 +23,27 @@ export function ActionsSidebar({
   choicesRef: RefObject<HTMLHeadingElement | null>;
   showRules: () => void;
   newGame: () => void;
+  cpuTurn?: boolean;
+  cpuPaused?: boolean;
 }) {
   const [revealed, setRevealed] = useState(false);
   const actor = game.players[game.currentPlayer]!;
+  if (cpuTurn)
+    return (
+      <aside className="actions-sidebar" aria-label="手番のアクション">
+        <div className="turn-heading" style={{ '--player-color': actor.color } as CSSProperties}>
+          <span className="eyebrow">CPUの操作</span>
+          <h2 ref={choicesRef} tabIndex={-1}>
+            {actor.name}の番です
+          </h2>
+          <p role="status">
+            {cpuPaused
+              ? 'CPUを一時停止しています。上の再開ボタンで続けられます。'
+              : 'CPUが考えています…'}
+          </p>
+        </div>
+      </aside>
+    );
   const choosingTribe = game.phase === 'setup' && !actor.tribe && !!actor.tribeOffer?.length;
   const setupHasTribes = !!actor.tribeOffer?.length;
   const actionTitle =
