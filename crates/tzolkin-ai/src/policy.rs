@@ -28,6 +28,26 @@ impl Default for HeuristicWeights {
         }
     }
 }
+impl HeuristicWeights {
+    /// Bounded, finite experimental coefficients; the frozen default is unchanged.
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .material_values
+            .iter()
+            .chain([
+                &self.corn_base,
+                &self.corn_when_short,
+                &self.temple_step,
+                &self.technology_step,
+                &self.worker,
+            ])
+            .any(|value| !value.is_finite() || value.abs() > 1000.0)
+        {
+            return Err("Heuristic coefficients must be finite and within -1000..1000".into());
+        }
+        Ok(())
+    }
+}
 fn resource_index(r: Resource) -> usize {
     RESOURCE_IDS.iter().position(|x| *x == r).unwrap()
 }
