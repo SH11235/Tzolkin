@@ -315,29 +315,49 @@ fn export_sources<'a>(
     let mut seen = BTreeSet::new();
     for index in 0..count {
         let record = source(index)?;
-        let ReplaySource::SelfPlay {
-            policy_version,
-            weights,
-        } = &record.header.source
-        else {
-            return Err("Training export accepts native SelfPlay only".into());
+        let policy_version = match &record.header.source {
+            ReplaySource::SelfPlay {
+                policy_version,
+                weights,
+            } => {
+                if policy_version.is_empty()
+                    || policy_version.len() > 128
+                    || weights
+                        .material_values
+                        .iter()
+                        .chain([
+                            &weights.corn_base,
+                            &weights.corn_when_short,
+                            &weights.temple_step,
+                            &weights.technology_step,
+                            &weights.worker,
+                        ])
+                        .any(|v| !v.is_finite())
+                {
+                    return Err("Invalid selfplay policy metadata".into());
+                }
+                policy_version.clone()
+            }
+            ReplaySource::PolicySelfPlay { policies } => {
+                if policies.len() != record.header.names.len() {
+                    return Err("Selfplay policy/seat count mismatch".into());
+                }
+                for policy in policies {
+                    policy.validate()?;
+                }
+                // The complete replay keeps explicit per-seat model SHA/heuristic metadata;
+                // strata use a content-bound identifier for that exact composition.
+                format!(
+                    "policy-selfplay-v1:{}",
+                    hex(Sha256::digest(
+                        serde_json::to_vec(policies).map_err(|e| e.to_string())?
+                    ))
+                )
+            }
+            ReplaySource::Human { .. } => {
+                return Err("Training export accepts native SelfPlay only".into());
+            }
         };
-        if policy_version.is_empty()
-            || policy_version.len() > 128
-            || weights
-                .material_values
-                .iter()
-                .chain([
-                    &weights.corn_base,
-                    &weights.corn_when_short,
-                    &weights.temple_step,
-                    &weights.technology_step,
-                    &weights.worker,
-                ])
-                .any(|v| !v.is_finite())
-        {
-            return Err("Invalid selfplay policy metadata".into());
-        }
         let terminal = replay::verify_replay(&record)?;
         let winners = terminal.final_scores.iter().filter(|s| s.rank == 1).count();
         if winners == 0 {
@@ -361,7 +381,7 @@ fn export_sources<'a>(
             samples: record.steps.len(),
             players: terminal.players.len(),
             options: record.header.options.clone(),
-            policy_version: policy_version.clone(),
+            policy_version,
         };
         prepared.push((game, utilities));
     }

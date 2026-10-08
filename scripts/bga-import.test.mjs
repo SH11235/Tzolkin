@@ -159,6 +159,15 @@ test('does not mix abandoned, historical, market-limited or cancelled human coho
   assert.equal(result.cohorts.length, 2);
   assert.equal(result.cohorts[0].trainingReady, false);
   assert.equal(result.cpu.players[0].observedCounts['action:yaxchilan:5'], 1);
+  replay.header.source = {
+    kind: 'policySelfPlay',
+    policies: [
+      { kind: 'learned', policyVersion: 'learned-policy-v1', modelChecksum: 'a'.repeat(64) },
+    ],
+  };
+  const learned = compareProfiles(profiles, replay);
+  assert.deepEqual(learned.cpu.generationSource, replay.header.source);
+  assert.equal(learned.cpu.players[0].observedCounts['action:yaxchilan:5'], 1);
   replay.verifiedComplete = false;
   assert.throws(() => compareProfiles(profiles, replay));
 });

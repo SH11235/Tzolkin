@@ -50,8 +50,18 @@ fn run() -> Result<(), String> {
     if command == "choose" {
         let mut request = String::new();
         std::io::stdin()
+            .take(16 * 1024 * 1024 + 1)
             .read_to_string(&mut request)
             .map_err(|e| e.to_string())?;
+        if request.len() > 16 * 1024 * 1024 {
+            return Err("CPU input exceeds 16 MiB".into());
+        }
+        let model_path = value(&args, "--model", "")?;
+        if !model_path.is_empty() {
+            let model = tzolkin_ai::model::ModelArtifact::load(std::path::Path::new(&model_path))?;
+            let observation = serde_json::from_str(&request).map_err(|error| error.to_string())?;
+            return output(&model.choose_move(&observation)?);
+        }
         println!("{}", dispatch_cpu(&request)?);
         return Ok(());
     }
@@ -82,6 +92,74 @@ fn run() -> Result<(), String> {
         let seeds = number(&args, "--seeds", "32")?;
         return output(&replay::verify_corpus(seeds)?);
     }
+    if command == "train" {
+        let input = value(&args, "--input", "")?;
+        let destination = value(&args, "--output", "")?;
+        if input.is_empty() || destination.is_empty() {
+            return Err("Usage: tzolkin-ai train --input DATASET --output NEW_DIRECTORY [--epochs N] [--resume CHECKPOINT]".into());
+        }
+        let resume_path = value(&args, "--resume", "")?;
+        let resume = if resume_path.is_empty() {
+            None
+        } else {
+            Some(tzolkin_ai::training::TrainingCheckpoint::load(
+                std::path::Path::new(&resume_path),
+            )?)
+        };
+        let previous = resume
+            .as_ref()
+            .map(|checkpoint| checkpoint.config.clone())
+            .unwrap_or_default();
+        let config = tzolkin_ai::training::TrainingConfig {
+            epochs: number(&args, "--epochs", &previous.epochs.to_string())?,
+            batch_size: number(&args, "--batch-size", &previous.batch_size.to_string())?,
+            learning_rate: number(
+                &args,
+                "--learning-rate",
+                &previous.learning_rate.to_string(),
+            )?,
+            seed: number(&args, "--seed", &previous.seed.to_string())?,
+            value_weight: number(&args, "--value-weight", &previous.value_weight.to_string())?,
+        };
+        let dataset = tzolkin_ai::dataset::load_dataset(std::path::Path::new(&input))?;
+        return output(&tzolkin_ai::experiment::train_to_directory(
+            &dataset,
+            &config,
+            resume.as_ref(),
+            std::path::Path::new(&destination),
+        )?);
+    }
+    if command == "evaluate" {
+        let input = value(&args, "--input", "")?;
+        let checkpoint_path = value(&args, "--checkpoint", "")?;
+        let seed_list = value(&args, "--seeds", "")?;
+        if input.is_empty() || checkpoint_path.is_empty() || seed_list.is_empty() {
+            return Err("Usage: tzolkin-ai evaluate --input DATASET --checkpoint PATH --players 3|4 --seeds HELD_OUT_SEEDS_COMMA_SEPARATED".into());
+        }
+        let seeds = seed_list
+            .split(',')
+            .map(|value| {
+                value
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid evaluation seed".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let players = number(&args, "--players", "3")?;
+        let flags: u8 = number(&args, "--flags", "0")?;
+        if flags > 15 {
+            return Err("Flags must be 0..15".into());
+        }
+        let dataset = tzolkin_ai::dataset::load_dataset(std::path::Path::new(&input))?;
+        let checkpoint =
+            tzolkin_ai::training::TrainingCheckpoint::load(std::path::Path::new(&checkpoint_path))?;
+        return output(&tzolkin_ai::experiment::evaluate_model(
+            &checkpoint,
+            &dataset,
+            players,
+            &seeds,
+            replay::options_from_mask(flags),
+        )?);
+    }
     if command == "dataset" {
         let input = value(&args, "--input", "")?;
         let destination = value(&args, "--output", "")?;
@@ -111,6 +189,9 @@ fn run() -> Result<(), String> {
         );
     }
     let players: usize = number(&args, "--players", "2")?;
+    if !(2..=5).contains(&players) {
+        return Err("Players must be 2..5".into());
+    }
     let seed: u32 = number(&args, "--seed", "0")?;
     let mut flags: u8 = number(&args, "--flags", "0")?;
     if flags > 15 {
@@ -127,7 +208,26 @@ fn run() -> Result<(), String> {
             .map(|i| args.get(i + 1).ok_or("Missing output path"))
             .transpose()?;
         let started = Instant::now();
-        let (state, decisions, record) = replay::play_game(players, seed, options, path.is_some())?;
+        let model_path = value(&args, "--model", "")?;
+        let (state, decisions, record) = if model_path.is_empty() {
+            replay::play_game(players, seed, options, path.is_some())?
+        } else {
+            let model = tzolkin_ai::model::ModelArtifact::load(std::path::Path::new(&model_path))?;
+            let seat = value(&args, "--model-seat", "all")?;
+            let seats = if seat == "all" {
+                (0..players).collect()
+            } else {
+                vec![seat.parse::<usize>().map_err(|_| "Invalid model seat")?]
+            };
+            tzolkin_ai::experiment::learned_game(
+                &model,
+                players,
+                seed,
+                options,
+                &seats,
+                path.is_some(),
+            )?
+        };
         if let Some(path) = path {
             if std::path::Path::new(path).exists() {
                 return Err("Replay output already exists".into());
@@ -143,7 +243,9 @@ fn run() -> Result<(), String> {
             file.write_all(&serde_json::to_vec(&replay).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
             file.sync_all().map_err(|e| e.to_string())?;
-            std::fs::rename(&temporary, path).map_err(|e| e.to_string())?;
+            let published = std::fs::hard_link(&temporary, path).map_err(|e| e.to_string());
+            let cleanup = std::fs::remove_file(&temporary).map_err(|e| e.to_string());
+            published.and(cleanup)?;
         }
         return output(
             &serde_json::json!({"players":players,"seed":seed,"flags":flags,"decisions":decisions,"elapsedMs":started.elapsed().as_secs_f64()*1000.0,"finalScores":state.final_scores}),
@@ -278,7 +380,7 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "tzolkin-ai choose | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--output PATH] | replay PATH | dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
+        "tzolkin-ai choose [--model PATH] | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--output PATH] [--model PATH --model-seat all|SEAT] | replay PATH | dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY | train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate X --seed N --value-weight X --resume CHECKPOINT] | evaluate --input DATASET --checkpoint PATH --players 3|4 --seeds HELD_OUT_SEEDS_COMMA_SEPARATED | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
     );
     Ok(())
 }

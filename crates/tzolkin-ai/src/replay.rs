@@ -23,11 +23,56 @@ pub enum ReplaySource {
         policy_version: String,
         weights: HeuristicWeights,
     },
+    PolicySelfPlay {
+        policies: Vec<SeatPolicy>,
+    },
     Human {
         provider: String,
         reference: String,
         skill_rating: Option<f64>,
     },
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum SeatPolicy {
+    Heuristic {
+        policy_version: String,
+        weights: HeuristicWeights,
+    },
+    Learned {
+        policy_version: String,
+        model_checksum: String,
+    },
+}
+
+impl SeatPolicy {
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Heuristic {
+                policy_version,
+                weights,
+            } if policy_version == POLICY_VERSION && *weights == HeuristicWeights::default() => {
+                Ok(())
+            }
+            Self::Learned {
+                policy_version,
+                model_checksum,
+            } if policy_version == crate::model::LEARNED_POLICY_VERSION
+                && model_checksum.len() == 64
+                && model_checksum
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                Ok(())
+            }
+            _ => Err("Unsupported selfplay seat-policy provenance".into()),
+        }
+    }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -112,9 +157,42 @@ fn check_state(state: &GameState) -> Result<(), String> {
 pub fn play_game(
     players: usize,
     seed: u32,
-    mut options: GameOptions,
+    options: GameOptions,
     record: bool,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_using(
+        players,
+        seed,
+        options,
+        record,
+        ReplaySource::SelfPlay {
+            policy_version: POLICY_VERSION.into(),
+            weights: HeuristicWeights::default(),
+        },
+        choose_move,
+    )
+}
+/// Controlled native runner. The policy receives only the current actor's redacted view.
+/// Source describes every generating seat; verification validates legality, not policy quality.
+pub fn play_game_using(
+    players: usize,
+    seed: u32,
+    mut options: GameOptions,
+    record: bool,
+    source: ReplaySource,
+    mut decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    if !(2..=5).contains(&players) {
+        return Err("Players must be 2..5".into());
+    }
+    if let ReplaySource::PolicySelfPlay { policies } = &source {
+        if policies.len() != players {
+            return Err("Selfplay policy/seat count mismatch".into());
+        }
+        for policy in policies {
+            policy.validate()?;
+        }
+    }
     if players == 5 {
         options.quick_actions = true;
     }
@@ -132,7 +210,12 @@ pub fn play_game(
             ));
         }
         let observation = observe(&state, state.current_player)?;
-        let decision = choose_move(&observation)?;
+        let decision = decide(&observation)?;
+        if decision.actor != observation.actor
+            || decision.observation_key != observation.observation_key
+        {
+            return Err("Policy returned stale or wrong-actor decision".into());
+        }
         let chosen = observation
             .legal_actions
             .iter()
@@ -172,10 +255,7 @@ pub fn play_game(
                 catalog_hash: catalog_hash(),
                 move_schema: MOVE_SCHEMA,
                 observation_schema: OBSERVATION_SCHEMA,
-                source: ReplaySource::SelfPlay {
-                    policy_version: POLICY_VERSION.into(),
-                    weights: HeuristicWeights::default(),
-                },
+                source,
                 names,
                 seed,
                 options,
@@ -208,6 +288,14 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
     }
     if replay.steps.len() > MAX_DECISIONS {
         return Err("Replay exceeds decision limit".into());
+    }
+    if let ReplaySource::PolicySelfPlay { policies } = &h.source {
+        if policies.len() != h.names.len() {
+            return Err("Replay policy/seat count mismatch".into());
+        }
+        for policy in policies {
+            policy.validate()?;
+        }
     }
     let mut state = create_game_with_options(h.names.clone(), h.seed, h.options.clone())?;
     check_state(&state)?;
