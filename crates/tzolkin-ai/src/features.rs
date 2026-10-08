@@ -1,10 +1,14 @@
 //! Versioned observation/action features. No saved state or replay metadata is accepted.
+use serde::ser::{Serialize, SerializeStruct, Serializer};
 use serde_json::Value;
 use tzolkin_core::compact::catalog::{BUILDING_IDS, MONUMENT_IDS, WEALTH_IDS};
-use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, TypedAction};
+use tzolkin_core::observation::{
+    MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, TypedAction, observation_key,
+};
 use tzolkin_core::*;
 
 pub const FEATURE_SCHEMA: u32 = 1;
+pub const PUBLIC_FEATURE_SCHEMA: u32 = 2;
 pub const FEATURE_COUNT: usize = 512;
 pub const MAX_LEGAL_ACTIONS: usize = 4096;
 const STATE_HASH_START: usize = 264;
@@ -86,19 +90,101 @@ pub fn encode_action(
         .ok_or("Non-legal feature action")?;
     encoder.encode_legal(index)
 }
+
+/// Explicit public schema; this output cannot enter the legacy raw-array API.
+pub fn encode_public_action(
+    o: &Observation,
+    action: &TypedAction,
+) -> Result<EncodedCandidate, String> {
+    let encoder = FeatureEncoder::new_public(o)?;
+    let index = o
+        .legal_actions
+        .iter()
+        .position(|a| a.action == *action)
+        .ok_or("Non-legal feature action")?;
+    encoder.encode_legal_tagged(index)
+}
+
+/// Schema and values are inseparable at this boundary. There is no untagged
+/// conversion, Deref, or Deserialize implementation; consumers must name their
+/// supported schema before borrowing the array.
+///
+/// ```compile_fail
+/// use tzolkin_ai::features::EncodedCandidate;
+/// let _: EncodedCandidate = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncodedCandidate {
+    feature_schema: u32,
+    values: [f32; FEATURE_COUNT],
+}
+impl EncodedCandidate {
+    pub fn feature_schema(&self) -> u32 {
+        self.feature_schema
+    }
+    pub fn values_for_schema(&self, expected: u32) -> Result<&[f32; FEATURE_COUNT], String> {
+        if expected != self.feature_schema {
+            return Err("Feature schema mismatch".into());
+        }
+        Ok(&self.values)
+    }
+}
+impl Serialize for EncodedCandidate {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut object = serializer.serialize_struct("EncodedCandidate", 2)?;
+        object.serialize_field("featureSchema", &self.feature_schema)?;
+        object.serialize_field("values", self.values.as_slice())?;
+        object.end()
+    }
+}
 /// Reuse the public state context across the ragged legal set during inference/export.
 pub struct FeatureEncoder<'a> {
     observation: &'a Observation,
     context: [f32; FEATURE_COUNT],
+    feature_schema: u32,
 }
 impl<'a> FeatureEncoder<'a> {
+    /// Existing native dataset/model/checkpoint default remains schema 1.
     pub fn new(observation: &'a Observation) -> Result<Self, String> {
+        Self::new_with_schema(observation, FEATURE_SCHEMA)
+    }
+    pub fn new_public(observation: &'a Observation) -> Result<Self, String> {
+        Self::new_with_schema(observation, PUBLIC_FEATURE_SCHEMA)
+    }
+    pub fn new_with_schema(observation: &'a Observation, schema: u32) -> Result<Self, String> {
+        if ![FEATURE_SCHEMA, PUBLIC_FEATURE_SCHEMA].contains(&schema) {
+            return Err("Unsupported feature schema".into());
+        }
+        let context = observation_features(observation, schema)?;
+        // Preserve legacy validation exactly. Public v2 additionally requires a
+        // self-consistent core key, not a claim of source-qualified provenance.
+        if schema == PUBLIC_FEATURE_SCHEMA
+            && observation_key(observation)? != observation.observation_key
+        {
+            return Err("Observation key mismatch".into());
+        }
         Ok(Self {
             observation,
-            context: observation_features(observation)?,
+            context,
+            feature_schema: schema,
         })
     }
+    pub fn feature_schema(&self) -> u32 {
+        self.feature_schema
+    }
     pub fn encode_legal(&self, index: usize) -> Result<[f32; FEATURE_COUNT], String> {
+        if self.feature_schema != FEATURE_SCHEMA {
+            return Err("Public features require schema-tagged encoding".into());
+        }
+        self.encode_values(index)
+    }
+    pub fn encode_legal_tagged(&self, index: usize) -> Result<EncodedCandidate, String> {
+        Ok(EncodedCandidate {
+            feature_schema: self.feature_schema,
+            values: self.encode_values(index)?,
+        })
+    }
+    fn encode_values(&self, index: usize) -> Result<[f32; FEATURE_COUNT], String> {
         let action = &self
             .observation
             .legal_actions
@@ -108,7 +194,7 @@ impl<'a> FeatureEncoder<'a> {
         candidate_features(self.observation, action, self.context)
     }
 }
-fn observation_features(o: &Observation) -> Result<[f32; FEATURE_COUNT], String> {
+fn observation_features(o: &Observation, schema: u32) -> Result<[f32; FEATURE_COUNT], String> {
     let n = o.players.len();
     if o.schema != OBSERVATION_SCHEMA
         || o.move_schema != MOVE_SCHEMA
@@ -298,18 +384,26 @@ fn observation_features(o: &Observation) -> Result<[f32; FEATURE_COUNT], String>
     for (scope, ids) in [
         ("market-building", &o.buildings),
         ("market-monument", &o.monuments),
-        ("wealth-offer", &o.private.wealth_offer),
-        ("selected-wealth", &o.private.selected_wealth),
     ] {
         for id in ids {
             categorical(&mut out, scope, 0, id);
         }
     }
-    for tribe in &o.private.tribe_offer {
-        categorical(&mut out, "tribe-offer", 0, tribe.id());
-    }
-    if let Some(tribe) = o.private.selected_tribe {
-        categorical(&mut out, "selected-tribe", 0, tribe.id());
+    if schema == FEATURE_SCHEMA || o.phase == Phase::Setup {
+        for (scope, ids) in [
+            ("wealth-offer", &o.private.wealth_offer),
+            ("selected-wealth", &o.private.selected_wealth),
+        ] {
+            for id in ids {
+                categorical(&mut out, scope, 0, id);
+            }
+        }
+        for tribe in &o.private.tribe_offer {
+            categorical(&mut out, "tribe-offer", 0, tribe.id());
+        }
+        if let Some(tribe) = o.private.selected_tribe {
+            categorical(&mut out, "selected-tribe", 0, tribe.id());
+        }
     }
     for (scope, count) in [
         ("building-deck-count", o.building_deck_count),
