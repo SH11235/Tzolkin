@@ -199,6 +199,9 @@ test('rejects wrong source costs and unobserved/future card identities', () => {
     input.raw.dom_entries
       .find((entry) => entry.action_id === 8)
       .messages[0].raw_text.replace(/歯車に\d+/, '歯車に99');
+  input.raw.entries.find((entry) => entry.action_id === 8).raw_text = input.raw.dom_entries.find(
+    (entry) => entry.action_id === 8,
+  ).messages[0].raw_text;
   input.companion.rawSha256 = sha256(JSON.stringify(input.raw));
   assert.throws(() => audit(input), /placement\/gear\/cost/);
   const sprite = fixture();
@@ -207,6 +210,48 @@ test('rejects wrong source costs and unobserved/future card identities', () => {
   const future = fixture();
   future.companion.cardMappings[0].catalogId = 'b32';
   assert.throws(() => audit(future), /future reveals/);
+});
+
+test('raw body must match DOM messages; unsupported residual text cannot be hidden', () => {
+  for (const text of ['\nBは新しいワーカーを獲得した', '\n2:22:11', '\n設定を変更する']) {
+    const input = fixture();
+    input.raw.entries.find((entry) => entry.action_id === 8).raw_text += text;
+    input.companion.rawSha256 = sha256(JSON.stringify(input.raw));
+    assert.throws(() => audit(input), /Raw\/DOM message text mismatch/);
+  }
+  const normalized = fixture();
+  for (const entry of normalized.raw.entries)
+    entry.raw_text = entry.raw_text.replace(/\n/g, '\r\n');
+  normalized.companion.rawSha256 = sha256(JSON.stringify(normalized.raw));
+  assert.equal(audit(normalized).manifest.verifiedSteps, 1);
+});
+
+test('known actor effects cannot be attached to an unrelated legal placement', () => {
+  for (const text of [
+    'Bは新しいワーカーを獲得した',
+    'Aは新しいワーカーを獲得した',
+    'Bは建物を建てた',
+    'Aは建物を建てた',
+    'Bは記念碑を建てた',
+    'Bは1 を2 に交換した',
+    'Bは1 を獲得した',
+    '歯車が進んだ',
+  ]) {
+    const input = fixture();
+    input.raw.entries.find((entry) => entry.action_id === 8).raw_text = text;
+    const message = input.raw.dom_entries.find((entry) => entry.action_id === 8).messages[0];
+    message.raw_text = text;
+    message.icons = [{ classes: 'tz_icon resource_corn imgtext' }];
+    input.companion.rawSha256 = sha256(JSON.stringify(input.raw));
+    assert.throws(() => audit(input), /Source (worker gain|build|monument|effect|gear advance)/);
+  }
+});
+
+test('each raw provenance ID must reverse-map to that operation, including canceled IDs', () => {
+  const input = fixture();
+  input.companion.timeline.find((node) => node.id === 'op8').step.sourceActionIds = [7, 8];
+  input.companion.record.steps[0].sourceActionIds = [7, 8];
+  assert.throws(() => audit(input), /provenance ID has no matching move coverage/);
 });
 
 test('unsupported options, hidden metadata and terminal/partial confusion are refused', () => {
@@ -308,6 +353,49 @@ test(
         /SHA-256 mismatch/,
       );
       await assert.rejects(stat(join(temporary, 'invalid')), { code: 'ENOENT' });
+      const corruptions = [
+        {
+          name: 'residual',
+          expected: /Raw\/DOM message text mismatch/,
+          mutate: (changed) => {
+            changed.raw.entries.find((entry) => entry.action_id === 8).raw_text +=
+              '\nBは新しいワーカーを獲得した';
+          },
+        },
+        {
+          name: 'wrong-actor',
+          expected: /Source build differs/,
+          mutate: (changed) => {
+            changed.raw.entries.find((entry) => entry.action_id === 8).raw_text = 'Bは建物を建てた';
+            changed.raw.dom_entries.find((entry) => entry.action_id === 8).messages[0].raw_text =
+              'Bは建物を建てた';
+          },
+        },
+        {
+          name: 'cancel-provenance',
+          expected: /provenance ID has no matching move coverage/,
+          mutate: (changed) => {
+            changed.companion.timeline.find((node) => node.id === 'op8').step.sourceActionIds = [
+              7, 8,
+            ];
+            changed.companion.record.steps[0].sourceActionIds = [7, 8];
+          },
+        },
+      ];
+      for (const corruption of corruptions) {
+        const changed = fixture();
+        corruption.mutate(changed);
+        const changedRaw = Buffer.from(JSON.stringify(changed.raw));
+        changed.companion.rawSha256 = sha256(changedRaw);
+        await writeFile(rawPath, changedRaw);
+        await writeFile(companionPath, JSON.stringify(changed.companion));
+        const rejectedOutput = join(temporary, corruption.name);
+        await assert.rejects(
+          exportReconstruction(rawPath, companionPath, nativeCli, rejectedOutput),
+          corruption.expected,
+        );
+        await assert.rejects(stat(rejectedOutput), { code: 'ENOENT' });
+      }
     } finally {
       await rm(temporary, { recursive: true, force: true });
     }

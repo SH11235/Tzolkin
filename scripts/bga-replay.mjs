@@ -158,23 +158,21 @@ function sourceEvents(raw, game, cutoff) {
   }
   for (const entry of raw.entries.filter((entry) => entry.action_id <= cutoff)) {
     const messages = messagesByAction.get(entry.action_id) ?? [];
-    if (!messages.length)
-      events.push({
-        actionId: entry.action_id,
-        messageIndex: -1,
-        kind: 'unparsed',
-        rawText: entry.raw_text,
-      });
-    else if (
-      entry.raw_text.split('\n').includes('ゲーム終了') &&
-      !messages.some((event) => event.kind === 'gameEnd')
-    )
+    // Exported entry bodies exclude the separate timestamp/header controls.
+    // Normalize line endings only; never discard arbitrary unmatched UI text.
+    const normalized = (value) => value.replace(/\r\n/g, '\n');
+    const body = normalized(entry.raw_text);
+    const joined = messages.map((message) => normalized(message.rawText)).join('\n');
+    const terminalSuffix = joined ? `${joined}\nゲーム終了` : 'ゲーム終了';
+    if (body === terminalSuffix && !messages.some((event) => event.kind === 'gameEnd'))
       events.push({
         actionId: entry.action_id,
         messageIndex: -1,
         kind: 'gameEnd',
         rawText: 'ゲーム終了',
       });
+    else if (body !== joined || !messages.length)
+      fail(`Raw/DOM message text mismatch at action ${entry.action_id}: unsupported residual text`);
   }
   return events.sort((a, b) => a.actionId - b.actionId || a.messageIndex - b.messageIndex);
 }
@@ -224,6 +222,8 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
   const game = normalizeGame(raw, companion.rawSha256);
   if (companion.tableId !== game.tableId) fail('Companion table mismatch');
   const cutoff = id(companion.cutoffActionId, 'cutoffActionId');
+  const events = sourceEvents(raw, game, cutoff);
+  if (events.length > MAX_EVENTS) fail('Prefix exceeds event limit');
   if (!['partial', 'complete'].includes(companion.status))
     fail('Explicit partial/complete status required');
   if (!Array.isArray(companion.unsupportedRules) || companion.unsupportedRules.length)
@@ -507,13 +507,11 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
     fail('Effective rollback operation sequence differs from record.steps');
   if (lastActionId !== cutoff) fail('Timeline must finish exactly at cutoff');
 
-  const events = sourceEvents(raw, game, cutoff);
-  if (events.length > MAX_EVENTS) fail('Prefix exceeds event limit');
   const eventMap = new Map(
     events.map((event) => [`${event.actionId}:${event.messageIndex}`, event]),
   );
   const covered = new Set();
-  const operationCoverage = new Set();
+  const operationCoverage = new Map();
   for (const row of array(companion.coverage, MAX_EVENTS, 'coverage')) {
     keys(row, ['actionId', 'messageIndex', 'kind', 'moveIds', 'reason'], 'coverage');
     const key = `${row.actionId}:${row.messageIndex}`;
@@ -554,6 +552,19 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
       const actorOperations = matched.filter(
         (operation) => names[operation.step.actor] === event.actor,
       );
+      const supported = [
+        'place',
+        'gearAction',
+        'technology',
+        'workerGain',
+        'build',
+        'monument',
+        'firstPlayer',
+        'gearAdvanced',
+        'unparsed',
+      ];
+      if (!supported.includes(event.kind))
+        fail(`Source effect ${event.kind} has no reviewed semantic matcher`);
       if (
         event.kind === 'place' &&
         !actorOperations.some(
@@ -608,21 +619,50 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
         )
       )
         fail('Source technology differs from explicit operation');
-      matched.forEach((operation) => operationCoverage.add(operation.id));
+      if (
+        event.kind === 'workerGain' &&
+        !actorOperations.some(
+          (operation) =>
+            operation.state.players[operation.step.actor].workers -
+              operation.beforeState.players[operation.step.actor].workers ===
+            1,
+        )
+      )
+        fail('Source worker gain differs from actor/worker transition');
+      for (const kind of ['build', 'monument', 'firstPlayer'])
+        if (
+          event.kind === kind &&
+          !actorOperations.some((operation) => operation.action.type === kind)
+        )
+          fail(`Source ${kind} differs from actor/typed operation`);
+      if (
+        event.kind === 'gearAdvanced' &&
+        !matched.some(
+          (operation) =>
+            operation.action.type === 'endTurn' &&
+            operation.state.round > operation.beforeState.round,
+        )
+      )
+        fail('Source gear advance differs from explicit round transition');
+      matched.forEach((operation) => {
+        if (!operationCoverage.has(operation.id)) operationCoverage.set(operation.id, new Set());
+        operationCoverage.get(operation.id).add(event.actionId);
+      });
     } else fail('Unsupported coverage kind');
   }
   if (covered.size !== events.length) fail('Uncovered source prefix events');
   for (const operation of operations.values()) {
-    if (
-      !operationCoverage.has(operation.id) &&
-      !(
-        operation.step.move.type === 'endTurn' &&
-        operation.step.sourceActionIds.every(
-          (actionId) => !raw.entries.some((entry) => entry.action_id === actionId),
+    for (const actionId of operation.step.sourceActionIds)
+      if (
+        !operationCoverage.get(operation.id)?.has(actionId) &&
+        !(
+          operation.step.move.type === 'endTurn' &&
+          !raw.entries.some((entry) => entry.action_id === actionId)
         )
       )
-    )
-      fail('Operation has no log evidence or explicit board-only endTurn boundary');
+        fail(
+          'Operation provenance ID has no matching move coverage or board-only endTurn boundary',
+        );
   }
   if (
     events
