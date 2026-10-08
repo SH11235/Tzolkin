@@ -12,7 +12,7 @@ import {
   type Choice,
   type ExpansionCatalog,
   type GameMove,
-  type GameState,
+  type GameViewState,
   type GearId,
 } from '../game/types';
 import { Board } from './Board';
@@ -36,7 +36,7 @@ export function GameBoardView({
   setView,
   expansionCatalog,
 }: {
-  game: GameState;
+  game: GameViewState;
   costs: Record<GearId, number | null>;
   moves: Choice[];
   play: (move: GameMove) => void;

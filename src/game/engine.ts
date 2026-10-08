@@ -1,6 +1,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Choice, ExpansionCatalog, GameMove, GameState, GearId } from './types';
 import type { Observation } from './cpu';
+import type { PublicReplayReport } from './publicReplay';
 
 export interface GameSnapshot {
   state: GameState;
@@ -76,4 +77,8 @@ export function observeGame(state: GameState, actor: number): Promise<Observatio
 
 export function validateGameState(value: unknown): Promise<boolean> {
   return dispatch<boolean>({ operation: 'validate', value: value ?? null });
+}
+
+export function verifyPublicReplay(replay: Record<string, unknown>): Promise<PublicReplayReport> {
+  return dispatch<PublicReplayReport>({ operation: 'publicReplay', replay });
 }
