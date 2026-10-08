@@ -1,4 +1,6 @@
 //! Deterministic, untrained policy operating exclusively on an actor observation.
+pub mod dataset;
+pub mod features;
 pub mod policy;
 pub mod replay;
 use serde::{Deserialize, Serialize};

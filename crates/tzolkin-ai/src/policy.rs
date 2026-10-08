@@ -178,13 +178,7 @@ fn action_value(
         GearId::Uxmal => match pos {
             1 => w.temple_step - 3.0 * value(o, p, Resource::Corn, w),
             2 => 1.0,
-            3 => {
-                if p.workers < 6 {
-                    w.worker * ((27 - o.round) as f64 / 18.0).max(0.2)
-                } else {
-                    0.0
-                }
-            }
+            3 if p.workers < 6 => w.worker * ((27 - o.round) as f64 / 18.0).max(0.2),
             4 => 6.0,
             5 => 9.0,
             _ => 0.0,

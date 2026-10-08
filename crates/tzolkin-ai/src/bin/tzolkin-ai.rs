@@ -82,6 +82,34 @@ fn run() -> Result<(), String> {
         let seeds = number(&args, "--seeds", "32")?;
         return output(&replay::verify_corpus(seeds)?);
     }
+    if command == "dataset" {
+        let input = value(&args, "--input", "")?;
+        let destination = value(&args, "--output", "")?;
+        if input.is_empty() || destination.is_empty() {
+            return Err(
+                "Usage: tzolkin-ai dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY".into(),
+            );
+        }
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(&input).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                paths.push(path);
+                if paths.len() > 100_000 {
+                    return Err("Too many dataset source files".into());
+                }
+            }
+        }
+        paths.sort();
+        let manifest =
+            tzolkin_ai::dataset::export_dataset_files(&paths, std::path::Path::new(&destination))?;
+        return output(
+            &serde_json::json!({"fingerprint":manifest.fingerprint,"games":manifest.games.len(),"samples":manifest.samples,"shards":manifest.shards.len(),"strata":manifest.strata,"sourceKind":manifest.source_kind}),
+        );
+    }
     let players: usize = number(&args, "--players", "2")?;
     let seed: u32 = number(&args, "--seed", "0")?;
     let mut flags: u8 = number(&args, "--flags", "0")?;
@@ -250,7 +278,7 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "tzolkin-ai choose | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--output PATH] | replay PATH | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
+        "tzolkin-ai choose | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--output PATH] | replay PATH | dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
     );
     Ok(())
 }
