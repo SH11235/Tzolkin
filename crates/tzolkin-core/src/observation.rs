@@ -1,5 +1,5 @@
 //! The policy boundary is an allowlist: saved-game metadata and hidden order never cross it.
-use crate::engine::{build_options, monument_options, resource_payments};
+use crate::engine::{build_options, monument_options, placement_payment, resource_payments};
 use crate::prophecies::{self, FoodDayStage, ProphecyId};
 use crate::quick_actions::QuickActionId;
 use crate::tribes::{self, TribeId};
@@ -235,18 +235,6 @@ fn quick(s: &GameState) -> Result<QuickActionId, String> {
         .and_then(|e| e.quick_actions.as_ref())
         .map(|q| q.current)
         .ok_or_else(|| "Missing quick action".into())
-}
-fn placement_payment(s: &GameState, gear: GearId, discount: bool) -> Result<i64, String> {
-    if crate::engine::pity_placement(s, Some(gear)) {
-        return Ok(s.players[s.current_player].resources[&Resource::Corn]);
-    }
-    let base = crate::get_placement_cost(s, &gear.to_string()).ok_or("Missing placement cost")?;
-    let discount = if discount {
-        (crate::engine::lowest_position(s, gear).ok_or("Missing placement position")? as i64).min(2)
-    } else {
-        0
-    };
-    Ok(base - discount)
 }
 fn semantic(s: &GameState, mv: &GameMove) -> Result<TypedAction, String> {
     let player = &s.players[s.current_player];

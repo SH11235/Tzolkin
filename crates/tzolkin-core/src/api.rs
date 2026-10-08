@@ -1,6 +1,6 @@
 use crate::engine::{
     apply_move, available_workers, create_game_with_options, get_available_moves, get_choices,
-    get_placement_cost, score_monument,
+    placement_payment, score_monument,
 };
 use crate::public_replay::{PublicReplayRecord, PublicState, Refills};
 use crate::types::{Choice, GEAR_IDS, GameMove, GameOptions, GameState, GearId, Player};
@@ -15,6 +15,7 @@ pub struct GameSnapshot {
     pub state: GameState,
     pub choices: Vec<Choice>,
     pub moves: Vec<Choice>,
+    /// Actual corn payment for ordinary placement, including mercy; null when full.
     pub placement_costs: BTreeMap<GearId, Option<i64>>,
     pub available_workers: Vec<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,7 +79,7 @@ fn snapshot(state: GameState) -> GameSnapshot {
         moves: get_available_moves(&state),
         placement_costs: GEAR_IDS
             .into_iter()
-            .map(|gear| (gear, get_placement_cost(&state, &gear.to_string())))
+            .map(|gear| (gear, placement_payment(&state, gear, false).ok()))
             .collect(),
         available_workers: (0..state.players.len())
             .map(|id| available_workers(&state, id))
