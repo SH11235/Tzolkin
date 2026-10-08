@@ -207,6 +207,21 @@ fn unsupported_roots_fallback_but_rekeyed_supported_forgeries_are_errors() {
         }
     );
     assert_legal(&o, &fallback);
+    let mut expanded = create_game(vec!["A".into(), "B".into(), "C".into()], 7, true).unwrap();
+    while expanded.phase == Phase::Setup {
+        let observed = observe(&expanded, expanded.current_player).unwrap();
+        expanded =
+            tzolkin_core::apply_move(&expanded, choose_move(&observed).unwrap().r#move).unwrap();
+    }
+    let observed = observe(&expanded, expanded.current_player).unwrap();
+    let fallback = search::choose_move(&observed, &SearchConfig::default()).unwrap();
+    assert_eq!(
+        fallback.status,
+        SearchStatus::Fallback {
+            reason: FallbackReason::UnsupportedRules
+        }
+    );
+    assert_legal(&observed, &fallback);
     let two = playing(2, 1);
     let o2 = observe(&two, two.current_player).unwrap();
     assert_eq!(
@@ -251,19 +266,19 @@ fn actual_search_decisions_finish_three_and_four_player_native_games_and_reverif
         let mut searched = 0;
         let mut fallback = 0;
         let mut pending_fallback = 0;
-        // Test-only custom provenance: production Search source registration is
-        // a separate unit. Human records remain excluded by dataset export.
-        let source = replay::ReplaySource::Human {
-            provider: "synthetic-search-test".into(),
-            reference: "native synthetic test; no human source or training acceptance".into(),
-            skill_rating: None,
+        // Explicit Search provenance and compact diagnostics. Human rejection
+        // is covered separately by the dataset regression tests.
+        let policy = search::PreparedSearch::new(&small_config()).unwrap();
+        let source = replay::ReplaySource::PolicySelfPlay {
+            policies: vec![tzolkin_ai::search_native::provenance(&policy); n],
         };
-        let (final_state, decisions, record) = replay::play_game_using_fast(
+        let (final_state, decisions, record) = replay::play_game_using_diagnostics(
             n,
             11235,
             replay::options_from_mask(0),
             true,
             source,
+            true,
             |o| {
                 let outcome = search::choose_move(o, &small_config())?;
                 assert_legal(o, &outcome);
@@ -276,7 +291,8 @@ fn actual_search_decisions_finish_three_and_four_player_native_games_and_reverif
                         }
                     }
                 }
-                Ok(outcome.decision)
+                let trace = tzolkin_ai::search_native::SearchTrace::from_outcome(&outcome);
+                Ok((outcome.decision, Some(trace)))
             },
         )
         .unwrap();

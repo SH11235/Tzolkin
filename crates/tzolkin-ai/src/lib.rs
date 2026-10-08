@@ -8,6 +8,7 @@ pub mod model;
 pub mod policy;
 pub mod replay;
 pub mod search;
+pub mod search_native;
 pub mod selfplay_batch;
 pub mod training;
 use serde::{Deserialize, Serialize};

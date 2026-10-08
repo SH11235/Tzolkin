@@ -6,6 +6,8 @@ use crate::kernel::Kernel;
 use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
 use crate::replay::{self, ReplaySource, SeatPolicy};
+use crate::search::{PreparedSearch, SearchConfig};
+use crate::search_native::{SearchSummary, SearchTrace};
 use crate::training::TrainingCheckpoint;
 use crate::{Decision, choose_move_with_weights};
 use serde::{Deserialize, Serialize};
@@ -66,6 +68,9 @@ fn scalar() -> String {
     deny_unknown_fields
 )]
 pub enum PolicyConfig {
+    Search {
+        config: SearchConfig,
+    },
     Heuristic {
         weights: HeuristicWeights,
     },
@@ -119,6 +124,7 @@ impl ArenaConfig {
     }
 }
 enum PreparedPolicy {
+    Search(PreparedSearch),
     Heuristic(HeuristicWeights),
     Learned {
         model: Box<ModelArtifact>,
@@ -129,6 +135,7 @@ enum PreparedPolicy {
 impl PreparedPolicy {
     fn load(config: &PolicyConfig, arena: &ArenaConfig, base: &Path) -> Result<Self, String> {
         match config {
+            PolicyConfig::Search { config } => Ok(Self::Search(PreparedSearch::new(config)?)),
             PolicyConfig::Heuristic { weights } => {
                 weights.validate()?;
                 Ok(Self::Heuristic(weights.clone()))
@@ -182,6 +189,7 @@ pub struct PolicyDescription {
     pub dataset_fingerprint: Option<String>,
 }
 enum PolicyChooser<'a> {
+    Search(&'a PreparedSearch),
     Heuristic(&'a HeuristicWeights),
     Learned(LoadedPolicy<'a>),
 }
@@ -195,6 +203,11 @@ struct PolicyHandle<'a> {
 impl<'a> PolicyHandle<'a> {
     fn new(policy: &'a PreparedPolicy) -> Result<Self, String> {
         let (chooser, provenance, dataset_fingerprint) = match policy {
+            PreparedPolicy::Search(policy) => (
+                PolicyChooser::Search(policy),
+                crate::search_native::provenance(policy),
+                None,
+            ),
             PreparedPolicy::Heuristic(weights) => (
                 PolicyChooser::Heuristic(weights),
                 SeatPolicy::Heuristic {
@@ -229,16 +242,28 @@ impl<'a> PolicyHandle<'a> {
             },
         })
     }
-    fn choose(&self, observation: &Observation) -> Result<Decision, String> {
+    fn choose_with_diagnostics(
+        &self,
+        observation: &Observation,
+    ) -> Result<(Decision, Option<SearchTrace>), String> {
         match &self.chooser {
-            PolicyChooser::Heuristic(weights) => choose_move_with_weights(observation, weights),
-            PolicyChooser::Learned(policy) => policy.choose_move(observation),
+            PolicyChooser::Search(policy) => crate::search_native::decide(policy, observation),
+            PolicyChooser::Heuristic(weights) => {
+                Ok((choose_move_with_weights(observation, weights)?, None))
+            }
+            PolicyChooser::Learned(policy) => Ok((policy.choose_move(observation)?, None)),
         }
+    }
+    #[cfg(test)]
+    fn choose(&self, observation: &Observation) -> Result<Decision, String> {
+        Ok(self.choose_with_diagnostics(observation)?.0)
     }
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArmResult {
+    /// Absolute-seat Search work, including attempted work before a failed game.
+    pub search: Vec<Option<SearchSummary>>,
     pub decisions: Option<usize>,
     pub elapsed_ms: f64,
     pub winner_utility: Option<f64>,
@@ -329,6 +354,14 @@ fn play_arm(
 ) -> ArmResult {
     let started = Instant::now();
     let mut start_of_play = None;
+    let mut search = pool
+        .iter()
+        .enumerate()
+        .map(|(index, opponent)| {
+            let handle = if index == seat { focal } else { opponent };
+            matches!(handle.chooser, PolicyChooser::Search(_)).then(SearchSummary::default)
+        })
+        .collect::<Vec<_>>();
     let played = (|| {
         let policies = pool
             .iter()
@@ -341,21 +374,26 @@ fn play_arm(
                 }
             })
             .collect();
-        let (state, decisions, _) = replay::play_game_using_fast(
+        let (state, decisions, _) = replay::play_game_using_diagnostics(
             pool.len(),
             seed,
             GameOptions::default(),
             false,
             ReplaySource::PolicySelfPlay { policies },
+            true,
             |observation| {
                 if start_of_play.is_none() && observation.phase == Phase::Playing {
                     start_of_play = Some(InitialConditions::from_observation(observation));
                 }
-                if observation.actor == seat {
-                    focal.choose(observation)
+                let result = if observation.actor == seat {
+                    focal.choose_with_diagnostics(observation)
                 } else {
-                    pool[observation.actor].choose(observation)
+                    pool[observation.actor].choose_with_diagnostics(observation)
+                }?;
+                if let Some(trace) = &result.1 {
+                    search[observation.actor].as_mut().unwrap().add(trace);
                 }
+                Ok(result)
             },
         )?;
         let terminal_players = observe(&state, state.current_player)?.players;
@@ -374,6 +412,7 @@ fn play_arm(
                 .find(|score| score.player_id == seat)
                 .expect("Validated native terminal contains each seat");
             ArmResult {
+                search,
                 decisions: Some(decisions),
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                 winner_utility: Some(if focal.rank == 1 {
@@ -391,6 +430,7 @@ fn play_arm(
             }
         }
         Err(error) => ArmResult {
+            search,
             decisions: None,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             winner_utility: None,
@@ -546,6 +586,8 @@ fn summarize(blocks: &[SeedBlock], bootstrap_seed: u64) -> PairedStatistics {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArenaReport {
+    /// Total Search work over all attempted arms, grouped by absolute seat.
+    pub search: Vec<Option<SearchSummary>>,
     pub schema: u32,
     pub config_sha256: String,
     pub players: usize,
@@ -607,7 +649,20 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
         blocks.push(block(*seed, pairs));
     }
     let statistics = summarize(&blocks, config.bootstrap_seed);
+    let mut search = vec![None; config.players];
+    for pair in blocks.iter().flat_map(|block| &block.pairs) {
+        for arm in [&pair.candidate, &pair.reference] {
+            for (total, summary) in search.iter_mut().zip(&arm.search) {
+                if let Some(summary) = summary {
+                    total
+                        .get_or_insert_with(SearchSummary::default)
+                        .merge(summary);
+                }
+            }
+        }
+    }
     Ok(ArenaReport {
+        search,
         schema: ARENA_SCHEMA,
         config_sha256: format!(
             "{:x}",
@@ -646,6 +701,7 @@ mod tests {
 
     fn arm(utility: f64) -> ArmResult {
         ArmResult {
+            search: vec![None; 3],
             decisions: Some(100),
             elapsed_ms: 1.0,
             winner_utility: Some(utility),
@@ -716,6 +772,54 @@ mod tests {
         assert!(result.failures_preclude_adoption);
         assert!(!result.strength_improvement_declared);
         assert_eq!(summarize(&[], 0).mean_utility_delta, None);
+    }
+
+    #[test]
+    fn failed_arm_retains_search_decisions_before_an_opponent_inference_error() {
+        let model = ModelArtifact::new(replay::catalog_hash(), 11235).unwrap();
+        let mut value = serde_json::to_value(model).unwrap();
+        let parameters = value["model"]["parameters"].as_array_mut().unwrap();
+        parameters.fill(serde_json::json!(0.0));
+        let hidden_bias = crate::features::FEATURE_COUNT * crate::model::HIDDEN;
+        let policy_head = hidden_bias + crate::model::HIDDEN;
+        parameters[hidden_bias..policy_head].fill(serde_json::json!(1.0));
+        parameters[policy_head..policy_head + crate::model::HIDDEN]
+            .fill(serde_json::json!(f32::MAX));
+        value["checksum"] = serde_json::json!("");
+        let mut artifact: ModelArtifact = serde_json::from_value(value).unwrap();
+        artifact.checksum = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&artifact).unwrap())
+        );
+        let prepared = [
+            PreparedPolicy::Search(PreparedSearch::new(&SearchConfig::default()).unwrap()),
+            PreparedPolicy::Learned {
+                model: Box::new(artifact),
+                kernel: Kernel::Scalar,
+                dataset_fingerprint: "a".repeat(64),
+            },
+            PreparedPolicy::Heuristic(HeuristicWeights::default()),
+        ];
+        let handles = prepared
+            .iter()
+            .map(PolicyHandle::new)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let arm = play_arm(11235, 0, &handles[0], &handles);
+        assert!(arm.error.as_ref().unwrap().contains("Non-finite"));
+        assert!(arm.decisions.is_none() && arm.score.is_none() && arm.winner_utility.is_none());
+        let search = arm.search[0].as_ref().unwrap();
+        assert_eq!(search.decisions, 1);
+        assert_eq!(
+            search
+                .fallback_reasons
+                .get(&crate::search::FallbackReason::Setup),
+            Some(&1)
+        );
+        assert_eq!(
+            search.atomic_steps, 0,
+            "Setup used the measured fallback before the opponent error"
+        );
     }
 
     #[test]
