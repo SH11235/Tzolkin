@@ -44,9 +44,99 @@ fn output(value: &impl serde::Serialize) -> Result<(), String> {
     );
     Ok(())
 }
+fn kernel(args: &[String]) -> Result<tzolkin_ai::kernel::Kernel, String> {
+    use tzolkin_ai::kernel::Kernel;
+    match value(args, "--kernel", "scalar")?.as_str() {
+        "scalar" => Ok(Kernel::Scalar),
+        "auto" => Ok(Kernel::Auto),
+        "avx2" => Ok(Kernel::Avx2),
+        "sse2" => Ok(Kernel::Sse2),
+        "neon" => Ok(Kernel::Neon),
+        "simd128" => Ok(Kernel::Simd128),
+        _ => Err("Unknown inference kernel".into()),
+    }
+}
+fn checked_flags(args: &[String], allowed: &[&str], switches: &[&str]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut i = 1;
+    while i < args.len() {
+        if !allowed.contains(&args[i].as_str()) || !seen.insert(args[i].as_str()) {
+            return Err(format!("Unknown or repeated flag {}", args[i]));
+        }
+        if switches.contains(&args[i].as_str()) {
+            i += 1;
+            continue;
+        }
+        if args.get(i + 1).is_none_or(|v| v.starts_with("--")) {
+            return Err(format!("Missing value after {}", args[i]));
+        }
+        i += 2;
+    }
+    Ok(())
+}
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = args.first().map(String::as_str).unwrap_or("help");
+    match command {
+        "choose" => checked_flags(&args, &["--model", "--kernel"], &[])?,
+        "dispatch" => checked_flags(&args, &[], &[])?,
+        "dataset" => checked_flags(&args, &["--input", "--output"], &[])?,
+        "train" => checked_flags(
+            &args,
+            &[
+                "--input",
+                "--output",
+                "--epochs",
+                "--batch-size",
+                "--learning-rate",
+                "--seed",
+                "--value-weight",
+                "--resume",
+            ],
+            &[],
+        )?,
+        "evaluate" => checked_flags(
+            &args,
+            &["--input", "--checkpoint", "--players", "--seeds", "--flags"],
+            &[],
+        )?,
+        "selfplay" => checked_flags(
+            &args,
+            &[
+                "--players",
+                "--seed",
+                "--flags",
+                "--output",
+                "--model",
+                "--model-seat",
+                "--kernel",
+                "--fast",
+            ],
+            &["--fast"],
+        )?,
+        "selfplay-batch" => checked_flags(
+            &args,
+            &[
+                "--players",
+                "--seed",
+                "--flags",
+                "--output",
+                "--model",
+                "--kernel",
+                "--games",
+                "--threads",
+            ],
+            &[],
+        )?,
+        "bench" => checked_flags(
+            &args,
+            &["--players", "--seed", "--flags", "--iterations"],
+            &[],
+        )?,
+        "corpus" => checked_flags(&args, &["--seeds"], &[])?,
+        "replay" if args.len() != 2 => return Err("Usage: tzolkin-ai replay PATH".into()),
+        _ => {}
+    }
     if command == "choose" {
         let mut request = String::new();
         std::io::stdin()
@@ -60,7 +150,11 @@ fn run() -> Result<(), String> {
         if !model_path.is_empty() {
             let model = tzolkin_ai::model::ModelArtifact::load(std::path::Path::new(&model_path))?;
             let observation = serde_json::from_str(&request).map_err(|error| error.to_string())?;
-            return output(&model.choose_move(&observation)?);
+            let policy = tzolkin_ai::model::LoadedPolicy::with_kernel(&model, kernel(&args)?)?;
+            return output(&policy.choose_move(&observation)?);
+        }
+        if args.iter().any(|arg| arg == "--kernel") {
+            return Err("--kernel requires --model".into());
         }
         println!("{}", dispatch_cpu(&request)?);
         return Ok(());
@@ -201,6 +295,39 @@ fn run() -> Result<(), String> {
         flags |= 8;
     }
     let options = replay::options_from_mask(flags);
+    if command == "selfplay-batch" {
+        let destination = value(&args, "--output", "")?;
+        if destination.is_empty() {
+            return Err("selfplay-batch requires --output NEW_DIRECTORY".into());
+        }
+        let model_path = value(&args, "--model", "")?;
+        let model = if model_path.is_empty() {
+            if args.iter().any(|arg| arg == "--kernel") {
+                return Err("--kernel requires --model".into());
+            }
+            None
+        } else {
+            Some(tzolkin_ai::model::ModelArtifact::load(
+                std::path::Path::new(&model_path),
+            )?)
+        };
+        let default_threads = std::thread::available_parallelism()
+            .map(|n| n.get().min(4))
+            .unwrap_or(1);
+        let config = tzolkin_ai::selfplay_batch::BatchConfig {
+            players,
+            first_seed: seed,
+            games: number(&args, "--games", "8")?,
+            threads: number(&args, "--threads", &default_threads.to_string())?,
+            options,
+        };
+        return output(&tzolkin_ai::selfplay_batch::generate_batch(
+            &config,
+            model.as_ref(),
+            kernel(&args)?,
+            std::path::Path::new(&destination),
+        )?);
+    }
     if command == "selfplay" {
         let path = args
             .iter()
@@ -209,8 +336,16 @@ fn run() -> Result<(), String> {
             .transpose()?;
         let started = Instant::now();
         let model_path = value(&args, "--model", "")?;
+        let fast = args.iter().any(|arg| arg == "--fast");
         let (state, decisions, record) = if model_path.is_empty() {
-            replay::play_game(players, seed, options, path.is_some())?
+            if args.iter().any(|arg| arg == "--kernel") {
+                return Err("--kernel requires --model".into());
+            }
+            if fast {
+                replay::play_game_fast(players, seed, options, path.is_some())?
+            } else {
+                replay::play_game(players, seed, options, path.is_some())?
+            }
         } else {
             let model = tzolkin_ai::model::ModelArtifact::load(std::path::Path::new(&model_path))?;
             let seat = value(&args, "--model-seat", "all")?;
@@ -219,13 +354,17 @@ fn run() -> Result<(), String> {
             } else {
                 vec![seat.parse::<usize>().map_err(|_| "Invalid model seat")?]
             };
-            tzolkin_ai::experiment::learned_game(
+            tzolkin_ai::experiment::learned_game_with_options(
                 &model,
                 players,
                 seed,
                 options,
                 &seats,
                 path.is_some(),
+                tzolkin_ai::experiment::InferenceOptions {
+                    kernel: kernel(&args)?,
+                    fast,
+                },
             )?
         };
         if let Some(path) = path {
@@ -380,7 +519,7 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "tzolkin-ai choose [--model PATH] | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--output PATH] [--model PATH --model-seat all|SEAT] | replay PATH | dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY | train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate X --seed N --value-weight X --resume CHECKPOINT] | evaluate --input DATASET --checkpoint PATH --players 3|4 --seeds HELD_OUT_SEEDS_COMMA_SEPARATED | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
+        "tzolkin-ai choose [--model PATH --kernel scalar|auto|avx2|sse2|neon|simd128] | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--fast] [--output PATH] [--model PATH --model-seat all|SEAT --kernel scalar|auto] | selfplay-batch --output NEW_DIRECTORY --players 2..5 --seed FIRST --games 1..10000 --threads 1..32 [--flags 0..15] [--model PATH --kernel scalar|auto] | replay PATH | dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY | train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate X --seed N --value-weight X --resume CHECKPOINT] | evaluate --input DATASET --checkpoint PATH --players 3|4 --seeds HELD_OUT_SEEDS_COMMA_SEPARATED | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
     );
     Ok(())
 }
