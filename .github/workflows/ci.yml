@@ -30,6 +30,7 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --locked -p tzolkin-core -p tzolkin-ai -p tzolkin-wasm --all-targets -- -D warnings
       - run: npm run test:core
+      - run: npm run test:bga
       - run: npm run lint
       - run: npm test
       - run: npm run build
