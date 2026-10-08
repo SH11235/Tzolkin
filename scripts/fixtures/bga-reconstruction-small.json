@@ -1,0 +1,5758 @@
+{
+  "description": "Synthetic sanitized UI evidence derived from a native basic game; no real BGA table/player data. Canned core frames omit unused observation and choice fields; retained states and selected legal action are unchanged native outputs.",
+  "raw": {
+    "schema_version": "1.0",
+    "table_id": "123",
+    "source_type": "public_ui_visible_log",
+    "export_scope": "all_observed_log_entries",
+    "source_url": "https://boardgamearena.com/gamereview?table=123",
+    "captured_on": "synthetic fixture",
+    "entry_count": 7,
+    "entries": [
+      {
+        "action_id": 1,
+        "raw_text": "A, Bのプレイヤーカラーは設定で選ばれました。設定を変更する",
+        "timestamp_display": "12:00:00"
+      },
+      {
+        "action_id": 5,
+        "raw_text": "各プレイヤーは対応する資源を手に入れた",
+        "timestamp_display": "12:00:00"
+      },
+      {
+        "action_id": 6,
+        "raw_text": "AはPalenqueの歯車に0\nを支払ってワーカーを置いた",
+        "timestamp_display": "12:00:00"
+      },
+      {
+        "action_id": 7,
+        "raw_text": "Aは行動をキャンセルした",
+        "timestamp_display": "12:00:00"
+      },
+      {
+        "action_id": 8,
+        "raw_text": "AはPalenqueの歯車に0\nを支払ってワーカーを置いた",
+        "timestamp_display": "12:00:00"
+      },
+      {
+        "action_id": 9,
+        "raw_text": "Aは行動をキャンセルした",
+        "timestamp_display": "12:00:00"
+      },
+      {
+        "action_id": 10,
+        "raw_text": "future message outside prefix",
+        "timestamp_display": "12:00:00"
+      }
+    ],
+    "dom_entries": [
+      {
+        "action_id": 1,
+        "timestamp_display": "12:00:00",
+        "messages": [
+          {
+            "raw_text": "A, Bのプレイヤーカラーは設定で選ばれました。設定を変更する",
+            "html": "A, Bのプレイヤーカラーは設定で選ばれました。設定を変更する",
+            "icons": []
+          }
+        ]
+      },
+      {
+        "action_id": 5,
+        "timestamp_display": "12:00:00",
+        "messages": [
+          {
+            "raw_text": "各プレイヤーは対応する資源を手に入れた",
+            "html": "各プレイヤーは対応する資源を手に入れた",
+            "icons": []
+          }
+        ]
+      },
+      {
+        "action_id": 6,
+        "timestamp_display": "12:00:00",
+        "messages": [
+          {
+            "raw_text": "AはPalenqueの歯車に0\nを支払ってワーカーを置いた",
+            "html": "AはPalenqueの歯車に0\nを支払ってワーカーを置いた",
+            "icons": []
+          }
+        ]
+      },
+      {
+        "action_id": 7,
+        "timestamp_display": "12:00:00",
+        "messages": [
+          {
+            "raw_text": "Aは行動をキャンセルした",
+            "html": "Aは行動をキャンセルした",
+            "icons": []
+          }
+        ]
+      },
+      {
+        "action_id": 8,
+        "timestamp_display": "12:00:00",
+        "messages": [
+          {
+            "raw_text": "AはPalenqueの歯車に0\nを支払ってワーカーを置いた",
+            "html": "AはPalenqueの歯車に0\nを支払ってワーカーを置いた",
+            "icons": []
+          }
+        ]
+      },
+      {
+        "action_id": 9,
+        "timestamp_display": "12:00:00",
+        "messages": [
+          {
+            "raw_text": "Aは行動をキャンセルした",
+            "html": "Aは行動をキャンセルした",
+            "icons": []
+          }
+        ]
+      },
+      {
+        "action_id": 10,
+        "timestamp_display": "12:00:00",
+        "messages": [
+          {
+            "raw_text": "future message outside prefix",
+            "html": "future message outside prefix",
+            "icons": []
+          }
+        ]
+      }
+    ],
+    "metadata": {
+      "table_id": "123",
+      "player_count": 4,
+      "players": [
+        {
+          "text": "A"
+        },
+        {
+          "text": "B"
+        },
+        {
+          "text": "C"
+        },
+        {
+          "text": "D"
+        }
+      ],
+      "history_text": "Synthetic partial game"
+    },
+    "table_details_text": "ゲーム構成\nゲームモード\nノーマルモード\nウシュマルコーンの制限\n制限なし\n"
+  },
+  "boards": [
+    {
+      "sourceActionId": 5,
+      "title": "synthetic board witness",
+      "round": 1,
+      "skullSupply": 13,
+      "firstPlayer": "firstplayer_100",
+      "players": [
+        {
+          "id": "100",
+          "name": "A",
+          "score": 0,
+          "counters": {
+            "corn": 8,
+            "wood": 1,
+            "stone": 1,
+            "gold": 0,
+            "skull": 0,
+            "worker": 3
+          }
+        },
+        {
+          "id": "101",
+          "name": "B",
+          "score": 0,
+          "counters": {
+            "corn": 9,
+            "wood": 1,
+            "stone": 1,
+            "gold": 1,
+            "skull": 0,
+            "worker": 3
+          }
+        },
+        {
+          "id": "102",
+          "name": "C",
+          "score": 0,
+          "counters": {
+            "corn": 2,
+            "wood": 2,
+            "stone": 0,
+            "gold": 0,
+            "skull": 0,
+            "worker": 4
+          }
+        },
+        {
+          "id": "103",
+          "name": "D",
+          "score": 0,
+          "counters": {
+            "corn": 12,
+            "wood": 2,
+            "stone": 2,
+            "gold": 0,
+            "skull": 0,
+            "worker": 3
+          }
+        }
+      ],
+      "market": [
+        {
+          "id": "building_age_1_1",
+          "class": "construction",
+          "style": "background-position: 0px 0px;"
+        },
+        {
+          "id": "building_age_1_2",
+          "class": "construction",
+          "style": "background-position: -66px 0px;"
+        },
+        {
+          "id": "building_age_1_3",
+          "class": "construction",
+          "style": "background-position: -132px 0px;"
+        },
+        {
+          "id": "building_age_1_4",
+          "class": "construction",
+          "style": "background-position: -198px 0px;"
+        },
+        {
+          "id": "building_age_1_5",
+          "class": "construction",
+          "style": "background-position: -264px 0px;"
+        },
+        {
+          "id": "building_age_1_6",
+          "class": "construction",
+          "style": "background-position: -330px 0px;"
+        },
+        {
+          "id": "monument_1",
+          "class": "construction",
+          "style": "background-position: 0px -82px;"
+        },
+        {
+          "id": "monument_2",
+          "class": "construction",
+          "style": "background-position: -66px -82px;"
+        },
+        {
+          "id": "monument_3",
+          "class": "construction",
+          "style": "background-position: -132px -82px;"
+        },
+        {
+          "id": "monument_4",
+          "class": "construction",
+          "style": "background-position: -198px -82px;"
+        },
+        {
+          "id": "monument_5",
+          "class": "construction",
+          "style": "background-position: -264px -82px;"
+        },
+        {
+          "id": "monument_6",
+          "class": "construction",
+          "style": "background-position: -330px -82px;"
+        }
+      ],
+      "workers": [],
+      "workerPlaces": [
+        {
+          "id": "workerplace_0",
+          "rect": {
+            "x": 0,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_1",
+          "rect": {
+            "x": 1,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_2",
+          "rect": {
+            "x": 2,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_3",
+          "rect": {
+            "x": 3,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_4",
+          "rect": {
+            "x": 4,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_5",
+          "rect": {
+            "x": 5,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_6",
+          "rect": {
+            "x": 6,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_7",
+          "rect": {
+            "x": 7,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_8",
+          "rect": {
+            "x": 8,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_9",
+          "rect": {
+            "x": 9,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_10",
+          "rect": {
+            "x": 10,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_11",
+          "rect": {
+            "x": 11,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_12",
+          "rect": {
+            "x": 12,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_13",
+          "rect": {
+            "x": 13,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_14",
+          "rect": {
+            "x": 14,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_15",
+          "rect": {
+            "x": 15,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_16",
+          "rect": {
+            "x": 16,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_17",
+          "rect": {
+            "x": 17,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_18",
+          "rect": {
+            "x": 18,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_19",
+          "rect": {
+            "x": 19,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_20",
+          "rect": {
+            "x": 20,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_21",
+          "rect": {
+            "x": 21,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_22",
+          "rect": {
+            "x": 22,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_23",
+          "rect": {
+            "x": 23,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_24",
+          "rect": {
+            "x": 24,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_25",
+          "rect": {
+            "x": 25,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_26",
+          "rect": {
+            "x": 26,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_27",
+          "rect": {
+            "x": 27,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_28",
+          "rect": {
+            "x": 28,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_29",
+          "rect": {
+            "x": 29,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_30",
+          "rect": {
+            "x": 30,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_31",
+          "rect": {
+            "x": 31,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_32",
+          "rect": {
+            "x": 32,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_33",
+          "rect": {
+            "x": 33,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_34",
+          "rect": {
+            "x": 34,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_35",
+          "rect": {
+            "x": 35,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_36",
+          "rect": {
+            "x": 36,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_37",
+          "rect": {
+            "x": 37,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_38",
+          "rect": {
+            "x": 38,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_39",
+          "rect": {
+            "x": 39,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_40",
+          "rect": {
+            "x": 40,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_41",
+          "rect": {
+            "x": 41,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_42",
+          "rect": {
+            "x": 42,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_43",
+          "rect": {
+            "x": 43,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_44",
+          "rect": {
+            "x": 44,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_45",
+          "rect": {
+            "x": 45,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_46",
+          "rect": {
+            "x": 46,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_47",
+          "rect": {
+            "x": 47,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_48",
+          "rect": {
+            "x": 48,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_49",
+          "rect": {
+            "x": 49,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_50",
+          "rect": {
+            "x": 50,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_51",
+          "rect": {
+            "x": 51,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_52",
+          "rect": {
+            "x": 52,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_53",
+          "rect": {
+            "x": 53,
+            "y": 0
+          }
+        }
+      ],
+      "markers": [
+        {
+          "id": "marker_0",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_1",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_2",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_3",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_4",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_5",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_6",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_7",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_8",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_9",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_10",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_11",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_12",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_13",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_14",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_15",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_16",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_17",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_18",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_19",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_20",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_21",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_22",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_23",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_24",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_25",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_26",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_27",
+          "style": "initial marker"
+        }
+      ],
+      "jungle": [
+        {
+          "id": "jungle_2",
+          "tiles": []
+        },
+        {
+          "id": "jungle_3",
+          "tiles": []
+        },
+        {
+          "id": "jungle_4",
+          "tiles": []
+        },
+        {
+          "id": "jungle_5",
+          "tiles": []
+        }
+      ],
+      "skullSpaces": [
+        {
+          "id": "skullplace_1",
+          "html": ""
+        },
+        {
+          "id": "skullplace_2",
+          "html": ""
+        },
+        {
+          "id": "skullplace_3",
+          "html": ""
+        },
+        {
+          "id": "skullplace_4",
+          "html": ""
+        },
+        {
+          "id": "skullplace_5",
+          "html": ""
+        },
+        {
+          "id": "skullplace_6",
+          "html": ""
+        },
+        {
+          "id": "skullplace_7",
+          "html": ""
+        },
+        {
+          "id": "skullplace_8",
+          "html": ""
+        },
+        {
+          "id": "skullplace_9",
+          "html": ""
+        }
+      ],
+      "wealth": [
+        {
+          "id": "player_wealthtiles_100",
+          "tiles": [
+            {
+              "id": "w14",
+              "style": "synthetic"
+            },
+            {
+              "id": "w18",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_101",
+          "tiles": [
+            {
+              "id": "w12",
+              "style": "synthetic"
+            },
+            {
+              "id": "w11",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_102",
+          "tiles": [
+            {
+              "id": "w15",
+              "style": "synthetic"
+            },
+            {
+              "id": "w20",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_103",
+          "tiles": [
+            {
+              "id": "w08",
+              "style": "synthetic"
+            },
+            {
+              "id": "w04",
+              "style": "synthetic"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sourceActionId": 6,
+      "title": "synthetic board witness",
+      "round": 1,
+      "skullSupply": 13,
+      "firstPlayer": "firstplayer_100",
+      "players": [
+        {
+          "id": "100",
+          "name": "A",
+          "score": 0,
+          "counters": {
+            "corn": 8,
+            "wood": 1,
+            "stone": 1,
+            "gold": 0,
+            "skull": 0,
+            "worker": 2
+          }
+        },
+        {
+          "id": "101",
+          "name": "B",
+          "score": 0,
+          "counters": {
+            "corn": 9,
+            "wood": 1,
+            "stone": 1,
+            "gold": 1,
+            "skull": 0,
+            "worker": 3
+          }
+        },
+        {
+          "id": "102",
+          "name": "C",
+          "score": 0,
+          "counters": {
+            "corn": 2,
+            "wood": 2,
+            "stone": 0,
+            "gold": 0,
+            "skull": 0,
+            "worker": 4
+          }
+        },
+        {
+          "id": "103",
+          "name": "D",
+          "score": 0,
+          "counters": {
+            "corn": 12,
+            "wood": 2,
+            "stone": 2,
+            "gold": 0,
+            "skull": 0,
+            "worker": 3
+          }
+        }
+      ],
+      "market": [
+        {
+          "id": "building_age_1_1",
+          "class": "construction",
+          "style": "background-position: 0px 0px;"
+        },
+        {
+          "id": "building_age_1_2",
+          "class": "construction",
+          "style": "background-position: -66px 0px;"
+        },
+        {
+          "id": "building_age_1_3",
+          "class": "construction",
+          "style": "background-position: -132px 0px;"
+        },
+        {
+          "id": "building_age_1_4",
+          "class": "construction",
+          "style": "background-position: -198px 0px;"
+        },
+        {
+          "id": "building_age_1_5",
+          "class": "construction",
+          "style": "background-position: -264px 0px;"
+        },
+        {
+          "id": "building_age_1_6",
+          "class": "construction",
+          "style": "background-position: -330px 0px;"
+        },
+        {
+          "id": "monument_1",
+          "class": "construction",
+          "style": "background-position: 0px -82px;"
+        },
+        {
+          "id": "monument_2",
+          "class": "construction",
+          "style": "background-position: -66px -82px;"
+        },
+        {
+          "id": "monument_3",
+          "class": "construction",
+          "style": "background-position: -132px -82px;"
+        },
+        {
+          "id": "monument_4",
+          "class": "construction",
+          "style": "background-position: -198px -82px;"
+        },
+        {
+          "id": "monument_5",
+          "class": "construction",
+          "style": "background-position: -264px -82px;"
+        },
+        {
+          "id": "monument_6",
+          "class": "construction",
+          "style": "background-position: -330px -82px;"
+        }
+      ],
+      "workers": [
+        {
+          "id": "worker_1",
+          "class": "worker worker_008000",
+          "style": "place palenque"
+        }
+      ],
+      "workerPlaces": [
+        {
+          "id": "workerplace_0",
+          "rect": {
+            "x": 0,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_1",
+          "rect": {
+            "x": 1,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_2",
+          "rect": {
+            "x": 2,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_3",
+          "rect": {
+            "x": 3,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_4",
+          "rect": {
+            "x": 4,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_5",
+          "rect": {
+            "x": 5,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_6",
+          "rect": {
+            "x": 6,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_7",
+          "rect": {
+            "x": 7,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_8",
+          "rect": {
+            "x": 8,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_9",
+          "rect": {
+            "x": 9,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_10",
+          "rect": {
+            "x": 10,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_11",
+          "rect": {
+            "x": 11,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_12",
+          "rect": {
+            "x": 12,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_13",
+          "rect": {
+            "x": 13,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_14",
+          "rect": {
+            "x": 14,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_15",
+          "rect": {
+            "x": 15,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_16",
+          "rect": {
+            "x": 16,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_17",
+          "rect": {
+            "x": 17,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_18",
+          "rect": {
+            "x": 18,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_19",
+          "rect": {
+            "x": 19,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_20",
+          "rect": {
+            "x": 20,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_21",
+          "rect": {
+            "x": 21,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_22",
+          "rect": {
+            "x": 22,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_23",
+          "rect": {
+            "x": 23,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_24",
+          "rect": {
+            "x": 24,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_25",
+          "rect": {
+            "x": 25,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_26",
+          "rect": {
+            "x": 26,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_27",
+          "rect": {
+            "x": 27,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_28",
+          "rect": {
+            "x": 28,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_29",
+          "rect": {
+            "x": 29,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_30",
+          "rect": {
+            "x": 30,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_31",
+          "rect": {
+            "x": 31,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_32",
+          "rect": {
+            "x": 32,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_33",
+          "rect": {
+            "x": 33,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_34",
+          "rect": {
+            "x": 34,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_35",
+          "rect": {
+            "x": 35,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_36",
+          "rect": {
+            "x": 36,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_37",
+          "rect": {
+            "x": 37,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_38",
+          "rect": {
+            "x": 38,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_39",
+          "rect": {
+            "x": 39,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_40",
+          "rect": {
+            "x": 40,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_41",
+          "rect": {
+            "x": 41,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_42",
+          "rect": {
+            "x": 42,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_43",
+          "rect": {
+            "x": 43,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_44",
+          "rect": {
+            "x": 44,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_45",
+          "rect": {
+            "x": 45,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_46",
+          "rect": {
+            "x": 46,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_47",
+          "rect": {
+            "x": 47,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_48",
+          "rect": {
+            "x": 48,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_49",
+          "rect": {
+            "x": 49,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_50",
+          "rect": {
+            "x": 50,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_51",
+          "rect": {
+            "x": 51,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_52",
+          "rect": {
+            "x": 52,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_53",
+          "rect": {
+            "x": 53,
+            "y": 0
+          }
+        }
+      ],
+      "markers": [
+        {
+          "id": "marker_0",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_1",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_2",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_3",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_4",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_5",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_6",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_7",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_8",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_9",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_10",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_11",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_12",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_13",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_14",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_15",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_16",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_17",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_18",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_19",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_20",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_21",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_22",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_23",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_24",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_25",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_26",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_27",
+          "style": "initial marker"
+        }
+      ],
+      "jungle": [
+        {
+          "id": "jungle_2",
+          "tiles": []
+        },
+        {
+          "id": "jungle_3",
+          "tiles": []
+        },
+        {
+          "id": "jungle_4",
+          "tiles": []
+        },
+        {
+          "id": "jungle_5",
+          "tiles": []
+        }
+      ],
+      "skullSpaces": [
+        {
+          "id": "skullplace_1",
+          "html": ""
+        },
+        {
+          "id": "skullplace_2",
+          "html": ""
+        },
+        {
+          "id": "skullplace_3",
+          "html": ""
+        },
+        {
+          "id": "skullplace_4",
+          "html": ""
+        },
+        {
+          "id": "skullplace_5",
+          "html": ""
+        },
+        {
+          "id": "skullplace_6",
+          "html": ""
+        },
+        {
+          "id": "skullplace_7",
+          "html": ""
+        },
+        {
+          "id": "skullplace_8",
+          "html": ""
+        },
+        {
+          "id": "skullplace_9",
+          "html": ""
+        }
+      ],
+      "wealth": [
+        {
+          "id": "player_wealthtiles_100",
+          "tiles": [
+            {
+              "id": "w14",
+              "style": "synthetic"
+            },
+            {
+              "id": "w18",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_101",
+          "tiles": [
+            {
+              "id": "w12",
+              "style": "synthetic"
+            },
+            {
+              "id": "w11",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_102",
+          "tiles": [
+            {
+              "id": "w15",
+              "style": "synthetic"
+            },
+            {
+              "id": "w20",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_103",
+          "tiles": [
+            {
+              "id": "w08",
+              "style": "synthetic"
+            },
+            {
+              "id": "w04",
+              "style": "synthetic"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sourceActionId": 7,
+      "title": "synthetic board witness",
+      "round": 1,
+      "skullSupply": 13,
+      "firstPlayer": "firstplayer_100",
+      "players": [
+        {
+          "id": "100",
+          "name": "A",
+          "score": 0,
+          "counters": {
+            "corn": 8,
+            "wood": 1,
+            "stone": 1,
+            "gold": 0,
+            "skull": 0,
+            "worker": 3
+          }
+        },
+        {
+          "id": "101",
+          "name": "B",
+          "score": 0,
+          "counters": {
+            "corn": 9,
+            "wood": 1,
+            "stone": 1,
+            "gold": 1,
+            "skull": 0,
+            "worker": 3
+          }
+        },
+        {
+          "id": "102",
+          "name": "C",
+          "score": 0,
+          "counters": {
+            "corn": 2,
+            "wood": 2,
+            "stone": 0,
+            "gold": 0,
+            "skull": 0,
+            "worker": 4
+          }
+        },
+        {
+          "id": "103",
+          "name": "D",
+          "score": 0,
+          "counters": {
+            "corn": 12,
+            "wood": 2,
+            "stone": 2,
+            "gold": 0,
+            "skull": 0,
+            "worker": 3
+          }
+        }
+      ],
+      "market": [
+        {
+          "id": "building_age_1_1",
+          "class": "construction",
+          "style": "background-position: 0px 0px;"
+        },
+        {
+          "id": "building_age_1_2",
+          "class": "construction",
+          "style": "background-position: -66px 0px;"
+        },
+        {
+          "id": "building_age_1_3",
+          "class": "construction",
+          "style": "background-position: -132px 0px;"
+        },
+        {
+          "id": "building_age_1_4",
+          "class": "construction",
+          "style": "background-position: -198px 0px;"
+        },
+        {
+          "id": "building_age_1_5",
+          "class": "construction",
+          "style": "background-position: -264px 0px;"
+        },
+        {
+          "id": "building_age_1_6",
+          "class": "construction",
+          "style": "background-position: -330px 0px;"
+        },
+        {
+          "id": "monument_1",
+          "class": "construction",
+          "style": "background-position: 0px -82px;"
+        },
+        {
+          "id": "monument_2",
+          "class": "construction",
+          "style": "background-position: -66px -82px;"
+        },
+        {
+          "id": "monument_3",
+          "class": "construction",
+          "style": "background-position: -132px -82px;"
+        },
+        {
+          "id": "monument_4",
+          "class": "construction",
+          "style": "background-position: -198px -82px;"
+        },
+        {
+          "id": "monument_5",
+          "class": "construction",
+          "style": "background-position: -264px -82px;"
+        },
+        {
+          "id": "monument_6",
+          "class": "construction",
+          "style": "background-position: -330px -82px;"
+        }
+      ],
+      "workers": [],
+      "workerPlaces": [
+        {
+          "id": "workerplace_0",
+          "rect": {
+            "x": 0,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_1",
+          "rect": {
+            "x": 1,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_2",
+          "rect": {
+            "x": 2,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_3",
+          "rect": {
+            "x": 3,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_4",
+          "rect": {
+            "x": 4,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_5",
+          "rect": {
+            "x": 5,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_6",
+          "rect": {
+            "x": 6,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_7",
+          "rect": {
+            "x": 7,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_8",
+          "rect": {
+            "x": 8,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_9",
+          "rect": {
+            "x": 9,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_10",
+          "rect": {
+            "x": 10,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_11",
+          "rect": {
+            "x": 11,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_12",
+          "rect": {
+            "x": 12,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_13",
+          "rect": {
+            "x": 13,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_14",
+          "rect": {
+            "x": 14,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_15",
+          "rect": {
+            "x": 15,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_16",
+          "rect": {
+            "x": 16,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_17",
+          "rect": {
+            "x": 17,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_18",
+          "rect": {
+            "x": 18,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_19",
+          "rect": {
+            "x": 19,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_20",
+          "rect": {
+            "x": 20,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_21",
+          "rect": {
+            "x": 21,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_22",
+          "rect": {
+            "x": 22,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_23",
+          "rect": {
+            "x": 23,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_24",
+          "rect": {
+            "x": 24,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_25",
+          "rect": {
+            "x": 25,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_26",
+          "rect": {
+            "x": 26,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_27",
+          "rect": {
+            "x": 27,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_28",
+          "rect": {
+            "x": 28,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_29",
+          "rect": {
+            "x": 29,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_30",
+          "rect": {
+            "x": 30,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_31",
+          "rect": {
+            "x": 31,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_32",
+          "rect": {
+            "x": 32,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_33",
+          "rect": {
+            "x": 33,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_34",
+          "rect": {
+            "x": 34,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_35",
+          "rect": {
+            "x": 35,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_36",
+          "rect": {
+            "x": 36,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_37",
+          "rect": {
+            "x": 37,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_38",
+          "rect": {
+            "x": 38,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_39",
+          "rect": {
+            "x": 39,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_40",
+          "rect": {
+            "x": 40,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_41",
+          "rect": {
+            "x": 41,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_42",
+          "rect": {
+            "x": 42,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_43",
+          "rect": {
+            "x": 43,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_44",
+          "rect": {
+            "x": 44,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_45",
+          "rect": {
+            "x": 45,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_46",
+          "rect": {
+            "x": 46,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_47",
+          "rect": {
+            "x": 47,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_48",
+          "rect": {
+            "x": 48,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_49",
+          "rect": {
+            "x": 49,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_50",
+          "rect": {
+            "x": 50,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_51",
+          "rect": {
+            "x": 51,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_52",
+          "rect": {
+            "x": 52,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_53",
+          "rect": {
+            "x": 53,
+            "y": 0
+          }
+        }
+      ],
+      "markers": [
+        {
+          "id": "marker_0",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_1",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_2",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_3",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_4",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_5",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_6",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_7",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_8",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_9",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_10",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_11",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_12",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_13",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_14",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_15",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_16",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_17",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_18",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_19",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_20",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_21",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_22",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_23",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_24",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_25",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_26",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_27",
+          "style": "initial marker"
+        }
+      ],
+      "jungle": [
+        {
+          "id": "jungle_2",
+          "tiles": []
+        },
+        {
+          "id": "jungle_3",
+          "tiles": []
+        },
+        {
+          "id": "jungle_4",
+          "tiles": []
+        },
+        {
+          "id": "jungle_5",
+          "tiles": []
+        }
+      ],
+      "skullSpaces": [
+        {
+          "id": "skullplace_1",
+          "html": ""
+        },
+        {
+          "id": "skullplace_2",
+          "html": ""
+        },
+        {
+          "id": "skullplace_3",
+          "html": ""
+        },
+        {
+          "id": "skullplace_4",
+          "html": ""
+        },
+        {
+          "id": "skullplace_5",
+          "html": ""
+        },
+        {
+          "id": "skullplace_6",
+          "html": ""
+        },
+        {
+          "id": "skullplace_7",
+          "html": ""
+        },
+        {
+          "id": "skullplace_8",
+          "html": ""
+        },
+        {
+          "id": "skullplace_9",
+          "html": ""
+        }
+      ],
+      "wealth": [
+        {
+          "id": "player_wealthtiles_100",
+          "tiles": [
+            {
+              "id": "w14",
+              "style": "synthetic"
+            },
+            {
+              "id": "w18",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_101",
+          "tiles": [
+            {
+              "id": "w12",
+              "style": "synthetic"
+            },
+            {
+              "id": "w11",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_102",
+          "tiles": [
+            {
+              "id": "w15",
+              "style": "synthetic"
+            },
+            {
+              "id": "w20",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_103",
+          "tiles": [
+            {
+              "id": "w08",
+              "style": "synthetic"
+            },
+            {
+              "id": "w04",
+              "style": "synthetic"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sourceActionId": 8,
+      "title": "synthetic board witness",
+      "round": 1,
+      "skullSupply": 13,
+      "firstPlayer": "firstplayer_100",
+      "players": [
+        {
+          "id": "100",
+          "name": "A",
+          "score": 0,
+          "counters": {
+            "corn": 8,
+            "wood": 1,
+            "stone": 1,
+            "gold": 0,
+            "skull": 0,
+            "worker": 2
+          }
+        },
+        {
+          "id": "101",
+          "name": "B",
+          "score": 0,
+          "counters": {
+            "corn": 9,
+            "wood": 1,
+            "stone": 1,
+            "gold": 1,
+            "skull": 0,
+            "worker": 3
+          }
+        },
+        {
+          "id": "102",
+          "name": "C",
+          "score": 0,
+          "counters": {
+            "corn": 2,
+            "wood": 2,
+            "stone": 0,
+            "gold": 0,
+            "skull": 0,
+            "worker": 4
+          }
+        },
+        {
+          "id": "103",
+          "name": "D",
+          "score": 0,
+          "counters": {
+            "corn": 12,
+            "wood": 2,
+            "stone": 2,
+            "gold": 0,
+            "skull": 0,
+            "worker": 3
+          }
+        }
+      ],
+      "market": [
+        {
+          "id": "building_age_1_1",
+          "class": "construction",
+          "style": "background-position: 0px 0px;"
+        },
+        {
+          "id": "building_age_1_2",
+          "class": "construction",
+          "style": "background-position: -66px 0px;"
+        },
+        {
+          "id": "building_age_1_3",
+          "class": "construction",
+          "style": "background-position: -132px 0px;"
+        },
+        {
+          "id": "building_age_1_4",
+          "class": "construction",
+          "style": "background-position: -198px 0px;"
+        },
+        {
+          "id": "building_age_1_5",
+          "class": "construction",
+          "style": "background-position: -264px 0px;"
+        },
+        {
+          "id": "building_age_1_6",
+          "class": "construction",
+          "style": "background-position: -330px 0px;"
+        },
+        {
+          "id": "monument_1",
+          "class": "construction",
+          "style": "background-position: 0px -82px;"
+        },
+        {
+          "id": "monument_2",
+          "class": "construction",
+          "style": "background-position: -66px -82px;"
+        },
+        {
+          "id": "monument_3",
+          "class": "construction",
+          "style": "background-position: -132px -82px;"
+        },
+        {
+          "id": "monument_4",
+          "class": "construction",
+          "style": "background-position: -198px -82px;"
+        },
+        {
+          "id": "monument_5",
+          "class": "construction",
+          "style": "background-position: -264px -82px;"
+        },
+        {
+          "id": "monument_6",
+          "class": "construction",
+          "style": "background-position: -330px -82px;"
+        }
+      ],
+      "workers": [
+        {
+          "id": "worker_1",
+          "class": "worker worker_008000",
+          "style": "place palenque"
+        }
+      ],
+      "workerPlaces": [
+        {
+          "id": "workerplace_0",
+          "rect": {
+            "x": 0,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_1",
+          "rect": {
+            "x": 1,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_2",
+          "rect": {
+            "x": 2,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_3",
+          "rect": {
+            "x": 3,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_4",
+          "rect": {
+            "x": 4,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_5",
+          "rect": {
+            "x": 5,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_6",
+          "rect": {
+            "x": 6,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_7",
+          "rect": {
+            "x": 7,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_8",
+          "rect": {
+            "x": 8,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_9",
+          "rect": {
+            "x": 9,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_10",
+          "rect": {
+            "x": 10,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_11",
+          "rect": {
+            "x": 11,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_12",
+          "rect": {
+            "x": 12,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_13",
+          "rect": {
+            "x": 13,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_14",
+          "rect": {
+            "x": 14,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_15",
+          "rect": {
+            "x": 15,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_16",
+          "rect": {
+            "x": 16,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_17",
+          "rect": {
+            "x": 17,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_18",
+          "rect": {
+            "x": 18,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_19",
+          "rect": {
+            "x": 19,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_20",
+          "rect": {
+            "x": 20,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_21",
+          "rect": {
+            "x": 21,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_22",
+          "rect": {
+            "x": 22,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_23",
+          "rect": {
+            "x": 23,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_24",
+          "rect": {
+            "x": 24,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_25",
+          "rect": {
+            "x": 25,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_26",
+          "rect": {
+            "x": 26,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_27",
+          "rect": {
+            "x": 27,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_28",
+          "rect": {
+            "x": 28,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_29",
+          "rect": {
+            "x": 29,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_30",
+          "rect": {
+            "x": 30,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_31",
+          "rect": {
+            "x": 31,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_32",
+          "rect": {
+            "x": 32,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_33",
+          "rect": {
+            "x": 33,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_34",
+          "rect": {
+            "x": 34,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_35",
+          "rect": {
+            "x": 35,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_36",
+          "rect": {
+            "x": 36,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_37",
+          "rect": {
+            "x": 37,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_38",
+          "rect": {
+            "x": 38,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_39",
+          "rect": {
+            "x": 39,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_40",
+          "rect": {
+            "x": 40,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_41",
+          "rect": {
+            "x": 41,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_42",
+          "rect": {
+            "x": 42,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_43",
+          "rect": {
+            "x": 43,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_44",
+          "rect": {
+            "x": 44,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_45",
+          "rect": {
+            "x": 45,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_46",
+          "rect": {
+            "x": 46,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_47",
+          "rect": {
+            "x": 47,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_48",
+          "rect": {
+            "x": 48,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_49",
+          "rect": {
+            "x": 49,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_50",
+          "rect": {
+            "x": 50,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_51",
+          "rect": {
+            "x": 51,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_52",
+          "rect": {
+            "x": 52,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_53",
+          "rect": {
+            "x": 53,
+            "y": 0
+          }
+        }
+      ],
+      "markers": [
+        {
+          "id": "marker_0",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_1",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_2",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_3",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_4",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_5",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_6",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_7",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_8",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_9",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_10",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_11",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_12",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_13",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_14",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_15",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_16",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_17",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_18",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_19",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_20",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_21",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_22",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_23",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_24",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_25",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_26",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_27",
+          "style": "initial marker"
+        }
+      ],
+      "jungle": [
+        {
+          "id": "jungle_2",
+          "tiles": []
+        },
+        {
+          "id": "jungle_3",
+          "tiles": []
+        },
+        {
+          "id": "jungle_4",
+          "tiles": []
+        },
+        {
+          "id": "jungle_5",
+          "tiles": []
+        }
+      ],
+      "skullSpaces": [
+        {
+          "id": "skullplace_1",
+          "html": ""
+        },
+        {
+          "id": "skullplace_2",
+          "html": ""
+        },
+        {
+          "id": "skullplace_3",
+          "html": ""
+        },
+        {
+          "id": "skullplace_4",
+          "html": ""
+        },
+        {
+          "id": "skullplace_5",
+          "html": ""
+        },
+        {
+          "id": "skullplace_6",
+          "html": ""
+        },
+        {
+          "id": "skullplace_7",
+          "html": ""
+        },
+        {
+          "id": "skullplace_8",
+          "html": ""
+        },
+        {
+          "id": "skullplace_9",
+          "html": ""
+        }
+      ],
+      "wealth": [
+        {
+          "id": "player_wealthtiles_100",
+          "tiles": [
+            {
+              "id": "w14",
+              "style": "synthetic"
+            },
+            {
+              "id": "w18",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_101",
+          "tiles": [
+            {
+              "id": "w12",
+              "style": "synthetic"
+            },
+            {
+              "id": "w11",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_102",
+          "tiles": [
+            {
+              "id": "w15",
+              "style": "synthetic"
+            },
+            {
+              "id": "w20",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_103",
+          "tiles": [
+            {
+              "id": "w08",
+              "style": "synthetic"
+            },
+            {
+              "id": "w04",
+              "style": "synthetic"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "sourceActionId": 9,
+      "title": "synthetic board witness",
+      "round": 1,
+      "skullSupply": 13,
+      "firstPlayer": "firstplayer_100",
+      "players": [
+        {
+          "id": "100",
+          "name": "A",
+          "score": 0,
+          "counters": {
+            "corn": 8,
+            "wood": 1,
+            "stone": 1,
+            "gold": 0,
+            "skull": 0,
+            "worker": 2
+          }
+        },
+        {
+          "id": "101",
+          "name": "B",
+          "score": 0,
+          "counters": {
+            "corn": 9,
+            "wood": 1,
+            "stone": 1,
+            "gold": 1,
+            "skull": 0,
+            "worker": 3
+          }
+        },
+        {
+          "id": "102",
+          "name": "C",
+          "score": 0,
+          "counters": {
+            "corn": 2,
+            "wood": 2,
+            "stone": 0,
+            "gold": 0,
+            "skull": 0,
+            "worker": 4
+          }
+        },
+        {
+          "id": "103",
+          "name": "D",
+          "score": 0,
+          "counters": {
+            "corn": 12,
+            "wood": 2,
+            "stone": 2,
+            "gold": 0,
+            "skull": 0,
+            "worker": 3
+          }
+        }
+      ],
+      "market": [
+        {
+          "id": "building_age_1_1",
+          "class": "construction",
+          "style": "background-position: 0px 0px;"
+        },
+        {
+          "id": "building_age_1_2",
+          "class": "construction",
+          "style": "background-position: -66px 0px;"
+        },
+        {
+          "id": "building_age_1_3",
+          "class": "construction",
+          "style": "background-position: -132px 0px;"
+        },
+        {
+          "id": "building_age_1_4",
+          "class": "construction",
+          "style": "background-position: -198px 0px;"
+        },
+        {
+          "id": "building_age_1_5",
+          "class": "construction",
+          "style": "background-position: -264px 0px;"
+        },
+        {
+          "id": "building_age_1_6",
+          "class": "construction",
+          "style": "background-position: -330px 0px;"
+        },
+        {
+          "id": "monument_1",
+          "class": "construction",
+          "style": "background-position: 0px -82px;"
+        },
+        {
+          "id": "monument_2",
+          "class": "construction",
+          "style": "background-position: -66px -82px;"
+        },
+        {
+          "id": "monument_3",
+          "class": "construction",
+          "style": "background-position: -132px -82px;"
+        },
+        {
+          "id": "monument_4",
+          "class": "construction",
+          "style": "background-position: -198px -82px;"
+        },
+        {
+          "id": "monument_5",
+          "class": "construction",
+          "style": "background-position: -264px -82px;"
+        },
+        {
+          "id": "monument_6",
+          "class": "construction",
+          "style": "background-position: -330px -82px;"
+        }
+      ],
+      "workers": [
+        {
+          "id": "worker_1",
+          "class": "worker worker_008000",
+          "style": "place palenque"
+        }
+      ],
+      "workerPlaces": [
+        {
+          "id": "workerplace_0",
+          "rect": {
+            "x": 0,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_1",
+          "rect": {
+            "x": 1,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_2",
+          "rect": {
+            "x": 2,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_3",
+          "rect": {
+            "x": 3,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_4",
+          "rect": {
+            "x": 4,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_5",
+          "rect": {
+            "x": 5,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_6",
+          "rect": {
+            "x": 6,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_7",
+          "rect": {
+            "x": 7,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_8",
+          "rect": {
+            "x": 8,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_9",
+          "rect": {
+            "x": 9,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_10",
+          "rect": {
+            "x": 10,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_11",
+          "rect": {
+            "x": 11,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_12",
+          "rect": {
+            "x": 12,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_13",
+          "rect": {
+            "x": 13,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_14",
+          "rect": {
+            "x": 14,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_15",
+          "rect": {
+            "x": 15,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_16",
+          "rect": {
+            "x": 16,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_17",
+          "rect": {
+            "x": 17,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_18",
+          "rect": {
+            "x": 18,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_19",
+          "rect": {
+            "x": 19,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_20",
+          "rect": {
+            "x": 20,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_21",
+          "rect": {
+            "x": 21,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_22",
+          "rect": {
+            "x": 22,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_23",
+          "rect": {
+            "x": 23,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_24",
+          "rect": {
+            "x": 24,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_25",
+          "rect": {
+            "x": 25,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_26",
+          "rect": {
+            "x": 26,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_27",
+          "rect": {
+            "x": 27,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_28",
+          "rect": {
+            "x": 28,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_29",
+          "rect": {
+            "x": 29,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_30",
+          "rect": {
+            "x": 30,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_31",
+          "rect": {
+            "x": 31,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_32",
+          "rect": {
+            "x": 32,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_33",
+          "rect": {
+            "x": 33,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_34",
+          "rect": {
+            "x": 34,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_35",
+          "rect": {
+            "x": 35,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_36",
+          "rect": {
+            "x": 36,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_37",
+          "rect": {
+            "x": 37,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_38",
+          "rect": {
+            "x": 38,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_39",
+          "rect": {
+            "x": 39,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_40",
+          "rect": {
+            "x": 40,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_41",
+          "rect": {
+            "x": 41,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_42",
+          "rect": {
+            "x": 42,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_43",
+          "rect": {
+            "x": 43,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_44",
+          "rect": {
+            "x": 44,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_45",
+          "rect": {
+            "x": 45,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_46",
+          "rect": {
+            "x": 46,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_47",
+          "rect": {
+            "x": 47,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_48",
+          "rect": {
+            "x": 48,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_49",
+          "rect": {
+            "x": 49,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_50",
+          "rect": {
+            "x": 50,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_51",
+          "rect": {
+            "x": 51,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_52",
+          "rect": {
+            "x": 52,
+            "y": 0
+          }
+        },
+        {
+          "id": "workerplace_53",
+          "rect": {
+            "x": 53,
+            "y": 0
+          }
+        }
+      ],
+      "markers": [
+        {
+          "id": "marker_0",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_1",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_2",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_3",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_4",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_5",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_6",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_7",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_8",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_9",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_10",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_11",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_12",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_13",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_14",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_15",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_16",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_17",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_18",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_19",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_20",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_21",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_22",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_23",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_24",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_25",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_26",
+          "style": "initial marker"
+        },
+        {
+          "id": "marker_27",
+          "style": "initial marker"
+        }
+      ],
+      "jungle": [
+        {
+          "id": "jungle_2",
+          "tiles": []
+        },
+        {
+          "id": "jungle_3",
+          "tiles": []
+        },
+        {
+          "id": "jungle_4",
+          "tiles": []
+        },
+        {
+          "id": "jungle_5",
+          "tiles": []
+        }
+      ],
+      "skullSpaces": [
+        {
+          "id": "skullplace_1",
+          "html": ""
+        },
+        {
+          "id": "skullplace_2",
+          "html": ""
+        },
+        {
+          "id": "skullplace_3",
+          "html": ""
+        },
+        {
+          "id": "skullplace_4",
+          "html": ""
+        },
+        {
+          "id": "skullplace_5",
+          "html": ""
+        },
+        {
+          "id": "skullplace_6",
+          "html": ""
+        },
+        {
+          "id": "skullplace_7",
+          "html": ""
+        },
+        {
+          "id": "skullplace_8",
+          "html": ""
+        },
+        {
+          "id": "skullplace_9",
+          "html": ""
+        }
+      ],
+      "wealth": [
+        {
+          "id": "player_wealthtiles_100",
+          "tiles": [
+            {
+              "id": "w14",
+              "style": "synthetic"
+            },
+            {
+              "id": "w18",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_101",
+          "tiles": [
+            {
+              "id": "w12",
+              "style": "synthetic"
+            },
+            {
+              "id": "w11",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_102",
+          "tiles": [
+            {
+              "id": "w15",
+              "style": "synthetic"
+            },
+            {
+              "id": "w20",
+              "style": "synthetic"
+            }
+          ]
+        },
+        {
+          "id": "player_wealthtiles_103",
+          "tiles": [
+            {
+              "id": "w08",
+              "style": "synthetic"
+            },
+            {
+              "id": "w04",
+              "style": "synthetic"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "companion": {
+    "schema": "tzolkin-bga-reconstruction-v1",
+    "tableId": "123",
+    "rawSha256": "298f0368000417d6c2c3f8fa03a5aa1cbe282f6877f1c28a9ecb94f6bd268441",
+    "cutoffActionId": 9,
+    "status": "partial",
+    "unsupportedRules": [],
+    "record": {
+      "schema": "tzolkin-public-replay-v1",
+      "rulesVersion": 1,
+      "catalogHash": "09d08c73b48cdfd7",
+      "market": "unlimited",
+      "source": {
+        "reference": "https://boardgamearena.com/archive/replay/fixture/?table=123&player=100&comments=",
+        "actionIds": [5]
+      },
+      "initial": {
+        "version": 1,
+        "additionalBuildings": false,
+        "phase": "playing",
+        "round": 1,
+        "age": 1,
+        "players": [
+          {
+            "id": 0,
+            "name": "A",
+            "color": "#378575",
+            "resources": {
+              "corn": 8,
+              "wood": 1,
+              "stone": 1,
+              "gold": 0,
+              "skull": 0
+            },
+            "score": 0,
+            "workers": 3,
+            "temples": {
+              "chaac": 0,
+              "quetzalcoatl": 0,
+              "kukulkan": 0
+            },
+            "technologies": {
+              "agriculture": 0,
+              "extraction": 0,
+              "architecture": 0,
+              "theology": 1
+            },
+            "buildings": [],
+            "monuments": [],
+            "wealth": ["w14", "w18"],
+            "feedWorkers": 1,
+            "feedAll": false,
+            "feedDiscount": 0,
+            "cornTiles": 0,
+            "woodTiles": 0,
+            "skullsPlaced": 0,
+            "buildingSkulls": 0,
+            "doubleAdvanceAvailable": true,
+            "templePoints": 0
+          },
+          {
+            "id": 1,
+            "name": "B",
+            "color": "#c6953e",
+            "resources": {
+              "corn": 9,
+              "wood": 1,
+              "stone": 1,
+              "gold": 1,
+              "skull": 0
+            },
+            "score": 0,
+            "workers": 3,
+            "temples": {
+              "chaac": 0,
+              "quetzalcoatl": 0,
+              "kukulkan": 0
+            },
+            "technologies": {
+              "agriculture": 0,
+              "extraction": 0,
+              "architecture": 1,
+              "theology": 0
+            },
+            "buildings": [],
+            "monuments": [],
+            "wealth": ["w12", "w11"],
+            "feedWorkers": 0,
+            "feedAll": false,
+            "feedDiscount": 0,
+            "cornTiles": 0,
+            "woodTiles": 0,
+            "skullsPlaced": 0,
+            "buildingSkulls": 0,
+            "doubleAdvanceAvailable": true,
+            "templePoints": 0
+          },
+          {
+            "id": 2,
+            "name": "C",
+            "color": "#c76050",
+            "resources": {
+              "corn": 2,
+              "wood": 2,
+              "stone": 0,
+              "gold": 0,
+              "skull": 0
+            },
+            "score": 0,
+            "workers": 4,
+            "temples": {
+              "chaac": 0,
+              "quetzalcoatl": 0,
+              "kukulkan": 0
+            },
+            "technologies": {
+              "agriculture": 0,
+              "extraction": 0,
+              "architecture": 0,
+              "theology": 1
+            },
+            "buildings": [],
+            "monuments": [],
+            "wealth": ["w15", "w20"],
+            "feedWorkers": 0,
+            "feedAll": false,
+            "feedDiscount": 0,
+            "cornTiles": 0,
+            "woodTiles": 0,
+            "skullsPlaced": 0,
+            "buildingSkulls": 0,
+            "doubleAdvanceAvailable": true,
+            "templePoints": 0
+          },
+          {
+            "id": 3,
+            "name": "D",
+            "color": "#53729d",
+            "resources": {
+              "corn": 12,
+              "wood": 2,
+              "stone": 2,
+              "gold": 0,
+              "skull": 0
+            },
+            "score": 0,
+            "workers": 3,
+            "temples": {
+              "chaac": 0,
+              "quetzalcoatl": 0,
+              "kukulkan": 0
+            },
+            "technologies": {
+              "agriculture": 0,
+              "extraction": 0,
+              "architecture": 0,
+              "theology": 0
+            },
+            "buildings": [],
+            "monuments": [],
+            "wealth": ["w08", "w04"],
+            "feedWorkers": 0,
+            "feedAll": false,
+            "feedDiscount": 0,
+            "cornTiles": 0,
+            "woodTiles": 0,
+            "skullsPlaced": 0,
+            "buildingSkulls": 0,
+            "doubleAdvanceAvailable": true,
+            "templePoints": 0
+          }
+        ],
+        "currentPlayer": 0,
+        "firstPlayer": 0,
+        "turnOrder": [0, 1, 2, 3],
+        "turnIndex": 0,
+        "turn": {
+          "mode": "none",
+          "count": 0,
+          "begged": false
+        },
+        "gears": {
+          "palenque": [null, null, null, null, null, null, null, null, null, null],
+          "yaxchilan": [null, null, null, null, null, null, null, null, null, null],
+          "tikal": [null, null, null, null, null, null, null, null, null, null],
+          "uxmal": [null, null, null, null, null, null, null, null, null, null],
+          "chichenItza": [
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null
+          ]
+        },
+        "jungle": {
+          "2": {
+            "corn": 4,
+            "wood": 0
+          },
+          "3": {
+            "corn": 4,
+            "wood": 4
+          },
+          "4": {
+            "corn": 4,
+            "wood": 4
+          },
+          "5": {
+            "corn": 4,
+            "wood": 4
+          }
+        },
+        "skullSupply": 13,
+        "skullSpaces": [null, null, null, null, null, null, null, null, null, null],
+        "firstPlayerClaimed": null,
+        "accumulatedCorn": 0,
+        "buildings": ["b07", "b14", "b10", "b09", "b08", "b01"],
+        "monuments": ["m06", "m12", "m08", "m01", "m07", "m04"],
+        "pending": null,
+        "log": [],
+        "foodDays": [],
+        "finalScores": [],
+        "hidden": {
+          "seed": "unknown",
+          "setupOffers": "unknown",
+          "deckOrder": "unknown"
+        },
+        "buildingDeckCount": 8,
+        "age2DeckCount": 18,
+        "retiredUnknownRefillCount": 0
+      },
+      "initialCheckpoint": {
+        "source": {
+          "reference": "https://boardgamearena.com/archive/replay/fixture/?table=123&player=100&comments=",
+          "actionIds": [5]
+        },
+        "expected": {
+          "round": 1,
+          "skullSupply": 13,
+          "players": [
+            {
+              "name": "A",
+              "resources": {
+                "corn": 8,
+                "gold": 0,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "B",
+              "resources": {
+                "corn": 9,
+                "gold": 1,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "C",
+              "resources": {
+                "corn": 2,
+                "gold": 0,
+                "skull": 0,
+                "stone": 0,
+                "wood": 2
+              },
+              "score": 0
+            },
+            {
+              "name": "D",
+              "resources": {
+                "corn": 12,
+                "gold": 0,
+                "skull": 0,
+                "stone": 2,
+                "wood": 2
+              },
+              "score": 0
+            }
+          ]
+        }
+      },
+      "steps": [
+        {
+          "actor": 0,
+          "move": {
+            "type": "place",
+            "gear": "palenque"
+          },
+          "sourceActionIds": [8],
+          "refills": {
+            "currentAge": [],
+            "age2": []
+          },
+          "checkpoint": {
+            "source": {
+              "reference": "https://boardgamearena.com/archive/replay/fixture/?table=123&player=100&comments=",
+              "actionIds": [8]
+            },
+            "expected": {
+              "round": 1,
+              "skullSupply": 13,
+              "players": [
+                {
+                  "name": "A",
+                  "resources": {
+                    "corn": 8,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 1,
+                    "wood": 1
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "B",
+                  "resources": {
+                    "corn": 9,
+                    "gold": 1,
+                    "skull": 0,
+                    "stone": 1,
+                    "wood": 1
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "C",
+                  "resources": {
+                    "corn": 2,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 0,
+                    "wood": 2
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "D",
+                  "resources": {
+                    "corn": 12,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 2,
+                    "wood": 2
+                  },
+                  "score": 0
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "evidenceFiles": [
+      {
+        "id": "boards",
+        "path": "boards.json",
+        "sha256": "96e38dc93502f2bd0fc9c07c32d91f943103f69bc0319f6ba838293d5b341fb7",
+        "reference": "https://boardgamearena.com/archive/replay/fixture/?table=123&player=100&comments="
+      }
+    ],
+    "witnesses": [
+      {
+        "id": "w5",
+        "actionId": 5,
+        "fileId": "boards",
+        "index": 0,
+        "expected": {
+          "round": 1,
+          "skullSupply": 13,
+          "players": [
+            {
+              "name": "A",
+              "resources": {
+                "corn": 8,
+                "gold": 0,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "B",
+              "resources": {
+                "corn": 9,
+                "gold": 1,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "C",
+              "resources": {
+                "corn": 2,
+                "gold": 0,
+                "skull": 0,
+                "stone": 0,
+                "wood": 2
+              },
+              "score": 0
+            },
+            {
+              "name": "D",
+              "resources": {
+                "corn": 12,
+                "gold": 0,
+                "skull": 0,
+                "stone": 2,
+                "wood": 2
+              },
+              "score": 0
+            }
+          ]
+        }
+      },
+      {
+        "id": "w6",
+        "actionId": 6,
+        "fileId": "boards",
+        "index": 1,
+        "expected": {
+          "round": 1,
+          "skullSupply": 13,
+          "players": [
+            {
+              "name": "A",
+              "resources": {
+                "corn": 8,
+                "gold": 0,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "B",
+              "resources": {
+                "corn": 9,
+                "gold": 1,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "C",
+              "resources": {
+                "corn": 2,
+                "gold": 0,
+                "skull": 0,
+                "stone": 0,
+                "wood": 2
+              },
+              "score": 0
+            },
+            {
+              "name": "D",
+              "resources": {
+                "corn": 12,
+                "gold": 0,
+                "skull": 0,
+                "stone": 2,
+                "wood": 2
+              },
+              "score": 0
+            }
+          ]
+        }
+      },
+      {
+        "id": "w7",
+        "actionId": 7,
+        "fileId": "boards",
+        "index": 2,
+        "expected": {
+          "round": 1,
+          "skullSupply": 13,
+          "players": [
+            {
+              "name": "A",
+              "resources": {
+                "corn": 8,
+                "gold": 0,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "B",
+              "resources": {
+                "corn": 9,
+                "gold": 1,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "C",
+              "resources": {
+                "corn": 2,
+                "gold": 0,
+                "skull": 0,
+                "stone": 0,
+                "wood": 2
+              },
+              "score": 0
+            },
+            {
+              "name": "D",
+              "resources": {
+                "corn": 12,
+                "gold": 0,
+                "skull": 0,
+                "stone": 2,
+                "wood": 2
+              },
+              "score": 0
+            }
+          ]
+        }
+      },
+      {
+        "id": "w8",
+        "actionId": 8,
+        "fileId": "boards",
+        "index": 3,
+        "expected": {
+          "round": 1,
+          "skullSupply": 13,
+          "players": [
+            {
+              "name": "A",
+              "resources": {
+                "corn": 8,
+                "gold": 0,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "B",
+              "resources": {
+                "corn": 9,
+                "gold": 1,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "C",
+              "resources": {
+                "corn": 2,
+                "gold": 0,
+                "skull": 0,
+                "stone": 0,
+                "wood": 2
+              },
+              "score": 0
+            },
+            {
+              "name": "D",
+              "resources": {
+                "corn": 12,
+                "gold": 0,
+                "skull": 0,
+                "stone": 2,
+                "wood": 2
+              },
+              "score": 0
+            }
+          ]
+        }
+      },
+      {
+        "id": "w9",
+        "actionId": 9,
+        "fileId": "boards",
+        "index": 4,
+        "expected": {
+          "round": 1,
+          "skullSupply": 13,
+          "players": [
+            {
+              "name": "A",
+              "resources": {
+                "corn": 8,
+                "gold": 0,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "B",
+              "resources": {
+                "corn": 9,
+                "gold": 1,
+                "skull": 0,
+                "stone": 1,
+                "wood": 1
+              },
+              "score": 0
+            },
+            {
+              "name": "C",
+              "resources": {
+                "corn": 2,
+                "gold": 0,
+                "skull": 0,
+                "stone": 0,
+                "wood": 2
+              },
+              "score": 0
+            },
+            {
+              "name": "D",
+              "resources": {
+                "corn": 12,
+                "gold": 0,
+                "skull": 0,
+                "stone": 2,
+                "wood": 2
+              },
+              "score": 0
+            }
+          ]
+        }
+      }
+    ],
+    "initialWitnessId": "w5",
+    "cardMappings": [
+      {
+        "uiId": "building_age_1_1",
+        "catalogId": "b07",
+        "sprite": [0, 0]
+      },
+      {
+        "uiId": "building_age_1_2",
+        "catalogId": "b14",
+        "sprite": [-66, 0]
+      },
+      {
+        "uiId": "building_age_1_3",
+        "catalogId": "b10",
+        "sprite": [-132, 0]
+      },
+      {
+        "uiId": "building_age_1_4",
+        "catalogId": "b09",
+        "sprite": [-198, 0]
+      },
+      {
+        "uiId": "building_age_1_5",
+        "catalogId": "b08",
+        "sprite": [-264, 0]
+      },
+      {
+        "uiId": "building_age_1_6",
+        "catalogId": "b01",
+        "sprite": [-330, 0]
+      },
+      {
+        "uiId": "monument_1",
+        "catalogId": "m06",
+        "sprite": [0, -82]
+      },
+      {
+        "uiId": "monument_2",
+        "catalogId": "m12",
+        "sprite": [-66, -82]
+      },
+      {
+        "uiId": "monument_3",
+        "catalogId": "m08",
+        "sprite": [-132, -82]
+      },
+      {
+        "uiId": "monument_4",
+        "catalogId": "m01",
+        "sprite": [-198, -82]
+      },
+      {
+        "uiId": "monument_5",
+        "catalogId": "m07",
+        "sprite": [-264, -82]
+      },
+      {
+        "uiId": "monument_6",
+        "catalogId": "m04",
+        "sprite": [-330, -82]
+      }
+    ],
+    "timeline": [
+      {
+        "kind": "move",
+        "id": "op6",
+        "step": {
+          "actor": 0,
+          "move": {
+            "type": "place",
+            "gear": "palenque"
+          },
+          "sourceActionIds": [6],
+          "refills": {
+            "currentAge": [],
+            "age2": []
+          },
+          "checkpoint": {
+            "source": {
+              "reference": "https://boardgamearena.com/archive/replay/fixture/?table=123&player=100&comments=",
+              "actionIds": [6]
+            },
+            "expected": {
+              "round": 1,
+              "skullSupply": 13,
+              "players": [
+                {
+                  "name": "A",
+                  "resources": {
+                    "corn": 8,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 1,
+                    "wood": 1
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "B",
+                  "resources": {
+                    "corn": 9,
+                    "gold": 1,
+                    "skull": 0,
+                    "stone": 1,
+                    "wood": 1
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "C",
+                  "resources": {
+                    "corn": 2,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 0,
+                    "wood": 2
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "D",
+                  "resources": {
+                    "corn": 12,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 2,
+                    "wood": 2
+                  },
+                  "score": 0
+                }
+              ]
+            }
+          }
+        },
+        "witnessId": "w6"
+      },
+      {
+        "kind": "cancel",
+        "actionId": 7,
+        "rollbackTo": "initial",
+        "removedMoveIds": ["op6"],
+        "beforeWitnessId": "w6",
+        "afterWitnessId": "w7"
+      },
+      {
+        "kind": "move",
+        "id": "op8",
+        "step": {
+          "actor": 0,
+          "move": {
+            "type": "place",
+            "gear": "palenque"
+          },
+          "sourceActionIds": [8],
+          "refills": {
+            "currentAge": [],
+            "age2": []
+          },
+          "checkpoint": {
+            "source": {
+              "reference": "https://boardgamearena.com/archive/replay/fixture/?table=123&player=100&comments=",
+              "actionIds": [8]
+            },
+            "expected": {
+              "round": 1,
+              "skullSupply": 13,
+              "players": [
+                {
+                  "name": "A",
+                  "resources": {
+                    "corn": 8,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 1,
+                    "wood": 1
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "B",
+                  "resources": {
+                    "corn": 9,
+                    "gold": 1,
+                    "skull": 0,
+                    "stone": 1,
+                    "wood": 1
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "C",
+                  "resources": {
+                    "corn": 2,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 0,
+                    "wood": 2
+                  },
+                  "score": 0
+                },
+                {
+                  "name": "D",
+                  "resources": {
+                    "corn": 12,
+                    "gold": 0,
+                    "skull": 0,
+                    "stone": 2,
+                    "wood": 2
+                  },
+                  "score": 0
+                }
+              ]
+            }
+          }
+        },
+        "witnessId": "w8"
+      },
+      {
+        "kind": "cancel",
+        "actionId": 9,
+        "rollbackTo": "op8",
+        "removedMoveIds": [],
+        "beforeWitnessId": "w8",
+        "afterWitnessId": "w9"
+      }
+    ],
+    "coverage": [
+      {
+        "actionId": 1,
+        "messageIndex": 0,
+        "kind": "nonGame",
+        "reason": "playerColors"
+      },
+      {
+        "actionId": 5,
+        "messageIndex": 0,
+        "kind": "initial"
+      },
+      {
+        "actionId": 6,
+        "messageIndex": 0,
+        "kind": "move",
+        "moveIds": ["op6"]
+      },
+      {
+        "actionId": 7,
+        "messageIndex": 0,
+        "kind": "cancel"
+      },
+      {
+        "actionId": 8,
+        "messageIndex": 0,
+        "kind": "move",
+        "moveIds": ["op8"]
+      },
+      {
+        "actionId": 9,
+        "messageIndex": 0,
+        "kind": "cancel"
+      }
+    ]
+  },
+  "core": {
+    "initialFrame": {
+      "index": 0,
+      "sourceActionIds": [],
+      "snapshot": {
+        "state": {
+          "version": 1,
+          "additionalBuildings": false,
+          "phase": "playing",
+          "round": 1,
+          "age": 1,
+          "players": [
+            {
+              "id": 0,
+              "name": "A",
+              "color": "#378575",
+              "resources": {
+                "corn": 8,
+                "wood": 1,
+                "stone": 1,
+                "gold": 0,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 3,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 0,
+                "theology": 1
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w14", "w18"],
+              "feedWorkers": 1,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            },
+            {
+              "id": 1,
+              "name": "B",
+              "color": "#c6953e",
+              "resources": {
+                "corn": 9,
+                "wood": 1,
+                "stone": 1,
+                "gold": 1,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 3,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 1,
+                "theology": 0
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w12", "w11"],
+              "feedWorkers": 0,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            },
+            {
+              "id": 2,
+              "name": "C",
+              "color": "#c76050",
+              "resources": {
+                "corn": 2,
+                "wood": 2,
+                "stone": 0,
+                "gold": 0,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 4,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 0,
+                "theology": 1
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w15", "w20"],
+              "feedWorkers": 0,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            },
+            {
+              "id": 3,
+              "name": "D",
+              "color": "#53729d",
+              "resources": {
+                "corn": 12,
+                "wood": 2,
+                "stone": 2,
+                "gold": 0,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 3,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 0,
+                "theology": 0
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w08", "w04"],
+              "feedWorkers": 0,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            }
+          ],
+          "currentPlayer": 0,
+          "firstPlayer": 0,
+          "turnOrder": [0, 1, 2, 3],
+          "turnIndex": 0,
+          "turn": {
+            "mode": "none",
+            "count": 0,
+            "begged": false
+          },
+          "gears": {
+            "palenque": [null, null, null, null, null, null, null, null, null, null],
+            "yaxchilan": [null, null, null, null, null, null, null, null, null, null],
+            "tikal": [null, null, null, null, null, null, null, null, null, null],
+            "uxmal": [null, null, null, null, null, null, null, null, null, null],
+            "chichenItza": [
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null
+            ]
+          },
+          "jungle": {
+            "2": {
+              "corn": 4,
+              "wood": 0
+            },
+            "3": {
+              "corn": 4,
+              "wood": 4
+            },
+            "4": {
+              "corn": 4,
+              "wood": 4
+            },
+            "5": {
+              "corn": 4,
+              "wood": 4
+            }
+          },
+          "skullSupply": 13,
+          "skullSpaces": [null, null, null, null, null, null, null, null, null, null],
+          "firstPlayerClaimed": null,
+          "accumulatedCorn": 0,
+          "buildings": ["b07", "b14", "b10", "b09", "b08", "b01"],
+          "buildingDeckCount": 8,
+          "age2DeckCount": 18,
+          "retiredUnknownRefillCount": 0,
+          "monuments": ["m06", "m12", "m08", "m01", "m07", "m04"],
+          "pending": null,
+          "log": [],
+          "foodDays": [],
+          "finalScores": [],
+          "hidden": {
+            "seed": "unknown",
+            "setupOffers": "unknown",
+            "deckOrder": "unknown"
+          }
+        }
+      },
+      "observation": {
+        "legalActions": [
+          {
+            "action": {
+              "type": "place",
+              "gear": "palenque",
+              "cornCost": 0,
+              "discount": false
+            },
+            "move": {
+              "type": "place",
+              "gear": "palenque"
+            }
+          }
+        ]
+      }
+    },
+    "afterFrame": {
+      "index": 1,
+      "sourceActionIds": [],
+      "snapshot": {
+        "state": {
+          "version": 1,
+          "additionalBuildings": false,
+          "phase": "playing",
+          "round": 1,
+          "age": 1,
+          "players": [
+            {
+              "id": 0,
+              "name": "A",
+              "color": "#378575",
+              "resources": {
+                "corn": 8,
+                "wood": 1,
+                "stone": 1,
+                "gold": 0,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 3,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 0,
+                "theology": 1
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w14", "w18"],
+              "feedWorkers": 1,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            },
+            {
+              "id": 1,
+              "name": "B",
+              "color": "#c6953e",
+              "resources": {
+                "corn": 9,
+                "wood": 1,
+                "stone": 1,
+                "gold": 1,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 3,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 1,
+                "theology": 0
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w12", "w11"],
+              "feedWorkers": 0,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            },
+            {
+              "id": 2,
+              "name": "C",
+              "color": "#c76050",
+              "resources": {
+                "corn": 2,
+                "wood": 2,
+                "stone": 0,
+                "gold": 0,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 4,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 0,
+                "theology": 1
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w15", "w20"],
+              "feedWorkers": 0,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            },
+            {
+              "id": 3,
+              "name": "D",
+              "color": "#53729d",
+              "resources": {
+                "corn": 12,
+                "wood": 2,
+                "stone": 2,
+                "gold": 0,
+                "skull": 0
+              },
+              "score": 0,
+              "workers": 3,
+              "temples": {
+                "chaac": 0,
+                "quetzalcoatl": 0,
+                "kukulkan": 0
+              },
+              "technologies": {
+                "agriculture": 0,
+                "extraction": 0,
+                "architecture": 0,
+                "theology": 0
+              },
+              "buildings": [],
+              "monuments": [],
+              "wealth": ["w08", "w04"],
+              "feedWorkers": 0,
+              "feedAll": false,
+              "feedDiscount": 0,
+              "cornTiles": 0,
+              "woodTiles": 0,
+              "skullsPlaced": 0,
+              "buildingSkulls": 0,
+              "doubleAdvanceAvailable": true,
+              "templePoints": 0
+            }
+          ],
+          "currentPlayer": 0,
+          "firstPlayer": 0,
+          "turnOrder": [0, 1, 2, 3],
+          "turnIndex": 0,
+          "turn": {
+            "mode": "place",
+            "count": 1,
+            "begged": false
+          },
+          "gears": {
+            "palenque": [
+              {
+                "playerId": 0,
+                "dummy": false
+              },
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null
+            ],
+            "yaxchilan": [null, null, null, null, null, null, null, null, null, null],
+            "tikal": [null, null, null, null, null, null, null, null, null, null],
+            "uxmal": [null, null, null, null, null, null, null, null, null, null],
+            "chichenItza": [
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null,
+              null
+            ]
+          },
+          "jungle": {
+            "2": {
+              "corn": 4,
+              "wood": 0
+            },
+            "3": {
+              "corn": 4,
+              "wood": 4
+            },
+            "4": {
+              "corn": 4,
+              "wood": 4
+            },
+            "5": {
+              "corn": 4,
+              "wood": 4
+            }
+          },
+          "skullSupply": 13,
+          "skullSpaces": [null, null, null, null, null, null, null, null, null, null],
+          "firstPlayerClaimed": null,
+          "accumulatedCorn": 0,
+          "buildings": ["b07", "b14", "b10", "b09", "b08", "b01"],
+          "buildingDeckCount": 8,
+          "age2DeckCount": 18,
+          "retiredUnknownRefillCount": 0,
+          "monuments": ["m06", "m12", "m08", "m01", "m07", "m04"],
+          "pending": null,
+          "log": ["A が パレンケ 0 に配置（0 コーン）"],
+          "foodDays": [],
+          "finalScores": [],
+          "hidden": {
+            "seed": "unknown",
+            "setupOffers": "unknown",
+            "deckOrder": "unknown"
+          }
+        }
+      },
+      "observation": {
+        "legalActions": [
+          {
+            "action": {
+              "type": "place",
+              "gear": "palenque",
+              "cornCost": 2,
+              "discount": false
+            },
+            "move": {
+              "type": "place",
+              "gear": "palenque"
+            }
+          }
+        ]
+      }
+    },
+    "finalReport": {
+      "status": "partial",
+      "verifiedComplete": false,
+      "verifiedSteps": 1,
+      "checkpointsVerified": 2,
+      "terminalMatched": false,
+      "sourceCoverage": {
+        "initial": false,
+        "foodDays": [],
+        "terminal": false,
+        "complete": false
+      },
+      "trainingReady": false,
+      "missingReasons": [
+        "record ends before the game finished",
+        "observed terminal scores/ranks have not been matched",
+        "full observed initial/food-day board checkpoints are not all covered"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "sourceActionIds": [5],
+          "snapshot": {
+            "state": {
+              "version": 1,
+              "additionalBuildings": false,
+              "phase": "playing",
+              "round": 1,
+              "age": 1,
+              "players": [
+                {
+                  "id": 0,
+                  "name": "A",
+                  "color": "#378575",
+                  "resources": {
+                    "corn": 8,
+                    "wood": 1,
+                    "stone": 1,
+                    "gold": 0,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 3,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 0,
+                    "theology": 1
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w14", "w18"],
+                  "feedWorkers": 1,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                },
+                {
+                  "id": 1,
+                  "name": "B",
+                  "color": "#c6953e",
+                  "resources": {
+                    "corn": 9,
+                    "wood": 1,
+                    "stone": 1,
+                    "gold": 1,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 3,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 1,
+                    "theology": 0
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w12", "w11"],
+                  "feedWorkers": 0,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                },
+                {
+                  "id": 2,
+                  "name": "C",
+                  "color": "#c76050",
+                  "resources": {
+                    "corn": 2,
+                    "wood": 2,
+                    "stone": 0,
+                    "gold": 0,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 4,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 0,
+                    "theology": 1
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w15", "w20"],
+                  "feedWorkers": 0,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                },
+                {
+                  "id": 3,
+                  "name": "D",
+                  "color": "#53729d",
+                  "resources": {
+                    "corn": 12,
+                    "wood": 2,
+                    "stone": 2,
+                    "gold": 0,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 3,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 0,
+                    "theology": 0
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w08", "w04"],
+                  "feedWorkers": 0,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                }
+              ],
+              "currentPlayer": 0,
+              "firstPlayer": 0,
+              "turnOrder": [0, 1, 2, 3],
+              "turnIndex": 0,
+              "turn": {
+                "mode": "none",
+                "count": 0,
+                "begged": false
+              },
+              "gears": {
+                "palenque": [null, null, null, null, null, null, null, null, null, null],
+                "yaxchilan": [null, null, null, null, null, null, null, null, null, null],
+                "tikal": [null, null, null, null, null, null, null, null, null, null],
+                "uxmal": [null, null, null, null, null, null, null, null, null, null],
+                "chichenItza": [
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null
+                ]
+              },
+              "jungle": {
+                "2": {
+                  "corn": 4,
+                  "wood": 0
+                },
+                "3": {
+                  "corn": 4,
+                  "wood": 4
+                },
+                "4": {
+                  "corn": 4,
+                  "wood": 4
+                },
+                "5": {
+                  "corn": 4,
+                  "wood": 4
+                }
+              },
+              "skullSupply": 13,
+              "skullSpaces": [null, null, null, null, null, null, null, null, null, null],
+              "firstPlayerClaimed": null,
+              "accumulatedCorn": 0,
+              "buildings": ["b07", "b14", "b10", "b09", "b08", "b01"],
+              "buildingDeckCount": 8,
+              "age2DeckCount": 18,
+              "retiredUnknownRefillCount": 0,
+              "monuments": ["m06", "m12", "m08", "m01", "m07", "m04"],
+              "pending": null,
+              "log": [],
+              "foodDays": [],
+              "finalScores": [],
+              "hidden": {
+                "seed": "unknown",
+                "setupOffers": "unknown",
+                "deckOrder": "unknown"
+              }
+            }
+          },
+          "observation": {
+            "legalActions": [
+              {
+                "action": {
+                  "type": "place",
+                  "gear": "palenque",
+                  "cornCost": 0,
+                  "discount": false
+                },
+                "move": {
+                  "type": "place",
+                  "gear": "palenque"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "index": 1,
+          "sourceActionIds": [8],
+          "snapshot": {
+            "state": {
+              "version": 1,
+              "additionalBuildings": false,
+              "phase": "playing",
+              "round": 1,
+              "age": 1,
+              "players": [
+                {
+                  "id": 0,
+                  "name": "A",
+                  "color": "#378575",
+                  "resources": {
+                    "corn": 8,
+                    "wood": 1,
+                    "stone": 1,
+                    "gold": 0,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 3,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 0,
+                    "theology": 1
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w14", "w18"],
+                  "feedWorkers": 1,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                },
+                {
+                  "id": 1,
+                  "name": "B",
+                  "color": "#c6953e",
+                  "resources": {
+                    "corn": 9,
+                    "wood": 1,
+                    "stone": 1,
+                    "gold": 1,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 3,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 1,
+                    "theology": 0
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w12", "w11"],
+                  "feedWorkers": 0,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                },
+                {
+                  "id": 2,
+                  "name": "C",
+                  "color": "#c76050",
+                  "resources": {
+                    "corn": 2,
+                    "wood": 2,
+                    "stone": 0,
+                    "gold": 0,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 4,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 0,
+                    "theology": 1
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w15", "w20"],
+                  "feedWorkers": 0,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                },
+                {
+                  "id": 3,
+                  "name": "D",
+                  "color": "#53729d",
+                  "resources": {
+                    "corn": 12,
+                    "wood": 2,
+                    "stone": 2,
+                    "gold": 0,
+                    "skull": 0
+                  },
+                  "score": 0,
+                  "workers": 3,
+                  "temples": {
+                    "chaac": 0,
+                    "quetzalcoatl": 0,
+                    "kukulkan": 0
+                  },
+                  "technologies": {
+                    "agriculture": 0,
+                    "extraction": 0,
+                    "architecture": 0,
+                    "theology": 0
+                  },
+                  "buildings": [],
+                  "monuments": [],
+                  "wealth": ["w08", "w04"],
+                  "feedWorkers": 0,
+                  "feedAll": false,
+                  "feedDiscount": 0,
+                  "cornTiles": 0,
+                  "woodTiles": 0,
+                  "skullsPlaced": 0,
+                  "buildingSkulls": 0,
+                  "doubleAdvanceAvailable": true,
+                  "templePoints": 0
+                }
+              ],
+              "currentPlayer": 0,
+              "firstPlayer": 0,
+              "turnOrder": [0, 1, 2, 3],
+              "turnIndex": 0,
+              "turn": {
+                "mode": "place",
+                "count": 1,
+                "begged": false
+              },
+              "gears": {
+                "palenque": [
+                  {
+                    "playerId": 0,
+                    "dummy": false
+                  },
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null
+                ],
+                "yaxchilan": [null, null, null, null, null, null, null, null, null, null],
+                "tikal": [null, null, null, null, null, null, null, null, null, null],
+                "uxmal": [null, null, null, null, null, null, null, null, null, null],
+                "chichenItza": [
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null,
+                  null
+                ]
+              },
+              "jungle": {
+                "2": {
+                  "corn": 4,
+                  "wood": 0
+                },
+                "3": {
+                  "corn": 4,
+                  "wood": 4
+                },
+                "4": {
+                  "corn": 4,
+                  "wood": 4
+                },
+                "5": {
+                  "corn": 4,
+                  "wood": 4
+                }
+              },
+              "skullSupply": 13,
+              "skullSpaces": [null, null, null, null, null, null, null, null, null, null],
+              "firstPlayerClaimed": null,
+              "accumulatedCorn": 0,
+              "buildings": ["b07", "b14", "b10", "b09", "b08", "b01"],
+              "buildingDeckCount": 8,
+              "age2DeckCount": 18,
+              "retiredUnknownRefillCount": 0,
+              "monuments": ["m06", "m12", "m08", "m01", "m07", "m04"],
+              "pending": null,
+              "log": ["A が パレンケ 0 に配置（0 コーン）"],
+              "foodDays": [],
+              "finalScores": [],
+              "hidden": {
+                "seed": "unknown",
+                "setupOffers": "unknown",
+                "deckOrder": "unknown"
+              }
+            }
+          },
+          "observation": {
+            "legalActions": [
+              {
+                "action": {
+                  "type": "place",
+                  "gear": "palenque",
+                  "cornCost": 2,
+                  "discount": false
+                },
+                "move": {
+                  "type": "place",
+                  "gear": "palenque"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

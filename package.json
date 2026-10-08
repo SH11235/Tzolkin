@@ -26,9 +26,10 @@
     "pretest:watch": "node scripts/build-wasm.mjs --test",
     "pretest:e2e": "node scripts/build-wasm.mjs --test",
     "test:core": "cargo test --locked -p tzolkin-core -p tzolkin-ai",
-    "test:bga": "node --test scripts/bga-import.test.mjs",
+    "test:bga": "node --test scripts/bga-import.test.mjs scripts/bga-replay.test.mjs",
     "bga:import": "node scripts/bga-import.mjs",
-    "bga:compare": "node scripts/bga-compare.mjs"
+    "bga:compare": "node scripts/bga-compare.mjs",
+    "bga:replay": "node scripts/bga-replay.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.1",
