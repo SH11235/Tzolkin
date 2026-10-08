@@ -2,10 +2,38 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use tzolkin_ai::kernel::Kernel;
+use tzolkin_ai::policy_dataset::{export_native_files, native_source_files};
 use tzolkin_ai::public_model::{LoadedPublicPolicy, MAX_OBSERVATION_BYTES, PublicPolicyArtifact};
 use tzolkin_core::observation::Observation;
 
-const HELP: &str = "tzolkin-public-ml choose --model PATH [--kernel scalar|auto|avx2|sse2|neon|simd128]\nReads a bounded core Observation JSON from stdin and writes a Decision JSON.\nDefault kernel: scalar. Requires base 3-4p Setup/Playing and a V2 policy-only artifact.\nDataset export, training, human admission and selfplay/Arena registration are not implemented in this binary.";
+const HELP: &str = "tzolkin-public-ml choose --model PATH [--kernel scalar|auto|avx2|sse2|neon|simd128]\ntzolkin-public-ml export-native --input NATIVE_REPLAY_DIRECTORY --output NEW_DATASET_DIRECTORY\nchoose reads a bounded core Observation JSON from stdin and writes a Decision JSON.\nDefault kernel: scalar. Both commands require base 3-4p; export-native copies and independently verifies complete native replay JSON sources.\nTraining, human admission and selfplay/Arena registration are separate future units.";
+
+fn export(args: &[String]) -> Result<(), String> {
+    let mut input = None;
+    let mut output = None;
+    let mut index = 1;
+    while index < args.len() {
+        let name = &args[index];
+        let slot = match name.as_str() {
+            "--input" => &mut input,
+            "--output" => &mut output,
+            _ => return Err(format!("Unknown export-native flag {name}")),
+        };
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.starts_with("--"))
+            .ok_or_else(|| format!("Missing value after {name}"))?;
+        if slot.replace(value.as_str()).is_some() {
+            return Err(format!("Repeated flag {name}"));
+        }
+        index += 2;
+    }
+    let paths = native_source_files(Path::new(input.ok_or("--input is required")?))?;
+    let manifest = export_native_files(&paths, Path::new(output.ok_or("--output is required")?))?;
+    serde_json::to_writer(std::io::stdout().lock(), &manifest).map_err(|e| e.to_string())?;
+    println!();
+    Ok(())
+}
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -13,8 +41,11 @@ fn run() -> Result<(), String> {
         println!("{HELP}");
         return Ok(());
     }
+    if args.first().map(String::as_str) == Some("export-native") {
+        return export(&args);
+    }
     if args.first().map(String::as_str) != Some("choose") {
-        return Err("Only the choose command is implemented; use --help".into());
+        return Err("Only choose and export-native commands are implemented; use --help".into());
     }
     let mut model = None;
     let mut kernel = None;
