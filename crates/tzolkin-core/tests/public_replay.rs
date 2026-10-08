@@ -34,7 +34,215 @@ fn partial(count: usize) -> PublicReplayRecord {
         initial_checkpoint: None,
         steps: vec![],
         terminal_checkpoint: None,
+        terminal_display_checkpoint: None,
     }
+}
+
+fn display_fixture() -> PublicReplayRecord {
+    let mut native = native_initial(3, 42);
+    let mut record = partial(3);
+    record.initial = PublicState::from_game_state(&native).unwrap();
+    for index in 0..1500 {
+        if native.phase == Phase::Finished {
+            break;
+        }
+        let legal = observe(&native, native.current_player)
+            .unwrap()
+            .legal_actions;
+        let preferred = if native.pending.is_some() {
+            legal.iter().find(|choice| {
+                matches!(choice.action, tzolkin_core::observation::TypedAction::Skip)
+            })
+        } else if native.turn.mode != TurnMode::None {
+            legal
+                .iter()
+                .find(|choice| matches!(choice.r#move, GameMove::EndTurn { .. }))
+        } else {
+            legal
+                .iter()
+                .find(|choice| matches!(choice.r#move, GameMove::Place { .. }))
+        };
+        let operation = preferred.unwrap_or(&legal[0]).r#move.clone();
+        let before = native;
+        native = apply_move(&before, operation.clone()).unwrap();
+        let revealed: Vec<_> = native
+            .buildings
+            .iter()
+            .filter(|id| !before.buildings.contains(id))
+            .cloned()
+            .collect();
+        record.steps.push(PublicReplayStep {
+            actor: before.current_player,
+            r#move: operation,
+            source_action_ids: vec![index as u64],
+            refills: Refills {
+                current_age: if before.age == native.age {
+                    revealed.clone()
+                } else {
+                    vec![]
+                },
+                age2: if before.age != native.age {
+                    revealed
+                } else {
+                    vec![]
+                },
+            },
+            checkpoint: None,
+        });
+    }
+    assert_eq!(native.phase, Phase::Finished);
+    assert!(
+        native
+            .final_scores
+            .iter()
+            .any(|score| score.total.fract() != 0.0)
+    );
+    record.terminal_display_checkpoint = Some(TerminalDisplayCheckpoint {
+        source: source(),
+        mode: TerminalDisplayMode::FloorTotal,
+        scores: native
+            .final_scores
+            .iter()
+            .map(|score| TerminalScore {
+                player_id: score.player_id,
+                total: score.total.floor(),
+                rank: score.rank,
+            })
+            .collect(),
+    });
+    record
+}
+
+#[test]
+fn display_comparison_retains_official_quarters_and_never_grants_exact_completeness() {
+    let record = display_fixture();
+    let mut without = record.clone();
+    without.terminal_display_checkpoint = None;
+    let baseline = verify_public_replay(&without).unwrap();
+    let mut reordered = record.clone();
+    reordered
+        .terminal_display_checkpoint
+        .as_mut()
+        .unwrap()
+        .scores
+        .reverse();
+    let report = verify_public_replay(&reordered).unwrap();
+    assert_eq!(
+        serde_json::to_value(&baseline.frames).unwrap(),
+        serde_json::to_value(&report.frames).unwrap()
+    );
+    assert_eq!(baseline.checkpoints_verified, report.checkpoints_verified);
+    assert_eq!(baseline.missing_reasons, report.missing_reasons);
+    assert_eq!(
+        serde_json::to_value(&baseline.source_coverage).unwrap(),
+        serde_json::to_value(&report.source_coverage).unwrap()
+    );
+    assert_eq!(report.status, ReplayStatus::Partial);
+    assert!(!report.verified_complete && !report.terminal_matched && !report.training_ready);
+    assert!(!report.source_coverage.terminal && !report.source_coverage.complete);
+    let comparison = report.terminal_display_comparison.as_ref().unwrap();
+    assert_eq!(comparison.mode, TerminalDisplayMode::FloorTotal);
+    assert_eq!(comparison.source, source());
+    for (score, native) in comparison
+        .scores
+        .iter()
+        .zip(&report.frames.last().unwrap().snapshot.state.final_scores)
+    {
+        assert_eq!(score.player_id, native.player_id);
+        assert_eq!(score.native_total, native.total);
+        assert_eq!(score.source_total, native.total.floor());
+        assert_eq!(score.difference, native.total - native.total.floor());
+        assert_eq!(score.native_rank, native.rank);
+        assert_eq!(score.source_rank, native.rank);
+    }
+    // With no new optional field, legacy records/reports have no extra JSON key.
+    assert!(
+        serde_json::to_value(&without)
+            .unwrap()
+            .get("terminalDisplayCheckpoint")
+            .is_none()
+    );
+    assert!(
+        serde_json::to_value(&baseline)
+            .unwrap()
+            .get("terminalDisplayComparison")
+            .is_none()
+    );
+    let mut exact = record.clone();
+    exact.terminal_checkpoint = Some(TerminalCheckpoint {
+        source: source(),
+        scores: comparison
+            .scores
+            .iter()
+            .map(|score| TerminalScore {
+                player_id: score.player_id,
+                total: score.native_total,
+                rank: score.native_rank,
+            })
+            .collect(),
+    });
+    let complete = verify_public_replay(&exact).unwrap();
+    assert!(complete.terminal_matched && complete.verified_complete);
+    assert_eq!(complete.status, ReplayStatus::Complete);
+    assert!(!complete.training_ready);
+    exact.terminal_checkpoint.as_mut().unwrap().scores[0].total += 1.0;
+    assert!(
+        verify_public_replay(&exact)
+            .unwrap_err()
+            .contains("terminal scores[0]")
+    );
+}
+
+#[test]
+fn display_checkpoint_rejects_incomplete_hostile_or_unfinished_evidence() {
+    let record = display_fixture();
+    for case in 0..11 {
+        let mut wrong = record.clone();
+        let point = wrong.terminal_display_checkpoint.as_mut().unwrap();
+        match case {
+            0 => {
+                point.scores.pop();
+            }
+            1 => point.scores.push(point.scores[0].clone()),
+            2 => point.scores[1].player_id = point.scores[0].player_id,
+            3 => point.scores[0].player_id = 3,
+            4 => point.scores[0].total = f64::NAN,
+            5 => point.scores[0].total = f64::INFINITY,
+            6 => point.scores[0].total = 9_007_199_254_740_991.0,
+            7 => point.scores[0].total += 0.25,
+            8 => point.scores[0].rank = 0,
+            9 => point.scores[0].rank = point.scores[0].rank % 3 + 1,
+            10 => point.source.reference.clear(),
+            _ => unreachable!(),
+        }
+        assert!(
+            verify_public_replay(&wrong)
+                .unwrap_err()
+                .contains("terminalDisplay"),
+            "case {case}"
+        );
+    }
+    let mut unfinished = partial(3);
+    unfinished.terminal_display_checkpoint = record.terminal_display_checkpoint.clone();
+    assert!(
+        verify_public_replay(&unfinished)
+            .unwrap_err()
+            .contains("terminalDisplay phase")
+    );
+    for mutation in ["mode", "source", "scores"] {
+        let mut value = serde_json::to_value(&record).unwrap();
+        value["terminalDisplayCheckpoint"]
+            .as_object_mut()
+            .unwrap()
+            .remove(mutation);
+        assert!(serde_json::from_value::<PublicReplayRecord>(value).is_err());
+    }
+    let mut value = serde_json::to_value(&record).unwrap();
+    value["terminalDisplayCheckpoint"]["mode"] = json!("roundNearest");
+    assert!(serde_json::from_value::<PublicReplayRecord>(value).is_err());
+    let mut value = serde_json::to_value(&record).unwrap();
+    value["terminalDisplayCheckpoint"]["nativeTotals"] = json!([1, 2, 3]);
+    assert!(serde_json::from_value::<PublicReplayRecord>(value).is_err());
 }
 fn refills(state: &GameState, operation: &GameMove) -> Refills {
     if !matches!(operation, GameMove::EndTurn { .. }) {

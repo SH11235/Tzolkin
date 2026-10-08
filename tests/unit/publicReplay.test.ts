@@ -6,7 +6,11 @@ import {
   MAX_REPLAY_STEPS,
   parsePublicReplay,
 } from '../../src/game/publicReplay';
-import { completePublicReplayFixture, publicReplayFixture } from '../helpers/publicReplay';
+import {
+  completePublicReplayFixture,
+  displayPublicReplayFixture,
+  publicReplayFixture,
+} from '../helpers/publicReplay';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -16,6 +20,81 @@ function file(value: unknown) {
 }
 
 describe('public replay import through the production Rust adapter', () => {
+  it('keeps source display and official fractional results separate without granting exact verification', async () => {
+    const exact = completePublicReplayFixture();
+    const baseline = await loadPublicReplay(file(exact));
+    const display = await loadPublicReplay(file(displayPublicReplayFixture()));
+    expect(display.frames).toEqual(baseline.frames);
+    expect(display.status).toBe('partial');
+    expect(display.verifiedComplete).toBe(false);
+    expect(display.terminalMatched).toBe(false);
+    expect(display.sourceCoverage?.terminal).toBe(false);
+    expect(display.sourceCoverage?.complete).toBe(false);
+    expect(display.trainingReady).toBe(false);
+    expect(baseline).not.toHaveProperty('terminalDisplayComparison');
+    const native = display.frames.at(-1)!.snapshot.state.finalScores;
+    expect(native.some((score) => score.total % 1 !== 0)).toBe(true);
+    expect(display.terminalDisplayComparison?.scores).toEqual(
+      native.map((score) => ({
+        playerId: score.playerId,
+        nativeTotal: score.total,
+        sourceTotal: Math.floor(score.total),
+        difference: score.total - Math.floor(score.total),
+        nativeRank: score.rank,
+        sourceRank: score.rank,
+      })),
+    );
+    exact.terminalDisplayCheckpoint = displayPublicReplayFixture().terminalDisplayCheckpoint;
+    exact.terminalCheckpoint!.scores[0]!.total++;
+    await expect(loadPublicReplay(file(exact))).rejects.toThrow('terminal scores[0]');
+  });
+
+  it('rejects hostile display modes, incomplete results, invalid evidence, ranks and preterminal claims', async () => {
+    const fixture = displayPublicReplayFixture();
+    for (const mutate of [
+      (point: Record<string, unknown>) => {
+        delete point.mode;
+      },
+      (point: Record<string, unknown>) => {
+        point.mode = 'roundNearest';
+      },
+      (point: Record<string, unknown>) => {
+        point.source = { reference: '', actionIds: [] };
+      },
+      (point: Record<string, unknown>) => {
+        point.scores = [];
+      },
+      (point: Record<string, unknown>) => {
+        const scores = point.scores as Array<Record<string, unknown>>;
+        scores[1]!.playerId = scores[0]!.playerId;
+      },
+      (point: Record<string, unknown>) => {
+        (point.scores as Array<Record<string, unknown>>)[0]!.rank = 0;
+      },
+      (point: Record<string, unknown>) => {
+        (point.scores as Array<Record<string, unknown>>)[0]!.total = 1e20;
+      },
+    ]) {
+      const wrong = structuredClone(fixture);
+      mutate(wrong.terminalDisplayCheckpoint as unknown as Record<string, unknown>);
+      await expect(loadPublicReplay(file(wrong))).rejects.toThrow();
+    }
+    const text = JSON.stringify(fixture).replace(/"total":(-?\d+(?:\.\d+)?)/, '"total":1e999');
+    await expect(loadPublicReplay({ size: text.length, text: async () => text })).rejects.toThrow();
+    const unfinished = publicReplayFixture();
+    unfinished.terminalDisplayCheckpoint = fixture.terminalDisplayCheckpoint;
+    await expect(loadPublicReplay(file(unfinished))).rejects.toThrow('terminalDisplay phase');
+  });
+
+  it('rejects a forged display comparison returned across the adapter boundary', async () => {
+    const fixture = displayPublicReplayFixture();
+    const valid = await loadPublicReplay(file(fixture));
+    const forged = structuredClone(valid);
+    forged.terminalDisplayComparison!.scores[0]!.nativeTotal += 0.25;
+    vi.spyOn(engine, 'verifyPublicReplay').mockResolvedValue(forged);
+    await expect(loadPublicReplay(file(fixture))).rejects.toThrow('検証結果が不正');
+  });
+
   it('verifies legal partial replay and keeps hidden values out of frame states', async () => {
     const replay = publicReplayFixture();
     const report = await loadPublicReplay(file(replay));

@@ -149,6 +149,37 @@ pub struct TerminalCheckpoint {
     pub source: Evidence,
     pub scores: Vec<TerminalScore>,
 }
+/// Explicit source-display interpretation, never an official scoring rule.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalDisplayMode {
+    FloorTotal,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalDisplayCheckpoint {
+    pub source: Evidence,
+    pub mode: TerminalDisplayMode,
+    pub scores: Vec<TerminalScore>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalDisplayScore {
+    pub player_id: usize,
+    pub native_total: f64,
+    pub source_total: f64,
+    /// Official native total minus the observed display total.
+    pub difference: f64,
+    pub native_rank: usize,
+    pub source_rank: usize,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalDisplayComparison {
+    pub source: Evidence,
+    pub mode: TerminalDisplayMode,
+    pub scores: Vec<TerminalDisplayScore>,
+}
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Market {
@@ -180,6 +211,8 @@ pub struct PublicReplayRecord {
     pub steps: Vec<PublicReplayStep>,
     #[serde(default)]
     pub terminal_checkpoint: Option<TerminalCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_display_checkpoint: Option<TerminalDisplayCheckpoint>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -214,6 +247,9 @@ pub struct PublicReplayReport {
     pub verified_steps: usize,
     pub checkpoints_verified: usize,
     pub terminal_matched: bool,
+    /// Validated display comparison only; does not grant exact/source completeness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_display_comparison: Option<TerminalDisplayComparison>,
     pub source_coverage: SourceCoverage,
     /// Training shards require separate provenance/cancellation audits.
     /// The core replay verifier deliberately never grants this flag.
@@ -894,6 +930,72 @@ fn covers_source_board(state: &PublicState, point: &Checkpoint) -> bool {
             })
 }
 
+fn compare_terminal_display(
+    state: &PublicState,
+    terminal: &TerminalDisplayCheckpoint,
+) -> Result<TerminalDisplayComparison, String> {
+    check_evidence(&terminal.source, "terminalDisplay")?;
+    if state.phase != Phase::Finished {
+        return Err("terminalDisplay phase: checkpoint provided before game finished".into());
+    }
+    if terminal.scores.len() != state.players.len() {
+        return Err("terminalDisplay scores: expected one observed result per player".into());
+    }
+    let mut seen = HashSet::new();
+    for (index, score) in terminal.scores.iter().enumerate() {
+        // Use the same exact quarter-score magnitude bound as ordinary saves.
+        if score.player_id >= state.players.len()
+            || !seen.insert(score.player_id)
+            || !score.total.is_finite()
+            || score.total.abs() > 9_007_199_254_740_991.0 / 4.0
+            || score.total.fract() != 0.0
+            || !(1..=state.players.len()).contains(&score.rank)
+        {
+            return Err(format!(
+                "terminalDisplay scores[{index}]: invalid player/total/rank"
+            ));
+        }
+        let native = state
+            .final_scores
+            .iter()
+            .find(|s| s.player_id == score.player_id)
+            .ok_or_else(|| format!("terminalDisplay scores[{index}]: missing native result"))?;
+        let projected = match terminal.mode {
+            TerminalDisplayMode::FloorTotal => native.total.floor(),
+        };
+        if projected != score.total || native.rank != score.rank {
+            return Err(format!(
+                "terminalDisplay scores[{index}]: observed display total/rank mismatch"
+            ));
+        }
+    }
+    // Native player order, independently of the source array's order.
+    let scores = state
+        .final_scores
+        .iter()
+        .map(|native| {
+            let observed = terminal
+                .scores
+                .iter()
+                .find(|s| s.player_id == native.player_id)
+                .unwrap();
+            TerminalDisplayScore {
+                player_id: native.player_id,
+                native_total: native.total,
+                source_total: observed.total,
+                difference: native.total - observed.total,
+                native_rank: native.rank,
+                source_rank: observed.rank,
+            }
+        })
+        .collect();
+    Ok(TerminalDisplayComparison {
+        source: terminal.source.clone(),
+        mode: terminal.mode,
+        scores,
+    })
+}
+
 pub fn verify_public_replay(record: &PublicReplayRecord) -> Result<PublicReplayReport, String> {
     if record.schema != PUBLIC_REPLAY_SCHEMA
         || record.rules_version != PUBLIC_RULES_VERSION
@@ -976,6 +1078,13 @@ pub fn verify_public_replay(record: &PublicReplayRecord) -> Result<PublicReplayR
         terminal_matched = true;
         checkpoints_verified += 1;
     }
+    // Exact terminal errors above always propagate. Display comparison is separate
+    // from exact checkpoints and all completeness/coverage/training decisions.
+    let terminal_display_comparison = record
+        .terminal_display_checkpoint
+        .as_ref()
+        .map(|point| compare_terminal_display(&state, point))
+        .transpose()?;
     let complete = state.phase == Phase::Finished && terminal_matched;
     source_coverage.terminal = terminal_matched;
     source_coverage.complete = source_coverage.initial
@@ -1002,6 +1111,7 @@ pub fn verify_public_replay(record: &PublicReplayRecord) -> Result<PublicReplayR
         verified_steps: record.steps.len(),
         checkpoints_verified,
         terminal_matched,
+        terminal_display_comparison,
         source_coverage,
         training_ready: false,
         missing_reasons,
