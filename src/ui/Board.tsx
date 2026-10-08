@@ -153,6 +153,7 @@ export function Board({
             )}
             <button
               className="place-button"
+              title={place?.description}
               disabled={!place || place.disabled}
               onClick={() => place && play(place.move)}
             >

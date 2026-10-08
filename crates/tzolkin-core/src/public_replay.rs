@@ -642,7 +642,7 @@ fn frame(state: &PublicState, index: usize, ids: Vec<u64>) -> Result<PublicRepla
                 .map(|gear| {
                     (
                         gear,
-                        crate::get_placement_cost(&mechanical, &gear.to_string()),
+                        crate::engine::placement_payment(&mechanical, gear, false).ok(),
                     )
                 })
                 .collect(),

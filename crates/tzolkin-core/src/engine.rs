@@ -635,6 +635,24 @@ pub fn get_placement_cost(s: &GameState, gear: &str) -> Option<i64> {
             + prophecies::placement_surcharge(s, g),
     )
 }
+/// Payment for an ordinary or discounted placement; the nominal tariff above
+/// remains the rule input for affordability and the cheapest-space mercy test.
+pub(crate) fn placement_payment(
+    s: &GameState,
+    gear: GearId,
+    discount: bool,
+) -> Result<i64, String> {
+    let base = get_placement_cost(s, &gear.to_string()).ok_or("Missing placement cost")?;
+    if pity_placement(s, Some(gear)) {
+        return Ok(current(s).resources[&Resource::Corn]);
+    }
+    let discount = if discount {
+        (lowest_position(s, gear).ok_or("Missing placement position")? as i64).min(2)
+    } else {
+        0
+    };
+    Ok(base - discount)
+}
 fn temple_max(t: TempleId) -> i64 {
     CATALOG.temple_tracks[&t].points.len() as i64 - 2
 }
@@ -3101,11 +3119,24 @@ fn tribe_ability_moves(s: &GameState) -> Vec<Choice> {
             for g in GEAR_IDS {
                 if let Some(pos) = lowest_position(s, g) {
                     let cost = get_placement_cost(s, &g.to_string()).unwrap() - (pos as i64).min(2);
+                    let can_afford = p.resources[&Resource::Corn] >= cost;
+                    let payment = if can_afford {
+                        placement_payment(s, g, true).unwrap()
+                    } else {
+                        cost
+                    };
+                    let mercy = if can_afford && pity_placement(s, Some(g)) {
+                        " · 神の慈悲（所持コーンすべて）"
+                    } else {
+                        ""
+                    };
                     add(
                         format!("discount:{g}"),
                         format!("{}に配置（部族の割引）", CATALOG.gear_labels[&g]),
                         available_workers(s, p.id) == 0 || p.resources[&Resource::Corn] < cost,
-                        Some(format!("コーン {cost} · この手番の配置割引を使用")),
+                        Some(format!(
+                            "コーン {payment}{mercy} · この手番の配置割引を使用"
+                        )),
                     );
                 }
             }
@@ -3133,7 +3164,15 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
                 id: format!("place:{gear}"),
                 label: format!("{}に配置", CATALOG.gear_labels[&gear]),
                 description: Some(
-                    cost.map(|c| format!("コーン {c}"))
+                    placement_payment(s, gear, false)
+                        .ok()
+                        .map(|payment| {
+                            if pity_placement(s, Some(gear)) {
+                                format!("コーン {payment} · 神の慈悲（所持コーンすべて）")
+                            } else {
+                                format!("コーン {payment}")
+                            }
+                        })
                         .unwrap_or_else(|| "空きがありません".into()),
                 ),
                 disabled: Some(
