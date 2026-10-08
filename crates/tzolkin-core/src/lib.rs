@@ -7,6 +7,7 @@ pub mod engine;
 mod expansion_tests;
 pub mod observation;
 pub mod prophecies;
+pub mod public_replay;
 pub mod quick_actions;
 pub mod tribes;
 pub mod types;

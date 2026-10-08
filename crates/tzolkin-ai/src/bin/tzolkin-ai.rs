@@ -55,6 +55,19 @@ fn run() -> Result<(), String> {
         println!("{}", dispatch_cpu(&request)?);
         return Ok(());
     }
+    if command == "dispatch" {
+        // Use the same validated boundary as Wasm/Tauri for offline public replay tooling.
+        let mut request = String::new();
+        std::io::stdin()
+            .take(16 * 1024 * 1024 + 1)
+            .read_to_string(&mut request)
+            .map_err(|e| e.to_string())?;
+        if request.len() > 16 * 1024 * 1024 {
+            return Err("Dispatch input exceeds 16 MiB".into());
+        }
+        println!("{}", tzolkin_core::api::dispatch_game(&request)?);
+        return Ok(());
+    }
     if command == "replay" {
         let path = args.get(1).ok_or("Usage: tzolkin-ai replay PATH")?;
         let replay: replay::GameReplay =
@@ -237,7 +250,7 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "tzolkin-ai choose | selfplay --players 2..5 --seed N --flags 0..15 [--output PATH] | replay PATH | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
+        "tzolkin-ai choose | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--output PATH] | replay PATH | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
     );
     Ok(())
 }

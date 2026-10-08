@@ -268,7 +268,42 @@ pub fn normalize_json_integers(value: &mut Value) {
 /// Validate untrusted v1 save data before restoring it, including component conservation
 /// and at least one enabled choice for every active pending task.
 pub fn validate_game_state(value: &Value) -> bool {
-    if !valid_shape(value) || !valid_expansion(value) || !valid_components(value) {
+    validate_with_scope(value, ValidationScope::Saved)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ValidationScope {
+    Saved,
+    PublicReplay,
+}
+
+/// Internal rule projection only: it is deliberately not a valid saved game.
+/// Empty offers/decks and zero seed are mechanical sentinels, never observations
+/// about the source game's hidden setup or deck order.
+pub(crate) fn validate_public_projection(value: &Value) -> bool {
+    if value["version"] != 1
+        || value["seed"] != 0
+        || value["additionalBuildings"] != false
+        || value.get("expansion").is_some()
+        || value["phase"] == "setup"
+        || !value["players"].as_array().is_some_and(|players| {
+            (3..=4).contains(&players.len())
+                && players.iter().all(|player| {
+                    player["wealthOffer"] == serde_json::json!([])
+                        && player.get("tribe").is_none()
+                        && player.get("tribeOffer").is_none()
+                })
+        })
+        || value["buildingDeck"] != serde_json::json!([])
+        || value["age2Deck"] != serde_json::json!([])
+    {
+        return false;
+    }
+    validate_with_scope(value, ValidationScope::PublicReplay)
+}
+
+fn validate_with_scope(value: &Value, scope: ValidationScope) -> bool {
+    if !valid_shape(value, scope) || !valid_expansion(value) || !valid_components(value, scope) {
         return false;
     }
     let mut normalized = value.clone();
@@ -285,7 +320,7 @@ pub fn validate_game_state(value: &Value) -> bool {
     }
 }
 
-fn valid_shape(value: &Value) -> bool {
+fn valid_shape(value: &Value, scope: ValidationScope) -> bool {
     if !value.is_object()
         || ![1.0, 2.0].contains(&number(&value["version"]))
         || !value["additionalBuildings"].is_boolean()
@@ -334,13 +369,15 @@ fn valid_shape(value: &Value) -> bool {
         if !ids(&player["buildings"], "ALL_BUILDINGS", 40)
             || !ids(&player["monuments"], "MONUMENTS", 7)
             || !ids(&player["wealthOffer"], "STARTING_WEALTH", 4)
-            || player["wealthOffer"].as_array().unwrap().len() != 4
+            || (scope == ValidationScope::Saved
+                && player["wealthOffer"].as_array().unwrap().len() != 4)
             || !ids(&player["wealth"], "STARTING_WEALTH", 3)
-            || !player["wealth"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|id| player["wealthOffer"].as_array().unwrap().contains(id))
+            || (scope == ValidationScope::Saved
+                && !player["wealth"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|id| player["wealthOffer"].as_array().unwrap().contains(id)))
         {
             return false;
         }
@@ -749,7 +786,7 @@ fn expansion_task(task: &Value) -> bool {
     )
 }
 
-fn valid_components(value: &Value) -> bool {
+fn valid_components(value: &Value, scope: ValidationScope) -> bool {
     let players = value["players"].as_array().unwrap();
     let player_count = players.len();
     let collect_ids = |key: &str| -> Vec<&str> {
@@ -766,6 +803,9 @@ fn valid_components(value: &Value) -> bool {
     };
     let unique_ids = |ids: &[&str]| ids.iter().copied().collect::<HashSet<_>>().len() == ids.len();
     if !unique_ids(&collect_ids("wealthOffer")) {
+        return false;
+    }
+    if scope == ValidationScope::PublicReplay && !unique_ids(&collect_ids("wealth")) {
         return false;
     }
     let mut all_buildings = collect_ids("buildings");
