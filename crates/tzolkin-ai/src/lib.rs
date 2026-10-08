@@ -2,9 +2,11 @@
 pub mod dataset;
 pub mod experiment;
 pub mod features;
+pub mod kernel;
 pub mod model;
 pub mod policy;
 pub mod replay;
+pub mod selfplay_batch;
 pub mod training;
 use serde::{Deserialize, Serialize};
 use tzolkin_core::GameMove;

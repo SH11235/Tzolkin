@@ -677,10 +677,49 @@ pub fn observe(s: &GameState, actor: usize) -> Result<Observation, String> {
 }
 /// Reproducible identifier for cancellation/replay checks, not a cryptographic signature.
 pub fn observation_key(o: &Observation) -> Result<String, String> {
-    let mut canonical = o.clone();
-    canonical.observation_key.clear();
-    let bytes = serde_json::to_vec(&canonical).map_err(|e| e.to_string())?;
-    Ok(format!("{:016x}", fingerprint(&bytes)))
+    let mut sink = FingerprintWriter(0xcbf29ce484222325);
+    serde_json::to_writer(&mut sink, &CanonicalObservation(o)).map_err(|e| e.to_string())?;
+    Ok(format!("{:016x}", sink.0))
+}
+// Preserve the exact schema-1 JSON byte order, while borrowing the observation and
+// replacing only its key. Golden parity tests compare this with the prior cloned view.
+struct CanonicalObservation<'a>(&'a Observation);
+impl Serialize for CanonicalObservation<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut object = serializer.serialize_struct("Observation", 29)?;
+        object.serialize_field("observationKey", "")?;
+        macro_rules! fields {
+            ($($name:ident => $key:literal),* $(,)?) => {
+                $(object.serialize_field($key, &self.0.$name)?;)*
+            };
+        }
+        fields! {
+            schema => "schema", move_schema => "moveSchema", actor => "actor",
+            turn_player => "turnPlayer", phase => "phase", round => "round", age => "age",
+            additional_buildings => "additionalBuildings", players => "players", private => "private",
+            first_player => "firstPlayer", turn_order => "turnOrder", turn_index => "turnIndex",
+            turn => "turn", gears => "gears", jungle => "jungle", skull_supply => "skullSupply",
+            skull_spaces => "skullSpaces", first_player_claimed => "firstPlayerClaimed",
+            accumulated_corn => "accumulatedCorn", buildings => "buildings",
+            building_deck_count => "buildingDeckCount", age2_deck_count => "age2DeckCount",
+            monuments => "monuments", pending_task => "pendingTask", food_days => "foodDays",
+            expansion => "expansion", legal_actions => "legalActions",
+        }
+        object.end()
+    }
+}
+struct FingerprintWriter(u64);
+impl std::io::Write for FingerprintWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, b| {

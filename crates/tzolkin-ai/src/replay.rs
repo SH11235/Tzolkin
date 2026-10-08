@@ -47,6 +47,8 @@ pub enum SeatPolicy {
     Learned {
         policy_version: String,
         model_checksum: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inference_backend: Option<String>,
     },
 }
 
@@ -62,7 +64,11 @@ impl SeatPolicy {
             Self::Learned {
                 policy_version,
                 model_checksum,
+                inference_backend,
             } if policy_version == crate::model::LEARNED_POLICY_VERSION
+                && inference_backend.as_ref().is_none_or(|backend| {
+                    ["scalar", "avx2", "sse2", "neon", "simd128"].contains(&backend.as_str())
+                })
                 && model_checksum.len() == 64
                 && model_checksum
                     .bytes()
@@ -177,10 +183,52 @@ pub fn play_game(
 pub fn play_game_using(
     players: usize,
     seed: u32,
+    options: GameOptions,
+    record: bool,
+    source: ReplaySource,
+    decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_internal(players, seed, options, record, source, decide, true)
+}
+/// Native games start from a validated seed/options and use checked legal operations.
+/// Avoids per-transition saved-JSON roundtrips; terminal validation remains mandatory.
+/// Published records must still pass the unchanged full independent replay verifier.
+pub fn play_game_fast(
+    players: usize,
+    seed: u32,
+    options: GameOptions,
+    record: bool,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_using_fast(
+        players,
+        seed,
+        options,
+        record,
+        ReplaySource::SelfPlay {
+            policy_version: POLICY_VERSION.into(),
+            weights: HeuristicWeights::default(),
+        },
+        choose_move,
+    )
+}
+pub fn play_game_using_fast(
+    players: usize,
+    seed: u32,
+    options: GameOptions,
+    record: bool,
+    source: ReplaySource,
+    decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_internal(players, seed, options, record, source, decide, false)
+}
+fn play_game_internal(
+    players: usize,
+    seed: u32,
     mut options: GameOptions,
     record: bool,
     source: ReplaySource,
     mut decide: impl FnMut(&Observation) -> Result<crate::Decision, String>,
+    check_every_step: bool,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
     if !(2..=5).contains(&players) {
         return Err("Players must be 2..5".into());
@@ -228,7 +276,9 @@ pub fn play_game_using(
             String::new()
         };
         state = apply_move(&state, decision.r#move).map_err(|e| format!("Legal-operation failure at decision {decisions} (players={players},seed={seed}): {e}; {chosen:?}"))?;
-        check_state(&state)?;
+        if check_every_step {
+            check_state(&state)?;
+        }
         if record {
             steps.push(ReplayStep {
                 index: decisions,
@@ -243,6 +293,7 @@ pub fn play_game_using(
         }
         decisions += 1;
     }
+    check_state(&state)?;
     if state.final_scores.len() != players {
         return Err("Missing final score entries".into());
     }

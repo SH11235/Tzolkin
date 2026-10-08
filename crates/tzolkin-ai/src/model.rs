@@ -10,6 +10,7 @@ use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, ob
 
 use crate::Decision;
 use crate::features::{FEATURE_COUNT, FEATURE_SCHEMA, FeatureEncoder};
+use crate::kernel::{Kernel, ResolvedKernel};
 
 pub const MODEL_SCHEMA: u32 = 1;
 pub const MODEL_VERSION: &str = "tiny-policy-value-mlp-v1";
@@ -59,14 +60,32 @@ pub struct Prediction {
 /// The borrow prevents artifact mutation while this handle is in use.
 pub struct LoadedPolicy<'a> {
     artifact: &'a ModelArtifact,
+    kernel: ResolvedKernel,
 }
 impl<'a> LoadedPolicy<'a> {
     pub fn new(artifact: &'a ModelArtifact) -> Result<Self, String> {
+        Self::with_kernel(artifact, Kernel::Scalar)
+    }
+    pub fn with_kernel(artifact: &'a ModelArtifact, kernel: Kernel) -> Result<Self, String> {
         artifact.validate()?;
-        Ok(Self { artifact })
+        Ok(Self {
+            artifact,
+            kernel: kernel.resolve()?,
+        })
+    }
+    pub fn backend(&self) -> &'static str {
+        self.kernel.backend()
+    }
+    pub fn predict(
+        &self,
+        features: &[f32],
+        active: [bool; VALUE_SIDES],
+    ) -> Result<Prediction, String> {
+        self.artifact
+            .predict_validated(features, active, self.kernel)
     }
     pub fn choose_move(&self, observation: &Observation) -> Result<Decision, String> {
-        self.artifact.choose_validated(observation)
+        self.artifact.choose_validated(observation, self.kernel)
     }
 }
 
@@ -250,6 +269,44 @@ impl TinyModel {
             ) + self.parameters[BV + side]
         })
     }
+    fn hidden_with_kernel(
+        &self,
+        features: &[f32],
+        hidden: &mut [f32],
+        kernel: ResolvedKernel,
+    ) -> Result<(), String> {
+        if features.len() != FEATURE_COUNT
+            || hidden.len() != HIDDEN
+            || features.iter().any(|value| !value.is_finite())
+        {
+            return Err("Invalid model feature/hidden shape or values".into());
+        }
+        kernel.dot_rows_validated(&self.parameters[W1..B1], features, hidden);
+        for (unit, value) in hidden.iter_mut().enumerate() {
+            *value += self.parameters[B1 + unit];
+            if !value.is_finite() {
+                return Err("Non-finite hidden activation".into());
+            }
+            *value = value.tanh();
+        }
+        Ok(())
+    }
+    fn policy_with_kernel(&self, hidden: &[f32], kernel: ResolvedKernel) -> Result<f32, String> {
+        let value = kernel.dot_validated(&self.parameters[WP..BP], hidden) + self.parameters[BP];
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err("Non-finite policy logit".into())
+        }
+    }
+    fn values_with_kernel(&self, hidden: &[f32], kernel: ResolvedKernel) -> [f32; VALUE_SIDES] {
+        let mut values = [0.0; VALUE_SIDES];
+        kernel.dot_rows_validated(&self.parameters[WV..BV], hidden, &mut values);
+        for (side, value) in values.iter_mut().enumerate() {
+            *value += self.parameters[BV + side];
+        }
+        values
+    }
 }
 
 impl ModelArtifact {
@@ -304,18 +361,31 @@ impl ModelArtifact {
         active: [bool; VALUE_SIDES],
     ) -> Result<Prediction, String> {
         self.validate()?;
+        self.predict_validated(features, active, Kernel::Scalar.resolve()?)
+    }
+    fn predict_validated(
+        &self,
+        features: &[f32],
+        active: [bool; VALUE_SIDES],
+        kernel: ResolvedKernel,
+    ) -> Result<Prediction, String> {
         let mut hidden = [0.0; HIDDEN];
-        self.model.hidden_into(features, &mut hidden)?;
+        self.model
+            .hidden_with_kernel(features, &mut hidden, kernel)?;
         Ok(Prediction {
-            policy_logit: self.model.policy_logit(&hidden)?,
-            utilities: value_softmax(self.model.value_logits(&hidden), active)?,
+            policy_logit: self.model.policy_with_kernel(&hidden, kernel)?,
+            utilities: value_softmax(self.model.values_with_kernel(&hidden, kernel), active)?,
         })
     }
     pub fn choose_move(&self, observation: &Observation) -> Result<Decision, String> {
         self.validate()?;
-        self.choose_validated(observation)
+        self.choose_validated(observation, Kernel::Scalar.resolve()?)
     }
-    fn choose_validated(&self, observation: &Observation) -> Result<Decision, String> {
+    fn choose_validated(
+        &self,
+        observation: &Observation,
+        kernel: ResolvedKernel,
+    ) -> Result<Decision, String> {
         if observation.schema != OBSERVATION_SCHEMA
             || observation.move_schema != MOVE_SCHEMA
             || !(2..=5).contains(&observation.players.len())
@@ -334,8 +404,9 @@ impl ModelArtifact {
         let encoder = FeatureEncoder::new(observation)?;
         for (index, legal) in observation.legal_actions.iter().enumerate() {
             let features = encoder.encode_legal(index)?;
-            self.model.hidden_into(&features, &mut hidden)?;
-            let score = self.model.policy_logit(&hidden)?;
+            self.model
+                .hidden_with_kernel(&features, &mut hidden, kernel)?;
+            let score = self.model.policy_with_kernel(&hidden, kernel)?;
             if best.as_ref().is_none_or(|(_, value)| score > *value) {
                 best = Some((legal, score));
             }

@@ -20,6 +20,7 @@ pub fn learned_seat(model: &ModelArtifact) -> SeatPolicy {
     SeatPolicy::Learned {
         policy_version: LEARNED_POLICY_VERSION.into(),
         model_checksum: model.checksum.clone(),
+        inference_backend: None,
     }
 }
 pub fn learned_game(
@@ -29,6 +30,30 @@ pub fn learned_game(
     options: GameOptions,
     learned_seats: &[usize],
     record: bool,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    learned_game_with_options(
+        model,
+        players,
+        seed,
+        options,
+        learned_seats,
+        record,
+        InferenceOptions::default(),
+    )
+}
+#[derive(Clone, Copy, Default)]
+pub struct InferenceOptions {
+    pub kernel: crate::kernel::Kernel,
+    pub fast: bool,
+}
+pub fn learned_game_with_options(
+    model: &ModelArtifact,
+    players: usize,
+    seed: u32,
+    options: GameOptions,
+    learned_seats: &[usize],
+    record: bool,
+    inference: InferenceOptions,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
     if !(2..=5).contains(&players)
         || learned_seats.is_empty()
@@ -40,30 +65,46 @@ pub fn learned_game(
     {
         return Err("Invalid learned selfplay seats".into());
     }
-    let policy = LoadedPolicy::new(model)?;
+    let policy = LoadedPolicy::with_kernel(model, inference.kernel)?;
     let policies = (0..players)
         .map(|seat| {
             if learned_seats.contains(&seat) {
-                learned_seat(model)
+                SeatPolicy::Learned {
+                    policy_version: LEARNED_POLICY_VERSION.into(),
+                    model_checksum: model.checksum.clone(),
+                    inference_backend: Some(policy.backend().into()),
+                }
             } else {
                 heuristic_seat()
             }
         })
         .collect();
-    replay::play_game_using(
-        players,
-        seed,
-        options,
-        record,
-        ReplaySource::PolicySelfPlay { policies },
-        |observation| {
-            if learned_seats.contains(&observation.actor) {
-                policy.choose_move(observation)
-            } else {
-                choose_move(observation)
-            }
-        },
-    )
+    let decide = |observation: &tzolkin_core::observation::Observation| {
+        if learned_seats.contains(&observation.actor) {
+            policy.choose_move(observation)
+        } else {
+            choose_move(observation)
+        }
+    };
+    if inference.fast {
+        replay::play_game_using_fast(
+            players,
+            seed,
+            options,
+            record,
+            ReplaySource::PolicySelfPlay { policies },
+            decide,
+        )
+    } else {
+        replay::play_game_using(
+            players,
+            seed,
+            options,
+            record,
+            ReplaySource::PolicySelfPlay { policies },
+            decide,
+        )
+    }
 }
 
 #[derive(Serialize)]
