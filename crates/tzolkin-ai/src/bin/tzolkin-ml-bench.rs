@@ -11,7 +11,7 @@ use tzolkin_ai::replay;
 use tzolkin_core::GameOptions;
 use tzolkin_core::observation::{Observation, fingerprint, observe};
 
-const USAGE: &str = "tzolkin-ml-bench --model PATH [--kernel auto|scalar|avx2|sse2|neon|simd128] [--players 3|4] [--seed 11235] [--iterations 1..1000] [--rounds 3..15]\nRelease measurements compare actual inference, feature encoding and legal move selection. Playing strength is not measured.";
+const USAGE: &str = "tzolkin-ml-bench --model PATH [--kernel auto|scalar|avx2|sse2|neon|simd128] [--players 3|4] [--seed 11235] [--iterations 1..1000] [--rounds 3..15]\nDefaults: kernel=auto, players=4, seed=11235, iterations=1, rounds=5.\nRelease measurements compare actual inference, feature encoding and legal move selection. Playing strength is not measured.";
 const MAX_FEATURE_VECTORS: usize = 65_536;
 const MAX_TOTAL_PREDICTIONS: usize = 2_000_000;
 
@@ -114,19 +114,40 @@ fn time(
     Ok(start.elapsed().as_secs_f64())
 }
 
-fn timings(samples: &[f64], operations: usize) -> Value {
+fn timings(name: &str, samples: &[f64], operations: usize) -> Result<Value, String> {
+    if samples.is_empty()
+        || samples
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+        || operations == 0
+    {
+        return Err(format!(
+            "{name}: benchmark requires positive finite round durations and nonzero operations; increase --iterations if the clock reports zero"
+        ));
+    }
     let mut ordered = samples.to_vec();
     ordered.sort_by(f64::total_cmp);
     let median = ordered[ordered.len() / 2];
-    json!({
+    let operations_per_second = operations as f64 / median;
+    let mean_ns_per_operation = median * 1_000_000_000.0 / operations as f64;
+    if !operations_per_second.is_finite()
+        || operations_per_second <= 0.0
+        || !mean_ns_per_operation.is_finite()
+        || mean_ns_per_operation <= 0.0
+    {
+        return Err(format!(
+            "{name}: benchmark rate is outside the finite positive range"
+        ));
+    }
+    Ok(json!({
         "roundSeconds": samples,
         "medianSeconds": median,
         "minSeconds": ordered[0],
         "maxSeconds": ordered[ordered.len() - 1],
         "operationsPerRound": operations,
-        "operationsPerSecond": operations as f64 / median,
-        "meanNsPerOperation": median * 1_000_000_000.0 / operations as f64,
-    })
+        "operationsPerSecond": operations_per_second,
+        "meanNsPerOperation": mean_ns_per_operation,
+    }))
 }
 
 #[derive(Default)]
@@ -294,11 +315,11 @@ fn run(config: Config) -> Result<Value, String> {
             "numericalWithinTolerance": parity.numerical_within_tolerance,
             "inactiveUtilitiesZero": parity.inactive_utilities_zero,
             "policyTolerance": "5e-5 * (1 + abs(scalar logit))", "valueAbsTolerance": 0.00005 },
-        "featureEncoding": timings(&encoding, feature_count * config.iterations),
-        "scalarPredict": timings(&scalar_predict, feature_count * config.iterations),
-        "selectedPredict": timings(&selected_predict, feature_count * config.iterations),
-        "scalarChoose": timings(&scalar_choose, observations.len() * config.iterations),
-        "selectedChoose": timings(&selected_choose, observations.len() * config.iterations),
+        "featureEncoding": timings("featureEncoding", &encoding, feature_count * config.iterations)?,
+        "scalarPredict": timings("scalarPredict", &scalar_predict, feature_count * config.iterations)?,
+        "selectedPredict": timings("selectedPredict", &selected_predict, feature_count * config.iterations)?,
+        "scalarChoose": timings("scalarChoose", &scalar_choose, observations.len() * config.iterations)?,
+        "selectedChoose": timings("selectedChoose", &selected_choose, observations.len() * config.iterations)?,
         "strengthMeasured": false,
         "humanReplayCorpus": false,
         "trainingKernel": "scalar",
@@ -326,6 +347,26 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timing_report_rejects_invalid_clock_samples_and_nonfinite_rates() {
+        for invalid in [0.0, -0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            // A positive median does not make an invalid round acceptable.
+            let error = timings("scalarPredict", &[1.0, invalid, 2.0], 10).unwrap_err();
+            assert!(error.starts_with("scalarPredict:"));
+        }
+        assert!(timings("empty", &[], 10).is_err());
+        assert!(timings("zero work", &[1.0], 0).is_err());
+        assert!(timings("rate overflow", &[f64::MIN_POSITIVE], usize::MAX).is_err());
+        assert!(timings("ns overflow", &[f64::MAX], 1).is_err());
+        let report = timings("valid", &[3.0, 1.0, 2.0], 4).unwrap();
+        assert_eq!(report["medianSeconds"], 2.0);
+        assert_eq!(report["minSeconds"], 1.0);
+        assert_eq!(report["maxSeconds"], 3.0);
+        assert_eq!(report["operationsPerSecond"], 2.0);
+        assert_eq!(report["meanNsPerOperation"], 500_000_000.0);
+        assert_eq!(report["roundSeconds"], json!([3.0, 1.0, 2.0]));
+    }
 
     #[test]
     fn rejects_missing_unknown_duplicate_and_unbounded_arguments() {

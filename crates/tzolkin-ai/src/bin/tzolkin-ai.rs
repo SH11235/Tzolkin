@@ -9,6 +9,8 @@ use tzolkin_core::observation::observe;
 
 struct CountingAllocator;
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+const DEFAULT_INFERENCE_KERNEL: &str = "scalar";
+const DEFAULT_BATCH_GAMES: &str = "8";
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
@@ -46,7 +48,7 @@ fn output(value: &impl serde::Serialize) -> Result<(), String> {
 }
 fn kernel(args: &[String]) -> Result<tzolkin_ai::kernel::Kernel, String> {
     use tzolkin_ai::kernel::Kernel;
-    match value(args, "--kernel", "scalar")?.as_str() {
+    match value(args, "--kernel", DEFAULT_INFERENCE_KERNEL)?.as_str() {
         "scalar" => Ok(Kernel::Scalar),
         "auto" => Ok(Kernel::Auto),
         "avx2" => Ok(Kernel::Avx2),
@@ -317,7 +319,7 @@ fn run() -> Result<(), String> {
         let config = tzolkin_ai::selfplay_batch::BatchConfig {
             players,
             first_seed: seed,
-            games: number(&args, "--games", "8")?,
+            games: number(&args, "--games", DEFAULT_BATCH_GAMES)?,
             threads: number(&args, "--threads", &default_threads.to_string())?,
             options,
         };
@@ -519,7 +521,20 @@ fn run() -> Result<(), String> {
         );
     }
     println!(
-        "tzolkin-ai choose [--model PATH --kernel scalar|auto|avx2|sse2|neon|simd128] | dispatch (validated JSON on stdin) | selfplay --players 2..5 --seed N --flags 0..15 [--fast] [--output PATH] [--model PATH --model-seat all|SEAT --kernel scalar|auto] | selfplay-batch --output NEW_DIRECTORY --players 2..5 --seed FIRST --games 1..10000 --threads 1..32 [--flags 0..15] [--model PATH --kernel scalar|auto] | replay PATH | dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY | train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate X --seed N --value-weight X --resume CHECKPOINT] | evaluate --input DATASET --checkpoint PATH --players 3|4 --seeds HELD_OUT_SEEDS_COMMA_SEPARATED | corpus [--seeds 32] | bench --players 2..5 --flags 0..15 [--iterations 10]\nFlags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\nBench measures correctness-neutral baseline operations; it does not measure playing strength."
+        "tzolkin-ai choose [--model PATH [--kernel KERNEL]]\n\
+         tzolkin-ai dispatch (validated JSON on stdin)\n\
+         tzolkin-ai selfplay [--players 2..5 --seed N --flags 0..15 --fast --output PATH] [--model PATH --model-seat all|SEAT --kernel KERNEL]\n\
+         tzolkin-ai selfplay-batch --output NEW_DIRECTORY [--players 2..5 --seed FIRST --games 1..10000 --threads 1..32 --flags 0..15] [--model PATH --kernel KERNEL]\n\
+         tzolkin-ai replay PATH\n\
+         tzolkin-ai dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY\n\
+         tzolkin-ai train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate X --seed N --value-weight X --resume CHECKPOINT]\n\
+         tzolkin-ai evaluate --input DATASET --checkpoint PATH --players 3|4 --seeds HELD_OUT_SEEDS_COMMA_SEPARATED\n\
+         tzolkin-ai corpus [--seeds 32]\n\
+         tzolkin-ai bench [--players 2..5 --seed N --flags 0..15 --iterations 10]\n\
+         Kernels: scalar|auto|avx2|sse2|neon|simd128; default {DEFAULT_INFERENCE_KERNEL}; --kernel requires --model. Explicit unsupported backends fail; auto resolves available SIMD or scalar.\n\
+         Selfplay/batch defaults: players=2, seed=0, flags=0. Selfplay model-seat=all; batch uses all model seats. Batch games={DEFAULT_BATCH_GAMES}, threads=min(available CPUs,4).\n\
+         Flags: additional=1 tribes=2 prophecies=4 quick=8; five players force quick.\n\
+         Bench measures correctness-neutral baseline operations; it does not measure playing strength."
     );
     Ok(())
 }
@@ -527,5 +542,34 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tzolkin_ai::kernel::Kernel;
+
+    #[test]
+    fn kernel_parser_accepts_documented_variants_and_keeps_scalar_default() {
+        assert_eq!(kernel(&["choose".into()]).unwrap(), Kernel::Scalar);
+        for (name, expected) in [
+            ("scalar", Kernel::Scalar),
+            ("auto", Kernel::Auto),
+            ("avx2", Kernel::Avx2),
+            ("sse2", Kernel::Sse2),
+            ("neon", Kernel::Neon),
+            ("simd128", Kernel::Simd128),
+        ] {
+            assert_eq!(
+                kernel(&["choose".into(), "--kernel".into(), name.into()]).unwrap(),
+                expected
+            );
+        }
+        assert!(kernel(&["choose".into(), "--kernel".into(), "unknown".into()]).is_err());
+        assert_eq!(
+            number::<usize>(&["selfplay-batch".into()], "--games", DEFAULT_BATCH_GAMES).unwrap(),
+            8
+        );
     }
 }
