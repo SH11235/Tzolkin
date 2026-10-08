@@ -2,6 +2,7 @@ use crate::engine::{
     apply_move, available_workers, create_game_with_options, get_available_moves, get_choices,
     get_placement_cost, score_monument,
 };
+use crate::public_replay::{PublicReplayRecord, PublicState, Refills};
 use crate::types::{Choice, GEAR_IDS, GameMove, GameOptions, GameState, GearId, Player};
 use crate::validation::{normalize_json_integers, validate_game_state};
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,19 @@ enum Request {
     },
     Validate {
         value: Value,
+    },
+    PublicReplay {
+        replay: Value,
+    },
+    PublicInspect {
+        state: Value,
+    },
+    PublicApply {
+        state: Value,
+        actor: usize,
+        r#move: GameMove,
+        #[serde(default)]
+        refills: Refills,
     },
     Catalog,
     Score {
@@ -113,6 +127,31 @@ fn dispatch(request: &str, checked: bool) -> Result<String, String> {
                 .map_err(|error| error.to_string())
         }
         Request::Validate { value } => Ok(validate_game_state(&value).to_string()),
+        Request::PublicReplay { replay } => {
+            let replay: PublicReplayRecord =
+                serde_json::from_value(replay).map_err(|error| format!("replay: {error}"))?;
+            serde_json::to_string(&crate::public_replay::verify_public_replay(&replay)?)
+                .map_err(|error| error.to_string())
+        }
+        Request::PublicInspect { state } => {
+            let state: PublicState =
+                serde_json::from_value(state).map_err(|error| format!("publicState: {error}"))?;
+            serde_json::to_string(&crate::public_replay::inspect_public(&state)?)
+                .map_err(|error| error.to_string())
+        }
+        Request::PublicApply {
+            state,
+            actor,
+            r#move,
+            refills,
+        } => serde_json::to_string(&crate::public_replay::apply_public(
+            &serde_json::from_value::<PublicState>(state)
+                .map_err(|error| format!("publicState: {error}"))?,
+            actor,
+            r#move,
+            &refills,
+        )?)
+        .map_err(|error| error.to_string()),
         Request::Catalog => Ok(include_str!("../data/catalog.json").into()),
         Request::Score { state, player, id } => {
             if checked {
