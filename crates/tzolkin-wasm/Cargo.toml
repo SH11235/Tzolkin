@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tzolkin-core = { path = "../tzolkin-core" }
+tzolkin-ai = { path = "../tzolkin-ai" }
 wasm-bindgen = "=0.2.129"
 
 [features]

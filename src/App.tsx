@@ -1,11 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
-import { applyMove, createGame, inspectGame, type GameSnapshot } from './game/engine';
+import { applyMove, createGame, inspectGame, observeGame, type GameSnapshot } from './game/engine';
+import { chooseCpu } from './game/cpu';
 import type { GameMove } from './game/types';
 import { CalendarArt, Icon } from './ui/Icons';
 import { PlayersSidebar } from './ui/PlayersSidebar';
 import { GameBoardView, type View } from './ui/GameBoardView';
 import { ActionsSidebar } from './ui/ActionsSidebar';
-import { SAVE_KEY, parseSession, readSession, type Session } from './game/storage';
+import {
+  SAVE_KEY,
+  controllersFor,
+  parseSession,
+  readSession,
+  type Controller,
+  type Session,
+} from './game/storage';
 import { ResetDialog } from './ui/ResetDialog';
 import { saveGameFile } from './game/files';
 import './App.css';
@@ -29,6 +37,14 @@ function App() {
   const [quickActions, setQuickActions] = useState(false);
   const [saving, setSaving] = useState(false);
   const [names, setNames] = useState(['翡翠の民', '黄金の民', '珊瑚の民', '藍の民', '紫水晶の民']);
+  const [controllers, setControllers] = useState<Controller[]>([
+    'human',
+    'human',
+    'human',
+    'human',
+    'human',
+  ]);
+  const [cpuPaused, setCpuPaused] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const importInput = useRef<HTMLInputElement>(null);
   const choicesRef = useRef<HTMLHeadingElement>(null);
@@ -38,6 +54,15 @@ function App() {
   const actor = game?.players[game.currentPlayer];
   const choices = active?.snapshot.choices ?? [];
   const moves = game?.phase === 'playing' ? (active?.snapshot.moves ?? []) : [];
+  const activeRef = useRef(active);
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
+  const cpuTurn =
+    !!session &&
+    !!game &&
+    game.phase !== 'finished' &&
+    controllersFor(session)[game.currentPlayer] === 'cpu';
   useEffect(() => {
     let cancelled = false;
     void readSession()
@@ -116,11 +141,12 @@ function App() {
     }
   }, [busy, game?.pending, game?.phase, game?.currentPlayer]);
   function play(move: GameMove) {
-    if (!session) return;
+    if (!session || cpuTurn) return;
     void run(async () => {
       const snapshot = await applyMove(session.state, move);
       updateSession(
         {
+          ...session,
           state: snapshot.state,
           history: [...session.history, session.state].slice(-60),
         },
@@ -128,6 +154,50 @@ function App() {
       );
     });
   }
+  useEffect(() => {
+    if (!active || !cpuTurn || cpuPaused || busy || confirmReset) return;
+    const controller = new AbortController();
+    const expected = active;
+    // Keep each decision on its own task so pause, undo and reset stay responsive.
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const observation = await observeGame(
+            expected.session.state,
+            expected.session.state.currentPlayer,
+          );
+          if (controller.signal.aborted) return;
+          const decision = await chooseCpu(observation, controller.signal);
+          if (controller.signal.aborted || activeRef.current !== expected) return;
+          const legal = [...expected.snapshot.choices, ...expected.snapshot.moves].some(
+            (choice) =>
+              !choice.disabled && JSON.stringify(choice.move) === JSON.stringify(decision.move),
+          );
+          if (!legal) throw new Error('CPUが合法でない操作を返しました。');
+          const snapshot = await applyMove(expected.session.state, decision.move);
+          if (controller.signal.aborted || activeRef.current !== expected) return;
+          updateSession(
+            {
+              ...expected.session,
+              state: snapshot.state,
+              history: [...expected.session.history, expected.session.state].slice(-60),
+            },
+            snapshot,
+          );
+        } catch (failure) {
+          if (controller.signal.aborted || activeRef.current !== expected) return;
+          setCpuPaused(true);
+          setError(
+            failure instanceof Error ? failure.message : 'CPUの操作を実行できませんでした。',
+          );
+        }
+      })();
+    }, 20);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [active, cpuTurn, cpuPaused, busy, confirmReset]);
   function start() {
     void run(async () => {
       const snapshot = await createGame(
@@ -139,19 +209,25 @@ function App() {
         {
           state: snapshot.state,
           history: [],
+          controllers: controllers.slice(0, count),
         },
         snapshot,
       );
+      setCpuPaused(false);
       setView('board');
     });
   }
   function undo() {
     if (!session?.history.length) return;
+    setCpuPaused(true);
     const state = session.history.at(-1);
     if (state)
       void run(async () => {
         const snapshot = await inspectGame(state);
-        updateSession({ state: snapshot.state, history: session.history.slice(0, -1) }, snapshot);
+        updateSession(
+          { ...session, state: snapshot.state, history: session.history.slice(0, -1) },
+          snapshot,
+        );
       });
   }
   function resume() {
@@ -159,6 +235,7 @@ function App() {
     void run(async () => {
       const snapshot = await inspectGame(saved.state);
       setActive({ session: { ...saved, state: snapshot.state }, snapshot });
+      setCpuPaused(false);
       setView('board');
     });
   }
@@ -186,6 +263,7 @@ function App() {
         const imported = await parseSession(await file.text());
         const snapshot = await inspectGame(imported.state);
         updateSession({ ...imported, state: snapshot.state }, snapshot);
+        setCpuPaused(false);
         setView('board');
         setNotice('保存した対局を読み込みました。');
       } finally {
@@ -254,7 +332,7 @@ function App() {
             <h2>
               ツォルキン<span>マヤの暦</span>
             </h2>
-            <p className="muted">一つの画面を囲んで、交代で遊べます。</p>
+            <p className="muted">一つの画面で交代して遊ぶか、CPUと対戦できます。</p>
             <fieldset className="player-count">
               <legend>プレイヤー数</legend>
               {[2, 3, 4, 5].map((n) => (
@@ -280,17 +358,36 @@ function App() {
             </p>
             <div className="name-fields">
               {names.slice(0, count).map((name, i) => (
-                <label key={i}>
-                  <span className={`player-dot player-dot-${i}`} />
-                  <span>プレイヤー {i + 1}</span>
-                  <input
-                    value={name}
-                    maxLength={24}
-                    onChange={(e) =>
-                      setNames(names.map((old, j) => (j === i ? e.target.value : old)))
-                    }
-                  />
-                </label>
+                <div className="seat-fields" key={i}>
+                  <label key={i}>
+                    <span className={`player-dot player-dot-${i}`} />
+                    <span>プレイヤー {i + 1}</span>
+                    <input
+                      value={name}
+                      maxLength={24}
+                      onChange={(e) =>
+                        setNames(names.map((old, j) => (j === i ? e.target.value : old)))
+                      }
+                    />
+                  </label>
+                  <label className="controller-field">
+                    <span>操作</span>
+                    <select
+                      aria-label={`プレイヤー ${i + 1}の操作`}
+                      value={controllers[i]}
+                      onChange={(event) =>
+                        setControllers(
+                          controllers.map((old, index) =>
+                            index === i ? (event.target.value as Controller) : old,
+                          ),
+                        )
+                      }
+                    >
+                      <option value="human">人間</option>
+                      <option value="cpu">CPU</option>
+                    </select>
+                  </label>
+                </div>
               ))}
             </div>
             <fieldset className="expansion-options">
@@ -415,6 +512,20 @@ function App() {
           </span>
         </div>
         <div className="header-tools">
+          {session && controllersFor(session).includes('cpu') && game.phase !== 'finished' && (
+            <button
+              className="cpu-toggle"
+              aria-label={cpuPaused ? 'CPUを再開' : 'CPUを一時停止'}
+              title={cpuPaused ? 'CPUを再開' : 'CPUを一時停止'}
+              onClick={() => {
+                setCpuPaused(!cpuPaused);
+                setError('');
+              }}
+              disabled={busy}
+            >
+              {cpuPaused ? '▶' : 'Ⅱ'}
+            </button>
+          )}
           <button
             title="1つ戻す"
             aria-label="1つ戻す"
@@ -447,11 +558,12 @@ function App() {
           </span>
         ))}
       </div>
-      <div className="game-layout" inert={busy}>
+      <div className="game-layout" inert={busy || (cpuTurn && !cpuPaused)}>
         <PlayersSidebar
           game={game}
           availableWorkers={active!.snapshot.availableWorkers}
           expansionCatalog={active!.snapshot.expansionCatalog}
+          controllers={controllersFor(session!)}
         />
         <GameBoardView
           game={game}
@@ -472,6 +584,8 @@ function App() {
           choicesRef={choicesRef}
           showRules={() => setView('rules')}
           newGame={openReset}
+          cpuTurn={cpuTurn}
+          cpuPaused={cpuPaused}
         />
       </div>
       {confirmReset && (

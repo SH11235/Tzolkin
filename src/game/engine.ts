@@ -1,5 +1,6 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { Choice, ExpansionCatalog, GameMove, GameState, GearId } from './types';
+import type { Observation } from './cpu';
 
 export interface GameSnapshot {
   state: GameState;
@@ -67,6 +68,10 @@ export function applyMove(state: GameState, move: GameMove): Promise<GameSnapsho
 
 export function inspectGame(state: GameState): Promise<GameSnapshot> {
   return dispatch<GameSnapshot>({ operation: 'inspect', state });
+}
+
+export function observeGame(state: GameState, actor: number): Promise<Observation> {
+  return dispatch<Observation>({ operation: 'observe', state, actor });
 }
 
 export function validateGameState(value: unknown): Promise<boolean> {

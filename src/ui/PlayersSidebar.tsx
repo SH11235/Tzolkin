@@ -9,14 +9,17 @@ import {
 } from '../game/types';
 import { Icon } from './Icons';
 import { effectText, formatScore, resourceNames, technologyNames, templeNames } from './content';
+import type { Controller } from '../game/storage';
 export function PlayersSidebar({
   game,
   availableWorkers,
   expansionCatalog,
+  controllers,
 }: {
   game: GameState;
   availableWorkers: number[];
   expansionCatalog?: ExpansionCatalog;
+  controllers?: Controller[];
 }) {
   return (
     <aside className="players-sidebar" aria-label="プレイヤーの状況">
@@ -31,7 +34,10 @@ export function PlayersSidebar({
         >
           <header>
             <span className="player-dot" />
-            <h2>{player.name}</h2>
+            <h2>
+              {player.name}
+              {controllers?.[player.id] === 'cpu' && <small className="cpu-badge">CPU</small>}
+            </h2>
             <span className="player-score">
               {game.phase === 'setup' ? '—' : formatScore(player.score)}
               <small>点</small>

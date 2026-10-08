@@ -611,7 +611,7 @@ pub fn available_workers(s: &GameState, pid: usize) -> i64 {
         });
     p.workers - n as i64 - quick as i64 - i64::from(s.first_player_claimed == Some(pid))
 }
-fn lowest_position(s: &GameState, g: GearId) -> Option<usize> {
+pub(crate) fn lowest_position(s: &GameState, g: GearId) -> Option<usize> {
     s.gears
         .get(&g)?
         .iter()
@@ -672,7 +672,7 @@ fn raise(s: &mut GameState, t: TempleId) -> Vec<Task> {
 fn gold_purchase_tax(s: &GameState, r: Resource) -> i64 {
     i64::from(r == Resource::Gold && prophecies::active(s) == Some(ProphecyId::GoldShortage))
 }
-fn resource_payments(amount: i64) -> Vec<Resources> {
+pub(crate) fn resource_payments(amount: i64) -> Vec<Resources> {
     let mut out = vec![];
     for wood in 0..=amount {
         for stone in 0..=amount - wood {
@@ -1186,13 +1186,13 @@ fn discard_renovation(s: &mut GameState, id: &Option<String>) {
     );
 }
 #[derive(Clone)]
-struct MonumentOption {
-    id: String,
-    monument_id: String,
-    cost: Resources,
-    renovation: Option<String>,
+pub(crate) struct MonumentOption {
+    pub(crate) id: String,
+    pub(crate) monument_id: String,
+    pub(crate) cost: Resources,
+    pub(crate) renovation: Option<String>,
 }
-fn monument_options(s: &GameState) -> Vec<MonumentOption> {
+pub(crate) fn monument_options(s: &GameState) -> Vec<MonumentOption> {
     let mut out = vec![];
     for id in &s.monuments {
         if let Some(m) = monument(id) {
@@ -1215,14 +1215,14 @@ fn monument_options(s: &GameState) -> Vec<MonumentOption> {
     out
 }
 #[derive(Clone)]
-struct BuildOption {
-    id: String,
-    building: Building,
-    cost: Resources,
-    architecture: bool,
-    renovation: Option<String>,
+pub(crate) struct BuildOption {
+    pub(crate) id: String,
+    pub(crate) building: Building,
+    pub(crate) cost: Resources,
+    pub(crate) architecture: bool,
+    pub(crate) renovation: Option<String>,
 }
-fn build_options(
+pub(crate) fn build_options(
     s: &GameState,
     remaining: i64,
     corn_payment: bool,
@@ -2791,7 +2791,7 @@ fn refill_buildings(s: &mut GameState) {
         s.buildings.push(s.building_deck.remove(0));
     }
 }
-fn pity_placement(s: &GameState, gear: Option<GearId>) -> bool {
+pub(crate) fn pity_placement(s: &GameState, gear: Option<GearId>) -> bool {
     let p = current(s);
     if gear.is_some_and(|g| prophecies::placement_surcharge(s, g) > 0) {
         return false;

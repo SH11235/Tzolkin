@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as core from '../../src/game/engine';
 import { createGame, inspectGame, validateGameState } from '../../src/game/engine';
-import { parseSession, readSession } from '../../src/game/storage';
+import { controllersFor, parseSession, readSession } from '../../src/game/storage';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -9,6 +9,22 @@ afterEach(() => {
 });
 
 describe('validated save import through the production Rust adapter', () => {
+  it('preserves CPU seats and treats old sessions as hotseat games', async () => {
+    const { state } = await createGame(['a', 'b'], 42);
+    const session = await parseSession(
+      JSON.stringify({ state, history: [], controllers: ['human', 'cpu'] }),
+    );
+    expect(controllersFor(session)).toEqual(['human', 'cpu']);
+    expect(controllersFor(await parseSession(JSON.stringify({ state, history: [] })))).toEqual([
+      'human',
+      'human',
+    ]);
+    for (const controllers of [['cpu'], ['human', 'unknown'], null]) {
+      await expect(
+        parseSession(JSON.stringify({ state, history: [], controllers })),
+      ).rejects.toThrow('操作設定');
+    }
+  });
   it('accepts version-one sessions and removes invalid history without altering the state', async () => {
     const { state } = await createGame(['a', 'b'], 42);
     const imported = await parseSession(

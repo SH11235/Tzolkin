@@ -142,15 +142,8 @@ test('quick action controls use core costs and occupancy and expansion views fit
   page,
 }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  let fixture: GameSnapshot | undefined;
-  for (let seed = 1; seed < 40; seed++) {
-    const candidate = createExpansion(2, { quickActions: true, prophecies: true }, seed);
-    if (candidate.state.expansion?.quickActions?.current === 'corn') {
-      fixture = candidate;
-      break;
-    }
-  }
-  if (!fixture) throw new Error('No corn quick action fixture was found');
+  const fixture = createExpansion(2, { quickActions: true, prophecies: true }, 3);
+  expect(fixture.state.expansion?.quickActions?.current).toBe('corn');
   let state = fixture.state;
   for (let limit = 0; state.phase === 'setup' && limit < 50; limit++) {
     const choice = getChoices(state).find((candidate) => !candidate.disabled);
@@ -164,15 +157,32 @@ test('quick action controls use core costs and occupancy and expansion views fit
   await expect(page.locator('.quick-action-schedule li')).toHaveCount(7);
   await expect(page.getByLabel('時代2のクイックアクション予定')).toHaveCount(0);
   await expect(page.locator('.quick-action-space').filter({ hasText: 'ダミー' })).toHaveCount(2);
+  expect(state.players[state.currentPlayer]!.resources.corn).toBe(0);
+  expect(
+    inspectGame(state).moves.find((choice) => choice.move.type === 'quickAction')?.disabled,
+  ).toBe(true);
+  const placement = page.locator('.quick-action-controls .place-button');
+  await expect(placement).toBeDisabled();
+  await page.getByRole('button', { name: /^物乞いしてコーンを 3 にする/ }).click();
+  state = applyMove(state, { type: 'beg' });
+  expect(await stateOf(page)).toEqual(state);
+  const apology = getChoices(state).find((choice) => choice.id === 'temple:kukulkan');
+  if (!apology || apology.disabled)
+    throw new Error('The begging temple choice should be available');
+  await choose(page, apology);
+  state = applyMove(state, apology.move);
+  expect(await stateOf(page)).toEqual(state);
+  expect(state.players[state.currentPlayer]!.resources.corn).toBe(3);
   const move = inspectGame(state).moves.find((choice) => choice.move.type === 'quickAction');
   if (!move || move.disabled) throw new Error('Corn quick action should be available');
-  const placement = page.locator('.quick-action-controls .place-button');
+  await expect(placement).toBeEnabled();
   await expect(placement).toContainText(move.label);
   if (move.description) await expect(placement).toContainText(move.description);
   await placement.click();
   await expect.poll(async () => (await stateOf(page)).turn.count).toBe(1);
   const expected = applyMove(state, move.move);
   expect(await stateOf(page)).toEqual(expected);
+  expect(expected.players[state.currentPlayer]!.resources.corn).toBe(2);
   await expect(page.locator('.quick-action-space').filter({ hasText: '翡翠' })).toHaveCount(1);
   await expect(placement).toBeDisabled();
   for (const label of ['神殿', '建物・記念碑', '対局記録', '遊び方', '歯車']) {
