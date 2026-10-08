@@ -525,9 +525,18 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
       )
         fail('Invalid initial-event coverage');
     } else if (row.kind === 'nonGame') {
+      const suffix = 'のプレイヤーカラーは設定で選ばれました。設定を変更する';
+      const colorNames = event.rawText.endsWith(suffix)
+        ? event.rawText
+            .slice(0, -suffix.length)
+            .split(',')
+            .map((name) => name.trim())
+        : [];
       if (
         row.reason !== 'playerColors' ||
-        !event.rawText.endsWith('のプレイヤーカラーは設定で選ばれました。設定を変更する')
+        /[\r\n]/.test(event.rawText) ||
+        !colorNames.length ||
+        colorNames.some((name) => !names.includes(name))
       )
         fail('Game/unknown event cannot be ignored');
     } else if (row.kind === 'cancel') {
@@ -552,6 +561,17 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
       const actorOperations = matched.filter(
         (operation) => names[operation.step.actor] === event.actor,
       );
+      if (event.actor !== null && actorOperations.length !== matched.length)
+        fail('Source group contains an operation by a different actor');
+      if (event.kind === 'gearAction' && event.detail.source === 'removal') {
+        if (
+          matched.length !== 2 ||
+          matched[0].action.type !== 'remove' ||
+          matched[1].action.type !== 'useAction' ||
+          !same(matched[0].state, matched[1].beforeState)
+        )
+          fail('Source removal requires only its consecutive remove/useAction micro-operations');
+      } else if (matched.length !== 1) fail('Source event supports exactly one explicit operation');
       const supported = [
         'place',
         'gearAction',
@@ -639,8 +659,10 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
         event.kind === 'gearAdvanced' &&
         !matched.some(
           (operation) =>
-            operation.action.type === 'endTurn' &&
-            operation.state.round > operation.beforeState.round,
+            ((operation.action.type === 'endTurn' && operation.action.doubleAdvance !== true) ||
+              (operation.action.type === 'rotate' && operation.action.days === 1)) &&
+            (operation.state.round - operation.beforeState.round === 1 ||
+              (operation.beforeState.phase === 'playing' && operation.state.phase === 'finished')),
         )
       )
         fail('Source gear advance differs from explicit round transition');
@@ -699,6 +721,7 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
   if (
     report.status !== companion.status ||
     report.verifiedSteps !== steps.length ||
+    report.checkpointsVerified !== steps.length + 1 + (record.terminalCheckpoint ? 1 : 0) ||
     !Array.isArray(report.frames) ||
     report.frames.length !== steps.length + 1 ||
     report.frames.length > MAX_STEPS + 1 ||

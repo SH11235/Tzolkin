@@ -243,7 +243,10 @@ test('known actor effects cannot be attached to an unrelated legal placement', (
     message.raw_text = text;
     message.icons = [{ classes: 'tz_icon resource_corn imgtext' }];
     input.companion.rawSha256 = sha256(JSON.stringify(input.raw));
-    assert.throws(() => audit(input), /Source (worker gain|build|monument|effect|gear advance)/);
+    assert.throws(
+      () => audit(input),
+      /Source (worker gain|build|monument|effect|gear advance|group)/,
+    );
   }
 });
 
@@ -252,6 +255,19 @@ test('each raw provenance ID must reverse-map to that operation, including cance
   input.companion.timeline.find((node) => node.id === 'op8').step.sourceActionIds = [7, 8];
   input.companion.record.steps[0].sourceActionIds = [7, 8];
   assert.throws(() => audit(input), /provenance ID has no matching move coverage/);
+});
+
+test('player-color notice cannot conceal a game effect or an unknown player', () => {
+  for (const text of [
+    'Bは新しいワーカーを獲得した\nA, Bのプレイヤーカラーは設定で選ばれました。設定を変更する',
+    'unknownのプレイヤーカラーは設定で選ばれました。設定を変更する',
+  ]) {
+    const input = fixture();
+    input.raw.entries[0].raw_text = text;
+    input.raw.dom_entries[0].messages[0].raw_text = text;
+    input.companion.rawSha256 = sha256(JSON.stringify(input.raw));
+    assert.throws(() => audit(input), /Game\/unknown event cannot be ignored/);
+  }
 });
 
 test('unsupported options, hidden metadata and terminal/partial confusion are refused', () => {
@@ -293,6 +309,9 @@ test('requires consistent bounded authoritative replay report, not a trusted inp
   for (const mutate of [
     (report) => {
       report.verifiedSteps = 99;
+    },
+    (report) => {
+      report.checkpointsVerified = 99;
     },
     (report) => {
       report.frames.push(structuredClone(report.frames[0]));
@@ -354,6 +373,44 @@ test(
       );
       await assert.rejects(stat(join(temporary, 'invalid')), { code: 'ENOENT' });
       const corruptions = [
+        ...[false, true].map((otherActor) => ({
+          name: otherActor ? 'unrelated-actor-group' : 'unrelated-same-actor-group',
+          expected: otherActor
+            ? /Source group contains an operation by a different actor/
+            : /Source event supports exactly one explicit operation/,
+          mutate: (changed) => {
+            changed.companion.cutoffActionId = 8;
+            changed.companion.witnesses = changed.companion.witnesses.filter(
+              (witness) => witness.actionId <= 8,
+            );
+            changed.companion.timeline = changed.companion.timeline.filter(
+              (node) => node.kind !== 'cancel' || node.actionId !== 9,
+            );
+            changed.companion.coverage = changed.companion.coverage.filter(
+              (row) => row.actionId !== 9,
+            );
+            const placement = changed.companion.timeline.find((node) => node.id === 'op8');
+            const end = structuredClone(placement);
+            end.id = 'extraEnd';
+            end.step.move = { type: 'endTurn' };
+            const injected = [end];
+            if (otherActor) {
+              const next = structuredClone(placement);
+              next.id = 'extraOther';
+              next.step.actor = 1;
+              next.step.move = { type: 'place', gear: 'yaxchilan' };
+              injected.push(next);
+            }
+            // Each legal injected operation keeps corn/score and the market unchanged,
+            // so counter checkpoints alone cannot establish its source provenance.
+            changed.companion.timeline.push(...injected);
+            changed.companion.record.steps.push(...injected.map((node) => node.step));
+            changed.companion.coverage.find((row) => row.actionId === 8).moveIds = [
+              'op8',
+              ...injected.map((node) => node.id),
+            ];
+          },
+        })),
         {
           name: 'residual',
           expected: /Raw\/DOM message text mismatch/,
@@ -364,7 +421,7 @@ test(
         },
         {
           name: 'wrong-actor',
-          expected: /Source build differs/,
+          expected: /Source group contains an operation by a different actor/,
           mutate: (changed) => {
             changed.raw.entries.find((entry) => entry.action_id === 8).raw_text = 'Bは建物を建てた';
             changed.raw.dom_entries.find((entry) => entry.action_id === 8).messages[0].raw_text =
