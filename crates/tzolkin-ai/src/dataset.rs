@@ -184,7 +184,9 @@ fn game_id(replay: &GameReplay) -> Result<String, String> {
     serde_json::to_writer(&mut sink, replay).map_err(|e| e.to_string())?;
     Ok(hex(sink.0.finalize()))
 }
-fn family_id(seed: u32) -> String {
+/// Stable seed-family identity shared by dataset export and strength evaluation.
+/// Player counts, seats, options and policy coefficients do not change the family.
+pub fn seed_family_id(seed: u32) -> String {
     let mut hash = Sha256::new();
     hash.update(b"tzolkin-seed-family-v1\0");
     hash.update(seed.to_le_bytes());
@@ -373,7 +375,7 @@ fn export_sources<'a>(
         if !seen.insert(id.clone()) {
             return Err("Duplicate game in dataset".into());
         }
-        let family = family_id(record.header.seed);
+        let family = seed_family_id(record.header.seed);
         let game = DatasetGame {
             game_id: id,
             family_id: family.clone(),

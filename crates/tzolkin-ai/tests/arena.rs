@@ -42,6 +42,16 @@ fn cli(args: &[&str]) -> std::process::Output {
         .output()
         .unwrap()
 }
+fn without_elapsed(mut report: serde_json::Value) -> serde_json::Value {
+    for block in report["blocks"].as_array_mut().unwrap() {
+        for pair in block["pairs"].as_array_mut().unwrap() {
+            for arm in ["candidate", "reference"] {
+                pair[arm].as_object_mut().unwrap().remove("elapsedMs");
+            }
+        }
+    }
+    report
+}
 
 #[test]
 fn explicit_default_keeps_all_decisions_scores_keys_and_hidden_information_contract() {
@@ -121,6 +131,14 @@ fn identical_candidate_and_reference_have_exact_zero_deltas_for_every_seat_in_fr
                 assert_eq!(pair.candidate.final_scores, pair.reference.final_scores);
                 assert_eq!(pair.candidate.decisions, pair.reference.decisions);
                 assert_eq!(pair.candidate.start_of_play, pair.reference.start_of_play);
+                assert_eq!(
+                    pair.candidate.terminal_players,
+                    pair.reference.terminal_players
+                );
+                assert_eq!(
+                    pair.candidate.terminal_players.as_ref().unwrap().len(),
+                    players
+                );
                 assert!(pair.candidate.start_of_play.is_some());
                 assert!(pair.candidate.unfed_workers.is_none());
             }
@@ -134,6 +152,23 @@ fn identical_candidate_and_reference_have_exact_zero_deltas_for_every_seat_in_fr
 
 #[test]
 fn partitions_limits_and_unknown_configuration_are_checked_before_games() {
+    for (seed, expected) in [
+        (
+            0,
+            "99dc81cb04d16afb2bfba9f0be0226b386cb3ad3eff42f23fed148a5549e4225",
+        ),
+        (
+            1,
+            "b2ea8ca9deb05b5c652b4784e7fc97fab420751d5634a6209af0f30ecb45a35a",
+        ),
+        (
+            u32::MAX,
+            "c76fc371ef1a390f82da9dfb3a0403f5f475b23238ff067075ce549bd0edabad",
+        ),
+    ] {
+        assert_eq!(family_id(seed), expected);
+        assert_eq!(dataset::seed_family_id(seed), expected);
+    }
     for (partition, split) in [
         (Partition::Pilot, dataset::DatasetSplit::Train),
         (Partition::Validation, dataset::DatasetSplit::Validation),
@@ -204,13 +239,37 @@ fn weighted_selfplay_is_verifiable_and_dataset_source_is_content_bound() {
         state.final_scores
     );
     let path = guard.0.join("dataset");
-    dataset::export_dataset(std::slice::from_ref(&record), &path).unwrap();
+    let default_policies = vec![experiment::heuristic_seat(); 3];
+    let default_record = replay::play_game_using_fast(
+        3,
+        0,
+        GameOptions::default(),
+        true,
+        replay::ReplaySource::PolicySelfPlay {
+            policies: default_policies,
+        },
+        choose_move,
+    )
+    .unwrap()
+    .2
+    .unwrap();
+    dataset::export_dataset(&[record.clone(), default_record], &path).unwrap();
     let loaded = dataset::load_dataset(&path).unwrap();
     assert!(
         loaded.manifest().games[0]
             .policy_version
             .starts_with("policy-selfplay-v1:")
     );
+    assert_eq!(loaded.manifest().strata.len(), 2);
+    assert_ne!(
+        loaded.manifest().games[0].policy_version,
+        loaded.manifest().games[1].policy_version
+    );
+    for game in &loaded.manifest().games {
+        assert_eq!(game.family_id, dataset::seed_family_id(0));
+        assert_eq!(game.family_id, family_id(0));
+        assert_eq!(game.split, seed_partition(0).unwrap());
+    }
     let mut corrupted = record;
     if let replay::ReplaySource::PolicySelfPlay { policies } = &mut corrupted.header.source
         && let replay::SeatPolicy::Heuristic { weights, .. } = &mut policies[0]
@@ -242,6 +301,12 @@ fn cli_preserves_existing_reports_and_learned_arena_binds_dataset_and_partition(
         serde_json::from_slice(&std::fs::read(&report_path).unwrap()).unwrap();
     assert_eq!(report["statistics"]["failedGames"], 0);
     assert_eq!(report["statistics"]["meanUtilityDelta"], 0.0);
+    assert_eq!(report["statistics"]["candidateFailedGames"], 0);
+    assert_eq!(report["statistics"]["referenceFailedGames"], 0);
+    assert_eq!(
+        report,
+        serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap()
+    );
     let before = std::fs::read(&report_path).unwrap();
     assert!(
         !cli(&[
@@ -255,6 +320,43 @@ fn cli_preserves_existing_reports_and_learned_arena_binds_dataset_and_partition(
         .success()
     );
     assert_eq!(before, std::fs::read(&report_path).unwrap());
+    let api_report = run_arena(&config(3, 1), Path::new(".")).unwrap();
+    let native =
+        replay::play_game_fast(3, api_report.blocks[0].seed, GameOptions::default(), false)
+            .unwrap()
+            .0;
+    let terminal = observe(&native, native.current_player).unwrap();
+    assert_eq!(terminal.phase, Phase::Finished);
+    assert!(terminal.legal_actions.is_empty());
+    for pair in &api_report.blocks[0].pairs {
+        assert_eq!(
+            pair.candidate.terminal_players.as_ref(),
+            Some(&terminal.players)
+        );
+        assert_eq!(
+            pair.reference.terminal_players.as_ref(),
+            Some(&terminal.players)
+        );
+        let value = serde_json::to_string(&pair.candidate.terminal_players).unwrap();
+        for hidden in [
+            "wealthOffer",
+            "tribeOffer",
+            "private",
+            "buildingDeck",
+            "age2Deck",
+        ] {
+            assert!(!value.contains(hidden));
+        }
+    }
+    let api_path = guard.0.join("api-report.json");
+    api_report.save_new(&api_path).unwrap();
+    let api_before = std::fs::read(&api_path).unwrap();
+    assert!(api_report.save_new(&api_path).is_err());
+    assert_eq!(api_before, std::fs::read(&api_path).unwrap());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&api_before).unwrap(),
+        serde_json::to_value(&api_report).unwrap()
+    );
     for args in [
         vec!["arena", "--config"],
         vec!["arena", "--config", "x", "--seed", "1"],
@@ -325,4 +427,45 @@ fn cli_preserves_existing_reports_and_learned_arena_binds_dataset_and_partition(
             .unwrap_err()
             .contains("fingerprint mismatch")
     );
+}
+
+#[test]
+fn cli_recovers_complete_report_when_post_run_publication_fails() {
+    let guard = Temporary::new("publication");
+    let config_path = guard.0.join("control.json");
+    let parent_file = guard.0.join("parent-file");
+    let destination = parent_file.join("report.json");
+    std::fs::write(&config_path, serde_json::to_vec(&config(3, 1)).unwrap()).unwrap();
+    std::fs::write(&parent_file, b"preserve parent file").unwrap();
+    let failed = cli(&[
+        "arena",
+        "--config",
+        config_path.to_str().unwrap(),
+        "--output",
+        destination.to_str().unwrap(),
+    ]);
+    assert!(!failed.status.success());
+    let mut recovered: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    let publication = recovered
+        .as_object_mut()
+        .unwrap()
+        .remove("publication")
+        .unwrap();
+    assert_eq!(publication["success"], false);
+    assert_eq!(publication["path"], destination.to_str().unwrap());
+    assert!(!publication["error"].as_str().unwrap().is_empty());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("publication failed"));
+    assert_eq!(
+        std::fs::read(&parent_file).unwrap(),
+        b"preserve parent file"
+    );
+    assert!(!destination.exists());
+    assert_eq!(recovered["statistics"]["completedGames"], 6);
+    assert_eq!(recovered["statistics"]["failedGames"], 0);
+    for _ in 0..2 {
+        let success = cli(&["arena", "--config", config_path.to_str().unwrap()]);
+        assert!(success.status.success());
+        let report = serde_json::from_slice(&success.stdout).unwrap();
+        assert_eq!(without_elapsed(recovered.clone()), without_elapsed(report));
+    }
 }

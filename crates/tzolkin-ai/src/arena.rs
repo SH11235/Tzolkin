@@ -1,5 +1,7 @@
 //! Paired, seat-rotated experiments. Policies receive only actor observations.
 use crate::dataset::{DatasetSplit, load_dataset, split_for_family};
+// Keep the original arena API while all callers use the dataset's family identity.
+pub use crate::dataset::seed_family_id as family_id;
 use crate::kernel::Kernel;
 use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tzolkin_core::observation::Observation;
+use tzolkin_core::observation::{Observation, PublicPlayer, observe};
 use tzolkin_core::{FinalScore, GameOptions, Phase};
 
 pub const ARENA_SCHEMA: u32 = 1;
@@ -32,12 +34,6 @@ impl Partition {
             Self::Test => DatasetSplit::Test,
         }
     }
-}
-pub fn family_id(seed: u32) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"tzolkin-seed-family-v1\0");
-    hash.update(seed.to_le_bytes());
-    format!("{:x}", hash.finalize())
 }
 pub fn seed_partition(seed: u32) -> Result<DatasetSplit, String> {
     split_for_family(&family_id(seed))
@@ -170,7 +166,6 @@ impl PreparedPolicy {
                     "simd128" => Kernel::Simd128,
                     _ => return Err("Unknown arena inference kernel".into()),
                 };
-                LoadedPolicy::with_kernel(&checkpoint.model, kernel)?;
                 Ok(Self::Learned {
                     model: Box::new(checkpoint.model),
                     kernel,
@@ -179,31 +174,6 @@ impl PreparedPolicy {
             }
         }
     }
-    fn provenance(&self) -> Result<SeatPolicy, String> {
-        Ok(match self {
-            Self::Heuristic(weights) => SeatPolicy::Heuristic {
-                policy_version: crate::POLICY_VERSION.into(),
-                weights: weights.clone(),
-            },
-            Self::Learned { model, kernel, .. } => SeatPolicy::Learned {
-                policy_version: crate::model::LEARNED_POLICY_VERSION.into(),
-                model_checksum: model.checksum.clone(),
-                inference_backend: Some(kernel.resolve()?.backend().into()),
-            },
-        })
-    }
-    fn description(&self) -> Result<PolicyDescription, String> {
-        Ok(PolicyDescription {
-            provenance: self.provenance()?,
-            dataset_fingerprint: match self {
-                Self::Heuristic(_) => None,
-                Self::Learned {
-                    dataset_fingerprint,
-                    ..
-                } => Some(dataset_fingerprint.clone()),
-            },
-        })
-    }
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,23 +181,58 @@ pub struct PolicyDescription {
     pub provenance: SeatPolicy,
     pub dataset_fingerprint: Option<String>,
 }
-enum PolicyHandle<'a> {
+enum PolicyChooser<'a> {
     Heuristic(&'a HeuristicWeights),
     Learned(LoadedPolicy<'a>),
 }
+/// Borrowing the prepared policies keeps coefficients/model bytes immutable for
+/// the entire run. Validation, backend resolution and provenance happen before
+/// game clocks start, rather than once per seat and arm.
+struct PolicyHandle<'a> {
+    chooser: PolicyChooser<'a>,
+    description: PolicyDescription,
+}
 impl<'a> PolicyHandle<'a> {
     fn new(policy: &'a PreparedPolicy) -> Result<Self, String> {
-        Ok(match policy {
-            PreparedPolicy::Heuristic(weights) => Self::Heuristic(weights),
-            PreparedPolicy::Learned { model, kernel, .. } => {
-                Self::Learned(LoadedPolicy::with_kernel(model, *kernel)?)
+        let (chooser, provenance, dataset_fingerprint) = match policy {
+            PreparedPolicy::Heuristic(weights) => (
+                PolicyChooser::Heuristic(weights),
+                SeatPolicy::Heuristic {
+                    policy_version: crate::POLICY_VERSION.into(),
+                    weights: weights.clone(),
+                },
+                None,
+            ),
+            PreparedPolicy::Learned {
+                model,
+                kernel,
+                dataset_fingerprint,
+            } => {
+                let loaded = LoadedPolicy::with_kernel(model, *kernel)?;
+                let provenance = SeatPolicy::Learned {
+                    policy_version: crate::model::LEARNED_POLICY_VERSION.into(),
+                    model_checksum: model.checksum.clone(),
+                    inference_backend: Some(loaded.backend().into()),
+                };
+                (
+                    PolicyChooser::Learned(loaded),
+                    provenance,
+                    Some(dataset_fingerprint.clone()),
+                )
             }
+        };
+        Ok(Self {
+            chooser,
+            description: PolicyDescription {
+                provenance,
+                dataset_fingerprint,
+            },
         })
     }
     fn choose(&self, observation: &Observation) -> Result<Decision, String> {
-        match self {
-            Self::Heuristic(weights) => choose_move_with_weights(observation, weights),
-            Self::Learned(policy) => policy.choose_move(observation),
+        match &self.chooser {
+            PolicyChooser::Heuristic(weights) => choose_move_with_weights(observation, weights),
+            PolicyChooser::Learned(policy) => policy.choose_move(observation),
         }
     }
 }
@@ -242,6 +247,8 @@ pub struct ArmResult {
     /// This runner does not collect complete feeding events; never infer from truncated UI logs.
     pub unfed_workers: Option<usize>,
     pub final_scores: Vec<FinalScore>,
+    /// Allowlisted terminal public players only; never private offers or decks.
+    pub terminal_players: Option<Vec<PublicPlayer>>,
     pub start_of_play: Option<InitialConditions>,
     pub error: Option<String>,
 }
@@ -314,7 +321,12 @@ pub struct SeedBlock {
     pub mean_score_delta: Option<f64>,
     pub mean_rank_improvement: Option<f64>,
 }
-fn play_arm(seed: u32, seat: usize, focal: &PreparedPolicy, pool: &[PreparedPolicy]) -> ArmResult {
+fn play_arm(
+    seed: u32,
+    seat: usize,
+    focal: &PolicyHandle<'_>,
+    pool: &[PolicyHandle<'_>],
+) -> ArmResult {
     let started = Instant::now();
     let mut start_of_play = None;
     let played = (|| {
@@ -323,20 +335,13 @@ fn play_arm(seed: u32, seat: usize, focal: &PreparedPolicy, pool: &[PreparedPoli
             .enumerate()
             .map(|(index, opponent)| {
                 if index == seat {
-                    focal.provenance()
+                    focal.description.provenance.clone()
                 } else {
-                    opponent.provenance()
+                    opponent.description.provenance.clone()
                 }
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let handles = pool
-            .iter()
-            .enumerate()
-            .map(|(index, opponent)| {
-                PolicyHandle::new(if index == seat { focal } else { opponent })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        replay::play_game_using_fast(
+            .collect();
+        let (state, decisions, _) = replay::play_game_using_fast(
             pool.len(),
             seed,
             GameOptions::default(),
@@ -346,12 +351,18 @@ fn play_arm(seed: u32, seat: usize, focal: &PreparedPolicy, pool: &[PreparedPoli
                 if start_of_play.is_none() && observation.phase == Phase::Playing {
                     start_of_play = Some(InitialConditions::from_observation(observation));
                 }
-                handles[observation.actor].choose(observation)
+                if observation.actor == seat {
+                    focal.choose(observation)
+                } else {
+                    pool[observation.actor].choose(observation)
+                }
             },
-        )
+        )?;
+        let terminal_players = observe(&state, state.current_player)?.players;
+        Ok::<_, String>((state, decisions, terminal_players))
     })();
     match played {
-        Ok((state, decisions, _)) => {
+        Ok((state, decisions, terminal_players)) => {
             let winners = state
                 .final_scores
                 .iter()
@@ -374,6 +385,7 @@ fn play_arm(seed: u32, seat: usize, focal: &PreparedPolicy, pool: &[PreparedPoli
                 rank: Some(focal.rank),
                 unfed_workers: None,
                 final_scores: state.final_scores,
+                terminal_players: Some(terminal_players),
                 start_of_play,
                 error: None,
             }
@@ -386,6 +398,7 @@ fn play_arm(seed: u32, seat: usize, focal: &PreparedPolicy, pool: &[PreparedPoli
             rank: None,
             unfed_workers: None,
             final_scores: vec![],
+            terminal_players: None,
             start_of_play,
             error: Some(error),
         },
@@ -422,6 +435,8 @@ pub struct PairedStatistics {
     pub planned_games: usize,
     pub completed_games: usize,
     pub failed_games: usize,
+    pub candidate_failed_games: usize,
+    pub reference_failed_games: usize,
     pub candidate_mean_utility: Option<f64>,
     pub reference_mean_utility: Option<f64>,
     pub mean_utility_delta: Option<f64>,
@@ -481,20 +496,25 @@ fn summarize(blocks: &[SeedBlock], bootstrap_seed: u64) -> PairedStatistics {
         .iter()
         .map(|block| block.pairs.len() * 2)
         .sum::<usize>();
-    let failed_games = blocks
+    let candidate_failed_games = blocks
         .iter()
         .flat_map(|block| &block.pairs)
-        .map(|pair| {
-            usize::from(pair.candidate.error.is_some())
-                + usize::from(pair.reference.error.is_some())
-        })
-        .sum();
+        .filter(|pair| pair.candidate.error.is_some())
+        .count();
+    let reference_failed_games = blocks
+        .iter()
+        .flat_map(|block| &block.pairs)
+        .filter(|pair| pair.reference.error.is_some())
+        .count();
+    let failed_games = candidate_failed_games + reference_failed_games;
     PairedStatistics {
         complete_blocks: complete.len(),
         incomplete_blocks: blocks.len() - complete.len(),
         planned_games,
         completed_games: planned_games - failed_games,
         failed_games,
+        candidate_failed_games,
+        reference_failed_games,
         candidate_mean_utility: mean(|block| {
             block
                 .pairs
@@ -558,6 +578,12 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
         .iter()
         .map(|policy| PreparedPolicy::load(policy, config, relative_to))
         .collect::<Result<Vec<_>, _>>()?;
+    let candidate = PolicyHandle::new(&candidate)?;
+    let reference = PolicyHandle::new(&reference)?;
+    let pool = pool
+        .iter()
+        .map(PolicyHandle::new)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut blocks = Vec::with_capacity(config.seeds.len());
     for (index, seed) in config.seeds.iter().enumerate() {
         let mut pairs = Vec::with_capacity(config.players);
@@ -590,12 +616,12 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
         players: config.players,
         options: GameOptions::default(),
         partition: config.partition,
-        candidate: candidate.description()?,
-        reference: reference.description()?,
+        candidate: candidate.description,
+        reference: reference.description,
         opponent_pool: pool
             .iter()
-            .map(PreparedPolicy::description)
-            .collect::<Result<Vec<_>, _>>()?,
+            .map(|policy| policy.description.clone())
+            .collect(),
         blocks,
         statistics,
         rules_baseline: replay::RULES_BASELINE.into(),
@@ -627,6 +653,7 @@ mod tests {
             rank: Some(if utility > 0.0 { 1 } else { 3 }),
             unfed_workers: None,
             final_scores: vec![],
+            terminal_players: None,
             start_of_play: None,
             error: None,
         }
@@ -653,13 +680,23 @@ mod tests {
         );
         assert_eq!(result.planned_games, 12);
         assert_eq!(result.completed_games, 12);
+        assert_eq!(result.candidate_failed_games, 0);
+        assert_eq!(result.reference_failed_games, 0);
         assert!(!result.strength_improvement_declared);
         assert_eq!(summarize(&blocks[..1], 0).utility_delta_bootstrap95, None);
         let mut broken = pairs(1.0);
+        broken[0].candidate.error = Some("candidate failed".into());
+        broken[0].candidate.winner_utility = None;
+        broken[0].candidate.score = None;
+        broken[0].candidate.rank = None;
         broken[1].candidate.error = Some("engine failed".into());
         broken[1].candidate.winner_utility = None;
         broken[1].candidate.score = None;
         broken[1].candidate.rank = None;
+        broken[2].reference.error = Some("reference failed".into());
+        broken[2].reference.winner_utility = None;
+        broken[2].reference.score = None;
+        broken[2].reference.rank = None;
         let failed = block(2, broken);
         assert!(!failed.complete);
         assert_eq!(failed.mean_utility_delta, None);
@@ -671,11 +708,94 @@ mod tests {
                 result.completed_games,
                 result.failed_games
             ),
-            (1, 1, 11, 1)
+            (1, 1, 9, 3)
         );
+        assert_eq!(result.candidate_failed_games, 2);
+        assert_eq!(result.reference_failed_games, 1);
         assert_eq!(result.mean_utility_delta, Some(0.0));
         assert!(result.failures_preclude_adoption);
         assert!(!result.strength_improvement_declared);
         assert_eq!(summarize(&[], 0).mean_utility_delta, None);
+    }
+
+    #[test]
+    fn cached_handles_preserve_distinct_weights_models_and_content_provenance() {
+        let weights = HeuristicWeights {
+            worker: 3.0,
+            technology_step: 8.0,
+            ..HeuristicWeights::default()
+        };
+        let prepared = [
+            PreparedPolicy::Heuristic(weights.clone()),
+            PreparedPolicy::Learned {
+                model: Box::new(ModelArtifact::new(replay::catalog_hash(), 0).unwrap()),
+                kernel: Kernel::Scalar,
+                dataset_fingerprint: "a".repeat(64),
+            },
+            PreparedPolicy::Learned {
+                model: Box::new(ModelArtifact::new(replay::catalog_hash(), 1).unwrap()),
+                kernel: Kernel::Scalar,
+                dataset_fingerprint: "b".repeat(64),
+            },
+        ];
+        let handles = prepared
+            .iter()
+            .map(PolicyHandle::new)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut changed_weighted_decision = false;
+        let mut changed_model_decision = false;
+        for state in replay::benchmark_states(3, 0, GameOptions::default()).unwrap() {
+            let observation =
+                tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+            let weighted = handles[0].choose(&observation).unwrap();
+            assert_eq!(
+                weighted,
+                choose_move_with_weights(&observation, &weights).unwrap()
+            );
+            changed_weighted_decision |=
+                weighted.r#move != crate::choose_move(&observation).unwrap().r#move;
+            for index in 1..=2 {
+                let PreparedPolicy::Learned { model, .. } = &prepared[index] else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    handles[index].choose(&observation).unwrap(),
+                    model.choose_move(&observation).unwrap()
+                );
+                let SeatPolicy::Learned {
+                    model_checksum,
+                    inference_backend,
+                    ..
+                } = &handles[index].description.provenance
+                else {
+                    unreachable!()
+                };
+                assert_eq!(model_checksum, &model.checksum);
+                assert_eq!(inference_backend.as_deref(), Some("scalar"));
+            }
+            changed_model_decision |= handles[1].choose(&observation).unwrap().r#move
+                != handles[2].choose(&observation).unwrap().r#move;
+        }
+        assert!(changed_weighted_decision);
+        assert!(changed_model_decision);
+        assert_eq!(
+            handles[1].description.dataset_fingerprint,
+            Some("a".repeat(64))
+        );
+        assert_eq!(
+            handles[2].description.dataset_fingerprint,
+            Some("b".repeat(64))
+        );
+        let mut corrupt = ModelArtifact::new(replay::catalog_hash(), 0).unwrap();
+        corrupt.checksum = "0".repeat(64);
+        assert!(
+            PolicyHandle::new(&PreparedPolicy::Learned {
+                model: Box::new(corrupt),
+                kernel: Kernel::Scalar,
+                dataset_fingerprint: "a".repeat(64),
+            })
+            .is_err()
+        );
     }
 }
