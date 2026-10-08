@@ -180,8 +180,19 @@ fn run() -> Result<(), String> {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         let report = tzolkin_ai::arena::run_arena(&config, base)?;
-        if !destination.is_empty() {
-            report.save_new(std::path::Path::new(&destination))?;
+        if !destination.is_empty()
+            && let Err(error) = report.save_new(std::path::Path::new(&destination))
+        {
+            // A completed experiment remains recoverable even when publication
+            // fails. Keep the report fields/schema and add only failure metadata.
+            let mut recovered = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+            recovered["publication"] = serde_json::json!({
+                "success": false,
+                "path": destination,
+                "error": error,
+            });
+            output(&recovered)?;
+            return Err(format!("Arena report publication failed: {error}"));
         }
         return output(&report);
     }

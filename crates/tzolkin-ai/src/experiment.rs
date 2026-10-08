@@ -1,11 +1,10 @@
 //! Explicit learned-policy experiments. A training loss is never a strength claim.
-use crate::dataset::{DatasetSplit, ValidatedDataset, split_for_family};
+use crate::dataset::{DatasetSplit, ValidatedDataset, seed_family_id, split_for_family};
 use crate::model::{LEARNED_POLICY_VERSION, LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
 use crate::replay::{self, GameReplay, ReplaySource, SeatPolicy};
 use crate::{POLICY_VERSION, choose_move};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::Instant;
 use tzolkin_core::{FinalScore, GameOptions, GameState};
@@ -162,10 +161,7 @@ pub fn evaluate_model(
         options.quick_actions = true;
     }
     for seed in seeds {
-        let mut hash = Sha256::new();
-        hash.update(b"tzolkin-seed-family-v1\0");
-        hash.update(seed.to_le_bytes());
-        let family = format!("{:x}", hash.finalize());
+        let family = seed_family_id(*seed);
         if split_for_family(&family)? != DatasetSplit::Test
             || dataset
                 .manifest()
