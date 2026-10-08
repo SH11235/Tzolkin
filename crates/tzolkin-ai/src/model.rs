@@ -447,9 +447,16 @@ pub(crate) fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T
 static TEMPORARY_SERIAL: AtomicU64 = AtomicU64::new(0);
 /// Publish with an atomic create-new hard link; existing files are never replaced.
 pub(crate) fn write_new_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    write_new_json_bounded(path, value, MAX_ARTIFACT_BYTES)
+}
+pub(crate) fn write_new_json_bounded<T: Serialize>(
+    path: &Path,
+    value: &T,
+    limit: usize,
+) -> Result<(), String> {
     let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_ARTIFACT_BYTES {
-        return Err("Artifact exceeds bounded 8 MiB output".into());
+    if bytes.len() > limit {
+        return Err(format!("Artifact exceeds bounded {limit} byte output"));
     }
     let parent = path
         .parent()

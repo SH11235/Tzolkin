@@ -82,6 +82,8 @@ fn run() -> Result<(), String> {
     match command {
         "choose" => checked_flags(&args, &["--model", "--kernel"], &[])?,
         "dispatch" => checked_flags(&args, &[], &[])?,
+        "arena" => checked_flags(&args, &["--config", "--output"], &[])?,
+        "arena-seeds" => checked_flags(&args, &["--partition", "--start", "--count"], &[])?,
         "dataset" => checked_flags(&args, &["--input", "--output"], &[])?,
         "train" => checked_flags(
             &args,
@@ -138,6 +140,50 @@ fn run() -> Result<(), String> {
         "corpus" => checked_flags(&args, &["--seeds"], &[])?,
         "replay" if args.len() != 2 => return Err("Usage: tzolkin-ai replay PATH".into()),
         _ => {}
+    }
+    if command == "arena-seeds" {
+        let partition = match value(&args, "--partition", "pilot")?.as_str() {
+            "pilot" => tzolkin_ai::arena::Partition::Pilot,
+            "validation" => tzolkin_ai::arena::Partition::Validation,
+            "test" => tzolkin_ai::arena::Partition::Test,
+            _ => return Err("Unknown arena seed partition".into()),
+        };
+        let seeds = tzolkin_ai::arena::partition_seeds(
+            partition,
+            number(&args, "--start", "0")?,
+            number(&args, "--count", "32")?,
+        )?;
+        return output(&serde_json::json!({"partition":partition,"seeds":seeds}));
+    }
+    if command == "arena" {
+        let input = value(&args, "--config", "")?;
+        let destination = value(&args, "--output", "")?;
+        if input.is_empty() {
+            return Err(
+                "Usage: tzolkin-ai arena --config CONFIG.json [--output NEW_REPORT.json]".into(),
+            );
+        }
+        if !destination.is_empty() && std::path::Path::new(&destination).exists() {
+            return Err("Arena output already exists".into());
+        }
+        let file = std::fs::File::open(&input).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > 1024 * 1024 {
+            return Err("Arena configuration exceeds 1 MiB".into());
+        }
+        let config: tzolkin_ai::arena::ArenaConfig =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let base = std::path::Path::new(&input)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let report = tzolkin_ai::arena::run_arena(&config, base)?;
+        if !destination.is_empty() {
+            report.save_new(std::path::Path::new(&destination))?;
+        }
+        return output(&report);
     }
     if command == "choose" {
         let mut request = String::new();
@@ -529,6 +575,8 @@ fn run() -> Result<(), String> {
          tzolkin-ai dataset --input REPLAY_DIRECTORY --output NEW_DIRECTORY\n\
          tzolkin-ai train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate X --seed N --value-weight X --resume CHECKPOINT]\n\
          tzolkin-ai evaluate --input DATASET --checkpoint PATH --players 3|4 --seeds HELD_OUT_SEEDS_COMMA_SEPARATED\n\
+         tzolkin-ai arena-seeds [--partition pilot|validation|test --start N --count 1..1024]\n\
+         tzolkin-ai arena --config CONFIG.json [--output NEW_REPORT.json]\n\
          tzolkin-ai corpus [--seeds 32]\n\
          tzolkin-ai bench [--players 2..5 --seed N --flags 0..15 --iterations 10]\n\
          Kernels: scalar|auto|avx2|sse2|neon|simd128; default {DEFAULT_INFERENCE_KERNEL}; --kernel requires --model. Explicit unsupported backends fail; auto resolves available SIMD or scalar.\n\

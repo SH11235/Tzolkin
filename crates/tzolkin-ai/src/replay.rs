@@ -58,9 +58,7 @@ impl SeatPolicy {
             Self::Heuristic {
                 policy_version,
                 weights,
-            } if policy_version == POLICY_VERSION && *weights == HeuristicWeights::default() => {
-                Ok(())
-            }
+            } if policy_version == POLICY_VERSION => weights.validate(),
             Self::Learned {
                 policy_version,
                 model_checksum,

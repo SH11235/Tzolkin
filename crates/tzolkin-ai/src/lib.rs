@@ -1,4 +1,5 @@
 //! Deterministic, untrained policy operating exclusively on an actor observation.
+pub mod arena;
 pub mod dataset;
 pub mod experiment;
 pub mod features;
@@ -23,6 +24,14 @@ pub struct Decision {
     pub score: f64,
 }
 pub fn choose_move(observation: &Observation) -> Result<Decision, String> {
+    choose_move_with_weights(observation, &policy::HeuristicWeights::default())
+}
+/// Experimental coefficients are explicit; the UI/default CPU keeps its frozen weights.
+pub fn choose_move_with_weights(
+    observation: &Observation,
+    weights: &policy::HeuristicWeights,
+) -> Result<Decision, String> {
+    weights.validate()?;
     if observation.schema != OBSERVATION_SCHEMA || observation.move_schema != MOVE_SCHEMA {
         return Err("Unsupported observation or move schema".into());
     }
@@ -43,10 +52,9 @@ pub fn choose_move(observation: &Observation) -> Result<Decision, String> {
     if key != observation.observation_key {
         return Err("Observation key mismatch".into());
     }
-    let weights = policy::HeuristicWeights::default();
     let mut best = None;
     for action in &observation.legal_actions {
-        let score = policy::score_action(observation, &action.action, &weights);
+        let score = policy::score_action(observation, &action.action, weights);
         if !score.is_finite() {
             return Err("Non-finite policy score".into());
         }
