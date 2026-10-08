@@ -37,8 +37,11 @@ export function catalogHash(): string {
 }
 
 /** Synthetic legal moves test the viewer boundary; this is not an observed BGA game. */
-export function publicReplayFixture(): PublicReplayRecord {
-  let state = createGame(['試験アオ', '試験ミドリ', '試験アカ'], 42);
+export function publicReplayFixture(playerCount: 3 | 4 = 3): PublicReplayRecord {
+  let state = createGame(
+    ['試験アオ', '試験ミドリ', '試験アカ', '試験シロ'].slice(0, playerCount),
+    42,
+  );
   for (let limit = 0; state.phase === 'setup' && limit < 20; limit++) {
     const choice = getChoices(state).find((option) => !option.disabled);
     if (!choice) throw new Error('Fixture setup has no legal choice');
@@ -121,5 +124,20 @@ export function completePublicReplayFixture(): PublicReplayRecord {
     source: { reference: 'synthetic-ui-fixture', actionIds: [replay.steps.length + 10] },
     scores: state.finalScores.map(({ playerId, total, rank }) => ({ playerId, total, rank })),
   };
+  return replay;
+}
+
+/** Synthetic source display evidence remains distinct from an exact terminal score. */
+export function displayPublicReplayFixture(): PublicReplayRecord {
+  const replay = completePublicReplayFixture();
+  replay.terminalDisplayCheckpoint = {
+    source: { reference: 'synthetic-display-fixture; not BGA evidence', actionIds: [999] },
+    mode: 'floorTotal',
+    scores: replay.terminalCheckpoint!.scores.map((score) => ({
+      ...score,
+      total: Math.floor(score.total),
+    })),
+  };
+  replay.terminalCheckpoint = null;
   return replay;
 }

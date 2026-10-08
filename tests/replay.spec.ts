@@ -1,9 +1,145 @@
 import { expect, test, type Page } from '@playwright/test';
-import { completePublicReplayFixture, publicReplayFixture } from './helpers/publicReplay';
+import {
+  completePublicReplayFixture,
+  displayPublicReplayFixture,
+  publicReplayFixture,
+} from './helpers/publicReplay';
 import type { PublicReplayReport } from '../src/game/publicReplay';
 import { request } from './helpers/core';
 
 const SAVE_KEY = 'tzolkin.game.v1';
+
+test('hostile terminal display evidence is rejected before results are rendered', async ({
+  page,
+}) => {
+  const base = displayPublicReplayFixture();
+  const cases: string[] = [];
+  for (const variant of ['missing', 'duplicate', 'rank', 'exact', 'preterminal']) {
+    const replay = variant === 'preterminal' ? publicReplayFixture() : structuredClone(base);
+    replay.terminalDisplayCheckpoint = structuredClone(base.terminalDisplayCheckpoint);
+    const scores = replay.terminalDisplayCheckpoint!.scores;
+    if (variant === 'missing') scores.pop();
+    if (variant === 'duplicate') scores[1]!.playerId = scores[0]!.playerId;
+    if (variant === 'rank') scores[0]!.rank = 0;
+    if (variant === 'exact') {
+      replay.terminalCheckpoint = completePublicReplayFixture().terminalCheckpoint;
+      replay.terminalCheckpoint!.scores[0]!.total++;
+    }
+    cases.push(JSON.stringify(replay));
+  }
+  cases.push(JSON.stringify(base).replace('"mode":"floorTotal"', '"mode":"roundNearest"'));
+  cases.push(JSON.stringify(base).replace('"mode":"floorTotal",', ''));
+  cases.push(JSON.stringify(base).replace(/"total":(-?\d+(?:\.\d+)?)/, '"total":1e999'));
+  await page.goto('/');
+  await page.getByRole('button', { name: '公開リプレイを読み込む', exact: true }).click();
+  for (let index = 0; index < cases.length; index++) {
+    await page.getByLabel('公開リプレイのJSONファイル', { exact: true }).setInputFiles({
+      name: `invalid-display-${index}.json`,
+      mimeType: 'application/json',
+      buffer: Buffer.from(cases[index]!),
+    });
+    await expect(page.getByRole('alert')).toBeVisible();
+    await expect(page.getByRole('table', { name: '公式得点と表示得点', exact: true })).toHaveCount(
+      0,
+    );
+    await expect(page.getByText('終局まで計算済み・表示得点のみ照合', { exact: true })).toHaveCount(
+      0,
+    );
+  }
+  await expect.poll(() => savedText(page)).toBeNull();
+});
+
+test('terminal display comparison shows both results and keeps exact verification unconfirmed', async ({
+  page,
+}) => {
+  const replay = displayPublicReplayFixture();
+  const expected = request<PublicReplayReport>({ operation: 'publicReplay', replay });
+  await page.goto('/');
+  await page.getByRole('button', { name: '公開リプレイを読み込む', exact: true }).click();
+  await page.getByLabel('公開リプレイのJSONファイル', { exact: true }).setInputFiles({
+    name: 'synthetic-display-ending.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(replay)),
+  });
+  await expect(page.getByText('終局まで計算済み・表示得点のみ照合', { exact: true })).toBeVisible();
+  const table = page.getByRole('table', { name: '公式得点と表示得点', exact: true });
+  await expect(table).toHaveCount(0);
+  await page.getByRole('button', { name: '終局', exact: true }).click();
+  await expect(table).toBeVisible();
+  await expect(
+    page.getByText(
+      '得点そのものの厳密な一致は未確認です。記録は部分検証のままで、学習用データは未承認です。',
+      { exact: true },
+    ),
+  ).toBeVisible();
+  await expect(page.getByText('原対局の盤面照合：追加の照合が必要', { exact: true })).toBeVisible();
+  for (const score of expected.terminalDisplayComparison!.scores) {
+    const name = expected.frames.at(-1)!.snapshot.state.players[score.playerId]!.name;
+    const row = table
+      .getByRole('row')
+      .filter({ has: page.getByRole('rowheader', { name, exact: true }) });
+    await expect(row.getByRole('cell')).toHaveText([
+      score.nativeTotal.toString(),
+      score.sourceTotal.toString(),
+      score.difference.toString(),
+      `${score.nativeRank}／${score.sourceRank}`,
+    ]);
+  }
+  await page.getByText('表示得点の証拠', { exact: true }).click();
+  await expect(
+    page.getByText('synthetic-display-fixture; not BGA evidence', { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'この局面のCPU候補を確認', exact: true }),
+  ).toBeDisabled();
+  await page.setViewportSize({ width: 390, height: 844 });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await expectOccupiedTokensInsideGear(page);
+  await expect.poll(() => savedText(page)).toBeNull();
+});
+
+test('replay SVG clipping keeps active four-player worker tokens and controls visible', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto('/');
+  await page.getByRole('button', { name: '公開リプレイを読み込む', exact: true }).click();
+  await page.getByLabel('公開リプレイのJSONファイル', { exact: true }).setInputFiles({
+    name: 'synthetic-four-player-active.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(publicReplayFixture(4))),
+  });
+  await expect(page.getByText('途中までの記録・終局未検証', { exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '記録の末尾', exact: true }).click();
+  await expectOccupiedTokensInsideGear(page);
+  await expect(page.getByRole('button', { name: '場所を取る', exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'この局面のCPU候補を確認', exact: true }),
+  ).toBeEnabled();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+});
+
+async function expectOccupiedTokensInsideGear(page: Page) {
+  const occupied = page.locator('.replay-layout .gear-slot.occupied');
+  expect(await occupied.count()).toBeGreaterThan(0);
+  const clipped = await occupied.evaluateAll((tokens) =>
+    tokens
+      .filter((token) => {
+        const bounds = token.parentElement!.getBoundingClientRect();
+        return [token, ...token.querySelectorAll('.slot-number')].some((part) => {
+          const rect = part.getBoundingClientRect();
+          return (
+            rect.left < bounds.left - 0.5 ||
+            rect.right > bounds.right + 0.5 ||
+            rect.top < bounds.top - 0.5 ||
+            rect.bottom > bounds.bottom + 0.5
+          );
+        });
+      })
+      .map((token) => token.getAttribute('aria-label')),
+  );
+  expect(clipped).toEqual([]);
+}
 
 test('a calculated ending without a source score is visibly unconfirmed', async ({ page }) => {
   const replay = completePublicReplayFixture();

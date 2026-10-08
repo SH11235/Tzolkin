@@ -3,6 +3,7 @@ import { loadPublicReplay, type PublicReplayReport } from '../game/publicReplay'
 import { chooseCpu, type CpuDecision } from '../game/cpu';
 import { GameBoardView, type View } from './GameBoardView';
 import { PlayersSidebar } from './PlayersSidebar';
+import { formatScore } from './content';
 import './ReplayViewer.css';
 
 const missingReasonLabels: Record<string, string> = {
@@ -172,7 +173,9 @@ export function ReplayViewer({ onClose }: { onClose: () => void }) {
                 {report.status === 'complete'
                   ? '終局まで検証済み・最終結果一致'
                   : calculatedToEnd
-                    ? '終局まで計算済み・元対局の結果は未照合'
+                    ? report.terminalDisplayComparison
+                      ? '終局まで計算済み・表示得点のみ照合'
+                      : '終局まで計算済み・元対局の結果は未照合'
                     : '途中までの記録・終局未検証'}
               </span>
               <p>
@@ -231,10 +234,61 @@ export function ReplayViewer({ onClose }: { onClose: () => void }) {
             <p className="replay-readonly">
               閲覧専用です。未公開の初期財産候補と山札の順序は不明のまま扱います。
             </p>
-            {game.phase === 'finished' && !report.terminalMatched && (
-              <p className="replay-readonly">
-                以下の得点・順位はルールエンジンの計算結果です。元対局の終局結果とは照合できていません。
-              </p>
+            {game.phase === 'finished' &&
+              !report.terminalMatched &&
+              !report.terminalDisplayComparison && (
+                <p className="replay-readonly">
+                  以下の得点・順位はルールエンジンの計算結果です。元対局の終局結果とは照合できていません。
+                </p>
+              )}
+            {game.phase === 'finished' && report.terminalDisplayComparison && (
+              <section className="replay-display-comparison" aria-label="終局の表示得点との比較">
+                <h2>公式得点と元対局の表示</h2>
+                <p>
+                  公式得点の小数部を切り捨てた値と、元対局の表示得点・順位を照合しました。
+                  公式得点は小数部を保持します。元対局の内部計算や丸め方を確認したものではありません。
+                </p>
+                {!report.terminalMatched && (
+                  <p>
+                    得点そのものの厳密な一致は未確認です。記録は部分検証のままで、学習用データは未承認です。
+                  </p>
+                )}
+                <div className="table-scroll">
+                  <table aria-label="公式得点と表示得点">
+                    <thead>
+                      <tr>
+                        <th>プレイヤー</th>
+                        <th>公式得点</th>
+                        <th>元対局の表示</th>
+                        <th>差</th>
+                        <th>順位（公式／元対局）</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {report.terminalDisplayComparison.scores.map((score) => (
+                        <tr key={score.playerId}>
+                          <th scope="row">{game.players[score.playerId]?.name}</th>
+                          <td>{formatScore(score.nativeTotal)}</td>
+                          <td>{formatScore(score.sourceTotal)}</td>
+                          <td>{formatScore(score.difference)}</td>
+                          <td>
+                            {score.nativeRank}／{score.sourceRank}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <details>
+                  <summary>表示得点の証拠</summary>
+                  <p>{report.terminalDisplayComparison.source.reference}</p>
+                  {report.terminalDisplayComparison.source.actionIds.length > 0 && (
+                    <p>
+                      元ログの行動 {report.terminalDisplayComparison.source.actionIds.join('・')}
+                    </p>
+                  )}
+                </details>
+              </section>
             )}
             <p className="replay-readonly">
               山札の残り：時代{game.age} {game.buildingDeckCount}枚

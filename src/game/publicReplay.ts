@@ -37,6 +37,11 @@ export interface PublicReplayRecord {
     source: ReplayEvidence;
     scores: Array<{ playerId: number; total: number; rank: number }>;
   } | null;
+  terminalDisplayCheckpoint?: {
+    source: ReplayEvidence;
+    mode: 'floorTotal';
+    scores: Array<{ playerId: number; total: number; rank: number }>;
+  } | null;
 }
 
 export interface PublicReplaySnapshot {
@@ -61,6 +66,18 @@ export interface PublicReplayReport {
   verifiedSteps: number;
   checkpointsVerified: number;
   terminalMatched: boolean;
+  terminalDisplayComparison?: {
+    source: ReplayEvidence;
+    mode: 'floorTotal';
+    scores: Array<{
+      playerId: number;
+      nativeTotal: number;
+      sourceTotal: number;
+      difference: number;
+      nativeRank: number;
+      sourceRank: number;
+    }>;
+  } | null;
   missingReasons: string[];
   sourceCoverage?: { initial: boolean; foodDays: number[]; terminal: boolean; complete: boolean };
   trainingReady?: boolean;
@@ -123,8 +140,48 @@ export async function loadPublicReplay(
     report.frames.length === 0 ||
     report.frames.length > MAX_REPLAY_STEPS + 1 ||
     !['partial', 'complete'].includes(report.status) ||
-    (report.status === 'complete' && (!report.verifiedComplete || !report.terminalMatched))
+    (report.status === 'complete' && (!report.verifiedComplete || !report.terminalMatched)) ||
+    !validTerminalDisplayComparison(report)
   )
     throw new Error('リプレイの検証結果が不正です。');
   return report;
+}
+
+function validTerminalDisplayComparison(report: PublicReplayReport): boolean {
+  const comparison = report.terminalDisplayComparison;
+  if (comparison == null) return true;
+  const state = report.frames.at(-1)?.snapshot?.state;
+  if (
+    !object(comparison) ||
+    comparison.mode !== 'floorTotal' ||
+    state?.phase !== 'finished' ||
+    !object(comparison.source) ||
+    typeof comparison.source.reference !== 'string' ||
+    !comparison.source.reference.trim() ||
+    comparison.source.reference.length > 4096 ||
+    !Array.isArray(comparison.source.actionIds) ||
+    comparison.source.actionIds.length > 64 ||
+    comparison.source.actionIds.some((id) => !Number.isSafeInteger(id) || id < 0) ||
+    !Array.isArray(comparison.scores) ||
+    comparison.scores.length !== state.players.length ||
+    comparison.scores.length !== state.finalScores.length
+  )
+    return false;
+  const seen = new Set<number>();
+  return comparison.scores.every((score) => {
+    if (!object(score) || !Number.isInteger(score.playerId) || seen.has(score.playerId))
+      return false;
+    seen.add(score.playerId);
+    const native = state.finalScores.find((result) => result.playerId === score.playerId);
+    return (
+      !!native &&
+      Number.isFinite(score.sourceTotal) &&
+      Math.abs(score.sourceTotal) <= Number.MAX_SAFE_INTEGER / 4 &&
+      score.nativeTotal === native.total &&
+      score.nativeRank === native.rank &&
+      score.sourceRank === native.rank &&
+      Math.floor(native.total) === score.sourceTotal &&
+      score.difference === native.total - score.sourceTotal
+    );
+  });
 }

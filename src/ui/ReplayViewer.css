@@ -77,6 +77,34 @@
 .replay-position {
   font-weight: 600;
 }
+.replay-display-comparison {
+  margin-block: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.4rem;
+  background: var(--paper);
+  min-width: 0;
+}
+.replay-display-comparison h2 {
+  font-size: 1.1rem;
+}
+.replay-display-comparison p {
+  font-size: 0.85rem;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.replay-display-comparison table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.replay-display-comparison th,
+.replay-display-comparison td {
+  padding: 0.5rem;
+  text-align: left;
+}
+.replay-display-comparison thead th {
+  white-space: normal;
+}
 .replay-cpu {
   display: flex;
   align-items: center;
@@ -100,6 +128,11 @@
 }
 .game-layout.replay-layout {
   grid-template-columns: 260px minmax(0, 1fr);
+}
+.replay-layout .calendar-art,
+.replay-layout .small-gear {
+  /* Keep the rotating SVG's rectangular bounds inside its circular board. */
+  overflow: hidden;
 }
 .replay-error,
 .replay-loading {
