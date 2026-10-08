@@ -1,0 +1,248 @@
+{
+  "description": "Hand-authored sanitized public UI source, not extracted from a native game/state. Source counters, exact DOM marker tokens, atlas positions, fixed table-setting/order text and log messages exist before the test constructs its separate native reconstruction. No real players/table/credentials.",
+  "settings": {
+    "schema": "bga-visible-table-settings-evidence-v1",
+    "tableId": "123",
+    "url": "https://boardgamearena.com/table?table=123",
+    "visibleConfiguration": [
+      { "label": "ゲームモード", "value": "ノーマルモード" },
+      { "label": "ウシュマルコーンの制限", "value": "制限なし" },
+      { "label": "追加建物", "value": "無効" },
+      { "label": "部族", "value": "無効" },
+      { "label": "予言", "value": "無効" },
+      { "label": "クイックアクション", "value": "無効" }
+    ]
+  },
+  "order": {
+    "schema": "bga-initial-order-visible-text-v1",
+    "tableId": "123",
+    "url": "https://boardgamearena.com/table?table=123",
+    "label": "初期手番順（ゲーム開始時）",
+    "text": "A → B → C → D"
+  },
+  "initialBoard": {
+    "sourceActionId": 5,
+    "title": "Aはワーカーを置くか取り除くかしてください",
+    "round": 1,
+    "firstPlayer": "firstplayer_100",
+    "skullSupply": 12,
+    "players": [
+      {
+        "id": "100",
+        "name": "A",
+        "score": 0,
+        "counters": { "corn": 13, "wood": 0, "stone": 1, "gold": 1, "skull": 0, "worker": 3 }
+      },
+      {
+        "id": "101",
+        "name": "B",
+        "score": 0,
+        "counters": { "corn": 9, "wood": 1, "stone": 1, "gold": 0, "skull": 1, "worker": 3 }
+      },
+      {
+        "id": "102",
+        "name": "C",
+        "score": 0,
+        "counters": { "corn": 4, "wood": 1, "stone": 0, "gold": 0, "skull": 0, "worker": 4 }
+      },
+      {
+        "id": "103",
+        "name": "D",
+        "score": 0,
+        "counters": { "corn": 9, "wood": 4, "stone": 0, "gold": 0, "skull": 0, "worker": 3 }
+      }
+    ],
+    "markers": [
+      { "id": "marker_100_temple_chaac", "style": "top: 167px; left: 17px;" },
+      { "id": "marker_100_temple_quetzalcoatl", "style": "top: 191px; left: 101px;" },
+      { "id": "marker_100_temple_kukulcan", "style": "top: 191px; left: 185px;" },
+      { "id": "marker_101_temple_chaac", "style": "top: 191px; left: 24px;" },
+      { "id": "marker_101_temple_quetzalcoatl", "style": "top: 191px; left: 108px;" },
+      { "id": "marker_101_temple_kukulcan", "style": "top: 191px; left: 192px;" },
+      { "id": "marker_102_temple_chaac", "style": "top: 191px; left: 31px;" },
+      { "id": "marker_102_temple_quetzalcoatl", "style": "top: 191px; left: 115px;" },
+      { "id": "marker_102_temple_kukulcan", "style": "top: 191px; left: 199px;" },
+      { "id": "marker_103_temple_chaac", "style": "top: 191px; left: 38px;" },
+      { "id": "marker_103_temple_quetzalcoatl", "style": "top: 191px; left: 122px;" },
+      { "id": "marker_103_temple_kukulcan", "style": "top: 191px; left: 206px;" },
+      { "id": "marker_100_technology_agriculture", "style": "top: 8px; left: 1px;" },
+      { "id": "marker_100_technology_extraction", "style": "top: 61px; left: 1px;" },
+      { "id": "marker_100_technology_architecture", "style": "top: 114px; left: 1px;" },
+      { "id": "marker_100_technology_theology", "style": "top: 167px; left: 1px;" },
+      { "id": "marker_101_technology_agriculture", "style": "top: 15px; left: 1px;" },
+      { "id": "marker_101_technology_extraction", "style": "top: 68px; left: 1px;" },
+      { "id": "marker_101_technology_architecture", "style": "top: 121px; left: 1px;" },
+      { "id": "marker_101_technology_theology", "style": "top: 174px; left: 38px;" },
+      { "id": "marker_102_technology_agriculture", "style": "top: 22px; left: 1px;" },
+      { "id": "marker_102_technology_extraction", "style": "top: 75px; left: 38px;" },
+      { "id": "marker_102_technology_architecture", "style": "top: 128px; left: 1px;" },
+      { "id": "marker_102_technology_theology", "style": "top: 181px; left: 1px;" },
+      { "id": "marker_103_technology_agriculture", "style": "top: 29px; left: 1px;" },
+      { "id": "marker_103_technology_extraction", "style": "top: 82px; left: 1px;" },
+      { "id": "marker_103_technology_architecture", "style": "top: 135px; left: 1px;" },
+      { "id": "marker_103_technology_theology", "style": "top: 188px; left: 38px;" }
+    ],
+    "market": [
+      {
+        "id": "building_age_1_36",
+        "class": "construction building_age_1",
+        "style": "background-position: -198px -82px;"
+      },
+      {
+        "id": "building_age_1_37",
+        "class": "construction building_age_1",
+        "style": "background-position: 0px 0px;"
+      },
+      {
+        "id": "building_age_1_40",
+        "class": "construction building_age_1",
+        "style": "background-position: -198px 0px;"
+      },
+      {
+        "id": "building_age_1_44",
+        "class": "construction building_age_1",
+        "style": "background-position: -66px 0px;"
+      },
+      {
+        "id": "building_age_1_47",
+        "class": "construction building_age_1",
+        "style": "background-position: 0px 0px;"
+      },
+      {
+        "id": "building_age_1_48",
+        "class": "construction building_age_1",
+        "style": "background-position: -66px -164px;"
+      },
+      {
+        "id": "monument_23",
+        "class": "construction monument",
+        "style": "background-position: -132px -82px;"
+      },
+      {
+        "id": "monument_27",
+        "class": "construction monument",
+        "style": "background-position: -66px 0px;"
+      },
+      {
+        "id": "monument_29",
+        "class": "construction monument",
+        "style": "background-position: -66px -164px;"
+      },
+      {
+        "id": "monument_31",
+        "class": "construction monument",
+        "style": "background-position: -198px -82px;"
+      },
+      {
+        "id": "monument_33",
+        "class": "construction monument",
+        "style": "background-position: -264px 0px;"
+      },
+      {
+        "id": "monument_34",
+        "class": "construction monument",
+        "style": "background-position: 0px -164px;"
+      }
+    ],
+    "wealth": [
+      {
+        "id": "player_wealthtiles_100",
+        "tiles": [
+          { "id": "wealth_tile_1", "style": "background-position: -60px -236px;" },
+          { "id": "wealth_tile_2", "style": "background-position: -300px -118px;" }
+        ]
+      },
+      {
+        "id": "player_wealthtiles_101",
+        "tiles": [
+          { "id": "wealth_tile_3", "style": "background-position: -180px -236px;" },
+          { "id": "wealth_tile_4", "style": "background-position: -120px -236px;" }
+        ]
+      },
+      {
+        "id": "player_wealthtiles_102",
+        "tiles": [
+          { "id": "wealth_tile_5", "style": "background-position: -360px 0px;" },
+          { "id": "wealth_tile_6", "style": "background-position: 0px -236px;" }
+        ]
+      },
+      {
+        "id": "player_wealthtiles_103",
+        "tiles": [
+          { "id": "wealth_tile_7", "style": "background-position: -360px -236px;" },
+          { "id": "wealth_tile_8", "style": "background-position: -300px -236px;" }
+        ]
+      }
+    ],
+    "jungle": [
+      {
+        "id": "jungle_2",
+        "tiles": [
+          { "id": "jungle_2_tile_1", "class": "tile corn_tile" },
+          { "id": "jungle_2_tile_2", "class": "tile corn_tile" },
+          { "id": "jungle_2_tile_3", "class": "tile corn_tile" },
+          { "id": "jungle_2_tile_4", "class": "tile corn_tile" }
+        ]
+      },
+      {
+        "id": "jungle_3",
+        "tiles": [
+          { "id": "jungle_3_tile_1", "class": "tile wood_tile" },
+          { "id": "jungle_3_tile_2", "class": "tile wood_tile" },
+          { "id": "jungle_3_tile_3", "class": "tile wood_tile" },
+          { "id": "jungle_3_tile_4", "class": "tile wood_tile" }
+        ]
+      },
+      {
+        "id": "jungle_4",
+        "tiles": [
+          { "id": "jungle_4_tile_1", "class": "tile wood_tile" },
+          { "id": "jungle_4_tile_2", "class": "tile wood_tile" },
+          { "id": "jungle_4_tile_3", "class": "tile wood_tile" },
+          { "id": "jungle_4_tile_4", "class": "tile wood_tile" }
+        ]
+      },
+      {
+        "id": "jungle_5",
+        "tiles": [
+          { "id": "jungle_5_tile_1", "class": "tile wood_tile" },
+          { "id": "jungle_5_tile_2", "class": "tile wood_tile" },
+          { "id": "jungle_5_tile_3", "class": "tile wood_tile" },
+          { "id": "jungle_5_tile_4", "class": "tile wood_tile" }
+        ]
+      }
+    ],
+    "skullSpaces": [
+      { "id": "skullplace_1", "html": "" },
+      { "id": "skullplace_2", "html": "" },
+      { "id": "skullplace_3", "html": "" },
+      { "id": "skullplace_4", "html": "" },
+      { "id": "skullplace_5", "html": "" },
+      { "id": "skullplace_6", "html": "" },
+      { "id": "skullplace_7", "html": "" },
+      { "id": "skullplace_8", "html": "" },
+      { "id": "skullplace_9", "html": "" }
+    ],
+    "workers": [],
+    "workerPlaces": []
+  },
+  "workerPlaceCapture": {
+    "description": "The test expands these explicitly captured gear labels/counts to DOM IDs/rectangles, before constructing any native state.",
+    "gears": [
+      { "label": "palenque", "count": 10 },
+      { "label": "yaxchilan", "count": 10 },
+      { "label": "tikal", "count": 10 },
+      { "label": "uxmal", "count": 10 },
+      { "label": "chichenItza", "count": 13 }
+    ]
+  },
+  "log": [
+    { "action_id": 1, "raw_text": "A, Bのプレイヤーカラーは設定で選ばれました。設定を変更する" },
+    { "action_id": 5, "raw_text": "各プレイヤーは対応する資源を手に入れた" },
+    { "action_id": 6, "raw_text": "AはUxmalの歯車に0\nを支払ってワーカーを置いた" },
+    { "action_id": 7, "raw_text": "Aは行動をキャンセルした" },
+    { "action_id": 8, "raw_text": "AはPalenqueの歯車に0\nを支払ってワーカーを置いた" },
+    { "action_id": 9, "raw_text": "Aは行動をキャンセルした" },
+    { "action_id": 10, "raw_text": "AはUxmalの歯車に1\nを支払ってワーカーを置いた" }
+  ]
+}
