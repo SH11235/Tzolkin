@@ -33,3 +33,6 @@ test-results/
 # Generated Rust and WebAssembly build output
 /target/
 /generated/
+
+# Local Codex settings
+/.codex/config.toml
