@@ -1,6 +1,7 @@
 //! Opt-in, game-local public Trade exit guard. This is not a producer authenticator.
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -19,6 +20,87 @@ pub const POLICY_VERSION: &str = "learned-public-policy-trade-guard-v1";
 pub const PROJECTION_VERSION: &str = "public-trading-state-v1";
 pub const MAX_PUBLIC_STATE_BYTES: usize = 131_072;
 pub const MAX_TRADES: usize = 64;
+pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+pub const MAX_GAME_EXAMPLES: usize = 64;
+pub const MAX_ARENA_EXAMPLES: usize = 4096;
+
+fn network_or_device_path(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let bytes = text.as_bytes();
+    (bytes.len() >= 2
+        && matches!(bytes[0], b'/' | b'\\')
+        && matches!(bytes[1], b'/' | b'\\'))
+        || path.components().any(|component| {
+            matches!(component, Component::Prefix(prefix) if !matches!(prefix.kind(), std::path::Prefix::Disk(_)))
+        })
+}
+
+/// Purpose-specific, closed local configuration input. No URL, network, device,
+/// symlink or junction hierarchy is accepted. Publication has its own authority.
+pub fn load_config(path: &Path) -> Result<TradeGuardConfig, String> {
+    let text = path.to_string_lossy();
+    if text.is_empty()
+        || text.contains('\0')
+        || text.contains("://")
+        || network_or_device_path(path)
+        || path.components().any(|c| matches!(c, Component::ParentDir))
+        || (!path.is_absolute() && matches!(path.components().next(), Some(Component::Prefix(_))))
+    {
+        return Err("Trade guard config requires a local regular file".into());
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    if network_or_device_path(&absolute) {
+        return Err("Network Trade guard config hierarchy rejected".into());
+    }
+    let mut current = PathBuf::new();
+    let mut leaf_metadata = None;
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse = false;
+        if metadata.file_type().is_symlink() || reparse {
+            return Err("Trade guard config symlink/junction hierarchy rejected".into());
+        }
+        leaf_metadata = Some(metadata);
+    }
+    // Reject stationary FIFOs/devices before opening: a FIFO read-only open
+    // can block before the bounded read or post-open type check is reached.
+    let metadata = leaf_metadata.ok_or("Trade guard config requires a local regular file")?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES as u64 {
+        return Err("Trade guard config must be a regular file of at most 64 KiB".into());
+    }
+    let file = std::fs::File::open(&absolute).map_err(|e| e.to_string())?;
+    // Retain handle metadata and the bounded read for changes after preflight.
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES as u64 {
+        return Err("Trade guard config must be a regular file of at most 64 KiB".into());
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_CONFIG_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err("Trade guard config exceeds 64 KiB".into());
+    }
+    let config: TradeGuardConfig = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    config.validate()?;
+    Ok(config)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -171,6 +253,231 @@ pub struct TradeGuardTrace {
     pub raw: GuardCandidate,
     pub skip: GuardCandidate,
     pub effective: GuardCandidate,
+}
+
+/// Fixed Trade/Skip tokens only, rather than full legal-choice strings or views.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CompactTradeChoice {
+    Trade { resource: Resource, buy: bool },
+    Skip,
+}
+impl CompactTradeChoice {
+    fn from_candidate(candidate: &GuardCandidate) -> Result<Self, String> {
+        match &candidate.legal.action {
+            TypedAction::Trade { resource, buy } => Ok(Self::Trade {
+                resource: *resource,
+                buy: *buy,
+            }),
+            TypedAction::Skip => Ok(Self::Skip),
+            _ => Err("Compact Trade example requires Trade/Skip actions".into()),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeGuardExample {
+    pub callback_index: usize,
+    pub actor: usize,
+    pub episode_ordinal: usize,
+    pub public_state_sha256: String,
+    pub trade_count_before: usize,
+    pub trade_count_after: usize,
+    pub raw_index: usize,
+    pub effective_index: usize,
+    pub skip_index: usize,
+    pub raw: CompactTradeChoice,
+    pub effective: CompactTradeChoice,
+    pub raw_logit: f32,
+    pub effective_logit: f32,
+    pub skip_logit: f32,
+    pub repeat_seen: bool,
+    pub budget_reached: bool,
+    pub reason: ExitReason,
+}
+impl TradeGuardExample {
+    fn from_trace(t: &TradeGuardTrace) -> Result<Self, String> {
+        if !t.overridden
+            || t.callback_index >= crate::replay::MAX_DECISIONS
+            || t.actor >= 4
+            || t.episode_ordinal >= crate::replay::MAX_DECISIONS
+            || t.trade_count_before > MAX_TRADES
+            || t.trade_count_after > MAX_TRADES
+            || t.public_state_sha256.len() != 64
+            || !t
+                .public_state_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || [&t.raw, &t.effective, &t.skip]
+                .iter()
+                .any(|c| c.legal_index >= crate::model::MAX_CANDIDATES || !c.logit.is_finite())
+        {
+            return Err("Invalid bounded Trade intervention example".into());
+        }
+        Ok(Self {
+            callback_index: t.callback_index,
+            actor: t.actor,
+            episode_ordinal: t.episode_ordinal,
+            public_state_sha256: t.public_state_sha256.clone(),
+            trade_count_before: t.trade_count_before,
+            trade_count_after: t.trade_count_after,
+            raw_index: t.raw.legal_index,
+            effective_index: t.effective.legal_index,
+            skip_index: t.skip.legal_index,
+            raw: CompactTradeChoice::from_candidate(&t.raw)?,
+            effective: CompactTradeChoice::from_candidate(&t.effective)?,
+            raw_logit: t.raw.logit,
+            effective_logit: t.effective.logit,
+            skip_logit: t.skip.logit,
+            repeat_seen: t.repeat_seen,
+            budget_reached: t.budget_reached,
+            reason: t.reason.ok_or("Intervention example missing reason")?,
+        })
+    }
+}
+/// Observation counters precede authoritative apply. Failed-game applied totals
+/// are unavailable. These summaries are diagnostics, not training qualification.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeGuardCallback {
+    pub index: usize,
+    pub actor: usize,
+    pub phase: Phase,
+    pub round: i64,
+    pub trade: bool,
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TradeGuardSummary {
+    pub provenance: SeatPolicy,
+    pub global_notifications: usize,
+    /// The last successful notification, not an apply acknowledgement.
+    pub last_callback: Option<TradeGuardCallback>,
+    pub notified_trade_callbacks: usize,
+    pub guarded_decisions_observed: usize,
+    pub choices_returned: usize,
+    pub failed_choices: usize,
+    pub completed_trade_traces: usize,
+    pub episodes_observed: usize,
+    pub raw_trade_choices: usize,
+    pub effective_trade_choices: usize,
+    pub voluntary_skip_choices: usize,
+    pub repeated_state_conditions: usize,
+    pub trade_budget_conditions: usize,
+    pub repeated_state_overrides: usize,
+    pub trade_budget_overrides: usize,
+    pub max_episode_trade_count: usize,
+    pub intervention_examples: Vec<TradeGuardExample>,
+    pub omitted_intervention_examples: usize,
+    #[serde(skip)]
+    last_episode: Option<usize>,
+}
+/// Shared capture budget affects examples only. Fresh guard histories are separate.
+pub(crate) struct TradeGuardCapture {
+    remaining: usize,
+}
+impl TradeGuardCapture {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+}
+impl TradeGuardSummary {
+    pub(crate) fn new(provenance: &SeatPolicy) -> Result<Self, String> {
+        provenance.validate()?;
+        if !matches!(provenance, SeatPolicy::PublicLearnedTradeGuard { .. }) {
+            return Err("Trade guard summary requires composite provenance".into());
+        }
+        Ok(Self {
+            provenance: provenance.clone(),
+            global_notifications: 0,
+            last_callback: None,
+            notified_trade_callbacks: 0,
+            guarded_decisions_observed: 0,
+            choices_returned: 0,
+            failed_choices: 0,
+            completed_trade_traces: 0,
+            episodes_observed: 0,
+            raw_trade_choices: 0,
+            effective_trade_choices: 0,
+            voluntary_skip_choices: 0,
+            repeated_state_conditions: 0,
+            trade_budget_conditions: 0,
+            repeated_state_overrides: 0,
+            trade_budget_overrides: 0,
+            max_episode_trade_count: 0,
+            intervention_examples: Vec::new(),
+            omitted_intervention_examples: 0,
+            last_episode: None,
+        })
+    }
+    pub(crate) fn notified(&mut self, index: usize, o: &Observation) {
+        self.global_notifications += 1;
+        self.notified_trade_callbacks += usize::from(is_trade(o));
+        self.last_callback = Some(TradeGuardCallback {
+            index,
+            actor: o.actor,
+            phase: o.phase,
+            round: o.round,
+            trade: is_trade(o),
+        });
+    }
+    pub(crate) fn choice_started(&mut self) {
+        self.guarded_decisions_observed += 1;
+    }
+    pub(crate) fn choice_failed(&mut self) {
+        self.failed_choices += 1;
+    }
+    pub(crate) fn returned(
+        &mut self,
+        trace: Option<&TradeGuardTrace>,
+        arm: &mut TradeGuardCapture,
+        run: &mut TradeGuardCapture,
+    ) -> Result<(), String> {
+        self.choices_returned += 1;
+        let Some(t) = trace else {
+            return Ok(());
+        };
+        let SeatPolicy::PublicLearnedTradeGuard {
+            configuration_key, ..
+        } = &self.provenance
+        else {
+            unreachable!()
+        };
+        if t.configuration_key != *configuration_key {
+            return Err("Trade summary configuration mismatch".into());
+        }
+        self.completed_trade_traces += 1;
+        if self.last_episode != Some(t.episode_ordinal) {
+            self.episodes_observed += 1;
+            self.last_episode = Some(t.episode_ordinal);
+        }
+        self.raw_trade_choices +=
+            usize::from(matches!(t.raw.legal.action, TypedAction::Trade { .. }));
+        self.effective_trade_choices += usize::from(matches!(
+            t.effective.legal.action,
+            TypedAction::Trade { .. }
+        ));
+        self.voluntary_skip_choices +=
+            usize::from(!t.overridden && matches!(t.raw.legal.action, TypedAction::Skip));
+        self.repeated_state_conditions += usize::from(t.repeat_seen);
+        self.trade_budget_conditions += usize::from(t.budget_reached);
+        self.repeated_state_overrides +=
+            usize::from(t.reason == Some(ExitReason::RepeatedPublicState));
+        self.trade_budget_overrides +=
+            usize::from(t.reason == Some(ExitReason::EpisodeTradeBudget));
+        self.max_episode_trade_count = self.max_episode_trade_count.max(t.trade_count_after);
+        if t.overridden {
+            let example = TradeGuardExample::from_trace(t)?;
+            if arm.remaining > 0 && run.remaining > 0 {
+                arm.remaining -= 1;
+                run.remaining -= 1;
+                self.intervention_examples.push(example);
+            } else {
+                self.omitted_intervention_examples += 1;
+            }
+        }
+        Ok(())
+    }
 }
 
 // Destructure every Observation field: additions require an explicit decision.
@@ -670,6 +977,76 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tzolkin_core::observation::{observation_key, observe};
     use tzolkin_core::{Pending, Phase, Task, apply_move};
+
+    #[test]
+    fn g2_capture_budgets_omit_examples_without_losing_observed_counts() {
+        use super::*;
+        let mut state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            state = apply_move(&state, crate::choose_move(&o).unwrap().r#move).unwrap();
+        }
+        state.players[state.current_player]
+            .resources
+            .insert(Resource::Corn, 3);
+        state.pending = Some(Pending {
+            title: "Trade capture fixture".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        let o = observe(&state, state.current_player).unwrap();
+        let guard = TradeGuardConfig::default();
+        let model = crate::public_native::integration_fixture::model(false);
+        let handle = crate::public_native::integration_fixture::handle(&model);
+        let provenance = handle.guarded_provenance(&guard).unwrap();
+        let mut session = TradeGuardSession::new(guard).unwrap();
+        session.on_callback(0, &o).unwrap();
+        session.transition(0, &o, 0, 1.0, 0.0).unwrap();
+        session.on_callback(1, &o).unwrap();
+        let intervention = session.transition(1, &o, 0, 1.0, 0.0).unwrap();
+        assert!(intervention.overridden && intervention.repeat_seen);
+        let mut run = TradeGuardCapture::new(2);
+        let mut arm = TradeGuardCapture::new(MAX_GAME_EXAMPLES);
+        let mut summary = TradeGuardSummary::new(&provenance).unwrap();
+        // Counter/capture unit fixture, not extra game callbacks. The production
+        // controller and selection do not receive either capture budget.
+        for _ in 0..3 {
+            summary
+                .returned(Some(&intervention), &mut arm, &mut run)
+                .unwrap();
+        }
+        assert_eq!(summary.intervention_examples.len(), 2);
+        assert_eq!(summary.omitted_intervention_examples, 1);
+        assert_eq!(summary.repeated_state_overrides, 3);
+        assert_eq!(summary.completed_trade_traces, 3);
+        assert_eq!(summary.episodes_observed, 1);
+        assert_eq!(summary.raw_trade_choices, 3);
+        assert_eq!(summary.effective_trade_choices, 0);
+        let mut next_arm = TradeGuardCapture::new(MAX_GAME_EXAMPLES);
+        let mut next = TradeGuardSummary::new(&provenance).unwrap();
+        next.returned(Some(&intervention), &mut next_arm, &mut run)
+            .unwrap();
+        assert!(next.intervention_examples.is_empty());
+        assert_eq!(next.omitted_intervention_examples, 1);
+        let mut run = TradeGuardCapture::new(MAX_ARENA_EXAMPLES);
+        let mut arm = TradeGuardCapture::new(0);
+        next.returned(Some(&intervention), &mut arm, &mut run)
+            .unwrap();
+        assert_eq!(next.omitted_intervention_examples, 2);
+        let mut hostile = intervention;
+        hostile.raw.logit = f32::NAN;
+        assert!(TradeGuardExample::from_trace(&hostile).is_err());
+        hostile.raw.logit = 1.0;
+        hostile.public_state_sha256 = "x".repeat(64);
+        assert!(TradeGuardExample::from_trace(&hostile).is_err());
+        let wire = serde_json::to_string(&summary).unwrap();
+        assert!(
+            !wire.contains("legalActions")
+                && !wire.contains("wealthOffer")
+                && !wire.contains("buy:wood")
+        );
+    }
 
     #[test]
     fn public_projection_bound_and_private_exclusion_do_not_relax_nn_input_guards() {

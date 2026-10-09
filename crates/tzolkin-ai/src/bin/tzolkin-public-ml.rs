@@ -11,6 +11,7 @@ use tzolkin_ai::policy_training::{
 };
 use tzolkin_ai::public_model::{LoadedPublicPolicy, MAX_OBSERVATION_BYTES, PublicPolicyArtifact};
 use tzolkin_ai::public_native::{self, PreparedPublicPolicy};
+use tzolkin_ai::public_trade_guard;
 use tzolkin_core::observation::Observation;
 
 const HELP: &str = "tzolkin-public-ml choose --model PATH [--kernel scalar|auto|avx2|sse2|neon|simd128]\ntzolkin-public-ml export-native --input NATIVE_REPLAY_DIRECTORY --output NEW_DATASET_DIRECTORY\ntzolkin-public-ml train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate F --seed N]\ntzolkin-public-ml resume --input DATASET --checkpoint PATH --epochs TOTAL --output NEW_DIRECTORY [--batch-size N --learning-rate F --seed N]\ntzolkin-public-ml evaluate --input DATASET --model PATH [--split train|validation|test]\ntzolkin-public-ml selfplay --checkpoint PATH --dataset DATASET --seats all|SEAT[,SEAT] [--players 3|4 --seed N --flags 0 --kernel scalar|auto|avx2|sse2|neon|simd128 --output NEW_REPLAY_FILE]\nchoose reads a bounded core Observation JSON from stdin and writes a Decision JSON.\nChoose defaults to scalar. BC training/resume/evaluation are Scalar only, base 3-4p, policy-only, value unavailable.\nTrain defaults: epochs=3, batch-size=16, learning-rate=0.001, seed=7. Resume inherits unchanged optimizer config; --epochs is required. Evaluate defaults to validation.\nSelfplay defaults: players=3, seed=0, flags=0, kernel=scalar; explicit --seats is required. Arena also accepts publicLearned configs. Human admission, PPO, calibrated estimates and CPU adoption are separate units.";
@@ -131,6 +132,7 @@ fn selfplay(args: &[String]) -> Result<(), String> {
             "--seats",
             "--kernel",
             "--output",
+            "--trade-guard-config",
         ],
     )?;
     let checkpoint = parsed
@@ -180,20 +182,50 @@ fn selfplay(args: &[String]) -> Result<(), String> {
             .map_err(|error| format!("Replay output must be a new local file: {error}"))?;
     }
     let kernel = public_native::parse_kernel(parsed.get("--kernel").copied().unwrap_or("scalar"))?;
+    let guard = parsed
+        .get("--trade-guard-config")
+        .map(|path| public_trade_guard::load_config(Path::new(path)))
+        .transpose()?;
     let prepared = PreparedPublicPolicy::load(Path::new(checkpoint), Path::new(dataset), kernel)?;
     let handle = prepared.handle()?;
+    let guarded_provenance = guard
+        .as_ref()
+        .map(|guard| handle.guarded_provenance(guard))
+        .transpose()?;
     // Dataset/model qualification and backend resolution are excluded from the game clock.
     let started = Instant::now();
-    let played = public_native::play_game(
-        &handle,
-        players,
-        seed,
-        tzolkin_core::GameOptions::default(),
-        &seats,
-        output.is_some(),
-    );
-    let (mut summary, failure) =
-        selfplay_report(players, seed, &seats, handle.provenance(), played, output)?;
+    let (mut summary, failure) = if let Some(guard) = guard {
+        let outcome = public_native::play_game_guarded_with_summary(
+            &handle,
+            players,
+            seed,
+            tzolkin_core::GameOptions::default(),
+            &seats,
+            output.is_some(),
+            guard,
+        )?;
+        guarded_selfplay_report(
+            players,
+            seed,
+            &seats,
+            guarded_provenance
+                .as_ref()
+                .expect("prepared guarded provenance"),
+            outcome.game,
+            &outcome.trade_guard,
+            output,
+        )?
+    } else {
+        let played = public_native::play_game(
+            &handle,
+            players,
+            seed,
+            tzolkin_core::GameOptions::default(),
+            &seats,
+            output.is_some(),
+        );
+        selfplay_report(players, seed, &seats, handle.provenance(), played, output)?
+    };
     summary["elapsedMs"] = (started.elapsed().as_secs_f64() * 1000.0).into();
     write_stdout(&summary)?;
     if let Some(error) = failure {
@@ -210,6 +242,23 @@ type PlayedGame = Result<
     ),
     String,
 >;
+
+fn guarded_selfplay_report(
+    players: usize,
+    seed: u32,
+    seats: &[usize],
+    policy: &tzolkin_ai::replay::SeatPolicy,
+    played: PlayedGame,
+    trade_guard: &impl serde::Serialize,
+    output: Option<&str>,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let (mut summary, failure) = selfplay_report(players, seed, seats, policy, played, output)?;
+    summary["schema"] = "tzolkin-public-policy-trade-guard-selfplay-v1".into();
+    summary["tradeGuard"] = serde_json::to_value(trade_guard).map_err(|e| e.to_string())?;
+    summary["tradeGuardCounts"] =
+        "observed pre-apply choices; failed-game applied totals unavailable".into();
+    Ok((summary, failure))
+}
 
 // Keep completion and publication separate: a late save failure must retain the completed result.
 fn selfplay_report(
@@ -389,6 +438,9 @@ fn run() -> Result<(), String> {
         println!(
             "tzolkin-public-ml export-state-native --input NATIVE_REPLAY_DIRECTORY --output NEW_STATE_MC_DIRECTORY\ntzolkin-public-ml train-state --input STATE_MC_DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate F --seed N]\ntzolkin-public-ml resume-state --input STATE_MC_DATASET --checkpoint PATH --epochs TOTAL --output NEW_DIRECTORY [--batch-size N --learning-rate F --seed N]\ntzolkin-public-ml evaluate-state --input STATE_MC_DATASET --checkpoint PATH [--split train|validation|test]\nState-MC is a separate Scalar complete-native gamma=1/lambda=1 raw state-MSE task. Defaults3/16/.001/7; resume inherits config except required total epochs; evaluation defaultsValidation. Estimates remain unqualified. PPO and CPU adoption are separate units."
         );
+        println!(
+            "Opt-in guarded selfplay adds --trade-guard-config LOCAL_FILE (closed config, at most 64 KiB); this flag is rejected by every other command. Arena also accepts the distinct publicLearnedTradeGuard kind. Guard diagnostics count observed pre-apply choices and retain failures; they do not qualify data for training or establish strength."
+        );
         return Ok(());
     }
     if matches!(
@@ -498,6 +550,61 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn g2_guarded_report_retains_observed_counts_on_game_and_late_publication_errors() {
+        let temp = Temp::new();
+        let destination = temp.0.join("guarded-report-only.json");
+        let observed = serde_json::json!([{"choicesReturned":9,"failedChoices":1},null,null]);
+        let provenance = tzolkin_ai::experiment::heuristic_seat();
+        // Report serialization/publication only, not a qualified NN producer or
+        // a real Guard trace. Library tests cover actual observed summaries.
+        let (report, error) = guarded_selfplay_report(
+            3,
+            17,
+            &[0],
+            &provenance,
+            Err("controlled NN error".into()),
+            &observed,
+            Some(destination.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            report["schema"],
+            "tzolkin-public-policy-trade-guard-selfplay-v1"
+        );
+        assert_eq!(report["tradeGuard"], observed);
+        assert_eq!(report["decisions"], serde_json::Value::Null);
+        assert_eq!(report["finalState"], serde_json::Value::Null);
+        assert_eq!(report["publication"], serde_json::Value::Null);
+        assert!(!destination.exists());
+        assert_eq!(error.as_deref(), Some("controlled NN error"));
+        validate_new_output_directory(&destination).unwrap();
+        fs::write(&destination, b"existing immutable file").unwrap();
+        let game = tzolkin_ai::replay::play_game_fast(3, 17, Default::default(), true).unwrap();
+        println!(
+            "G2 report publication fixture seed17,3p callbacks{}",
+            game.1
+        );
+        let decisions = game.1;
+        let (report, error) = guarded_selfplay_report(
+            3,
+            17,
+            &[0],
+            &provenance,
+            Ok(game),
+            &observed,
+            Some(destination.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(error.is_some());
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["success"], false);
+        assert_eq!(report["decisions"], decisions);
+        assert_eq!(report["tradeGuard"], observed);
+        assert_eq!(report["publication"]["success"], false);
+        assert_eq!(fs::read(&destination).unwrap(), b"existing immutable file");
     }
 
     #[test]
