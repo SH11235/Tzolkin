@@ -13,7 +13,7 @@ use tzolkin_ai::public_model::{LoadedPublicPolicy, MAX_OBSERVATION_BYTES, Public
 use tzolkin_ai::public_native::{self, PreparedPublicPolicy};
 use tzolkin_core::observation::Observation;
 
-const HELP: &str = "tzolkin-public-ml choose --model PATH [--kernel scalar|auto|avx2|sse2|neon|simd128]\ntzolkin-public-ml export-native --input NATIVE_REPLAY_DIRECTORY --output NEW_DATASET_DIRECTORY\ntzolkin-public-ml train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate F --seed N]\ntzolkin-public-ml resume --input DATASET --checkpoint PATH --epochs TOTAL --output NEW_DIRECTORY [--batch-size N --learning-rate F --seed N]\ntzolkin-public-ml evaluate --input DATASET --model PATH [--split train|validation|test]\ntzolkin-public-ml selfplay --checkpoint PATH --dataset DATASET --seats all|SEAT[,SEAT] [--players 3|4 --seed N --flags 0 --kernel scalar|auto|avx2|sse2|neon|simd128 --output NEW_REPLAY_FILE]\nchoose reads a bounded core Observation JSON from stdin and writes a Decision JSON.\nChoose defaults to scalar. BC training/resume/evaluation are Scalar only, base 3-4p, policy-only, value unavailable.\nTrain defaults: epochs=3, batch-size=16, learning-rate=0.001, seed=7. Resume inherits unchanged optimizer config; --epochs is required. Evaluate defaults to validation.\nSelfplay defaults: players=3, seed=0, flags=0, kernel=scalar; explicit --seats is required. Arena also accepts publicLearned configs. Human admission, PPO/critics and CPU adoption are separate future units.";
+const HELP: &str = "tzolkin-public-ml choose --model PATH [--kernel scalar|auto|avx2|sse2|neon|simd128]\ntzolkin-public-ml export-native --input NATIVE_REPLAY_DIRECTORY --output NEW_DATASET_DIRECTORY\ntzolkin-public-ml train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate F --seed N]\ntzolkin-public-ml resume --input DATASET --checkpoint PATH --epochs TOTAL --output NEW_DIRECTORY [--batch-size N --learning-rate F --seed N]\ntzolkin-public-ml evaluate --input DATASET --model PATH [--split train|validation|test]\ntzolkin-public-ml selfplay --checkpoint PATH --dataset DATASET --seats all|SEAT[,SEAT] [--players 3|4 --seed N --flags 0 --kernel scalar|auto|avx2|sse2|neon|simd128 --output NEW_REPLAY_FILE]\nchoose reads a bounded core Observation JSON from stdin and writes a Decision JSON.\nChoose defaults to scalar. BC training/resume/evaluation are Scalar only, base 3-4p, policy-only, value unavailable.\nTrain defaults: epochs=3, batch-size=16, learning-rate=0.001, seed=7. Resume inherits unchanged optimizer config; --epochs is required. Evaluate defaults to validation.\nSelfplay defaults: players=3, seed=0, flags=0, kernel=scalar; explicit --seats is required. Arena also accepts publicLearned configs. Human admission, PPO, calibrated estimates and CPU adoption are separate units.";
 
 fn write_stdout(value: &impl serde::Serialize) -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
@@ -299,14 +299,106 @@ fn export_state_native(args: &[String]) -> Result<(), String> {
     write_stdout(&manifest)
 }
 
+fn train_state(args: &[String]) -> Result<(), String> {
+    use tzolkin_ai::state_mc_training::{self, StateMcConfig, StateMcTrainingCheckpoint};
+    let resume = args[0] == "resume-state";
+    let allowed = if resume {
+        &[
+            "--input",
+            "--output",
+            "--checkpoint",
+            "--epochs",
+            "--batch-size",
+            "--learning-rate",
+            "--seed",
+        ][..]
+    } else {
+        &[
+            "--input",
+            "--output",
+            "--epochs",
+            "--batch-size",
+            "--learning-rate",
+            "--seed",
+        ][..]
+    };
+    let parsed = flags(args, allowed)?;
+    let input = parsed.get("--input").ok_or("--input is required")?;
+    let output = parsed.get("--output").ok_or("--output is required")?;
+    state_mc_training::validate_new_output_directory(Path::new(output))?;
+    let checkpoint = if resume {
+        if !parsed.contains_key("--epochs") {
+            return Err("Resume-state requires --epochs TOTAL".into());
+        }
+        Some(StateMcTrainingCheckpoint::load(Path::new(
+            parsed
+                .get("--checkpoint")
+                .ok_or("--checkpoint is required")?,
+        ))?)
+    } else {
+        None
+    };
+    let mut config = checkpoint
+        .as_ref()
+        .map_or_else(StateMcConfig::default, |p| p.config().clone());
+    if let Some(value) = parsed.get("--epochs") {
+        config.epochs = value.parse().map_err(|_| "Invalid --epochs")?;
+    }
+    if let Some(value) = parsed.get("--batch-size") {
+        config.batch_size = value.parse().map_err(|_| "Invalid --batch-size")?;
+    }
+    if let Some(value) = parsed.get("--learning-rate") {
+        config.learning_rate = value.parse().map_err(|_| "Invalid --learning-rate")?;
+    }
+    if let Some(value) = parsed.get("--seed") {
+        config.seed = value.parse().map_err(|_| "Invalid --seed")?;
+    }
+    config.validate()?;
+    let dataset = tzolkin_ai::state_mc_dataset::load_state_mc_dataset(Path::new(input))?;
+    let outcome = state_mc_training::train_dataset(&dataset, &config, checkpoint.as_ref())?;
+    outcome.save_new_directory(Path::new(output))?;
+    write_stdout(&serde_json::json!({"metrics":outcome.metrics(),"workPlan":outcome.work_plan()}))
+}
+
+fn evaluate_state(args: &[String]) -> Result<(), String> {
+    let parsed = flags(args, &["--input", "--checkpoint", "--split"])?;
+    let input = parsed.get("--input").ok_or("--input is required")?;
+    let checkpoint = parsed
+        .get("--checkpoint")
+        .ok_or("--checkpoint is required")?;
+    let split = match parsed.get("--split").copied().unwrap_or("validation") {
+        "train" => DatasetSplit::Train,
+        "validation" => DatasetSplit::Validation,
+        "test" => DatasetSplit::Test,
+        _ => return Err("Unknown state evaluation --split".into()),
+    };
+    let checkpoint =
+        tzolkin_ai::state_mc_training::StateMcTrainingCheckpoint::load(Path::new(checkpoint))?;
+    let dataset = tzolkin_ai::state_mc_dataset::load_state_mc_dataset(Path::new(input))?;
+    write_stdout(&tzolkin_ai::state_mc_training::evaluate_dataset(
+        &dataset,
+        &checkpoint,
+        split,
+    )?)
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["help"] || args == ["--help"] {
         println!("{HELP}");
         println!(
-            "tzolkin-public-ml export-state-native --input NATIVE_REPLAY_DIRECTORY --output NEW_STATE_MC_DIRECTORY\nState-MC is a separate complete-native gamma=1/lambda=1 state-target task; no training command."
+            "tzolkin-public-ml export-state-native --input NATIVE_REPLAY_DIRECTORY --output NEW_STATE_MC_DIRECTORY\ntzolkin-public-ml train-state --input STATE_MC_DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate F --seed N]\ntzolkin-public-ml resume-state --input STATE_MC_DATASET --checkpoint PATH --epochs TOTAL --output NEW_DIRECTORY [--batch-size N --learning-rate F --seed N]\ntzolkin-public-ml evaluate-state --input STATE_MC_DATASET --checkpoint PATH [--split train|validation|test]\nState-MC is a separate Scalar complete-native gamma=1/lambda=1 raw state-MSE task. Defaults3/16/.001/7; resume inherits config except required total epochs; evaluation defaultsValidation. Estimates remain unqualified. PPO and CPU adoption are separate units."
         );
         return Ok(());
+    }
+    if matches!(
+        args.first().map(String::as_str),
+        Some("train-state" | "resume-state")
+    ) {
+        return train_state(&args);
+    }
+    if args.first().map(String::as_str) == Some("evaluate-state") {
+        return evaluate_state(&args);
     }
     if args.first().map(String::as_str) == Some("export-state-native") {
         return export_state_native(&args);
