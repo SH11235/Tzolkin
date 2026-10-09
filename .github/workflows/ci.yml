@@ -34,7 +34,10 @@ jobs:
           rust=true
           app=true
           if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
-            files=$(git diff --name-only HEAD^1 HEAD)
+            # --no-renames lists both sides of a move, so moving a file out of
+            # the application into an experiment path still counts as an
+            # application change.
+            files=$(git diff --name-only --no-renames HEAD^1 HEAD)
             pattern='^(crates/|src-tauri/|scripts/|tests/fixtures/|\.github/|\.cargo/|Cargo\.(toml|lock)$|package(-lock)?\.json$|rust-toolchain(\.toml)?$|(clippy|rustfmt)\.toml$)'
             if ! grep -qE "$pattern" <<<"$files"; then
               rust=false
