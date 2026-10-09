@@ -3416,6 +3416,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn yaxchilan_one_and_extra_worker_grant_printed_wealth_before_first_turn() {
+        for count in [3, 4] {
+            let mut state =
+                create_game((0..count).map(|id| format!("P{id}")).collect(), 3, false).unwrap();
+            assert_eq!(state.players[0].wealth_offer, ["w15", "w05", "w10", "w11"]);
+            state = apply_move(
+                &state,
+                GameMove::Choose {
+                    choice_id: "wealth:w15:w05".into(),
+                },
+            )
+            .unwrap();
+            while state.phase == Phase::Setup {
+                let operation = get_available_moves(&state)
+                    .into_iter()
+                    .find(|choice| choice.disabled != Some(true))
+                    .unwrap()
+                    .r#move;
+                state = apply_move(&state, operation).unwrap();
+            }
+            assert_eq!(state.phase, Phase::Playing);
+            assert_eq!(state.round, 1);
+            assert_eq!(state.turn.mode, TurnMode::None);
+            let player = &state.players[0];
+            assert_eq!(player.wealth, ["w15", "w05"]);
+            let mut expected_resources = zero_resources();
+            expected_resources.insert(Resource::Wood, 1);
+            assert_eq!(player.resources, expected_resources);
+            assert_eq!(player.workers, 4);
+            assert_eq!(available_workers(&state, 0), 4);
+            for technology in TECHNOLOGY_IDS {
+                assert_eq!(
+                    player.technologies[&technology],
+                    i64::from(technology == TechnologyId::Extraction),
+                );
+            }
+            for temple in TEMPLE_IDS {
+                assert_eq!(
+                    player.temples[&temple],
+                    i64::from(temple == TempleId::Kukulkan),
+                );
+            }
+        }
+    }
+
+    #[test]
     fn seed_edges_preserve_existing_uint32_shuffle_order() {
         let fixtures = [
             (

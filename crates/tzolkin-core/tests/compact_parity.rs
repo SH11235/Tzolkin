@@ -105,7 +105,7 @@ struct TraceStep {
 }
 
 #[test]
-fn all_historical_reference_traces_preserve_saves_legal_sets_transitions_and_results() {
+fn historical_old_catalog_traces_preserve_saves_legal_sets_transitions_and_results() {
     let traces: ReferenceTraces = serde_json::from_str(include_str!(
         "../../../tests/fixtures/reference-traces.json"
     ))
@@ -116,7 +116,24 @@ fn all_historical_reference_traces_preserve_saves_legal_sets_transitions_and_res
         for step in trace.steps {
             let compact = assert_state(&state);
             assert!(compact.legal_moves().contains(&step.r#move));
+            let actor = state.current_player;
+            let historical_w05 = state.phase == Phase::Setup
+                && matches!(&step.r#move, GameMove::Choose { choice_id }
+                    if choice_id.strip_prefix("wealth:").is_some_and(|ids|
+                        ids.split(':').any(|id| id == "w05")));
             state = assert_transition(&state, &compact, step.r#move);
+            // Preserve the old fixture and its reference commit. Compare the real
+            // transition first, then remove only w05's formerly missing wood for
+            // the historical continuation. The direct setup regression tests
+            // the corrected current catalog without this test-only adjustment.
+            if historical_w05 {
+                let wood = state.players[actor]
+                    .resources
+                    .get_mut(&Resource::Wood)
+                    .unwrap();
+                assert!(*wood >= 1);
+                *wood -= 1;
+            }
         }
         assert_state(&state);
         assert_eq!(state, trace.final_state);

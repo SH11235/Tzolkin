@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { afterAll, describe, expect, it } from 'vitest';
-import { applyMove, createGame } from '../../src/game/engine';
+import { applyMove, createGame, inspectGame } from '../../src/game/engine';
 import type { GameSnapshot } from '../../src/game/engine';
 import reference from '../fixtures/reference-traces.json';
 import type { GameMove } from '../../src/game/types';
@@ -26,6 +26,26 @@ function hash(value: unknown): string {
   return createHash('sha256')
     .update(JSON.stringify(normalize(value)))
     .digest('hex');
+}
+
+// These immutable snapshots precede the w05 wood correction. Normalize only
+// its exact choice-description prefix; other card text remains authoritative.
+function historicalWealthDescriptions(snapshot: GameSnapshot): GameSnapshot {
+  for (const choice of [...snapshot.choices, ...snapshot.moves]) {
+    const move = choice.move;
+    if (
+      move.type === 'choose' &&
+      move.choiceId.startsWith('wealth:') &&
+      move.choiceId.split(':').slice(1).includes('w05')
+    ) {
+      const prefix = 'ヤシュチラン 1: 木材 1、';
+      expect(choice.description, 'current w05 description before historical adjustment').toContain(
+        prefix,
+      );
+      choice.description = choice.description!.replace(prefix, 'ヤシュチラン 1: ');
+    }
+  }
+  return snapshot;
 }
 
 const metadata = JSON.parse(
@@ -60,7 +80,7 @@ afterAll(() => {
   native.kill();
 });
 
-describe('saved rule behavior across native Rust and production Wasm', () => {
+describe('historical old-catalog snapshots across native Rust and production Wasm', () => {
   for (const trace of reference.traces) {
     it(`${trace.names.length} players, additional buildings ${trace.additionalBuildings}`, async () => {
       let wasmState = await createGame(trace.names, trace.seed, {
@@ -72,12 +92,36 @@ describe('saved rule behavior across native Rust and production Wasm', () => {
         seed: trace.seed,
         additionalBuildings: trace.additionalBuildings,
       });
+      expect(wasmState).toEqual(nativeState);
+      wasmState = historicalWealthDescriptions(wasmState);
+      nativeState = historicalWealthDescriptions(nativeState);
       expect(hash(wasmState), 'initial Wasm state').toBe(trace.initialHash);
       expect(hash(nativeState), 'initial native state').toBe(trace.initialHash);
       for (const [index, step] of trace.steps.entries()) {
         const move = step.move as GameMove;
+        const actor = wasmState.state.currentPlayer;
+        const historicalW05 =
+          wasmState.state.phase === 'setup' &&
+          move.type === 'choose' &&
+          move.choiceId.startsWith('wealth:') &&
+          move.choiceId.split(':').slice(1).includes('w05');
         wasmState = await applyMove(wasmState.state, move);
         nativeState = await nativeRequest({ operation: 'apply', state: nativeState.state, move });
+        expect(wasmState, 'current transition parity before historical adjustment').toEqual(
+          nativeState,
+        );
+        if (historicalW05) {
+          // Remove the corrected grant only in this historical test, then use
+          // the real inspect APIs to rebuild legal choices from the old state.
+          expect(wasmState.state.players[actor].resources.wood).toBeGreaterThanOrEqual(1);
+          wasmState.state.players[actor].resources.wood -= 1;
+          nativeState.state.players[actor].resources.wood -= 1;
+          wasmState = await inspectGame(wasmState.state);
+          nativeState = await nativeRequest({ operation: 'inspect', state: nativeState.state });
+          expect(wasmState).toEqual(nativeState);
+        }
+        wasmState = historicalWealthDescriptions(wasmState);
+        nativeState = historicalWealthDescriptions(nativeState);
         expect(hash(wasmState), `Wasm step ${index}, ${JSON.stringify(move)}`).toBe(step.hash);
         expect(hash(nativeState), `native step ${index}, ${JSON.stringify(move)}`).toBe(step.hash);
       }

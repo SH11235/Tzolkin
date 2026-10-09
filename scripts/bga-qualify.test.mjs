@@ -236,7 +236,7 @@ function fixture() {
     record: {
       schema: 'tzolkin-public-replay-v1',
       rulesVersion: 1,
-      catalogHash: '09d08c73b48cdfd7',
+      catalogHash: '59d366aef93711bb',
       market: 'unlimited',
       source: { reference, actionIds: [5] },
       initial: nativeInitial,
