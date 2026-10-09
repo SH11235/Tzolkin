@@ -77,7 +77,8 @@ TypeScript は ESLint の解析器が公式に対応する最新安定版を使�
 ## 構成
 
 - `crates/tzolkin-core/`: Tauri・ブラウザに依存しないゲーム状態、ルール、合法手、得点計算、保存データ検証。
-- `crates/tzolkin-ai/`: 判断者の観測情報を使う policy、検証済みデータ生成、policy/value 学習、native CLI。
+- `crates/tzolkin-bot/`: アプリの CPU が使うヒューリスティック policy。判断者の観測情報だけを入力にする。
+- `crates/tzolkin-ai/`: 実験用の検証済みデータ生成、policy/value 学習、探索、Arena、native CLI。
 - `crates/tzolkin-core/data/catalog.json`: 出版社の資料と照合した共通カタログ。Rust のルール処理と UI が同じデータを参照。
 - `crates/tzolkin-wasm/`: ブラウザ用の Wasm 接続部分。
 - `src/game/engine.ts`: Wasm／Tauri を選ぶ非同期接続部分。ゲームのルール処理は Rust に委譲。

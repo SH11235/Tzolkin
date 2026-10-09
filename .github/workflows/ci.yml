@@ -21,6 +21,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      app: ${{ steps.filter.outputs.app }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,14 +32,23 @@ jobs:
           # The diff is its own statement so that a git failure stops the job
           # instead of looking like "no Rust change".
           rust=true
+          app=true
           if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
             files=$(git diff --name-only HEAD^1 HEAD)
             pattern='^(crates/|src-tauri/|scripts/|tests/fixtures/|\.github/|\.cargo/|Cargo\.(toml|lock)$|package(-lock)?\.json$|rust-toolchain(\.toml)?$|(clippy|rustfmt)\.toml$)'
             if ! grep -qE "$pattern" <<<"$files"; then
               rust=false
             fi
+            # The application (Wasm, web and desktop) does not depend on the
+            # experiment crate. Skip its jobs only when every changed file is
+            # known to be outside the application.
+            lab_only='^(crates/tzolkin-ai/|scripts/bga-[^/]*$|scripts/fixtures/|.*\.md$)'
+            if [[ -n $files ]] && ! grep -qvE "$lab_only" <<<"$files"; then
+              app=false
+            fi
           fi
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "app=$app" >> "$GITHUB_OUTPUT"
 
   lint:
     runs-on: ubuntu-24.04
@@ -59,7 +69,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - run: npm ci
       - run: cargo fmt --all --check
-      - run: cargo clippy --locked -p tzolkin-core -p tzolkin-ai -p tzolkin-wasm --all-targets -- -D warnings
+      - run: cargo clippy --locked -p tzolkin-core -p tzolkin-bot -p tzolkin-ai -p tzolkin-wasm --all-targets -- -D warnings
       - run: npm run lint
 
   rust:
@@ -85,6 +95,8 @@ jobs:
       - run: npm run test:bga
 
   web:
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -123,6 +135,8 @@ jobs:
       - run: npm run test:e2e
 
   desktop:
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
