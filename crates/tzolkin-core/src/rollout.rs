@@ -32,6 +32,74 @@ pub struct RolloutWorld {
     state: GameState,
 }
 
+/// One authoritative current decision, held under an exclusive world borrow.
+/// The owned observation is read-only; consuming `apply` checks its legal moves
+/// before calling the unchanged pure engine. It exposes no state or deck.
+///
+/// A world cannot change while its cached decision is still in use:
+/// ```compile_fail
+/// use tzolkin_core::{GameMove, rollout::RolloutWorld};
+/// fn cannot_change(world: &mut RolloutWorld, operation: GameMove) {
+///     let decision = world.decision().unwrap();
+///     world.apply(operation).unwrap();
+///     let _ = decision.observation();
+/// }
+/// ```
+/// The guard cannot be copied or deserialized:
+/// ```compile_fail
+/// use tzolkin_core::rollout::RolloutDecision;
+/// fn cannot_copy(decision: RolloutDecision<'_>) {
+///     let _: RolloutDecision<'_> = Clone::clone(&decision);
+/// }
+/// ```
+/// ```compile_fail
+/// use tzolkin_core::rollout::RolloutDecision;
+/// let _: RolloutDecision<'_> = serde_json::from_str("{}").unwrap();
+/// ```
+/// Nor can the cached observation be changed:
+/// ```compile_fail
+/// use tzolkin_core::rollout::RolloutDecision;
+/// fn cannot_edit(decision: RolloutDecision<'_>) {
+///     decision.observation().legal_actions.clear();
+/// }
+/// ```
+/// A decision is applied at most once:
+/// ```compile_fail
+/// use tzolkin_core::{GameMove, rollout::RolloutDecision};
+/// fn cannot_reuse(decision: RolloutDecision<'_>, operation: GameMove) {
+///     decision.apply(operation.clone()).unwrap();
+///     decision.apply(operation).unwrap();
+/// }
+/// ```
+pub struct RolloutDecision<'world> {
+    world: &'world mut RolloutWorld,
+    observation: Observation,
+}
+impl RolloutDecision<'_> {
+    pub fn observation(&self) -> &Observation {
+        &self.observation
+    }
+    // These expose only the same public queries as the existing opaque world.
+    pub fn settled_for(&self, actor: usize, target_round: i64) -> bool {
+        self.world.settled_for(actor, target_round)
+    }
+    pub fn score_projection(&self) -> Vec<f64> {
+        self.world.score_projection()
+    }
+    pub fn apply(self, operation: GameMove) -> Result<(), String> {
+        if self.observation.phase != Phase::Playing
+            || !self
+                .observation
+                .legal_actions
+                .iter()
+                .any(|choice| choice.r#move == operation)
+        {
+            return Err("rollout: non-legal operation".into());
+        }
+        self.world.apply_legal(operation)
+    }
+}
+
 impl RolloutRoot {
     pub fn from_observation(o: &Observation) -> Result<Self, String> {
         if o.schema != OBSERVATION_SCHEMA || o.move_schema != MOVE_SCHEMA {
@@ -239,6 +307,13 @@ impl RolloutWorld {
     pub fn observation(&self) -> Result<Observation, String> {
         observe(&self.state, self.state.current_player)
     }
+    pub fn decision(&mut self) -> Result<RolloutDecision<'_>, String> {
+        let observation = self.observation()?;
+        Ok(RolloutDecision {
+            world: self,
+            observation,
+        })
+    }
     pub fn apply(&mut self, operation: GameMove) -> Result<(), String> {
         if self.state.phase != Phase::Playing
             || !crate::get_available_moves(&self.state)
@@ -247,6 +322,9 @@ impl RolloutWorld {
         {
             return Err("rollout: non-legal operation".into());
         }
+        self.apply_legal(operation)
+    }
+    fn apply_legal(&mut self, operation: GameMove) -> Result<(), String> {
         let mut next = crate::apply_move(&self.state, operation)?;
         // Display history is never a policy input and must not grow with depth.
         next.log.clear();
@@ -483,6 +561,7 @@ mod tests {
             // order. The production opaque API cannot accept or expose a deck.
             world.state.building_deck = reference.building_deck.clone();
             world.state.age2_deck = reference.age2_deck.clone();
+            let mut legacy = world.clone();
             let mut rotation = false;
             let mut first_player = false;
             for _ in 0..2000 {
@@ -536,7 +615,16 @@ mod tests {
                     .unwrap_or(&choices[0]);
                 rotation |= matches!(selected.action, TypedAction::Rotate { days: 2 });
                 first_player |= matches!(selected.action, TypedAction::FirstPlayer { .. });
-                world.apply(selected.r#move.clone()).unwrap();
+                let cached = world.decision().unwrap();
+                assert_eq!(cached.observation(), &observed);
+                assert_eq!(cached.score_projection(), legacy.score_projection());
+                assert_eq!(
+                    cached.settled_for(root_actor, 1),
+                    legacy.settled_for(root_actor, 1)
+                );
+                cached.apply(selected.r#move.clone()).unwrap();
+                legacy.apply(selected.r#move.clone()).unwrap();
+                assert_eq!(world.state, legacy.state);
                 reference = crate::apply_move(&reference, selected.r#move.clone()).unwrap();
             }
             assert!(world.finished());
@@ -546,6 +634,15 @@ mod tests {
                 "{n}p rotation={rotation}, first_player={first_player}"
             );
             assert_eq!(world.terminal_scores().unwrap(), reference.final_scores);
+            let finished = world.state.clone();
+            let invalid = GameMove::Place {
+                gear: GearId::Palenque,
+            };
+            assert_eq!(
+                world.decision().unwrap().apply(invalid.clone()),
+                legacy.apply(invalid)
+            );
+            assert_eq!(world.state, finished);
             assert_eq!(
                 world.score_projection(),
                 reference
@@ -598,6 +695,7 @@ mod tests {
         let mut world = root.sample(0, 0);
         world.state.building_deck = reference.building_deck.clone();
         world.state.age2_deck = reference.age2_deck.clone();
+        let mut legacy = world.clone();
         let mut saw_after = false;
         for step in 0..20 {
             let observation = world.observation().unwrap();
@@ -652,7 +750,11 @@ mod tests {
                     .unwrap_or(&observation.legal_actions[0]),
             };
             let operation = selected.r#move.clone();
-            world.apply(operation.clone()).unwrap();
+            let cached = world.decision().unwrap();
+            assert_eq!(cached.observation(), &observation);
+            cached.apply(operation.clone()).unwrap();
+            legacy.apply(operation.clone()).unwrap();
+            assert_eq!(world.state, legacy.state);
             reference = crate::apply_move(&reference, operation).unwrap();
             assert_eq!(
                 world.state.pending.as_ref().map(|p| (&p.task, &p.after)),
@@ -673,11 +775,60 @@ mod tests {
         let end = GameMove::EndTurn {
             double_advance: None,
         };
-        world.apply(end.clone()).unwrap();
+        world.decision().unwrap().apply(end.clone()).unwrap();
+        legacy.apply(end.clone()).unwrap();
+        assert_eq!(world.state, legacy.state);
         reference = crate::apply_move(&reference, end).unwrap();
         assert_eq!(world.state.buildings.len(), 6);
         assert_eq!(world.state.buildings, reference.buildings);
         assert_eq!(world.state.building_deck, reference.building_deck);
+    }
+
+    #[test]
+    fn cached_decision_rejection_and_pure_engine_errors_leave_world_unchanged() {
+        for n in [3, 4] {
+            let source = playing(n, 17);
+            let root =
+                RolloutRoot::from_observation(&observe(&source, source.current_player).unwrap())
+                    .ok()
+                    .unwrap();
+            let mut world = root.sample(0, 0);
+            let mut legacy = world.clone();
+            let before = world.state.clone();
+            let invalid = GameMove::Choose {
+                choice_id: "unknown-choice".into(),
+            };
+            assert_eq!(
+                world.decision().unwrap().apply(invalid.clone()),
+                legacy.apply(invalid.clone())
+            );
+            assert_eq!(world.state, before);
+            assert_eq!(legacy.state, before);
+            // This module alone can poison private cache fields. Even that test
+            // oracle cannot bypass the unchanged pure engine's choice validation.
+            let engine_error = crate::apply_move(&before, invalid.clone()).unwrap_err();
+            let mut cache = world.decision().unwrap();
+            let mut poisoned = cache.observation.legal_actions[0].clone();
+            poisoned.r#move = invalid.clone();
+            cache.observation.legal_actions.push(poisoned);
+            assert_eq!(cache.apply(invalid), Err(engine_error));
+            assert_eq!(world.state, before);
+
+            let setup =
+                crate::create_game((0..n).map(|id| format!("Setup {id}")).collect(), 17, false)
+                    .unwrap();
+            let mut world = RolloutWorld {
+                state: setup.clone(),
+            };
+            let mut legacy = world.clone();
+            let operation = world.observation().unwrap().legal_actions[0].r#move.clone();
+            assert_eq!(
+                world.decision().unwrap().apply(operation.clone()),
+                legacy.apply(operation)
+            );
+            assert_eq!(world.state, setup);
+            assert_eq!(legacy.state, setup);
+        }
     }
 
     #[test]

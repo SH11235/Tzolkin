@@ -1,0 +1,476 @@
+{
+  "sourceCommit": "6fa4e7efa9eb127e8e27ff3412c243d86164fb67",
+  "executableSha256": "301cb47ac3f2e0a11695e305cb8877711caa9f1b66cc9680149fe7b918a7c191",
+  "seed": 11235,
+  "sourceKind": "native heuristic selfplay; no human/BGA input; timing fields excluded",
+  "cases": [
+    {
+      "name": "default",
+      "players": 3,
+      "config": {
+        "horizonDays": 6,
+        "maxRolloutSteps": 256,
+        "maxTotalSteps": 16384,
+        "minCompletedWorlds": 2,
+        "samplingSalt": 0,
+        "worldsPerAction": 4
+      },
+      "configurationKey": "5b14ab0ca6ddb3249e30f4bf8572fcbb0aecccc5633a4fa9cae87578dc3f4c48",
+      "sourceReplaySha256": "46bdfdda90f6e3f808b422d028d0ebb50997ecbbf3b86e707defac084643d7bc",
+      "selectedCorpusSha256": "1e936ec213bf44182e447a1bee6669b4f26b8eee7fe82a9aa179f8956b54d8e7",
+      "states": [
+        {
+          "replayIndex": 0,
+          "observationKey": "c3edda356888d47b",
+          "directOutcomeSha256": "1b1da8e435d37359d2d1037556b4d9c36666bb05a224c743728992007e378ca8"
+        },
+        {
+          "replayIndex": 1,
+          "observationKey": "11e650a7b06a9f95",
+          "directOutcomeSha256": "6a6dba301596fbdf0c01f21bf92aabcfa6e2519d2b61a2869e5b6a73215e3829"
+        },
+        {
+          "replayIndex": 2,
+          "observationKey": "f8f3823034001da2",
+          "directOutcomeSha256": "e8b04c14d6a69c99a4b417ac1f5a738660b49137efe9af2227cb8075c0a9a712"
+        },
+        {
+          "replayIndex": 31,
+          "observationKey": "f482936420159999",
+          "directOutcomeSha256": "0d54b7ca9d1bf24011b43a6dd12c32d3651c7a66d18d43d3853ccd13d0858fe7"
+        },
+        {
+          "replayIndex": 46,
+          "observationKey": "c5338cdbcd203220",
+          "directOutcomeSha256": "c14a23a4b873b5646ed18259589a5e14fd3de83afcb557fe79a1dbac61e03bd7"
+        },
+        {
+          "replayIndex": 106,
+          "observationKey": "40495d62963b02d4",
+          "directOutcomeSha256": "7a26260bb868be8e11de82cc2a878989de3d3d2dc766f68df8e9d9b451c071b7"
+        },
+        {
+          "replayIndex": 115,
+          "observationKey": "c85005e71e65888b",
+          "directOutcomeSha256": "b7b446feda99be0f03fd1c052f8daa8b6022819890c0a4e7a7801de6e7948507"
+        },
+        {
+          "replayIndex": 175,
+          "observationKey": "dd9ad8dbc76f018b",
+          "directOutcomeSha256": "d723c3378273b6a3315d2865139431b745aa79af57e689ce97aa78a0085718ef"
+        },
+        {
+          "replayIndex": 201,
+          "observationKey": "43fc64b124471ddf",
+          "directOutcomeSha256": "dc82f1f3cd07bbb9e46350102a0c3a722a01888e7aac5eb108ff6c5fa216c287"
+        },
+        {
+          "replayIndex": 240,
+          "observationKey": "9b5188c2dd8af845",
+          "directOutcomeSha256": "3823a87a0ccdfdb5a26eacb901d75b66cc4f9da5b89ef73ff6566bdeb59d2d55"
+        },
+        {
+          "replayIndex": 285,
+          "observationKey": "f1d01bc328d4b6b9",
+          "directOutcomeSha256": "01f6193d03a88b028473d9a0987a1b4b3782538ff45de9018d924837c91d6b9a"
+        },
+        {
+          "replayIndex": 304,
+          "observationKey": "94ed51af978f1427",
+          "directOutcomeSha256": "74d2cfdb5dbc4ecdc5170b3ec5c43cccf99cd4f1e9e959e61188060cdf3dc8d5"
+        }
+      ],
+      "capturedRawSha256": "b8a6c251c722b4e6aa9101b45de24676049ce011d571316ec57976d3228d94fe"
+    },
+    {
+      "name": "default",
+      "players": 4,
+      "config": {
+        "horizonDays": 6,
+        "maxRolloutSteps": 256,
+        "maxTotalSteps": 16384,
+        "minCompletedWorlds": 2,
+        "samplingSalt": 0,
+        "worldsPerAction": 4
+      },
+      "configurationKey": "5b14ab0ca6ddb3249e30f4bf8572fcbb0aecccc5633a4fa9cae87578dc3f4c48",
+      "sourceReplaySha256": "3d57f7021f8499c15d68f850eadf6cc684fa9ea4322a14bb28f98c5bb227832e",
+      "selectedCorpusSha256": "fe624e53fad3d8054f37435618618a3f285c46527582d9f430c071ed0adf212a",
+      "states": [
+        {
+          "replayIndex": 0,
+          "observationKey": "0e6dd80d570b20e7",
+          "directOutcomeSha256": "58c864db96b0d58a5d5d75aab4a744b07e5296b3ef8687055d1e6512715bdbda"
+        },
+        {
+          "replayIndex": 1,
+          "observationKey": "d7ad8c277deff06d",
+          "directOutcomeSha256": "96fcc30d53734406949b4853090fc113322ea56ae735318453d40a91c6f8f15b"
+        },
+        {
+          "replayIndex": 2,
+          "observationKey": "9b3abce3f7a399f6",
+          "directOutcomeSha256": "98d833c5cfbf24a6a0c87076680394f9f6183dbb2208911bdd8da8c1f9b6ae76"
+        },
+        {
+          "replayIndex": 3,
+          "observationKey": "017afad5f699fb12",
+          "directOutcomeSha256": "499eb5aea3daf1ac1e4d403def911c5dfef69962d4682aae3fa31b3d74db095d"
+        },
+        {
+          "replayIndex": 53,
+          "observationKey": "414f9769f517774e",
+          "directOutcomeSha256": "7f2a895baaa437ec4a1aa05e9eed321cb0a0d7630650a68054b08e70cef9dd22"
+        },
+        {
+          "replayIndex": 64,
+          "observationKey": "6196a4d3b0efe3db",
+          "directOutcomeSha256": "07136a479eb34be49e1b2f1b8cdfe4a88fa5e68a54e055ce9368bebdfa9940f4"
+        },
+        {
+          "replayIndex": 164,
+          "observationKey": "5a75d386e9286b7c",
+          "directOutcomeSha256": "ae588e62743b8beb2a0603e4600008078252b47b914f5ca5edc9952d1ee70e22"
+        },
+        {
+          "replayIndex": 178,
+          "observationKey": "ccce8a484a943d0e",
+          "directOutcomeSha256": "89f1bed24d78892a7c6fe5c26e60e5ca0c3d367a8ad3abd952bad209e123ad8a"
+        },
+        {
+          "replayIndex": 262,
+          "observationKey": "52ac778abc334b41",
+          "directOutcomeSha256": "ba53a384c24ad9a50c273943e4c2877e522d91a67281a954f86d7322eb85824d"
+        },
+        {
+          "replayIndex": 291,
+          "observationKey": "a29a40d9c650aa48",
+          "directOutcomeSha256": "8f9e1b4c48efe30994532e9f5ce3954b1bc64a8b7a7bab3e2c8fc63f7e9c6c20"
+        },
+        {
+          "replayIndex": 390,
+          "observationKey": "2878e75e560519bb",
+          "directOutcomeSha256": "27dc56bc362b780c859e571b9929646cf4247a390fe97cbd976284e90b567888"
+        },
+        {
+          "replayIndex": 392,
+          "observationKey": "ba081c99c1657e65",
+          "directOutcomeSha256": "e2e5191578209f7a79a9698a4a1055e6193b7cbf184edf07eb85c37b3b2ce9da"
+        }
+      ],
+      "capturedRawSha256": "cea6225b045d831f3c03eeac548436edef10390f38dcc191a07c9c6014b69bca"
+    },
+    {
+      "name": "total-cap-one",
+      "players": 3,
+      "config": {
+        "horizonDays": 6,
+        "maxRolloutSteps": 256,
+        "maxTotalSteps": 1,
+        "minCompletedWorlds": 2,
+        "samplingSalt": 0,
+        "worldsPerAction": 4
+      },
+      "configurationKey": "0f2c7f34a72516da6399ec590cf8ba07fa612e595ed55f3e676968f75bc6bb3f",
+      "sourceReplaySha256": "46bdfdda90f6e3f808b422d028d0ebb50997ecbbf3b86e707defac084643d7bc",
+      "selectedCorpusSha256": "1e936ec213bf44182e447a1bee6669b4f26b8eee7fe82a9aa179f8956b54d8e7",
+      "states": [
+        {
+          "replayIndex": 0,
+          "observationKey": "c3edda356888d47b",
+          "directOutcomeSha256": "dd8a7257a93eb5fba9dfd7e226d0835815bf6a071a54b779098f0f8aac5829b0"
+        },
+        {
+          "replayIndex": 1,
+          "observationKey": "11e650a7b06a9f95",
+          "directOutcomeSha256": "85682969d67bd07b8c026eed5049eb0af2350c8e6941839c3f8f23cdc29bad51"
+        },
+        {
+          "replayIndex": 2,
+          "observationKey": "f8f3823034001da2",
+          "directOutcomeSha256": "66d2f4fa24df9a043c46e28f93d452c0cb1cfc15117edd57c8ec8fdf11fc74e6"
+        },
+        {
+          "replayIndex": 31,
+          "observationKey": "f482936420159999",
+          "directOutcomeSha256": "d556326506af2d461c5f63019090bfc2cd9b6b23521c4828a9aaa93aeb026da5"
+        },
+        {
+          "replayIndex": 46,
+          "observationKey": "c5338cdbcd203220",
+          "directOutcomeSha256": "9e3ed41a2ec1a5116772f4d5afa1aa8e2b3c85b8e2cb981cfc982775cfcbe6cd"
+        },
+        {
+          "replayIndex": 106,
+          "observationKey": "40495d62963b02d4",
+          "directOutcomeSha256": "449f242da73adc78d29fcccb3ad798c7903d56c5a81302b5364f56ace64e5915"
+        },
+        {
+          "replayIndex": 115,
+          "observationKey": "c85005e71e65888b",
+          "directOutcomeSha256": "f662777b4ba9ea5714a1f1d90d6efeaf59fa3531eab5dd377ecb17adca4d88eb"
+        },
+        {
+          "replayIndex": 175,
+          "observationKey": "dd9ad8dbc76f018b",
+          "directOutcomeSha256": "cc3302c8a2c90d02ecf5cb53480e28656db69ab632e23d0020fdcc65499717c7"
+        },
+        {
+          "replayIndex": 201,
+          "observationKey": "43fc64b124471ddf",
+          "directOutcomeSha256": "1a9daf62e1d7ad7b5053a321d05f9ea2c2b55f94ec11a16a1afd286390a8d8be"
+        },
+        {
+          "replayIndex": 240,
+          "observationKey": "9b5188c2dd8af845",
+          "directOutcomeSha256": "19613393492dda0065b52d293f50b47d94862dc2c9bc77ea4a2fc5eed372afad"
+        },
+        {
+          "replayIndex": 285,
+          "observationKey": "f1d01bc328d4b6b9",
+          "directOutcomeSha256": "df368bd242561aea3caa633824fc8a9d7738fd3003efdde19bcbc799c3e49b37"
+        },
+        {
+          "replayIndex": 304,
+          "observationKey": "94ed51af978f1427",
+          "directOutcomeSha256": "17c3a94970f921689b3bbc706b5b9dfb5ac45712e24398c3aa36dd0bd71c0922"
+        }
+      ],
+      "capturedRawSha256": "aa21840c7ee50134e0df2d502aefdc3403eb16480012b3b4dce4a65ef7d8adfe"
+    },
+    {
+      "name": "total-cap-one",
+      "players": 4,
+      "config": {
+        "horizonDays": 6,
+        "maxRolloutSteps": 256,
+        "maxTotalSteps": 1,
+        "minCompletedWorlds": 2,
+        "samplingSalt": 0,
+        "worldsPerAction": 4
+      },
+      "configurationKey": "0f2c7f34a72516da6399ec590cf8ba07fa612e595ed55f3e676968f75bc6bb3f",
+      "sourceReplaySha256": "3d57f7021f8499c15d68f850eadf6cc684fa9ea4322a14bb28f98c5bb227832e",
+      "selectedCorpusSha256": "fe624e53fad3d8054f37435618618a3f285c46527582d9f430c071ed0adf212a",
+      "states": [
+        {
+          "replayIndex": 0,
+          "observationKey": "0e6dd80d570b20e7",
+          "directOutcomeSha256": "9cd1f73b25dde6465485eaa4ef51a02848cd0700d2516bc337e2e0ed691acc9e"
+        },
+        {
+          "replayIndex": 1,
+          "observationKey": "d7ad8c277deff06d",
+          "directOutcomeSha256": "ed3d364711968e58befd176bd5ad1e748584f3c3a0242ecce3ddc49efc20b253"
+        },
+        {
+          "replayIndex": 2,
+          "observationKey": "9b3abce3f7a399f6",
+          "directOutcomeSha256": "ecaddb1710824ad1f388673cfffc076a5e6bd6317594b207b146a0b024884cf6"
+        },
+        {
+          "replayIndex": 3,
+          "observationKey": "017afad5f699fb12",
+          "directOutcomeSha256": "277ee8363339769a57974a3409ce786a44098ddfac6024c1b234a66a280a7945"
+        },
+        {
+          "replayIndex": 53,
+          "observationKey": "414f9769f517774e",
+          "directOutcomeSha256": "540fa849ee29a4032d78dc0a5ff1abbcb67677f62e578d504f2a7f61c7bc59e5"
+        },
+        {
+          "replayIndex": 64,
+          "observationKey": "6196a4d3b0efe3db",
+          "directOutcomeSha256": "296eb9cb260618aabcf520037b298a5cdade831b941bee5834cbcf90675e493f"
+        },
+        {
+          "replayIndex": 164,
+          "observationKey": "5a75d386e9286b7c",
+          "directOutcomeSha256": "ae93dd247e80539f6d248bbda923f10ef6de85357b58d14e10d1b762f73d5e65"
+        },
+        {
+          "replayIndex": 178,
+          "observationKey": "ccce8a484a943d0e",
+          "directOutcomeSha256": "008f7838b4cdc7159217c6f32469fd19fe35c82e484fd4db53a928ba5f70f9cd"
+        },
+        {
+          "replayIndex": 262,
+          "observationKey": "52ac778abc334b41",
+          "directOutcomeSha256": "3d114e8e57b92fa7f6839e8f80204166d57def111f52643fe18ee51aeb5b6dac"
+        },
+        {
+          "replayIndex": 291,
+          "observationKey": "a29a40d9c650aa48",
+          "directOutcomeSha256": "db808092c22ec0f91f2a01377fb0acc129e43feafee7fde4cd06617240bdc007"
+        },
+        {
+          "replayIndex": 390,
+          "observationKey": "2878e75e560519bb",
+          "directOutcomeSha256": "1ae1dab48da0d71a7be8e8fe9e0b0037a8eac4c69299c84d577d7df2ab57bc3a"
+        },
+        {
+          "replayIndex": 392,
+          "observationKey": "ba081c99c1657e65",
+          "directOutcomeSha256": "19c5de4e0e5a573a95dfa9b89e688b62d14f2837829fa697cf8761170b43df66"
+        }
+      ],
+      "capturedRawSha256": "965700efe7d873c7216053ed5bce1300008235137813cb0b50a44f7d643386cc"
+    },
+    {
+      "name": "rollout-cap-one",
+      "players": 3,
+      "config": {
+        "horizonDays": 6,
+        "maxRolloutSteps": 1,
+        "maxTotalSteps": 16384,
+        "minCompletedWorlds": 2,
+        "samplingSalt": 0,
+        "worldsPerAction": 4
+      },
+      "configurationKey": "847e2e0168bb4bec533bfe40e504ee167bd8637acabb7021367457fcbab6586e",
+      "sourceReplaySha256": "46bdfdda90f6e3f808b422d028d0ebb50997ecbbf3b86e707defac084643d7bc",
+      "selectedCorpusSha256": "1e936ec213bf44182e447a1bee6669b4f26b8eee7fe82a9aa179f8956b54d8e7",
+      "states": [
+        {
+          "replayIndex": 0,
+          "observationKey": "c3edda356888d47b",
+          "directOutcomeSha256": "9ace81577fff7f10f190639f94a6a53d30563db0bc10c87804e2e7f1ff946e4f"
+        },
+        {
+          "replayIndex": 1,
+          "observationKey": "11e650a7b06a9f95",
+          "directOutcomeSha256": "ac5d7c5109dc17b75b5d9879a6d0370b16ee3db75b24b86b9957a7984b23aa52"
+        },
+        {
+          "replayIndex": 2,
+          "observationKey": "f8f3823034001da2",
+          "directOutcomeSha256": "4853cd9ca11be6cb2b5adec0f592a6af021cb9d66edfeb701a627adb5ebfe002"
+        },
+        {
+          "replayIndex": 31,
+          "observationKey": "f482936420159999",
+          "directOutcomeSha256": "e46b5efb990f6a3bacf4aaecb8f5d08cb9560253823f88899d606ae8fddc469b"
+        },
+        {
+          "replayIndex": 46,
+          "observationKey": "c5338cdbcd203220",
+          "directOutcomeSha256": "5bd5bf373c19a9f442e70cf4c0dbc3100262b0f4b6b26f5df9d06983fd905b43"
+        },
+        {
+          "replayIndex": 106,
+          "observationKey": "40495d62963b02d4",
+          "directOutcomeSha256": "c55ac01383565d0051d939a1fc86f9794114fec68ded8ec9b6ae76a34548bb02"
+        },
+        {
+          "replayIndex": 115,
+          "observationKey": "c85005e71e65888b",
+          "directOutcomeSha256": "c80916784137f8f9e5c0de273520a801846d07fc4351523bf6adef8d0a45dad7"
+        },
+        {
+          "replayIndex": 175,
+          "observationKey": "dd9ad8dbc76f018b",
+          "directOutcomeSha256": "b806c96f7f68db0dbb45319ef0dd4ac6cbf76c1d152387617ea0079087b0162c"
+        },
+        {
+          "replayIndex": 201,
+          "observationKey": "43fc64b124471ddf",
+          "directOutcomeSha256": "9c34b15cf9ff8b5083058935758fb5ce4501063ef93813394633531250747098"
+        },
+        {
+          "replayIndex": 240,
+          "observationKey": "9b5188c2dd8af845",
+          "directOutcomeSha256": "faef01b25384f8744b51df0da5ad7859862c22f43a8a14b86e1531aa98c2310c"
+        },
+        {
+          "replayIndex": 285,
+          "observationKey": "f1d01bc328d4b6b9",
+          "directOutcomeSha256": "a1cc629707e934f091dd27f2e06ebdcb11aefd1e7b456c2f09052fd5eceface8"
+        },
+        {
+          "replayIndex": 304,
+          "observationKey": "94ed51af978f1427",
+          "directOutcomeSha256": "04e89ff920cd1049b6ece7dc8306a2928860a09979032f973c8f6b0a8aabd365"
+        }
+      ],
+      "capturedRawSha256": "95e3c77df82557e8e63f6748a41e5b7a65ff0a730e21fc10e01796239c30d3cc"
+    },
+    {
+      "name": "rollout-cap-one",
+      "players": 4,
+      "config": {
+        "horizonDays": 6,
+        "maxRolloutSteps": 1,
+        "maxTotalSteps": 16384,
+        "minCompletedWorlds": 2,
+        "samplingSalt": 0,
+        "worldsPerAction": 4
+      },
+      "configurationKey": "847e2e0168bb4bec533bfe40e504ee167bd8637acabb7021367457fcbab6586e",
+      "sourceReplaySha256": "3d57f7021f8499c15d68f850eadf6cc684fa9ea4322a14bb28f98c5bb227832e",
+      "selectedCorpusSha256": "fe624e53fad3d8054f37435618618a3f285c46527582d9f430c071ed0adf212a",
+      "states": [
+        {
+          "replayIndex": 0,
+          "observationKey": "0e6dd80d570b20e7",
+          "directOutcomeSha256": "513eeae0d6aeed400954bce58678c8f8a95350f02e4e0aaed72b980136446261"
+        },
+        {
+          "replayIndex": 1,
+          "observationKey": "d7ad8c277deff06d",
+          "directOutcomeSha256": "772e40d34f541c8785c54c497a5d11fda6c3c30c5a266cee9e8f112c898a78fd"
+        },
+        {
+          "replayIndex": 2,
+          "observationKey": "9b3abce3f7a399f6",
+          "directOutcomeSha256": "f5d5dd5ba1661559ba6c88474e747fe3ea95af819bfdb21abc5cd867516011ad"
+        },
+        {
+          "replayIndex": 3,
+          "observationKey": "017afad5f699fb12",
+          "directOutcomeSha256": "dea0ba8cd129b45082a023573e90bfaafe23140f3c126265c105e3b03b794e0f"
+        },
+        {
+          "replayIndex": 53,
+          "observationKey": "414f9769f517774e",
+          "directOutcomeSha256": "c478546d2661e72f2fc89f3c40d30ee75c6d157686833689c90cab1f045cd758"
+        },
+        {
+          "replayIndex": 64,
+          "observationKey": "6196a4d3b0efe3db",
+          "directOutcomeSha256": "f39825a418ff6e312d370c6a5e0fb2abf4ac6c23ab710f74c73a4db89eb73ca4"
+        },
+        {
+          "replayIndex": 164,
+          "observationKey": "5a75d386e9286b7c",
+          "directOutcomeSha256": "67231b94b61f1d11e848ce820dd7a1a25d7b2d9818e26950a65a9890cb37ebe5"
+        },
+        {
+          "replayIndex": 178,
+          "observationKey": "ccce8a484a943d0e",
+          "directOutcomeSha256": "cbea5954a9df07ee40f2f45714b35cfc4ded136a10a9e9d3675af0efb63e5953"
+        },
+        {
+          "replayIndex": 262,
+          "observationKey": "52ac778abc334b41",
+          "directOutcomeSha256": "734ef41512b8ace022f4d7e82af804ff190228f2e3526164938715e1051c64e8"
+        },
+        {
+          "replayIndex": 291,
+          "observationKey": "a29a40d9c650aa48",
+          "directOutcomeSha256": "e10709b893bb11a7ada6a6e92682f5e0bf457bd6ea3b9306e292b66ddfda116d"
+        },
+        {
+          "replayIndex": 390,
+          "observationKey": "2878e75e560519bb",
+          "directOutcomeSha256": "7d5d2f50388130d1e5fa1a18aa2e5e9175ac21f1364205992babc289f9cb813f"
+        },
+        {
+          "replayIndex": 392,
+          "observationKey": "ba081c99c1657e65",
+          "directOutcomeSha256": "a063a9882e06e39fd642705ac712ba8359995631e7d944aefa6b39f04ed5e179"
+        }
+      ],
+      "capturedRawSha256": "345345b712795ae5f86627af1a06118e396b82b5064f79e00c80ab397a4cf581"
+    }
+  ]
+}
