@@ -250,12 +250,15 @@ function publicUiDomView(raw, tableEvidenceBytes) {
   }
   for (const player of raw.metadata.players) {
     if (player.rank == null && player.score == null) continue;
-    if (!/^\d+位$/.test(player.rank) || !/^\d+\s*$/.test(player.score))
+    if (!/^\d+位$/.test(player.rank) || !/^-?\d+\s*$/.test(player.score))
       throw new Error('Invalid current UI displayed result');
     history.push(player.rank, player.name, player.score.trim() + ' ');
   }
   let table_details_text = '';
   let tableEvidence;
+  let terminationText = raw.metadata.historyRowText ?? null;
+  if (terminationText != null && typeof terminationText !== 'string')
+    throw new Error('Invalid current UI history row text');
   if (tableEvidenceBytes != null) {
     if (!Buffer.isBuffer(tableEvidenceBytes)) throw new Error('Expected raw table evidence bytes');
     const table = JSON.parse(tableEvidenceBytes);
@@ -267,6 +270,10 @@ function publicUiDomView(raw, tableEvidenceBytes) {
       throw new Error('Table evidence schema/identity/options mismatch');
     table_details_text = `ゲーム構成\n${table.optionsText}`;
     tableEvidence = { reference: table.url, sha256: hash(tableEvidenceBytes) };
+    if (table.resultText != null) {
+      if (typeof table.resultText !== 'string') throw new Error('Invalid visible result text');
+      terminationText = [terminationText, table.resultText].filter(Boolean).join('\n') || null;
+    }
   }
   return {
     raw: {
@@ -286,6 +293,7 @@ function publicUiDomView(raw, tableEvidenceBytes) {
       table_details_text,
     },
     tableEvidence,
+    terminationText,
   };
 }
 
@@ -312,16 +320,19 @@ export function normalizeGame(original, sourceSha256, tableEvidenceBytes = null)
     }
   }
   const cancellationCount = events.filter((e) => e.kind === 'cancellation').length;
-  const status = raw.metadata.history_text.includes('放棄されたテーブル')
+  const terminationText = adapted ? adapted.terminationText : raw.metadata.history_text;
+  const status = terminationText?.includes('放棄されたテーブル')
     ? 'abandoned'
-    : raw.metadata.history_text.includes('投了')
+    : terminationText?.includes('投了')
       ? 'forfeit'
-      : events.some((event) => event.kind === 'gameEnd') ||
-          raw.entries.some((entry) => entry.raw_text.split('\n').includes('ゲーム終了'))
-        ? 'normalEnd'
-        : 'unknown';
+      : adapted && !terminationText
+        ? 'unknown'
+        : events.some((event) => event.kind === 'gameEnd') ||
+            raw.entries.some((entry) => entry.raw_text.split('\n').includes('ゲーム終了'))
+          ? 'normalEnd'
+          : 'unknown';
   const config = raw.table_details_text.split('ゲーム構成\n')[1] ?? '';
-  const results = [...raw.metadata.history_text.matchAll(/(\d+)位\n([^\n]+)\n(\d+)\s/g)].map(
+  const results = [...raw.metadata.history_text.matchAll(/(\d+)位\n([^\n]+)\n(-?\d+)\s/g)].map(
     (m) => ({ player: m[2].trim(), rank: Number(m[1]), scoreDisplay: Number(m[3]) }),
   );
   const splitByte = parseInt(hash(raw.table_id).slice(0, 8), 16) % 10;
@@ -355,6 +366,7 @@ export function normalizeGame(original, sourceSha256, tableEvidenceBytes = null)
     },
     quality: {
       status,
+      ...(adapted ? { terminalLogObserved: events.some((event) => event.kind === 'gameEnd') } : {}),
       cancellationCount,
       rollbackResolved: cancellationCount === 0,
       verifiedComplete: false,

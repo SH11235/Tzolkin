@@ -89,6 +89,7 @@ function currentTable() {
       schema: 'tzolkin-bga-public-table-ui-v1',
       url: 'https://boardgamearena.com/table?table=123',
       optionsText: 'ゲームモード\nアリーナモード\nウシュマルコーンの制限\n制限なし',
+      resultText: 'ゲーム終了\nゲーム結果',
     }),
   );
 }
@@ -119,6 +120,25 @@ test('adapts current public DOM wire without replacing original entries or inven
   const unknown = normalizeGame(raw, 'checksum');
   assert.equal(unknown.context.mode, null);
   assert.equal(unknown.context.marketOption, null);
+  assert.equal(unknown.quality.status, 'unknown');
+  assert.equal(unknown.quality.terminalLogObserved, true);
+  const negative = currentFixture();
+  negative.metadata.players[0].score = '-3 ';
+  assert.equal(
+    normalizeGame(negative, 'checksum', currentTable()).resultsDisplay[0].scoreDisplay,
+    -3,
+  );
+  for (const [marker, expected] of [
+    ['放棄されたテーブル', 'abandoned'],
+    ['投了', 'forfeit'],
+  ]) {
+    const table = JSON.parse(currentTable());
+    table.resultText = marker;
+    assert.equal(
+      normalizeGame(raw, 'checksum', Buffer.from(JSON.stringify(table))).quality.status,
+      expected,
+    );
+  }
   for (const change of [
     (g) => {
       g.export_scope = 'all_observed_log_entries';
