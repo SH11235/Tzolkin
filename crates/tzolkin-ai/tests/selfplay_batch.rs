@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 
 use kernel::Kernel;
 use sha2::{Digest, Sha256};
@@ -8,16 +9,10 @@ use tzolkin_ai::selfplay_batch::{BatchConfig, BatchManifest, generate_batch};
 use tzolkin_ai::{kernel, model, replay};
 use tzolkin_core::GameOptions;
 
-static SERIAL: AtomicU64 = AtomicU64::new(0);
 struct Temporary(PathBuf);
 impl Temporary {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "tzolkin-batch-{}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = test_temp_root::create("tzolkin-batch").unwrap();
         Self(path)
     }
 }

@@ -2,7 +2,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -21,16 +22,10 @@ use tzolkin_core::public_replay::{PublicState, inspect_public};
 use tzolkin_core::tribes::TribeId;
 use tzolkin_core::*;
 
-static SERIAL: AtomicU64 = AtomicU64::new(0);
 struct Temporary(PathBuf);
 impl Temporary {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "tzolkin-public-model-{}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = test_temp_root::create("tzolkin-public-model").unwrap();
         Self(path)
     }
 }

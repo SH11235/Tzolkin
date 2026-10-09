@@ -4,7 +4,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 use tzolkin_ai::dataset::{self, DatasetSplit};
 use tzolkin_ai::policy_dataset::{export_native_files, load_policy_dataset};
 use tzolkin_ai::policy_training::{PolicyBcConfig, train_dataset};
@@ -15,13 +16,7 @@ use tzolkin_core::GameOptions;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "tzolkin-stochastic-cli-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = test_temp_root::create("tzolkin-stochastic-cli").unwrap();
         Self(path)
     }
 }

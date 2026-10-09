@@ -1159,7 +1159,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    mod test_temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
+        ));
+    }
     use tzolkin_ai::public_model::PublicPolicyArtifact;
 
     fn args(mode: &str, extra: &[&str]) -> Vec<String> {
@@ -1388,13 +1393,7 @@ mod tests {
     }
     #[test]
     fn reports_publish_exclusively_and_reject_network_paths() {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "tzolkin-v2-bench-publish-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&dir).unwrap();
+        let dir = test_temp_root::create("tzolkin-v2-bench-publish").unwrap();
         let file = dir.join("result.json");
         publish(&file, &json!({"test":1})).unwrap();
         let old = fs::read(&file).unwrap();

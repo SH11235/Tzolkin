@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 use tzolkin_ai::dataset::{self, DatasetSplit};
 use tzolkin_ai::policy_dataset::{export_native_files, load_policy_dataset};
 use tzolkin_ai::policy_training::{
@@ -19,13 +20,7 @@ use tzolkin_core::GameOptions;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "tzolkin-public-training-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&dir).unwrap();
+        let dir = test_temp_root::create("tzolkin-public-training").unwrap();
         Self(dir)
     }
     fn export(&self, count: usize) -> PathBuf {

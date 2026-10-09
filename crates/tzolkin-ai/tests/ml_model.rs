@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 
 use sha2::{Digest, Sha256};
 use tzolkin_ai::dataset::{
@@ -14,16 +15,10 @@ use tzolkin_ai::training::{TrainingCheckpoint, TrainingConfig, train, train_data
 use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, observe};
 use tzolkin_core::{GameOptions, create_game};
 
-static SERIAL: AtomicU64 = AtomicU64::new(0);
 struct Temporary(PathBuf);
 impl Temporary {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "tzolkin-ml-{}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = test_temp_root::create("tzolkin-ml").unwrap();
         Self(path)
     }
 }

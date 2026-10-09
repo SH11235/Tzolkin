@@ -529,20 +529,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod test_temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
+        ));
+    }
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "tzolkin-public-selfplay-report-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
+            let path = test_temp_root::create("tzolkin-public-selfplay-report").unwrap();
             Self(path)
         }
     }

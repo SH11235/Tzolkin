@@ -859,6 +859,12 @@ fn publish(path: &Path, value: &impl Serialize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod test_temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
+        ));
+    }
     use crate::features::FeatureEncoder;
     use crate::public_model::LoadedPublicPolicy;
     use std::sync::OnceLock;
@@ -1035,8 +1041,7 @@ mod tests {
 
     #[test]
     fn publisher_never_overwrites_a_destination_or_foreign_temporary_file() {
-        let dir = std::env::temp_dir().join(format!("tzolkin-bc-publish-{}", std::process::id()));
-        fs::create_dir(&dir).unwrap();
+        let dir = test_temp_root::create("tzolkin-bc-publish").unwrap();
         let path = dir.join("checkpoint.json");
         fs::write(&path, b"original").unwrap();
         assert!(publish(&path, &7).is_err());

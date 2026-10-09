@@ -3,7 +3,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 use tzolkin_ai::arena::{ArenaConfig, Partition, PolicyConfig, partition_seeds, run_arena};
 use tzolkin_ai::dataset::{self, DatasetSplit};
 use tzolkin_ai::kernel::Kernel;
@@ -20,13 +21,7 @@ use tzolkin_core::observation::observe;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "tzolkin-public-native-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&dir).unwrap();
+        let dir = test_temp_root::create("tzolkin-public-native").unwrap();
         Self(dir)
     }
 }

@@ -2,7 +2,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 use tzolkin_ai::dataset::{self, DatasetManifest, DatasetSplit, TrainingSample};
 use tzolkin_ai::features::{FEATURE_COUNT, FeatureEncoder, encode_action};
 use tzolkin_ai::replay::{self, GameReplay, ReplaySource};
@@ -39,13 +40,7 @@ fn five() -> &'static GameReplay {
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        static COUNT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "tzolkin-ml-dataset-{}-{}",
-            std::process::id(),
-            COUNT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = test_temp_root::create("tzolkin-ml-dataset").unwrap();
         Self(path)
     }
     fn dataset(&self) -> PathBuf {

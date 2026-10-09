@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tzolkin_ai::{dataset, experiment, model::ModelArtifact, replay, training::TrainingCheckpoint};
 use tzolkin_core::{GameOptions, create_game, observation::observe};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 
 struct Temporary(PathBuf);
 impl Drop for Temporary {
@@ -19,8 +21,7 @@ fn cli(args: &[&str]) -> std::process::Output {
 }
 #[test]
 fn native_cli_trains_resumes_selects_legal_moves_and_enforces_evaluation_provenance() {
-    let root = std::env::temp_dir().join(format!("tzolkin-ml-pipeline-cli-{}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = test_temp_root::create("tzolkin-ml-pipeline-cli").unwrap();
     let guard = Temporary(root);
     let records = [0, 3].map(|seed| {
         replay::play_game(2, seed, GameOptions::default(), true)
