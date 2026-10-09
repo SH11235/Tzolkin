@@ -33,30 +33,32 @@ test('a human can finish setup and take a turn against a CPU seat', async ({ pag
   await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
-test('CPU seats play through the real Wasm Worker and finish a five-player expansion game', async ({
-  page,
-}) => {
-  test.setTimeout(300_000);
-  const failures: string[] = [];
-  page.on('pageerror', (error) => failures.push(error.message));
-  await page.goto('/');
-  await page.getByLabel('クイックアクション・5人対局').check();
-  await page.getByLabel('部族', { exact: false }).check();
-  await page.getByLabel('予言', { exact: false }).check();
-  await page.getByLabel('追加建物8枚を混ぜる').check();
-  await page.getByRole('button', { name: '5人', exact: true }).click();
-  for (let seat = 1; seat <= 5; seat++)
-    await page.getByLabel(`プレイヤー ${seat}の操作`).selectOption('cpu');
-  await page.getByRole('button', { name: '対局をはじめる', exact: true }).click();
-  await expect
-    .poll(async () => (await sessionOf(page))?.state.phase, { timeout: 260_000 })
-    .toBe('finished');
-  const session = await sessionOf(page);
-  expect(session.controllers).toEqual(['cpu', 'cpu', 'cpu', 'cpu', 'cpu']);
-  expect(session.state.finalScores).toHaveLength(5);
-  await expect(page.getByRole('alert')).toHaveCount(0);
-  expect(failures).toEqual([]);
-});
+test(
+  'CPU seats play through the real Wasm Worker and finish a five-player expansion game',
+  { tag: '@long' },
+  async ({ page }) => {
+    test.setTimeout(300_000);
+    const failures: string[] = [];
+    page.on('pageerror', (error) => failures.push(error.message));
+    await page.goto('/');
+    await page.getByLabel('クイックアクション・5人対局').check();
+    await page.getByLabel('部族', { exact: false }).check();
+    await page.getByLabel('予言', { exact: false }).check();
+    await page.getByLabel('追加建物8枚を混ぜる').check();
+    await page.getByRole('button', { name: '5人', exact: true }).click();
+    for (let seat = 1; seat <= 5; seat++)
+      await page.getByLabel(`プレイヤー ${seat}の操作`).selectOption('cpu');
+    await page.getByRole('button', { name: '対局をはじめる', exact: true }).click();
+    await expect
+      .poll(async () => (await sessionOf(page))?.state.phase, { timeout: 260_000 })
+      .toBe('finished');
+    const session = await sessionOf(page);
+    expect(session.controllers).toEqual(['cpu', 'cpu', 'cpu', 'cpu', 'cpu']);
+    expect(session.state.finalScores).toHaveLength(5);
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(failures).toEqual([]);
+  },
+);
 
 test('pause, undo and reload preserve CPU seats and stop automatic moves', async ({ page }) => {
   await page.goto('/');

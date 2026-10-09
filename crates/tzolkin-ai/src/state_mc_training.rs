@@ -1947,6 +1947,7 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
     #[test]
+    #[ignore = "slow ML correctness integration; run npm run test:ml:slow"]
     fn train_resume_save_have_zero_test_forwards_despite_whole_test_integrity_reads() {
         // Four actual complete fixture generations here, separate from the integration
         // process's five. No experimental family or protected main input is used.

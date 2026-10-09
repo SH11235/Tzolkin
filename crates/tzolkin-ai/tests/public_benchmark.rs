@@ -51,6 +51,7 @@ fn json(output: &std::process::Output) -> Value {
 }
 
 #[test]
+#[ignore = "slow ML correctness integration; run npm run test:ml:slow"]
 fn genuine_trained_native_pipeline_verifies_corpus_and_complete_mixed_games_without_clocks() {
     let temp = Temp::new();
     let mut files = Vec::new();

@@ -120,6 +120,7 @@ fn bytes(out: &Path) -> [Vec<u8>; 3] {
 }
 
 #[test]
+#[ignore = "slow ML correctness integration; run npm run test:ml:slow"]
 fn complete_native_scalar_continuous_resume_noop_and_actual_cli_are_exact() {
     let f = fixture();
     assert!(f.pending_off_turn > 0);
