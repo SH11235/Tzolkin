@@ -99,6 +99,7 @@ fn path(path: &Path) -> &str {
 }
 
 #[test]
+#[ignore = "slow ML correctness integration; run npm run test:ml:slow"]
 fn native_bc_epoch_resume_matches_continuous_bits_metrics_and_actual_train_resume_evaluate_cli() {
     let temp = Temp::new();
     let dataset_dir = temp.export(3);

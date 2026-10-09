@@ -402,53 +402,55 @@ test('the additional building market describes seasonal rewards and end-turn ref
   await expect(card).toContainText('最初の2回の食料日に木材1、最後の2回に髑髏1（給食前）');
 });
 
-test('a complete 27-day match reaches Food Days and renders ranked final results', async ({
-  page,
-}) => {
-  test.setTimeout(150_000);
-  let state = await startGame(page, 2);
-  const days = new Set([state.round]);
-  for (let actions = 0; state.phase !== 'finished' && actions < 600; actions++) {
-    let move: GameMove;
-    if (state.pending) move = safeChoice(state).move;
-    else if (state.turn.count) move = { type: 'endTurn' };
-    else {
-      const choices = getAvailableMoves(state).filter((choice) => !choice.disabled);
-      const remove = choices.find((choice) => choice.move.type === 'remove');
-      const places = choices
-        .filter((choice) => choice.move.type === 'place')
-        .sort((first, second) => {
-          const cost = (choice: Choice) => Number(choice.description?.match(/\d+/)?.[0] ?? 0);
-          return cost(first) - cost(second);
-        });
-      const selected =
-        remove ??
-        places[0] ??
-        choices.find((choice) => choice.move.type === 'firstPlayer') ??
-        choices.find((choice) => choice.move.type === 'beg');
-      if (!selected) throw new Error(`No usable move on day ${state.round}`);
-      move = selected.move;
+test(
+  'a complete 27-day match reaches Food Days and renders ranked final results',
+  { tag: '@long' },
+  async ({ page }) => {
+    test.setTimeout(150_000);
+    let state = await startGame(page, 2);
+    const days = new Set([state.round]);
+    for (let actions = 0; state.phase !== 'finished' && actions < 600; actions++) {
+      let move: GameMove;
+      if (state.pending) move = safeChoice(state).move;
+      else if (state.turn.count) move = { type: 'endTurn' };
+      else {
+        const choices = getAvailableMoves(state).filter((choice) => !choice.disabled);
+        const remove = choices.find((choice) => choice.move.type === 'remove');
+        const places = choices
+          .filter((choice) => choice.move.type === 'place')
+          .sort((first, second) => {
+            const cost = (choice: Choice) => Number(choice.description?.match(/\d+/)?.[0] ?? 0);
+            return cost(first) - cost(second);
+          });
+        const selected =
+          remove ??
+          places[0] ??
+          choices.find((choice) => choice.move.type === 'firstPlayer') ??
+          choices.find((choice) => choice.move.type === 'beg');
+        if (!selected) throw new Error(`No usable move on day ${state.round}`);
+        move = selected.move;
+      }
+      state = await perform(page, move);
+      days.add(state.round);
     }
-    state = await perform(page, move);
-    days.add(state.round);
-  }
-  expect(state.phase).toBe('finished');
-  expect([...days]).toEqual(Array.from({ length: 27 }, (_, index) => index + 1));
-  expect(state.foodDays).toEqual([8, 14, 21, 27]);
-  expect(state.age).toBe(2);
-  expect(state.finalScores).toHaveLength(2);
-  expect(state.finalScores.every((score) => Number.isFinite(score.total) && score.rank >= 1)).toBe(
-    true,
-  );
-  await expect(page.getByRole('heading', { name: /の勝利$/ })).toBeVisible();
-  await expect(page.getByRole('table').getByRole('row')).toHaveCount(3);
-  await expect(page.locator('.place-button:enabled')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: '手番を終了', exact: true })).toHaveCount(0);
-  await page.reload();
-  await page.getByRole('button', { name: /^保存した対局を続ける/ }).click();
-  await expect(page.getByRole('heading', { name: /の勝利$/ })).toBeVisible();
-  expect(await gameState(page)).toEqual(state);
-});
+    expect(state.phase).toBe('finished');
+    expect([...days]).toEqual(Array.from({ length: 27 }, (_, index) => index + 1));
+    expect(state.foodDays).toEqual([8, 14, 21, 27]);
+    expect(state.age).toBe(2);
+    expect(state.finalScores).toHaveLength(2);
+    expect(
+      state.finalScores.every((score) => Number.isFinite(score.total) && score.rank >= 1),
+    ).toBe(true);
+    await expect(page.getByRole('heading', { name: /の勝利$/ })).toBeVisible();
+    await expect(page.getByRole('table').getByRole('row')).toHaveCount(3);
+    await expect(page.locator('.place-button:enabled')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '手番を終了', exact: true })).toHaveCount(0);
+    await page.reload();
+    await page.getByRole('button', { name: /^保存した対局を続ける/ }).click();
+    await expect(page.getByRole('heading', { name: /の勝利$/ })).toBeVisible();
+    expect(await gameState(page)).toEqual(state);
+  },
+);
 
 test('390px screens keep setup and all game views inside the viewport', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });

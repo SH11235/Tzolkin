@@ -56,6 +56,7 @@ fn path(path: &Path) -> &str {
 }
 
 #[test]
+#[ignore = "slow ML correctness integration; run npm run test:ml:slow"]
 fn actual_trained_policy_completes_three_four_players_roundtrips_and_runs_qualified_arena() {
     let temp = Temp::new();
     let mut sources = Vec::new();
