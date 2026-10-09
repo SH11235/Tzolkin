@@ -24,6 +24,15 @@ pub(crate) const B1: usize = FEATURE_COUNT * HIDDEN;
 pub(crate) const WP: usize = B1 + HIDDEN;
 pub(crate) const BP: usize = WP + HIDDEN;
 const MAX_FEATURE_ABS: f32 = 1024.0;
+const CONTEXT_COLUMNS: usize = 384;
+
+fn prefix_bits_equal(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -48,7 +57,7 @@ impl PublicPolicyModel {
         }
         Ok(())
     }
-    fn logit(&self, row: &EncodedCandidate, kernel: ResolvedKernel) -> Result<f32, String> {
+    fn validated_values(row: &EncodedCandidate) -> Result<&[f32; FEATURE_COUNT], String> {
         let values = row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
         if values
             .iter()
@@ -71,9 +80,20 @@ impl PublicPolicyModel {
         {
             return Err("Tagged features outside the base 3-4p Setup/Playing contract".into());
         }
+        Ok(values)
+    }
+    fn logit(&self, row: &EncodedCandidate, kernel: ResolvedKernel) -> Result<f32, String> {
+        let values = Self::validated_values(row)?;
         let mut hidden = [0.0; HIDDEN];
         // The immutable loaded handle has checked parameter shape and finiteness.
         kernel.dot_rows_validated(&self.parameters[..B1], values, &mut hidden);
+        self.finish_hidden(hidden, kernel)
+    }
+    fn finish_hidden(
+        &self,
+        mut hidden: [f32; HIDDEN],
+        kernel: ResolvedKernel,
+    ) -> Result<f32, String> {
         for (unit, value) in hidden.iter_mut().enumerate() {
             *value += self.parameters[B1 + unit];
             if !value.is_finite() {
@@ -261,12 +281,42 @@ impl<'a> LoadedPublicPolicy<'a> {
             return Err("Invalid public policy candidate count".into());
         }
         let context = rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        // This is only an optimization predicate, not a new acceptance guard.
+        // Numeric-equal contexts with different signed-zero bits retain the
+        // old path. A bad tag also retains the old per-row error ordering.
+        let reusable = rows.len() > 1
+            && rows.iter().all(|row| {
+                row.values_for_schema(PUBLIC_FEATURE_SCHEMA)
+                    .is_ok_and(|values| {
+                        prefix_bits_equal(&context[..CONTEXT_COLUMNS], &values[..CONTEXT_COLUMNS])
+                    })
+            });
+        let mut prefix = None;
         let mut logits = Vec::with_capacity(rows.len());
         for row in rows {
-            if row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384] != context[..384] {
+            if row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..CONTEXT_COLUMNS]
+                != context[..CONTEXT_COLUMNS]
+            {
                 return Err("Public policy candidates do not share one context".into());
             }
-            logits.push(self.policy_logit(row)?);
+            let logit = if reusable {
+                // Every candidate's full 512-value guard runs before its dot.
+                // Initialization occurs only after the first row is validated;
+                // the cache cannot escape this call or its immutable model.
+                let values = PublicPolicyModel::validated_values(row)?;
+                let saved = prefix.get_or_insert_with(|| {
+                    self.kernel.policy_prefix_validated(
+                        &self.artifact.model.parameters[..B1],
+                        &context[..CONTEXT_COLUMNS],
+                    )
+                });
+                let mut hidden = [0.0; HIDDEN];
+                saved.continue_validated(&values[CONTEXT_COLUMNS..], &mut hidden);
+                self.artifact.model.finish_hidden(hidden, self.kernel)?
+            } else {
+                self.policy_logit(row)?
+            };
+            logits.push(logit);
         }
         let mut probabilities = vec![0.0; logits.len()];
         policy_softmax(&logits, &mut probabilities)?;
@@ -396,4 +446,20 @@ pub(crate) fn validate_contract(o: &Observation) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::prefix_bits_equal;
+
+    #[test]
+    fn numeric_equal_signed_zero_is_ineligible_for_prefix_reuse() {
+        let left = [0.0, 1.0, f32::from_bits(1)];
+        let right = [-0.0, 1.0, f32::from_bits(1)];
+        assert_eq!(left, right); // existing batch acceptance is numerical
+        assert!(!prefix_bits_equal(&left, &right)); // retain per-row path
+        assert!(prefix_bits_equal(&left, &left));
+        assert!(!prefix_bits_equal(&left, &left[..2]));
+        assert!(!prefix_bits_equal(&[1.0], &[1.0000001]));
+    }
 }
