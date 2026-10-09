@@ -5,6 +5,7 @@ pub use crate::dataset::seed_family_id as family_id;
 use crate::kernel::Kernel;
 use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
+use crate::public_native::{PreparedPublicPolicy, PublicPolicyHandle};
 use crate::replay::{self, ReplaySource, SeatPolicy};
 use crate::search::{PreparedSearch, SearchConfig};
 use crate::search_native::{SearchSummary, SearchTrace};
@@ -68,6 +69,12 @@ fn scalar() -> String {
     deny_unknown_fields
 )]
 pub enum PolicyConfig {
+    PublicLearned {
+        checkpoint: PathBuf,
+        dataset: PathBuf,
+        #[serde(default = "scalar")]
+        kernel: String,
+    },
     Search {
         config: SearchConfig,
     },
@@ -124,6 +131,7 @@ impl ArenaConfig {
     }
 }
 enum PreparedPolicy {
+    PublicLearned(PreparedPublicPolicy),
     Search(PreparedSearch),
     Heuristic(HeuristicWeights),
     Learned {
@@ -135,6 +143,24 @@ enum PreparedPolicy {
 impl PreparedPolicy {
     fn load(config: &PolicyConfig, arena: &ArenaConfig, base: &Path) -> Result<Self, String> {
         match config {
+            PolicyConfig::PublicLearned {
+                checkpoint,
+                dataset,
+                kernel,
+            } => {
+                if arena.partition != Partition::Test {
+                    return Err(
+                        "Public learned arena policies require the held-out test partition".into(),
+                    );
+                }
+                let prepared = PreparedPublicPolicy::load(
+                    &base.join(checkpoint),
+                    &base.join(dataset),
+                    crate::public_native::parse_kernel(kernel)?,
+                )?;
+                prepared.require_test_families(&arena.seeds)?;
+                Ok(Self::PublicLearned(prepared))
+            }
             PolicyConfig::Search { config } => Ok(Self::Search(PreparedSearch::new(config)?)),
             PolicyConfig::Heuristic { weights } => {
                 weights.validate()?;
@@ -189,6 +215,7 @@ pub struct PolicyDescription {
     pub dataset_fingerprint: Option<String>,
 }
 enum PolicyChooser<'a> {
+    PublicLearned(Box<PublicPolicyHandle<'a>>),
     Search(&'a PreparedSearch),
     Heuristic(&'a HeuristicWeights),
     Learned(LoadedPolicy<'a>),
@@ -203,6 +230,23 @@ struct PolicyHandle<'a> {
 impl<'a> PolicyHandle<'a> {
     fn new(policy: &'a PreparedPolicy) -> Result<Self, String> {
         let (chooser, provenance, dataset_fingerprint) = match policy {
+            PreparedPolicy::PublicLearned(policy) => {
+                let handle = policy.handle()?;
+                let provenance = handle.provenance().clone();
+                let SeatPolicy::PublicLearned {
+                    dataset_fingerprint,
+                    ..
+                } = &provenance
+                else {
+                    return Err("Prepared public policy provenance mismatch".into());
+                };
+                let fingerprint = dataset_fingerprint.clone();
+                (
+                    PolicyChooser::PublicLearned(Box::new(handle)),
+                    provenance,
+                    Some(fingerprint),
+                )
+            }
             PreparedPolicy::Search(policy) => (
                 PolicyChooser::Search(policy),
                 crate::search_native::provenance(policy),
@@ -247,6 +291,7 @@ impl<'a> PolicyHandle<'a> {
         observation: &Observation,
     ) -> Result<(Decision, Option<SearchTrace>), String> {
         match &self.chooser {
+            PolicyChooser::PublicLearned(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::Search(policy) => crate::search_native::decide(policy, observation),
             PolicyChooser::Heuristic(weights) => {
                 Ok((choose_move_with_weights(observation, weights)?, None))
