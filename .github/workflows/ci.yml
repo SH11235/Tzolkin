@@ -28,11 +28,15 @@ jobs:
       - id: filter
         run: |
           # A pull request checks out its merge commit; the first parent is the base.
+          # The diff is its own statement so that a git failure stops the job
+          # instead of looking like "no Rust change".
           rust=true
-          if [[ $GITHUB_EVENT_NAME == pull_request ]] &&
-            ! git diff --name-only HEAD^1 HEAD |
-              grep -qE '^(crates/|src-tauri/|scripts/|tests/fixtures/|\.github/|Cargo\.(toml|lock)$|package(-lock)?\.json$)'; then
-            rust=false
+          if [[ $GITHUB_EVENT_NAME == pull_request ]]; then
+            files=$(git diff --name-only HEAD^1 HEAD)
+            pattern='^(crates/|src-tauri/|scripts/|tests/fixtures/|\.github/|\.cargo/|Cargo\.(toml|lock)$|package(-lock)?\.json$|rust-toolchain(\.toml)?$|(clippy|rustfmt)\.toml$)'
+            if ! grep -qE "$pattern" <<<"$files"; then
+              rust=false
+            fi
           fi
           echo "rust=$rust" >> "$GITHUB_OUTPUT"
 
