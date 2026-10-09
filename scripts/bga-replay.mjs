@@ -353,7 +353,12 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
     fail('Initial checkpoint/provenance mismatch');
   const initialReport = dispatch({
     operation: 'publicReplay',
-    replay: { ...record, steps: [], terminalCheckpoint: null },
+    replay: {
+      ...record,
+      steps: [],
+      terminalCheckpoint: null,
+      terminalDisplayCheckpoint: null,
+    },
   });
   if (
     !Array.isArray(initialReport.frames) ||
@@ -543,7 +548,10 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
       if (event.kind !== 'cancellation' || !cancellations.has(event.actionId))
         fail('Unresolved source cancellation');
     } else if (row.kind === 'terminal') {
-      if (event.kind !== 'gameEnd' || companion.status !== 'complete')
+      if (
+        event.kind !== 'gameEnd' ||
+        !(record.terminalCheckpoint || record.terminalDisplayCheckpoint)
+      )
         fail('Invalid terminal coverage');
     } else if (row.kind === 'move') {
       const moveIds = array(row.moveIds, 64, 'coverage.moveIds');
@@ -692,30 +700,32 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
       .some((event) => !cancellations.has(event.actionId))
   )
     fail('Unresolved prefix cancellation');
-  if (companion.status === 'complete') {
+  const hasTerminalSource = events.some((event) => event.kind === 'gameEnd');
+  const terminal = record.terminalCheckpoint ?? record.terminalDisplayCheckpoint;
+  if (companion.status === 'complete' || hasTerminalSource || terminal) {
     if (
       cutoff !== raw.entries.at(-1).action_id ||
-      !events.some((event) => event.kind === 'gameEnd') ||
-      !record.terminalCheckpoint
+      !hasTerminalSource ||
+      !terminal ||
+      (companion.status === 'complete' && !record.terminalCheckpoint) ||
+      (companion.status === 'partial' &&
+        (record.terminalCheckpoint || record.terminalDisplayCheckpoint?.mode !== 'floorTotal'))
     )
-      fail('Complete reconstruction requires full-source terminal evidence');
-    evidence(record.terminalCheckpoint.source, companion.tableId, cutoff, knownIds);
-    if (!record.terminalCheckpoint.source.actionIds.includes(cutoff))
-      fail('Terminal checkpoint must cite cutoff');
+      fail('Terminal reconstruction requires explicit exact or display-only evidence');
+    evidence(terminal.source, companion.tableId, cutoff, knownIds);
+    if (!terminal.source.actionIds.includes(cutoff)) fail('Terminal checkpoint must cite cutoff');
     if (
       game.resultsDisplay.length !== names.length ||
-      !Array.isArray(record.terminalCheckpoint.scores) ||
-      record.terminalCheckpoint.scores.length !== names.length ||
-      new Set(record.terminalCheckpoint.scores.map((score) => score.playerId)).size !==
-        names.length ||
-      record.terminalCheckpoint.scores.some((score) => {
+      !Array.isArray(terminal.scores) ||
+      terminal.scores.length !== names.length ||
+      new Set(terminal.scores.map((score) => score.playerId)).size !== names.length ||
+      terminal.scores.some((score) => {
         const shown = game.resultsDisplay.find((result) => result.player === names[score.playerId]);
         return !shown || shown.rank !== score.rank || shown.scoreDisplay !== score.total;
       })
     )
       fail('Terminal scores/ranks differ from preserved BGA results');
-  } else if (record.terminalCheckpoint || events.some((event) => event.kind === 'gameEnd'))
-    fail('A terminal source cannot be exported as a partial prefix');
+  }
 
   const report = dispatch({ operation: 'publicReplay', replay: record });
   if (
@@ -727,7 +737,10 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
     report.frames.length > MAX_STEPS + 1 ||
     report.trainingReady !== false ||
     (companion.status === 'complete' && (!report.verifiedComplete || !report.terminalMatched)) ||
-    (companion.status === 'partial' && (report.verifiedComplete || report.terminalMatched))
+    (companion.status === 'partial' && (report.verifiedComplete || report.terminalMatched)) ||
+    (record.terminalDisplayCheckpoint &&
+      (!report.terminalDisplayComparison ||
+        report.frames.at(-1)?.snapshot.state.phase !== 'finished'))
   )
     fail('Core replay status/frame/verification mismatch');
   if (!same(report.frames.at(-1).snapshot.state, state))
@@ -750,6 +763,8 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
       status: report.status,
       verifiedComplete: report.verifiedComplete,
       terminalMatched: report.terminalMatched,
+      mechanicallyFinished: report.frames.at(-1).snapshot.state.phase === 'finished',
+      terminalDisplayComparison: report.terminalDisplayComparison ?? null,
       trainingReady: false,
       sourceEventsCovered: covered.size,
       timelineOperations: operations.size,
@@ -774,6 +789,140 @@ async function boundedRead(path) {
   return bytes;
 }
 
+// Same byte fingerprint as tzolkin-core, including whitespace in the catalog.
+export function catalogFingerprint(bytes) {
+  let hash = 0xcbf29ce484222325n;
+  for (const byte of bytes) hash = ((hash ^ BigInt(byte)) * 0x100000001b3n) & 0xffffffffffffffffn;
+  return hash.toString(16).padStart(16, '0');
+}
+
+/**
+ * Recompute an existing public record with the current engine. This does not
+ * reconstruct raw logs, authenticate the source, or bypass the strict exporter.
+ * A catalog update is safe here only when the entire difference concerns
+ * unselected starting tiles: their resources/effects are no longer used after
+ * setup. Their dummy placement geometry must remain identical as well.
+ */
+export function revalidateRecord(recordBytes, previousCatalogBytes, currentCatalogBytes, dispatch) {
+  for (const bytes of [recordBytes, previousCatalogBytes, currentCatalogBytes])
+    if (!Buffer.isBuffer(bytes) || bytes.length > MAX_INPUT_BYTES)
+      fail('Record/catalog exceeds 16 MiB');
+  const original = JSON.parse(recordBytes);
+  if (
+    !object(original) ||
+    original.schema !== 'tzolkin-public-replay-v1' ||
+    original.rulesVersion !== 1 ||
+    original.market !== 'unlimited' ||
+    !Array.isArray(original.initial?.players) ||
+    ![3, 4].includes(original.initial.players.length) ||
+    original.initial.phase !== 'playing'
+  )
+    fail('Expected a basic 3/4-player post-setup public replay');
+  array(original.steps, MAX_STEPS, 'record.steps');
+  if (original.catalogHash !== catalogFingerprint(previousCatalogBytes))
+    fail('Previous catalog fingerprint differs from original record');
+  const previous = JSON.parse(previousCatalogBytes);
+  const current = JSON.parse(currentCatalogBytes);
+  const selected = new Set();
+  for (const player of original.initial.players) {
+    if (!Array.isArray(player.wealth) || player.wealth.length !== 2)
+      fail('Expected two observed starting tiles per player');
+    for (const id of player.wealth) selected.add(id);
+  }
+  const oldTiles = array(previous.STARTING_WEALTH, 100, 'previous STARTING_WEALTH');
+  const newTiles = array(current.STARTING_WEALTH, 100, 'current STARTING_WEALTH');
+  if (
+    !same({ ...previous, STARTING_WEALTH: null }, { ...current, STARTING_WEALTH: null }) ||
+    !same(
+      oldTiles.map((tile) => tile.id),
+      newTiles.map((tile) => tile.id),
+    ) ||
+    new Set(oldTiles.map((tile) => tile.id)).size !== oldTiles.length
+  )
+    fail('Catalog change affects playing rules or starting-tile inventory');
+  const changedUnusedTiles = [];
+  oldTiles.forEach((tile, index) => {
+    const next = newTiles[index];
+    if (same(tile, next)) return;
+    if (selected.has(tile.id) || tile.gear !== next.gear || tile.position !== next.position)
+      fail('Catalog change affects selected wealth or dummy placement');
+    changedUnusedTiles.push(tile.id);
+  });
+  if ([...selected].some((id) => !oldTiles.some((tile) => tile.id === id)))
+    fail('Selected starting tile is absent from previous catalog');
+  const record = { ...original, catalogHash: catalogFingerprint(currentCatalogBytes) };
+  // All initial counters, dummy reachability, actions, refill streams and
+  // observed checkpoints are independently checked by the current Rust core.
+  const report = dispatch({ operation: 'publicReplay', replay: record });
+  const last = report.frames?.at(-1)?.snapshot?.state;
+  if (
+    !Array.isArray(report.frames) ||
+    report.frames.length !== record.steps.length + 1 ||
+    report.verifiedSteps !== record.steps.length ||
+    report.checkpointsVerified !==
+      Number(!!record.initialCheckpoint) +
+        record.steps.filter((step) => step.checkpoint != null).length +
+        Number(!!record.terminalCheckpoint) ||
+    !['partial', 'complete'].includes(report.status) ||
+    report.trainingReady !== false ||
+    (report.status === 'complete' && (!report.verifiedComplete || !report.terminalMatched)) ||
+    (report.status === 'partial' && (report.verifiedComplete || report.terminalMatched)) ||
+    (record.terminalDisplayCheckpoint &&
+      (last?.phase !== 'finished' || !report.terminalDisplayComparison))
+  )
+    fail('Current core replay verification mismatch');
+  return {
+    record,
+    manifest: {
+      schema: 'tzolkin-public-replay-revalidation-v1',
+      originalRecordSha256: sha256(recordBytes),
+      recordSha256: sha256(JSON.stringify(record)),
+      previousCatalogSha256: sha256(previousCatalogBytes),
+      currentCatalogSha256: sha256(currentCatalogBytes),
+      previousCatalogHash: original.catalogHash,
+      catalogHash: record.catalogHash,
+      changedUnusedStartingTiles: changedUnusedTiles,
+      preservedSourceAndOperations: true,
+      verifiedSteps: report.verifiedSteps,
+      checkpointsVerified: report.checkpointsVerified,
+      frames: report.frames.length,
+      mechanicallyFinished: last?.phase === 'finished',
+      status: report.status,
+      verifiedComplete: report.verifiedComplete,
+      terminalMatched: report.terminalMatched,
+      terminalDisplayComparison: report.terminalDisplayComparison ?? null,
+      sourceCoverage: report.sourceCoverage,
+      trainingReady: false,
+      strictExporterAccepted: false,
+      sourceAuthenticityIndependentlyAudited: false,
+      missingReasons: report.missingReasons,
+      limitations: [
+        'Existing explicit public actions are recomputed; this is not raw-log conversion or a source/cancellation audit.',
+        'Omitted checkpoints and unknown setup offers, seed and deck order remain unknown.',
+        'Display-only terminal comparison preserves official fractional scores and does not grant exact result or training approval.',
+      ],
+    },
+  };
+}
+
+export async function exportVerifiedRecord(
+  recordPath,
+  previousCatalogPath,
+  currentCatalogPath,
+  cliPath,
+  outputPath,
+) {
+  const recordBytes = await boundedRead(recordPath);
+  const previous = await boundedRead(previousCatalogPath);
+  const current = await boundedRead(currentCatalogPath);
+  const cliSha256 = sha256(await boundedRead(cliPath));
+  const result = revalidateRecord(recordBytes, previous, current, coreDispatcher(cliPath));
+  if (sha256(await boundedRead(cliPath)) !== cliSha256)
+    fail('Core executable changed during verification');
+  result.manifest.coreCliSha256 = cliSha256;
+  return publishReplay(result, outputPath);
+}
+
 export async function exportReconstruction(rawPath, companionPath, cliPath, outputPath) {
   const rawBytes = await boundedRead(rawPath);
   const companionBytes = await boundedRead(companionPath);
@@ -794,6 +943,17 @@ export async function exportReconstruction(rawPath, companionPath, cliPath, outp
     documents.set(file.id, bytes);
   }
   const result = auditReconstruction(rawBytes, companion, documents, coreDispatcher(cliPath));
+  result.manifest.reconstructionFileSha256 = sha256(companionBytes);
+  result.manifest.inputs = {
+    rawPath: resolve(rawPath),
+    reconstructionPath: resolve(companionPath),
+    coreCliPath: resolve(cliPath),
+    outputPath: resolve(outputPath),
+  };
+  return publishReplay(result, outputPath);
+}
+
+async function publishReplay(result, outputPath) {
   const output = resolve(outputPath);
   await mkdir(dirname(output), { recursive: true });
   await mkdir(output); // An existing output, including an empty one, is rejected.
@@ -801,13 +961,6 @@ export async function exportReconstruction(rawPath, companionPath, cliPath, outp
   if (dirname(temporary) !== dirname(output)) fail('Invalid staging path');
   let published = false;
   try {
-    result.manifest.reconstructionFileSha256 = sha256(companionBytes);
-    result.manifest.inputs = {
-      rawPath: resolve(rawPath),
-      reconstructionPath: resolve(companionPath),
-      coreCliPath: resolve(cliPath),
-      outputPath: output,
-    };
     await writeFile(join(temporary, 'record.json'), JSON.stringify(result.record));
     await writeFile(join(temporary, 'manifest.json'), JSON.stringify(result.manifest, null, 2));
     await rmdir(output); // Only remove the empty reservation this call created.
@@ -825,18 +978,18 @@ export async function exportReconstruction(rawPath, companionPath, cliPath, outp
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const [rawPath, companionPath, cliPath, outputPath] = process.argv.slice(2);
-  if (!rawPath || !companionPath || !cliPath || !outputPath || process.argv.length !== 6) {
+  const args = process.argv.slice(2);
+  const verify = args[0] === 'verify-record';
+  if (args.length !== (verify ? 6 : 4) || args.some((arg) => !arg)) {
     console.error(
-      'Usage: node scripts/bga-replay.mjs RAW_GAME_JSON RECONSTRUCTION_JSON RUST_CLI NEW_OUTPUT_DIR',
+      'Usage: node scripts/bga-replay.mjs RAW_GAME_JSON RECONSTRUCTION_JSON RUST_CLI NEW_OUTPUT_DIR\n' +
+        '   or: node scripts/bga-replay.mjs verify-record RECORD_JSON PREVIOUS_CATALOG CURRENT_CATALOG RUST_CLI NEW_OUTPUT_DIR',
     );
     process.exitCode = 1;
   } else {
-    exportReconstruction(
-      resolve(rawPath),
-      resolve(companionPath),
-      resolve(cliPath),
-      resolve(outputPath),
+    (verify
+      ? exportVerifiedRecord(...args.slice(1).map((path) => resolve(path)))
+      : exportReconstruction(...args.map((path) => resolve(path)))
     )
       .then((manifest) =>
         console.log(
@@ -845,7 +998,10 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
             status: manifest.status,
             verifiedSteps: manifest.verifiedSteps,
             checkpointsVerified: manifest.checkpointsVerified,
-            cancellations: manifest.cancellations.length,
+            mechanicallyFinished: manifest.mechanicallyFinished,
+            terminalMatched: manifest.terminalMatched,
+            terminalDisplayComparison: manifest.terminalDisplayComparison,
+            cancellations: manifest.cancellations?.length ?? null,
             trainingReady: false,
           }),
         ),
