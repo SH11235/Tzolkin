@@ -3158,6 +3158,7 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
     let p = current(s);
     let mut out = vec![];
     if s.turn.mode != TurnMode::Remove {
+        let no_available_workers = available_workers(s, s.current_player) == 0;
         for gear in GEAR_IDS {
             let cost = get_placement_cost(s, &gear.to_string());
             out.push(Choice {
@@ -3176,7 +3177,7 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
                         .unwrap_or_else(|| "空きがありません".into()),
                 ),
                 disabled: Some(
-                    available_workers(s, s.current_player) == 0
+                    no_available_workers
                         || cost.is_none()
                         || cost.is_some_and(|c| {
                             p.resources[&Resource::Corn] < c && !pity_placement(s, Some(gear))
@@ -3194,7 +3195,7 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
                 s.accumulated_corn
             )),
             disabled: Some(
-                available_workers(s, s.current_player) == 0
+                no_available_workers
                     || s.first_player_claimed.is_some()
                     || p.resources[&Resource::Corn] < tribes::placement_surcharge(p, s.turn.count),
             ),
