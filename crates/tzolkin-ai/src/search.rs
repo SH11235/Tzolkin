@@ -207,10 +207,33 @@ fn choose_prepared<F>(
     o: &Observation,
     config: &SearchConfig,
     configuration_key: &str,
-    mut rollout_policy: F,
+    rollout_policy: F,
 ) -> Result<SearchOutcome, String>
 where
     F: FnMut(&Observation) -> Result<Decision, String>,
+{
+    choose_prepared_with(o, config, configuration_key, rollout_policy, simulate::<F>)
+}
+// Static function-item dispatch in production; the historical loop is injected
+// only by unit tests, with no runtime policy/configuration switch.
+fn choose_prepared_with<F, S>(
+    o: &Observation,
+    config: &SearchConfig,
+    configuration_key: &str,
+    mut rollout_policy: F,
+    mut simulation: S,
+) -> Result<SearchOutcome, String>
+where
+    F: FnMut(&Observation) -> Result<Decision, String>,
+    S: FnMut(
+        RolloutWorld,
+        GameMove,
+        usize,
+        i64,
+        &SearchConfig,
+        &mut SearchStats,
+        &mut F,
+    ) -> Result<Sample, DiscardReason>,
 {
     let configuration_key = configuration_key.to_owned();
     let unsupported = unsupported_reason(o);
@@ -255,7 +278,7 @@ where
         let mut block = Vec::with_capacity(candidates.len());
         let mut failed = None;
         for (index, action) in o.legal_actions.iter().enumerate() {
-            match simulate(
+            match simulation(
                 common.clone(),
                 action.r#move.clone(),
                 o.actor,
@@ -381,19 +404,12 @@ where
     F: FnMut(&Observation) -> Result<Decision, String>,
 {
     let mut local_steps = 0;
-    let mut next = first;
+    count_attempt(stats, &mut local_steps, config)?;
+    // The initial candidate still uses the existing opaque world's checked API.
+    world
+        .apply(first)
+        .map_err(|_| DiscardReason::SimulationError)?;
     loop {
-        if stats.atomic_steps >= config.max_total_steps {
-            return Err(DiscardReason::TotalStepCap);
-        }
-        if local_steps >= config.max_rollout_steps {
-            return Err(DiscardReason::RolloutStepCap);
-        }
-        stats.atomic_steps += 1;
-        local_steps += 1;
-        world
-            .apply(next)
-            .map_err(|_| DiscardReason::SimulationError)?;
         stats.max_reached_round = Some(
             stats
                 .max_reached_round
@@ -406,20 +422,21 @@ where
                 round: world.round(),
             });
         }
-        let observation = world
-            .observation()
+        let guard = world
+            .decision()
             .map_err(|_| DiscardReason::SimulationError)?;
+        let observation = guard.observation();
         // At a horizon reaching the final day, resolve the actual terminal
         // score rather than guessing which seats have a final action left.
-        if target_round < 27 && world.settled_for(actor, target_round) {
-            let scores = potential_scores(&observation, world.score_projection())?;
+        if target_round < 27 && guard.settled_for(actor, target_round) {
+            let scores = potential_scores(observation, guard.score_projection())?;
             return Ok(Sample {
                 score: margin(&scores, actor)?,
                 terminal: false,
-                round: world.round(),
+                round: observation.round,
             });
         }
-        let decision = policy(&observation).map_err(|_| DiscardReason::SimulationError)?;
+        let decision = policy(observation).map_err(|_| DiscardReason::SimulationError)?;
         if decision.actor != observation.actor
             || decision.observation_key != observation.observation_key
             || !decision.score.is_finite()
@@ -430,8 +447,28 @@ where
         {
             return Err(DiscardReason::SimulationError);
         }
-        next = decision.r#move;
+        // Preserve legacy precedence: observe, compute and validate the next
+        // policy decision even when the successful previous apply reached a cap.
+        count_attempt(stats, &mut local_steps, config)?;
+        guard
+            .apply(decision.r#move)
+            .map_err(|_| DiscardReason::SimulationError)?;
     }
+}
+fn count_attempt(
+    stats: &mut SearchStats,
+    local_steps: &mut usize,
+    config: &SearchConfig,
+) -> Result<(), DiscardReason> {
+    if stats.atomic_steps >= config.max_total_steps {
+        return Err(DiscardReason::TotalStepCap);
+    }
+    if *local_steps >= config.max_rollout_steps {
+        return Err(DiscardReason::RolloutStepCap);
+    }
+    stats.atomic_steps += 1;
+    *local_steps += 1;
+    Ok(())
 }
 fn margin(scores: &[f64], actor: usize) -> Result<f64, DiscardReason> {
     if actor >= scores.len() || scores.len() < 2 || scores.iter().any(|v| !v.is_finite()) {
@@ -516,6 +553,10 @@ fn potential_scores(o: &Observation, mut scores: Vec<f64>) -> Result<Vec<f64>, D
     }
     Ok(scores)
 }
+
+#[cfg(test)]
+#[path = "search_decision_tests.rs"]
+mod decision_cache_tests;
 
 #[cfg(test)]
 mod tests {
