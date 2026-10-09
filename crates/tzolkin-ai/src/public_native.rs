@@ -21,6 +21,7 @@ pub struct PreparedPublicPolicy {
     checkpoint: Box<PolicyTrainingCheckpoint>,
     kernel: ResolvedKernel,
     non_test_families: BTreeSet<String>,
+    train_families: BTreeSet<String>,
 }
 impl PreparedPublicPolicy {
     pub fn load(checkpoint: &Path, dataset: &Path, kernel: Kernel) -> Result<Self, String> {
@@ -42,10 +43,18 @@ impl PreparedPublicPolicy {
             .filter(|game| game.split != DatasetSplit::Test)
             .map(|game| game.family_id.clone())
             .collect();
+        let train_families = dataset
+            .manifest()
+            .games
+            .iter()
+            .filter(|game| game.split == DatasetSplit::Train)
+            .map(|game| game.family_id.clone())
+            .collect();
         Ok(Self {
             checkpoint: Box::new(checkpoint),
             kernel,
             non_test_families,
+            train_families,
         })
     }
     pub fn model(&self) -> &PublicPolicyArtifact {
@@ -87,6 +96,27 @@ impl PreparedPublicPolicy {
         }
         Ok(())
     }
+    /// Development comparisons may reuse Validation families; this is not a fresh Test gate.
+    pub(crate) fn require_validation_families(&self, seeds: &[u32]) -> Result<(), String> {
+        check_validation_families(&self.train_families, seeds)
+    }
+}
+
+fn check_validation_families(
+    train_families: &BTreeSet<String>,
+    seeds: &[u32],
+) -> Result<(), String> {
+    for seed in seeds {
+        let family = seed_family_id(*seed);
+        if split_for_family(&family)? != DatasetSplit::Validation
+            || train_families.contains(&family)
+        {
+            return Err(format!(
+                "Seed {seed} is not a non-training public-policy validation family"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub struct PublicPolicyHandle<'a> {
@@ -353,6 +383,22 @@ pub(crate) mod integration_fixture {
 #[cfg(test)]
 mod integration_tests {
     use super::*;
+
+    #[test]
+    fn development_families_allow_validation_reuse_but_reject_train_test_and_overlap() {
+        let train = BTreeSet::from([seed_family_id(0)]);
+        assert_eq!(
+            split_for_family(&seed_family_id(3)).unwrap(),
+            DatasetSplit::Validation
+        );
+        check_validation_families(&train, &[3]).unwrap();
+        check_validation_families(&train, &[3]).unwrap();
+        for seeds in [&[0][..], &[10][..], &[3, 0][..]] {
+            assert!(check_validation_families(&train, seeds).is_err());
+        }
+        let overlap = BTreeSet::from([seed_family_id(3)]);
+        assert!(check_validation_families(&overlap, &[3]).is_err());
+    }
 
     #[test]
     fn g2_native_outcome_and_old_adapter_match_and_sessions_restart() {

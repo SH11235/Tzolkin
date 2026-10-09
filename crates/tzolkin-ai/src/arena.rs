@@ -72,6 +72,14 @@ fn scalar() -> String {
     deny_unknown_fields
 )]
 pub enum PolicyConfig {
+    /// Explicit development use of Validation families, including previously used families.
+    PublicLearnedDevelopment {
+        checkpoint: PathBuf,
+        dataset: PathBuf,
+        #[serde(default = "scalar")]
+        kernel: String,
+        guard: Option<TradeGuardConfig>,
+    },
     PublicLearnedTradeGuard {
         checkpoint: PathBuf,
         dataset: PathBuf,
@@ -157,6 +165,35 @@ enum PreparedPolicy {
 impl PreparedPolicy {
     fn load(config: &PolicyConfig, arena: &ArenaConfig, base: &Path) -> Result<Self, String> {
         match config {
+            PolicyConfig::PublicLearnedDevelopment {
+                checkpoint,
+                dataset,
+                kernel,
+                guard,
+            } => {
+                if arena.partition != Partition::Validation {
+                    return Err(
+                        "Public learned development arena policies require the validation partition"
+                            .into(),
+                    );
+                }
+                if let Some(guard) = guard {
+                    guard.validate()?;
+                }
+                let policy = PreparedPublicPolicy::load(
+                    &base.join(checkpoint),
+                    &base.join(dataset),
+                    crate::public_native::parse_kernel(kernel)?,
+                )?;
+                policy.require_validation_families(&arena.seeds)?;
+                match guard {
+                    Some(guard) => Ok(Self::PublicLearnedTradeGuard {
+                        policy,
+                        guard: guard.clone(),
+                    }),
+                    None => Ok(Self::PublicLearned(policy)),
+                }
+            }
             PolicyConfig::PublicLearnedTradeGuard {
                 checkpoint,
                 dataset,
@@ -1067,6 +1104,54 @@ mod tests {
                 .get("tradeGuard")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn development_config_is_closed_and_all_slots_reject_non_validation_before_loading() {
+        let wire = serde_json::json!({
+            "kind":"publicLearnedDevelopment", "checkpoint":"absent", "dataset":"absent",
+            "guard":null
+        });
+        let pure: PolicyConfig = serde_json::from_value(wire.clone()).unwrap();
+        let encoded = serde_json::to_value(&pure).unwrap();
+        assert_eq!(encoded["kind"], "publicLearnedDevelopment");
+        assert_eq!(encoded["kernel"], "scalar");
+        assert!(encoded["guard"].is_null());
+        let mut unknown = wire;
+        unknown["allowTrain"] = true.into();
+        assert!(serde_json::from_value::<PolicyConfig>(unknown).is_err());
+        for (partition, seed) in [(Partition::Pilot, 17), (Partition::Test, 10)] {
+            for guard in [None, Some(TradeGuardConfig::default())] {
+                let policy = PolicyConfig::PublicLearnedDevelopment {
+                    checkpoint: "absent".into(),
+                    dataset: "absent".into(),
+                    kernel: "scalar".into(),
+                    guard,
+                };
+                for slot in 0..5 {
+                    let mut arena = ArenaConfig {
+                        schema: 1,
+                        players: 3,
+                        partition,
+                        seeds: vec![seed],
+                        candidate: PolicyConfig::default(),
+                        reference: PolicyConfig::default(),
+                        opponent_pool: vec![PolicyConfig::default(); 3],
+                        bootstrap_seed: 17,
+                    };
+                    match slot {
+                        0 => arena.candidate = policy.clone(),
+                        1 => arena.reference = policy.clone(),
+                        other => arena.opponent_pool[other - 2] = policy.clone(),
+                    }
+                    assert!(
+                        run_arena(&arena, Path::new("."))
+                            .unwrap_err()
+                            .contains("require the validation partition")
+                    );
+                }
+            }
+        }
     }
 
     fn arm(utility: f64) -> ArmResult {

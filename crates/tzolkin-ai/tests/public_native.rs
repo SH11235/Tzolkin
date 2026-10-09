@@ -275,6 +275,94 @@ fn actual_trained_policy_completes_three_four_players_roundtrips_and_runs_qualif
                 .contains("held-out test")
         );
     }
+    // Development deliberately permits a family already used for Validation metrics.
+    let validation_seed = (0..1000)
+        .find(|seed| {
+            dataset::split_for_family(&dataset::seed_family_id(*seed)).unwrap()
+                == DatasetSplit::Validation
+        })
+        .unwrap();
+    assert!(dataset.manifest().games.iter().any(|game| {
+        game.split == DatasetSplit::Validation
+            && game.family_id == dataset::seed_family_id(validation_seed)
+    }));
+    for guard in [
+        None,
+        Some(tzolkin_ai::public_trade_guard::TradeGuardConfig::default()),
+    ] {
+        let development_policy = PolicyConfig::PublicLearnedDevelopment {
+            checkpoint: checkpoint_path.clone(),
+            dataset: dataset_path.clone(),
+            kernel: "scalar".into(),
+            guard: guard.clone(),
+        };
+        let mut development = config.clone();
+        development.partition = Partition::Validation;
+        development.seeds = vec![validation_seed];
+        development.candidate = development_policy.clone();
+        development.reference = development_policy.clone();
+        development.opponent_pool[1] = development_policy.clone();
+        let development_report = run_arena(&development, &temp.0).unwrap();
+        assert_eq!(development_report.partition, Partition::Validation);
+        assert_ne!(development_report.config_sha256, report.config_sha256);
+        assert_eq!(development_report.statistics.planned_games, 6);
+        assert_eq!(
+            development_report.statistics.completed_games
+                + development_report.statistics.failed_games,
+            6
+        );
+        assert!(!development_report.statistics.strength_improvement_declared);
+        for described in [
+            &development_report.candidate,
+            &development_report.reference,
+            &development_report.opponent_pool[1],
+        ] {
+            assert_eq!(
+                described.dataset_fingerprint.as_deref(),
+                Some(dataset.manifest().fingerprint.as_str())
+            );
+            assert!(matches!(
+                (&guard, &described.provenance),
+                (None, SeatPolicy::PublicLearned { .. })
+                    | (Some(_), SeatPolicy::PublicLearnedTradeGuard { .. })
+            ));
+        }
+        // A policy loop remains a failed arm, with unavailable terminal results.
+        for pair in &development_report.blocks[0].pairs {
+            assert_eq!(pair.candidate.error, pair.reference.error);
+            assert_eq!(pair.candidate.final_scores, pair.reference.final_scores);
+            for arm in [&pair.candidate, &pair.reference] {
+                if arm.error.is_some() {
+                    assert!(arm.decisions.is_none());
+                    assert!(arm.winner_utility.is_none());
+                    assert!(arm.score.is_none());
+                    assert!(arm.rank.is_none());
+                    assert!(arm.final_scores.is_empty());
+                    assert!(arm.terminal_players.is_none());
+                }
+            }
+        }
+        for partition in [Partition::Pilot, Partition::Test] {
+            for location in 0..5 {
+                let mut rejected = config.clone();
+                rejected.partition = partition;
+                rejected.seeds = partition_seeds(partition, 100, 1).unwrap();
+                rejected.candidate = PolicyConfig::default();
+                rejected.reference = PolicyConfig::default();
+                rejected.opponent_pool = vec![PolicyConfig::default(); 3];
+                match location {
+                    0 => rejected.candidate = development_policy.clone(),
+                    1 => rejected.reference = development_policy.clone(),
+                    other => rejected.opponent_pool[other - 2] = development_policy.clone(),
+                }
+                assert!(
+                    run_arena(&rejected, &temp.0)
+                        .unwrap_err()
+                        .contains("require the validation partition")
+                );
+            }
+        }
+    }
     let mut malformed = checkpoint.clone();
     malformed.metrics.final_train.policy_loss += 1.0;
     resign(&mut malformed);
