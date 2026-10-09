@@ -149,7 +149,7 @@ function boardHash(board) {
   return stateHash(visible);
 }
 
-function sourceEvents(raw, game, cutoff) {
+export function sourceEvents(raw, game, cutoff) {
   const events = game.events.filter((event) => event.actionId <= cutoff);
   const messagesByAction = new Map();
   for (const event of events) {
@@ -953,7 +953,7 @@ export async function exportReconstruction(rawPath, companionPath, cliPath, outp
   return publishReplay(result, outputPath);
 }
 
-async function publishReplay(result, outputPath) {
+export async function publishReplay(result, outputPath) {
   const output = resolve(outputPath);
   await mkdir(dirname(output), { recursive: true });
   await mkdir(output); // An existing output, including an empty one, is rejected.
