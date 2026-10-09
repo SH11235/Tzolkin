@@ -102,6 +102,9 @@ pub enum PolicyConfig {
     CornFirstSetup {
         weights: HeuristicWeights,
     },
+    CornFirstUxmalOpening {
+        weights: HeuristicWeights,
+    },
     Learned {
         checkpoint: PathBuf,
         dataset: PathBuf,
@@ -160,6 +163,7 @@ enum PreparedPolicy {
     Search(PreparedSearch),
     Heuristic(HeuristicWeights),
     CornFirstSetup(HeuristicWeights),
+    CornFirstUxmalOpening(HeuristicWeights),
     Learned {
         model: Box<ModelArtifact>,
         kernel: Kernel,
@@ -249,6 +253,10 @@ impl PreparedPolicy {
                 weights.validate()?;
                 Ok(Self::CornFirstSetup(weights.clone()))
             }
+            PolicyConfig::CornFirstUxmalOpening { weights } => {
+                weights.validate()?;
+                Ok(Self::CornFirstUxmalOpening(weights.clone()))
+            }
             PolicyConfig::Learned {
                 checkpoint,
                 dataset,
@@ -306,6 +314,7 @@ enum PolicyChooser<'a> {
     Search(&'a PreparedSearch),
     Heuristic(&'a HeuristicWeights),
     CornFirstSetup(&'a HeuristicWeights),
+    CornFirstUxmalOpening(&'a HeuristicWeights),
     Learned(LoadedPolicy<'a>),
 }
 /// Borrowing the prepared policies keeps coefficients/model bytes immutable for
@@ -372,6 +381,14 @@ impl<'a> PolicyHandle<'a> {
                 },
                 None,
             ),
+            PreparedPolicy::CornFirstUxmalOpening(weights) => (
+                PolicyChooser::CornFirstUxmalOpening(weights),
+                SeatPolicy::CornFirstUxmalOpening {
+                    policy_version: crate::setup_policy::UXMAL_OPENING_POLICY_VERSION.into(),
+                    weights: weights.clone(),
+                },
+                None,
+            ),
             PreparedPolicy::Learned {
                 model,
                 kernel,
@@ -413,6 +430,10 @@ impl<'a> PolicyHandle<'a> {
             }
             PolicyChooser::CornFirstSetup(weights) => Ok((
                 crate::setup_policy::choose_move_with_weights(observation, weights)?,
+                None,
+            )),
+            PolicyChooser::CornFirstUxmalOpening(weights) => Ok((
+                crate::setup_policy::choose_uxmal_opening_with_weights(observation, weights)?,
                 None,
             )),
             PolicyChooser::Learned(policy) => Ok((policy.choose_move(observation)?, None)),
@@ -1306,6 +1327,30 @@ mod tests {
             technology_step: 8.0,
             ..HeuristicWeights::default()
         };
+        let config = PolicyConfig::CornFirstUxmalOpening {
+            weights: weights.clone(),
+        };
+        let mut wire = serde_json::to_value(&config).unwrap();
+        assert_eq!(wire["kind"], "cornFirstUxmalOpening");
+        wire["forceLaterSeats"] = true.into();
+        assert!(serde_json::from_value::<PolicyConfig>(wire).is_err());
+        let arena = ArenaConfig {
+            schema: 1,
+            players: 3,
+            partition: Partition::Pilot,
+            seeds: vec![17],
+            candidate: config.clone(),
+            reference: PolicyConfig::default(),
+            opponent_pool: vec![config.clone(); 3],
+            bootstrap_seed: 17,
+        };
+        let opening = PreparedPolicy::load(&config, &arena, Path::new(".")).unwrap();
+        let opening = PolicyHandle::new(&opening).unwrap();
+        assert!(matches!(
+            &opening.description.provenance,
+            SeatPolicy::CornFirstUxmalOpening { .. }
+        ));
+        opening.description.provenance.validate().unwrap();
         let prepared = [
             PreparedPolicy::Heuristic(weights.clone()),
             PreparedPolicy::Learned {
@@ -1329,6 +1374,11 @@ mod tests {
         for state in replay::benchmark_states(3, 0, GameOptions::default()).unwrap() {
             let observation =
                 tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+            assert_eq!(
+                opening.choose(&observation).unwrap(),
+                crate::setup_policy::choose_uxmal_opening_with_weights(&observation, &weights)
+                    .unwrap()
+            );
             let weighted = handles[0].choose(&observation).unwrap();
             assert_eq!(
                 weighted,
