@@ -301,7 +301,9 @@
       "name": "ヤシュチラン 1",
       "gear": "yaxchilan",
       "position": 1,
-      "resources": {},
+      "resources": {
+        "wood": 1
+      },
       "effects": [
         {
           "type": "temple",

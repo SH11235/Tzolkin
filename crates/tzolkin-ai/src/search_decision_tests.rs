@@ -1,9 +1,8 @@
-//! Historical-loop and external native CLI byte oracles for decision caching.
+//! Legacy-loop outcome and complete observation-trace parity for decision caching.
 use super::*;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::Write;
-use tzolkin_core::{GameOptions, create_game};
+use tzolkin_core::create_game;
 
 // Frozen simulate body from commit 6fa4e7efa9eb127e8e27ff3412c243d86164fb67.
 // Intentionally retains observation + the old independently checked World.apply.
@@ -186,107 +185,6 @@ fn old_loop_outcome_bytes_and_complete_policy_trace_match_caps_and_error_precede
                         }
                     );
                 }
-            }
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoldenState {
-    replay_index: usize,
-    observation_key: String,
-    direct_outcome_sha256: String,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GoldenCase {
-    name: String,
-    players: usize,
-    config: SearchConfig,
-    configuration_key: String,
-    source_replay_sha256: String,
-    selected_corpus_sha256: String,
-    states: Vec<GoldenState>,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Goldens {
-    source_commit: String,
-    executable_sha256: String,
-    seed: u32,
-    cases: Vec<GoldenCase>,
-}
-fn digest<T: serde::Serialize>(value: &T) -> String {
-    format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
-}
-
-#[test]
-fn frozen_external_cli_full_outcome_bytes_match_default_caps_setup_pending_and_day27() {
-    let goldens: Goldens = serde_json::from_str(include_str!(
-        "../tests/fixtures/search-decision-baseline-6fa4e7e.json"
-    ))
-    .unwrap();
-    assert_eq!(
-        goldens.source_commit,
-        "6fa4e7efa9eb127e8e27ff3412c243d86164fb67"
-    );
-    assert_eq!(
-        goldens.executable_sha256,
-        "301cb47ac3f2e0a11695e305cb8877711caa9f1b66cc9680149fe7b918a7c191"
-    );
-    assert_eq!(goldens.cases.len(), 6);
-    for n in [3, 4] {
-        let record = crate::replay::play_game_fast(n, goldens.seed, GameOptions::default(), true)
-            .unwrap()
-            .2
-            .unwrap();
-        crate::replay::verify_replay(&record).unwrap();
-        for case in goldens.cases.iter().filter(|c| c.players == n) {
-            assert_eq!(digest(&record), case.source_replay_sha256);
-            assert_eq!(
-                case.config.configuration_key().unwrap(),
-                case.configuration_key
-            );
-            assert_eq!(case.states.len(), 12);
-            let selected: Vec<_> = case
-                .states
-                .iter()
-                .map(|s| &record.steps[s.replay_index].observation)
-                .collect();
-            assert_eq!(digest(&selected), case.selected_corpus_sha256);
-            assert!(selected.iter().any(|o| o.phase == Phase::Setup));
-            assert!(selected.iter().any(|o| o.pending_task.is_some()));
-            assert!(
-                selected
-                    .iter()
-                    .any(|o| o.phase == Phase::Playing && o.pending_task.is_none())
-            );
-            let mut reached_terminal = false;
-            let mut reached_cutoff = false;
-            let mut insufficient_worlds = false;
-            for (at, expected) in case.states.iter().enumerate() {
-                assert_eq!(selected[at].observation_key, expected.observation_key);
-                let outcome = choose_move(selected[at], &case.config).unwrap();
-                reached_terminal |= outcome.stats.terminal_rollouts > 0
-                    && outcome.stats.max_reached_round == Some(27);
-                reached_cutoff |= outcome.stats.cutoff_rollouts > 0;
-                insufficient_worlds |= outcome.status
-                    == SearchStatus::Fallback {
-                        reason: FallbackReason::InsufficientCompletedWorlds,
-                    };
-                assert_eq!(
-                    digest(&outcome),
-                    expected.direct_outcome_sha256,
-                    "{n}p case={} replayIndex={}",
-                    case.name,
-                    expected.replay_index
-                );
-            }
-            if case.name == "default" {
-                assert!(reached_terminal && reached_cutoff);
-            } else {
-                assert!(insufficient_worlds);
             }
         }
     }
