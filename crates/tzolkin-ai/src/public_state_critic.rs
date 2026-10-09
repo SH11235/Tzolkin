@@ -60,6 +60,9 @@ pub struct PublicStateContext {
     phase: Phase,
 }
 impl PublicStateContext {
+    pub(crate) fn training_values(&self) -> &[f32; CONTEXT_COUNT] {
+        &self.values
+    }
     pub fn from_observation(observation: &Observation) -> Result<Self, String> {
         crate::public_model::validate_contract(observation)?;
         let encoder = FeatureEncoder::new_public(observation)?;
@@ -132,6 +135,9 @@ pub struct PublicStateCriticModel {
     parameters: Vec<f32>,
 }
 impl PublicStateCriticModel {
+    pub(crate) fn training_parameters_mut(&mut self) -> &mut [f32] {
+        &mut self.parameters
+    }
     pub fn parameters(&self) -> &[f32] {
         &self.parameters
     }
@@ -170,6 +176,15 @@ pub struct PublicStateCriticArtifact {
     pub checksum: String,
 }
 impl PublicStateCriticArtifact {
+    pub(crate) fn training_reseal(&mut self) -> Result<(), String> {
+        // Check immutable metadata as well as finite parameters before resealing.
+        // A temporary matching checksum does not waive any normal artifact guard.
+        let mut candidate = self.clone();
+        candidate.checksum = candidate.expected_checksum()?;
+        candidate.validate()?;
+        self.checksum = candidate.checksum;
+        Ok(())
+    }
     /// Deterministically initialized and untrained. This does not run value training.
     pub fn new(seed: u64) -> Result<Self, String> {
         let mut random = Random { state: seed };
