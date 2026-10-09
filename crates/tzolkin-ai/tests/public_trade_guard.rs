@@ -355,7 +355,7 @@ fn guarded_source(artifact: &PublicPolicyArtifact) -> SeatPolicy {
 fn records() -> &'static [GameReplay] {
     static RECORDS: OnceLock<Vec<GameReplay>> = OnceLock::new();
     RECORDS.get_or_init(|| {
-        let artifact = model(true); let loaded = LoadedPublicPolicy::new(&artifact).unwrap();
+        let artifact = model(false); let loaded = LoadedPublicPolicy::new(&artifact).unwrap();
         [(3, vec![0, 1, 2]), (4, vec![0])].into_iter().map(|(players, seats)| {
             let policies = (0..players).map(|seat| if seats.contains(&seat) { guarded_source(&artifact) }
                 else { tzolkin_ai::experiment::heuristic_seat() }).collect();
@@ -395,7 +395,8 @@ fn records() -> &'static [GameReplay] {
 }
 
 #[test]
-fn complete_single_and_mixed_guarded_sources_verify_but_a2_a6_reject_before_output_creation() {
+fn complete_single_and_mixed_guarded_sources_verify_but_all_exporters_reject_before_output_creation()
+ {
     let root = std::env::temp_dir().join(format!(
         "tzolkin-g1-{}-{}",
         std::process::id(),
@@ -427,6 +428,17 @@ fn complete_single_and_mixed_guarded_sources_verify_but_a2_a6_reject_before_outp
             assert!(error.contains("Guarded public learned source admission"));
             assert!(!output.exists());
         }
+        let output = root.join(format!("legacy-memory-{i}"));
+        let error =
+            tzolkin_ai::dataset::export_dataset(std::slice::from_ref(record), &output).unwrap_err();
+        assert!(error.contains("Guarded public learned source admission"));
+        assert!(!output.exists());
+        let output = root.join(format!("legacy-file-{i}"));
+        let error =
+            tzolkin_ai::dataset::export_dataset_files(std::slice::from_ref(&source), &output)
+                .unwrap_err();
+        assert!(error.contains("Guarded public learned source admission"));
+        assert!(!output.exists());
         assert_eq!(fs::read(source).unwrap(), bytes);
     }
     fs::remove_dir_all(root).unwrap();
@@ -456,6 +468,24 @@ fn source_and_trace_tampering_is_rejected_while_joint_stripping_is_not_authentic
         }
         assert!(replay::verify_replay(&r).is_err());
     }
+    let overridden = original
+        .steps
+        .iter()
+        .position(|s| s.trade_guard.as_ref().is_some_and(|t| t.overridden))
+        .unwrap();
+    let mut impossible_max = original.clone();
+    let trace = impossible_max.steps[overridden]
+        .trade_guard
+        .as_mut()
+        .unwrap();
+    assert_ne!(trace.raw.legal_index, trace.skip.legal_index);
+    trace.skip.logit = trace.raw.logit + 1.0;
+    trace.effective.logit = trace.skip.logit; // keep the forced-skip fields mutually consistent
+    assert!(
+        replay::verify_replay(&impossible_max)
+            .unwrap_err()
+            .contains("Invalid reported Trade proposal/logits")
+    );
     let mut r = original.clone();
     let ReplaySource::PolicySelfPlay { policies } = &mut r.header.source else {
         panic!()

@@ -536,6 +536,7 @@ impl TradeGuardSession {
             || !raw_logit.is_finite()
             || !skip_logit.is_finite()
             || (raw == skip && raw_logit.to_bits() != skip_logit.to_bits())
+            || (raw != skip && (skip_logit > raw_logit || (skip_logit == raw_logit && skip < raw)))
         {
             return Err("Invalid reported Trade proposal/logits".into());
         }
@@ -665,7 +666,10 @@ pub(crate) fn is_trade_observation(o: &Observation) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PUBLIC_STATE_BYTES, public_bytes};
+    use super::{MAX_PUBLIC_STATE_BYTES, TradeGuardSession, public_bytes};
+    use sha2::{Digest, Sha256};
+    use tzolkin_core::observation::{observation_key, observe};
+    use tzolkin_core::{Pending, Phase, Task, apply_move};
 
     #[test]
     fn public_projection_bound_and_private_exclusion_do_not_relax_nn_input_guards() {
@@ -690,5 +694,71 @@ mod tests {
         );
         // These direct serializer tests make no claim that either mutated
         // observation is accepted by the unchanged NN/card/key contract.
+    }
+
+    #[test]
+    fn reported_skip_logits_cannot_contradict_pairwise_first_maximum() {
+        let mut state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            state = apply_move(&state, crate::choose_move(&o).unwrap().r#move).unwrap();
+        }
+        state.players[state.current_player].resources = [
+            (tzolkin_core::Resource::Corn, 3),
+            (tzolkin_core::Resource::Wood, 3),
+            (tzolkin_core::Resource::Stone, 1),
+            (tzolkin_core::Resource::Gold, 0),
+            (tzolkin_core::Resource::Skull, 0),
+        ]
+        .into_iter()
+        .collect();
+        state.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: Vec::new(),
+        });
+        assert!(tzolkin_core::validation::validate_game_state(
+            &serde_json::to_value(&state).unwrap()
+        ));
+        let original = observe(&state, state.current_player).unwrap();
+        let mut session = TradeGuardSession::new(Default::default()).unwrap();
+        session.on_callback(0, &original).unwrap();
+        let valid = session.transition(0, &original, 0, 0.0, 0.0).unwrap();
+        assert!(valid.skip.legal_index > valid.raw.legal_index);
+        for earlier_skip in [false, true] {
+            let mut o = original.clone();
+            let mut trace = valid.clone();
+            if earlier_skip {
+                // Native replay validation also preserves its authoritative order.
+                // This directly audits the standalone ordered-mask trace boundary.
+                o.legal_actions.rotate_right(1);
+                o.observation_key = observation_key(&o).unwrap();
+                trace.raw.legal_index = 1;
+                trace.raw.legal = o.legal_actions[1].clone();
+                trace.skip.legal_index = 0;
+                trace.skip.legal = o.legal_actions[0].clone();
+                trace.skip.logit = -0.0; // numeric tie obeys first-max even across signed zero
+                trace.public_state_sha256 =
+                    format!("{:x}", Sha256::digest(public_bytes(&o).unwrap()));
+            } else {
+                trace.skip.logit = 1.0;
+            }
+            trace.effective = trace.raw.clone();
+            let mut session = TradeGuardSession::new(Default::default()).unwrap();
+            session.on_callback(0, &o).unwrap();
+            assert!(
+                session
+                    .verify_trace(0, &o, &trace.effective.legal, &trace)
+                    .unwrap_err()
+                    .contains("Invalid reported Trade proposal/logits")
+            );
+            assert!(session.on_callback(1, &original).is_err());
+        }
+        let mut earlier_skip = original;
+        earlier_skip.legal_actions.rotate_right(1);
+        let mut session = TradeGuardSession::new(Default::default()).unwrap();
+        session.on_callback(0, &earlier_skip).unwrap();
+        assert!(session.transition(0, &earlier_skip, 1, 1.0, 0.0).is_ok());
     }
 }
