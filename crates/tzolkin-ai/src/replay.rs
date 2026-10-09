@@ -363,6 +363,34 @@ pub fn play_game_using_trade_guard(
         &Observation,
     ) -> Result<(crate::Decision, Option<TradeGuardTrace>), String>,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_using_all_diagnostics(players, seed, options, record, source, fast, |index, o| {
+        let (decision, guard) = decide(index, o)?;
+        Ok((decision, None, guard))
+    })
+}
+
+/// One global callback index for mixed Search/Guard rosters. The policy still
+/// receives only the current actor's Observation; both traces use the existing
+/// independent checks. Indices include Setup, pending tasks and every seat.
+pub fn play_game_using_all_diagnostics(
+    players: usize,
+    seed: u32,
+    options: GameOptions,
+    record: bool,
+    source: ReplaySource,
+    fast: bool,
+    mut decide: impl FnMut(
+        usize,
+        &Observation,
+    ) -> Result<
+        (
+            crate::Decision,
+            Option<SearchTrace>,
+            Option<TradeGuardTrace>,
+        ),
+        String,
+    >,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
     let mut index = 0;
     play_game_internal(
         players,
@@ -371,9 +399,9 @@ pub fn play_game_using_trade_guard(
         record,
         source,
         |o| {
-            let (decision, guard) = decide(index, o)?;
+            let result = decide(index, o)?;
             index += 1;
-            Ok((decision, None, guard))
+            Ok(result)
         },
         !fast,
     )

@@ -6,6 +6,9 @@ use crate::kernel::Kernel;
 use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
 use crate::public_native::{PreparedPublicPolicy, PublicPolicyHandle};
+use crate::public_trade_guard::{
+    self, TradeGuardCapture, TradeGuardConfig, TradeGuardSession, TradeGuardSummary,
+};
 use crate::replay::{self, ReplaySource, SeatPolicy};
 use crate::search::{PreparedSearch, SearchConfig};
 use crate::search_native::{SearchSummary, SearchTrace};
@@ -69,6 +72,13 @@ fn scalar() -> String {
     deny_unknown_fields
 )]
 pub enum PolicyConfig {
+    PublicLearnedTradeGuard {
+        checkpoint: PathBuf,
+        dataset: PathBuf,
+        #[serde(default = "scalar")]
+        kernel: String,
+        guard: TradeGuardConfig,
+    },
     PublicLearned {
         checkpoint: PathBuf,
         dataset: PathBuf,
@@ -131,6 +141,10 @@ impl ArenaConfig {
     }
 }
 enum PreparedPolicy {
+    PublicLearnedTradeGuard {
+        policy: PreparedPublicPolicy,
+        guard: TradeGuardConfig,
+    },
     PublicLearned(PreparedPublicPolicy),
     Search(PreparedSearch),
     Heuristic(HeuristicWeights),
@@ -143,6 +157,30 @@ enum PreparedPolicy {
 impl PreparedPolicy {
     fn load(config: &PolicyConfig, arena: &ArenaConfig, base: &Path) -> Result<Self, String> {
         match config {
+            PolicyConfig::PublicLearnedTradeGuard {
+                checkpoint,
+                dataset,
+                kernel,
+                guard,
+            } => {
+                guard.validate()?;
+                if arena.partition != Partition::Test {
+                    return Err(
+                        "Guarded public learned arena policies require the held-out test partition"
+                            .into(),
+                    );
+                }
+                let policy = PreparedPublicPolicy::load(
+                    &base.join(checkpoint),
+                    &base.join(dataset),
+                    crate::public_native::parse_kernel(kernel)?,
+                )?;
+                policy.require_test_families(&arena.seeds)?;
+                Ok(Self::PublicLearnedTradeGuard {
+                    policy,
+                    guard: guard.clone(),
+                })
+            }
             PolicyConfig::PublicLearned {
                 checkpoint,
                 dataset,
@@ -215,6 +253,10 @@ pub struct PolicyDescription {
     pub dataset_fingerprint: Option<String>,
 }
 enum PolicyChooser<'a> {
+    PublicLearnedTradeGuard {
+        policy: Box<PublicPolicyHandle<'a>>,
+        guard: &'a TradeGuardConfig,
+    },
     PublicLearned(Box<PublicPolicyHandle<'a>>),
     Search(&'a PreparedSearch),
     Heuristic(&'a HeuristicWeights),
@@ -230,6 +272,22 @@ struct PolicyHandle<'a> {
 impl<'a> PolicyHandle<'a> {
     fn new(policy: &'a PreparedPolicy) -> Result<Self, String> {
         let (chooser, provenance, dataset_fingerprint) = match policy {
+            PreparedPolicy::PublicLearnedTradeGuard { policy, guard } => {
+                let handle = policy.handle()?;
+                let provenance = handle.guarded_provenance(guard)?;
+                let SeatPolicy::PublicLearnedTradeGuard { base, .. } = &provenance else {
+                    unreachable!()
+                };
+                let fingerprint = base.dataset_fingerprint.clone();
+                (
+                    PolicyChooser::PublicLearnedTradeGuard {
+                        policy: Box::new(handle),
+                        guard,
+                    },
+                    provenance,
+                    Some(fingerprint),
+                )
+            }
             PreparedPolicy::PublicLearned(policy) => {
                 let handle = policy.handle()?;
                 let provenance = handle.provenance().clone();
@@ -291,6 +349,9 @@ impl<'a> PolicyHandle<'a> {
         observation: &Observation,
     ) -> Result<(Decision, Option<SearchTrace>), String> {
         match &self.chooser {
+            PolicyChooser::PublicLearnedTradeGuard { .. } => {
+                Err("Guarded chooser requires its game-local indexed session".into())
+            }
             PolicyChooser::PublicLearned(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::Search(policy) => crate::search_native::decide(policy, observation),
             PolicyChooser::Heuristic(weights) => {
@@ -309,6 +370,10 @@ impl<'a> PolicyHandle<'a> {
 pub struct ArmResult {
     /// Absolute-seat Search work, including attempted work before a failed game.
     pub search: Vec<Option<SearchSummary>>,
+    /// Present only for a guarded actual roster, in absolute-seat order. Choices
+    /// are observed before apply; failed-game applied totals are unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trade_guard: Option<Vec<Option<TradeGuardSummary>>>,
     pub decisions: Option<usize>,
     pub elapsed_ms: f64,
     pub winner_utility: Option<f64>,
@@ -391,11 +456,27 @@ pub struct SeedBlock {
     pub mean_score_delta: Option<f64>,
     pub mean_rank_improvement: Option<f64>,
 }
+#[cfg(test)]
 fn play_arm(
     seed: u32,
     seat: usize,
     focal: &PolicyHandle<'_>,
     pool: &[PolicyHandle<'_>],
+) -> ArmResult {
+    play_arm_captured(
+        seed,
+        seat,
+        focal,
+        pool,
+        &mut TradeGuardCapture::new(public_trade_guard::MAX_ARENA_EXAMPLES),
+    )
+}
+fn play_arm_captured(
+    seed: u32,
+    seat: usize,
+    focal: &PolicyHandle<'_>,
+    pool: &[PolicyHandle<'_>],
+    run_capture: &mut TradeGuardCapture,
 ) -> ArmResult {
     let started = Instant::now();
     let mut start_of_play = None;
@@ -407,7 +488,43 @@ fn play_arm(
             matches!(handle.chooser, PolicyChooser::Search(_)).then(SearchSummary::default)
         })
         .collect::<Vec<_>>();
+    let roster = pool
+        .iter()
+        .enumerate()
+        .map(|(index, opponent)| if index == seat { focal } else { opponent })
+        .collect::<Vec<_>>();
+    let guarded = roster.iter().any(|handle| {
+        matches!(
+            handle.chooser,
+            PolicyChooser::PublicLearnedTradeGuard { .. }
+        )
+    });
+    let mut trade_guard = guarded.then(|| {
+        roster
+            .iter()
+            .map(|handle| {
+                matches!(
+                    handle.chooser,
+                    PolicyChooser::PublicLearnedTradeGuard { .. }
+                )
+                .then(|| {
+                    TradeGuardSummary::new(&handle.description.provenance)
+                        .expect("validated immutable guarded provenance")
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let mut capture = TradeGuardCapture::new(public_trade_guard::MAX_GAME_EXAMPLES);
     let played = (|| {
+        let mut sessions = roster
+            .iter()
+            .map(|handle| match &handle.chooser {
+                PolicyChooser::PublicLearnedTradeGuard { guard, .. } => {
+                    TradeGuardSession::new((*guard).clone()).map(Some)
+                }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let policies = pool
             .iter()
             .enumerate()
@@ -419,22 +536,54 @@ fn play_arm(
                 }
             })
             .collect();
-        let (state, decisions, _) = replay::play_game_using_diagnostics(
+        let (state, decisions, _) = replay::play_game_using_all_diagnostics(
             pool.len(),
             seed,
             GameOptions::default(),
             false,
             ReplaySource::PolicySelfPlay { policies },
             true,
-            |observation| {
+            |index, observation| {
+                for (absolute_seat, session) in sessions.iter_mut().enumerate() {
+                    if let Some(session) = session {
+                        session.on_callback(index, observation)?;
+                        trade_guard.as_mut().expect("guarded roster")[absolute_seat]
+                            .as_mut()
+                            .expect("guarded seat")
+                            .notified(index, observation);
+                    }
+                }
                 if start_of_play.is_none() && observation.phase == Phase::Playing {
                     start_of_play = Some(InitialConditions::from_observation(observation));
                 }
-                let result = if observation.actor == seat {
-                    focal.choose_with_diagnostics(observation)
+                let handle = roster[observation.actor];
+                let result = if let PolicyChooser::PublicLearnedTradeGuard { policy, .. } =
+                    &handle.chooser
+                {
+                    let summary = trade_guard.as_mut().expect("guarded roster")[observation.actor]
+                        .as_mut()
+                        .expect("guarded seat");
+                    summary.choice_started();
+                    let result = sessions[observation.actor]
+                        .as_mut()
+                        .expect("guarded session")
+                        .choose_with_distribution(index, observation, || {
+                            policy.distribution(observation)
+                        });
+                    match result {
+                        Ok((decision, trace)) => {
+                            summary.returned(trace.as_ref(), &mut capture, run_capture)?;
+                            (decision, None, trace)
+                        }
+                        Err(error) => {
+                            summary.choice_failed();
+                            return Err(error);
+                        }
+                    }
                 } else {
-                    pool[observation.actor].choose_with_diagnostics(observation)
-                }?;
+                    let (decision, trace) = handle.choose_with_diagnostics(observation)?;
+                    (decision, trace, None)
+                };
                 if let Some(trace) = &result.1 {
                     search[observation.actor].as_mut().unwrap().add(trace);
                 }
@@ -458,6 +607,7 @@ fn play_arm(
                 .expect("Validated native terminal contains each seat");
             ArmResult {
                 search,
+                trade_guard,
                 decisions: Some(decisions),
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                 winner_utility: Some(if focal.rank == 1 {
@@ -476,6 +626,7 @@ fn play_arm(
         }
         Err(error) => ArmResult {
             search,
+            trade_guard,
             decisions: None,
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             winner_utility: None,
@@ -672,18 +823,25 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
         .map(PolicyHandle::new)
         .collect::<Result<Vec<_>, _>>()?;
     let mut blocks = Vec::with_capacity(config.seeds.len());
+    // Shared capture only, never shared controller history. Original run order
+    // determines retained examples when this budget is exhausted.
+    let mut capture = TradeGuardCapture::new(public_trade_guard::MAX_ARENA_EXAMPLES);
     for (index, seed) in config.seeds.iter().enumerate() {
         let mut pairs = Vec::with_capacity(config.players);
         for seat in 0..config.players {
             // Alternate paired run order to avoid measuring one arm systematically later.
             let (candidate_result, reference_result) = if (index + seat) % 2 == 0 {
                 (
-                    play_arm(*seed, seat, &candidate, &pool),
-                    play_arm(*seed, seat, &reference, &pool),
+                    play_arm_captured(*seed, seat, &candidate, &pool, &mut capture),
+                    play_arm_captured(*seed, seat, &reference, &pool, &mut capture),
                 )
             } else {
-                let reference_result = play_arm(*seed, seat, &reference, &pool);
-                (play_arm(*seed, seat, &candidate, &pool), reference_result)
+                let reference_result =
+                    play_arm_captured(*seed, seat, &reference, &pool, &mut capture);
+                (
+                    play_arm_captured(*seed, seat, &candidate, &pool, &mut capture),
+                    reference_result,
+                )
             };
             pairs.push(SeatPair {
                 seat,
@@ -744,9 +902,177 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
 mod tests {
     use super::*;
 
+    fn synthetic_guard_handle<'a>(
+        model: &'a crate::public_model::PublicPolicyArtifact,
+        guard: &'a TradeGuardConfig,
+    ) -> PolicyHandle<'a> {
+        let policy = crate::public_native::integration_fixture::handle(model);
+        let provenance = policy.guarded_provenance(guard).unwrap();
+        PolicyHandle {
+            chooser: PolicyChooser::PublicLearnedTradeGuard {
+                policy: Box::new(policy),
+                guard,
+            },
+            description: PolicyDescription {
+                provenance,
+                dataset_fingerprint: Some("c".repeat(64)),
+            },
+        }
+    }
+
+    #[test]
+    fn g2_actual_mixed_search_guard_arms_keep_absolute_slots_and_fresh_histories() {
+        let model = crate::public_native::integration_fixture::model(false);
+        let original = serde_json::to_vec(&model).unwrap();
+        let guard = TradeGuardConfig {
+            max_trades_per_episode: 1,
+            ..Default::default()
+        };
+        let prepared_search = PreparedSearch::new(&SearchConfig {
+            worlds_per_action: 1,
+            horizon_days: 1,
+            max_rollout_steps: 1,
+            max_total_steps: 1,
+            min_completed_worlds: 1,
+            sampling_salt: 17,
+        })
+        .unwrap();
+        let search = PreparedPolicy::Search(prepared_search);
+        for players in [3, 4] {
+            let focal = synthetic_guard_handle(&model, &guard);
+            let pool = (0..players)
+                .map(|seat| {
+                    if seat == 1 {
+                        PolicyHandle::new(&search).unwrap()
+                    } else {
+                        synthetic_guard_handle(&model, &guard)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut capture = TradeGuardCapture::new(public_trade_guard::MAX_ARENA_EXAMPLES);
+            let a = play_arm_captured(17, 0, &focal, &pool, &mut capture);
+            let b = play_arm_captured(17, 0, &focal, &pool, &mut capture);
+            println!(
+                "G2 synthetic mixed Arena fixture seed17,{players}p two arms callbacks{:?}",
+                a.decisions
+            );
+            assert!(a.error.is_none(), "{:?}", a.error);
+            assert_eq!(a.final_scores, b.final_scores);
+            assert_eq!(a.start_of_play, b.start_of_play);
+            assert_eq!(a.search, b.search);
+            assert!(a.search[1].as_ref().unwrap().decisions > 0);
+            assert_eq!(a.trade_guard, b.trade_guard);
+            let summaries = a.trade_guard.as_ref().unwrap();
+            assert!(summaries[1].is_none());
+            assert!(
+                summaries
+                    .iter()
+                    .flatten()
+                    .all(|s| s.global_notifications == a.decisions.unwrap()
+                        && s.choices_returned > 0)
+            );
+            assert_eq!(serde_json::to_vec(&model).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn g2_failed_arm_keeps_all_guard_notifications_and_search_prefix() {
+        let model = crate::public_native::integration_fixture::model(true);
+        let guard = TradeGuardConfig::default();
+        let search = PreparedPolicy::Search(PreparedSearch::new(&SearchConfig::default()).unwrap());
+        let pool = vec![
+            PolicyHandle::new(&search).unwrap(),
+            synthetic_guard_handle(&model, &guard),
+            synthetic_guard_handle(&model, &guard),
+        ];
+        let arm = play_arm(11235, 0, &pool[0], &pool);
+        assert!(arm.error.as_ref().unwrap().contains("hidden activation"));
+        assert!(
+            arm.decisions.is_none()
+                && arm.terminal_players.is_none()
+                && arm.final_scores.is_empty()
+        );
+        assert_eq!(arm.search[0].as_ref().unwrap().decisions, 1);
+        let summaries = arm.trade_guard.unwrap();
+        assert!(summaries[0].is_none());
+        assert!(
+            summaries
+                .iter()
+                .flatten()
+                .all(|s| s.global_notifications == 2)
+        );
+        assert!(
+            summaries
+                .iter()
+                .flatten()
+                .all(|s| s.last_callback.as_ref().unwrap().index == 1)
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .flatten()
+                .map(|s| s.failed_choices)
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn g2_all_slots_reject_non_test_before_checkpoint_loading_and_pure_wire_omits_guard() {
+        for partition in [Partition::Pilot, Partition::Validation] {
+            let seed = if partition == Partition::Pilot {
+                17
+            } else {
+                // Existing A7 Validation metadata fixture; no game is created.
+                3
+            };
+            assert_eq!(seed_partition(seed).unwrap(), partition.split());
+            let guarded = PolicyConfig::PublicLearnedTradeGuard {
+                checkpoint: "absent".into(),
+                dataset: "absent".into(),
+                kernel: "scalar".into(),
+                guard: Default::default(),
+            };
+            let base = ArenaConfig {
+                schema: 1,
+                players: 3,
+                partition,
+                seeds: vec![seed],
+                candidate: PolicyConfig::default(),
+                reference: PolicyConfig::default(),
+                opponent_pool: vec![PolicyConfig::default(); 3],
+                bootstrap_seed: 17,
+            };
+            for slot in 0..5 {
+                // Fresh roster each time so an earlier guarded slot cannot
+                // mask the candidate/reference/opponent under examination.
+                let mut arena = base.clone();
+                let policy = match slot {
+                    0 => &mut arena.candidate,
+                    1 => &mut arena.reference,
+                    other => &mut arena.opponent_pool[other - 2],
+                };
+                *policy = guarded.clone();
+                arena.validate().unwrap();
+                assert!(
+                    run_arena(&arena, Path::new("."))
+                        .unwrap_err()
+                        .contains("held-out test")
+                );
+            }
+        }
+        assert!(
+            serde_json::to_value(arm(0.0))
+                .unwrap()
+                .get("tradeGuard")
+                .is_none()
+        );
+    }
+
     fn arm(utility: f64) -> ArmResult {
         ArmResult {
             search: vec![None; 3],
+            trade_guard: None,
             decisions: Some(100),
             elapsed_ms: 1.0,
             winner_utility: Some(utility),
