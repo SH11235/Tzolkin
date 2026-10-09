@@ -323,7 +323,7 @@ impl Write for ByteLimit {
         Ok(())
     }
 }
-fn validate_contract(o: &Observation) -> Result<(), String> {
+pub(crate) fn validate_contract(o: &Observation) -> Result<(), String> {
     if !(3..=4).contains(&o.players.len())
         || !matches!(o.phase, Phase::Setup | Phase::Playing)
         || o.additional_buildings

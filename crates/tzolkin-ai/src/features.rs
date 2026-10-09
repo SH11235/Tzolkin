@@ -178,6 +178,22 @@ impl<'a> FeatureEncoder<'a> {
         }
         self.encode_values(index)
     }
+    /// Candidate-independent schema-2 context; never obtained from a chosen row.
+    pub(crate) fn public_state_prefix(&self) -> Result<[f32; 384], String> {
+        if self.feature_schema != PUBLIC_FEATURE_SCHEMA {
+            return Err("Public state context requires feature schema 2".into());
+        }
+        const { assert!(ACTION_START == 384) };
+        let mut prefix = [0.0; 384];
+        prefix.copy_from_slice(&self.context[..384]);
+        if prefix
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 1024.0)
+        {
+            return Err("Invalid public state context values".into());
+        }
+        Ok(prefix)
+    }
     pub fn encode_legal_tagged(&self, index: usize) -> Result<EncodedCandidate, String> {
         Ok(EncodedCandidate {
             feature_schema: self.feature_schema,

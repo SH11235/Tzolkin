@@ -10,6 +10,7 @@ pub mod policy_dataset;
 pub mod policy_training;
 pub mod public_model;
 pub mod public_native;
+pub mod public_state_critic;
 pub mod replay;
 pub mod search;
 pub mod search_native;
