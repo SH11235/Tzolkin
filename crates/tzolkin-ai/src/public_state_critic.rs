@@ -87,6 +87,30 @@ impl PublicStateContext {
     pub fn phase(&self) -> Phase {
         self.phase
     }
+    pub(crate) fn context_checksum(&self) -> String {
+        let mut bytes = Vec::with_capacity(CONTEXT_COUNT * 4 + 128);
+        bytes.extend_from_slice(b"tzolkin-public-state-context-v1\0");
+        bytes.extend_from_slice(CONTEXT_CONTRACT.as_bytes());
+        bytes.push(0);
+        for value in [
+            self.context_schema,
+            self.feature_schema,
+            CONTEXT_COUNT as u32,
+            self.actor as u32,
+            self.player_count as u32,
+        ] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.push(match self.phase {
+            Phase::Setup => 0,
+            Phase::Playing => 1,
+            Phase::Finished => 2,
+        });
+        for value in &self.values {
+            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        digest(&bytes)
+    }
 }
 
 /// Finite inference alone establishes neither training history nor calibration.

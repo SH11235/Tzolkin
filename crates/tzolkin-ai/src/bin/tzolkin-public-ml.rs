@@ -287,11 +287,29 @@ fn export(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn export_state_native(args: &[String]) -> Result<(), String> {
+    let parsed = flags(args, &["--input", "--output"])?;
+    let paths = tzolkin_ai::state_mc_dataset::native_source_files(Path::new(
+        parsed.get("--input").ok_or("--input is required")?,
+    ))?;
+    let manifest = tzolkin_ai::state_mc_dataset::export_native_files(
+        &paths,
+        Path::new(parsed.get("--output").ok_or("--output is required")?),
+    )?;
+    write_stdout(&manifest)
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args == ["help"] || args == ["--help"] {
         println!("{HELP}");
+        println!(
+            "tzolkin-public-ml export-state-native --input NATIVE_REPLAY_DIRECTORY --output NEW_STATE_MC_DIRECTORY\nState-MC is a separate complete-native gamma=1/lambda=1 state-target task; no training command."
+        );
         return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("export-state-native") {
+        return export_state_native(&args);
     }
     if args.first().map(String::as_str) == Some("export-native") {
         return export(&args);

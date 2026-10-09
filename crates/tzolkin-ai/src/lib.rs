@@ -15,6 +15,7 @@ pub mod replay;
 pub mod search;
 pub mod search_native;
 pub mod selfplay_batch;
+pub mod state_mc_dataset;
 pub mod training;
 use serde::{Deserialize, Serialize};
 use tzolkin_core::GameMove;
