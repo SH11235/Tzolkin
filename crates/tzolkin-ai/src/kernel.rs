@@ -255,12 +255,18 @@ fn rows_scalar(matrix: &[f32], vector: &[f32], output: &mut [f32]) {
 }
 
 fn prepare_scalar(matrix: &[f32], prefix: &[f32], state: &mut PrefixState) {
-    for (row, saved) in matrix.chunks_exact(POLICY_COLUMNS).zip(state) {
+    for (row, saved) in matrix.as_chunks::<POLICY_COLUMNS>().0.iter().zip(state) {
         saved[0] = dot_scalar(&row[..PREFIX_COLUMNS], prefix);
     }
 }
 fn continue_scalar(matrix: &[f32], suffix: &[f32], state: &PrefixState, output: &mut [f32]) {
-    for ((row, saved), value) in matrix.chunks_exact(POLICY_COLUMNS).zip(state).zip(output) {
+    for ((row, saved), value) in matrix
+        .as_chunks::<POLICY_COLUMNS>()
+        .0
+        .iter()
+        .zip(state)
+        .zip(output)
+    {
         *value = row[PREFIX_COLUMNS..]
             .iter()
             .zip(suffix)
