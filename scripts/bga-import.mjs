@@ -23,7 +23,7 @@ const increment = (counts, key) => {
 };
 
 // Only explicit text patterns are interpreted. Raw text and icon classes remain the evidence.
-export function parseMessage(message, players) {
+export function parseMessage(message, players, { englishTerminal = false } = {}) {
   const raw = message.raw_text;
   const actor =
     [...players]
@@ -42,7 +42,11 @@ export function parseMessage(message, players) {
   let m;
   if (actor && text === 'は行動をキャンセルした') result.kind = 'cancellation';
   else if (raw === '歯車が進んだ') result.kind = 'gearAdvanced';
-  else if (raw === 'ゲーム終了') result.kind = 'gameEnd';
+  else if (
+    raw === 'ゲーム終了' ||
+    (englishTerminal && players.some((player) => raw === `End of game : ${player} wins!`))
+  )
+    result.kind = 'gameEnd';
   else if (actor && text === 'は新しいワーカーを獲得した') result.kind = 'workerGain';
   else if (
     actor &&
@@ -182,14 +186,130 @@ function validate(raw) {
   return players;
 }
 
-export function normalizeGame(raw, sourceSha256) {
+// The current collector preserves complete entry text (including its UI header)
+// and literal icon `class` attributes. This view is transient: original raw
+// entries and their file checksum remain the exported source evidence.
+function publicUiDomView(raw, tableEvidenceBytes) {
+  if (
+    raw.schema_version !== 1 ||
+    raw.source_type !== 'public_ui_dom' ||
+    raw.export_scope !== 'all_rendered_gamereview_log_entries'
+  )
+    throw new Error('Unsupported UI export schema/source/scope');
+  if (
+    !Array.isArray(raw.entries) ||
+    !Array.isArray(raw.dom_entries) ||
+    raw.entries.length !== raw.dom_entries.length ||
+    raw.entry_count !== raw.entries.length ||
+    raw.dom_entry_count !== raw.dom_entries.length ||
+    !Array.isArray(raw.metadata?.players)
+  )
+    throw new Error('Invalid current UI entry counts/metadata');
+  const tableUrl = new URL(raw.metadata.tableUrl);
+  if (
+    tableUrl.protocol !== 'https:' ||
+    !['boardgamearena.com', 'ja.boardgamearena.com', 'en.boardgamearena.com'].includes(
+      tableUrl.hostname,
+    ) ||
+    tableUrl.pathname !== '/table' ||
+    tableUrl.searchParams.get('table') !== raw.table_id
+  )
+    throw new Error('Current metadata table URL mismatch');
+  const entries = raw.entries.map((entry, index) => {
+    const dom = raw.dom_entries[index];
+    if (!Array.isArray(dom.messages) || typeof entry.raw_text !== 'string')
+      throw new Error('Invalid current UI message evidence');
+    const prefix = `行動 ${entry.action_id} :\n${entry.timestamp_display}\n`;
+    const text = entry.raw_text.replaceAll('\r\n', '\n');
+    if (!text.startsWith(prefix)) throw new Error('Current UI action header/timestamp mismatch');
+    const body = text.slice(prefix.length);
+    if (
+      body !==
+      dom.messages
+        .map((message) => message.raw_text)
+        .join('\n')
+        .replaceAll('\r\n', '\n')
+    )
+      throw new Error('Current UI raw/DOM message mismatch');
+    return { ...entry, raw_text: body };
+  });
+  const dom_entries = raw.dom_entries.map((entry) => ({
+    ...entry,
+    messages: entry.messages.map((message) => ({
+      ...message,
+      icons: message.icons.map((icon) => {
+        if (typeof icon.class !== 'string') throw new Error('Missing current UI icon class');
+        return { ...icon, classes: icon.class };
+      }),
+    })),
+  }));
+  const history = [];
+  if (raw.metadata.date != null) {
+    if (typeof raw.metadata.date !== 'string') throw new Error('Invalid current UI date');
+    history.push(raw.metadata.date);
+  }
+  for (const player of raw.metadata.players) {
+    if (player.rank == null && player.score == null) continue;
+    if (!/^\d+位$/.test(player.rank) || !/^-?\d+\s*$/.test(player.score))
+      throw new Error('Invalid current UI displayed result');
+    history.push(player.rank, player.name, player.score.trim() + ' ');
+  }
+  let table_details_text = '';
+  let tableEvidence;
+  let terminationText = raw.metadata.historyRowText ?? null;
+  if (terminationText != null && typeof terminationText !== 'string')
+    throw new Error('Invalid current UI history row text');
+  terminationText = terminationText?.trim() || null;
+  if (tableEvidenceBytes != null) {
+    if (!Buffer.isBuffer(tableEvidenceBytes)) throw new Error('Expected raw table evidence bytes');
+    const table = JSON.parse(tableEvidenceBytes);
+    if (
+      table.schema !== 'tzolkin-bga-public-table-ui-v1' ||
+      table.url !== raw.metadata.tableUrl ||
+      typeof table.optionsText !== 'string'
+    )
+      throw new Error('Table evidence schema/identity/options mismatch');
+    table_details_text = `ゲーム構成\n${table.optionsText}`;
+    tableEvidence = { reference: table.url, sha256: hash(tableEvidenceBytes) };
+    if (table.resultText != null) {
+      if (typeof table.resultText !== 'string') throw new Error('Invalid visible result text');
+      terminationText =
+        [terminationText, table.resultText.trim()].filter(Boolean).join('\n') || null;
+    }
+  }
+  return {
+    raw: {
+      ...raw,
+      schema_version: '1.0',
+      source_type: 'public_ui_visible_log',
+      export_scope: 'all_observed_log_entries',
+      entries,
+      dom_entries,
+      metadata: {
+        ...raw.metadata,
+        table_id: raw.table_id,
+        player_count: raw.metadata.playerCount,
+        players: raw.metadata.players.map((player) => ({ text: player.name })),
+        history_text: history.join('\n'),
+      },
+      table_details_text,
+    },
+    tableEvidence,
+    terminationText,
+  };
+}
+
+export function normalizeGame(original, sourceSha256, tableEvidenceBytes = null) {
+  const adapted =
+    original.schema_version === 1 ? publicUiDomView(original, tableEvidenceBytes) : null;
+  const raw = adapted?.raw ?? original;
   const players = validate(raw);
   const events = [];
   let rotationMarkersBefore = 0;
   for (let i = 0; i < raw.entries.length; i++) {
     const entry = raw.entries[i];
     for (const [messageIndex, message] of raw.dom_entries[i].messages.entries()) {
-      const parsed = parseMessage(message, players);
+      const parsed = parseMessage(message, players, { englishTerminal: !!adapted });
       events.push({
         actionId: entry.action_id,
         messageIndex,
@@ -202,16 +322,28 @@ export function normalizeGame(raw, sourceSha256) {
     }
   }
   const cancellationCount = events.filter((e) => e.kind === 'cancellation').length;
-  const status = raw.metadata.history_text.includes('放棄されたテーブル')
+  const terminationText = adapted ? adapted.terminationText : raw.metadata.history_text;
+  const abandoned =
+    terminationText?.includes('放棄されたテーブル') ||
+    (adapted &&
+      /^\s*(?:Abandoned table|Table (?:was )?abandoned)\s*$/im.test(terminationText ?? ''));
+  const forfeit =
+    terminationText?.includes('投了') ||
+    (adapted && /^\s*(?:Conceded|Game conceded)\s*$/im.test(terminationText ?? ''));
+  const normalEndEvidence =
+    !adapted || /^\s*(?:ゲーム終了|Game ended|Game finished)\s*$/im.test(terminationText ?? '');
+  const status = abandoned
     ? 'abandoned'
-    : raw.metadata.history_text.includes('投了')
+    : forfeit
       ? 'forfeit'
-      : events.some((event) => event.kind === 'gameEnd') ||
-          raw.entries.some((entry) => entry.raw_text.split('\n').includes('ゲーム終了'))
-        ? 'normalEnd'
-        : 'unknown';
+      : !normalEndEvidence
+        ? 'unknown'
+        : events.some((event) => event.kind === 'gameEnd') ||
+            raw.entries.some((entry) => entry.raw_text.split('\n').includes('ゲーム終了'))
+          ? 'normalEnd'
+          : 'unknown';
   const config = raw.table_details_text.split('ゲーム構成\n')[1] ?? '';
-  const results = [...raw.metadata.history_text.matchAll(/(\d+)位\n([^\n]+)\n(\d+)\s/g)].map(
+  const results = [...raw.metadata.history_text.matchAll(/(\d+)位\n([^\n]+)\n(-?\d+)\s/g)].map(
     (m) => ({ player: m[2].trim(), rank: Number(m[1]), scoreDisplay: Number(m[3]) }),
   );
   const splitByte = parseInt(hash(raw.table_id).slice(0, 8), 16) % 10;
@@ -223,6 +355,12 @@ export function normalizeGame(raw, sourceSha256) {
       reference: raw.source_url,
       sha256: sourceSha256,
       capturedOn: raw.captured_on,
+      ...(adapted
+        ? {
+            adapter: 'bga-public-ui-dom-v1',
+            ...(adapted.tableEvidence ? { tableEvidence: adapted.tableEvidence } : {}),
+          }
+        : {}),
     },
     split: splitByte < 8 ? 'train' : splitByte === 8 ? 'validation' : 'test',
     context: {
@@ -239,6 +377,7 @@ export function normalizeGame(raw, sourceSha256) {
     },
     quality: {
       status,
+      ...(adapted ? { terminalLogObserved: events.some((event) => event.kind === 'gameEnd') } : {}),
       cancellationCount,
       rollbackResolved: cancellationCount === 0,
       verifiedComplete: false,
@@ -264,7 +403,7 @@ export function normalizeGame(raw, sourceSha256) {
     },
     resultsDisplay: results,
     // Preserve every action, including terminal text outside message divs.
-    rawEntries: raw.entries,
+    rawEntries: original.entries,
     events,
   };
 }
@@ -322,9 +461,31 @@ export async function importCorpus(input, output) {
       throw new Error('Duplicate or misnamed table');
     seen.add(raw.table_id);
     const sha256 = hash(bytes);
-    const game = normalizeGame(raw, sha256);
+    let tableEvidenceBytes = null;
+    if (raw.schema_version === 1) {
+      try {
+        tableEvidenceBytes = await readFile(join(input, 'table-evidence', name));
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+    const game = normalizeGame(raw, sha256, tableEvidenceBytes);
     games.push(game);
-    sources.push({ tableId: game.tableId, file: `games/${name}`, bytes: bytes.length, sha256 });
+    sources.push({
+      tableId: game.tableId,
+      file: `games/${name}`,
+      bytes: bytes.length,
+      sha256,
+      ...(tableEvidenceBytes
+        ? {
+            tableEvidence: {
+              file: `table-evidence/${name}`,
+              bytes: tableEvidenceBytes.length,
+              sha256: hash(tableEvidenceBytes),
+            },
+          }
+        : {}),
+    });
   }
   const profiles = games.flatMap(profileGame);
   const summary = {
