@@ -99,6 +99,9 @@ pub enum PolicyConfig {
     Heuristic {
         weights: HeuristicWeights,
     },
+    CornFirstSetup {
+        weights: HeuristicWeights,
+    },
     Learned {
         checkpoint: PathBuf,
         dataset: PathBuf,
@@ -156,6 +159,7 @@ enum PreparedPolicy {
     PublicLearned(PreparedPublicPolicy),
     Search(PreparedSearch),
     Heuristic(HeuristicWeights),
+    CornFirstSetup(HeuristicWeights),
     Learned {
         model: Box<ModelArtifact>,
         kernel: Kernel,
@@ -241,6 +245,10 @@ impl PreparedPolicy {
                 weights.validate()?;
                 Ok(Self::Heuristic(weights.clone()))
             }
+            PolicyConfig::CornFirstSetup { weights } => {
+                weights.validate()?;
+                Ok(Self::CornFirstSetup(weights.clone()))
+            }
             PolicyConfig::Learned {
                 checkpoint,
                 dataset,
@@ -297,6 +305,7 @@ enum PolicyChooser<'a> {
     PublicLearned(Box<PublicPolicyHandle<'a>>),
     Search(&'a PreparedSearch),
     Heuristic(&'a HeuristicWeights),
+    CornFirstSetup(&'a HeuristicWeights),
     Learned(LoadedPolicy<'a>),
 }
 /// Borrowing the prepared policies keeps coefficients/model bytes immutable for
@@ -355,6 +364,14 @@ impl<'a> PolicyHandle<'a> {
                 },
                 None,
             ),
+            PreparedPolicy::CornFirstSetup(weights) => (
+                PolicyChooser::CornFirstSetup(weights),
+                SeatPolicy::CornFirstSetup {
+                    policy_version: crate::setup_policy::POLICY_VERSION.into(),
+                    weights: weights.clone(),
+                },
+                None,
+            ),
             PreparedPolicy::Learned {
                 model,
                 kernel,
@@ -394,6 +411,10 @@ impl<'a> PolicyHandle<'a> {
             PolicyChooser::Heuristic(weights) => {
                 Ok((choose_move_with_weights(observation, weights)?, None))
             }
+            PolicyChooser::CornFirstSetup(weights) => Ok((
+                crate::setup_policy::choose_move_with_weights(observation, weights)?,
+                None,
+            )),
             PolicyChooser::Learned(policy) => Ok((policy.choose_move(observation)?, None)),
         }
     }

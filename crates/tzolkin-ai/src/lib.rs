@@ -19,6 +19,7 @@ pub mod replay;
 pub mod search;
 pub mod search_native;
 pub mod selfplay_batch;
+pub mod setup_policy;
 pub mod state_mc_dataset;
 pub mod state_mc_training;
 pub mod training;
