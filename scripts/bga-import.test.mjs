@@ -44,6 +44,136 @@ function fixture() {
   };
 }
 
+function currentFixture() {
+  const old = fixture();
+  const raw = {
+    ...old,
+    schema_version: 1,
+    source_type: 'public_ui_dom',
+    export_scope: 'all_rendered_gamereview_log_entries',
+    dom_entry_count: old.entry_count,
+    metadata: {
+      playerCount: 3,
+      tableUrl: 'https://boardgamearena.com/table?table=123',
+      date: '2026年10月01日 12:00',
+      players: ['A', 'B', 'C'].map((name, index) => ({
+        name,
+        rank: `${index + 1}位`,
+        score: `${120 - index * 30} `,
+      })),
+    },
+    dom_entries: structuredClone(old.dom_entries),
+  };
+  delete raw.table_details_text;
+  raw.dom_entries[0].messages = [
+    {
+      raw_text: 'Aは1\nを4\nに交換した',
+      html: 'synthetic trade icons',
+      icons: [{ class: 'tz_icon resource_gold' }, { class: 'tz_icon resource_corn' }],
+    },
+  ];
+  raw.dom_entries
+    .at(-1)
+    .messages.push({ raw_text: 'End of game : A wins!', html: 'End of game : A wins!', icons: [] });
+  raw.entries = raw.dom_entries.map((entry) => ({
+    action_id: entry.action_id,
+    timestamp_display: entry.timestamp_display,
+    raw_text: `行動 ${entry.action_id} :\n${entry.timestamp_display}\n${entry.messages.map((m) => m.raw_text).join('\n')}`,
+  }));
+  return raw;
+}
+
+function currentTable() {
+  return Buffer.from(
+    JSON.stringify({
+      schema: 'tzolkin-bga-public-table-ui-v1',
+      url: 'https://boardgamearena.com/table?table=123',
+      optionsText: 'ゲームモード\nアリーナモード\nウシュマルコーンの制限\n制限なし',
+    }),
+  );
+}
+
+test('adapts current public DOM wire without replacing original entries or inventing setup', () => {
+  const raw = currentFixture();
+  const before = JSON.stringify(raw);
+  const game = normalizeGame(raw, 'original-file-checksum', currentTable());
+  assert.equal(JSON.stringify(raw), before);
+  assert.deepEqual(game.rawEntries, raw.entries);
+  assert.equal(game.source.sha256, 'original-file-checksum');
+  assert.equal(game.source.adapter, 'bga-public-ui-dom-v1');
+  assert.equal(game.source.tableEvidence.sha256.length, 64);
+  assert.equal(game.context.mode, 'アリーナモード');
+  assert.equal(game.context.marketOption, '制限なし');
+  assert.equal(game.context.initialSeatOrder, null);
+  assert.equal(game.context.initialResources, null);
+  assert.equal(game.context.extensionOptions, null);
+  assert.equal(game.quality.status, 'normalEnd');
+  assert.equal(game.quality.verifiedComplete, false);
+  assert.equal(game.quality.policyTrainingReady, false);
+  assert.deepEqual(game.events[0].detail, {
+    from: { resource: 'gold', amount: 1 },
+    to: { resource: 'corn', amount: 4 },
+  });
+  assert.equal(game.events.at(-1).kind, 'gameEnd');
+  assert.deepEqual(game.resultsDisplay[0], { player: 'A', rank: 1, scoreDisplay: 120 });
+  const unknown = normalizeGame(raw, 'checksum');
+  assert.equal(unknown.context.mode, null);
+  assert.equal(unknown.context.marketOption, null);
+  for (const change of [
+    (g) => {
+      g.export_scope = 'all_observed_log_entries';
+    },
+    (g) => {
+      g.entries[0].raw_text = g.entries[0].raw_text.replace('行動 1', '行動 2');
+    },
+    (g) => {
+      g.entries[0].raw_text += '\nunobserved residual';
+    },
+    (g) => {
+      g.dom_entries[0].messages[0].icons[0].class = null;
+    },
+    (g) => {
+      g.dom_entry_count--;
+    },
+    (g) => {
+      g.metadata.tableUrl = 'https://boardgamearena.com/table?table=999';
+    },
+  ]) {
+    const changed = structuredClone(raw);
+    change(changed);
+    assert.throws(() => normalizeGame(changed, 'checksum', currentTable()));
+  }
+  const wrong = JSON.parse(currentTable());
+  wrong.url = 'https://boardgamearena.com/table?table=999';
+  assert.throws(
+    () => normalizeGame(raw, 'checksum', Buffer.from(JSON.stringify(wrong))),
+    /Table evidence/,
+  );
+});
+
+test('imports current DOM source and binds optional table evidence separately', async () => {
+  const temp = await mkdtemp(join(tmpdir(), 'tzolkin-bga-current-test-'));
+  try {
+    const input = join(temp, 'input');
+    await mkdir(join(input, 'games'), { recursive: true });
+    await mkdir(join(input, 'table-evidence'));
+    const bytes = JSON.stringify(currentFixture());
+    await writeFile(join(input, 'games', '123.json'), bytes);
+    await writeFile(join(input, 'table-evidence', '123.json'), currentTable());
+    const output = join(temp, 'output');
+    const manifest = await importCorpus(input, output);
+    const stored = JSON.parse(await readFile(join(output, 'games', '123.json')));
+    assert.equal(manifest.sources[0].tableEvidence.sha256, stored.source.tableEvidence.sha256);
+    assert.equal(manifest.sources[0].tableEvidence.bytes, currentTable().length);
+    assert.equal(manifest.sources[0].bytes, Buffer.byteLength(bytes));
+    assert.equal(stored.events.at(-1).kind, 'gameEnd');
+    assert.equal(manifest.policyTrainingRows, 0);
+    assert.deepEqual(stored.rawEntries, currentFixture().entries);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test('parses action position separately from worker position and Uxmal selections', () => {
   const game = normalizeGame(fixture(), 'checksum');
   assert.deepEqual(game.events[0].detail, {
