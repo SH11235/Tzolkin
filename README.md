@@ -70,6 +70,12 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 npm run tauri build -- --no-bundle
 ```
 
+`npm run test:core` は [cargo-nextest](https://nexte.st/) でテストバイナリを並列に実行します。初回に次のコマンドで導入してください。doctest は nextest の対象外なので、同じスクリプトが続けて `cargo test --doc` を実行します。
+
+```sh
+cargo install cargo-nextest --locked --version 0.9.148
+```
+
 ルールの回帰テストは Rust コアを Node 向け Wasm で呼び出します。さらに、保存した 6 対局・1,740 操作の参照データに対し、ネイティブ Rust と本番用 Wasm の状態・選択肢・配置費用を各操作で比較します。拡張のテストでは全 13 部族の能力、ダミーワーカー、クイックアクション、予言を確認し、プレイヤー数と拡張の組み合わせごとに本番 API を使って終局まで進めます。既存の保存 JSON `version: 1` は引き続き読み込めます。部族・予言・クイックアクションを使う対局は `version: 2` で保存します。検証を省略するテスト用の Wasm API は本番ビルドに含めません。
 
 TypeScript は ESLint の解析器が公式に対応する最新安定版を使用します。依存関係は npm と Cargo の lockfile で固定しています。

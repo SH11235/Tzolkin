@@ -77,6 +77,8 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      NEXTEST_VERSION: 0.9.148
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -87,6 +89,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
+      # npm run test:core runs the tests through cargo-nextest, which runs test
+      # binaries in parallel. Keep the version in step with the README.
+      - id: nextest-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/nextest
+          key: nextest-${{ runner.os }}-${{ runner.arch }}-${{ env.NEXTEST_VERSION }}
+      - if: steps.nextest-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-nextest --version "$NEXTEST_VERSION" --locked --root "$HOME/.local/nextest"
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/nextest-build
+      - run: echo "$HOME/.local/nextest/bin" >> "$GITHUB_PATH"
       - run: npm ci
       - run: npm run test:core
         env:
