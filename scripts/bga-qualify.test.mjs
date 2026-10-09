@@ -328,10 +328,10 @@ function audit(input, dispatch = coreDispatcher(nativeCli)) {
 
 test('table-family identity uses the frozen domain and excludes native actor indices', () => {
   assert.equal(
-    tableFamilyId('919633279'),
-    'da501eb006094334c5dc541d5a7e380bfd524b902ff2ef52a73590cc00cbe9c4',
+    tableFamilyId('123'),
+    '87c281fd9533a7d20dcc12bff164a426f00fafd29fa36b87b260c8068791b1d8',
   );
-  for (const id of ['0919633279', '0', 'boardgamearena:919633279', 919633279])
+  for (const id of ['0123', '0', 'boardgamearena:123', 123])
     assert.throws(() => tableFamilyId(id), /canonical table ID/);
 });
 

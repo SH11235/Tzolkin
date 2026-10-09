@@ -29,6 +29,48 @@ const canonical = (value) =>
 const same = (a, b) => canonical(a) === canonical(b);
 const stateHash = (state) => sha256(canonical(state));
 
+export function assertBasicUnlimitedOptions(config) {
+  if (typeof config !== 'string') fail('Missing observed BGA table settings');
+  if (
+    /部族|予言|預言|拡張|追加(?:建物|建築)|クイックアクション|Tribes?|Prophec(?:y|ies)|Expansion|Additional buildings?|Quick actions?/i.test(
+      config,
+    )
+  )
+    fail('BGA table has unsupported/unknown settings');
+  const lines = config
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const settings = new Map();
+  for (let index = 0; index < lines.length;) {
+    const key = lines[index++];
+    const value = lines[index++];
+    if (settings.has(key)) fail('BGA table has unsupported/unknown settings');
+    if (key === 'ゲームモード') {
+      if (
+        settings.size ||
+        !['ノーマルモード', 'アリーナモード', 'Normal mode', 'Arena mode'].includes(value)
+      )
+        fail('BGA table has unsupported/unknown settings');
+      const prefix = `${value}: `;
+      if (lines[index]?.startsWith(prefix) && lines[index].length > prefix.length) index++;
+    } else if (key === 'ゲームの速度') {
+      if (
+        !settings.has('ゲームモード') ||
+        settings.has('ウシュマルコーンの制限') ||
+        !/^ターンベース • 1日あたり[1-9]\d*手番$/.test(value) ||
+        !/^毎手番ごとに\+\d+h[0-5]\d\(最大[1-9]\d* 日\)$/.test(lines[index++])
+      )
+        fail('BGA table has unsupported/unknown settings');
+    } else if (key !== 'ウシュマルコーンの制限' || !['制限なし', 'Unlimited'].includes(value))
+      fail('BGA table has unsupported/unknown settings');
+    settings.set(key, value);
+  }
+  if (!settings.has('ウシュマルコーンの制限'))
+    fail('Only explicitly unlimited BGA markets are supported');
+}
+
 function keys(value, allowed, context) {
   if (!object(value) || Object.keys(value).some((key) => !allowed.includes(key)))
     fail(`${context}: unexpected object/field`);
@@ -228,15 +270,8 @@ export function auditReconstruction(rawBytes, companion, documents, dispatch) {
     fail('Explicit partial/complete status required');
   if (!Array.isArray(companion.unsupportedRules) || companion.unsupportedRules.length)
     fail('Unsupported/unknown rules must be resolved before reconstruction');
-  if (!['制限なし', 'Unlimited'].includes(game.context.marketOption))
-    fail('Only explicitly unlimited BGA markets are supported');
-  const config = raw.table_details_text.split('ゲーム構成\n')[1] ?? '';
-  if (
-    /部族|予言|拡張|追加建物|Tribes|Prophecies|Expansion|Additional buildings|Quick actions/i.test(
-      config,
-    )
-  )
-    fail('BGA table has unsupported/unknown expansion settings');
+  const config = raw.table_details_text.split('ゲーム構成\n').slice(1).join('ゲーム構成\n');
+  assertBasicUnlimitedOptions(config);
   const record = companion.record;
   if (
     !object(record) ||

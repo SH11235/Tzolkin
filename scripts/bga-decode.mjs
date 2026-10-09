@@ -3,7 +3,12 @@ import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeGame } from './bga-import.mjs';
-import { coreDispatcher, publishReplay, sourceEvents } from './bga-replay.mjs';
+import {
+  assertBasicUnlimitedOptions,
+  coreDispatcher,
+  publishReplay,
+  sourceEvents,
+} from './bga-replay.mjs';
 
 export const WITNESS_SCHEMA = 'tzolkin-bga-public-witnesses-v1';
 const MAX_BYTES = 16 * 1024 * 1024;
@@ -77,11 +82,11 @@ function paymentOf(events) {
     });
   return result;
 }
-function sourceGroups(events, initialId) {
-  const groups = new Map();
+function sourceGroups(events, initialId, actionIds) {
+  const groups = new Map(actionIds.filter((id) => id > initialId).map((id) => [id, []]));
   for (const event of events) {
     if (event.actionId <= initialId) continue;
-    if (!groups.has(event.actionId)) groups.set(event.actionId, []);
+    if (!groups.has(event.actionId)) fail('Event has no matching raw source action ID');
     groups.get(event.actionId).push(event);
   }
   return [...groups.entries()];
@@ -111,19 +116,37 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
   positive(witnesses.initialActionId, 'initialActionId');
   if (!Array.isArray(witnesses.witnesses) || witnesses.witnesses.length > MAX_STEPS)
     fail('Invalid witness list');
-  const game = normalizeGame(JSON.parse(rawBytes), sha(rawBytes), tableBytes);
+  const raw = JSON.parse(rawBytes);
+  const game = normalizeGame(raw, sha(rawBytes), tableBytes);
+  if (game.source.adapter !== 'bga-public-ui-dom-v1' && tableBytes !== null)
+    fail('Legacy input requires embedded table settings, not separate table evidence');
   if (
     game.tableId !== witnesses.tableId ||
     !game.rawEntries.some((entry) => entry.action_id === witnesses.initialActionId)
   )
     fail('Witness table/initial source mismatch');
-  if (game.context.marketOption !== '制限なし') fail('An observed unlimited market is required');
+  assertBasicUnlimitedOptions(
+    game.source.adapter === 'bga-public-ui-dom-v1'
+      ? tableBytes === null
+        ? ''
+        : JSON.parse(tableBytes).optionsText
+      : raw.table_details_text.split('ゲーム構成\n').slice(1).join('ゲーム構成\n'),
+  );
   const knownActionIds = game.rawEntries.map((entry) => entry.action_id);
   const knownIds = new Set(knownActionIds);
+  const eventIds = new Set(game.events.map((event) => event.actionId));
   const normalizedEvents =
     game.source.adapter === 'bga-public-ui-dom-v1'
       ? game.events
-      : sourceEvents({ entries: game.rawEntries }, game, knownActionIds.at(-1));
+      : sourceEvents(
+          {
+            entries: game.rawEntries.filter(
+              (entry) => entry.raw_text !== '' || eventIds.has(entry.action_id),
+            ),
+          },
+          game,
+          knownActionIds.at(-1),
+        );
   const source = {
     reference: game.source.reference,
     actionIds: [witnesses.initialActionId],
@@ -159,6 +182,12 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       (!object(witness.expected) || !Object.keys(witness.expected).length)
     )
       fail('Empty witness checkpoint');
+    if (
+      witness.pendingTask !== undefined &&
+      witness.pendingTask !== null &&
+      typeof witness.pendingTask !== 'string'
+    )
+      fail('Invalid pending task witness');
     for (const field of ['buildings', 'monuments'])
       if (
         witness[field] !== undefined &&
@@ -379,7 +408,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     }
     fail('Refill planner did not converge');
   }
-  function choose(predicate, reason, derived = false) {
+  function choose(predicate, reason, derived = false, visibleCalendar = false) {
     if (record.steps.length >= MAX_STEPS) fail('Move limit reached');
     let candidates = legal().filter((row) => predicate(row.action));
     // The following visible decision can establish declining an optional
@@ -409,6 +438,13 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       fail(`Ambiguous legal operation for ${reason}`);
     const chosen = outcomes[0];
     const previous = state();
+    if (
+      derived &&
+      !visibleCalendar &&
+      (chosen.frame.snapshot.state.round !== previous.round ||
+        chosen.frame.snapshot.state.phase !== previous.phase)
+    )
+      fail('Derived actor boundary requires an observed calendar transition');
     const feeding = calendarTransition(previous, chosen.frame.snapshot.state, chosen.row.action);
     if (feeding.length) {
       context.feeding.push(...feeding);
@@ -424,10 +460,13 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
         'workers',
         'score',
         ...RESOURCES.map((resource) => `resource:${resource}`),
+        ...['chaac', 'quetzalcoatl', 'kukulkan'].map((temple) => `temple:${temple}`),
       ]) {
         const delta = field.startsWith('resource:')
           ? next.resources[field.slice(9)] - player.resources[field.slice(9)]
-          : next[field] - player[field];
+          : field.startsWith('temple:')
+            ? next.temples[field.slice(7)] - player.temples[field.slice(7)]
+            : next[field] - player[field];
         const cost =
           field === 'resource:corn'
             ? (player.id === previous.currentPlayer ? cornCost : 0) + (food?.cost ?? 0)
@@ -501,6 +540,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
         (action) => action.type === 'endTurn' && action.doubleAdvance === null,
         'visible end-of-round',
         true,
+        true,
       );
     if (days !== null && pending() === 'rotation')
       choose(
@@ -515,15 +555,21 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
   }
   function pay(values) {
     if (!values.some(Boolean)) return false;
+    if (!['theology', 'payTechnology', 'payResource'].includes(pending())) return false;
+    if (context.paymentActor !== state().currentPlayer)
+      fail('Observed payment actor differs from the pending payment actor');
+    const remaining = values.map((amount, index) =>
+      Math.max(
+        0,
+        amount - (context.effects[`${state().currentPlayer}:resource:${RESOURCES[index]}:-1`] ?? 0),
+      ),
+    );
+    if (!remaining.some(Boolean)) {
+      if (context.paymentOperations && pending() !== 'theology')
+        fail('Observed payment was already consumed by another payment operation');
+      return false;
+    }
     if (pending() === 'theology') {
-      const remaining = values.map((amount, index) =>
-        Math.max(
-          0,
-          amount -
-            (context.effects[`${state().currentPlayer}:resource:${RESOURCES[index]}:-1`] ?? 0),
-        ),
-      );
-      if (!remaining.some(Boolean)) return false;
       const material = remaining.findIndex((amount) => amount !== 0);
       if (
         material < 1 ||
@@ -535,13 +581,16 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
         (action) => action.type === 'offering' && action.resource === RESOURCES[material],
         'observed theology offering',
       );
+      context.paymentOperations++;
       return true;
     }
-    if (pending() !== 'payTechnology' && pending() !== 'payResource') return false;
     choose(
-      (action) => action.type === 'payment' && same(action.resources, values),
+      (action) =>
+        action.type === 'payment' &&
+        action.resources.every((amount, index) => amount <= remaining[index]),
       'observed payment',
     );
+    context.paymentOperations++;
     return true;
   }
   function automatic(event, field, amount, direction = 1) {
@@ -553,9 +602,19 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       fail(`Source effect ${field}=${direction * amount} is not established by this macro`);
     context.claims[key] = consumed + amount;
   }
+  function unclaimed(event, field, direction = 1) {
+    const id = actorId(event.actor);
+    if (id < 0) fail('Automatic effect has no known actor');
+    const key = `${id}:${field}:${direction}`;
+    return (context.effects[key] ?? 0) - (context.claims[key] ?? 0);
+  }
 
   let blocked = null;
-  for (const [id, events] of sourceGroups(normalizedEvents, witnesses.initialActionId)) {
+  for (const [id, events] of sourceGroups(
+    normalizedEvents,
+    witnesses.initialActionId,
+    knownActionIds,
+  )) {
     const witness = observed.get(id) ?? {};
     const saved = {
       frame: copy(frame),
@@ -582,8 +641,17 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       effects: {},
       feeding: [],
       feedingDay: null,
+      paymentActor: null,
+      paymentOperations: 0,
     };
     try {
+      if (!events.length) fail('Raw source action has no observed messages');
+      for (const [field, kind] of [
+        ['buildings', 'build'],
+        ['monuments', 'monument'],
+      ])
+        if (witness[field]?.length && !events.some((event) => event.kind === kind))
+          fail(`Unused ${field} witness without a matching source event`);
       if (events.some((event) => event.kind === 'cancellation')) {
         alignActor(events[0].actor);
         if (
@@ -629,10 +697,47 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
         });
       } else {
         const payments = paymentOf(events);
+        const paymentActors = events
+          .filter((event) => event.kind === 'resourcePayment')
+          .map((event) => actorId(event.actor));
+        if (paymentActors.some((actor) => actor < 0 || actor !== paymentActors[0]))
+          fail('Observed payments do not have one unambiguous actor');
+        context.paymentActor = paymentActors[0] ?? null;
+        const firstOperation = events.findIndex(
+          (event) =>
+            ['place', 'gearAction', 'technology', 'trade', 'build', 'monument', 'beg'].includes(
+              event.kind,
+            ) ||
+            (event.kind === 'resourceGain' && pending() === 'resource') ||
+            (event.kind === 'resourcePayment' &&
+              ['payTechnology', 'payResource', 'theology'].includes(pending())) ||
+            (event.kind === 'unparsed' &&
+              event.actor !== null &&
+              /は(?:スタートプレイヤースペースに|(?:Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を|(?:corn|コーン|wood)タイルを獲得した)/.test(
+                event.rawText.slice(event.actor.length),
+              )),
+        );
+        if (
+          firstOperation >= 0 &&
+          events
+            .slice(firstOperation + 1)
+            .some((event) =>
+              ['gearAdvanced', 'feeding', 'firstPlayer', 'doubleAdvance'].includes(event.kind),
+            )
+        )
+          fail('Actor operation precedes a calendar message in the same source');
         const startsCalendar = events.some((event) =>
           ['gearAdvanced', 'feeding', 'firstPlayer'].includes(event.kind),
         );
-        const double = events.some((event) => event.kind === 'doubleAdvance');
+        const doubleEvents = events.filter((event) => event.kind === 'doubleAdvance');
+        const double = doubleEvents.length > 0;
+        if (
+          double &&
+          (doubleEvents.length !== 1 ||
+            state().firstPlayerClaimed === null ||
+            actorId(doubleEvents[0].actor) !== state().firstPlayerClaimed)
+        )
+          fail('Observed double advancement actor differs from the core claimer');
         if (startsCalendar || double) calendar();
         if (double) {
           choose(
@@ -762,31 +867,37 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
                     (action) => action.type === 'resource' && action.resource === RESOURCES[index],
                     'resource selection',
                   );
-            } else
-              for (const [index, amount] of values.entries())
-                if (amount) automatic(event, `resource:${RESOURCES[index]}`, amount);
+            }
+            for (const [index, amount] of values.entries())
+              if (amount) automatic(event, `resource:${RESOURCES[index]}`, amount);
           } else if (event.kind === 'beg') {
+            const body = event.rawText.slice(event.actor?.length ?? 0);
+            const temple = body.match(
+              /^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を(?:1段)?下げ(?:て|ることで|、)コーン3個を受け取った$/,
+            );
+            if (!temple) fail('Begging requires one unambiguous temple in the actor-free phrase');
             alignActor(event.actor);
             choose((action) => action.type === 'beg', 'observed begging');
-            const text = event.rawText.match(/(?:Chaac|Quetzalcoatl|Kukulkan|Kukulcan)/)?.[0];
-            if (!text) fail('Begging temple is unknown');
             choose(
               (action) =>
                 action.type === 'temple' &&
-                action.temple === TEMPLES[text] &&
+                action.temple === TEMPLES[temple[1]] &&
                 action.direction === -1,
               'observed begging temple',
             );
+            automatic(event, `temple:${TEMPLES[temple[1]]}`, 1, -1);
           } else if (event.kind === 'unparsed') {
-            const first = event.rawText.match(
-              /はスタートプレイヤースペースに(\d+)\s*を支払ってワーカーを置いた$/,
+            const body =
+              event.actor === null ? event.rawText : event.rawText.slice(event.actor.length);
+            const first = body.match(
+              /^はスタートプレイヤースペースに(\d+)\s*を支払ってワーカーを置いた$/,
             );
-            const temple = event.rawText.match(
-              /は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段(上げた|下げた)$/,
+            const temple = body.match(
+              /^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段(上げた|下げた)$/,
             );
-            const harvest = event.rawText.match(/は(corn|コーン|wood)タイルを獲得した$/);
-            const paidRemoval = event.rawText.match(
-              /は(Palenque|Yaxchilan|Tikal|Uxmal|Chichen Itza) (\d+)のワーカーを取り除き、\s*(\d+)コーンを支払ってn°(\d+)\s*アクションを行った$/,
+            const harvest = body.match(/^は(corn|コーン|wood)タイルを獲得した$/);
+            const paidRemoval = body.match(
+              /^は(Palenque|Yaxchilan|Tikal|Uxmal|Chichen Itza) (\d+)のワーカーを取り除き、\s*(\d+)コーンを支払ってn°(\d+)\s*アクションを行った$/,
             );
             if (first) {
               alignActor(event.actor);
@@ -822,7 +933,8 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
               alignActor(event.actor);
               const direction = temple[2] === '上げた' ? 1 : -1;
               pay(payments);
-              if (pending() === 'temple') {
+              const field = `temple:${TEMPLES[temple[1]]}`;
+              if (unclaimed(event, field, direction) < 1 && pending() === 'temple') {
                 choose(
                   (action) =>
                     action.type === 'temple' &&
@@ -830,12 +942,8 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
                     action.direction === direction,
                   'temple advance',
                 );
-              } else if (
-                state().players[actorId(event.actor)].temples[TEMPLES[temple[1]]] -
-                  context.before.players[actorId(event.actor)].temples[TEMPLES[temple[1]]] !==
-                direction
-              )
-                fail('Automatic temple effect not established');
+              }
+              automatic(event, field, 1, direction);
             } else if (harvest) {
               alignActor(event.actor);
               const kind = harvest[1] === 'コーン' ? 'corn' : harvest[1];
@@ -899,6 +1007,8 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       }
       if (context.pools.currentAge.length || context.pools.age2.length)
         fail('Observed reveal pool was not consumed at this source event');
+      if (Object.hasOwn(witness, 'pendingTask') && witness.pendingTask !== pending())
+        fail('Observed macro-end pending task mismatch');
       if (witness.expected && !matches(state(), witness.expected))
         fail('Observed macro-end public checkpoint mismatch');
       if (record.steps.length > saved.stepCount && witness.expected)
@@ -934,6 +1044,13 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       })),
     };
   const report = core({ operation: 'publicReplay', replay: record });
+  if (
+    report.verifiedSteps !== record.steps.length ||
+    report.frames?.length !== record.steps.length + 1 ||
+    !same(report.frames.at(-1).snapshot, frame.snapshot) ||
+    !same(report.frames.at(-1).observation, frame.observation)
+  )
+    fail('Final core replay differs from the incremental verified prefix');
   return {
     record,
     manifest: {

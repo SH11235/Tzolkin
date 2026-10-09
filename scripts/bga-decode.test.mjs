@@ -133,6 +133,135 @@ test('keeps the effective witnessed rollback prefix and stops before an unknown 
     table,
   );
   assert.deepEqual(currentResult.record, result.record);
+  const options = value.raw.table_details_text.split('ゲーム構成\n')[1];
+  for (const extra of [
+    '部族\n有効',
+    '予言\n有効',
+    '拡張\n有効',
+    '追加建物\n有効',
+    'Quick actions\nEnabled',
+    'Unknown option\nDisabled',
+    'ゲームモード\nノーマルモード',
+  ]) {
+    const legacy = input();
+    legacy.raw.table_details_text = `ゲーム構成\n${options}${extra}\n`;
+    assert.throws(
+      () => decode(legacy, () => assert.fail('Options must reject before core dispatch')),
+      /unsupported\/unknown settings/,
+    );
+    const unsupportedTable = Buffer.from(
+      JSON.stringify({ ...JSON.parse(table), optionsText: `${options}${extra}\n` }),
+    );
+    assert.throws(
+      () =>
+        decode(
+          clone(current),
+          () => assert.fail('Options must reject before core dispatch'),
+          unsupportedTable,
+        ),
+      /unsupported\/unknown settings/,
+    );
+  }
+  const clock = 'ゲームの速度\nターンベース • 1日あたり2手番\n毎手番ごとに+12h30(最大2 日)\n';
+  const market = 'ウシュマルコーンの制限\n制限なし\n';
+  const configurations = [
+    `ゲームモード\nノーマルモード\n${clock}${market}`,
+    `ゲームモード\nアリーナモード\nアリーナモード: 合成の対戦区分の説明\n${clock}${market}`,
+    `ゲームモード\nArena mode\nArena mode: Synthetic competition category\n${clock}${market}`,
+  ];
+  const invalidConfigurations = [
+    configurations[0].replace('ターンベース • 1日あたり2手番', 'リアルタイム • 10分'),
+    configurations[0].replace('+12h30', '+12h99'),
+    configurations[0].replace('毎手番ごとに', '未知の時計補足'),
+    configurations[0].replace('ゲームの速度\n', ''),
+    configurations[0].replace('ノーマルモード\n', 'ノーマルモード\nアリーナモード: 合成の説明\n'),
+    configurations[1].replace(
+      '合成の対戦区分の説明',
+      '合成の対戦区分の説明\nアリーナモード: 二重の説明',
+    ),
+    configurations[1].replace('合成の対戦区分の説明', '追加建物を有効にする説明'),
+    configurations[1].replace(market, '未知の項目\n無効\n' + market),
+  ];
+  for (const [accepted, configs] of [
+    [true, configurations],
+    [false, invalidConfigurations],
+  ])
+    for (const config of configs) {
+      const legacy = input();
+      legacy.raw.table_details_text = `ゲーム構成\n${config}`;
+      const currentTable = Buffer.from(
+        JSON.stringify({ ...JSON.parse(table), optionsText: config }),
+      );
+      for (const [candidate, evidence] of [
+        [legacy, null],
+        [clone(current), currentTable],
+      ]) {
+        if (accepted)
+          assert.deepEqual(
+            decode(
+              candidate,
+              dispatcher(saved.core.initialFrame, () => clone(saved.core.afterFrame)),
+              evidence,
+            ).record,
+            result.record,
+          );
+        else
+          assert.throws(
+            () =>
+              decode(
+                candidate,
+                () => assert.fail('Unknown settings must reject before core dispatch'),
+                evidence,
+              ),
+            /unsupported\/unknown settings/,
+          );
+      }
+    }
+  assert.throws(
+    () =>
+      decode(
+        input(),
+        () => assert.fail('Legacy table evidence must reject before core dispatch'),
+        table,
+      ),
+    /Legacy input requires embedded table settings/,
+  );
+  const empty = input();
+  replaceEvents(empty, [
+    [6, []],
+    [7, [{ raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' }]],
+  ]);
+  const emptyResult = decode(
+    empty,
+    dispatcher(saved.core.initialFrame, () => clone(saved.core.afterFrame)),
+  );
+  assert.equal(emptyResult.manifest.blocked.actionId, 6);
+  assert.match(emptyResult.manifest.blocked.reason, /no observed messages/);
+  assert.equal(emptyResult.record.steps.length, 0);
+  const unused = input();
+  unused.witness.witnesses = [{ actionId: 6, buildings: ['b04'] }];
+  assert.match(
+    decode(
+      unused,
+      dispatcher(saved.core.initialFrame, () => clone(saved.core.afterFrame)),
+    ).manifest.blocked.reason,
+    /Unused buildings witness/,
+  );
+  for (const corrupt of [
+    (report) => report.verifiedSteps++,
+    (report) => report.frames.at(-1).snapshot.state.round++,
+  ]) {
+    const dispatch = dispatcher(saved.core.initialFrame, () => clone(saved.core.afterFrame));
+    assert.throws(
+      () =>
+        decode(input(), (request) => {
+          const report = dispatch(request);
+          if (request.operation === 'publicReplay' && request.replay.steps.length) corrupt(report);
+          return report;
+        }),
+      /Final core replay differs/,
+    );
+  }
   current.raw.entries.at(-1).raw_text += '\nunmatched current body';
   assert.throws(
     () =>
@@ -248,6 +377,90 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
     delayed.record.steps.map((step) => step.sourceActionIds),
     [[6], [7]],
   );
+  const pendingMismatch = clone(value);
+  pendingMismatch.witness.witnesses = [{ actionId: 6, pendingTask: null }];
+  const pendingResult = decode(pendingMismatch, dispatch);
+  assert.match(pendingResult.manifest.blocked.reason, /macro-end pending task mismatch/);
+  assert.equal(pendingResult.record.steps.length, 0);
+  pendingMismatch.witness.witnesses[0].pendingTask = 1;
+  assert.throws(() => decode(pendingMismatch, dispatch), /Invalid pending task witness/);
+  const reused = input();
+  replaceEvents(reused, [
+    [
+      6,
+      [
+        { raw_text: 'Aは\nを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+        { raw_text: 'Aは収集を1レベル進めた' },
+        { raw_text: 'Aは農業を1レベル進めた' },
+      ],
+    ],
+  ]);
+  const another = clone(paid);
+  another.observation.pendingTask = { type: 'technology', remaining: 1, free: false };
+  another.observation.legalActions = [
+    {
+      action: { type: 'technology', technology: 'agriculture' },
+      move: { type: 'choose', choiceId: 'tech:agriculture' },
+    },
+  ];
+  const second = clone(another);
+  second.observation.pendingTask = { type: 'payTechnology', technology: 'agriculture', amount: 1 };
+  second.observation.legalActions = clone(selected.observation.legalActions);
+  const noReuse = decode(
+    reused,
+    dispatcher(initial, (request) => {
+      if (request.move.choiceId === 'tech:extraction') return clone(selected);
+      if (request.move.choiceId === 'pay:0') return clone(another);
+      assert.equal(request.move.choiceId, 'tech:agriculture');
+      return clone(second);
+    }),
+  );
+  assert.match(noReuse.manifest.blocked.reason, /payment was already consumed/);
+  assert.equal(noReuse.record.steps.length, 0);
+  const otherActor = input();
+  replaceEvents(otherActor, [
+    [
+      6,
+      [
+        { raw_text: 'Bは\nを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+        { raw_text: 'Aは収集を1レベル進めた' },
+      ],
+    ],
+  ]);
+  assert.match(decode(otherActor, dispatch).manifest.blocked.reason, /payment actor differs/);
+  const resourceInitial = clone(paid);
+  resourceInitial.observation.pendingTask = { type: 'resource', remaining: 2 };
+  resourceInitial.observation.legalActions = [
+    {
+      action: { type: 'resource', resource: 'wood' },
+      move: { type: 'choose', choiceId: 'resource:wood' },
+    },
+  ];
+  const firstResource = clone(resourceInitial);
+  firstResource.snapshot.state.players[0].resources.wood++;
+  firstResource.observation.pendingTask.remaining = 1;
+  const secondResource = clone(firstResource);
+  secondResource.snapshot.state.players[0].resources.wood++;
+  secondResource.observation.pendingTask = null;
+  secondResource.observation.legalActions = [];
+  const selectedResources = input();
+  selectedResources.witness.initial = clone(resourceInitial.snapshot.state);
+  const gain = { raw_text: 'Aは2\nを獲得した', icons: [{ classes: 'tz_icon resource_wood' }] };
+  replaceEvents(selectedResources, [[6, [gain]]]);
+  const resourceDispatch = dispatcher(resourceInitial, (request) => {
+    assert.equal(request.move.choiceId, 'resource:wood');
+    return clone(
+      request.state.players[0].resources.wood ===
+        resourceInitial.snapshot.state.players[0].resources.wood
+        ? firstResource
+        : secondResource,
+    );
+  });
+  assert.equal(decode(selectedResources, resourceDispatch).manifest.blocked, null);
+  replaceEvents(selectedResources, [[6, [gain, clone(gain)]]]);
+  const duplicateGain = decode(selectedResources, resourceDispatch);
+  assert.match(duplicateGain.manifest.blocked.reason, /resource:wood=2/);
+  assert.equal(duplicateGain.record.steps.length, 0);
   value.witness.witnesses = [{ actionId: 6, refills: { age2: ['b15'] } }];
   const future = decode(value, dispatch);
   assert.equal(future.record.steps.length, 0);
@@ -345,6 +558,60 @@ test('draw identities are supplied only to the operation that actually requires 
     /caption has no matching core food-day receipt/,
   );
   assert.equal(rejectedCaption.record.steps.length, 0);
+  const mixed = input();
+  replaceEvents(mixed, [
+    [
+      6,
+      [
+        { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' },
+        { raw_text: '歯車が進んだ' },
+      ],
+    ],
+  ]);
+  const wrongOrder = decode(
+    mixed,
+    dispatcher(initial, () => clone(after)),
+  );
+  assert.match(wrongOrder.manifest.blocked.reason, /Actor operation precedes a calendar message/);
+  assert.equal(wrongOrder.record.steps.length, 0);
+  const switched = input();
+  replaceEvents(switched, [
+    [6, [{ raw_text: 'BはPalenqueの歯車に0\nを支払ってワーカーを置いた' }]],
+  ]);
+  const nextRound = clone(after);
+  nextRound.snapshot.state.currentPlayer = 1;
+  const hiddenRotation = decode(
+    switched,
+    dispatcher(initial, () => clone(nextRound)),
+  );
+  assert.match(
+    hiddenRotation.manifest.blocked.reason,
+    /Derived actor boundary requires an observed calendar/,
+  );
+  assert.equal(hiddenRotation.record.steps.length, 0);
+  const rotating = clone(initial);
+  rotating.snapshot.state.firstPlayerClaimed = 0;
+  rotating.observation.pendingTask = { type: 'rotation' };
+  rotating.observation.legalActions = [
+    { action: { type: 'rotate', days: 2 }, move: { type: 'choose', choiceId: 'rotate:2' } },
+  ];
+  const advanced = clone(rotating);
+  advanced.snapshot.state.round += 2;
+  advanced.snapshot.state.firstPlayerClaimed = null;
+  advanced.observation.pendingTask = null;
+  advanced.observation.legalActions = [];
+  const double = input();
+  double.witness.initial = clone(rotating.snapshot.state);
+  replaceEvents(double, [
+    [6, [{ raw_text: 'Aは歯車を高速化し2段階回した!' }, { raw_text: '歯車が進んだ' }]],
+  ]);
+  const doubleDispatch = dispatcher(rotating, () => clone(advanced));
+  assert.equal(decode(double, doubleDispatch).manifest.blocked, null);
+  replaceEvents(double, [[6, [{ raw_text: 'Bは歯車を高速化し2段階回した!' }]]]);
+  assert.match(
+    decode(double, doubleDispatch).manifest.blocked.reason,
+    /double advancement actor differs/,
+  );
 });
 
 test('keeps automatic payments distinct from typed theology offerings and temple spellings', () => {
@@ -435,6 +702,32 @@ test('keeps automatic payments distinct from typed theology offerings and temple
       [[6], [6], [7], [8]],
     );
     assert.deepEqual(result.record.terminalDisplayCheckpoint.source.actionIds, [8]);
+    const combined = clone(value);
+    replaceEvents(combined, [
+      [
+        6,
+        [
+          ...clone(value.raw.dom_entries.find((entry) => entry.action_id === 6).messages),
+          { raw_text: 'Aは\nを支払った', icons: [{ classes: 'tz_icon resource_stone' }] },
+        ],
+      ],
+      [7, [{ raw_text: `Aは${templeName}の信仰を1段上げた` }]],
+    ]);
+    const automaticBeforeChoice = decode(combined, dispatch);
+    assert.equal(automaticBeforeChoice.manifest.blocked, null);
+    assert.deepEqual(
+      automaticBeforeChoice.record.steps.map((step) => step.move.choiceId).filter(Boolean),
+      ['action:2', 'offer:stone', 'temple:kukulkan'],
+    );
+    const repeated = clone(value);
+    const repeatedSource = repeated.raw.dom_entries.find((entry) => entry.action_id === 6);
+    repeatedSource.messages.push(clone(repeatedSource.messages[2]));
+    repeated.raw.entries.find((entry) => entry.action_id === 6).raw_text = repeatedSource.messages
+      .map((message) => message.raw_text)
+      .join('\n');
+    const repeatedTemple = decode(repeated, dispatch);
+    assert.match(repeatedTemple.manifest.blocked.reason, /temple:chaac=1/);
+    assert.equal(repeatedTemple.record.steps.length, 0);
     const source = value.raw.dom_entries.find((entry) => entry.action_id === 6);
     source.messages[0].raw_text = source.messages[0].raw_text.replace('0コーン', '2コーン');
     source.messages[0].html = source.messages[0].raw_text;
@@ -458,6 +751,46 @@ test('keeps automatic payments distinct from typed theology offerings and temple
     assert.match(invalid.manifest.blocked.reason, /one wood, stone, or gold/);
     assert.equal(invalid.record.steps.length, 2);
   }
+  const begging = input();
+  begging.raw.metadata.players[0].text = 'ChaacReader';
+  replaceEvents(begging, [
+    [6, [{ raw_text: 'ChaacReaderはQuetzalcoatlの信仰を1段下げてコーン3個を受け取った' }]],
+  ]);
+  const begInitial = clone(saved.core.initialFrame);
+  begInitial.snapshot.state.players[0].name = 'ChaacReader';
+  begInitial.observation.legalActions = [{ action: { type: 'beg' }, move: { type: 'beg' } }];
+  begging.witness.initial = clone(begInitial.snapshot.state);
+  const begged = clone(begInitial);
+  begged.observation.pendingTask = { type: 'temple', remaining: 1, direction: -1 };
+  begged.observation.legalActions = ['chaac', 'quetzalcoatl'].map((temple) => ({
+    action: { type: 'temple', temple, direction: -1 },
+    move: { type: 'choose', choiceId: `temple:${temple}` },
+  }));
+  const lowered = clone(begged);
+  lowered.snapshot.state.players[0].temples.quetzalcoatl--;
+  lowered.snapshot.state.players[0].resources.corn = 3;
+  lowered.observation.pendingTask = null;
+  lowered.observation.legalActions = [];
+  const begDispatch = dispatcher(begInitial, (request) => {
+    if (request.move.type === 'beg') return clone(begged);
+    assert.equal(request.move.choiceId, 'temple:quetzalcoatl');
+    return clone(lowered);
+  });
+  const namedTemple = decode(begging, begDispatch);
+  assert.equal(namedTemple.manifest.blocked, null);
+  assert.equal(namedTemple.record.steps.at(-1).move.choiceId, 'temple:quetzalcoatl');
+  replaceEvents(begging, [
+    [6, [{ raw_text: 'ChaacReaderはQuetzalcoatlの信仰を1段下げることでコーン3個を受け取った' }]],
+  ]);
+  const alternateBeg = decode(begging, begDispatch);
+  assert.equal(alternateBeg.manifest.blocked, null);
+  assert.equal(alternateBeg.record.steps.at(-1).move.choiceId, 'temple:quetzalcoatl');
+  replaceEvents(begging, [
+    [6, [{ raw_text: 'ChaacReaderはChaacとQuetzalcoatlの信仰を1段下げてコーン3個を受け取った' }]],
+  ]);
+  const ambiguousBeg = decode(begging, begDispatch);
+  assert.match(ambiguousBeg.manifest.blocked.reason, /one unambiguous temple/);
+  assert.equal(ambiguousBeg.record.steps.length, 0);
   const paidGain = input();
   replaceEvents(paidGain, [
     [
