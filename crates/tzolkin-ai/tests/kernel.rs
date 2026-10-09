@@ -219,3 +219,103 @@ fn validated_hot_shape_guard_also_runs_in_release() {
         .is_err()
     );
 }
+
+#[test]
+fn unfinished_prefix_continuation_matches_full_dot_bits_with_unaligned_inputs() {
+    // Offsets 0..8 cover all SIMD alignments without adding an alignment requirement.
+    for offset in 0..8 {
+        let mut matrix = vec![0.0; 32 * 512 + offset];
+        let mut vector = vec![0.0; 512 + offset];
+        for (i, value) in matrix[offset..].iter_mut().enumerate() {
+            *value = ((i * 13 % 31) as f32 - 15.0) / 64.0;
+        }
+        for (i, value) in vector[offset..].iter_mut().enumerate() {
+            *value = match i % 19 {
+                0 => -0.0,
+                1 => f32::from_bits(1), // subnormal
+                _ => ((i % 17) as f32 - 8.0) / 17.0,
+            };
+        }
+        let matrix = &matrix[offset..];
+        let vector = &mut vector[offset..];
+        for backend in kernels() {
+            let prefix = backend.policy_prefix_validated(matrix, &vector[..384]);
+            // Repeated suffixes share a prefix but vary the candidate contribution.
+            for shift in [0.0, 0.25, -0.5] {
+                for (i, value) in vector[384..].iter_mut().enumerate() {
+                    *value = (i as f32 - 64.0) / 128.0 + shift;
+                }
+                let mut actual = [0.0; 32];
+                prefix.continue_validated(&vector[384..], &mut actual);
+                let mut expected = [0.0; 32];
+                backend.dot_rows_validated(matrix, vector, &mut expected);
+                assert_eq!(
+                    actual.map(f32::to_bits),
+                    expected.map(f32::to_bits),
+                    "{} offset{offset} shift{shift}",
+                    backend.backend()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn prefix_does_not_reduce_lanes_early_or_hide_nonfinite_final_affine() {
+    for backend in kernels() {
+        // SIMD prefix horizontal sum overflows, but each unreduced lane can
+        // cancel in the suffix. An early reduction would lose this result.
+        let mut matrix = vec![0.0; 32 * 512];
+        let vector = [1.0; 512];
+        for row in matrix.chunks_exact_mut(512) {
+            row[..8].fill(f32::MAX / 4.0);
+            row[384..392].fill(-f32::MAX / 4.0);
+        }
+        let cache = backend.policy_prefix_validated(&matrix, &vector[..384]);
+        let mut expected = [0.0; 32];
+        let mut actual = [0.0; 32];
+        backend.dot_rows_validated(&matrix, &vector, &mut expected);
+        cache.continue_validated(&vector[384..], &mut actual);
+        assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+        if backend.backend() != "scalar" {
+            assert!(actual.iter().all(|v| v.is_finite()));
+        } else {
+            assert!(actual.iter().all(|v| !v.is_finite()));
+        }
+        // Finite operands can overflow inside a lane. Retain that nonfinite
+        // result for the model's full-affine finite check, never tanh it away.
+        matrix.fill(f32::MAX);
+        let vector = [2.0; 512];
+        let cache = backend.policy_prefix_validated(&matrix, &vector[..384]);
+        cache.continue_validated(&vector[384..], &mut actual);
+        assert!(actual.iter().all(|v| !v.is_finite()));
+        backend.dot_rows_validated(&matrix, &vector, &mut expected);
+        assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+    }
+}
+
+#[test]
+fn prefix_shape_guards_hold_before_any_backend_load() {
+    for backend in kernels() {
+        let matrix = vec![0.0; 32 * 512];
+        assert!(
+            std::panic::catch_unwind(
+                || backend.policy_prefix_validated(&matrix[..matrix.len() - 1], &[0.0; 384])
+            )
+            .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| backend.policy_prefix_validated(&matrix, &[0.0; 383]))
+                .is_err()
+        );
+        let cache = backend.policy_prefix_validated(&matrix, &[0.0; 384]);
+        assert!(
+            std::panic::catch_unwind(|| cache.continue_validated(&[0.0; 127], &mut [0.0; 32]))
+                .is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| cache.continue_validated(&[0.0; 128], &mut [0.0; 31]))
+                .is_err()
+        );
+    }
+}

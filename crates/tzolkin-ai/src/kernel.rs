@@ -18,6 +18,31 @@ pub enum Kernel {
 
 type Dot = unsafe fn(&[f32], &[f32]) -> f32;
 type Rows = unsafe fn(&[f32], &[f32], &mut [f32]);
+const PREFIX_COLUMNS: usize = 384;
+const POLICY_COLUMNS: usize = 512;
+const POLICY_ROWS: usize = 32;
+type PrefixState = [[f32; 8]; POLICY_ROWS];
+type PreparePrefix = unsafe fn(&[f32], &[f32], &mut PrefixState);
+type ContinuePrefix = unsafe fn(&[f32], &[f32], &PrefixState, &mut [f32]);
+
+/// One call's unfinished accumulators, bound to its immutable matrix and backend.
+/// No horizontal reduction or bias is performed at the prefix boundary. The
+/// caller validates finite operands; continuation accepts only the 128 suffix
+/// columns so it cannot accidentally substitute another context.
+pub(crate) struct PolicyPrefix<'a> {
+    matrix: &'a [f32],
+    state: PrefixState,
+    continuation: ContinuePrefix,
+}
+impl PolicyPrefix<'_> {
+    pub(crate) fn continue_validated(&self, suffix: &[f32], output: &mut [f32]) {
+        assert_eq!(suffix.len(), POLICY_COLUMNS - PREFIX_COLUMNS);
+        assert_eq!(output.len(), POLICY_ROWS);
+        // SAFETY: construction checked fixed matrix/prefix shape and resolved
+        // CPU support. The checked suffix/output lengths bound every access.
+        unsafe { (self.continuation)(self.matrix, suffix, &self.state, output) }
+    }
+}
 
 /// 実行環境を確認済みのハンドル。内積ごとの CPU 検出や enum 分岐はない。
 #[derive(Clone, Copy, Debug)]
@@ -25,6 +50,8 @@ pub struct ResolvedKernel {
     name: &'static str,
     dot: Dot,
     rows: Rows,
+    prepare_prefix: PreparePrefix,
+    continue_prefix: ContinuePrefix,
 }
 
 impl Kernel {
@@ -46,6 +73,28 @@ impl Kernel {
 }
 
 impl ResolvedKernel {
+    /// Fixed schema-2 hidden layer only. The model boundary has validated finite
+    /// parameters and features. Shapes are checked in release before any load.
+    /// The saved state is deliberately allowed to be non-finite: only the full
+    /// affine result plus bias is subject to the existing finite guard.
+    pub(crate) fn policy_prefix_validated<'a>(
+        self,
+        matrix: &'a [f32],
+        prefix: &[f32],
+    ) -> PolicyPrefix<'a> {
+        assert_eq!(matrix.len(), POLICY_COLUMNS * POLICY_ROWS);
+        assert_eq!(prefix.len(), PREFIX_COLUMNS);
+        let mut state = [[0.0; 8]; POLICY_ROWS];
+        // SAFETY: resolved backend and fixed checked dimensions. Prefix length
+        // is divisible by every supported SIMD width; there is no partial lane.
+        unsafe { (self.prepare_prefix)(matrix, prefix, &mut state) };
+        PolicyPrefix {
+            matrix,
+            state,
+            continuation: self.continue_prefix,
+        }
+    }
+
     /// 実際に使用するバックエンド名。
     pub fn backend(self) -> &'static str {
         self.name
@@ -120,6 +169,8 @@ fn scalar() -> ResolvedKernel {
         name: "scalar",
         dot: dot_scalar,
         rows: rows_scalar,
+        prepare_prefix: prepare_scalar,
+        continue_prefix: continue_scalar,
     }
 }
 
@@ -134,6 +185,8 @@ fn available(requested: Kernel) -> Option<ResolvedKernel> {
                 name: "avx2",
                 dot: x86::dot_avx2,
                 rows: x86::rows_avx2,
+                prepare_prefix: x86::prepare_avx2,
+                continue_prefix: x86::continue_avx2,
             });
         }
         if requested == Kernel::Sse2 && std::is_x86_feature_detected!("sse2") {
@@ -141,6 +194,8 @@ fn available(requested: Kernel) -> Option<ResolvedKernel> {
                 name: "sse2",
                 dot: x86::dot_sse2,
                 rows: x86::rows_sse2,
+                prepare_prefix: x86::prepare_sse2,
+                continue_prefix: x86::continue_sse2,
             });
         }
     }
@@ -150,6 +205,8 @@ fn available(requested: Kernel) -> Option<ResolvedKernel> {
             name: "neon",
             dot: neon::dot_neon,
             rows: neon::rows_neon,
+            prepare_prefix: neon::prepare_neon,
+            continue_prefix: neon::continue_neon,
         });
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -158,6 +215,8 @@ fn available(requested: Kernel) -> Option<ResolvedKernel> {
             name: "simd128",
             dot: wasm::dot_simd128,
             rows: wasm::rows_simd128,
+            prepare_prefix: wasm::prepare_simd128,
+            continue_prefix: wasm::continue_simd128,
         });
     }
     None
@@ -195,6 +254,20 @@ fn rows_scalar(matrix: &[f32], vector: &[f32], output: &mut [f32]) {
     }
 }
 
+fn prepare_scalar(matrix: &[f32], prefix: &[f32], state: &mut PrefixState) {
+    for (row, saved) in matrix.chunks_exact(POLICY_COLUMNS).zip(state) {
+        saved[0] = dot_scalar(&row[..PREFIX_COLUMNS], prefix);
+    }
+}
+fn continue_scalar(matrix: &[f32], suffix: &[f32], state: &PrefixState, output: &mut [f32]) {
+    for ((row, saved), value) in matrix.chunks_exact(POLICY_COLUMNS).zip(state).zip(output) {
+        *value = row[PREFIX_COLUMNS..]
+            .iter()
+            .zip(suffix)
+            .fold(saved[0], |sum, (a, b)| sum + a * b);
+    }
+}
+
 #[cfg(any(
     target_arch = "x86",
     target_arch = "x86_64",
@@ -213,6 +286,68 @@ macro_rules! simd_rows {
                 // SAFETY: 同じ target_feature の backend 内で直接呼ぶ。形状検証済みで
                 // row と vector は同長。output の mutable 借用は入力の借用と重ならない。
                 *value = unsafe { $dot(row, vector) };
+            }
+        }
+    };
+}
+
+#[cfg(any(
+    target_arch = "x86",
+    target_arch = "x86_64",
+    target_arch = "aarch64",
+    all(target_arch = "wasm32", target_feature = "simd128")
+))]
+macro_rules! simd_prefix_rows {
+    ($prepare:ident, $continue:ident, $feature:literal, $width:literal,
+     $zero:expr, $load:ident, $store:ident, $mul:ident, $add:ident) => {
+        #[target_feature(enable = $feature)]
+        pub(super) unsafe fn $prepare(
+            matrix: &[f32],
+            prefix: &[f32],
+            state: &mut super::PrefixState,
+        ) {
+            // SAFETY: the private factory checks 32x512 and prefix384; resolved
+            // feature support is retained by the cache. All loads/stores are
+            // unaligned, full-width, and within their respective slices.
+            unsafe {
+                for (row, saved) in matrix.chunks_exact(super::POLICY_COLUMNS).zip(state) {
+                    let mut sum = $zero;
+                    for index in (0..super::PREFIX_COLUMNS).step_by($width) {
+                        let a = $load(row.as_ptr().add(index));
+                        let b = $load(prefix.as_ptr().add(index));
+                        sum = $add(sum, $mul(a, b));
+                    }
+                    $store(saved.as_mut_ptr(), sum);
+                }
+            }
+        }
+        #[target_feature(enable = $feature)]
+        pub(super) unsafe fn $continue(
+            matrix: &[f32],
+            suffix: &[f32],
+            state: &super::PrefixState,
+            output: &mut [f32],
+        ) {
+            // SAFETY: the cache binds this backend and matrix; continuation
+            // checks suffix128/output32. Lane phase is unchanged at index384.
+            unsafe {
+                for ((row, saved), value) in matrix
+                    .chunks_exact(super::POLICY_COLUMNS)
+                    .zip(state)
+                    .zip(output)
+                {
+                    let mut sum = $load(saved.as_ptr());
+                    for index in (0..super::POLICY_COLUMNS - super::PREFIX_COLUMNS).step_by($width)
+                    {
+                        let a = $load(row.as_ptr().add(super::PREFIX_COLUMNS + index));
+                        let b = $load(suffix.as_ptr().add(index));
+                        sum = $add(sum, $mul(a, b));
+                    }
+                    let mut lanes = [0.0_f32; $width];
+                    $store(lanes.as_mut_ptr(), sum);
+                    // Identical to the existing full-width dot's final reduce.
+                    *value = lanes.into_iter().sum();
+                }
             }
         }
     };
@@ -270,6 +405,28 @@ mod x86 {
 
     simd_rows!(rows_avx2, dot_avx2, "avx2");
     simd_rows!(rows_sse2, dot_sse2, "sse2");
+    simd_prefix_rows!(
+        prepare_avx2,
+        continue_avx2,
+        "avx2",
+        8,
+        _mm256_setzero_ps(),
+        _mm256_loadu_ps,
+        _mm256_storeu_ps,
+        _mm256_mul_ps,
+        _mm256_add_ps
+    );
+    simd_prefix_rows!(
+        prepare_sse2,
+        continue_sse2,
+        "sse2",
+        4,
+        _mm_setzero_ps(),
+        _mm_loadu_ps,
+        _mm_storeu_ps,
+        _mm_mul_ps,
+        _mm_add_ps
+    );
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -298,6 +455,17 @@ mod neon {
         }
     }
     simd_rows!(rows_neon, dot_neon, "neon");
+    simd_prefix_rows!(
+        prepare_neon,
+        continue_neon,
+        "neon",
+        4,
+        vdupq_n_f32(0.0),
+        vld1q_f32,
+        vst1q_f32,
+        vmulq_f32,
+        vaddq_f32
+    );
 }
 
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
@@ -326,4 +494,25 @@ mod wasm {
         }
     }
     simd_rows!(rows_simd128, dot_simd128, "simd128");
+    #[inline]
+    unsafe fn load_f32(pointer: *const f32) -> v128 {
+        // SAFETY: macro callers check a complete four-f32 lane.
+        unsafe { v128_load(pointer.cast()) }
+    }
+    #[inline]
+    unsafe fn store_f32(pointer: *mut f32, value: v128) {
+        // SAFETY: macro callers supply at least four writable f32 values.
+        unsafe { v128_store(pointer.cast(), value) }
+    }
+    simd_prefix_rows!(
+        prepare_simd128,
+        continue_simd128,
+        "simd128",
+        4,
+        f32x4_splat(0.0),
+        load_f32,
+        store_f32,
+        f32x4_mul,
+        f32x4_add
+    );
 }
