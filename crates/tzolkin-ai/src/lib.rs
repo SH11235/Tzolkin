@@ -6,6 +6,7 @@ pub mod features;
 pub mod kernel;
 pub mod model;
 pub mod policy;
+pub mod policy_dataset;
 pub mod public_model;
 pub mod replay;
 pub mod search;
