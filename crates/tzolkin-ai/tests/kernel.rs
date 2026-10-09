@@ -267,7 +267,7 @@ fn prefix_does_not_reduce_lanes_early_or_hide_nonfinite_final_affine() {
         // cancel in the suffix. An early reduction would lose this result.
         let mut matrix = vec![0.0; 32 * 512];
         let vector = [1.0; 512];
-        for row in matrix.chunks_exact_mut(512) {
+        for row in matrix.as_chunks_mut::<512>().0.iter_mut() {
             row[..8].fill(f32::MAX / 4.0);
             row[384..392].fill(-f32::MAX / 4.0);
         }
