@@ -77,6 +77,10 @@ pub enum SeatPolicy {
         policy_version: String,
         weights: HeuristicWeights,
     },
+    CornFirstUxmalOpening {
+        policy_version: String,
+        weights: HeuristicWeights,
+    },
     Learned {
         policy_version: String,
         model_checksum: String,
@@ -154,6 +158,12 @@ impl SeatPolicy {
                 policy_version,
                 weights,
             } if policy_version == crate::setup_policy::POLICY_VERSION => weights.validate(),
+            Self::CornFirstUxmalOpening {
+                policy_version,
+                weights,
+            } if policy_version == crate::setup_policy::UXMAL_OPENING_POLICY_VERSION => {
+                weights.validate()
+            }
             Self::Learned {
                 policy_version,
                 model_checksum,
