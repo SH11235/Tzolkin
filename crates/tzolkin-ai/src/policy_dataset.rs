@@ -401,6 +401,15 @@ fn source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
     replay::verify_replay(&record)?;
     Ok((bytes, record))
 }
+// State-MC consumes the same closed native source boundary without changing it.
+pub(crate) fn read_state_native_source(
+    path: &Path,
+    index: usize,
+) -> Result<(Vec<u8>, GameReplay, PolicyDatasetGame), String> {
+    let (bytes, record) = source(path)?;
+    let metadata = game_metadata(index, &bytes, &record)?;
+    Ok((bytes, record, metadata))
+}
 fn expected_sample(
     state: &GameState,
     step: &ReplayStep,
