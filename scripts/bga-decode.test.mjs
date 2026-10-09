@@ -494,6 +494,90 @@ test('draw identities are supplied only to the operation that actually requires 
   assert.deepEqual(result.record.steps[0].refills.currentAge, ['b04']);
   assert.equal(result.manifest.blocked, null);
   assert.equal(inspections, 4); // failed dry probes and final independent replay
+  const opening = clone(saved.core.initialFrame);
+  opening.observation.legalActions = [
+    {
+      action: { type: 'place', gear: 'palenque', cornCost: 0, discount: false },
+      move: { type: 'place', gear: 'palenque' },
+    },
+  ];
+  const placed = clone(saved.core.afterFrame);
+  placed.observation.legalActions = clone(initial.observation.legalActions);
+  const handoff = clone(placed);
+  handoff.snapshot.state.currentPlayer = 1;
+  handoff.observation.legalActions = [];
+  let endTurns = 0;
+  const openingDispatch = dispatcher(opening, (request) => {
+    if (request.move.type === 'place') return clone(placed);
+    assert.equal(request.move.type, 'endTurn');
+    endTurns++;
+    return clone(handoff);
+  });
+  const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
+  const announceA = { raw_text: 'Aがこのラウンドのスタートプレイヤーです' };
+  const announceB = { raw_text: 'Bがこのラウンドのスタートプレイヤーです' };
+  const announced = input();
+  replaceEvents(announced, [
+    [6, [placement]],
+    [7, [announceA]],
+  ]);
+  const noExtraTurn = decode(announced, openingDispatch);
+  assert.equal(noExtraTurn.manifest.blocked, null);
+  assert.equal(noExtraTurn.record.steps.length, 1);
+  assert.deepEqual(noExtraTurn.record.steps[0].move, { type: 'place', gear: 'palenque' });
+  assert.equal(endTurns, 0);
+  replaceEvents(announced, [
+    [6, [placement, announceA]],
+    [7, [announceA]],
+  ]);
+  const duplicateInitial = decode(announced, openingDispatch);
+  assert.equal(duplicateInitial.manifest.blocked.actionId, 7);
+  assert.match(duplicateInitial.manifest.blocked.reason, /known initial round/);
+  assert.equal(duplicateInitial.record.steps.length, 1);
+  assert.equal(endTurns, 0);
+  const beforePlacement = opening.snapshot.state;
+  replaceEvents(announced, [
+    [6, [placement, announceA]],
+    [7, [{ raw_text: 'Aは行動をキャンセルした' }]],
+    [8, [announceA]],
+  ]);
+  announced.witness.witnesses = [
+    {
+      actionId: 7,
+      expected: {
+        round: beforePlacement.round,
+        gears: clone(beforePlacement.gears),
+        players: beforePlacement.players.map((player) => ({
+          resources: clone(player.resources),
+          workers: player.workers,
+        })),
+      },
+      pendingTask: null,
+    },
+  ];
+  const restoredAnnouncement = decode(announced, openingDispatch);
+  assert.equal(restoredAnnouncement.manifest.blocked, null);
+  assert.equal(restoredAnnouncement.record.steps.length, 0);
+  assert.equal(restoredAnnouncement.manifest.audit.find((row) => row.cancellation).removedSteps, 1);
+  const future = input();
+  const claimedOpening = clone(opening);
+  claimedOpening.snapshot.state.firstPlayerClaimed = 1;
+  future.witness.initial = clone(claimedOpening.snapshot.state);
+  replaceEvents(future, [[6, [announceB]]]);
+  const unestablishedFuture = decode(
+    future,
+    dispatcher(claimedOpening, () => assert.fail('An announcement cannot create an operation')),
+  );
+  assert.match(unestablishedFuture.manifest.blocked.reason, /known initial round/);
+  assert.equal(unestablishedFuture.record.steps.length, 0);
+  const ordinaryTurn = input();
+  replaceEvents(ordinaryTurn, [[6, [{ raw_text: '歯車が進んだ' }]]]);
+  const ordinaryHandoff = decode(
+    ordinaryTurn,
+    dispatcher(initial, () => clone(handoff)),
+  );
+  assert.match(ordinaryHandoff.manifest.blocked.reason, /no completed or pending core rotation/);
+  assert.equal(ordinaryHandoff.record.steps.length, 0);
   const fedInitial = clone(initial);
   Object.assign(fedInitial.snapshot.state.players[0], {
     workers: 3,
@@ -597,6 +681,7 @@ test('draw identities are supplied only to the operation that actually requires 
   ];
   const advanced = clone(rotating);
   advanced.snapshot.state.round += 2;
+  advanced.snapshot.state.firstPlayer = 1;
   advanced.snapshot.state.firstPlayerClaimed = null;
   advanced.observation.pendingTask = null;
   advanced.observation.legalActions = [];
@@ -612,6 +697,145 @@ test('draw identities are supplied only to the operation that actually requires 
     decode(double, doubleDispatch).manifest.blocked.reason,
     /double advancement actor differs/,
   );
+  const rotationMessages = [
+    { raw_text: 'Aは歯車を高速化し2段階回した!' },
+    { raw_text: '歯車が進んだ' },
+  ];
+  const lastTurn = clone(initial);
+  lastTurn.snapshot.state.currentPlayer = 3;
+  lastTurn.snapshot.state.firstPlayerClaimed = 0;
+  const pendingBoundary = input();
+  pendingBoundary.witness.initial = clone(lastTurn.snapshot.state);
+  replaceEvents(pendingBoundary, [[6, rotationMessages]]);
+  const establishedBoundary = decode(
+    pendingBoundary,
+    dispatcher(lastTurn, (request) => clone(request.move.type === 'endTurn' ? rotating : advanced)),
+  );
+  assert.equal(establishedBoundary.manifest.blocked, null);
+  assert.equal(establishedBoundary.record.steps.length, 2);
+  const payoutInitial = clone(initial);
+  Object.assign(payoutInitial.snapshot.state, {
+    round: 3,
+    currentPlayer: 1,
+    firstPlayerClaimed: 1,
+    accumulatedCorn: 2,
+  });
+  const paid = clone(payoutInitial);
+  paid.snapshot.state.currentPlayer = 2;
+  paid.snapshot.state.accumulatedCorn = 0;
+  paid.snapshot.state.players[1].resources.corn += 2;
+  paid.observation.legalActions = clone(opening.observation.legalActions);
+  const placedLast = clone(paid);
+  placedLast.snapshot.state.gears = clone(placed.snapshot.state.gears);
+  for (const worker of Object.values(placedLast.snapshot.state.gears).flat())
+    if (worker && !worker.dummy) worker.playerId = 2;
+  placedLast.observation.legalActions = clone(initial.observation.legalActions);
+  const payoutRotation = clone(placedLast);
+  payoutRotation.snapshot.state.currentPlayer = 1;
+  payoutRotation.observation.pendingTask = { type: 'rotation' };
+  payoutRotation.observation.legalActions = clone(rotating.observation.legalActions);
+  const payout = {
+    raw_text: 'Bは2\nを歯車から獲得した',
+    icons: [{ classes: 'tz_icon resource_corn' }],
+  };
+  const lastPlacement = { raw_text: 'CはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
+  const payoutInput = (messages, repeated = false) => {
+    const next = input();
+    next.witness.initial = clone(payoutInitial.snapshot.state);
+    replaceEvents(next, [
+      [6, [lastPlacement]],
+      [7, messages],
+      ...(repeated ? [[8, messages]] : []),
+    ]);
+    return next;
+  };
+  const payoutDispatch = (boundary) =>
+    dispatcher(payoutInitial, (request) => {
+      if (request.move.type === 'endTurn')
+        return clone(request.state.currentPlayer === 1 ? paid : boundary);
+      assert.deepEqual(request.move, { type: 'place', gear: 'palenque' });
+      return clone(placedLast);
+    });
+  const pairedPayout = decode(payoutInput([payout, announceB]), payoutDispatch(payoutRotation));
+  assert.equal(pairedPayout.manifest.blocked, null);
+  assert.equal(pairedPayout.record.steps.length, 3);
+  assert.equal(pairedPayout.manifest.pendingCalendarAnnouncement.actor, 1);
+  const nonfinal = clone(placedLast);
+  nonfinal.snapshot.state.currentPlayer = 3;
+  nonfinal.observation.legalActions = [];
+  const prematurePayout = decode(payoutInput([payout, announceB]), payoutDispatch(nonfinal));
+  assert.match(prematurePayout.manifest.blocked.reason, /no completed or pending core rotation/);
+  assert.equal(prematurePayout.record.steps.length, 2);
+  for (const messages of [
+    [{ ...payout, raw_text: 'Bは3\nを歯車から獲得した' }, announceB],
+    [{ ...payout, icons: [{ classes: 'tz_icon resource_wood' }] }, announceB],
+    [{ ...payout, raw_text: 'Aは2\nを歯車から獲得した' }, announceB],
+    [payout, announceA],
+    [payout, payout, announceB],
+    [payout, announceB, announceB],
+    [{ ...payout, raw_text: 'Bは2\nを歯車より獲得した' }, announceB],
+  ]) {
+    const invalidPayout = decode(payoutInput(messages), payoutDispatch(payoutRotation));
+    assert.equal(invalidPayout.manifest.blocked.actionId, 7);
+    assert.equal(invalidPayout.record.steps.length, 2);
+  }
+  const repeatedPayout = decode(
+    payoutInput([payout, announceB], true),
+    payoutDispatch(payoutRotation),
+  );
+  assert.equal(repeatedPayout.manifest.blocked.actionId, 8);
+  assert.equal(repeatedPayout.record.steps.length, 3);
+  replaceEvents(double, [
+    [6, [announceB]],
+    [7, rotationMessages],
+  ]);
+  const pendingAnnouncement = decode(double, doubleDispatch);
+  assert.equal(pendingAnnouncement.manifest.blocked, null);
+  assert.equal(pendingAnnouncement.record.steps.length, 1);
+  assert.equal(pendingAnnouncement.manifest.pendingCalendarAnnouncement, null);
+  replaceEvents(double, [[6, [announceA]]]);
+  const wrongPendingActor = decode(double, doubleDispatch);
+  assert.match(wrongPendingActor.manifest.blocked.reason, /pending core rotation/);
+  assert.equal(wrongPendingActor.record.steps.length, 0);
+  replaceEvents(double, [
+    [6, [announceB]],
+    [7, [announceB]],
+  ]);
+  const duplicatePending = decode(double, doubleDispatch);
+  assert.equal(duplicatePending.manifest.blocked.actionId, 7);
+  assert.equal(duplicatePending.record.steps.length, 0);
+  assert.equal(duplicatePending.manifest.pendingCalendarAnnouncement.actionId, 6);
+  replaceEvents(double, [
+    [6, rotationMessages],
+    [7, [announceB]],
+  ]);
+  const currentReceipt = decode(double, doubleDispatch);
+  assert.equal(currentReceipt.manifest.blocked, null);
+  assert.equal(currentReceipt.record.steps.length, 1);
+  replaceEvents(double, [
+    [6, rotationMessages],
+    [7, [announceB]],
+    [8, [announceB]],
+  ]);
+  const duplicateReceipt = decode(double, doubleDispatch);
+  assert.equal(duplicateReceipt.manifest.blocked.actionId, 8);
+  assert.match(duplicateReceipt.manifest.blocked.reason, /current core rotation receipt/);
+  assert.equal(duplicateReceipt.record.steps.length, 1);
+  replaceEvents(double, [
+    [6, rotationMessages],
+    [7, [announceA]],
+  ]);
+  const wrongReceiptActor = decode(double, doubleDispatch);
+  assert.match(wrongReceiptActor.manifest.blocked.reason, /current core rotation receipt/);
+  assert.equal(wrongReceiptActor.record.steps.length, 1);
+  replaceEvents(double, [
+    [6, [announceB]],
+    [7, rotationMessages],
+    [8, [announceB]],
+  ]);
+  const duplicateConfirmed = decode(double, doubleDispatch);
+  assert.equal(duplicateConfirmed.manifest.blocked.actionId, 8);
+  assert.equal(duplicateConfirmed.record.steps.length, 1);
 });
 
 test('keeps automatic payments distinct from typed theology offerings and temple spellings', () => {

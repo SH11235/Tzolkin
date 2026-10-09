@@ -74,6 +74,12 @@ function resourceAmounts(event) {
   for (const resource of icons) values[RESOURCES.indexOf(resource)] += amount ?? 1;
   return values;
 }
+function accumulatedCornPayout(event) {
+  if (event.kind !== 'unparsed' || event.actor === null) return null;
+  const match = event.rawText.slice(event.actor.length).match(/^は(\d+)\s*を歯車から獲得した$/);
+  const amount = match ? Number(match[1]) : null;
+  return Number.isSafeInteger(amount) ? amount : null;
+}
 function paymentOf(events) {
   const result = RESOURCES.map(() => 0);
   for (const event of events.filter((item) => item.kind === 'resourcePayment'))
@@ -228,7 +234,17 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     fail('Initial/source players differ');
   let rotationCredit = 0;
   let declaredRotation = null;
-  let calendarEvidence = { corn: null, rotation: null, feeding: [], announcement: null };
+  let calendarEvidence = {
+    corn: null,
+    rotation: null,
+    feeding: [],
+    initialAnnouncement: {
+      actor: frame.snapshot.state.firstPlayer,
+      round: frame.snapshot.state.round,
+      consumed: false,
+    },
+    announcement: null,
+  };
   let history = [
     { frame: copy(frame), steps: 0, rotationCredit, declaredRotation, calendarEvidence },
   ];
@@ -268,7 +284,10 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
         after.players[actor].resources.corn - before.players[actor].resources.corn < amount
       )
         fail('Accumulated corn gain is not separable from this core transition');
-      calendarEvidence = { ...calendarEvidence, corn: { actor, amount, consumed: false } };
+      calendarEvidence = {
+        ...calendarEvidence,
+        corn: { actor, amount, round: before.round, consumed: false },
+      };
     }
     if (after.round > before.round || (before.phase !== 'finished' && after.phase === 'finished')) {
       const claimed = before.firstPlayerClaimed;
@@ -281,13 +300,26 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
           after.players[claimed].workers !== before.players[claimed].workers)
       )
         fail('First-player worker return is not established by this core rotation');
-      const announcement = calendarEvidence.announcement;
-      if (announcement && !announcement.confirmed && announcement.actor !== after.firstPlayer)
+      const announcement =
+        calendarEvidence.announcement?.confirmed === false ? calendarEvidence.announcement : null;
+      if (
+        announcement &&
+        (announcement.actor !== after.firstPlayer || announcement.round !== before.round)
+      )
         fail('First-player announcement disagrees with the completed core rotation');
       calendarEvidence = {
         ...calendarEvidence,
-        rotation: { actor: claimed, firstPlayer: after.firstPlayer, returned, consumed: false },
-        announcement: announcement ? { ...announcement, confirmed: true } : null,
+        rotation: {
+          actor: claimed,
+          firstPlayer: after.firstPlayer,
+          round: after.round,
+          returned,
+          consumed: false,
+          announcementConsumed: announcement !== null,
+        },
+        announcement: announcement
+          ? { ...announcement, round: after.round, confirmed: true }
+          : null,
       };
     }
     const feeding = [];
@@ -445,6 +477,15 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
         chosen.frame.snapshot.state.phase !== previous.phase)
     )
       fail('Derived actor boundary requires an observed calendar transition');
+    if (
+      derived &&
+      visibleCalendar &&
+      chosen.row.action.type === 'endTurn' &&
+      chosen.frame.snapshot.state.round === previous.round &&
+      chosen.frame.snapshot.state.phase === previous.phase &&
+      (pending() === 'rotation' || chosen.frame.observation?.pendingTask?.type !== 'rotation')
+    )
+      fail('Calendar boundary has no completed or pending core rotation');
     const feeding = calendarTransition(previous, chosen.frame.snapshot.state, chosen.row.action);
     if (feeding.length) {
       context.feeding.push(...feeding);
@@ -721,13 +762,11 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
           firstOperation >= 0 &&
           events
             .slice(firstOperation + 1)
-            .some((event) =>
-              ['gearAdvanced', 'feeding', 'firstPlayer', 'doubleAdvance'].includes(event.kind),
-            )
+            .some((event) => ['gearAdvanced', 'feeding', 'doubleAdvance'].includes(event.kind))
         )
           fail('Actor operation precedes a calendar message in the same source');
         const startsCalendar = events.some((event) =>
-          ['gearAdvanced', 'feeding', 'firstPlayer'].includes(event.kind),
+          ['gearAdvanced', 'feeding'].includes(event.kind),
         );
         const doubleEvents = events.filter((event) => event.kind === 'doubleAdvance');
         const double = doubleEvents.length > 0;
@@ -738,7 +777,42 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
             actorId(doubleEvents[0].actor) !== state().firstPlayerClaimed)
         )
           fail('Observed double advancement actor differs from the core claimer');
-        if (startsCalendar || double) calendar();
+        const payouts = events.filter((event) => accumulatedCornPayout(event) !== null);
+        const announcements = events.filter((event) => event.kind === 'firstPlayer');
+        let payoutBoundary = false;
+        if (
+          !startsCalendar &&
+          !double &&
+          pending() === null &&
+          payouts.length &&
+          announcements.length
+        ) {
+          const receipt = calendarEvidence.corn;
+          const claimed = state().firstPlayerClaimed;
+          const future = claimed === state().firstPlayer ? (claimed + 1) % names.length : claimed;
+          if (
+            events.length !== 2 ||
+            payouts.length !== 1 ||
+            announcements.length !== 1 ||
+            !receipt ||
+            receipt.consumed ||
+            receipt.round !== state().round ||
+            claimed === null ||
+            receipt.actor !== claimed ||
+            receipt.actor !== future ||
+            future === state().firstPlayer ||
+            actorId(payouts[0].actor) !== receipt.actor ||
+            actorId(announcements[0].actor) !== receipt.actor ||
+            accumulatedCornPayout(payouts[0]) !== receipt.amount ||
+            !same(payouts[0].iconResources, ['corn']) ||
+            announcements[0].iconResources.length ||
+            announcements[0].rawText !==
+              `${announcements[0].actor}がこのラウンドのスタートプレイヤーです`
+          )
+            fail('Corn/first-player boundary has no matching unconsumed core payout receipt');
+          payoutBoundary = true;
+        }
+        if (startsCalendar || double || payoutBoundary) calendar();
         if (double) {
           choose(
             (action) => action.type === 'rotate' && action.days === 2,
@@ -759,17 +833,41 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
           else if (event.kind === 'firstPlayer') {
             const actor = actorId(event.actor);
             const claimed = state().firstPlayerClaimed;
-            const predicted =
-              pending() === 'rotation' && claimed !== null
-                ? claimed === state().firstPlayer
-                  ? (claimed + 1) % names.length
-                  : claimed
-                : state().firstPlayer;
-            if (actor < 0 || actor !== predicted)
-              fail('First-player announcement disagrees with the public calendar');
+            const rotation = calendarEvidence.rotation;
+            const initial = calendarEvidence.initialAnnouncement;
+            if (actor < 0) fail('First-player announcement disagrees with the public calendar');
+            if (pending() === 'rotation') {
+              const predicted =
+                claimed === state().firstPlayer ? (claimed + 1) % names.length : claimed;
+              if (
+                claimed === null ||
+                actor !== predicted ||
+                calendarEvidence.announcement?.confirmed === false
+              )
+                fail('First-player announcement disagrees with the pending core rotation');
+            } else if (rotation && rotation.round === state().round) {
+              if (actor !== rotation.firstPlayer || rotation.announcementConsumed)
+                fail('First-player announcement disagrees with the current core rotation receipt');
+              calendarEvidence = {
+                ...calendarEvidence,
+                rotation: { ...rotation, announcementConsumed: true },
+              };
+            } else {
+              if (actor !== initial.actor || state().round !== initial.round || initial.consumed)
+                fail('First-player announcement disagrees with the known initial round');
+              calendarEvidence = {
+                ...calendarEvidence,
+                initialAnnouncement: { ...initial, consumed: true },
+              };
+            }
             calendarEvidence = {
               ...calendarEvidence,
-              announcement: { actor, actionId: id, confirmed: pending() !== 'rotation' },
+              announcement: {
+                actor,
+                round: state().round,
+                actionId: id,
+                confirmed: pending() !== 'rotation',
+              },
             };
             syncHistory();
           } else if (event.kind === 'gameEnd') {
@@ -979,8 +1077,8 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
                 fail('Worker return has no matching actor/claimed-worker core receipt');
               calendarEvidence = { ...calendarEvidence, rotation: { ...receipt, consumed: true } };
               syncHistory();
-            } else if (/は\d+\s*を歯車から獲得した$/.test(event.rawText)) {
-              const amount = Number(event.rawText.match(/は(\d+)\s*を歯車から獲得した$/)[1]);
+            } else if (accumulatedCornPayout(event) !== null) {
+              const amount = accumulatedCornPayout(event);
               const receipt = calendarEvidence.corn;
               if (
                 !receipt ||
