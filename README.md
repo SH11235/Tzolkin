@@ -46,6 +46,15 @@ npm run tauri build
 
 公開盤面と有効操作を復元した JSON は、対局画面の「リプレイ」で検証して閲覧できます。局面ごとの CPU 候補も確認できます。
 
+確率的な自己対戦の収集と監査には専用 CLI を使います。公開 V2 policy の資格検査に使う checkpoint と dataset を指定してください。
+
+```sh
+cargo run --locked --release -p tzolkin-ai --bin tzolkin-public-stochastic -- collect-native --checkpoint CHECKPOINT.json --dataset DATASET --players 3 --environment-seed 17 --sampling-seed 7 --episode-ordinal 0 --replicate-ordinal 0 --output NEW.stochastic.json
+cargo run --locked --release -p tzolkin-ai --bin tzolkin-public-stochastic -- audit-record --checkpoint CHECKPOINT.json --dataset DATASET --input NEW.stochastic.json
+```
+
+基本ルールの3〜4人戦を Scalar 推論で収集します。既存の出力は上書きしません。収集の終了コードは完走・保存成功が0、未完走の記録を保存した場合が2、コマンド失敗が1です。監査の終了コード0は未完走記録にも使うため、JSON の `collectionComplete` を併せて確認してください。モデル準備と対局処理の時間は別に報告します。上限などは `--help` で確認できます。この専用形式は対局画面のリプレイや既存の学習データ形式とは別です。
+
 ## 検証
 
 ```sh
