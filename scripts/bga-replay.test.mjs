@@ -5,7 +5,12 @@ import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
-import { auditReconstruction, exportReconstruction } from './bga-replay.mjs';
+import {
+  auditReconstruction,
+  catalogFingerprint,
+  exportReconstruction,
+  revalidateRecord,
+} from './bga-replay.mjs';
 
 const saved = JSON.parse(
   await readFile(new URL('./fixtures/bga-reconstruction-small.json', import.meta.url)),
@@ -60,6 +65,103 @@ function audit(input, dispatch = fixtureDispatcher(input)) {
     dispatch,
   );
 }
+
+test('revalidates unchanged public moves only across unused starting-tile corrections', async () => {
+  const current = JSON.parse(
+    await readFile(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+  );
+  const previous = structuredClone(current);
+  previous.STARTING_WEALTH.find((tile) => tile.id === 'w05').resources = {};
+  const oldBytes = Buffer.from(JSON.stringify(previous));
+  const newBytes = Buffer.from(JSON.stringify(current));
+  const input = fixture();
+  input.companion.record.catalogHash = catalogFingerprint(oldBytes);
+  const original = Buffer.from(JSON.stringify(input.companion.record));
+  const result = revalidateRecord(original, oldBytes, newBytes, fixtureDispatcher(input));
+  assert.deepEqual(result.record, {
+    ...input.companion.record,
+    catalogHash: catalogFingerprint(newBytes),
+  });
+  assert.deepEqual(result.manifest.changedUnusedStartingTiles, ['w05']);
+  assert.equal(result.manifest.originalRecordSha256, sha256(original));
+  assert.equal(result.manifest.recordSha256, sha256(JSON.stringify(result.record)));
+  assert.equal(result.manifest.strictExporterAccepted, false);
+  assert.equal(result.manifest.trainingReady, false);
+  assert.equal(result.manifest.mechanicallyFinished, false);
+  assert.throws(
+    () => revalidateRecord(original, newBytes, newBytes, fixtureDispatcher(input)),
+    /Previous catalog/,
+  );
+  for (const change of [
+    (catalog) => {
+      catalog.STARTING_WEALTH.find((tile) => tile.id === 'w14').resources.corn++;
+    },
+    (catalog) => {
+      catalog.STARTING_WEALTH.find((tile) => tile.id === 'w05').position++;
+    },
+    (catalog) => {
+      catalog.BUILDINGS[0].cost.wood = (catalog.BUILDINGS[0].cost.wood ?? 0) + 1;
+    },
+  ]) {
+    const changed = structuredClone(current);
+    change(changed);
+    assert.throws(
+      () =>
+        revalidateRecord(
+          original,
+          oldBytes,
+          Buffer.from(JSON.stringify(changed)),
+          fixtureDispatcher(input),
+        ),
+      /Catalog change/,
+    );
+  }
+  assert.throws(
+    () =>
+      revalidateRecord(original, oldBytes, newBytes, () => {
+        throw new Error('step 0 observed mismatch');
+      }),
+    /step 0 observed mismatch/,
+  );
+});
+
+test('terminal display-only source stays partial and requires a finished core comparison', () => {
+  const input = fixture();
+  input.raw.entries.pop(); // Remove the future entry beyond the source boundary.
+  input.raw.dom_entries.pop();
+  input.raw.entry_count = input.raw.entries.length;
+  const terminal = input.raw.entries.at(-1);
+  terminal.raw_text += '\nゲーム終了';
+  input.raw.dom_entries
+    .find((entry) => entry.action_id === terminal.action_id)
+    .messages.push({
+      raw_text: 'ゲーム終了',
+      html: 'ゲーム終了',
+      icons: [],
+    });
+  const names = input.companion.record.initial.players.map((player) => player.name);
+  input.raw.metadata.history_text = names.map((name) => `1位\n${name}\n0 `).join('\n');
+  input.companion.rawSha256 = sha256(Buffer.from(JSON.stringify(input.raw)));
+  input.companion.coverage.push({ actionId: 9, messageIndex: 1, kind: 'terminal' });
+  input.companion.record.terminalDisplayCheckpoint = {
+    source: { reference: input.companion.record.source.reference, actionIds: [9] },
+    mode: 'floorTotal',
+    scores: names.map((_, playerId) => ({ playerId, total: 0, rank: 1 })),
+  };
+  input.core.afterFrame.snapshot.state.phase = 'finished';
+  input.core.finalReport.frames[1] = structuredClone(input.core.afterFrame);
+  input.core.finalReport.terminalDisplayComparison = { mode: 'floorTotal' };
+  const result = audit(input);
+  assert.equal(result.manifest.status, 'partial');
+  assert.equal(result.manifest.mechanicallyFinished, true);
+  assert.equal(result.manifest.verifiedComplete, false);
+  assert.equal(result.manifest.terminalMatched, false);
+  assert.equal(result.manifest.trainingReady, false);
+  delete input.core.finalReport.terminalDisplayComparison;
+  assert.throws(() => audit(input), /Core replay status/);
+  delete input.companion.record.terminalDisplayCheckpoint;
+  assert.throws(() => audit(input), /Invalid terminal coverage/);
+});
 
 test('exports only the effective suffix after explicit rollback and witnessed no-op', () => {
   const input = fixture();
