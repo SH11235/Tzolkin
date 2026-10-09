@@ -376,14 +376,16 @@ fn local_path(path: &Path, kind: PathKind) -> Result<PathBuf, String> {
             if !matches!(prefix.kind(), std::path::Prefix::Disk(_)) {
                 return Err("Device/UNC/verbatim path rejected".into());
             }
-        } else if let Component::Normal(name) = part {
-            if name.to_string_lossy().contains(':') {
-                return Err("Alternate stream/device path rejected".into());
-            }
-            #[cfg(windows)]
-            if windows_component_rejected(&name.to_string_lossy()) {
-                return Err("Windows reserved device/ambiguous component rejected".into());
-            }
+        } else if let Component::Normal(name) = part
+            && name.to_string_lossy().contains(':')
+        {
+            return Err("Alternate stream/device path rejected".into());
+        }
+        #[cfg(windows)]
+        if let Component::Normal(name) = part
+            && windows_component_rejected(&name.to_string_lossy())
+        {
+            return Err("Windows reserved device/ambiguous component rejected".into());
         }
     }
     local_drive(&absolute)?;

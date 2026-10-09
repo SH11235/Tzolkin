@@ -1,18 +1,21 @@
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tzolkin_ai::{arena, replay, search, search_native};
 use tzolkin_core::{GameOptions, Phase, observation::observe};
 
 struct Temporary(std::path::PathBuf);
 impl Temporary {
     fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "tzolkin-search-cli-{}-{}",
+            "tzolkin-search-cli-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         Self(path)
