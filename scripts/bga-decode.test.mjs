@@ -461,6 +461,181 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
   const duplicateGain = decode(selectedResources, resourceDispatch);
   assert.match(duplicateGain.manifest.blocked.reason, /resource:wood=2/);
   assert.equal(duplicateGain.record.steps.length, 0);
+  const caption = { raw_text: '収集技術ボーナス: Aは好きな資源2個を得た' };
+  const technology = { raw_text: 'Aは収集を1レベル進めた' };
+  const payment = { raw_text: 'Aは\nを支払った', icons: [{ classes: 'tz_icon resource_wood' }] };
+  const material = (resource, amount = 1, actor = 'A') => ({
+    raw_text: `${actor}は${amount}\nを獲得した`,
+    icons: [{ classes: `tz_icon resource_${resource}` }],
+  });
+  const bonusFixture = ({ free = false, level = 3, doubledGain = false } = {}) => {
+    const start = clone(initial);
+    start.snapshot.state.players[0].technologies.extraction = level;
+    start.observation.pendingTask.free = free;
+    const requested = clone(selected);
+    requested.snapshot.state.players[0].technologies.extraction = Math.min(3, level + 1);
+    const grant = clone(requested);
+    if (!free) grant.snapshot.state.players[0].resources.wood--;
+    grant.observation.pendingTask = level === 3 ? { type: 'resource', remaining: 2 } : null;
+    grant.observation.legalActions =
+      level === 3
+        ? ['wood', 'stone', 'gold'].map((resource) => ({
+            action: { type: 'resource', resource },
+            move: { type: 'choose', choiceId: `resource:${resource}` },
+          }))
+        : [];
+    const apply = (request) => {
+      if (request.move.choiceId === 'tech:extraction') return clone(free ? grant : requested);
+      if (request.move.choiceId === 'pay:0') return clone(grant);
+      const resource = request.move.choiceId.split(':')[1];
+      assert.ok(['wood', 'stone', 'gold'].includes(resource));
+      const next = clone(grant);
+      next.snapshot.state = clone(request.state);
+      next.snapshot.state.players[0].resources[resource] += doubledGain ? 2 : 1;
+      const selectedCount = ['wood', 'stone', 'gold'].reduce(
+        (sum, item) =>
+          sum +
+          next.snapshot.state.players[0].resources[item] -
+          grant.snapshot.state.players[0].resources[item],
+        0,
+      );
+      next.observation.pendingTask = selectedCount < 2 ? { type: 'resource', remaining: 1 } : null;
+      if (selectedCount >= 2) next.observation.legalActions = [];
+      return next;
+    };
+    const make = (rows) => {
+      const next = input();
+      next.witness.initial = clone(start.snapshot.state);
+      replaceEvents(next, rows);
+      return next;
+    };
+    return { start, grant, make, dispatch: dispatcher(start, apply) };
+  };
+  const paidBonus = bonusFixture();
+  const bonusOpening = [payment, technology, caption];
+  for (const [free, rows] of [
+    [false, [[6, [...bonusOpening, material('wood', 2)]]]],
+    [true, [[6, [technology, caption, material('wood', 2)]]]],
+    [true, [[6, [technology, material('wood', 2), caption]]]],
+    [
+      false,
+      [
+        [6, bonusOpening],
+        [7, [material('wood')]],
+        [8, [material('stone')]],
+      ],
+    ],
+  ]) {
+    const fixture = bonusFixture({ free });
+    const completedBonus = decode(fixture.make(rows), fixture.dispatch);
+    assert.equal(completedBonus.manifest.blocked, null);
+    assert.equal(completedBonus.manifest.extractionRewardReceipt.remaining, 0);
+    assert.equal(completedBonus.manifest.extractionRewardReceipt.captionActionId, 6);
+    assert.equal(completedBonus.manifest.extractionRewardReceipt.materials.length, 2);
+  }
+  for (const rows of [
+    [[6, bonusOpening]],
+    [
+      [6, bonusOpening],
+      [7, [material('wood')]],
+    ],
+  ]) {
+    const pendingBonus = decode(paidBonus.make(rows), paidBonus.dispatch);
+    assert.equal(pendingBonus.manifest.blocked, null);
+    assert.equal(
+      pendingBonus.manifest.extractionRewardReceipt.remaining,
+      rows.length === 1 ? 2 : 1,
+    );
+  }
+  for (const wrongCaption of [
+    { raw_text: '収集技術ボーナス: Bは好きな資源2個を得た' },
+    { raw_text: '収集技術ボーナス: Aは好きな資源3個を得た' },
+    { ...caption, icons: [{ classes: 'tz_icon resource_wood' }] },
+  ]) {
+    const invalidCaption = decode(
+      paidBonus.make([[6, [payment, technology, wrongCaption]]]),
+      paidBonus.dispatch,
+    );
+    assert.match(invalidCaption.manifest.blocked.reason, /Extraction caption/);
+    assert.equal(invalidCaption.record.steps.length, 0);
+    assert.equal(invalidCaption.manifest.extractionRewardReceipt, null);
+  }
+  const noBonus = bonusFixture({ free: true, level: 2 });
+  assert.equal(
+    decode(noBonus.make([[6, [technology, caption]]]), noBonus.dispatch).record.steps.length,
+    0,
+  );
+  const unrelated = input();
+  unrelated.witness.initial = clone(resourceInitial.snapshot.state);
+  replaceEvents(unrelated, [[6, [caption]]]);
+  assert.match(decode(unrelated, resourceDispatch).manifest.blocked.reason, /Extraction caption/);
+  for (const rows of [
+    [[6, [...bonusOpening, caption]]],
+    [
+      [6, bonusOpening],
+      [7, [material('corn', 2)]],
+    ],
+    [
+      [6, bonusOpening],
+      [7, [material('wood', 2, 'B')]],
+    ],
+    [
+      [6, bonusOpening],
+      [7, [material('wood', 2), material('wood', 2)]],
+    ],
+  ]) {
+    const invalidBonus = decode(paidBonus.make(rows), paidBonus.dispatch);
+    assert.notEqual(invalidBonus.manifest.blocked, null);
+    assert.equal(invalidBonus.record.steps.length, rows.length === 1 ? 0 : 2);
+  }
+  const badGain = bonusFixture({ doubledGain: true });
+  const inflated = decode(
+    badGain.make([
+      [6, bonusOpening],
+      [7, [material('wood')]],
+    ]),
+    badGain.dispatch,
+  );
+  assert.match(inflated.manifest.blocked.reason, /exact matching core material gain/);
+  assert.equal(inflated.manifest.extractionRewardReceipt.remaining, 2);
+  const failedBonus = decode(
+    paidBonus.make([
+      [6, [payment, technology]],
+      [7, [caption, material('wood'), { raw_text: 'unknown reward continuation' }]],
+    ]),
+    paidBonus.dispatch,
+  );
+  assert.equal(failedBonus.record.steps.length, 2);
+  assert.equal(failedBonus.manifest.extractionRewardReceipt.remaining, 2);
+  assert.equal(failedBonus.manifest.extractionRewardReceipt.captionActionId, null);
+  assert.deepEqual(failedBonus.manifest.extractionRewardReceipt.materials, []);
+  const cancelledBonus = paidBonus.make([
+    [6, bonusOpening],
+    [7, [material('wood')]],
+    [8, [{ raw_text: 'Aは行動をキャンセルした' }]],
+    [9, [material('wood', 2)]],
+  ]);
+  const grantState = paidBonus.grant.snapshot.state;
+  cancelledBonus.witness.witnesses = [
+    {
+      actionId: 8,
+      pendingTask: 'resource',
+      expected: {
+        round: grantState.round,
+        gears: clone(grantState.gears),
+        players: grantState.players.map((player) => ({
+          resources: clone(player.resources),
+          workers: player.workers,
+        })),
+      },
+    },
+  ];
+  const restoredBonus = decode(cancelledBonus, paidBonus.dispatch);
+  assert.equal(restoredBonus.manifest.blocked, null);
+  assert.equal(restoredBonus.record.steps.length, 4);
+  assert.equal(restoredBonus.manifest.audit.find((row) => row.cancellation).removedSteps, 1);
+  assert.equal(restoredBonus.manifest.extractionRewardReceipt.remaining, 0);
+  assert.deepEqual(restoredBonus.manifest.extractionRewardReceipt.materials, ['wood', 'wood']);
   value.witness.witnesses = [{ actionId: 6, refills: { age2: ['b15'] } }];
   const future = decode(value, dispatch);
   assert.equal(future.record.steps.length, 0);

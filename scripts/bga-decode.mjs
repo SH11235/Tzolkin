@@ -234,6 +234,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     fail('Initial/source players differ');
   let rotationCredit = 0;
   let declaredRotation = null;
+  let extractionReward = null;
   let calendarEvidence = {
     corn: null,
     rotation: null,
@@ -246,7 +247,14 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     announcement: null,
   };
   let history = [
-    { frame: copy(frame), steps: 0, rotationCredit, declaredRotation, calendarEvidence },
+    {
+      frame: copy(frame),
+      steps: 0,
+      rotationCredit,
+      declaredRotation,
+      calendarEvidence,
+      extractionReward,
+    },
   ];
   const audit = [];
   let context;
@@ -256,7 +264,96 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
   const pending = () => frame.observation?.pendingTask?.type ?? null;
 
   function syncHistory() {
-    Object.assign(history.at(-1), { rotationCredit, declaredRotation, calendarEvidence });
+    Object.assign(history.at(-1), {
+      rotationCredit,
+      declaredRotation,
+      calendarEvidence,
+      extractionReward,
+    });
+  }
+  function extractionTransition(nextFrame, action) {
+    const before = state();
+    const after = nextFrame.snapshot.state;
+    const task = frame.observation.pendingTask;
+    const nextTask = nextFrame.observation.pendingTask;
+    const actor = before.currentPlayer;
+    const opens =
+      before.players[actor].technologies.extraction === 3 &&
+      ((action.type === 'technology' &&
+        action.technology === 'extraction' &&
+        task?.type === 'technology' &&
+        task.free === true) ||
+        (action.type === 'payment' &&
+          task?.type === 'payTechnology' &&
+          task.technology === 'extraction')) &&
+      nextTask?.type === 'resource' &&
+      nextTask.remaining === 2;
+    if (extractionReward?.remaining > 0) {
+      if (
+        opens ||
+        action.type !== 'resource' ||
+        actor !== extractionReward.actor ||
+        before.round !== extractionReward.round ||
+        task?.type !== 'resource' ||
+        task.remaining !== extractionReward.remaining ||
+        !['wood', 'stone', 'gold'].includes(action.resource) ||
+        after.currentPlayer !== actor ||
+        after.round !== before.round ||
+        RESOURCES.some(
+          (resource) =>
+            after.players[actor].resources[resource] - before.players[actor].resources[resource] !==
+            Number(resource === action.resource),
+        ) ||
+        (extractionReward.remaining > 1 &&
+          (nextTask?.type !== 'resource' || nextTask.remaining !== extractionReward.remaining - 1))
+      )
+        fail('Extraction reward choice has no exact matching core material gain');
+      extractionReward = {
+        ...extractionReward,
+        remaining: extractionReward.remaining - 1,
+        materials: [...extractionReward.materials, action.resource],
+      };
+    } else {
+      extractionReward = null;
+      if (opens) {
+        if (
+          after.currentPlayer !== actor ||
+          after.round !== before.round ||
+          after.players[actor].technologies.extraction !== 3
+        )
+          fail('Extraction reward origin has no matching actor/core task');
+        extractionReward = {
+          actor,
+          round: before.round,
+          originActionId: context.id,
+          remaining: 2,
+          materials: [],
+          captionActionId: null,
+        };
+      }
+    }
+  }
+  function extractionCaption(event) {
+    const actors = names.filter(
+      (name) => event.rawText === `収集技術ボーナス: ${name}は好きな資源2個を得た`,
+    );
+    if (
+      event.actor !== null ||
+      event.iconResources.length ||
+      actors.length !== 1 ||
+      !extractionReward ||
+      extractionReward.actor !== actorId(actors[0]) ||
+      state().currentPlayer !== extractionReward.actor ||
+      state().round !== extractionReward.round ||
+      extractionReward.captionActionId !== null ||
+      (extractionReward.remaining !== 0 && extractionReward.remaining !== 2) ||
+      (extractionReward.remaining === 2 &&
+        (pending() !== 'resource' || frame.observation.pendingTask.remaining !== 2)) ||
+      (extractionReward.remaining === 0 && pending() === 'resource')
+    )
+      fail('Extraction caption has no unique unconsumed core reward receipt');
+    extractionReward = { ...extractionReward, captionActionId: context.id };
+    syncHistory();
   }
   function available(publicState, playerId) {
     return (
@@ -486,6 +583,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       (pending() === 'rotation' || chosen.frame.observation?.pendingTask?.type !== 'rotation')
     )
       fail('Calendar boundary has no completed or pending core rotation');
+    extractionTransition(chosen.frame, chosen.row.action);
     const feeding = calendarTransition(previous, chosen.frame.snapshot.state, chosen.row.action);
     if (feeding.length) {
       context.feeding.push(...feeding);
@@ -545,6 +643,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       rotationCredit,
       declaredRotation,
       calendarEvidence,
+      extractionReward,
     });
     audit.push({
       actionId: context.id,
@@ -666,10 +765,12 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       historyLastCredit: history.at(-1).rotationCredit,
       historyLastDeclaration: history.at(-1).declaredRotation,
       historyLastEvidence: history.at(-1).calendarEvidence,
+      historyLastReward: history.at(-1).extractionReward,
       audit: audit.length,
       rotationCredit,
       declaredRotation,
       calendarEvidence,
+      extractionReward,
     };
     context = {
       id,
@@ -730,6 +831,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
         rotationCredit = selected.rotationCredit;
         declaredRotation = selected.declaredRotation;
         calendarEvidence = selected.calendarEvidence;
+        extractionReward = selected.extractionReward;
         audit.push({
           actionId: id,
           cancellation: true,
@@ -1046,6 +1148,8 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
               alignActor(event.actor);
               const kind = harvest[1] === 'コーン' ? 'corn' : harvest[1];
               choose((action) => action.type === 'harvest' && action.kind === kind, 'harvest');
+            } else if (event.rawText.startsWith('収集技術ボーナス: ')) {
+              extractionCaption(event);
             } else if (event.rawText.startsWith('世代中間報酬: ')) {
               if (
                 event.actor !== null ||
@@ -1123,10 +1227,12 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       history.at(-1).rotationCredit = saved.historyLastCredit;
       history.at(-1).declaredRotation = saved.historyLastDeclaration;
       history.at(-1).calendarEvidence = saved.historyLastEvidence;
+      history.at(-1).extractionReward = saved.historyLastReward;
       audit.length = saved.audit;
       rotationCredit = saved.rotationCredit;
       declaredRotation = saved.declaredRotation;
       calendarEvidence = saved.calendarEvidence;
+      extractionReward = saved.extractionReward;
       blocked = { actionId: id, kinds: events.map((event) => event.kind), reason: error.message };
       break;
     }
@@ -1172,6 +1278,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       audit,
       pendingCalendarAnnouncement:
         calendarEvidence.announcement?.confirmed === false ? calendarEvidence.announcement : null,
+      extractionRewardReceipt: extractionReward,
     },
   };
 }
