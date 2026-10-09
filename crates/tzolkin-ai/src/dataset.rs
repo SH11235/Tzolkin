@@ -345,6 +345,11 @@ fn export_sources<'a>(
                     return Err("Selfplay policy/seat count mismatch".into());
                 }
                 for policy in policies {
+                    if matches!(policy, replay::SeatPolicy::PublicLearnedTradeGuard { .. }) {
+                        return Err(
+                            "Guarded public learned source admission is not implemented".into()
+                        );
+                    }
                     policy.validate()?;
                 }
                 // The complete replay keeps explicit per-seat model SHA, heuristic,

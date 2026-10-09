@@ -7,7 +7,8 @@ use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::policy_dataset::{ValidatedPolicyDataset, load_policy_dataset};
 use crate::policy_training::{PolicyTrainingCheckpoint, validate_checkpoint_dataset};
-use crate::public_model::{LoadedPublicPolicy, PublicPolicyArtifact};
+use crate::public_model::{LoadedPublicPolicy, PublicPolicyArtifact, PublicPolicyDistribution};
+use crate::public_trade_guard::{self, PublicLearnedSource, TradeGuardConfig, TradeGuardSession};
 use crate::replay::{self, GameReplay, ReplaySource, SeatPolicy};
 use tzolkin_core::observation::Observation;
 use tzolkin_core::{GameOptions, GameState};
@@ -99,6 +100,12 @@ impl PublicPolicyHandle<'_> {
     pub fn choose_move(&self, observation: &Observation) -> Result<Decision, String> {
         self.loaded.choose_move(observation)
     }
+    pub(crate) fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<PublicPolicyDistribution, String> {
+        self.loaded.distribution(observation)
+    }
 }
 
 pub fn parse_kernel(value: &str) -> Result<Kernel, String> {
@@ -163,6 +170,71 @@ pub fn play_game(
                 policy.choose_move(observation)
             } else {
                 crate::choose_move(observation)
+            }
+        },
+    )?;
+    if let Some(record) = &result.2 {
+        replay::verify_replay(record)?;
+    }
+    Ok(result)
+}
+
+/// Opt-in composite algorithm, with one fresh session and all-seat notifications.
+/// Source consistency is audited; neither this metadata nor replay traces authenticate a producer.
+pub fn play_game_guarded(
+    policy: &PublicPolicyHandle<'_>,
+    players: usize,
+    seed: u32,
+    options: GameOptions,
+    seats: &[usize],
+    record: bool,
+    guard: TradeGuardConfig,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    validate_seats(players, &options, seats)?;
+    let base = PublicLearnedSource::from_pure(policy.provenance())?;
+    let configuration_key = guard.configuration_key()?;
+    let provenance = SeatPolicy::PublicLearnedTradeGuard {
+        policy_version: public_trade_guard::POLICY_VERSION.into(),
+        base,
+        guard: guard.clone(),
+        configuration_key,
+    };
+    provenance.validate()?;
+    let policies = (0..players)
+        .map(|seat| {
+            if seats.contains(&seat) {
+                provenance.clone()
+            } else {
+                crate::experiment::heuristic_seat()
+            }
+        })
+        .collect();
+    let mut sessions = (0..players)
+        .map(|seat| {
+            if seats.contains(&seat) {
+                TradeGuardSession::new(guard.clone()).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = replay::play_game_using_trade_guard(
+        players,
+        seed,
+        options,
+        record,
+        ReplaySource::PolicySelfPlay { policies },
+        true,
+        |index, observation| {
+            for session in sessions.iter_mut().flatten() {
+                session.on_callback(index, observation)?;
+            }
+            if let Some(session) = sessions.get_mut(observation.actor).and_then(Option::as_mut) {
+                session.choose_with_distribution(index, observation, || {
+                    policy.distribution(observation)
+                })
+            } else {
+                Ok((crate::choose_move(observation)?, None))
             }
         },
     )?;

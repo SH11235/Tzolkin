@@ -1,4 +1,7 @@
 //! Versioned, validated replay and corpus tools. Training shards are a separate future layer.
+use crate::public_trade_guard::{
+    PublicLearnedSource, TradeGuardConfig, TradeGuardSession, TradeGuardTrace,
+};
 use crate::search::{SEARCH_POLICY_VERSION, SearchConfig};
 use crate::search_native::SearchTrace;
 use crate::{POLICY_VERSION, choose_move, policy::HeuristicWeights};
@@ -42,6 +45,12 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    PublicLearnedTradeGuard {
+        policy_version: String,
+        base: PublicLearnedSource,
+        guard: TradeGuardConfig,
+        configuration_key: String,
+    },
     PublicLearned {
         policy_version: String,
         model_version: String,
@@ -75,6 +84,19 @@ pub enum SeatPolicy {
 impl SeatPolicy {
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PublicLearnedTradeGuard {
+                policy_version,
+                base,
+                guard,
+                configuration_key,
+            } => {
+                if policy_version != crate::public_trade_guard::POLICY_VERSION
+                    || *configuration_key != guard.configuration_key()?
+                {
+                    return Err("Unsupported guarded public learned provenance".into());
+                }
+                base.pure_policy().validate()
+            }
             Self::PublicLearned {
                 policy_version,
                 model_version,
@@ -171,6 +193,8 @@ pub struct ReplayStep {
     pub validated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<SearchTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trade_guard: Option<TradeGuardTrace>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -259,7 +283,7 @@ pub fn play_game_using(
         options,
         record,
         source,
-        |o| Ok((decide(o)?, None)),
+        |o| Ok((decide(o)?, None, None)),
         true,
     )
 }
@@ -298,7 +322,7 @@ pub fn play_game_using_fast(
         options,
         record,
         source,
-        |o| Ok((decide(o)?, None)),
+        |o| Ok((decide(o)?, None, None)),
         false,
     )
 }
@@ -310,9 +334,105 @@ pub fn play_game_using_diagnostics(
     record: bool,
     source: ReplaySource,
     fast: bool,
-    decide: impl FnMut(&Observation) -> Result<(crate::Decision, Option<SearchTrace>), String>,
+    mut decide: impl FnMut(&Observation) -> Result<(crate::Decision, Option<SearchTrace>), String>,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
-    play_game_internal(players, seed, options, record, source, decide, !fast)
+    play_game_internal(
+        players,
+        seed,
+        options,
+        record,
+        source,
+        |o| {
+            let (decision, search) = decide(o)?;
+            Ok((decision, search, None))
+        },
+        !fast,
+    )
+}
+
+/// Additive guarded runner. Callback indices include every seat and every phase.
+pub fn play_game_using_trade_guard(
+    players: usize,
+    seed: u32,
+    options: GameOptions,
+    record: bool,
+    source: ReplaySource,
+    fast: bool,
+    mut decide: impl FnMut(
+        usize,
+        &Observation,
+    ) -> Result<(crate::Decision, Option<TradeGuardTrace>), String>,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    let mut index = 0;
+    play_game_internal(
+        players,
+        seed,
+        options,
+        record,
+        source,
+        |o| {
+            let (decision, guard) = decide(index, o)?;
+            index += 1;
+            Ok((decision, None, guard))
+        },
+        !fast,
+    )
+}
+
+struct GuardReplay {
+    sessions: Vec<Option<TradeGuardSession>>,
+}
+impl GuardReplay {
+    fn new(source: &ReplaySource) -> Result<Self, String> {
+        let sessions = match source {
+            ReplaySource::PolicySelfPlay { policies } => policies
+                .iter()
+                .map(|policy| match policy {
+                    SeatPolicy::PublicLearnedTradeGuard { guard, .. } => {
+                        TradeGuardSession::new(guard.clone()).map(Some)
+                    }
+                    _ => Ok(None),
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => Vec::new(),
+        };
+        Ok(Self { sessions })
+    }
+    fn check(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        chosen: &LegalAction,
+        trace: &Option<TradeGuardTrace>,
+        decision: Option<&crate::Decision>,
+    ) -> Result<(), String> {
+        for session in self.sessions.iter_mut().flatten() {
+            session.on_callback(index, o)?;
+        }
+        let session = self.sessions.get_mut(o.actor).and_then(Option::as_mut);
+        if let Some(session) = session {
+            if decision.is_some_and(|d| {
+                d.policy_version != crate::public_trade_guard::POLICY_VERSION
+                    || !d.score.is_finite()
+            }) {
+                return Err("Guarded decision policy version/finite score mismatch".into());
+            }
+            if crate::public_trade_guard::is_trade_observation(o) {
+                let trace = trace
+                    .as_ref()
+                    .ok_or("Missing public Trade guard diagnostics")?;
+                session.verify_trace(index, o, chosen, trace)?;
+                if decision.is_some_and(|d| d.score != f64::from(trace.effective.logit)) {
+                    return Err("Guarded decision/effective logit mismatch".into());
+                }
+                return Ok(());
+            }
+        }
+        if trace.is_some() {
+            return Err("Public Trade guard diagnostics on a non-guarded Trade callback".into());
+        }
+        Ok(())
+    }
 }
 
 fn validate_search_trace(
@@ -344,7 +464,16 @@ fn play_game_internal(
     mut options: GameOptions,
     record: bool,
     source: ReplaySource,
-    mut decide: impl FnMut(&Observation) -> Result<(crate::Decision, Option<SearchTrace>), String>,
+    mut decide: impl FnMut(
+        &Observation,
+    ) -> Result<
+        (
+            crate::Decision,
+            Option<SearchTrace>,
+            Option<TradeGuardTrace>,
+        ),
+        String,
+    >,
     check_every_step: bool,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
     if !(2..=5).contains(&players) {
@@ -371,6 +500,13 @@ fn play_game_internal(
         {
             return Err("Public learned provenance requires base 3..4p".into());
         }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::PublicLearnedTradeGuard { .. }))
+            && (!(3..=4).contains(&players) || options != GameOptions::default())
+        {
+            return Err("Guarded public learned provenance requires base 3..4p".into());
+        }
     }
     if players == 5 {
         options.quick_actions = true;
@@ -382,6 +518,7 @@ fn play_game_internal(
     check_state(&state)?;
     let mut steps = Vec::new();
     let mut decisions = 0;
+    let mut guard_replay = GuardReplay::new(&source)?;
     while state.phase != Phase::Finished {
         if decisions >= MAX_DECISIONS {
             return Err(format!(
@@ -389,7 +526,7 @@ fn play_game_internal(
             ));
         }
         let observation = observe(&state, state.current_player)?;
-        let (decision, search) = decide(&observation)?;
+        let (decision, search, trade_guard) = decide(&observation)?;
         validate_search_trace(&source, &observation, &search)?;
         if search.as_ref().is_some_and(|trace| {
             decision.policy_version != trace.policy_version || decision.score != trace.score
@@ -407,6 +544,13 @@ fn play_game_internal(
             .find(|a| a.r#move == decision.r#move)
             .cloned()
             .ok_or("Policy returned a non-legal action")?;
+        guard_replay.check(
+            decisions,
+            &observation,
+            &chosen,
+            &trade_guard,
+            Some(&decision),
+        )?;
         let before = if record {
             state_key(&state)?
         } else {
@@ -427,6 +571,7 @@ fn play_game_internal(
                 state_after: state_key(&state)?,
                 validated: true,
                 search,
+                trade_guard,
             });
         }
         decisions += 1;
@@ -499,9 +644,17 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
         {
             return Err("Public learned provenance requires base 3..4p".into());
         }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::PublicLearnedTradeGuard { .. }))
+            && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
+        {
+            return Err("Guarded public learned provenance requires base 3..4p".into());
+        }
     }
     let mut state = create_game_with_options(h.names.clone(), h.seed, h.options.clone())?;
     check_state(&state)?;
+    let mut guard_replay = GuardReplay::new(&h.source)?;
     for (index, step) in replay.steps.iter().enumerate() {
         if state.phase == Phase::Finished {
             return Err("Replay contains operations after the game ended".into());
@@ -520,6 +673,7 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
                 "Replay observation/actor/legal/state mismatch at step {index}"
             ));
         }
+        guard_replay.check(index, &observation, &step.chosen, &step.trade_guard, None)?;
         state = apply_move(&state, step.chosen.r#move.clone())?;
         check_state(&state)?;
         if step.state_after != state_key(&state)? {
