@@ -9,7 +9,7 @@ pub fn dispatch_game(request: &str) -> Result<String, JsError> {
 /// Choose only from a redacted observation, in a browser Web Worker or native Wasm host.
 #[wasm_bindgen]
 pub fn dispatch_cpu(observation: &str) -> Result<String, JsError> {
-    tzolkin_ai::dispatch_cpu(observation).map_err(|error| JsError::new(&error))
+    tzolkin_bot::dispatch_cpu(observation).map_err(|error| JsError::new(&error))
 }
 
 /// Rule fixtures can isolate mechanics without constructing a complete saved game.

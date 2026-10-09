@@ -1,6 +1,12 @@
 [workspace]
-members = ["crates/tzolkin-core", "crates/tzolkin-ai", "crates/tzolkin-wasm", "src-tauri"]
-default-members = ["crates/tzolkin-core", "crates/tzolkin-ai"]
+members = [
+  "crates/tzolkin-core",
+  "crates/tzolkin-bot",
+  "crates/tzolkin-ai",
+  "crates/tzolkin-wasm",
+  "src-tauri",
+]
+default-members = ["crates/tzolkin-core", "crates/tzolkin-bot", "crates/tzolkin-ai"]
 resolver = "3"
 
 [profile.release]

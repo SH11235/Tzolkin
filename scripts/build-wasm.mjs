@@ -81,7 +81,7 @@ build('web', join(root, 'generated/wasm'), false);
 if (process.argv.includes('--test')) {
   build('nodejs', join(root, 'generated/wasm-node'), true);
   run('cargo', ['build', '--locked', '-p', 'tzolkin-core', '--example', 'dispatch']);
-  run('cargo', ['build', '--locked', '-p', 'tzolkin-ai', '--bin', 'tzolkin-ai']);
+  run('cargo', ['build', '--locked', '-p', 'tzolkin-bot', '--bin', 'tzolkin-bot']);
 }
 if (!existsSync(join(root, 'generated/wasm/tzolkin_wasm_bg.wasm'))) {
   throw new Error('The WebAssembly build did not produce its browser asset.');

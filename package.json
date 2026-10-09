@@ -25,7 +25,7 @@
     "pretest": "node scripts/build-wasm.mjs --test",
     "pretest:watch": "node scripts/build-wasm.mjs --test",
     "pretest:e2e": "node scripts/build-wasm.mjs --test",
-    "test:core": "cargo test --locked -p tzolkin-core -p tzolkin-ai",
+    "test:core": "cargo test --locked -p tzolkin-core -p tzolkin-bot -p tzolkin-ai",
     "test:bga": "node --test scripts/bga-import.test.mjs scripts/bga-replay.test.mjs scripts/bga-qualify.test.mjs",
     "bga:import": "node scripts/bga-import.mjs",
     "bga:compare": "node scripts/bga-compare.mjs",
@@ -34,7 +34,7 @@
     "test:e2e:full": "playwright test",
     "pretest:e2e:long": "node scripts/build-wasm.mjs --test",
     "pretest:e2e:full": "node scripts/build-wasm.mjs --test",
-    "test:core:full": "cargo test --locked -p tzolkin-core -p tzolkin-ai -- --include-ignored",
+    "test:core:full": "cargo test --locked -p tzolkin-core -p tzolkin-bot -p tzolkin-ai -- --include-ignored",
     "test:ml:slow": "cargo test --locked -p tzolkin-ai -- --ignored"
   },
   "dependencies": {
