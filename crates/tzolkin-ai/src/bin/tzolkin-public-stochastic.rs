@@ -762,16 +762,16 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod test_temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
+        ));
+    }
     struct Temp(PathBuf);
     impl Temp {
         fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "tzolkin-stochastic-cli-unit-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
+            let path = test_temp_root::create("tzolkin-stochastic-cli-unit").unwrap();
             Self(path)
         }
     }

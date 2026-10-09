@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 use tzolkin_ai::dataset::{self, DatasetSplit};
 use tzolkin_ai::features::{FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
 use tzolkin_ai::policy::HeuristicWeights;
@@ -19,13 +20,7 @@ type Mutation = Box<dyn Fn(&mut Value)>;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "tzolkin-public-dataset-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
+        let path = test_temp_root::create("tzolkin-public-dataset").unwrap();
         Self(path)
     }
     fn source(&self, name: &str, record: &GameReplay) -> PathBuf {

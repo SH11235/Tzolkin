@@ -754,6 +754,12 @@ pub(crate) fn audit_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod test_temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
+        ));
+    }
     use crate::public_native::integration_fixture;
     use crate::public_stochastic::SamplingSeed;
     use crate::public_stochastic_record::{audit_record_bytes, encode_record};
@@ -1028,14 +1034,7 @@ mod tests {
         reject_legacy_exports(&encode_record(&game).unwrap());
     }
     fn reject_legacy_exports(bytes: &[u8]) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static SERIAL: AtomicUsize = AtomicUsize::new(0);
-        let directory = std::env::temp_dir().join(format!(
-            "tzolkin-a8b-export-reject-{}-{}",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&directory).unwrap();
+        let directory = test_temp_root::create("tzolkin-a8b-export-reject").unwrap();
         let source = directory.join("stochastic.json");
         std::fs::write(&source, bytes).unwrap();
         let policy_output = directory.join("policy");

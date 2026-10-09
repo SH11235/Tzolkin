@@ -2,11 +2,12 @@ use std::fs;
 use std::process::Command;
 use tzolkin_ai::{dataset::load_dataset, replay};
 use tzolkin_core::GameOptions;
+#[path = "support/temp_root.rs"]
+mod test_temp_root;
 
 #[test]
 fn dataset_cli_exports_native_replays_and_refuses_partial_or_existing_outputs() {
-    let root = std::env::temp_dir().join(format!("tzolkin-dataset-cli-{}", std::process::id()));
-    fs::create_dir(&root).unwrap();
+    let root = test_temp_root::create("tzolkin-dataset-cli").unwrap();
     let source = root.join("source");
     fs::create_dir(&source).unwrap();
     let (_, decisions, native) = replay::play_game(3, 11235, GameOptions::default(), true).unwrap();

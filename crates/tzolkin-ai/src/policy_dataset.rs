@@ -1054,16 +1054,14 @@ pub fn load_policy_dataset(directory: &Path) -> Result<ValidatedPolicyDataset, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    fn directory() -> PathBuf {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "tzolkin-policy-publication-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
+    mod test_temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
         ));
-        fs::create_dir(&path).unwrap();
-        path
+    }
+    fn directory() -> PathBuf {
+        test_temp_root::create("tzolkin-policy-publication").unwrap()
     }
     #[test]
     fn source_changed_on_second_pass_leaves_no_completion_marker() {
