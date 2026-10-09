@@ -7,5 +7,11 @@ resolver = "3"
 lto = true
 codegen-units = 1
 
+# Tests need optimized code to finish in reasonable time. Level 1 halves the
+# build of the workspace crates compared with level 2 and costs about a tenth
+# in run time; dependencies are built once and cached, so they use level 3.
 [profile.test]
-opt-level = 2
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 3
