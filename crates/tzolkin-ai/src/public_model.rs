@@ -20,9 +20,9 @@ pub const INPUT_CONTRACT: &str = "base-3-4p-native-setup-public-playing-v2";
 pub const HIDDEN: usize = 32;
 pub const PARAMETER_COUNT: usize = FEATURE_COUNT * HIDDEN + HIDDEN + HIDDEN + 1;
 pub const MAX_OBSERVATION_BYTES: usize = 16 * 1024 * 1024;
-const B1: usize = FEATURE_COUNT * HIDDEN;
-const WP: usize = B1 + HIDDEN;
-const BP: usize = WP + HIDDEN;
+pub(crate) const B1: usize = FEATURE_COUNT * HIDDEN;
+pub(crate) const WP: usize = B1 + HIDDEN;
+pub(crate) const BP: usize = WP + HIDDEN;
 const MAX_FEATURE_ABS: f32 = 1024.0;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -152,6 +152,12 @@ impl PublicPolicyArtifact {
         Ok(digest(
             &serde_json::to_vec(&payload).map_err(|error| error.to_string())?,
         ))
+    }
+    /// Training's private boundary after finite parameter updates; not a raw public constructor.
+    pub(crate) fn reseal(&mut self) -> Result<(), String> {
+        self.model.validate()?;
+        self.checksum = self.expected_checksum()?;
+        self.validate()
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != MODEL_SCHEMA
