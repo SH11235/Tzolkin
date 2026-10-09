@@ -23,7 +23,7 @@ const increment = (counts, key) => {
 };
 
 // Only explicit text patterns are interpreted. Raw text and icon classes remain the evidence.
-export function parseMessage(message, players) {
+export function parseMessage(message, players, { englishTerminal = false } = {}) {
   const raw = message.raw_text;
   const actor =
     [...players]
@@ -44,7 +44,7 @@ export function parseMessage(message, players) {
   else if (raw === '歯車が進んだ') result.kind = 'gearAdvanced';
   else if (
     raw === 'ゲーム終了' ||
-    players.some((player) => raw === `End of game : ${player} wins!`)
+    (englishTerminal && players.some((player) => raw === `End of game : ${player} wins!`))
   )
     result.kind = 'gameEnd';
   else if (actor && text === 'は新しいワーカーを獲得した') result.kind = 'workerGain';
@@ -259,6 +259,7 @@ function publicUiDomView(raw, tableEvidenceBytes) {
   let terminationText = raw.metadata.historyRowText ?? null;
   if (terminationText != null && typeof terminationText !== 'string')
     throw new Error('Invalid current UI history row text');
+  terminationText = terminationText?.trim() || null;
   if (tableEvidenceBytes != null) {
     if (!Buffer.isBuffer(tableEvidenceBytes)) throw new Error('Expected raw table evidence bytes');
     const table = JSON.parse(tableEvidenceBytes);
@@ -272,7 +273,8 @@ function publicUiDomView(raw, tableEvidenceBytes) {
     tableEvidence = { reference: table.url, sha256: hash(tableEvidenceBytes) };
     if (table.resultText != null) {
       if (typeof table.resultText !== 'string') throw new Error('Invalid visible result text');
-      terminationText = [terminationText, table.resultText].filter(Boolean).join('\n') || null;
+      terminationText =
+        [terminationText, table.resultText.trim()].filter(Boolean).join('\n') || null;
     }
   }
   return {
@@ -307,7 +309,7 @@ export function normalizeGame(original, sourceSha256, tableEvidenceBytes = null)
   for (let i = 0; i < raw.entries.length; i++) {
     const entry = raw.entries[i];
     for (const [messageIndex, message] of raw.dom_entries[i].messages.entries()) {
-      const parsed = parseMessage(message, players);
+      const parsed = parseMessage(message, players, { englishTerminal: !!adapted });
       events.push({
         actionId: entry.action_id,
         messageIndex,
@@ -321,11 +323,20 @@ export function normalizeGame(original, sourceSha256, tableEvidenceBytes = null)
   }
   const cancellationCount = events.filter((e) => e.kind === 'cancellation').length;
   const terminationText = adapted ? adapted.terminationText : raw.metadata.history_text;
-  const status = terminationText?.includes('放棄されたテーブル')
+  const abandoned =
+    terminationText?.includes('放棄されたテーブル') ||
+    (adapted &&
+      /^\s*(?:Abandoned table|Table (?:was )?abandoned)\s*$/im.test(terminationText ?? ''));
+  const forfeit =
+    terminationText?.includes('投了') ||
+    (adapted && /^\s*(?:Conceded|Game conceded)\s*$/im.test(terminationText ?? ''));
+  const normalEndEvidence =
+    !adapted || /^\s*(?:ゲーム終了|Game ended|Game finished)\s*$/im.test(terminationText ?? '');
+  const status = abandoned
     ? 'abandoned'
-    : terminationText?.includes('投了')
+    : forfeit
       ? 'forfeit'
-      : adapted && !terminationText
+      : !normalEndEvidence
         ? 'unknown'
         : events.some((event) => event.kind === 'gameEnd') ||
             raw.entries.some((entry) => entry.raw_text.split('\n').includes('ゲーム終了'))

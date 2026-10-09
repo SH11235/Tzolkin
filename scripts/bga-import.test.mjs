@@ -122,6 +122,23 @@ test('adapts current public DOM wire without replacing original entries or inven
   assert.equal(unknown.context.marketOption, null);
   assert.equal(unknown.quality.status, 'unknown');
   assert.equal(unknown.quality.terminalLogObserved, true);
+  for (const text of [' ', 'unrelated visible text']) {
+    const table = JSON.parse(currentTable());
+    table.resultText = text;
+    table.resultHtml = '放棄されたテーブル';
+    assert.equal(
+      normalizeGame(raw, 'checksum', Buffer.from(JSON.stringify(table))).quality.status,
+      'unknown',
+    );
+  }
+  const legacy = fixture();
+  legacy.entries[0].raw_text = 'End of game : A wins!';
+  legacy.dom_entries[0].messages[0].raw_text = legacy.entries[0].raw_text;
+  const legacyGame = normalizeGame(legacy, 'checksum');
+  assert.equal(legacyGame.events[0].kind, 'unparsed');
+  assert.equal(legacyGame.quality.status, 'unknown');
+  legacy.metadata.history_text = legacy.metadata.history_text.replace('120 ', '-3 ');
+  assert.equal(normalizeGame(legacy, 'checksum').resultsDisplay[0].scoreDisplay, -3);
   const negative = currentFixture();
   negative.metadata.players[0].score = '-3 ';
   assert.equal(
@@ -131,6 +148,8 @@ test('adapts current public DOM wire without replacing original entries or inven
   for (const [marker, expected] of [
     ['放棄されたテーブル', 'abandoned'],
     ['投了', 'forfeit'],
+    ['Abandoned table', 'abandoned'],
+    ['Game conceded', 'forfeit'],
   ]) {
     const table = JSON.parse(currentTable());
     table.resultText = marker;
