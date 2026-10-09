@@ -15,7 +15,7 @@ const metadata = JSON.parse(
 const native = join(
   metadata.target_directory,
   'debug',
-  `tzolkin-ai${process.platform === 'win32' ? '.exe' : ''}`,
+  `tzolkin-bot${process.platform === 'win32' ? '.exe' : ''}`,
 );
 
 describe('production CPU Wasm and native parity', () => {

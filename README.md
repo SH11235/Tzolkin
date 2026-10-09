@@ -70,6 +70,12 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 npm run tauri build -- --no-bundle
 ```
 
+`npm run test:core` は [cargo-nextest](https://nexte.st/) でテストバイナリを並列に実行します。初回に次のコマンドで導入してください。doctest は nextest の対象外なので、同じスクリプトが続けて `cargo test --doc` を実行します。
+
+```sh
+cargo install cargo-nextest --locked --version 0.9.148
+```
+
 ルールの回帰テストは Rust コアを Node 向け Wasm で呼び出します。さらに、保存した 6 対局・1,740 操作の参照データに対し、ネイティブ Rust と本番用 Wasm の状態・選択肢・配置費用を各操作で比較します。拡張のテストでは全 13 部族の能力、ダミーワーカー、クイックアクション、予言を確認し、プレイヤー数と拡張の組み合わせごとに本番 API を使って終局まで進めます。既存の保存 JSON `version: 1` は引き続き読み込めます。部族・予言・クイックアクションを使う対局は `version: 2` で保存します。検証を省略するテスト用の Wasm API は本番ビルドに含めません。
 
 TypeScript は ESLint の解析器が公式に対応する最新安定版を使用します。依存関係は npm と Cargo の lockfile で固定しています。
@@ -77,7 +83,8 @@ TypeScript は ESLint の解析器が公式に対応する最新安定版を使�
 ## 構成
 
 - `crates/tzolkin-core/`: Tauri・ブラウザに依存しないゲーム状態、ルール、合法手、得点計算、保存データ検証。
-- `crates/tzolkin-ai/`: 判断者の観測情報を使う policy、検証済みデータ生成、policy/value 学習、native CLI。
+- `crates/tzolkin-bot/`: アプリの CPU が使うヒューリスティック policy。判断者の観測情報だけを入力にする。
+- `crates/tzolkin-ai/`: 実験用の検証済みデータ生成、policy/value 学習、探索、Arena、native CLI。
 - `crates/tzolkin-core/data/catalog.json`: 出版社の資料と照合した共通カタログ。Rust のルール処理と UI が同じデータを参照。
 - `crates/tzolkin-wasm/`: ブラウザ用の Wasm 接続部分。
 - `src/game/engine.ts`: Wasm／Tauri を選ぶ非同期接続部分。ゲームのルール処理は Rust に委譲。
