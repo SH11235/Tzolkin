@@ -42,6 +42,19 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    PublicLearned {
+        policy_version: String,
+        model_version: String,
+        training_version: String,
+        feature_schema: u32,
+        input_contract: String,
+        task: String,
+        value_validity: crate::public_model::ValueValidity,
+        model_checksum: String,
+        training_checkpoint_checksum: String,
+        dataset_fingerprint: String,
+        inference_backend: String,
+    },
     Search {
         policy_version: String,
         config: SearchConfig,
@@ -62,6 +75,42 @@ pub enum SeatPolicy {
 impl SeatPolicy {
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PublicLearned {
+                policy_version,
+                model_version,
+                training_version,
+                feature_schema,
+                input_contract,
+                task,
+                value_validity,
+                model_checksum,
+                training_checkpoint_checksum,
+                dataset_fingerprint,
+                inference_backend,
+            } if policy_version == crate::public_model::POLICY_VERSION
+                && model_version == crate::public_model::MODEL_VERSION
+                && training_version == crate::policy_training::TRAINING_VERSION
+                && *feature_schema == crate::features::PUBLIC_FEATURE_SCHEMA
+                && input_contract == crate::public_model::INPUT_CONTRACT
+                && task == "policyOnlyBc"
+                && *value_validity == crate::public_model::ValueValidity::UnavailablePolicyOnly
+                && ["scalar", "avx2", "sse2", "neon", "simd128"]
+                    .contains(&inference_backend.as_str())
+                && [
+                    model_checksum,
+                    training_checkpoint_checksum,
+                    dataset_fingerprint,
+                ]
+                .iter()
+                .all(|id| {
+                    id.len() == 64
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }) =>
+            {
+                Ok(())
+            }
             Self::Search {
                 policy_version,
                 config,
@@ -315,6 +364,13 @@ fn play_game_internal(
         {
             return Err("Search provenance requires base 3..4p".into());
         }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::PublicLearned { .. }))
+            && (!(3..=4).contains(&players) || options != GameOptions::default())
+        {
+            return Err("Public learned provenance requires base 3..4p".into());
+        }
     }
     if players == 5 {
         options.quick_actions = true;
@@ -435,6 +491,13 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
             && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
         {
             return Err("Search provenance requires base 3..4p".into());
+        }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::PublicLearned { .. }))
+            && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
+        {
+            return Err("Public learned provenance requires base 3..4p".into());
         }
     }
     let mut state = create_game_with_options(h.names.clone(), h.seed, h.options.clone())?;

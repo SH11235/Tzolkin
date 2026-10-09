@@ -240,6 +240,15 @@ impl<'a> LoadedPublicPolicy<'a> {
             kernel: kernel.resolve()?,
         })
     }
+    /// The native prepared owner has resolved CPU support and audited its immutable model.
+    /// Shape/checksum validation stays at this boundary; no raw parameter constructor is exposed.
+    pub(crate) fn with_resolved(
+        artifact: &'a PublicPolicyArtifact,
+        kernel: ResolvedKernel,
+    ) -> Result<Self, String> {
+        artifact.validate()?;
+        Ok(Self { artifact, kernel })
+    }
     pub fn backend(&self) -> &'static str {
         self.kernel.backend()
     }

@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use tzolkin_ai::dataset::DatasetSplit;
 use tzolkin_ai::kernel::Kernel;
@@ -9,9 +10,10 @@ use tzolkin_ai::policy_training::{
     train_dataset, validate_new_output_directory,
 };
 use tzolkin_ai::public_model::{LoadedPublicPolicy, MAX_OBSERVATION_BYTES, PublicPolicyArtifact};
+use tzolkin_ai::public_native::{self, PreparedPublicPolicy};
 use tzolkin_core::observation::Observation;
 
-const HELP: &str = "tzolkin-public-ml choose --model PATH [--kernel scalar|auto|avx2|sse2|neon|simd128]\ntzolkin-public-ml export-native --input NATIVE_REPLAY_DIRECTORY --output NEW_DATASET_DIRECTORY\ntzolkin-public-ml train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate F --seed N]\ntzolkin-public-ml resume --input DATASET --checkpoint PATH --epochs TOTAL --output NEW_DIRECTORY [--batch-size N --learning-rate F --seed N]\ntzolkin-public-ml evaluate --input DATASET --model PATH [--split train|validation|test]\nchoose reads a bounded core Observation JSON from stdin and writes a Decision JSON.\nChoose defaults to scalar. BC training/resume/evaluation are Scalar only, base 3-4p, policy-only, value unavailable.\nTrain defaults: epochs=3, batch-size=16, learning-rate=0.001, seed=7. Resume inherits unchanged optimizer config; --epochs is required. Evaluate defaults to validation.\nHuman admission, selfplay/Arena registration and PPO/critics are separate future units.";
+const HELP: &str = "tzolkin-public-ml choose --model PATH [--kernel scalar|auto|avx2|sse2|neon|simd128]\ntzolkin-public-ml export-native --input NATIVE_REPLAY_DIRECTORY --output NEW_DATASET_DIRECTORY\ntzolkin-public-ml train --input DATASET --output NEW_DIRECTORY [--epochs N --batch-size N --learning-rate F --seed N]\ntzolkin-public-ml resume --input DATASET --checkpoint PATH --epochs TOTAL --output NEW_DIRECTORY [--batch-size N --learning-rate F --seed N]\ntzolkin-public-ml evaluate --input DATASET --model PATH [--split train|validation|test]\ntzolkin-public-ml selfplay --checkpoint PATH --dataset DATASET --seats all|SEAT[,SEAT] [--players 3|4 --seed N --flags 0 --kernel scalar|auto|avx2|sse2|neon|simd128 --output NEW_REPLAY_FILE]\nchoose reads a bounded core Observation JSON from stdin and writes a Decision JSON.\nChoose defaults to scalar. BC training/resume/evaluation are Scalar only, base 3-4p, policy-only, value unavailable.\nTrain defaults: epochs=3, batch-size=16, learning-rate=0.001, seed=7. Resume inherits unchanged optimizer config; --epochs is required. Evaluate defaults to validation.\nSelfplay defaults: players=3, seed=0, flags=0, kernel=scalar; explicit --seats is required. Arena also accepts publicLearned configs. Human admission, PPO/critics and CPU adoption are separate future units.";
 
 fn write_stdout(value: &impl serde::Serialize) -> Result<(), String> {
     let mut stdout = std::io::stdout().lock();
@@ -117,6 +119,147 @@ fn evaluate(args: &[String]) -> Result<(), String> {
     write_stdout(&evaluate_dataset(&dataset, &model, split)?)
 }
 
+fn selfplay(args: &[String]) -> Result<(), String> {
+    let parsed = flags(
+        args,
+        &[
+            "--checkpoint",
+            "--dataset",
+            "--players",
+            "--seed",
+            "--flags",
+            "--seats",
+            "--kernel",
+            "--output",
+        ],
+    )?;
+    let checkpoint = parsed
+        .get("--checkpoint")
+        .ok_or("--checkpoint is required")?;
+    let dataset = parsed.get("--dataset").ok_or("--dataset is required")?;
+    let players: usize = parsed
+        .get("--players")
+        .copied()
+        .unwrap_or("3")
+        .parse()
+        .map_err(|_| "Invalid --players")?;
+    let seed: u32 = parsed
+        .get("--seed")
+        .copied()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "Invalid --seed")?;
+    let flag_mask: u8 = parsed
+        .get("--flags")
+        .copied()
+        .unwrap_or("0")
+        .parse()
+        .map_err(|_| "Invalid --flags")?;
+    if flag_mask != 0 {
+        return Err("Public-policy selfplay supports --flags 0 only".into());
+    }
+    let seats = match *parsed
+        .get("--seats")
+        .ok_or("--seats all|SEAT[,SEAT] is required")?
+    {
+        "all" => (0..players.min(4)).collect::<Vec<_>>(),
+        selected => {
+            if selected.split(',').count() > 4 {
+                return Err("Too many selected seats".into());
+            }
+            selected
+                .split(',')
+                .map(|value| value.parse::<usize>().map_err(|_| "Invalid --seats"))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+    };
+    public_native::validate_seats(players, &tzolkin_core::GameOptions::default(), &seats)?;
+    let output = parsed.get("--output").copied();
+    if let Some(output) = output {
+        validate_new_output_directory(Path::new(output))
+            .map_err(|error| format!("Replay output must be a new local file: {error}"))?;
+    }
+    let kernel = public_native::parse_kernel(parsed.get("--kernel").copied().unwrap_or("scalar"))?;
+    let prepared = PreparedPublicPolicy::load(Path::new(checkpoint), Path::new(dataset), kernel)?;
+    let handle = prepared.handle()?;
+    // Dataset/model qualification and backend resolution are excluded from the game clock.
+    let started = Instant::now();
+    let played = public_native::play_game(
+        &handle,
+        players,
+        seed,
+        tzolkin_core::GameOptions::default(),
+        &seats,
+        output.is_some(),
+    );
+    let (mut summary, failure) =
+        selfplay_report(players, seed, &seats, handle.provenance(), played, output)?;
+    summary["elapsedMs"] = (started.elapsed().as_secs_f64() * 1000.0).into();
+    write_stdout(&summary)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(())
+}
+
+type PlayedGame = Result<
+    (
+        tzolkin_core::GameState,
+        usize,
+        Option<tzolkin_ai::replay::GameReplay>,
+    ),
+    String,
+>;
+
+// Keep completion and publication separate: a late save failure must retain the completed result.
+fn selfplay_report(
+    players: usize,
+    seed: u32,
+    seats: &[usize],
+    policy: &tzolkin_ai::replay::SeatPolicy,
+    played: PlayedGame,
+    output: Option<&str>,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    let mut summary = serde_json::json!({
+        "schema":"tzolkin-public-policy-selfplay-v1", "players":players, "seed":seed,
+        "options":tzolkin_core::GameOptions::default(), "seats":seats, "policy":policy,
+        "complete":false, "success":false, "decisions":null, "finalScores":[], "finalState":null,
+        "error":null, "publication":null
+    });
+    let failure = match played {
+        Ok((state, decisions, record)) => {
+            summary["complete"] = true.into();
+            summary["decisions"] = decisions.into();
+            summary["finalScores"] =
+                serde_json::to_value(&state.final_scores).map_err(|e| e.to_string())?;
+            summary["finalState"] = tzolkin_ai::replay::state_key(&state)?.into();
+            let publication = output.map(|path| {
+                let result = record
+                    .as_ref()
+                    .ok_or("Missing public-policy replay".to_owned())
+                    .and_then(|record| {
+                        tzolkin_ai::replay::save_replay_new(Path::new(path), record)
+                    });
+                (path, result.err())
+            });
+            let failure = if let Some((path, error)) = publication {
+                summary["publication"] =
+                    serde_json::json!({"path":path,"success":error.is_none(),"error":error});
+                error
+            } else {
+                None
+            };
+            summary["success"] = failure.is_none().into();
+            failure
+        }
+        Err(error) => {
+            summary["error"] = error.clone().into();
+            Some(error)
+        }
+    };
+    Ok((summary, failure))
+}
+
 fn export(args: &[String]) -> Result<(), String> {
     let mut input = None;
     let mut output = None;
@@ -158,6 +301,9 @@ fn run() -> Result<(), String> {
     }
     if args.first().map(String::as_str) == Some("evaluate") {
         return evaluate(&args);
+    }
+    if args.first().map(String::as_str) == Some("selfplay") {
+        return selfplay(&args);
     }
     if args.first().map(String::as_str) != Some("choose") {
         return Err("Unknown public ML command; use --help".into());
@@ -215,5 +361,92 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct Temp(PathBuf);
+    impl Temp {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "tzolkin-public-selfplay-report-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn late_publication_failure_keeps_the_complete_result_and_preserves_existing_bytes() {
+        let temp = Temp::new();
+        let destination = temp.0.join("replay.json");
+        // The destination appears after a successful CLI-style preflight, without a timer/race.
+        validate_new_output_directory(&destination).unwrap();
+        fs::write(&destination, b"existing source").unwrap();
+        let played = tzolkin_ai::replay::play_game_fast(3, 0, Default::default(), true).unwrap();
+        let expected_scores = serde_json::to_value(&played.0.final_scores).unwrap();
+        let expected_key = tzolkin_ai::replay::state_key(&played.0).unwrap();
+        let expected_decisions = played.1;
+        // This publication-only fixture uses its actual heuristic provenance; it claims no V2 producer.
+        let provenance = tzolkin_ai::experiment::heuristic_seat();
+        let (report, error) = selfplay_report(
+            3,
+            0,
+            &[0],
+            &provenance,
+            Ok(played),
+            Some(destination.to_str().unwrap()),
+        )
+        .unwrap();
+        assert!(error.is_some());
+        assert_eq!(report["complete"], true);
+        assert_eq!(report["success"], false);
+        assert_eq!(report["decisions"], expected_decisions);
+        assert_eq!(report["finalScores"], expected_scores);
+        assert_eq!(report["finalState"], expected_key);
+        assert_eq!(report["error"], serde_json::Value::Null);
+        assert_eq!(report["publication"]["success"], false);
+        assert_eq!(report["publication"]["error"].as_str(), error.as_deref());
+        assert_eq!(fs::read(&destination).unwrap(), b"existing source");
+    }
+
+    #[test]
+    fn failed_game_has_null_results_and_does_not_publish_a_replay() {
+        let temp = Temp::new();
+        let destination = temp.0.join("not-published.json");
+        let provenance = tzolkin_ai::experiment::heuristic_seat();
+        let failure = "Game did not finish within the native decision bound".to_owned();
+        let (report, error) = selfplay_report(
+            3,
+            0,
+            &[0],
+            &provenance,
+            Err(failure.clone()),
+            Some(destination.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(error, Some(failure.clone()));
+        assert_eq!(report["error"], failure);
+        assert_eq!(report["complete"], false);
+        assert_eq!(report["success"], false);
+        assert_eq!(report["decisions"], serde_json::Value::Null);
+        assert_eq!(report["finalState"], serde_json::Value::Null);
+        assert_eq!(report["finalScores"], serde_json::json!([]));
+        assert_eq!(report["publication"], serde_json::Value::Null);
+        assert!(!destination.exists());
     }
 }

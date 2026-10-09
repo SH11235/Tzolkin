@@ -402,6 +402,18 @@ pub fn load_evaluation_model(path: &Path) -> Result<PublicPolicyArtifact, String
     model.validate()?;
     Ok(model)
 }
+/// Qualifies an immutable checkpoint against its dataset using the audited no-op resume.
+/// Recomputes final losses and completes EOF/source checks; does not authenticate history.
+pub fn validate_checkpoint_dataset(
+    dataset: &ValidatedPolicyDataset,
+    checkpoint: &PolicyTrainingCheckpoint,
+) -> Result<(), String> {
+    let audited = train_dataset(dataset, &checkpoint.config, Some(checkpoint))?;
+    if audited.checkpoint != *checkpoint {
+        return Err("Public policy checkpoint differs from audited no-op resume".into());
+    }
+    Ok(())
+}
 /// Early local-path check, not publication authority: create_dir still refuses races.
 pub fn validate_new_output_directory(path: &Path) -> Result<(), String> {
     local_path(path)?;
