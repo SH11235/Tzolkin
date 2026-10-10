@@ -35,6 +35,15 @@ pub struct FrozenMixedRoster<'a> {
 impl<'a> FrozenMixedRoster<'a> {
     pub fn new(seats: Vec<Option<BorrowedArenaPolicy<'a>>>) -> Result<Self, String> {
         let learner_seat = learner_slot(&seats)?;
+        if seats
+            .iter()
+            .flatten()
+            .any(|p| matches!(p, BorrowedArenaPolicy::Mixed(_)))
+        {
+            return Err(
+                "Mixed owner requires a distinct native source codec; v1 roster refused".into(),
+            );
+        }
         let opponents = seats
             .into_iter()
             .map(|p| p.map(FrozenReactiveOpponent::new).transpose())
@@ -96,6 +105,9 @@ impl<'a> FrozenMixedRoster<'a> {
             )
             .ok_or_else(|| "Mixed Search work bound overflow".into())
     }
+}
+pub(crate) fn legacy_opponent_identity_allowed(policy: &crate::replay::SeatPolicy) -> bool {
+    !matches!(policy, crate::replay::SeatPolicy::PublicRlMixed { .. })
 }
 fn learner_slot<T>(seats: &[Option<T>]) -> Result<usize, String> {
     if !(3..=4).contains(&seats.len()) || seats.iter().filter(|s| s.is_none()).count() != 1 {
@@ -331,6 +343,13 @@ pub(crate) fn audit_mixed_rl_record_bytes(
     if record.schema != RECORD_SCHEMA
         || record.header.source_kind != SOURCE_KIND
         || record.training_admission != "unavailable-distinct-codec-required"
+        || record
+            .header
+            .base_policy
+            .opponents
+            .iter()
+            .flatten()
+            .any(|p| !legacy_opponent_identity_allowed(&p.provenance))
     {
         return Err("Wrong mixed RL record schema/source/admission".into());
     }

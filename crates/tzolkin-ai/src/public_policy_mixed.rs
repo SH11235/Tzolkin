@@ -1,4 +1,4 @@
-//! One sealed mixed learner joint update; no continuation sampling admission.
+//! One sealed mixed learner joint update; no durable continuation admission.
 use crate::dataset::{DatasetSplit, split_for_family};
 use crate::public_model::{self, PublicPolicyModel};
 use crate::public_policy_baseline::{self, InitializedResidualBaseline, ResidualFitConfig};
@@ -275,6 +275,32 @@ impl MixedJointOwner {
     }
     pub fn imported_update_count(&self) -> u64 {
         self.artifact.imported_update_count
+    }
+    pub(crate) fn family_closure(&self) -> impl Iterator<Item = &String> {
+        self.artifact
+            .report
+            .root
+            .trained_families
+            .iter()
+            .chain(self.artifact.report.families.iter())
+    }
+    pub(crate) fn validate_for_inference(&self) -> Result<(), String> {
+        let a = &self.artifact;
+        a.actor.validate()?;
+        if a.report.contract != contract()
+            || a.imported_update_count != a.report.root.parent_count
+            || !(1..=crate::public_policy_paired_long::MAX_UPDATES)
+                .contains(&a.imported_update_count)
+            || a.mixed_update_count != 1
+            || a.report.changed_parameters() == [0, 0]
+            || a.report.expected_checksum()? != a.report.checksum
+            || a.expected_checksum()? != a.checksum
+            || a.residual_parameters.len() != crate::public_state_critic::PARAMETER_COUNT
+            || a.residual_parameters.iter().any(|x| !x.is_finite())
+        {
+            return Err("Mixed inference requires the genuine one-batch joint owner".into());
+        }
+        Ok(())
     }
 }
 pub(crate) enum MixedProposal {

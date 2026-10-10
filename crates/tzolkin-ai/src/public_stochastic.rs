@@ -289,6 +289,7 @@ enum SamplingPolicyKind {
     Repeated,
     Long,
     Paired,
+    Mixed,
 }
 impl SamplingPolicyKind {
     fn sampling_version(self) -> &'static str {
@@ -298,6 +299,7 @@ impl SamplingPolicyKind {
             Self::Repeated => REPEATED_SAMPLING_VERSION,
             Self::Long => crate::public_policy_long::SAMPLING_VERSION,
             Self::Paired => crate::public_policy_paired_long::SAMPLING_VERSION,
+            Self::Mixed => crate::public_rl_mixed_handle::SAMPLING_VERSION,
         }
     }
 }
@@ -306,6 +308,7 @@ impl SamplingPolicyKind {
 enum SamplingPrediction {
     Bc(PublicPolicyDistribution),
     Rl(PublicRlPolicyDistribution),
+    Mixed(Box<crate::public_rl_mixed_handle::MixedPolicyDistribution>),
 }
 impl SamplingPrediction {
     fn compatible(&self, kind: SamplingPolicyKind) -> bool {
@@ -344,6 +347,10 @@ impl SamplingPrediction {
                         .contains(&p.update_count())
                     && p.backend() == "scalar"
             }
+            (Self::Mixed(p), SamplingPolicyKind::Mixed) => {
+                p.identity().validate().is_ok()
+                    && p.value_validity() == ValueValidity::UnavailablePolicyOnly
+            }
             _ => false,
         }
     }
@@ -351,12 +358,14 @@ impl SamplingPrediction {
         match self {
             Self::Bc(p) => &p.logits,
             Self::Rl(p) => p.logits(),
+            Self::Mixed(p) => p.logits(),
         }
     }
     fn probability_count(&self) -> usize {
         match self {
             Self::Bc(p) => p.probabilities.len(),
             Self::Rl(p) => p.probabilities().len(),
+            Self::Mixed(p) => p.probabilities().len(),
         }
     }
 }
@@ -1031,6 +1040,46 @@ impl<'handle, 'model> PairedStochasticSession<'handle, 'model> {
     }
 }
 
+/// Inference-only mixed-owner sampler. Existing actor-local tick53/RNG and
+/// reserve-before-forward/error-stop mechanics are reused without relabeling.
+/// No native record codec, Train admission, family reservation, or durable
+/// continuation is granted by creating or using this standalone session.
+pub struct MixedStochasticSession<'handle, 'owner> {
+    policy: &'handle crate::public_rl_mixed_handle::MixedPolicyHandle<'owner>,
+    policy_binding_key: String,
+    state: SessionState,
+}
+impl<'handle, 'owner> MixedStochasticSession<'handle, 'owner> {
+    pub fn new(
+        policy: &'handle crate::public_rl_mixed_handle::MixedPolicyHandle<'owner>,
+        identity: SamplingStreamIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            policy_binding_key: policy.identity().binding_key()?,
+            state: SessionState::new(identity)?,
+        })
+    }
+    pub fn counters(&self) -> SamplingCounters {
+        self.state.counters()
+    }
+    pub fn stop(&mut self) {
+        self.state.stopped = true;
+    }
+    pub fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
+        self.state.sample_with_kind(
+            &self.policy_binding_key,
+            SamplingPolicyKind::Mixed,
+            observation,
+            |o| {
+                self.policy
+                    .distribution(o)
+                    .map(|p| SamplingPrediction::Mixed(Box::new(p)))
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,6 +1094,30 @@ mod tests {
     };
     fn identity(players: usize) -> SamplingStreamIdentity {
         SamplingStreamIdentity::new(SamplingSeed::new(17), 0, 0, players).unwrap()
+    }
+    #[test]
+    fn mixed_sampling_kind_refuses_legacy_prediction_without_model_or_rng_work() {
+        let p = SamplingPrediction::Bc(PublicPolicyDistribution {
+            policy_version: POLICY_VERSION.into(),
+            feature_schema: PUBLIC_FEATURE_SCHEMA,
+            logits: vec![0.0],
+            probabilities: vec![1.0],
+            value: (),
+            value_validity: ValueValidity::UnavailablePolicyOnly,
+        });
+        assert!(!p.compatible(SamplingPolicyKind::Mixed));
+        assert_eq!(
+            SamplingPolicyKind::Mixed.sampling_version(),
+            crate::public_rl_mixed_handle::SAMPLING_VERSION
+        );
+        assert_ne!(
+            SamplingPolicyKind::Mixed.sampling_version(),
+            SamplingPolicyKind::Rl.sampling_version()
+        );
+        assert_ne!(
+            SamplingPolicyKind::Mixed.sampling_version(),
+            SamplingPolicyKind::Paired.sampling_version()
+        );
     }
     fn setup(players: usize) -> GameState {
         create_game((0..players).map(|p| format!("P{p}")).collect(), 17, false).unwrap()
