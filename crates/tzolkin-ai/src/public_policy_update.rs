@@ -368,6 +368,44 @@ pub(crate) fn validate_checkpoint_report(
     families: &[String],
     source: &SeatPolicy,
 ) -> Result<(), String> {
+    validate_report_numeric(
+        counts,
+        deltas,
+        numeric,
+        config,
+        identities,
+        families,
+        (source, false),
+    )
+}
+pub(crate) fn validate_joint_checkpoint_report(
+    counts: &[usize; 3],
+    deltas: &Deltas,
+    numeric: &NumericReport,
+    config: &OneStepConfig,
+    identities: ([&str; 4], &[String; 4]),
+    families: &[String],
+    source: &SeatPolicy,
+) -> Result<(), String> {
+    validate_report_numeric(
+        counts,
+        deltas,
+        numeric,
+        config,
+        identities,
+        families,
+        (source, true),
+    )
+}
+fn validate_report_numeric(
+    counts: &[usize; 3],
+    deltas: &Deltas,
+    numeric: &NumericReport,
+    config: &OneStepConfig,
+    identities: ([&str; 4], &[String; 4]),
+    families: &[String],
+    (source, allow_unchanged_actor): (&SeatPolicy, bool),
+) -> Result<(), String> {
     let finite = [
         deltas.max_abs_all_log_delta,
         deltas.max_abs_chosen_log_delta,
@@ -382,7 +420,10 @@ pub(crate) fn validate_checkpoint_report(
     if finite.iter().any(|v| !v.is_finite() || *v < 0.0)
         || deltas.max_abs_all_log_delta > MAX_ALL_LOG_DELTA
         || numeric.actual_delta_max_abs > config.max_abs_actual_delta
-        || numeric.changed_parameters == 0
+        || (numeric.changed_parameters == 0
+            && (!allow_unchanged_actor
+                || numeric.actual_delta_l2 != 0.0
+                || numeric.actual_delta_max_abs != 0.0))
         || numeric.changed_parameters > PARAMETER_COUNT
         || counts[0] == 0
         || counts[0] > 4 * crate::public_stochastic::MAX_SAMPLES
@@ -788,6 +829,42 @@ pub(crate) fn checkpoint_test_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn joint_metadata_allows_zero_actor_delta_without_weakening_plain_guard() {
+        let model = crate::public_native::integration_fixture::model(false);
+        let source = crate::public_native::integration_fixture::handle(&model)
+            .provenance()
+            .clone();
+        let identity = "a".repeat(64);
+        let episodes = std::array::from_fn(|_| identity.clone());
+        let family = (0..100)
+            .map(crate::dataset::seed_family_id)
+            .find(|f| split_for_family(f) == Ok(DatasetSplit::Train))
+            .unwrap();
+        let config = OneStepConfig::new(1e-4, 0.01, 4).unwrap();
+        let mut numeric = NumericReport {
+            raw_gradient_l2: 1.0,
+            raw_gradient_max_abs: 1.0,
+            actual_delta_l2: 0.0,
+            actual_delta_max_abs: 0.0,
+            changed_parameters: 0,
+        };
+        let check = |numeric: &NumericReport, joint: bool| {
+            validate_report_numeric(
+                &[4, 4, 4],
+                &Deltas::default(),
+                numeric,
+                &config,
+                ([&identity, &identity, &identity, &identity], &episodes),
+                std::slice::from_ref(&family),
+                (&source, joint),
+            )
+        };
+        assert!(check(&numeric, false).is_err());
+        check(&numeric, true).unwrap();
+        numeric.actual_delta_max_abs = f64::MIN_POSITIVE;
+        assert!(check(&numeric, true).is_err());
+    }
     #[test]
     fn numeric_ascent_rounding_nochange_signed_zero_and_limits() {
         let config = OneStepConfig::default();

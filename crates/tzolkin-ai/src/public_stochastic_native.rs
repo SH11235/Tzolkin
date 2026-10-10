@@ -280,6 +280,7 @@ pub(crate) enum NativePolicy<'handle, 'model> {
     Rl(&'handle UpdatedPublicRlHandle<'model>),
     Repeated(&'handle RepeatedPublicRlHandle<'model>),
     Long(&'handle crate::public_rl_native::LongRlHandle<'model>),
+    Paired(&'handle crate::public_rl_native::PairedRlHandle<'model>),
 }
 impl<'handle, 'model> NativePolicy<'handle, 'model> {
     fn session(
@@ -296,6 +297,10 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
                 crate::public_stochastic::LongStochasticSession::new(policy, identity)
                     .map(NativeSession::Long)
             }
+            Self::Paired(policy) => {
+                crate::public_stochastic::PairedStochasticSession::new(policy, identity)
+                    .map(NativeSession::Paired)
+            }
         }
     }
     fn sampling_version(self) -> &'static str {
@@ -304,6 +309,7 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
             Self::Rl(_) => RL_SAMPLING_VERSION,
             Self::Repeated(_) => REPEATED_SAMPLING_VERSION,
             Self::Long(_) => crate::public_policy_long::SAMPLING_VERSION,
+            Self::Paired(_) => crate::public_policy_paired_long::SAMPLING_VERSION,
         }
     }
 }
@@ -312,6 +318,7 @@ enum NativeSession<'handle, 'model> {
     Rl(RlStochasticSession<'handle, 'model>),
     Repeated(RepeatedStochasticSession<'handle, 'model>),
     Long(crate::public_stochastic::LongStochasticSession<'handle, 'model>),
+    Paired(crate::public_stochastic::PairedStochasticSession<'handle, 'model>),
 }
 impl NativeSession<'_, '_> {
     fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
@@ -320,6 +327,7 @@ impl NativeSession<'_, '_> {
             Self::Rl(session) => session.sample(observation),
             Self::Repeated(session) => session.sample(observation),
             Self::Long(session) => session.sample(observation),
+            Self::Paired(session) => session.sample(observation),
         }
     }
     fn counters(&self) -> SamplingCounters {
@@ -328,6 +336,7 @@ impl NativeSession<'_, '_> {
             Self::Rl(session) => session.counters(),
             Self::Repeated(session) => session.counters(),
             Self::Long(session) => session.counters(),
+            Self::Paired(session) => session.counters(),
         }
     }
     fn stop(&mut self) {
@@ -336,6 +345,7 @@ impl NativeSession<'_, '_> {
             Self::Rl(session) => session.stop(),
             Self::Repeated(session) => session.stop(),
             Self::Long(session) => session.stop(),
+            Self::Paired(session) => session.stop(),
         }
     }
 }

@@ -129,7 +129,7 @@ impl AuditedRlStochasticGame {
     }
 }
 
-fn header(
+pub(crate) fn header(
     config: &NativeStochasticConfig,
     policy: &UpdatedPublicRlHandle<'_>,
 ) -> Result<Header<RlSamplingPolicy>, String> {
