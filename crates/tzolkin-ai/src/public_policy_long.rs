@@ -4,7 +4,7 @@
 //! a loader: stored hashes establish consistency, not producer authentication.
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::dataset::{DatasetSplit, split_for_family};
 use crate::features::PUBLIC_FEATURE_SCHEMA;
@@ -77,13 +77,13 @@ pub enum LongRlParent<'a> {
     Long(&'a LongRlPolicy),
 }
 impl<'a> LongRlParent<'a> {
-    fn checksum(self) -> &'a str {
+    pub(crate) fn checksum(self) -> &'a str {
         match self {
             Self::Count1(p) => p.artifact().checksum(),
             Self::Long(p) => p.artifact().checksum(),
         }
     }
-    fn count(self) -> u64 {
+    pub(crate) fn count(self) -> u64 {
         match self {
             Self::Count1(p) => p.artifact().update_count(),
             Self::Long(p) => p.artifact().update_count(),
@@ -160,9 +160,27 @@ impl<'a> LongRlParent<'a> {
             Self::Long(_) => (COHORT_VERSION, SAMPLING_VERSION),
         }
     }
-    fn validate(self, limits: LongRunLimits) -> Result<(), String> {
+    pub(crate) fn validate(self, limits: LongRunLimits) -> Result<(), String> {
         match self {
-            Self::Count1(p) => p.validate_for_inference(),
+            Self::Count1(p) => {
+                p.validate_for_inference()?;
+                let families = p.artifact().report().family_closure();
+                if families.is_empty()
+                    || families.len() > crate::policy_dataset::MAX_FILES + 4
+                    || families.windows(2).any(|w| w[0] >= w[1])
+                    || families
+                        .iter()
+                        .any(|f| !crate::public_policy_update::checkpoint_digest(f))
+                {
+                    return Err("Invalid Count1 long bootstrap closure".into());
+                }
+                for f in families {
+                    if split_for_family(f)? == DatasetSplit::Test {
+                        return Err("Count1 long bootstrap includes Test".into());
+                    }
+                }
+                Ok(())
+            }
             Self::Long(p) => {
                 p.validate_for_sampling()?;
                 if p.limits() != limits {
@@ -289,6 +307,15 @@ impl LongStepReport {
     pub fn config(&self) -> &OneStepConfig {
         &self.config
     }
+    pub(crate) fn bc_source(&self) -> &SeatPolicy {
+        &self.bc_source
+    }
+    pub(crate) fn plan_checksum(&self) -> &str {
+        &self.cohort_plan_checksum
+    }
+    pub(crate) fn parent_lineage(&self) -> &str {
+        &self.parent_lineage_checksum
+    }
     fn expected_checksum(&self) -> Result<String, String> {
         hash(
             b"tzolkin-public-rl-long-report-v2\0",
@@ -384,6 +411,37 @@ impl LongRlPolicy {
             return Err("Incompatible sealed long-run owner".into());
         }
         r.config.validate()?;
+        r.bc_source.validate()?;
+        if !matches!(&r.bc_source, SeatPolicy::PublicLearned { inference_backend, .. } if inference_backend == "scalar")
+            || [
+                &r.parent_artifact_checksum,
+                &r.root_init_checksum,
+                &r.root_count1_checksum,
+                &r.cohort_plan_checksum,
+                &r.cohort_receipt_checksum,
+                &r.parent_lineage_checksum,
+                &r.lineage_checksum,
+                &r.checksum,
+                &a.checksum,
+            ]
+            .into_iter()
+            .chain(r.episode_checksums.iter())
+            .any(|s| !crate::public_policy_update::checkpoint_digest(s))
+            || (r.parent_update_count == 1 && r.parent_artifact_checksum != r.root_count1_checksum)
+            || r.lineage_checksum
+                != extend_lineage(&r.parent_lineage_checksum, &r.rollout_families)?
+        {
+            return Err("Invalid Long source/root/lineage metadata".into());
+        }
+        for (i, f) in r.rollout_families.iter().enumerate() {
+            if !crate::public_policy_update::checkpoint_digest(f)
+                || split_for_family(f)? != DatasetSplit::Train
+                || r.rollout_families[..i].contains(f)
+                || !self.families.contains(f)
+            {
+                return Err("Invalid Long latest whole-four membership".into());
+            }
+        }
         self.model().validate()?;
         if r.checksum != r.expected_checksum()?
             || a.checksum != artifact_checksum(a.update_count, r, &a.model)?
@@ -406,6 +464,51 @@ pub fn ascent_long(
     config: &OneStepConfig,
     limits: LongRunLimits,
 ) -> Result<LongStepOutcome, String> {
+    let prepared = prepare_long_step(parent, cohort, config, limits)?;
+    match prepared {
+        PreparedLongStep::NoChange(report) => Ok(LongStepOutcome::NoChange(report)),
+        updated => Ok(updated.commit(parent.families())),
+    }
+}
+
+// Only sealed parents/cohorts create this object. Every fallible calculation is
+// complete before a session moves its owned family set into commit.
+pub(crate) enum PreparedLongStep {
+    Updated(LongRlArtifact),
+    NoChange(LongStepReport),
+}
+impl PreparedLongStep {
+    pub(crate) fn artifact(&self) -> Option<&LongRlArtifact> {
+        match self {
+            Self::Updated(a) => Some(a),
+            Self::NoChange(_) => None,
+        }
+    }
+    pub(crate) fn report(&self) -> &LongStepReport {
+        match self {
+            Self::Updated(a) => &a.report,
+            Self::NoChange(r) => r,
+        }
+    }
+    pub(crate) fn commit(self, mut families: BTreeSet<String>) -> LongStepOutcome {
+        match self {
+            Self::NoChange(r) => LongStepOutcome::NoChange(r),
+            Self::Updated(artifact) => {
+                families.extend(artifact.report.rollout_families.iter().cloned());
+                LongStepOutcome::Updated(LongRlPolicy { artifact, families })
+            }
+        }
+    }
+}
+pub(crate) fn take_families(owner: LongRlPolicy) -> BTreeSet<String> {
+    owner.families
+}
+pub(crate) fn prepare_long_step(
+    parent: LongRlParent<'_>,
+    cohort: &ValidatedRlCohort,
+    config: &OneStepConfig,
+    limits: LongRunLimits,
+) -> Result<PreparedLongStep, String> {
     config.validate()?;
     LongRunLimits::new(limits.max_updates, limits.max_families)?;
     parent.validate(limits)?;
@@ -476,26 +579,132 @@ pub fn ascent_long(
     };
     report.checksum = report.expected_checksum()?;
     if !changed {
-        return Ok(LongStepOutcome::NoChange(report));
+        return Ok(PreparedLongStep::NoChange(report));
     }
-    let mut closure = parent.families();
-    closure.extend(families.iter().cloned());
     let model = PublicPolicyModel {
         parameters: proposal.parameters,
     };
     model.validate()?;
     let checksum = artifact_checksum(count, &report, &model)?;
-    Ok(LongStepOutcome::Updated(LongRlPolicy {
-        artifact: LongRlArtifact {
-            update_count: count,
-            report,
-            model,
-            checksum,
-        },
-        families: closure,
+    Ok(PreparedLongStep::Updated(LongRlArtifact {
+        update_count: count,
+        report,
+        model,
+        checksum,
     }))
 }
-fn extend_lineage(parent: &str, families: &[String; 4]) -> Result<String, String> {
+
+// A bounded pinned checkpoint may reconstruct content, never attest its
+// optimization history. Exact trained membership is independently derived from
+// the session's ordered journal, not accepted from the artifact JSON.
+pub(crate) fn restore_checkpoint_owner(
+    value: serde_json::Value,
+    families: BTreeSet<String>,
+    limits: LongRunLimits,
+) -> Result<LongRlPolicy, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Report {
+        contract: serde_json::Value,
+        parent_artifact_checksum: String,
+        parent_update_count: u64,
+        attempted_update_count: u64,
+        root_init_checksum: String,
+        root_count1_checksum: String,
+        bc_source: SeatPolicy,
+        cohort_contract: String,
+        sampling_version: String,
+        cohort_plan_checksum: String,
+        cohort_receipt_checksum: String,
+        episode_checksums: [String; 4],
+        rollout_families: [String; 4],
+        parent_lineage_checksum: String,
+        lineage_checksum: String,
+        family_count: usize,
+        config: serde_json::Value,
+        counts: [usize; 3],
+        deltas: Deltas,
+        numeric: NumericReport,
+        checksum: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Artifact {
+        update_count: u64,
+        report: Report,
+        model: PublicPolicyModel,
+        checksum: String,
+    }
+    let decoded: Artifact = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let r = decoded.report;
+    let source = if r.parent_update_count == 1 {
+        (COHORT_CONTRACT, RL_SAMPLING_VERSION)
+    } else {
+        (COHORT_VERSION, SAMPLING_VERSION)
+    };
+    if r.contract != serde_json::to_value(contract(limits)).map_err(|e| e.to_string())?
+        || (r.cohort_contract.as_str(), r.sampling_version.as_str()) != source
+    {
+        return Err("Long checkpoint contract mismatch".into());
+    }
+    let config = OneStepConfig::from_checkpoint(r.config)?;
+    let mut latest = r.rollout_families.to_vec();
+    latest.sort();
+    crate::public_policy_update::validate_checkpoint_report(
+        &r.counts,
+        &r.deltas,
+        &r.numeric,
+        &config,
+        (
+            [
+                &r.root_init_checksum,
+                &r.cohort_plan_checksum,
+                &r.cohort_receipt_checksum,
+                &r.checksum,
+            ],
+            &r.episode_checksums,
+        ),
+        &latest,
+        &r.bc_source,
+    )?;
+    let owner = LongRlPolicy {
+        artifact: LongRlArtifact {
+            update_count: decoded.update_count,
+            model: decoded.model,
+            checksum: decoded.checksum,
+            report: LongStepReport {
+                contract: contract(limits),
+                parent_artifact_checksum: r.parent_artifact_checksum,
+                parent_update_count: r.parent_update_count,
+                attempted_update_count: r.attempted_update_count,
+                root_init_checksum: r.root_init_checksum,
+                root_count1_checksum: r.root_count1_checksum,
+                bc_source: r.bc_source,
+                cohort_contract: source.0,
+                sampling_version: source.1,
+                cohort_plan_checksum: r.cohort_plan_checksum,
+                cohort_receipt_checksum: r.cohort_receipt_checksum,
+                episode_checksums: r.episode_checksums,
+                rollout_families: r.rollout_families,
+                parent_lineage_checksum: r.parent_lineage_checksum,
+                lineage_checksum: r.lineage_checksum,
+                family_count: r.family_count,
+                config,
+                counts: r.counts,
+                deltas: r.deltas,
+                numeric: r.numeric,
+                checksum: r.checksum,
+            },
+        },
+        families,
+    };
+    owner.validate_for_sampling()?;
+    if serde_json::to_value(owner.artifact()).map_err(|e| e.to_string())? != value {
+        return Err("Noncanonical Long checkpoint fields".into());
+    }
+    Ok(owner)
+}
+pub(crate) fn extend_lineage(parent: &str, families: &[String; 4]) -> Result<String, String> {
     hash(
         b"tzolkin-public-rl-long-lineage-step-v2\0",
         &(parent, families),
