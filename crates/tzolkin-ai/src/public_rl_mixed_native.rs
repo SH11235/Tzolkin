@@ -153,7 +153,7 @@ pub struct MixedRlLearner<'a> {
     families: Vec<String>,
 }
 impl<'a> MixedRlLearner<'a> {
-    pub fn new(parent: PairedRlParent<'a>) -> Result<Self, String> {
+    pub(crate) fn new(parent: PairedRlParent<'a>) -> Result<Self, String> {
         match parent {
             PairedRlParent::Count1(p) => {
                 let h = UpdatedPublicRlHandle::new(p)?;
@@ -305,7 +305,7 @@ impl AuditedMixedRlGame {
         &self.record
     }
 }
-pub fn collect_mixed_rl_native(
+pub(crate) fn collect_mixed_rl_native(
     native: &NativeStochasticConfig,
     learner: &MixedRlLearner<'_>,
     roster: &FrozenMixedRoster<'_>,
@@ -319,10 +319,10 @@ pub fn collect_mixed_rl_native(
     )?;
     Ok(CollectedMixedRlGame { record })
 }
-pub fn encode_mixed_rl_record(game: &CollectedMixedRlGame) -> Result<Vec<u8>, String> {
+pub(crate) fn encode_mixed_rl_record(game: &CollectedMixedRlGame) -> Result<Vec<u8>, String> {
     encode_typed_record(&game.record)
 }
-pub fn audit_mixed_rl_record_bytes(
+pub(crate) fn audit_mixed_rl_record_bytes(
     bytes: &[u8],
     learner: &MixedRlLearner<'_>,
     roster: &FrozenMixedRoster<'_>,

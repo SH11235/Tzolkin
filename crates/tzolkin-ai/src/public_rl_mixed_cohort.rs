@@ -19,7 +19,7 @@ pub struct PlannedMixedRlCohort {
     checksum: String,
 }
 impl PlannedMixedRlCohort {
-    pub fn new(
+    pub(crate) fn new(
         learner: &MixedRlLearner<'_>,
         configs: [NativeStochasticConfig; 4],
         rosters: [&FrozenMixedRoster<'_>; 4],
@@ -81,7 +81,7 @@ impl PlannedMixedRlCohort {
             "headers":self.headers,"families":self.families,"actorNormalization":"learnerOwnSumTimes1/4",
             "criticTargets":"learnerCallbacksOnlyIncludingSingletons","producerAuthenticated":false,"independentSeedOriginsVerified":false})
     }
-    pub fn finish(
+    pub(crate) fn finish(
         self,
         results: [Result<ValidatedMixedRlEpisode, String>; 4],
     ) -> Result<ValidatedMixedRlCohort, String> {

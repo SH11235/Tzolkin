@@ -18,7 +18,7 @@ pub struct ValidatedMixedRlEpisode {
     checksum: String,
 }
 impl ValidatedMixedRlEpisode {
-    pub fn from_audited(source: AuditedMixedRlGame) -> Result<Self, String> {
+    pub(crate) fn from_audited(source: AuditedMixedRlGame) -> Result<Self, String> {
         let record = source.record();
         let h = &record.header;
         let config = h.config.checked_config()?;

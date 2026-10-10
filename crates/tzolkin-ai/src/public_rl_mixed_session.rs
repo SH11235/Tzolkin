@@ -160,6 +160,27 @@ pub struct MixedRlCollectionSpec {
 impl MixedRlCollectionSpec {
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
         let value = unique_json(raw, MAX_SPEC_BYTES)?;
+        if !value
+            .get("rosters")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|rosters| {
+                rosters.iter().all(|roster| {
+                    roster.as_array().is_some_and(|seats| {
+                        seats.iter().all(|seat| {
+                            seat.is_null()
+                                || seat.as_object().is_some_and(|fields| {
+                                    fields.len() == 1
+                                        && fields
+                                            .get("kind")
+                                            .is_some_and(serde_json::Value::is_string)
+                                })
+                        })
+                    })
+                })
+            })
+        {
+            return Err("Mixed roster opponent requires exactly its closed kind field".into());
+        }
         let s: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
         s.weights.validate()?;
         s.search.validate()?;
@@ -204,7 +225,7 @@ pub struct MixedRlCollectionSession<'a> {
     search: PreparedSearch,
 }
 impl<'a> MixedRlCollectionSession<'a> {
-    pub fn new(
+    pub(crate) fn new(
         spec: MixedRlCollectionSpec,
         learner: PairedRlParent<'a>,
         prepared: &'a PreparedPublicPolicy,
@@ -310,7 +331,7 @@ impl<'a> MixedRlCollectionSession<'a> {
         expected_sha256: &str,
         output: &Path,
     ) -> Result<ValidatedMixedRlCohort, String> {
-        require_separate_audit_output(source, output)?;
+        require_output_outside_directory(source, output)?;
         if sha(collection_raw) != expected_sha256 {
             return Err("Mixed collection external raw pin differs".into());
         }
@@ -472,7 +493,8 @@ fn collection_inventory(dir: &Path, cap: u64) -> Result<Vec<FilePin>, String> {
         })
         .collect()
 }
-fn require_separate_audit_output(source: &Path, output: &Path) -> Result<(), String> {
+/// Reject canonical overlap before opening any output or running policy work.
+pub fn require_output_outside_directory(source: &Path, output: &Path) -> Result<(), String> {
     let source = fs::canonicalize(source).map_err(|e| e.to_string())?;
     let resolved_output = match fs::canonicalize(output) {
         Ok(resolved) => resolved,
@@ -490,7 +512,7 @@ fn require_separate_audit_output(source: &Path, output: &Path) -> Result<(), Str
         }
         Err(e) => return Err(e.to_string()),
     };
-    if resolved_output.starts_with(source) {
+    if resolved_output.starts_with(&source) || source.starts_with(&resolved_output) {
         return Err("Mixed audit output must remain outside the saved source directory".into());
     }
     Ok(())
@@ -593,6 +615,34 @@ mod tests {
     use std::ffi::OsString;
 
     #[test]
+    fn closed_whole4_spec_rejects_unit_payload_and_bad_roles_without_worlds() {
+        let configs=(0..4).map(|i|serde_json::json!({"players":if i<2{3}else{4},"environmentSeed":i,
+            "options":{"additionalBuildings":false,"tribes":false,"prophecies":false,"quickActions":false},
+            "samplingSeed":"000000000000001d","episodeOrdinal":format!("{:016x}",2000004+i),
+            "replicateOrdinal":"0000000000000001","maxCallbacks":1500,"maxCandidateRows":100000,
+            "maxSourceBytes":16*1024*1024,"maxTraceBytes":8*1024*1024})).collect::<Vec<_>>();
+        let unit = serde_json::json!({"kind":"heuristic"});
+        let good = serde_json::json!({"schema":SPEC_SCHEMA,"catalogHash":crate::replay::catalog_hash(),
+            "configurations":configs,"rosters":[[null,unit,unit],[unit,null,unit],[null,unit,unit,unit],[unit,unit,unit,null]],
+            "weights":HeuristicWeights::default(),"search":SearchConfig::default(),"maxOutputBytes":4*MAX_RECORD_BYTES+METADATA_RESERVE as usize});
+        assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&good).unwrap()).is_ok());
+        let mut unknown = good.clone();
+        unknown["rosters"][0][1]["unknown"] = true.into();
+        assert!(
+            MixedRlCollectionSpec::from_json(&serde_json::to_vec(&unknown).unwrap())
+                .err()
+                .unwrap()
+                .contains("closed kind")
+        );
+        let mut players = good.clone();
+        players["configurations"][2]["players"] = 3.into();
+        assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&players).unwrap()).is_err());
+        let mut roles = good;
+        roles["rosters"][0][1] = serde_json::Value::Null;
+        assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&roles).unwrap()).is_err());
+    }
+
+    #[test]
     fn saved_inventory_rejects_unexpected_or_fifteenth_entry_without_draining() {
         let visited = Cell::new(0);
         let unexpected = std::iter::from_fn(|| {
@@ -631,11 +681,12 @@ mod tests {
         fs::create_dir(&directory).unwrap();
         let source = directory.join("saved");
         fs::create_dir(&source).unwrap();
-        assert!(require_separate_audit_output(&source, &source).is_err());
-        assert!(require_separate_audit_output(&source, &source.join("audit")).is_err());
+        assert!(require_output_outside_directory(&source, &source).is_err());
+        assert!(require_output_outside_directory(&source, &source.join("audit")).is_err());
         let alias = source.join("..").join("saved").join("audit");
-        assert!(require_separate_audit_output(&source, &alias).is_err());
-        assert!(require_separate_audit_output(&source, &directory.join("audit")).is_ok());
+        assert!(require_output_outside_directory(&source, &alias).is_err());
+        assert!(require_output_outside_directory(&source, &directory).is_err());
+        assert!(require_output_outside_directory(&source, &directory.join("audit")).is_ok());
         assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
         assert!(!directory.join("audit").exists());
         fs::remove_dir(&source).unwrap();

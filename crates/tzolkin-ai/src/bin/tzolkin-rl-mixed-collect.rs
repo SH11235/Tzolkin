@@ -8,7 +8,7 @@ use std::{
 use tzolkin_ai::kernel::Kernel;
 use tzolkin_ai::public_native::PreparedPublicPolicy;
 use tzolkin_ai::public_rl_mixed_session::{
-    ImportedMixedRlParent, MAX_SPEC_BYTES, MixedRlCollectionSpec,
+    ImportedMixedRlParent, MAX_SPEC_BYTES, MixedRlCollectionSpec, require_output_outside_directory,
 };
 use tzolkin_ai::public_rl_paired_session::{PairedRunSpec, read_bounded};
 
@@ -16,7 +16,7 @@ const HELP: &str = "tzolkin-rl-mixed-collect collect --inputs FILE --expected-sh
 tzolkin-rl-mixed-collect audit --inputs FILE --expected-sha256 LOWERCASE64HEX --collection FILE --collection-sha256 LOWERCASE64HEX --output NEW_DIRECTORY\n\
 Input schema tzolkin-rl-mixed-collection-input-pins-v1 pins spec, BC checkpoint, dataset manifest and a resolved Count1 or closed Paired parent. Every pin requires path, bytes and sha256. Paired parent also requires its original runSpec and directory. Prepared BC is qualified once per invocation; imports are read-only and preserve parent sampling seed, replicate and next four episode ordinals.\n\
 Spec schema tzolkin-mixed-rl-collection-spec-v1 requires catalogHash, four configurations (existing native camelCase config with fixed base options), four absolute rosters, weights, search and maxOutputBytes. Exactly two members use3p and two4p; exactly one null seat per roster is the learner. Opponent kinds: heuristic, cornFirstSetup, cornFirstUxmalOpening, preparedBc, parentArgmax, search. Freeze the roster/seat before worlds; rotate learner seats through explicit separate plans. Source/family/stream duplicates or inherited opponent/learner overlap are rejected.\n\
-Collect saves the whole4 plan and started/returned receipts, all4 raw records and collection.json; failed prefixes are retained. No retries or recollection of unknown work. Audit requires the external raw SHA of collection.json, reads every pinned saved file and performs4 full fresh native audits in a new output directory. Opponent applied moves remain audited; only actual learner decisions become sealed actor/critic steps, with own-SUM coefficient1/4. This input cannot enter existing self-play producers. No optimizer, mixed-updated owner, BC retraining, evaluation or strength claim is emitted. Exit0 means the requested data operation completed, not playing-strength improvement.\n\
+Collect saves the whole4 plan and started/returned receipts, all4 raw records and collection.json; failed prefixes are retained. This tool has no global durable mixed ledger and cannot globally prevent reuse of the original prefix in another invocation. The caller must externally reserve all4 planned families and sampler tuples, including failed/Unknown work; no retries or replacement collection. A distinct durable mixed owner is required before mixed updates or resumable collection. Audit requires the external raw SHA of collection.json, reads every pinned saved file and performs4 full fresh native audits in a new output directory. Opponent applied moves remain audited; only actual learner decisions become sealed actor/critic steps, with own-SUM coefficient1/4. This input cannot enter existing self-play producers. No optimizer, mixed-updated owner, BC retraining, evaluation or strength claim is emitted. Exit0 means the requested data operation completed, not playing-strength improvement.\n\
 Use a single writer and caller-owned wall watchdog. maxOutputBytes includes file content, not filesystem/RSS overhead, reserves4 worst-case96MiB records plus2MiB metadata, and is capped512MiB. Existing output directories are refused; audit never writes its source directory.\n";
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -71,6 +71,31 @@ fn digest(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+fn collection_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+fn input_preflight(
+    inputs: &Inputs,
+    command: &str,
+    flags: &BTreeMap<&str, &str>,
+) -> Result<(), String> {
+    if inputs.dataset_manifest.path.file_name() != Some(std::ffi::OsStr::new("manifest.json")) {
+        return Err("Dataset pin must name manifest.json, the file Prepared reads".into());
+    }
+    let output = Path::new(flags["--output"]);
+    if let Parent::Paired { directory, .. } = &inputs.parent {
+        require_output_outside_directory(directory, output)?;
+    }
+    if command == "audit" {
+        require_output_outside_directory(
+            collection_directory(Path::new(flags["--collection"])),
+            output,
+        )?;
+    }
+    Ok(())
+}
 fn args(raw: &[String]) -> Result<(&str, BTreeMap<&str, &str>), String> {
     let command = raw.first().ok_or("Missing collect/audit command")?.as_str();
     if !matches!(command, "collect" | "audit") || !(raw.len() - 1).is_multiple_of(2) {
@@ -121,6 +146,7 @@ fn run(raw: &[String]) -> Result<(), String> {
     if inputs.schema != "tzolkin-rl-mixed-collection-input-pins-v1" {
         return Err("Wrong mixed input schema".into());
     }
+    input_preflight(&inputs, command, &f)?;
     let spec = MixedRlCollectionSpec::from_json(&inputs.spec.read(MAX_SPEC_BYTES)?)?;
     inputs.bc_checkpoint.read(16 * 1024 * 1024)?;
     inputs.dataset_manifest.read(1024 * 1024)?;
@@ -151,6 +177,24 @@ fn run(raw: &[String]) -> Result<(), String> {
             directory,
         )?,
     };
+    // Qualification/import may take time. Re-pin every control artifact before
+    // a new output or native collection/audit can begin.
+    if read_bounded(Path::new(f["--inputs"]), MAX_SPEC_BYTES)? != raw {
+        return Err("Mixed control changed during qualification/import".into());
+    }
+    inputs.spec.read(MAX_SPEC_BYTES)?;
+    inputs.bc_checkpoint.read(16 * 1024 * 1024)?;
+    inputs.dataset_manifest.read(1024 * 1024)?;
+    match &inputs.parent {
+        Parent::Count1 { checkpoint } => {
+            checkpoint.read(tzolkin_ai::public_rl_session::MAX_CHECKPOINT_BYTES)?;
+        }
+        Parent::Paired { run_spec, head, .. } => {
+            run_spec.read(MAX_SPEC_BYTES)?;
+            head.read(tzolkin_ai::public_rl_paired_session::MAX_CHECKPOINT_BYTES)?;
+        }
+    }
+    input_preflight(&inputs, command, &f)?;
     let session = parent.collection_session(spec, &prepared)?;
     let output = Path::new(f["--output"]);
     if command == "collect" {
@@ -162,9 +206,7 @@ fn run(raw: &[String]) -> Result<(), String> {
     } else {
         let source = Path::new(f["--collection"]);
         let cohort = session.audit_saved(
-            source
-                .parent()
-                .ok_or("Missing saved collection directory")?,
+            collection_directory(source),
             &read_bounded(source, MAX_SPEC_BYTES)?,
             f["--collection-sha256"],
             output,
@@ -191,6 +233,43 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manifest_leaf_and_paired_output_preflight_refuse_without_model_load() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("tzolkin-mixed-cli-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        let nested = directory.join("new-output");
+        let pin = serde_json::json!({"path":"unused","bytes":1,"sha256":"a".repeat(64)});
+        let raw = serde_json::json!({"schema":"tzolkin-rl-mixed-collection-input-pins-v1","spec":pin,
+            "bcCheckpoint":pin,"datasetManifest":pin,"parent":{"kind":"paired","runSpec":pin,"head":pin,"directory":directory}});
+        let mut input: Inputs = serde_json::from_value(raw).unwrap();
+        let flags = BTreeMap::from([("--output", nested.to_str().unwrap())]);
+        assert!(
+            input_preflight(&input, "collect", &flags)
+                .unwrap_err()
+                .contains("manifest.json")
+        );
+        input.dataset_manifest.path = PathBuf::from("manifest.json");
+        assert!(
+            input_preflight(&input, "collect", &flags)
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(!nested.exists());
+        assert_eq!(
+            collection_directory(Path::new("collection.json")),
+            Path::new(".")
+        );
+        assert_eq!(
+            collection_directory(Path::new("saved/collection.json")),
+            Path::new("saved")
+        );
+        std::fs::remove_dir(&directory).unwrap();
+    }
     #[test]
     fn saved_audit_requires_external_pin_and_collect_forbids_saved_work() {
         let hash = "a".repeat(64);
