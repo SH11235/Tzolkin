@@ -872,6 +872,9 @@ impl LongTrainingSession {
                 })?;
                 return Ok("batchFailed".into());
             }
+            if saved_only {
+                resume_headroom(&self.spec, &self.progress, self.sequence)?;
+            }
             let bytes = self.preflight_records()?;
             match self.audit(bytes)? {
                 Ok(cohort) => self.update(&cohort)?,
@@ -1411,6 +1414,23 @@ fn restore(
     }
     Ok(session)
 }
+fn resume_headroom(spec: &LongRunSpec, progress: &Progress, sequence: u64) -> Result<(), String> {
+    // Re-auditing four records may append eight events, then gradient/resolve.
+    // Refuse before native work, retaining pending and remaining headroom.
+    let metadata = OWNER_BYTES as u64 + 10 * MAX_CHECKPOINT_BYTES as u64;
+    if sequence
+        .checked_add(10)
+        .is_none_or(|n| n > spec.max_journal_entries)
+        || progress
+            .metadata_bytes
+            .checked_add(metadata)
+            .is_none_or(|n| n > spec.max_metadata_bytes)
+    {
+        return Err("Insufficient Long headroom before resume audit; pending unchanged".into());
+    }
+    Ok(())
+}
+
 fn checked_configs(configs: &[Config; 4]) -> Result<[NativeStochasticConfig; 4], String> {
     configs
         .iter()
