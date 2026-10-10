@@ -12,6 +12,7 @@ pub mod policy_dataset;
 pub mod policy_training;
 pub mod public_model;
 pub mod public_native;
+pub mod public_policy_cohort;
 pub mod public_policy_episode;
 pub mod public_policy_likelihood;
 pub mod public_policy_pullback;
