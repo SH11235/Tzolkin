@@ -648,6 +648,19 @@ impl PairedTrainingSession {
     pub fn require_unused_validation_families(&self, seeds: &[u32]) -> Result<(), String> {
         require_unused_validation(seeds, &self.consumed, &self.spec.excluded_families)
     }
+    pub(crate) fn require_unused_training_families(&self, seeds: &[u32]) -> Result<(), String> {
+        self.require_evaluation_ready()?;
+        for seed in seeds {
+            let family = seed_family_id(*seed);
+            if split_for_family(&family)? != DatasetSplit::Train
+                || self.consumed.contains(&family)
+                || self.spec.excluded_families.contains(&family)
+            {
+                return Err("Imported paired Train family consumed/excluded or non-Train".into());
+            }
+        }
+        Ok(())
+    }
     fn bootstrap(
         spec: PairedRunSpec,
         prepared: &PreparedPublicPolicy,

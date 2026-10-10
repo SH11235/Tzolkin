@@ -385,6 +385,10 @@ fn sha_digest(value: &str) -> Result<(), String> {
 /// Validate representation before any reconstruction/model work. Existing
 /// FNV fingerprints are sixteen hex digits; SHA digests are sixty-four.
 /// These shape checks neither authenticate a source nor validate likelihood.
+pub(crate) fn allows_opponents(schema: &str) -> bool {
+    schema == crate::public_mixed_native::RECORD_SCHEMA
+        || schema == crate::public_rl_mixed_native::RECORD_SCHEMA
+}
 fn validate_wire<P>(record: &Record<P>) -> Result<(), String> {
     let header = &record.header;
     parse_hex64(&header.catalog_hash)?;
@@ -401,7 +405,7 @@ fn validate_wire<P>(record: &Record<P>) -> Result<(), String> {
         parse_hex64(value)?;
     }
     for callback in &record.callbacks {
-        if record.schema != crate::public_mixed_native::RECORD_SCHEMA
+        if !allows_opponents(&record.schema)
             && (callback.opponent_choice.is_some() || callback.opponent_attempted)
         {
             return Err("Opponent fields are forbidden in an all-seat stochastic schema".into());

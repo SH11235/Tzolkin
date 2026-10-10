@@ -506,16 +506,43 @@ pub(crate) fn run_mixed_shared<P: Serialize + PartialEq>(
     )
 }
 
+pub(crate) fn run_frozen_mixed_shared<P: Serialize + PartialEq>(
+    config: &NativeStochasticConfig,
+    policy: NativePolicy<'_, '_>,
+    roster: &crate::public_rl_mixed_native::FrozenMixedRoster<'_>,
+    header: Header<P>,
+    expected: Option<&Record<P>>,
+) -> Result<Record<P>, String> {
+    run_loop(
+        config,
+        policy,
+        SamplingActors::Frozen(roster),
+        crate::public_rl_mixed_native::RECORD_SCHEMA,
+        header,
+        expected,
+        apply_move,
+    )
+}
+
 #[derive(Clone, Copy)]
-enum SamplingActors {
+enum SamplingActors<'roster, 'owner> {
     All,
     One(usize),
+    Frozen(&'roster crate::public_rl_mixed_native::FrozenMixedRoster<'owner>),
 }
-impl SamplingActors {
+impl SamplingActors<'_, '_> {
+    fn learner_seat(self) -> Option<usize> {
+        match self {
+            Self::All => None,
+            Self::One(learner) => Some(learner),
+            Self::Frozen(roster) => Some(roster.learner_seat()),
+        }
+    }
     fn samples(self, actor: usize) -> bool {
         match self {
             Self::All => true,
             Self::One(learner) => actor == learner,
+            Self::Frozen(roster) => actor == roster.learner_seat(),
         }
     }
 }
@@ -540,14 +567,14 @@ fn run_shared_with_apply<P: Serialize + PartialEq>(
 fn run_loop<P: Serialize + PartialEq>(
     config: &NativeStochasticConfig,
     policy: NativePolicy<'_, '_>,
-    actors: SamplingActors,
+    actors: SamplingActors<'_, '_>,
     schema: &str,
     header: Header<P>,
     expected: Option<&Record<P>>,
     mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
 ) -> Result<Record<P>, String> {
-    if let SamplingActors::One(learner) = actors
-        && (learner >= config.players || schema != crate::public_mixed_native::RECORD_SCHEMA)
+    if let Some(learner) = actors.learner_seat()
+        && (learner >= config.players || !crate::public_stochastic_record::allows_opponents(schema))
     {
         return Err("Invalid mixed learner seat or schema".into());
     }
@@ -801,7 +828,18 @@ fn run_loop<P: Serialize + PartialEq>(
             d.clone()
         } else {
             record.callbacks[index].opponent_attempted = true;
-            let decision = match crate::choose_move_with_weights(&observation, &opponent_weights) {
+            let opponent = match actors {
+                SamplingActors::Frozen(roster) => Some(roster.opponent(observation.actor)?),
+                _ => None,
+            };
+            let expected_version = opponent
+                .map(|p| p.policy_version())
+                .unwrap_or(crate::POLICY_VERSION);
+            let choice = match opponent {
+                Some(p) => p.choose(&observation),
+                None => crate::choose_move_with_weights(&observation, &opponent_weights),
+            };
+            let decision = match choice {
                 Ok(decision) => decision,
                 Err(error) => {
                     fail(
@@ -822,7 +860,7 @@ fn run_loop<P: Serialize + PartialEq>(
                 .collect::<Vec<_>>();
             if decision.actor != observation.actor
                 || decision.observation_key != observation.observation_key
-                || decision.policy_version != crate::POLICY_VERSION
+                || decision.policy_version != expected_version
                 || !decision.score.is_finite()
                 || chosen.len() != 1
             {
