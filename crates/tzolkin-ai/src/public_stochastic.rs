@@ -734,6 +734,11 @@ mod tests {
     }
     #[test]
     fn signed_zero_logit_bits_remain_distinct_but_probabilities_equal() {
+        // Independent SHA-256 vector of the domain and ordered little-endian f32 bits.
+        assert_eq!(
+            full_logits_digest(&[0.0, -0.0, 1.25, -2.5]),
+            "93860294c2dbf980bb96284298ec0f875ba695e528182fcecf9c926aa5e3488a"
+        );
         let plus = TickDistribution::new(&[0.0, 0.0]).unwrap();
         let minus = TickDistribution::new(&[-0.0, 0.0]).unwrap();
         assert_eq!(plus.boundaries, minus.boundaries);

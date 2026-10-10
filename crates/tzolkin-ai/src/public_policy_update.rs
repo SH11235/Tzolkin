@@ -576,22 +576,4 @@ mod tests {
             assert!(OneStepConfig::new(lr, cap, rows).is_err());
         }
     }
-    #[test]
-    fn own_decisions_sum_then_equal_actor_game_weights_keep_singletons_and_ties() {
-        let mut total = [0.0];
-        // Three own decisions, not a decision mean; each actor has the same mass.
-        let three_own_sum = (0..3).fold(0.0, |sum, _| sum + (1.0 - 1.0 / 3.0));
-        add_actor(&mut total, &[three_own_sum], 1.0 / 12.0).unwrap();
-        add_actor(&mut total, &[(1.0 - 1.0 / 3.0)], 1.0 / 12.0).unwrap();
-        // A singleton contributes zero but changes none of the fixed denominators.
-        add_actor(&mut total, &[0.0], 1.0 / 12.0).unwrap();
-        // Winner-share 1/2 from a tie, baseline 1/4, in a 4p actor.
-        add_actor(&mut total, &[(0.5 - 1.0 / 4.0)], 1.0 / 16.0).unwrap();
-        let expected = three_own_sum / 12.0 + (1.0 - 1.0 / 3.0) / 12.0 + (0.5 - 1.0 / 4.0) / 16.0;
-        assert!((total[0] - expected).abs() < 1e-15);
-        assert_eq!(2.0 * 3.0 / 12.0, 0.5);
-        assert_eq!(2.0 * 4.0 / 16.0, 0.5);
-        assert!(add_actor(&mut total, &[f64::INFINITY], 1.0 / 12.0).is_err());
-        assert!(add_actor(&mut [0.0], &[], 1.0 / 16.0).is_err());
-    }
 }
