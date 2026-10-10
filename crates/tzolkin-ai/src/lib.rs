@@ -36,6 +36,7 @@ pub mod public_rl_paired_session;
 pub mod public_rl_paired_stochastic_native;
 pub mod public_rl_policy_cohort;
 pub mod public_rl_policy_episode;
+mod public_rl_record_storage;
 pub mod public_rl_repeated_stochastic_native;
 pub mod public_rl_session;
 pub mod public_rl_stochastic_native;

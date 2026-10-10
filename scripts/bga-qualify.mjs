@@ -36,7 +36,7 @@ const FEATURE_SOURCE_CHAIN = [
   },
   {
     path: 'crates/tzolkin-ai/Cargo.toml',
-    sha256: 'd608d70ab4cd872e5c66501e7408694bbce0499b8572fe48f8b03d2834d63d76',
+    sha256: '54d2f279faa54f54a8c35494f730418c285c26827720a292073665b40ea0ef5c',
   },
 ];
 const GEARS = ['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'];
