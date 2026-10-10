@@ -27,6 +27,7 @@ use crate::public_model::{
     MAX_OBSERVATION_BYTES, POLICY_VERSION, PublicPolicyDistribution, ValueValidity,
 };
 use crate::public_native::PublicPolicyHandle;
+use crate::public_policy_likelihood::nominal_weights;
 use crate::replay::SeatPolicy;
 
 pub const SAMPLING_VERSION: &str = "public-stochastic-bc-uniform-tick53-v1";
@@ -456,24 +457,7 @@ struct TickDistribution {
 }
 impl TickDistribution {
     fn new(logits: &[f32]) -> Result<Self, String> {
-        if logits.is_empty()
-            || logits.len() > MAX_CANDIDATES
-            || logits.iter().any(|z| !z.is_finite())
-        {
-            return Err("Invalid finite full-mask sampling logits".into());
-        }
-        let maximum = logits
-            .iter()
-            .map(|z| f64::from(*z))
-            .fold(f64::NEG_INFINITY, f64::max);
-        let weights: Vec<f64> = logits
-            .iter()
-            .map(|z| (f64::from(*z) - maximum).exp())
-            .collect();
-        let sum = weights.iter().fold(0.0_f64, |a, b| a + b);
-        if !sum.is_finite() || sum <= 0.0 {
-            return Err("Invalid f64 softmax denominator".into());
-        }
+        let (weights, sum) = nominal_weights(logits)?;
         let floor = UNIFORM_MIXTURE / logits.len() as f64;
         let mut nominal = Vec::with_capacity(logits.len());
         let mut boundaries = Vec::with_capacity(logits.len());
@@ -544,6 +528,16 @@ impl TickDistribution {
         }
         format!("{:x}", hash.finalize())
     }
+}
+pub(crate) fn behavior_distribution(
+    logits: &[f32],
+) -> Result<(Vec<f64>, Vec<u64>, String), String> {
+    let distribution = TickDistribution::new(logits)?;
+    let masses = (0..logits.len())
+        .map(|index| distribution.mass(index))
+        .collect::<Result<_, _>>()?;
+    let digest = distribution.digest();
+    Ok((distribution.nominal, masses, digest))
 }
 struct BoundedHash {
     hash: Sha256,
