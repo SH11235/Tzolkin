@@ -1,7 +1,7 @@
 //! One plain ascent step from the sealed current RL parent and a whole fresh
 //! four-game cohort. Count2..10 share one owner and update contract; count1's
-//! owner/contract remain separate. Current collection admits count1 sources, so
-//! count3..10 still need the distinct repeated handle/collector/cohort route.
+//! owner/contract remain separate. Each next update requires a fresh closed
+//! rollout cohort bound to the immediate parent's artifact and source version.
 //! The objective is an independent-actor best-response surrogate, not improving
 //! the constant all-seat winner-share mean. No loader, inference or I/O exists.
 //! Checksums bind consistency, not producer/time/independent-origin proof.
@@ -29,8 +29,8 @@ pub const ARTIFACT_SCHEMA: &str = "tzolkin-public-rl-repeat-v1";
 pub const TASK: &str = "policyOnlyRlRepeat";
 pub const POLICY_VERSION: &str = "learned-public-rl-repeat-v1";
 pub const MAX_UPDATE_COUNT: u64 = 10;
-// These are reserved for the closed repeated collection/cohort adapters. The
-// current count1 factory cannot create a cohort carrying these contracts.
+// Distinct contracts for repeated collection/cohort adapters. Count1 sources
+// cannot carry these identities.
 pub const REPEATED_COHORT_CONTRACT: &str = "four-train-games-all-seat-rl-repeat-actor-sum-v1";
 pub const REPEATED_SAMPLING_VERSION: &str = "public-stochastic-rl-repeat-uniform-tick53-v1";
 const MAX_FAMILIES: usize = crate::policy_dataset::MAX_FILES + 4 * MAX_UPDATE_COUNT as usize;

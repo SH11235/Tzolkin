@@ -1,13 +1,16 @@
 //! Fixed four-game, all-seat RL rollout admission from a sealed immediate parent.
 //! No collection, forwarding, update or chronology authentication occurs here.
-//! Count1 is the current closed route; repeated count2..10 needs a new owner
-//! contract rather than fabricated BC metadata or a type for every count.
+//! Count1 and repeated count2..10 are distinct closed source routes. No BC
+//! metadata fabrication or per-count owner type is used.
 //! Freshness here is Train plus inherited-lineage exclusion; full external
 //! experiment history and chronological reservation remain caller responsibilities.
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::public_policy_episode::TARGET_CONTRACT;
-use crate::public_rl_native::UpdatedPublicRlHandle;
-use crate::public_rl_policy_episode::{EPISODE_CONTRACT, ValidatedRlPolicyEpisode};
+use crate::public_policy_repeat::{MAX_UPDATE_COUNT, REPEATED_COHORT_CONTRACT};
+use crate::public_rl_native::{RepeatedPublicRlHandle, UpdatedPublicRlHandle};
+use crate::public_rl_policy_episode::{
+    EPISODE_CONTRACT, REPEATED_EPISODE_CONTRACT, ValidatedRlPolicyEpisode,
+};
 use crate::public_stochastic::{MAX_RESERVED_CANDIDATE_ROWS, MAX_SAMPLES, RlSamplingPolicy};
 use crate::public_stochastic_native::{NativeStochasticConfig, numerical_target};
 use crate::public_stochastic_record::Config;
@@ -16,12 +19,50 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 pub const COHORT_CONTRACT: &str = "four-train-games-all-seat-rl-count1-actor-sum-v1";
+#[derive(Clone, Copy)]
+enum CohortRole {
+    Count1,
+    Repeated,
+}
+impl CohortRole {
+    fn contract(self) -> &'static str {
+        match self {
+            Self::Count1 => COHORT_CONTRACT,
+            Self::Repeated => REPEATED_COHORT_CONTRACT,
+        }
+    }
+    fn episode_contract(self) -> &'static str {
+        match self {
+            Self::Count1 => EPISODE_CONTRACT,
+            Self::Repeated => REPEATED_EPISODE_CONTRACT,
+        }
+    }
+    fn plan_domain(self) -> &'static [u8] {
+        match self {
+            Self::Count1 => b"tzolkin-planned-rl-count1-cohort-v1\0",
+            Self::Repeated => b"tzolkin-planned-rl-repeat-cohort-v1\0",
+        }
+    }
+    fn receipt_domain(self) -> &'static [u8] {
+        match self {
+            Self::Count1 => b"tzolkin-completed-rl-count1-cohort-v1\0",
+            Self::Repeated => b"tzolkin-completed-rl-repeat-cohort-v1\0",
+        }
+    }
+    fn accepts_count(self, count: u64) -> bool {
+        match self {
+            Self::Count1 => count == 1,
+            Self::Repeated => (2..=MAX_UPDATE_COUNT).contains(&count),
+        }
+    }
+}
 const GAMES: usize = 4;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 
 /// Content-bound full plan. Call before collecting all members; no raw or
 /// Deserialize constructor. External reservation/time evidence is separate.
 pub struct PlannedRlCohort {
+    role: CohortRole,
     source: RlSamplingPolicy,
     configurations: [NativeStochasticConfig; GAMES],
     families: [String; GAMES],
@@ -35,7 +76,19 @@ impl PlannedRlCohort {
         configurations: [NativeStochasticConfig; GAMES],
     ) -> Result<Self, String> {
         plan_parts(
+            CohortRole::Count1,
             RlSamplingPolicy::from_handle(parent)?,
+            parent.family_closure(),
+            configurations,
+        )
+    }
+    pub fn new_repeated(
+        parent: &RepeatedPublicRlHandle<'_>,
+        configurations: [NativeStochasticConfig; GAMES],
+    ) -> Result<Self, String> {
+        plan_parts(
+            CohortRole::Repeated,
+            RlSamplingPolicy::from_repeated_handle(parent)?,
             parent.family_closure(),
             configurations,
         )
@@ -44,7 +97,7 @@ impl PlannedRlCohort {
         &self.checksum
     }
     pub(crate) fn cohort_contract(&self) -> &'static str {
-        COHORT_CONTRACT
+        self.role.contract()
     }
     pub fn parent_artifact_checksum(&self) -> &str {
         self.source.artifact_checksum()
@@ -79,7 +132,7 @@ impl PlannedRlCohort {
         let counts = check_members(&self, &members)?;
         let identities = members.map(|m| (m.checksum, m.callbacks, m.rows, m.singletons));
         let checksum = hash(
-            b"tzolkin-completed-rl-count1-cohort-v1\0",
+            self.role.receipt_domain(),
             &(&self.checksum, identities, counts),
         )?;
         Ok(ValidatedRlCohort {
@@ -144,16 +197,25 @@ fn completed(
     })
 }
 fn plan_parts(
+    role: CohortRole,
     source: RlSamplingPolicy,
     inherited_closure: &[String],
     configurations: [NativeStochasticConfig; GAMES],
 ) -> Result<PlannedRlCohort, String> {
-    if source.update_count() != 1
+    if !role.accepts_count(source.update_count())
         || !digest_id(source.artifact_checksum())
         || configurations.iter().filter(|c| c.players() == 3).count() != 2
         || configurations.iter().filter(|c| c.players() == 4).count() != 2
     {
-        return Err("RL cohort requires a sealed count1 parent and two 3p/two 4p games".into());
+        return Err(match role {
+            CohortRole::Count1 => {
+                "RL cohort requires a sealed count1 parent and two 3p/two 4p games"
+            }
+            CohortRole::Repeated => {
+                "RL cohort requires a sealed count2..10 parent and two 3p/two 4p games"
+            }
+        }
+        .into());
     }
     let families = std::array::from_fn(|i| seed_family_id(configurations[i].environment_seed()));
     for (index, config) in configurations.iter().enumerate() {
@@ -175,10 +237,10 @@ fn plan_parts(
     // The parent checksum already seals its entire non-Test lineage; the plan
     // checks exclusion against that owner without copying/hashing the model.
     let checksum = hash(
-        b"tzolkin-planned-rl-count1-cohort-v1\0",
+        role.plan_domain(),
         &(
-            COHORT_CONTRACT,
-            EPISODE_CONTRACT,
+            role.contract(),
+            role.episode_contract(),
             TARGET_CONTRACT,
             RULES_VERSION,
             RULES_BASELINE,
@@ -190,6 +252,7 @@ fn plan_parts(
         ),
     )?;
     Ok(PlannedRlCohort {
+        role,
         source,
         configurations,
         families,
@@ -201,6 +264,7 @@ fn plan_parts(
 
 #[derive(Clone, Copy)]
 struct Member<'a> {
+    episode_contract: &'static str,
     config: &'a NativeStochasticConfig,
     family: &'a str,
     source: &'a RlSamplingPolicy,
@@ -222,6 +286,7 @@ fn member(episode: &ValidatedRlPolicyEpisode) -> Result<Member<'_>, String> {
         singletons += usize::from(legal == 1);
     }
     Ok(Member {
+        episode_contract: episode.episode_contract(),
         config: episode.source_config(),
         family: episode.family_id(),
         source: episode.parent_policy(),
@@ -240,7 +305,8 @@ fn check_members(
     let mut counts = [0usize; 3];
     for (index, member) in members.iter().enumerate() {
         let limits = plan.configurations[index].limits();
-        if member.config != &plan.configurations[index]
+        if member.episode_contract != plan.role.episode_contract()
+            || member.config != &plan.configurations[index]
             || member.family != plan.families[index]
             || member.source != &plan.source
             || member.catalog != plan.catalog

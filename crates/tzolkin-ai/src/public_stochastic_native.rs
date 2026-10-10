@@ -12,11 +12,12 @@ use serde::Serialize;
 
 use crate::dataset::seed_family_id;
 use crate::public_native::PublicPolicyHandle;
-use crate::public_rl_native::UpdatedPublicRlHandle;
+use crate::public_policy_repeat::REPEATED_SAMPLING_VERSION;
+use crate::public_rl_native::{RepeatedPublicRlHandle, UpdatedPublicRlHandle};
 use crate::public_stochastic::{
     MAX_RESERVED_CANDIDATE_ROWS, MAX_SAMPLES, RL_SAMPLING_VERSION, RNG_VERSION,
-    RlStochasticSession, SAMPLING_VERSION, SampledDecision, SamplingCounters,
-    SamplingStreamIdentity, StochasticSession, UNIFORM_MIXTURE,
+    RepeatedStochasticSession, RlStochasticSession, SAMPLING_VERSION, SampledDecision,
+    SamplingCounters, SamplingStreamIdentity, StochasticSession, UNIFORM_MIXTURE,
 };
 use crate::public_stochastic_record::{
     AttemptStage, CALLBACK_RESERVE, Callback, Config, Counts, FINAL_RESERVE, Failure,
@@ -276,6 +277,7 @@ pub fn collect_native(
 pub(crate) enum NativePolicy<'handle, 'model> {
     Bc(&'handle PublicPolicyHandle<'model>),
     Rl(&'handle UpdatedPublicRlHandle<'model>),
+    Repeated(&'handle RepeatedPublicRlHandle<'model>),
 }
 impl<'handle, 'model> NativePolicy<'handle, 'model> {
     fn session(
@@ -285,36 +287,44 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
         match self {
             Self::Bc(policy) => StochasticSession::new(policy, identity).map(NativeSession::Bc),
             Self::Rl(policy) => RlStochasticSession::new(policy, identity).map(NativeSession::Rl),
+            Self::Repeated(policy) => {
+                RepeatedStochasticSession::new(policy, identity).map(NativeSession::Repeated)
+            }
         }
     }
     fn sampling_version(self) -> &'static str {
         match self {
             Self::Bc(_) => SAMPLING_VERSION,
             Self::Rl(_) => RL_SAMPLING_VERSION,
+            Self::Repeated(_) => REPEATED_SAMPLING_VERSION,
         }
     }
 }
 enum NativeSession<'handle, 'model> {
     Bc(StochasticSession<'handle, 'model>),
     Rl(RlStochasticSession<'handle, 'model>),
+    Repeated(RepeatedStochasticSession<'handle, 'model>),
 }
 impl NativeSession<'_, '_> {
     fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
         match self {
             Self::Bc(session) => session.sample(observation),
             Self::Rl(session) => session.sample(observation),
+            Self::Repeated(session) => session.sample(observation),
         }
     }
     fn counters(&self) -> SamplingCounters {
         match self {
             Self::Bc(session) => session.counters(),
             Self::Rl(session) => session.counters(),
+            Self::Repeated(session) => session.counters(),
         }
     }
     fn stop(&mut self) {
         match self {
             Self::Bc(session) => session.stop(),
             Self::Rl(session) => session.stop(),
+            Self::Repeated(session) => session.stop(),
         }
     }
 }

@@ -27,7 +27,10 @@ use crate::public_model::{
     MAX_OBSERVATION_BYTES, POLICY_VERSION, PublicPolicyDistribution, ValueValidity,
 };
 use crate::public_native::PublicPolicyHandle;
-use crate::public_rl_native::{PublicRlPolicyDistribution, UpdatedPublicRlHandle};
+use crate::public_policy_repeat::{MAX_UPDATE_COUNT, REPEATED_SAMPLING_VERSION};
+use crate::public_rl_native::{
+    PublicRlPolicyDistribution, RepeatedPublicRlHandle, UpdatedPublicRlHandle,
+};
 use crate::replay::SeatPolicy;
 
 pub const SAMPLING_VERSION: &str = "public-stochastic-bc-uniform-tick53-v1";
@@ -283,12 +286,14 @@ fn next_splitmix(state: u64) -> (u64, u64) {
 enum SamplingPolicyKind {
     Bc,
     Rl,
+    Repeated,
 }
 impl SamplingPolicyKind {
     fn sampling_version(self) -> &'static str {
         match self {
             Self::Bc => SAMPLING_VERSION,
             Self::Rl => RL_SAMPLING_VERSION,
+            Self::Repeated => REPEATED_SAMPLING_VERSION,
         }
     }
 }
@@ -311,6 +316,13 @@ impl SamplingPrediction {
                     && p.feature_schema() == PUBLIC_FEATURE_SCHEMA
                     && p.value_validity() == ValueValidity::UnavailablePolicyOnly
                     && p.update_count() == 1
+                    && p.backend() == "scalar"
+            }
+            (Self::Rl(p), SamplingPolicyKind::Repeated) => {
+                p.policy_version() == crate::public_policy_repeat::POLICY_VERSION
+                    && p.feature_schema() == PUBLIC_FEATURE_SCHEMA
+                    && p.value_validity() == ValueValidity::UnavailablePolicyOnly
+                    && (2..=MAX_UPDATE_COUNT).contains(&p.update_count())
                     && p.backend() == "scalar"
             }
             _ => false,
@@ -745,6 +757,25 @@ impl RlSamplingPolicy {
             numerical_target: crate::public_stochastic_native::numerical_target(),
         })
     }
+    pub(crate) fn from_repeated_handle(
+        policy: &RepeatedPublicRlHandle<'_>,
+    ) -> Result<Self, String> {
+        if policy.backend() != "scalar" || !(2..=MAX_UPDATE_COUNT).contains(&policy.update_count())
+        {
+            return Err("Repeated RL sampling requires a sealed Scalar count2..10 handle".into());
+        }
+        Ok(Self {
+            policy_version: crate::public_policy_repeat::POLICY_VERSION.into(),
+            artifact_checksum: policy.artifact_checksum().into(),
+            update_count: policy.update_count(),
+            task: crate::public_policy_repeat::TASK.into(),
+            model_version: crate::public_model::MODEL_VERSION.into(),
+            input_contract: crate::public_model::INPUT_CONTRACT.into(),
+            feature_schema: PUBLIC_FEATURE_SCHEMA,
+            backend: policy.backend().into(),
+            numerical_target: crate::public_stochastic_native::numerical_target(),
+        })
+    }
     pub(crate) fn artifact_checksum(&self) -> &str {
         &self.artifact_checksum
     }
@@ -754,6 +785,12 @@ impl RlSamplingPolicy {
     pub(crate) fn binding_key(&self) -> Result<String, String> {
         let mut hash = Sha256::new();
         hash.update(b"tzolkin-public-stochastic-rl-count1-policy-v1\0");
+        hash.update(serde_json::to_vec(self).map_err(|e| e.to_string())?);
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    pub(crate) fn repeated_binding_key(&self) -> Result<String, String> {
+        let mut hash = Sha256::new();
+        hash.update(b"tzolkin-public-stochastic-rl-repeat-policy-v1\0");
         hash.update(serde_json::to_vec(self).map_err(|e| e.to_string())?);
         Ok(format!("{:x}", hash.finalize()))
     }
@@ -789,6 +826,42 @@ impl<'handle, 'model> RlStochasticSession<'handle, 'model> {
         self.state.sample_with_kind(
             &self.policy_binding_key,
             SamplingPolicyKind::Rl,
+            observation,
+            |o| self.policy.distribution(o).map(SamplingPrediction::Rl),
+        )
+    }
+}
+
+/// Repeated count2..10 session, distinct from BC and count1. No retry/reset after
+/// error. Standalone sampling does not enforce Train/family exclusion; native
+/// collection and audit enforce those guards before world creation or NN use.
+pub struct RepeatedStochasticSession<'handle, 'model> {
+    policy: &'handle RepeatedPublicRlHandle<'model>,
+    policy_binding_key: String,
+    state: SessionState,
+}
+impl<'handle, 'model> RepeatedStochasticSession<'handle, 'model> {
+    pub fn new(
+        policy: &'handle RepeatedPublicRlHandle<'model>,
+        identity: SamplingStreamIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            policy_binding_key: RlSamplingPolicy::from_repeated_handle(policy)?
+                .repeated_binding_key()?,
+            state: SessionState::new(identity)?,
+        })
+    }
+    pub fn counters(&self) -> SamplingCounters {
+        self.state.counters()
+    }
+    pub fn stop(&mut self) {
+        self.state.stopped = true;
+    }
+    pub fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
+        self.state.sample_with_kind(
+            &self.policy_binding_key,
+            SamplingPolicyKind::Repeated,
             observation,
             |o| self.policy.distribution(o).map(SamplingPrediction::Rl),
         )
