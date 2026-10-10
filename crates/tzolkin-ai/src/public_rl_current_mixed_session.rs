@@ -3,6 +3,7 @@
 //! continuation restoration, retry or global anti-fork registry is provided.
 use crate::arena::BorrowedArenaPolicy;
 use crate::public_native::PreparedPublicPolicy;
+use crate::public_policy_mixed_continued::CurrentMixedPolicyHandle;
 use crate::public_rl_current_mixed_source::{
     self as source, PlannedCurrentMixedCohort, ValidatedCurrentMixedCohort,
 };
@@ -82,6 +83,11 @@ impl<'a> AdmittedCurrentMixedRoot<'a> {
     }
     pub fn handle(&self) -> Result<MixedPolicyHandle<'_>, String> {
         MixedPolicyHandle::new(self.session.owner().ok_or("Missing admitted mixed owner")?)
+    }
+    fn current_handle(&self) -> Result<CurrentMixedPolicyHandle<'_>, String> {
+        CurrentMixedPolicyHandle::from_initial(
+            self.session.owner().ok_or("Missing admitted mixed owner")?,
+        )
     }
     pub fn next_episode_ordinal(&self) -> u64 {
         self.next
@@ -193,7 +199,7 @@ impl<'a> CurrentMixedDataSession<'a> {
             .session
             .owner()
             .ok_or("Missing current mixed parent")?;
-        let parent = MixedPolicyHandle::new(owner)?;
+        let parent = CurrentMixedPolicyHandle::from_initial(owner)?;
         let (prepared, _) = self.root.session.current_data_context()?;
         spec.inner
             .wire
@@ -239,7 +245,7 @@ impl<'a> CurrentMixedDataSession<'a> {
         }
         let configs = spec.inner.configs()?;
         let rosters = self.rosters(spec)?;
-        let handle = self.root.handle()?;
+        let handle = self.root.current_handle()?;
         let headers = configs
             .iter()
             .zip(&rosters)
@@ -317,7 +323,7 @@ impl<'a> CurrentMixedDataSession<'a> {
             audit_pins: Vec::new(),
         });
         let plan_pin = writer.save("plan.json", &plan.receipt())?;
-        let handle = self.root.handle()?;
+        let handle = self.root.current_handle()?;
         let rosters = self.rosters(&spec)?;
         let began = Instant::now();
         let mut members = Vec::new();
@@ -479,7 +485,7 @@ impl<'a> CurrentMixedDataSession<'a> {
         let output = directory.join("audit");
         let mut writer = Writer::new(&output, 2 * 1024 * 1024)?;
         writer.save("plan.json", &plan.receipt())?;
-        let handle = self.root.handle()?;
+        let handle = self.root.current_handle()?;
         let rosters = self.rosters(&spec)?;
         let mut results = Vec::new();
         for (member, (bytes, roster)) in raw.iter().zip(&rosters).enumerate() {

@@ -35,11 +35,12 @@ pub struct FrozenMixedRoster<'a> {
 impl<'a> FrozenMixedRoster<'a> {
     pub fn new(seats: Vec<Option<BorrowedArenaPolicy<'a>>>) -> Result<Self, String> {
         learner_slot(&seats)?;
-        if seats
-            .iter()
-            .flatten()
-            .any(|p| matches!(p, BorrowedArenaPolicy::Mixed(_)))
-        {
+        if seats.iter().flatten().any(|p| {
+            matches!(
+                p,
+                BorrowedArenaPolicy::Mixed(_) | BorrowedArenaPolicy::ContinuedMixed(_)
+            )
+        }) {
             return Err(
                 "Mixed owner requires a distinct native source codec; v1 roster refused".into(),
             );
@@ -48,16 +49,20 @@ impl<'a> FrozenMixedRoster<'a> {
     }
     pub(crate) fn for_current(
         seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
-        parent: &crate::public_rl_mixed_handle::MixedInferenceIdentity,
+        parent: &crate::public_rl_current_mixed_source::CurrentMixedParentIdentity,
     ) -> Result<Self, String> {
         parent.validate()?;
         for p in seats.iter().flatten() {
             match p {
                 BorrowedArenaPolicy::Mixed(owner)
-                    if crate::public_rl_mixed_handle::MixedPolicyHandle::new(owner)?.identity()
-                        != parent =>
+                    if crate::public_policy_mixed_continued::CurrentMixedPolicyHandle::from_initial(owner)?.identity()!=parent =>
                 {
                     return Err("Current mixed opponent is not the actual learner parent".into());
+                }
+                BorrowedArenaPolicy::ContinuedMixed(owner)
+                    if crate::public_policy_mixed_continued::CurrentMixedPolicyHandle::from_continued(owner)?.identity()!=parent =>
+                {
+                    return Err("Continued mixed opponent is not the actual learner parent".into());
                 }
                 BorrowedArenaPolicy::Count1(_) | BorrowedArenaPolicy::Paired(_) => {
                     return Err("Current mixed roster cannot substitute an imported parent".into());
@@ -140,7 +145,11 @@ impl<'a> FrozenMixedRoster<'a> {
     }
 }
 pub(crate) fn legacy_opponent_identity_allowed(policy: &crate::replay::SeatPolicy) -> bool {
-    !matches!(policy, crate::replay::SeatPolicy::PublicRlMixed { .. })
+    !matches!(
+        policy,
+        crate::replay::SeatPolicy::PublicRlMixed { .. }
+            | crate::replay::SeatPolicy::PublicRlContinuedMixed { .. }
+    )
 }
 fn learner_slot<T>(seats: &[Option<T>]) -> Result<usize, String> {
     if !(3..=4).contains(&seats.len()) || seats.iter().filter(|s| s.is_none()).count() != 1 {

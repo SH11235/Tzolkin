@@ -1,11 +1,12 @@
-//! Distinct current-mixed data codec. Only a genuine initial mixed handle is
-//! executable here; continued metadata cannot construct an owner or producer.
+//! Distinct current-mixed data codec. Only a genuine current owner is executable;
+//! continued metadata alone cannot construct an owner or producer.
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::public_policy_episode::{
     ActorLink, AppliedActorStep, applied_mixed_plan, applied_step, canonical_record_checksum,
 };
+use crate::public_policy_mixed_continued::{ContinuedMixedOwner, CurrentMixedPolicyHandle};
 use crate::public_policy_update::{checkpoint_digest, hash};
-use crate::public_rl_mixed_handle::{MixedInferenceIdentity, MixedPolicyHandle};
+use crate::public_rl_mixed_handle::MixedInferenceIdentity;
 use crate::public_rl_mixed_native::{FrozenMixedRoster, FrozenOpponentIdentity};
 use crate::public_stochastic::{RNG_VERSION, UNIFORM_MIXTURE};
 use crate::public_stochastic_native::{
@@ -32,8 +33,8 @@ pub const CONTINUED_SAMPLING_VERSION: &str =
 pub const CONTINUED_TASK: &str = "currentMixedLearnerOwnSumQuarterJointV2";
 pub const MAX_MIXED_UPDATES: u64 = 1_000_000;
 
-/// Count-neutral, closed future-parent metadata. Validation is content-only;
-/// this unit provides no continued owner, handle, sampler or artifact restore.
+/// Count-neutral closed metadata. Validation is content-only, never an owner
+/// constructor, promotion receipt or journal-checked artifact restore.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContinuedMixedIdentity {
@@ -58,6 +59,49 @@ pub struct ContinuedMixedIdentity {
     numerical_target: String,
 }
 impl ContinuedMixedIdentity {
+    pub(crate) fn from_owner(owner: &ContinuedMixedOwner) -> Result<Self, String> {
+        owner.validate_for_inference()?;
+        let identity = Self {
+            schema: CONTINUED_IDENTITY_SCHEMA.into(),
+            policy_version: CONTINUED_POLICY_VERSION.into(),
+            sampling_version: CONTINUED_SAMPLING_VERSION.into(),
+            task: CONTINUED_TASK.into(),
+            artifact_checksum: owner.artifact().checksum().into(),
+            first_mixed_checksum: owner.first_mixed_checksum().into(),
+            parent_artifact_checksum: owner
+                .artifact()
+                .report()
+                .parent_identity()
+                .artifact_checksum()
+                .into(),
+            imported_update_count: owner.imported_update_count(),
+            mixed_update_count: owner.mixed_update_count(),
+            actor_model_version: crate::public_model::MODEL_VERSION.into(),
+            critic_model_version: crate::public_state_critic::MODEL_VERSION.into(),
+            actor_parameters_checksum: hash(
+                b"tzolkin-continued-mixed-inference-actor-v2\0",
+                &owner.actor_model().parameters(),
+            )?,
+            residual_parameters_checksum: hash(
+                b"tzolkin-continued-mixed-inference-residual-v2\0",
+                &owner.residual_parameters(),
+            )?,
+            feature_schema: crate::features::PUBLIC_FEATURE_SCHEMA,
+            input_contract: crate::public_model::INPUT_CONTRACT.into(),
+            context_schema: crate::public_state_critic::CONTEXT_SCHEMA,
+            context_contract: crate::public_state_critic::CONTEXT_CONTRACT.into(),
+            backend: "scalar".into(),
+            numerical_target: numerical_target(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+    pub fn first_mixed_checksum(&self) -> &str {
+        &self.first_mixed_checksum
+    }
+    pub fn policy_version(&self) -> &str {
+        &self.policy_version
+    }
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != CONTINUED_IDENTITY_SCHEMA
             || self.policy_version != CONTINUED_POLICY_VERSION
@@ -123,25 +167,35 @@ impl CurrentMixedParentIdentity {
             Self::ContinuedMixedV2 { policy } => &policy.artifact_checksum,
         }
     }
-    pub(crate) fn require_initial(&self, actual: &MixedInferenceIdentity) -> Result<(), String> {
+    pub(crate) fn require_current(
+        &self,
+        actual: &CurrentMixedPolicyHandle<'_>,
+    ) -> Result<(), String> {
         self.validate()?;
-        match self {
-            Self::InitialMixedV1 { policy } if policy == actual => Ok(()),
-            Self::InitialMixedV1 { .. } => {
-                Err("Current mixed parent differs from genuine handle".into())
-            }
-            Self::ContinuedMixedV2 { .. } => {
-                Err("Continued mixed producer is unavailable before work".into())
-            }
+        if self != actual.identity() {
+            return Err("Current mixed parent differs from genuine handle".into());
         }
+        Ok(())
     }
-    fn binding_key(&self) -> Result<String, String> {
+    pub(crate) fn binding_key(&self) -> Result<String, String> {
         match self {
             Self::InitialMixedV1 { policy } => policy.binding_key(),
-            Self::ContinuedMixedV2 { .. } => Err("Continued mixed sampler is unavailable".into()),
+            Self::ContinuedMixedV2 { policy } => {
+                policy.validate()?;
+                hash(
+                    b"tzolkin-continued-mixed-inference-sampling-binding-v2\0",
+                    policy,
+                )
+            }
         }
     }
-    fn sampling_version(&self) -> &'static str {
+    pub fn policy_version(&self) -> &str {
+        match self {
+            Self::InitialMixedV1 { policy } => policy.policy_version(),
+            Self::ContinuedMixedV2 { policy } => policy.policy_version(),
+        }
+    }
+    pub(crate) fn sampling_version(&self) -> &'static str {
         match self {
             Self::InitialMixedV1 { .. } => crate::public_rl_mixed_handle::SAMPLING_VERSION,
             Self::ContinuedMixedV2 { .. } => CONTINUED_SAMPLING_VERSION,
@@ -162,7 +216,7 @@ pub(crate) struct CurrentMixedSource {
 }
 pub(crate) fn header(
     config: &NativeStochasticConfig,
-    handle: &MixedPolicyHandle<'_>,
+    handle: &CurrentMixedPolicyHandle<'_>,
     roster: &FrozenMixedRoster<'_>,
     consumed: &std::collections::BTreeSet<String>,
 ) -> Result<Header<CurrentMixedSource>, String> {
@@ -170,7 +224,7 @@ pub(crate) fn header(
     if config.players() != roster.players()
         || split_for_family(&family)? != DatasetSplit::Train
         || consumed.contains(&family)
-        || handle.family_closure().any(|f| f == &family)
+        || handle.contains_family(&family)
         || roster.contains_family(&family)
     {
         return Err("Current mixed Train family overlaps closure or roster size".into());
@@ -186,9 +240,7 @@ pub(crate) fn header(
         base_policy: CurrentMixedSource {
             contract: ROSTER_CONTRACT.into(),
             learner_seat: roster.learner_seat(),
-            parent: CurrentMixedParentIdentity::InitialMixedV1 {
-                policy: handle.identity().clone(),
-            },
+            parent: handle.identity().clone(),
             opponents: roster.descriptions().to_vec(),
             roster_checksum: roster.checksum().into(),
             max_opponent_action_rows: config
@@ -199,7 +251,7 @@ pub(crate) fn header(
             max_opponent_search_steps: roster
                 .max_opponent_search_steps(config.limits().max_callbacks())?,
         },
-        sampling_version: crate::public_rl_mixed_handle::SAMPLING_VERSION.into(),
+        sampling_version: handle.sampling_version().into(),
         rng_version: RNG_VERSION.into(),
         denominator_bits: 53,
         uniform_mixture_bits: hex64(UNIFORM_MIXTURE.to_bits()),
@@ -213,7 +265,7 @@ pub(crate) fn header(
 }
 pub(crate) fn collect(
     config: &NativeStochasticConfig,
-    handle: &MixedPolicyHandle<'_>,
+    handle: &CurrentMixedPolicyHandle<'_>,
     roster: &FrozenMixedRoster<'_>,
     header: Header<CurrentMixedSource>,
 ) -> Result<Record<CurrentMixedSource>, String> {
@@ -257,14 +309,11 @@ pub(crate) fn check_record(
 }
 pub(crate) fn audit(
     raw: &[u8],
-    handle: &MixedPolicyHandle<'_>,
+    handle: &CurrentMixedPolicyHandle<'_>,
     roster: &FrozenMixedRoster<'_>,
     header: Header<CurrentMixedSource>,
 ) -> Result<ValidatedCurrentMixedEpisode, String> {
-    header
-        .base_policy
-        .parent
-        .require_initial(handle.identity())?;
+    header.base_policy.parent.require_current(handle)?;
     let expected = check_record(raw, &header)?;
     let config = header.config.checked_config()?;
     let actual = run_current_mixed_shared(&config, handle, roster, header, Some(&expected))?;
@@ -335,6 +384,12 @@ impl ValidatedCurrentMixedEpisode {
     }
     pub fn parent_identity(&self) -> &CurrentMixedParentIdentity {
         &self.record.header.base_policy.parent
+    }
+    pub(crate) fn numerical_target(&self) -> &str {
+        &self.record.header.numerical_target
+    }
+    pub(crate) fn frozen_roster_checksum(&self) -> &str {
+        &self.record.header.base_policy.roster_checksum
     }
     pub fn steps(&self) -> impl ExactSizeIterator<Item = AppliedActorStep<'_>> {
         self.indices.iter().zip(&self.links).map(|(&index, link)| {
@@ -480,6 +535,9 @@ impl ValidatedCurrentMixedCohort {
     pub fn total_learner_singletons(&self) -> usize {
         self.counts[2]
     }
+    pub fn total_observed_callbacks(&self) -> usize {
+        self.observed
+    }
     pub fn receipt_checksum(&self) -> &str {
         &self.checksum
     }
@@ -578,7 +636,7 @@ pub(crate) mod tests {
         PlannedCurrentMixedCohort::new(configs, headers).unwrap()
     }
     #[test]
-    fn current_mixed_codec_keeps_initial_binding_and_refuses_continued_producer() {
+    fn current_mixed_codec_keeps_initial_binding_and_closed_continued_metadata() {
         let old = initial();
         let old_raw = serde_json::to_vec(&old).unwrap();
         let tagged = CurrentMixedParentIdentity::InitialMixedV1 {
@@ -615,8 +673,7 @@ pub(crate) mod tests {
                 policy: serde_json::from_value(wire.clone()).unwrap(),
             };
             parent.validate().unwrap();
-            assert!(parent.require_initial(&old).is_err());
-            assert!(parent.binding_key().is_err());
+            assert!(parent.binding_key().is_ok());
             assert_eq!(parent.imported_update_count(), 1);
             assert_eq!(parent.mixed_update_count(), count);
         }

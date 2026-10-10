@@ -55,6 +55,13 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    /// Count-neutral continued mixed evaluation metadata, never owner admission.
+    PublicRlContinuedMixed {
+        identity: Box<crate::public_rl_current_mixed_source::ContinuedMixedIdentity>,
+        selection_version: String,
+        #[serde(deserialize_with = "required_null")]
+        guard: (),
+    },
     /// Mixed joint owner evaluation only; identity DTOs mint no executable owner.
     PublicRlMixed {
         identity: crate::public_rl_mixed_handle::MixedInferenceIdentity,
@@ -154,11 +161,22 @@ impl SeatPolicy {
                 Some(policy_version)
             }
             Self::PublicRlMixed { identity, .. } => Some(identity.policy_version()),
+            Self::PublicRlContinuedMixed { identity, .. } => Some(identity.policy_version()),
             _ => None,
         }
     }
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PublicRlContinuedMixed {
+                identity,
+                selection_version,
+                guard: (),
+            } => {
+                if selection_version != RL_ARGMAX_SELECTION_VERSION {
+                    return Err("Unsupported continued mixed evaluation selection version".into());
+                }
+                identity.validate()
+            }
             Self::PublicRlMixed {
                 identity,
                 selection_version,

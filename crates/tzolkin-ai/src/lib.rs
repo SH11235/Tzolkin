@@ -21,6 +21,7 @@ pub mod public_policy_episode;
 pub mod public_policy_likelihood;
 pub mod public_policy_long;
 pub mod public_policy_mixed;
+pub mod public_policy_mixed_continued;
 pub mod public_policy_paired;
 pub mod public_policy_paired_long;
 pub mod public_policy_pullback;

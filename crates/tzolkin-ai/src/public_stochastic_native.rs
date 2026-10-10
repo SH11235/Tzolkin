@@ -281,7 +281,7 @@ pub(crate) enum NativePolicy<'handle, 'model> {
     Repeated(&'handle RepeatedPublicRlHandle<'model>),
     Long(&'handle crate::public_rl_native::LongRlHandle<'model>),
     Paired(&'handle crate::public_rl_native::PairedRlHandle<'model>),
-    Mixed(&'handle crate::public_rl_mixed_handle::MixedPolicyHandle<'model>),
+    CurrentMixed(&'handle crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'model>),
 }
 impl<'handle, 'model> NativePolicy<'handle, 'model> {
     fn session(
@@ -302,9 +302,9 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
                 crate::public_stochastic::PairedStochasticSession::new(policy, identity)
                     .map(NativeSession::Paired)
             }
-            Self::Mixed(policy) => {
-                crate::public_stochastic::MixedStochasticSession::new(policy, identity)
-                    .map(NativeSession::Mixed)
+            Self::CurrentMixed(policy) => {
+                crate::public_stochastic::CurrentMixedStochasticSession::new(policy, identity)
+                    .map(NativeSession::CurrentMixed)
             }
         }
     }
@@ -315,7 +315,7 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
             Self::Repeated(_) => REPEATED_SAMPLING_VERSION,
             Self::Long(_) => crate::public_policy_long::SAMPLING_VERSION,
             Self::Paired(_) => crate::public_policy_paired_long::SAMPLING_VERSION,
-            Self::Mixed(_) => crate::public_rl_mixed_handle::SAMPLING_VERSION,
+            Self::CurrentMixed(policy) => policy.sampling_version(),
         }
     }
 }
@@ -325,7 +325,7 @@ enum NativeSession<'handle, 'model> {
     Repeated(RepeatedStochasticSession<'handle, 'model>),
     Long(crate::public_stochastic::LongStochasticSession<'handle, 'model>),
     Paired(crate::public_stochastic::PairedStochasticSession<'handle, 'model>),
-    Mixed(crate::public_stochastic::MixedStochasticSession<'handle, 'model>),
+    CurrentMixed(crate::public_stochastic::CurrentMixedStochasticSession<'handle, 'model>),
 }
 impl NativeSession<'_, '_> {
     fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
@@ -335,7 +335,7 @@ impl NativeSession<'_, '_> {
             Self::Repeated(session) => session.sample(observation),
             Self::Long(session) => session.sample(observation),
             Self::Paired(session) => session.sample(observation),
-            Self::Mixed(session) => session.sample(observation),
+            Self::CurrentMixed(session) => session.sample(observation),
         }
     }
     fn counters(&self) -> SamplingCounters {
@@ -345,7 +345,7 @@ impl NativeSession<'_, '_> {
             Self::Repeated(session) => session.counters(),
             Self::Long(session) => session.counters(),
             Self::Paired(session) => session.counters(),
-            Self::Mixed(session) => session.counters(),
+            Self::CurrentMixed(session) => session.counters(),
         }
     }
     fn stop(&mut self) {
@@ -355,7 +355,7 @@ impl NativeSession<'_, '_> {
             Self::Repeated(session) => session.stop(),
             Self::Long(session) => session.stop(),
             Self::Paired(session) => session.stop(),
-            Self::Mixed(session) => session.stop(),
+            Self::CurrentMixed(session) => session.stop(),
         }
     }
 }
@@ -536,18 +536,15 @@ pub(crate) fn run_frozen_mixed_shared<P: Serialize + PartialEq>(
 
 pub(crate) fn run_current_mixed_shared(
     config: &NativeStochasticConfig,
-    policy: &crate::public_rl_mixed_handle::MixedPolicyHandle<'_>,
+    policy: &crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'_>,
     roster: &crate::public_rl_mixed_native::FrozenMixedRoster<'_>,
     header: Header<crate::public_rl_current_mixed_source::CurrentMixedSource>,
     expected: Option<&Record<crate::public_rl_current_mixed_source::CurrentMixedSource>>,
 ) -> Result<Record<crate::public_rl_current_mixed_source::CurrentMixedSource>, String> {
-    header
-        .base_policy
-        .parent
-        .require_initial(policy.identity())?;
+    header.base_policy.parent.require_current(policy)?;
     run_loop(
         config,
-        NativePolicy::Mixed(policy),
+        NativePolicy::CurrentMixed(policy),
         SamplingActors::CurrentFrozen(roster),
         crate::public_rl_current_mixed_source::RECORD_SCHEMA,
         header,
@@ -614,7 +611,7 @@ fn run_loop<P: Serialize + PartialEq>(
     expected: Option<&Record<P>>,
     mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
 ) -> Result<Record<P>, String> {
-    if matches!(policy, NativePolicy::Mixed(_))
+    if matches!(policy, NativePolicy::CurrentMixed(_))
         != matches!(actors, SamplingActors::CurrentFrozen(_))
     {
         return Err("Current mixed sampler requires its distinct frozen v2 route".into());
