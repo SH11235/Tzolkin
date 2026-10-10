@@ -10,6 +10,8 @@ crate-type = ["cdylib"]
 [dependencies]
 tzolkin-core = { path = "../tzolkin-core" }
 tzolkin-bot = { path = "../tzolkin-bot" }
+tzolkin-inference = { path = "../tzolkin-inference" }
+serde_json = { version = "1", features = ["float_roundtrip"] }
 wasm-bindgen = "=0.2.129"
 
 [features]
