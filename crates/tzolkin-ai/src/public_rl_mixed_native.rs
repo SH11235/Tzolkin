@@ -34,7 +34,7 @@ pub struct FrozenMixedRoster<'a> {
 }
 impl<'a> FrozenMixedRoster<'a> {
     pub fn new(seats: Vec<Option<BorrowedArenaPolicy<'a>>>) -> Result<Self, String> {
-        let learner_seat = learner_slot(&seats)?;
+        learner_slot(&seats)?;
         if seats
             .iter()
             .flatten()
@@ -44,6 +44,39 @@ impl<'a> FrozenMixedRoster<'a> {
                 "Mixed owner requires a distinct native source codec; v1 roster refused".into(),
             );
         }
+        Self::freeze(seats, b"tzolkin-frozen-mixed-roster-v1\0", ROSTER_CONTRACT)
+    }
+    pub(crate) fn for_current(
+        seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
+        parent: &crate::public_rl_mixed_handle::MixedInferenceIdentity,
+    ) -> Result<Self, String> {
+        parent.validate()?;
+        for p in seats.iter().flatten() {
+            match p {
+                BorrowedArenaPolicy::Mixed(owner)
+                    if crate::public_rl_mixed_handle::MixedPolicyHandle::new(owner)?.identity()
+                        != parent =>
+                {
+                    return Err("Current mixed opponent is not the actual learner parent".into());
+                }
+                BorrowedArenaPolicy::Count1(_) | BorrowedArenaPolicy::Paired(_) => {
+                    return Err("Current mixed roster cannot substitute an imported parent".into());
+                }
+                _ => (),
+            }
+        }
+        Self::freeze(
+            seats,
+            b"tzolkin-frozen-current-mixed-roster-v2\0",
+            crate::public_rl_current_mixed_source::ROSTER_CONTRACT,
+        )
+    }
+    fn freeze(
+        seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
+        domain: &[u8],
+        contract: &str,
+    ) -> Result<Self, String> {
+        let learner_seat = learner_slot(&seats)?;
         let opponents = seats
             .into_iter()
             .map(|p| p.map(FrozenReactiveOpponent::new).transpose())
@@ -61,10 +94,7 @@ impl<'a> FrozenMixedRoster<'a> {
                 })
             })
             .collect::<Vec<_>>();
-        let checksum = hash(
-            b"tzolkin-frozen-mixed-roster-v1\0",
-            &(ROSTER_CONTRACT, learner_seat, &descriptions),
-        )?;
+        let checksum = hash(domain, &(contract, learner_seat, &descriptions))?;
         Ok(Self {
             learner_seat,
             opponents,
@@ -87,11 +117,14 @@ impl<'a> FrozenMixedRoster<'a> {
             .and_then(Option::as_ref)
             .ok_or_else(|| "Missing frozen absolute opponent seat".into())
     }
-    fn contains_family(&self, family: &str) -> bool {
+    pub(crate) fn contains_family(&self, family: &str) -> bool {
         self.opponents
             .iter()
             .flatten()
             .any(|p| p.contains_family(family))
+    }
+    pub(crate) fn descriptions(&self) -> &[Option<FrozenOpponentIdentity>] {
+        &self.descriptions
     }
     pub fn max_opponent_search_steps(&self, callbacks: usize) -> Result<usize, String> {
         callbacks
@@ -274,6 +307,19 @@ pub(crate) struct FrozenOpponentIdentity {
     provenance: crate::replay::SeatPolicy,
     dataset_fingerprint: Option<String>,
     model_version: Option<String>,
+}
+#[cfg(test)]
+impl FrozenOpponentIdentity {
+    pub(crate) fn test_heuristic() -> Self {
+        Self {
+            provenance: crate::replay::SeatPolicy::Heuristic {
+                policy_version: crate::POLICY_VERSION.into(),
+                weights: crate::policy::HeuristicWeights::default(),
+            },
+            dataset_fingerprint: None,
+            model_version: None,
+        }
+    }
 }
 
 pub struct CollectedMixedRlGame {

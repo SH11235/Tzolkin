@@ -677,6 +677,112 @@ impl<'a> MixedOneBatchSession<'a> {
     pub fn owner(&self) -> Option<&MixedJointOwner> {
         self.owner.as_ref()
     }
+    pub(crate) fn current_data_context(
+        &self,
+    ) -> Result<(&'a PreparedPublicPolicy, [u64; 2]), String> {
+        if self.progress.phase != Phase::Resolved
+            || self.progress.outcome.as_deref() != Some("updated")
+            || self.progress.unknown_work
+            || self.progress.error.is_some()
+            || self.owner.is_none()
+        {
+            return Err("Current mixed data requires a genuinely resolved updated owner".into());
+        }
+        self.owner
+            .as_ref()
+            .expect("checked owner")
+            .validate_for_inference()?;
+        Ok((self.prepared, [self.prefix[0], self.prefix[1]]))
+    }
+    pub(crate) fn require_current_data_output(&self, output: &Path) -> Result<(), String> {
+        require_output_outside_directory(&self.directory, output)?;
+        require_output_outside_directory(
+            self.progress
+                .source_directory
+                .as_deref()
+                .ok_or("Missing mixed adopted source directory")?,
+            output,
+        )?;
+        if let Some(parent) = self.parent.protected_directory() {
+            require_output_outside_directory(parent, output)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn current_data_snapshot(&self) -> Result<serde_json::Value, String> {
+        self.current_data_context()?;
+        self.require_current_inventory()?;
+        self.usage()?;
+        let source_spec = read_pin(
+            &self.directory,
+            self.progress
+                .source_spec
+                .as_ref()
+                .ok_or("Missing mixed collection spec pin")?,
+            "collection-spec.json",
+            MAX_SPEC_BYTES,
+        )?;
+        let spec = MixedRlCollectionSpec::from_json(&source_spec)?;
+        let source = crate::public_rl_mixed_session::collection_inventory(
+            self.progress
+                .source_directory
+                .as_deref()
+                .ok_or("Missing mixed source")?,
+            spec.wire.max_output_bytes,
+        )?;
+        if serde_json::to_value(&source).map_err(|e| e.to_string())?
+            != *self
+                .progress
+                .source_inventory
+                .as_ref()
+                .and_then(|v| v.get("inventory"))
+                .ok_or("Missing reserved mixed source inventory")?
+            || audit_inventory(&self.directory)? != self.progress.audit_inventory
+        {
+            return Err("Current mixed root source/audit inventory changed".into());
+        }
+        let mut files = Vec::new();
+        let mut previous = String::new();
+        for sequence in 1..=self.sequence {
+            let name = format!("head-{sequence}.json");
+            let raw = read_bounded(&self.directory.join(&name), MAX_HEAD_BYTES)?;
+            let entry: Entry = closed(&raw, MAX_HEAD_BYTES)?;
+            if entry.sequence != sequence || entry.previous != previous {
+                return Err("Current mixed root raw journal chain changed".into());
+            }
+            previous = sha(&raw);
+            if sequence == self.sequence && previous != self.tip {
+                return Err("Current mixed latest raw head changed".into());
+            }
+            files.push(pin(&name, &raw));
+        }
+        let raw = read_bounded(&self.directory.join("training-spec.json"), MAX_SPEC_BYTES)?;
+        let stored: MixedOneBatchSpec = closed(&raw, MAX_SPEC_BYTES)?;
+        if hash(b"tzolkin-mixed-one-batch-spec-v1\0", &stored)? != self.spec_checksum()? {
+            return Err("Current mixed training spec changed".into());
+        }
+        files.push(pin("training-spec.json", &raw));
+        for (p, name, cap) in [
+            (
+                &self.progress.source_spec,
+                "collection-spec.json",
+                MAX_SPEC_BYTES,
+            ),
+            (
+                &self.progress.source_receipt,
+                "source-receipt.json",
+                MAX_SPEC_BYTES,
+            ),
+            (&self.progress.report, "report.json", MAX_HEAD_BYTES),
+            (&self.progress.owner, "artifact.json", ARTIFACT_BYTES),
+        ] {
+            let p = p.as_ref().ok_or("Missing resolved mixed root file pin")?;
+            read_pin(&self.directory, p, name, cap)?;
+            files.push(p.clone());
+        }
+        Ok(
+            serde_json::json!({"rootFiles":files,"auditFiles":self.progress.audit_inventory,"sourceFiles":source}),
+        )
+    }
     pub fn status(&self) -> MixedOneBatchStatus {
         MixedOneBatchStatus {
             schema: JOURNAL_SCHEMA.into(),

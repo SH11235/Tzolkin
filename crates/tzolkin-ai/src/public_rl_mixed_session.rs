@@ -163,7 +163,7 @@ impl ImportedMixedRlParent {
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
-enum OpponentSpec {
+pub(crate) enum OpponentSpec {
     Heuristic,
     CornFirstSetup,
     CornFirstUxmalOpening,
@@ -173,26 +173,29 @@ enum OpponentSpec {
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MixedRlSpecWire {
-    schema: String,
-    catalog_hash: String,
-    configurations: [Config; 4],
-    rosters: [Vec<Option<OpponentSpec>>; 4],
-    weights: HeuristicWeights,
-    search: SearchConfig,
-    max_output_bytes: u64,
+pub(crate) struct MixedRlSpecWire {
+    pub(crate) schema: String,
+    pub(crate) catalog_hash: String,
+    pub(crate) configurations: [Config; 4],
+    pub(crate) rosters: [Vec<Option<OpponentSpec>>; 4],
+    pub(crate) weights: HeuristicWeights,
+    pub(crate) search: SearchConfig,
+    pub(crate) max_output_bytes: u64,
 }
 /// Opaque checked spec. Only from_json can mint it; serde cannot discard
 /// unknown opponent payloads or bypass catalog/schema/whole-four reservations.
 #[derive(Clone)]
 pub struct MixedRlCollectionSpec {
-    wire: MixedRlSpecWire,
+    pub(crate) wire: MixedRlSpecWire,
 }
 impl MixedRlCollectionSpec {
     pub(crate) fn to_json(&self) -> Result<Vec<u8>, String> {
         serde_json::to_vec(&self.wire).map_err(|e| e.to_string())
     }
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
+        Self::from_json_schema(raw, SPEC_SCHEMA)
+    }
+    pub(crate) fn from_json_schema(raw: &[u8], schema: &str) -> Result<Self, String> {
         let value = unique_json(raw, MAX_SPEC_BYTES)?;
         if !value
             .get("rosters")
@@ -220,7 +223,7 @@ impl MixedRlCollectionSpec {
         };
         s.wire.weights.validate()?;
         s.wire.search.validate()?;
-        if s.wire.schema != SPEC_SCHEMA
+        if s.wire.schema != schema
             || s.wire.catalog_hash != crate::replay::catalog_hash()
             || !(4 * MAX_RECORD_BYTES as u64 + METADATA_RESERVE..=512 * 1024 * 1024)
                 .contains(&s.wire.max_output_bytes)
@@ -242,7 +245,7 @@ impl MixedRlCollectionSpec {
         }
         Ok(s)
     }
-    fn configs(&self) -> Result<[NativeStochasticConfig; 4], String> {
+    pub(crate) fn configs(&self) -> Result<[NativeStochasticConfig; 4], String> {
         self.wire
             .configurations
             .iter()
@@ -541,10 +544,10 @@ fn require_imported_output(
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct FilePin {
-    name: String,
-    bytes: usize,
-    sha256: String,
+pub(crate) struct FilePin {
+    pub(crate) name: String,
+    pub(crate) bytes: usize,
+    pub(crate) sha256: String,
 }
 fn expected_collection_names() -> Vec<String> {
     let mut expected = vec!["plan.json".to_owned(), "collection.json".to_owned()];
@@ -578,7 +581,7 @@ fn bounded_inventory_names(
     }
     Ok(names)
 }
-fn collection_inventory(dir: &Path, cap: u64) -> Result<Vec<FilePin>, String> {
+pub(crate) fn collection_inventory(dir: &Path, cap: u64) -> Result<Vec<FilePin>, String> {
     let entries = fs::read_dir(dir)
         .map_err(|e| e.to_string())?
         .map(|entry| entry.map(|e| e.file_name()).map_err(|e| e.to_string()));
@@ -655,7 +658,7 @@ pub struct MixedRlCollectionReport {
     updated_owners: usize,
     recollection_available: bool,
 }
-fn read_pin(dir: &Path, pin: &FilePin, cap: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn read_pin(dir: &Path, pin: &FilePin, cap: usize) -> Result<Vec<u8>, String> {
     if pin.name.is_empty()
         || pin.name.len() > 64
         || !pin
@@ -672,23 +675,30 @@ fn read_pin(dir: &Path, pin: &FilePin, cap: usize) -> Result<Vec<u8>, String> {
     }
     Ok(raw)
 }
-struct Writer<'a> {
+pub(crate) struct Writer<'a> {
     dir: &'a Path,
     bytes: u64,
     cap: u64,
     files: usize,
+    pins: Vec<FilePin>,
 }
 impl<'a> Writer<'a> {
-    fn new(dir: &'a Path, cap: u64) -> Result<Self, String> {
+    pub(crate) fn new(dir: &'a Path, cap: u64) -> Result<Self, String> {
         fs::create_dir(dir).map_err(|e| e.to_string())?;
         Ok(Self {
             dir,
             bytes: 0,
             cap,
             files: 0,
+            pins: Vec::new(),
         })
     }
-    fn raw(&mut self, name: &str, raw: &[u8], per_file: usize) -> Result<FilePin, String> {
+    pub(crate) fn raw(
+        &mut self,
+        name: &str,
+        raw: &[u8],
+        per_file: usize,
+    ) -> Result<FilePin, String> {
         use std::io::Write;
         let total = self
             .bytes
@@ -707,13 +717,26 @@ impl<'a> Writer<'a> {
             .map_err(|e| e.to_string())?;
         self.bytes = total;
         self.files += 1;
-        Ok(FilePin {
+        let pin = FilePin {
             name: name.into(),
             bytes: raw.len(),
             sha256: sha(raw),
-        })
+        };
+        self.pins.push(pin.clone());
+        Ok(pin)
     }
-    fn save(&mut self, name: &str, value: &impl Serialize) -> Result<FilePin, String> {
+    pub(crate) fn require_current(&self) -> Result<(), String> {
+        for pin in &self.pins {
+            read_pin(self.dir, pin, pin.bytes)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn pinned_inventory(&self) -> Vec<FilePin> {
+        let mut pins = self.pins.clone();
+        pins.sort_by(|a, b| a.name.cmp(&b.name));
+        pins
+    }
+    pub(crate) fn save(&mut self, name: &str, value: &impl Serialize) -> Result<FilePin, String> {
         self.raw(
             name,
             &serde_json::to_vec(value).map_err(|e| e.to_string())?,
