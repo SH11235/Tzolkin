@@ -1,0 +1,1630 @@
+//! Source-bound, policy-only learning of the observed two-of-four initial choice.
+//! This seat-marginal task does not reconstruct a Playing observation or admit a
+//! whole human replay. Externally pinned atlas declarations bind local content;
+//! checksums neither authenticate its producer nor perform image recognition.
+use crate::dataset::{DatasetSplit, split_for_family};
+use crate::model::{digest, dot, policy_softmax, write_new_json};
+use crate::public_model::ValueValidity;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use tzolkin_core::catalog::wealth;
+use tzolkin_core::{Effect, FeedWorkers, Resource, Target, TechnologyId, TempleId};
+
+pub const TASK: &str = "InitialWealthTwoOfFour";
+pub const FEATURE_SCHEMA: &str = "catalog-initial-wealth-pair-effects-v1";
+pub const MODEL_SCHEMA: &str = "tzolkin-human-initial-wealth-logit-v1";
+pub const INPUT_SCHEMA: &str = "tzolkin-human-initial-wealth-source-manifest-v1";
+pub const ATLAS_SCHEMA: &str = "tzolkin-initial-wealth-atlas-calibration-v1";
+pub const NOMINATION_SCHEMA: &str = "tzolkin-human-player-nomination-v1";
+pub const FEATURE_COUNT: usize = 20;
+const PAIRS: [[usize; 2]; 6] = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ROWS: usize = 10_000;
+const MAX_CANDIDATE_EVALUATIONS: usize = 10_000_000;
+const MAX_SOURCE_MOVE: usize = 100_000;
+const CAPTURE_SCHEMA: &str = "tzolkin-bga-public-initial-selection-observation-v1";
+const SELECTION_PROMPT: &str = "あなたは初期財産タイルを2個選んでください";
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContentPin {
+    pub path: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AtlasEntry {
+    archive_release: String,
+    sprite: [i64; 2],
+    catalog_id: String,
+    calibration_image: ContentPin,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AtlasWire {
+    schema: String,
+    catalog_hash: String,
+    entries: Vec<AtlasEntry>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NominationWire {
+    schema: String,
+    basis: String,
+    player_ids: Vec<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SourceWire {
+    before: ContentPin,
+    after: ContentPin,
+    setup_complete_board: Option<ContentPin>,
+    post_choice_metadata: Option<ContentPin>,
+    table_ui: Option<ContentPin>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManifestWire {
+    schema: String,
+    atlas: ContentPin,
+    nominations: ContentPin,
+    sources: Vec<SourceWire>,
+    held_out_family: Option<String>,
+}
+
+fn checksum(value: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        Ok(())
+    } else {
+        Err("Expected lowercase SHA-256".into())
+    }
+}
+fn decimal(value: &str) -> Result<String, String> {
+    if value.is_empty()
+        || value.len() > 16
+        || value.starts_with('0')
+        || !value.bytes().all(|c| c.is_ascii_digit())
+    {
+        return Err("Invalid source identity".into());
+    }
+    Ok(value.into())
+}
+fn identity(value: &Value) -> Result<String, String> {
+    if let Some(value) = value.as_str() {
+        decimal(value)
+    } else if let Some(value) = value.as_u64() {
+        decimal(&value.to_string())
+    } else {
+        Err("Invalid source identity".into())
+    }
+}
+fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str, String> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| format!("Missing string field: {field}"))
+}
+fn array<'a>(value: &'a Value, field: &str) -> Result<&'a [Value], String> {
+    value[field]
+        .as_array()
+        .map(Vec::as_slice)
+        .ok_or_else(|| format!("Missing array: {field}"))
+}
+fn local_path(path: &Path) -> Result<(), String> {
+    let s = path.to_str().ok_or("Invalid local path")?;
+    if s.is_empty()
+        || s.contains('\0')
+        || s.contains("://")
+        || s.starts_with("\\\\")
+        || s.starts_with("//")
+        || path.components().any(|c| c == Component::ParentDir)
+    {
+        return Err("Expected a local path without parent traversal".into());
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    for ancestor in absolute.ancestors() {
+        if let Ok(info) = fs::symlink_metadata(ancestor) {
+            if info.file_type().is_symlink() {
+                return Err("Local evidence symlink hierarchy rejected".into());
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if info.file_attributes() & 0x400 != 0 {
+                    return Err("Local evidence reparse hierarchy rejected".into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn read_pin(pin: &ContentPin, base: &Path, total: &mut u64) -> Result<Vec<u8>, String> {
+    checksum(&pin.sha256)?;
+    if pin.bytes == 0 || pin.bytes > MAX_FILE_BYTES {
+        return Err("Evidence file size outside bound".into());
+    }
+    let supplied = Path::new(&pin.path);
+    local_path(supplied)?;
+    let path = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        base.join(supplied)
+    };
+    local_path(&path)?;
+    let info = fs::symlink_metadata(&path).map_err(|e| format!("Cannot read evidence: {e}"))?;
+    if !info.is_file() || info.len() != pin.bytes {
+        return Err("Evidence file size/type mismatch".into());
+    }
+    *total = total
+        .checked_add(pin.bytes)
+        .ok_or("Evidence budget overflow")?;
+    if *total > MAX_TOTAL_BYTES {
+        return Err("Aggregate evidence budget exceeded".into());
+    }
+    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 != pin.bytes || digest(&bytes) != pin.sha256 {
+        return Err("Evidence content pin mismatch".into());
+    }
+    Ok(bytes)
+}
+fn load_json(bytes: &[u8]) -> Result<Value, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("Invalid evidence JSON: {e}"))
+}
+fn release(value: &str) -> Result<(), String> {
+    if value.len() != 11
+        || value.as_bytes()[6] != b'-'
+        || value
+            .bytes()
+            .enumerate()
+            .any(|(i, c)| i != 6 && !c.is_ascii_digit())
+    {
+        return Err("Invalid archive release".into());
+    }
+    Ok(())
+}
+#[derive(Debug, PartialEq, Eq)]
+struct ArchiveIdentity {
+    release: String,
+    table: String,
+    player: String,
+}
+fn archive_url(url: &str) -> Result<ArchiveIdentity, String> {
+    let stripped = url
+        .strip_prefix("https://")
+        .ok_or("Expected HTTPS public archive")?;
+    let (host, rest) = stripped
+        .split_once('/')
+        .ok_or("Invalid public archive URL")?;
+    if ![
+        "boardgamearena.com",
+        "ja.boardgamearena.com",
+        "en.boardgamearena.com",
+    ]
+    .contains(&host)
+    {
+        return Err("Unexpected archive host".into());
+    }
+    let (path, query) = rest.split_once('?').ok_or("Archive query missing")?;
+    let r = path
+        .strip_prefix("archive/replay/")
+        .and_then(|s| s.strip_suffix('/'))
+        .ok_or("Expected public replay path")?;
+    release(r)?;
+    let mut params = BTreeMap::new();
+    for p in query.split('&') {
+        let (key, value) = p.split_once('=').ok_or("Invalid archive query")?;
+        if !["table", "player", "comments"].contains(&key) || params.insert(key, value).is_some() {
+            return Err("Unexpected/duplicate archive query".into());
+        }
+    }
+    Ok(ArchiveIdentity {
+        release: r.into(),
+        table: decimal(params.get("table").ok_or("Missing archive table")?)?,
+        player: decimal(params.get("player").ok_or("Missing archive player")?)?,
+    })
+}
+fn attribute<'a>(opening: &'a str, key: &str) -> Result<&'a str, String> {
+    let token = format!(" {key}=\"");
+    if opening.matches(&token).count() != 1 {
+        return Err(format!("Missing/duplicate HTML {key}"));
+    }
+    let at = opening.find(&token).ok_or("Missing HTML attribute")? + token.len();
+    opening[at..]
+        .split_once('"')
+        .map(|(value, _)| value)
+        .ok_or("Unterminated HTML attribute".into())
+}
+fn css_number(style: &str, key: &str) -> Result<i64, String> {
+    let values: Vec<_> = style
+        .split(';')
+        .filter_map(|d| d.trim().split_once(':'))
+        .filter(|(k, _)| k.trim() == key)
+        .collect();
+    if values.len() != 1 {
+        return Err("Missing/duplicate CSS token".into());
+    }
+    values[0]
+        .1
+        .trim()
+        .strip_suffix("px")
+        .ok_or("Expected CSS pixels")?
+        .parse()
+        .map_err(|_| "Uncalibrated CSS number".into())
+}
+fn sprite(style: &str) -> Result<[i64; 2], String> {
+    let values: Vec<_> = style
+        .split(';')
+        .filter_map(|d| d.trim().split_once(':'))
+        .filter(|(k, _)| k.trim() == "background-position")
+        .collect();
+    if values.len() != 1 {
+        return Err("Missing/duplicate tile sprite".into());
+    }
+    let tokens: Vec<_> = values[0].1.split_whitespace().collect();
+    if tokens.len() != 2 {
+        return Err("Expected two sprite coordinates".into());
+    }
+    let parse = |s: &str| {
+        s.strip_suffix("px")
+            .ok_or("Expected sprite pixels")?
+            .parse::<i64>()
+            .map_err(|_| "Invalid sprite coordinate".to_owned())
+    };
+    Ok([parse(tokens[0])?, parse(tokens[1])?])
+}
+#[derive(Clone)]
+struct Tile {
+    id: String,
+    sprite: [i64; 2],
+}
+fn tile(opening: &str, active: bool) -> Result<Tile, String> {
+    let id = attribute(opening, "id")?;
+    decimal(
+        id.strip_prefix("wealth_tile_")
+            .ok_or("Expected wealth tile element")?,
+    )?;
+    let classes: Vec<_> = attribute(opening, "class")?.split_whitespace().collect();
+    if !classes.contains(&"wealth_tile") || (active && !classes.contains(&"active")) {
+        return Err("Offered tile is not visibly active".into());
+    }
+    Ok(Tile {
+        id: id.into(),
+        sprite: sprite(attribute(opening, "style")?)?,
+    })
+}
+fn panel_tiles(html: &str) -> Result<Vec<Tile>, String> {
+    let mut found = Vec::new();
+    let mut tail = html;
+    while let Some(at) = tail.find("<div ") {
+        tail = &tail[at..];
+        let end = tail.find('>').ok_or("Unterminated HTML div")?;
+        let opening = &tail[..end + 1];
+        if opening.contains("class=\"wealth_tile") {
+            found.push(tile(opening, false)?);
+        }
+        tail = &tail[end + 1..];
+    }
+    Ok(found)
+}
+fn own_panel<'a>(capture: &'a Value, actor: &str) -> Result<&'a str, String> {
+    let wanted = format!("player_wealthtiles_{actor}");
+    if let Some(panels) = capture["selectedPlayerTiles"].as_array() {
+        let matching: Vec<_> = panels
+            .iter()
+            .filter(|p| p["id"].as_str() == Some(&wanted))
+            .collect();
+        if matching.len() != 1 {
+            return Err("Missing/duplicate chosen-player panel".into());
+        }
+        let html = text(matching[0], "html")?;
+        let opening = &html[..html.find('>').ok_or("Invalid chosen panel HTML")? + 1];
+        if attribute(opening, "id")? != wanted
+            || !attribute(opening, "class")?
+                .split_whitespace()
+                .any(|c| c == "player_wealthtiles")
+        {
+            return Err("Chosen panel HTML identity mismatch".into());
+        }
+        return Ok(html);
+    }
+    let area = text(capture, "gameAreaHtml")?;
+    let prefix = format!("<div id=\"{wanted}\"");
+    if area.matches(&prefix).count() != 1 {
+        return Err("Missing/duplicate initial player panel".into());
+    }
+    let start = area.find(&prefix).ok_or("Missing initial panel")?;
+    let end = area[start..]
+        .find("</div>")
+        .ok_or("Unterminated initial panel")?
+        + start
+        + 6;
+    Ok(&area[start..end])
+}
+fn move_number(capture: &Value) -> Result<usize, String> {
+    text(capture, "move")?
+        .strip_prefix("Move #")
+        .ok_or("Missing replay move")?
+        .parse()
+        .map_err(|_| "Invalid replay move".into())
+}
+fn capture_time(capture: &Value) -> Result<&str, String> {
+    let value = text(capture, "capturedAt")?;
+    let separators = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'.'),
+        (23, b'Z'),
+    ];
+    if value.len() != 24
+        || value.bytes().enumerate().any(|(i, c)| {
+            separators
+                .iter()
+                .find(|(j, _)| i == *j)
+                .map_or(!c.is_ascii_digit(), |(_, expected)| c != *expected)
+        })
+    {
+        return Err("Expected fixed-width UTC capture time".into());
+    }
+    Ok(value)
+}
+
+type Atlas = BTreeMap<(String, [i64; 2]), String>;
+fn decode_choice(
+    before: &Value,
+    after: &Value,
+    atlas: &Atlas,
+) -> Result<(ArchiveIdentity, InitialChoiceInput, usize, usize), String> {
+    if text(before, "schema")? != CAPTURE_SCHEMA
+        || text(after, "schema")? != CAPTURE_SCHEMA
+        || text(before, "header")? != SELECTION_PROMPT
+        || capture_time(before)? >= capture_time(after)?
+    {
+        return Err("Unsupported initial-choice capture/instruction".into());
+    }
+    let id = archive_url(text(before, "url")?)?;
+    if archive_url(text(after, "url")?)? != id
+        || identity(&before["viewPlayerId"])? != id.player
+        || (!after["viewPlayerId"].is_null() && identity(&after["viewPlayerId"])? != id.player)
+        || (!before["tableId"].is_null() && identity(&before["tableId"])? != id.table)
+        || (!after["tableId"].is_null() && identity(&after["tableId"])? != id.table)
+    {
+        return Err("Initial-choice actor/table/archive mismatch".into());
+    }
+    let names = array(before, "playerPanels")?;
+    let roster: BTreeSet<_> = names
+        .iter()
+        .map(|p| {
+            text(p, "id")?
+                .strip_prefix("player_name_")
+                .ok_or_else(|| "Expected pre-choice player name panel".to_owned())
+                .and_then(decimal)
+        })
+        .collect::<Result<_, _>>()?;
+    if !(3..=4).contains(&names.len())
+        || roster.len() != names.len()
+        || !roster.contains(&id.player)
+    {
+        return Err("Initial-choice roster is not unique 3-4p".into());
+    }
+    let before_move = move_number(before)?;
+    let after_move = move_number(after)?;
+    if before_move == 0
+        || after_move <= before_move
+        || after_move > MAX_SOURCE_MOVE
+        || !panel_tiles(own_panel(before, &id.player)?)?.is_empty()
+    {
+        return Err("Choice was not witnessed before selection".into());
+    }
+    let offers = array(before, "offers")?;
+    if offers.len() != 4 {
+        return Err("Four offered faces required".into());
+    }
+    let area = text(before, "gameAreaHtml")?;
+    let offer_area = text(before, "wealthTilesHtml")?;
+    let mut captured = Vec::new();
+    let mut catalog_ids = Vec::new();
+    for offer in offers {
+        let html = text(offer, "html")?;
+        let end = html.find('>').ok_or("Invalid offered tile HTML")?;
+        let parsed = tile(&html[..end + 1], true)?;
+        if offer["visible"].as_bool() != Some(true)
+            || text(offer, "id")? != parsed.id
+            || html[end + 1..].trim() != "</div>"
+            || !area.contains(html)
+            || !offer_area.contains(html)
+        {
+            return Err("Offered face disagrees with retained visible DOM".into());
+        }
+        let catalog = atlas
+            .get(&(id.release.clone(), parsed.sprite))
+            .ok_or("Uncalibrated sprite/archive release")?;
+        catalog_ids.push(catalog.clone());
+        captured.push(parsed);
+    }
+    if captured
+        .iter()
+        .map(|t| &t.id)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 4
+        || panel_tiles(offer_area)?.len() != 4
+    {
+        return Err("Incomplete/duplicate four-offer panel".into());
+    }
+    let input = InitialChoiceInput::new(
+        catalog_ids
+            .try_into()
+            .map_err(|_| "Four catalog faces required")?,
+    )?;
+    let chosen_panel = own_panel(after, &id.player)?;
+    if !text(after, "gameAreaHtml")?.contains(chosen_panel) {
+        return Err("Chosen panel differs from retained game DOM".into());
+    }
+    let chosen = panel_tiles(chosen_panel)?;
+    if chosen.len() != 2 || chosen[0].id == chosen[1].id {
+        return Err("Exactly two distinct selected tiles required".into());
+    }
+    let indices: Vec<_> = chosen
+        .iter()
+        .map(|t| {
+            captured
+                .iter()
+                .position(|o| o.id == t.id && o.sprite == t.sprite)
+                .ok_or("Selected tile is outside the calibrated offer")
+        })
+        .collect::<Result<_, _>>()?;
+    let index = PAIRS
+        .iter()
+        .position(|p| p.contains(&indices[0]) && p.contains(&indices[1]))
+        .ok_or("Selected pair is not unique in six candidates")?;
+    Ok((id, input, index, roster.len()))
+}
+
+#[derive(Clone, Debug)]
+pub struct InitialChoiceInput {
+    offers: [String; 4],
+}
+impl InitialChoiceInput {
+    /// Task-local catalog input, never a full-state feature or source-admission constructor.
+    pub fn new(offers: [String; 4]) -> Result<Self, String> {
+        if offers.iter().any(|id| wealth(id).is_none())
+            || offers.iter().collect::<BTreeSet<_>>().len() != 4
+        {
+            return Err("Four distinct bundled wealth IDs required".into());
+        }
+        Ok(Self { offers })
+    }
+    pub fn offers(&self) -> &[String; 4] {
+        &self.offers
+    }
+    pub fn candidates(&self) -> [[String; 2]; 6] {
+        PAIRS.map(|[a, b]| [self.offers[a].clone(), self.offers[b].clone()])
+    }
+    fn features(&self) -> Result<[[f32; FEATURE_COUNT]; 6], String> {
+        let mut rows = [[0.0; FEATURE_COUNT]; 6];
+        for (row, [a, b]) in rows.iter_mut().zip(PAIRS) {
+            let gains = Gains::pair([&self.offers[a], &self.offers[b]])?;
+            let r = gains.resources.map(|v| v as f32);
+            *row = [
+                r[0] / 10.0,
+                r[1] / 3.0,
+                r[2] / 3.0,
+                r[3] / 3.0,
+                r[4],
+                gains.workers as f32,
+                gains.feed as f32 / 2.0,
+                gains.temples[0] as f32 / 2.0,
+                gains.temples[1] as f32 / 2.0,
+                gains.temples[2] as f32 / 2.0,
+                gains.technologies[0] as f32 / 2.0,
+                gains.technologies[1] as f32 / 2.0,
+                gains.technologies[2] as f32 / 2.0,
+                gains.technologies[3] as f32 / 2.0,
+                r[0] * gains.workers as f32 / 10.0,
+                r[0] * r[4] / 10.0,
+                r[1] * gains.technologies[1] as f32 / 3.0,
+                r[0] * gains.technologies[0] as f32 / 10.0,
+                gains.feed as f32 * gains.workers as f32 / 2.0,
+                (gains.technologies.iter().sum::<i64>() as f32).powi(2) / 4.0,
+            ];
+        }
+        Ok(rows)
+    }
+}
+fn best_pair(input: &InitialChoiceInput, logits: &[f32; 6]) -> usize {
+    let keys = input.candidates().map(|mut pair| {
+        pair.sort();
+        pair
+    });
+    (1..6).fold(0, |best, i| {
+        if logits[i] > logits[best] || (logits[i] == logits[best] && keys[i] < keys[best]) {
+            i
+        } else {
+            best
+        }
+    })
+}
+#[derive(Default)]
+struct Gains {
+    resources: [i64; 5],
+    workers: i64,
+    feed: i64,
+    temples: [i64; 3],
+    technologies: [i64; 4],
+}
+impl Gains {
+    fn pair(ids: [&str; 2]) -> Result<Self, String> {
+        let mut out = Self::default();
+        for id in ids {
+            let tile = wealth(id).ok_or("Unknown bundled wealth ID")?;
+            for (i, resource) in [
+                Resource::Corn,
+                Resource::Wood,
+                Resource::Stone,
+                Resource::Gold,
+                Resource::Skull,
+            ]
+            .iter()
+            .enumerate()
+            {
+                out.resources[i] += tile.resources.get(resource).copied().unwrap_or(0);
+            }
+            for effect in &tile.effects {
+                match effect {
+                    Effect::Worker => out.workers += 1,
+                    Effect::Feed {
+                        workers: FeedWorkers::Count(n),
+                    } => out.feed += *n,
+                    Effect::Temple {
+                        temple: Target::Specific(t),
+                        steps,
+                    } => {
+                        let i = [TempleId::Chaac, TempleId::Quetzalcoatl, TempleId::Kukulkan]
+                            .iter()
+                            .position(|v| v == t)
+                            .ok_or("Unknown temple")?;
+                        out.temples[i] += steps.unwrap_or(1);
+                    }
+                    Effect::Technology {
+                        technology: Target::Specific(t),
+                        steps,
+                    } => {
+                        let i = [
+                            TechnologyId::Agriculture,
+                            TechnologyId::Extraction,
+                            TechnologyId::Architecture,
+                            TechnologyId::Theology,
+                        ]
+                        .iter()
+                        .position(|v| v == t)
+                        .ok_or("Unknown technology")?;
+                        out.technologies[i] += steps.unwrap_or(1);
+                    }
+                    _ => return Err("Unsupported bundled starting-wealth effect".into()),
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+fn selected_crosscheck(
+    board: &Value,
+    id: &ArchiveIdentity,
+    input: &InitialChoiceInput,
+    chosen: usize,
+    after: &Value,
+) -> Result<(), String> {
+    if text(board, "schema")? != "tzolkin-bga-public-playing-initial-board-witness-v1"
+        || archive_url(text(board, "url")?)? != *id
+        || move_number(board)? != move_number(after)?
+        || !text(board, "visibleLogText")?.contains("各プレイヤーは対応する資源を手に入れた")
+        || array(board, "gearWorkerNodes")?
+            .iter()
+            .any(|w| !text(w, "id").is_ok_and(|id| id.starts_with("worker_dummy_")))
+    {
+        return Err("Counter cross-check is not a setup-complete pre-placement witness".into());
+    }
+    let gains = Gains::pair(input.candidates()[chosen].each_ref().map(String::as_str))?;
+    let counters = array(board, "publicCounters")?;
+    for (label, expected) in ["corn", "wood", "stone", "gold", "skull", "worker"]
+        .iter()
+        .zip(gains.resources.into_iter().chain([3 + gains.workers]))
+    {
+        let wanted = format!("{label}_number_player_{}", id.player);
+        let found: Vec<_> = counters
+            .iter()
+            .filter(|c| c["id"].as_str() == Some(&wanted))
+            .collect();
+        if found.len() != 1
+            || text(found[0], "valueText")?.parse::<i64>().ok() != Some(expected)
+            || found[0]["visible"].as_bool() != Some(true)
+        {
+            return Err("Chosen artwork differs from initial resource/worker counters".into());
+        }
+        let html = text(found[0], "html")?;
+        let end = html.find('>').ok_or("Invalid counter HTML")?;
+        if attribute(&html[..end + 1], "id")? != wanted
+            || html[end + 1..].trim() != format!("{expected}</span>")
+            || !html.starts_with("<span ")
+        {
+            return Err("Counter declaration differs from retained counter DOM".into());
+        }
+    }
+    for (field, names, expected, css_key, start, stride) in [
+        (
+            "templeMarkers",
+            vec!["chaac", "quetzalcoatl", "kukulcan"],
+            gains.temples.to_vec(),
+            "top",
+            191,
+            -24,
+        ),
+        (
+            "technologyMarkers",
+            vec!["agriculture", "extraction", "architecture", "theology"],
+            gains.technologies.to_vec(),
+            "left",
+            1,
+            37,
+        ),
+    ] {
+        let markers = array(board, field)?;
+        let kind = if field == "templeMarkers" {
+            "temple"
+        } else {
+            "technology"
+        };
+        for (name, level) in names.iter().zip(expected) {
+            let wanted = format!("marker_{}_{kind}_{name}", id.player);
+            let found: Vec<_> = markers
+                .iter()
+                .filter(|m| m["id"].as_str() == Some(&wanted))
+                .collect();
+            if found.len() != 1 {
+                return Err("Missing/duplicate initial marker".into());
+            }
+            let html = text(found[0], "html")?;
+            let opening = &html[..html.find('>').ok_or("Invalid marker HTML")? + 1];
+            if attribute(opening, "id")? != wanted
+                || css_number(attribute(opening, "style")?, css_key)? != start + stride * level
+            {
+                return Err("Chosen artwork differs from initial temple/technology markers".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialRowReport {
+    pub table_family_id: String,
+    pub split: DatasetSplit,
+    pub source_actor: String,
+    pub archive_release: String,
+    pub player_count: usize,
+    pub offers: [String; 4],
+    pub candidates: [[String; 2]; 6],
+    pub chosen: usize,
+    pub stratum: String,
+    pub mode: Option<String>,
+    pub initial_seat: Option<usize>,
+    pub first_player: Option<String>,
+    pub post_choice_inferred_seat: Option<usize>,
+    pub unknown_mechanics: [Option<bool>; 4],
+    pub value_target: (),
+    pub counter_crosscheck: bool,
+    pub before_sha256: String,
+    pub after_sha256: String,
+}
+struct ValidatedRow {
+    input: InitialChoiceInput,
+    report: InitialRowReport,
+}
+/// Rows have no Deserialize or raw-feature constructor; load revalidates their pinned source.
+pub struct ValidatedInitialDataset {
+    rows: Vec<ValidatedRow>,
+    manifest_sha256: String,
+    atlas_sha256: String,
+    nomination_sha256: String,
+    held_out_family: Option<String>,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialDatasetReport {
+    pub schema: String,
+    pub task: String,
+    pub feature_schema: String,
+    pub manifest_sha256: String,
+    pub atlas_sha256: String,
+    pub nomination_sha256: String,
+    pub split_policy: String,
+    pub held_out_family: Option<String>,
+    pub rows: Vec<InitialRowReport>,
+    pub samples: [usize; 3],
+    pub families: [usize; 3],
+    pub value_rows: usize,
+    pub full_replay_admitted: bool,
+    pub limitations: Vec<String>,
+}
+fn split_index(split: DatasetSplit) -> usize {
+    match split {
+        DatasetSplit::Train => 0,
+        DatasetSplit::Validation => 1,
+        DatasetSplit::Test => 2,
+    }
+}
+pub fn table_family_id(table: &str) -> Result<String, String> {
+    decimal(table)?;
+    Ok(digest(
+        format!("tzolkin-human-initial-table-family-v1\0{table}").as_bytes(),
+    ))
+}
+fn family_split(family: &str, held_out: Option<&str>) -> Result<DatasetSplit, String> {
+    checksum(family)?;
+    if let Some(held_out) = held_out {
+        checksum(held_out)?;
+        Ok(if family == held_out {
+            DatasetSplit::Validation
+        } else {
+            DatasetSplit::Train
+        })
+    } else {
+        split_for_family(family)
+    }
+}
+impl ValidatedInitialDataset {
+    /// Atlas and nomination SHA arguments are external pins, not accepted flags
+    /// inside the source manifest. Atlas visual calibration is an external review.
+    pub fn load(
+        manifest_path: &Path,
+        manifest_sha256: &str,
+        atlas_sha256: &str,
+        nomination_sha256: &str,
+    ) -> Result<Self, String> {
+        for sha in [manifest_sha256, atlas_sha256, nomination_sha256] {
+            checksum(sha)?;
+        }
+        local_path(manifest_path)?;
+        let metadata = fs::symlink_metadata(manifest_path).map_err(|e| e.to_string())?;
+        let pin = ContentPin {
+            path: manifest_path.to_string_lossy().into(),
+            bytes: metadata.len(),
+            sha256: manifest_sha256.into(),
+        };
+        let mut total = 0;
+        let bytes = read_pin(&pin, Path::new("."), &mut total)?;
+        let manifest: ManifestWire = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if manifest.schema != INPUT_SCHEMA
+            || manifest.sources.is_empty()
+            || manifest.sources.len() > MAX_ROWS
+            || manifest.atlas.sha256 != atlas_sha256
+            || manifest.nominations.sha256 != nomination_sha256
+        {
+            return Err("Initial dataset manifest/external pin mismatch".into());
+        }
+        if let Some(family) = &manifest.held_out_family {
+            checksum(family)?;
+        }
+        let base = manifest_path.parent().unwrap_or(Path::new("."));
+        let atlas_bytes = read_pin(&manifest.atlas, base, &mut total)?;
+        let atlas_wire: AtlasWire =
+            serde_json::from_slice(&atlas_bytes).map_err(|e| e.to_string())?;
+        if atlas_wire.schema != ATLAS_SCHEMA
+            || atlas_wire.catalog_hash != crate::replay::catalog_hash()
+            || atlas_wire.entries.is_empty()
+            || atlas_wire.entries.len() > 512
+        {
+            return Err("Atlas catalog/schema/size mismatch".into());
+        }
+        let atlas_base = resolved_parent(&manifest.atlas, base);
+        let mut atlas = BTreeMap::new();
+        let mut images = BTreeMap::new();
+        for entry in atlas_wire.entries {
+            release(&entry.archive_release)?;
+            if wealth(&entry.catalog_id).is_none()
+                || entry.sprite.iter().any(|v| !(-4096..=0).contains(v))
+                || atlas
+                    .insert((entry.archive_release, entry.sprite), entry.catalog_id)
+                    .is_some()
+            {
+                return Err("Unknown/duplicate atlas mapping".into());
+            }
+            let key = (
+                entry.calibration_image.path.clone(),
+                entry.calibration_image.sha256.clone(),
+            );
+            if let Some(bytes) = images.get(&key) {
+                if *bytes != entry.calibration_image.bytes {
+                    return Err("Calibration image pin disagreement".into());
+                }
+            } else {
+                let image = read_pin(&entry.calibration_image, &atlas_base, &mut total)?;
+                if !image.starts_with(b"\x89PNG\r\n\x1a\n")
+                    && !image.starts_with(&[0xff, 0xd8, 0xff])
+                {
+                    return Err("Atlas calibration image is not PNG/JPEG content".into());
+                }
+                images.insert(key, entry.calibration_image.bytes);
+            }
+        }
+        let nomination_bytes = read_pin(&manifest.nominations, base, &mut total)?;
+        let nomination: NominationWire =
+            serde_json::from_slice(&nomination_bytes).map_err(|e| e.to_string())?;
+        let nominated: BTreeSet<_> = nomination
+            .player_ids
+            .iter()
+            .map(|id| decimal(id))
+            .collect::<Result<_, _>>()?;
+        if nomination.schema != NOMINATION_SCHEMA
+            || nomination.basis != "userNominatedHistoricalArenaTop5"
+            || nomination.player_ids.is_empty()
+            || nomination.player_ids.len() > 100
+            || nominated.len() != nomination.player_ids.len()
+        {
+            return Err("Invalid user-nominated expert provenance".into());
+        }
+        let mut rows = Vec::new();
+        let mut identities = BTreeSet::new();
+        for source in manifest.sources {
+            let before = load_json(&read_pin(&source.before, base, &mut total)?)?;
+            let after = load_json(&read_pin(&source.after, base, &mut total)?)?;
+            let (id, input, chosen, count) = decode_choice(&before, &after, &atlas)?;
+            if !identities.insert((id.table.clone(), id.player.clone())) {
+                return Err("Duplicate table/actor choice".into());
+            }
+            let mut checked = false;
+            if let Some(pin) = &source.setup_complete_board {
+                let board = load_json(&read_pin(pin, base, &mut total)?)?;
+                selected_crosscheck(&board, &id, &input, chosen, &after)?;
+                checked = true;
+            }
+            let mut late_seat = None;
+            if let Some(pin) = &source.post_choice_metadata {
+                let meta = load_json(&read_pin(pin, base, &mut total)?)?;
+                if identity(&meta["tableId"])? != id.table
+                    || identity(&meta["viewPlayerId"])? != id.player
+                {
+                    return Err("Post-choice metadata actor/table mismatch".into());
+                }
+                late_seat = meta["inferredViewPlayerSeat"].as_u64().map(|v| v as usize);
+                if late_seat.is_some_and(|s| s == 0 || s > count) {
+                    return Err("Invalid post-choice seat metadata".into());
+                }
+            }
+            let mut mode = None;
+            if let Some(pin) = &source.table_ui {
+                let ui = load_json(&read_pin(pin, base, &mut total)?)?;
+                let url = text(&ui, "url")?;
+                if !url.ends_with(&format!("/table?table={}", id.table)) {
+                    return Err("Table UI identity mismatch".into());
+                }
+                if let Some(rows) = ui["optionRows"].as_array() {
+                    mode = rows
+                        .iter()
+                        .find(|r| {
+                            r["id"].as_str() == Some("gameoption_201_wrap")
+                                && r["visible"].as_bool() == Some(true)
+                        })
+                        .and_then(|r| r["text"].as_str())
+                        .and_then(|s| s.lines().nth(1))
+                        .map(str::to_owned);
+                }
+            }
+            let family = table_family_id(&id.table)?;
+            rows.push(ValidatedRow {
+                report: InitialRowReport {
+                    split: family_split(&family, manifest.held_out_family.as_deref())?,
+                    table_family_id: family,
+                    source_actor: id.player.clone(),
+                    archive_release: id.release,
+                    player_count: count,
+                    offers: input.offers.clone(),
+                    candidates: input.candidates(),
+                    chosen,
+                    stratum: if nominated.contains(&id.player) {
+                        "userNominatedExpert"
+                    } else {
+                        "otherPlayer"
+                    }
+                    .into(),
+                    mode,
+                    initial_seat: None,
+                    first_player: None,
+                    post_choice_inferred_seat: late_seat,
+                    unknown_mechanics: [None; 4],
+                    value_target: (),
+                    counter_crosscheck: checked,
+                    before_sha256: source.before.sha256,
+                    after_sha256: source.after.sha256,
+                },
+                input,
+            });
+        }
+        if let Some(held_out) = &manifest.held_out_family {
+            let families: BTreeSet<_> = rows
+                .iter()
+                .filter(|r| r.report.stratum == "userNominatedExpert")
+                .map(|r| &r.report.table_family_id)
+                .collect();
+            if families.len() < 2 || !families.contains(held_out) {
+                return Err("Declared held-out family must belong to at least two nominated-expert table families".into());
+            }
+        }
+        Ok(Self {
+            rows,
+            manifest_sha256: manifest_sha256.into(),
+            atlas_sha256: atlas_sha256.into(),
+            nomination_sha256: nomination_sha256.into(),
+            held_out_family: manifest.held_out_family,
+        })
+    }
+    pub fn report(&self) -> InitialDatasetReport {
+        let mut samples = [0; 3];
+        let mut families: [BTreeSet<&str>; 3] = std::array::from_fn(|_| BTreeSet::new());
+        for row in &self.rows {
+            let index = split_index(row.report.split);
+            samples[index] += 1;
+            families[index].insert(&row.report.table_family_id);
+        }
+        InitialDatasetReport {
+            schema: "tzolkin-human-initial-wealth-dataset-report-v1".into(), task: TASK.into(), feature_schema: FEATURE_SCHEMA.into(),
+            manifest_sha256: self.manifest_sha256.clone(), atlas_sha256: self.atlas_sha256.clone(), nomination_sha256: self.nomination_sha256.clone(),
+            split_policy: if self.held_out_family.is_some() { "externallyPinnedLeaveOneTableFamilyOut" } else { "fixedTableFamilyHash" }.into(),
+            held_out_family: self.held_out_family.clone(),
+            rows: self.rows.iter().map(|r| r.report.clone()).collect(), samples, families: families.map(|s| s.len()),
+            value_rows: 0, full_replay_admitted: false,
+            limitations: vec![
+                "Content pins establish local consistency, not BGA authentication or automated artwork recognition.".into(),
+                "Externally reviewed atlas and user nomination are declared provenance; neither verifies current player strength.".into(),
+                "Model conditions only on own catalog pair effects; seat, mode, options and later order are excluded.".into(),
+                "No whole-game, Playing-BC, exact terminal/value or application deployment admission.".into(),
+                "Table/actor metadata and recoverable family hashes belong in private artifacts.".into(),
+            ],
+        }
+    }
+}
+fn resolved_parent(pin: &ContentPin, base: &Path) -> PathBuf {
+    let p = Path::new(&pin.path);
+    let resolved = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
+    resolved.parent().unwrap_or(base).to_path_buf()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InitialArtifactContext {
+    manifest_sha256: String,
+    atlas_sha256: String,
+    nomination_sha256: String,
+}
+impl InitialArtifactContext {
+    fn dataset(dataset: &ValidatedInitialDataset) -> Self {
+        Self {
+            manifest_sha256: dataset.manifest_sha256.clone(),
+            atlas_sha256: dataset.atlas_sha256.clone(),
+            nomination_sha256: dataset.nomination_sha256.clone(),
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InitialWealthArtifact {
+    pub schema: String,
+    pub task: String,
+    pub feature_schema: String,
+    pub feature_count: usize,
+    pub conditioning: String,
+    pub catalog_hash: String,
+    pub value_validity: ValueValidity,
+    coefficients: [f32; FEATURE_COUNT],
+    training_context: Option<InitialArtifactContext>,
+    pub checksum: String,
+}
+impl InitialWealthArtifact {
+    pub fn new() -> Result<Self, String> {
+        let mut out = Self {
+            schema: MODEL_SCHEMA.into(),
+            task: TASK.into(),
+            feature_schema: FEATURE_SCHEMA.into(),
+            feature_count: FEATURE_COUNT,
+            conditioning: "seatAndOptionsMarginalOwnTileEffects".into(),
+            catalog_hash: crate::replay::catalog_hash(),
+            value_validity: ValueValidity::UnavailablePolicyOnly,
+            coefficients: [0.0; FEATURE_COUNT],
+            training_context: None,
+            checksum: String::new(),
+        };
+        out.reseal()?;
+        Ok(out)
+    }
+    fn expected_checksum(&self) -> Result<String, String> {
+        let mut payload = self.clone();
+        payload.checksum.clear();
+        Ok(digest(
+            &serde_json::to_vec(&payload).map_err(|e| e.to_string())?,
+        ))
+    }
+    fn reseal(&mut self) -> Result<(), String> {
+        self.checksum = self.expected_checksum()?;
+        self.validate()
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(context) = &self.training_context {
+            for pin in [
+                &context.manifest_sha256,
+                &context.atlas_sha256,
+                &context.nomination_sha256,
+            ] {
+                checksum(pin)?;
+            }
+        }
+        if self.schema != MODEL_SCHEMA
+            || self.task != TASK
+            || self.feature_schema != FEATURE_SCHEMA
+            || self.feature_count != FEATURE_COUNT
+            || self.conditioning != "seatAndOptionsMarginalOwnTileEffects"
+            || self.catalog_hash != crate::replay::catalog_hash()
+            || self.value_validity != ValueValidity::UnavailablePolicyOnly
+            || self
+                .coefficients
+                .iter()
+                .any(|w| !w.is_finite() || w.abs() > 100.0)
+            || self.checksum != self.expected_checksum()?
+        {
+            return Err("Initial-wealth model contract/parameters/checksum mismatch".into());
+        }
+        Ok(())
+    }
+    pub fn coefficients(&self) -> &[f32; FEATURE_COUNT] {
+        &self.coefficients
+    }
+    pub fn load(path: &Path, expected_sha256: &str) -> Result<Self, String> {
+        local_path(path)?;
+        let pin = ContentPin {
+            path: path.to_string_lossy().into(),
+            bytes: fs::metadata(path).map_err(|e| e.to_string())?.len(),
+            sha256: expected_sha256.into(),
+        };
+        let bytes = read_pin(&pin, Path::new("."), &mut 0)?;
+        let out: Self = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        out.validate()?;
+        Ok(out)
+    }
+    pub fn save_new(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        local_path(path)?;
+        write_new_json(path, self)
+    }
+    pub fn predict(&self, input: &InitialChoiceInput) -> Result<InitialDistribution, String> {
+        self.validate()?;
+        let rows = input.features()?;
+        let logits = rows.map(|r| dot(&self.coefficients, &r));
+        let mut probabilities = [0.0; 6];
+        policy_softmax(&logits, &mut probabilities)?;
+        let chosen = best_pair(input, &logits);
+        Ok(InitialDistribution {
+            task: TASK.into(),
+            feature_schema: FEATURE_SCHEMA.into(),
+            candidates: input.candidates(),
+            logits,
+            probabilities,
+            chosen,
+            value: (),
+            value_validity: ValueValidity::UnavailablePolicyOnly,
+        })
+    }
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialDistribution {
+    pub task: String,
+    pub feature_schema: String,
+    pub candidates: [[String; 2]; 6],
+    pub logits: [f32; 6],
+    pub probabilities: [f32; 6],
+    pub chosen: usize,
+    pub value: (),
+    pub value_validity: ValueValidity,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InitialTrainConfig {
+    pub epochs: usize,
+    pub learning_rate: f32,
+    pub max_weight_delta: f32,
+}
+impl InitialTrainConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=10_000).contains(&self.epochs)
+            || !self.learning_rate.is_finite()
+            || !(0.0..=1.0).contains(&self.learning_rate)
+            || self.learning_rate == 0.0
+            || !self.max_weight_delta.is_finite()
+            || !(0.0..=0.1).contains(&self.max_weight_delta)
+            || self.max_weight_delta == 0.0
+        {
+            return Err("Invalid bounded initial-wealth training config".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialLossReport {
+    pub samples: usize,
+    pub families: usize,
+    pub cross_entropy: f64,
+    pub correct_top1: usize,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialTrainingReport {
+    pub schema: String,
+    pub task: String,
+    pub feature_schema: String,
+    pub manifest_sha256: String,
+    pub atlas_sha256: String,
+    pub nomination_sha256: String,
+    pub model_checksum: String,
+    pub config: InitialTrainConfig,
+    pub optimizer: String,
+    pub updates: usize,
+    pub initial_train: InitialLossReport,
+    pub initial_validation: InitialLossReport,
+    pub final_train: InitialLossReport,
+    pub final_validation: InitialLossReport,
+    pub uniform_cross_entropy: f64,
+    pub uniform_expected_top1: f64,
+    pub value_rows: usize,
+    pub strength_measured: bool,
+    pub deployment_admitted: bool,
+}
+fn loss_gradient(
+    coefficients: &[f32; FEATURE_COUNT],
+    input: &InitialChoiceInput,
+    chosen: usize,
+    gradient: Option<&mut [f64; FEATURE_COUNT]>,
+) -> Result<(f64, bool), String> {
+    if chosen >= 6 {
+        return Err("Chosen index outside six-pair task".into());
+    }
+    let rows = input.features()?;
+    let logits = rows.map(|r| dot(coefficients, &r));
+    let mut probabilities = [0.0; 6];
+    policy_softmax(&logits, &mut probabilities)?;
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let loss = maximum - logits[chosen] as f64
+        + logits
+            .iter()
+            .map(|v| (f64::from(*v) - maximum).exp())
+            .sum::<f64>()
+            .ln();
+    if !loss.is_finite() || loss < 0.0 {
+        return Err("Nonfinite categorical initial-wealth loss".into());
+    }
+    let best = best_pair(input, &logits);
+    if let Some(gradient) = gradient {
+        for (i, row) in rows.iter().enumerate() {
+            let delta = f64::from(probabilities[i]) - f64::from(i == chosen);
+            for (g, value) in gradient.iter_mut().zip(row) {
+                *g += delta * f64::from(*value);
+            }
+        }
+        if gradient.iter().any(|v| !v.is_finite()) {
+            return Err("Nonfinite initial-wealth gradient".into());
+        }
+    }
+    Ok((loss, best == chosen))
+}
+fn evaluate(
+    dataset: &ValidatedInitialDataset,
+    coefficients: &[f32; FEATURE_COUNT],
+    split: DatasetSplit,
+) -> Result<InitialLossReport, String> {
+    let mut samples = 0;
+    let mut total = 0.0;
+    let mut correct = 0;
+    let mut families = BTreeSet::new();
+    for row in dataset
+        .rows
+        .iter()
+        .filter(|r| r.report.split == split && r.report.stratum == "userNominatedExpert")
+    {
+        let (loss, hit) = loss_gradient(coefficients, &row.input, row.report.chosen, None)?;
+        samples += 1;
+        total += loss;
+        correct += usize::from(hit);
+        families.insert(&row.report.table_family_id);
+    }
+    if samples == 0 {
+        return Err(
+            "Nonempty isolated nominated-expert Train and Validation families required".into(),
+        );
+    }
+    Ok(InitialLossReport {
+        samples,
+        families: families.len(),
+        cross_entropy: total / samples as f64,
+        correct_top1: correct,
+    })
+}
+fn bounded_coefficient(old: f32, delta: f64, limit: f32) -> Result<f32, String> {
+    let mut proposed = (f64::from(old) - delta) as f32;
+    // Apply the bound to the represented update, including f32 rounding.
+    if (f64::from(proposed) - f64::from(old)).abs() > f64::from(limit) {
+        proposed = if proposed > old {
+            proposed.next_down()
+        } else {
+            proposed.next_up()
+        };
+    }
+    if !proposed.is_finite()
+        || proposed.abs() > 100.0
+        || (f64::from(proposed) - f64::from(old)).abs() > f64::from(limit)
+    {
+        return Err("Initial-wealth update exceeds finite coefficient/delta bound".into());
+    }
+    Ok(proposed)
+}
+pub fn train(
+    dataset: &ValidatedInitialDataset,
+    config: &InitialTrainConfig,
+) -> Result<(InitialWealthArtifact, InitialTrainingReport), String> {
+    config.validate()?;
+    let evaluations = dataset
+        .rows
+        .len()
+        .checked_mul(config.epochs + 4)
+        .and_then(|n| n.checked_mul(6))
+        .ok_or("Initial-wealth work budget overflow")?;
+    if evaluations > MAX_CANDIDATE_EVALUATIONS {
+        return Err("Initial-wealth candidate evaluation budget exceeded".into());
+    }
+    let mut artifact = InitialWealthArtifact::new()?;
+    let initial_train = evaluate(dataset, &artifact.coefficients, DatasetSplit::Train)?;
+    let initial_validation = evaluate(dataset, &artifact.coefficients, DatasetSplit::Validation)?;
+    for _ in 0..config.epochs {
+        let mut gradient = [0.0; FEATURE_COUNT];
+        for row in dataset.rows.iter().filter(|r| {
+            r.report.split == DatasetSplit::Train && r.report.stratum == "userNominatedExpert"
+        }) {
+            loss_gradient(
+                &artifact.coefficients,
+                &row.input,
+                row.report.chosen,
+                Some(&mut gradient),
+            )?;
+        }
+        for g in &mut gradient {
+            *g /= initial_train.samples as f64;
+        }
+        let norm = gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if !norm.is_finite() {
+            return Err("Nonfinite initial-wealth gradient norm".into());
+        }
+        let clip = if norm > 5.0 { 5.0 / norm } else { 1.0 };
+        let mut deltas = gradient.map(|g| g * clip * f64::from(config.learning_rate));
+        let max = deltas.iter().map(|d| d.abs()).fold(0.0_f64, f64::max);
+        if max > f64::from(config.max_weight_delta) {
+            for delta in &mut deltas {
+                *delta *= f64::from(config.max_weight_delta) / max;
+            }
+        }
+        let mut proposed = artifact.coefficients;
+        for (i, value) in proposed.iter_mut().enumerate() {
+            *value =
+                bounded_coefficient(artifact.coefficients[i], deltas[i], config.max_weight_delta)?;
+        }
+        artifact.coefficients = proposed;
+    }
+    let final_train = evaluate(dataset, &artifact.coefficients, DatasetSplit::Train)?;
+    let final_validation = evaluate(dataset, &artifact.coefficients, DatasetSplit::Validation)?;
+    artifact.training_context = Some(InitialArtifactContext::dataset(dataset));
+    artifact.reseal()?;
+    let report = InitialTrainingReport {
+        schema: "tzolkin-human-initial-wealth-training-v1".into(),
+        task: TASK.into(),
+        feature_schema: FEATURE_SCHEMA.into(),
+        manifest_sha256: dataset.manifest_sha256.clone(),
+        atlas_sha256: dataset.atlas_sha256.clone(),
+        nomination_sha256: dataset.nomination_sha256.clone(),
+        model_checksum: artifact.checksum.clone(),
+        config: config.clone(),
+        optimizer: "boundedFullBatchClippedSgd".into(),
+        updates: config.epochs,
+        initial_train,
+        initial_validation,
+        final_train,
+        final_validation,
+        uniform_cross_entropy: 6.0_f64.ln(),
+        uniform_expected_top1: 1.0 / 6.0,
+        value_rows: 0,
+        strength_measured: false,
+        deployment_admitted: false,
+    };
+    Ok((artifact, report))
+}
+
+/// Creates only a fresh local output directory; partial publication is retained on error.
+pub fn publish_new(
+    directory: &Path,
+    dataset: &ValidatedInitialDataset,
+    training: Option<(&InitialWealthArtifact, &InitialTrainingReport)>,
+) -> Result<(), String> {
+    local_path(directory)?;
+    let parent = directory
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err("Output parent must already exist".into());
+    }
+    if let Some((model, report)) = training {
+        model.validate()?;
+        report.config.validate()?;
+        if model.training_context.as_ref() != Some(&InitialArtifactContext::dataset(dataset))
+            || report.schema != "tzolkin-human-initial-wealth-training-v1"
+            || report.task != TASK
+            || report.feature_schema != FEATURE_SCHEMA
+            || report.manifest_sha256 != dataset.manifest_sha256
+            || report.atlas_sha256 != dataset.atlas_sha256
+            || report.nomination_sha256 != dataset.nomination_sha256
+            || report.model_checksum != model.checksum
+            || report.updates != report.config.epochs
+            || report.optimizer != "boundedFullBatchClippedSgd"
+            || report.value_rows != 0
+            || report.strength_measured
+            || report.deployment_admitted
+        {
+            return Err("Initial-wealth publication context mismatch".into());
+        }
+    }
+    fs::create_dir(directory).map_err(|e| format!("Cannot create fresh output directory: {e}"))?;
+    write_new_json(&directory.join("dataset-report.json"), &dataset.report())?;
+    if let Some((model, report)) = training {
+        model.save_new(&directory.join("model.json"))?;
+        write_new_json(&directory.join("training-report.json"), report)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn input() -> InitialChoiceInput {
+        InitialChoiceInput::new(["w10", "w12", "w06", "w04"].map(str::to_owned)).unwrap()
+    }
+    #[test]
+    fn pair_features_are_permutation_equivariant_and_gradient_is_finite() {
+        let input = input();
+        let mut model = InitialWealthArtifact::new().unwrap();
+        model.coefficients = std::array::from_fn(|i| i as f32 * 0.013 - 0.1);
+        model.reseal().unwrap();
+        let original = model.predict(&input).unwrap();
+        let permuted =
+            InitialChoiceInput::new(["w04", "w06", "w10", "w12"].map(str::to_owned)).unwrap();
+        let changed = model.predict(&permuted).unwrap();
+        for (i, pair) in original.candidates.iter().enumerate() {
+            let j = changed
+                .candidates
+                .iter()
+                .position(|p| p.contains(&pair[0]) && p.contains(&pair[1]))
+                .unwrap();
+            assert_eq!(original.logits[i].to_bits(), changed.logits[j].to_bits());
+            assert!((original.probabilities[i] - changed.probabilities[j]).abs() < 1.0e-6);
+        }
+        let uniform = InitialWealthArtifact::new().unwrap();
+        let first = uniform.predict(&input).unwrap();
+        let second = uniform.predict(&permuted).unwrap();
+        assert!(second.candidates[second.chosen].contains(&first.candidates[first.chosen][0]));
+        assert!(second.candidates[second.chosen].contains(&first.candidates[first.chosen][1]));
+        let mut gradient = [0.0; FEATURE_COUNT];
+        loss_gradient(&model.coefficients, &input, 4, Some(&mut gradient)).unwrap();
+        for i in 0..FEATURE_COUNT {
+            let mut plus = model.coefficients;
+            let mut minus = model.coefficients;
+            plus[i] += 0.002;
+            minus[i] -= 0.002;
+            let actual_step = f64::from(plus[i]) - f64::from(minus[i]);
+            let finite = (loss_gradient(&plus, &input, 4, None).unwrap().0
+                - loss_gradient(&minus, &input, 4, None).unwrap().0)
+                / actual_step;
+            assert!(
+                (finite - gradient[i]).abs() < 0.0003,
+                "feature {i}: {finite} {}",
+                gradient[i]
+            );
+        }
+        let mut wrong = model.clone();
+        wrong.feature_schema = "public-v2".into();
+        wrong.checksum = wrong.expected_checksum().unwrap();
+        assert!(wrong.predict(&input).is_err());
+        for old in [-99.0_f32, -0.01, 0.0, 0.01, 99.0] {
+            for direction in [-1.0_f64, 1.0] {
+                let limit = 0.01_f32;
+                let changed =
+                    bounded_coefficient(old, direction * f64::from(limit), limit).unwrap();
+                assert!((f64::from(changed) - f64::from(old)).abs() <= f64::from(limit));
+            }
+        }
+    }
+    #[test]
+    fn source_decoder_refuses_unknown_release_sprite_subset_and_poststate_inputs() {
+        let release = "000000-0000";
+        let styles = [[0, 0], [-60, 0], [-120, 0], [-180, 0]];
+        let offers: Vec<_> = styles.iter().enumerate().map(|(i, [x, y])| {
+            let id = format!("wealth_tile_{}", i + 1);
+            let html = format!("<div id=\"{id}\" class=\"wealth_tile active\" style=\"background-position: {x}px {y}px;\"></div>");
+            serde_json::json!({"id":id,"html":html,"visible":true})
+        }).collect();
+        let offer_html = offers
+            .iter()
+            .map(|o| o["html"].as_str().unwrap())
+            .collect::<String>();
+        let empty = "<div id=\"player_wealthtiles_100\" class=\"player_wealthtiles\"></div>";
+        let url = format!(
+            "https://boardgamearena.com/archive/replay/{release}/?table=123&player=100&comments="
+        );
+        let before = serde_json::json!({"schema":CAPTURE_SCHEMA,"capturedAt":"2000-01-01T00:00:00.000Z","url":url,"viewPlayerId":"100","tableId":"123","move":"Move #1","header":SELECTION_PROMPT,"offers":offers,"wealthTilesHtml":offer_html,"gameAreaHtml":format!("{offer_html}{empty}"),"playerPanels":[{"id":"player_name_100"},{"id":"player_name_101"},{"id":"player_name_102"}],"selectedPlayerTiles":[{"id":"player_wealthtiles_100","html":empty}]});
+        let selected = format!(
+            "<div id=\"player_wealthtiles_100\" class=\"player_wealthtiles\">{}{}</div>",
+            before["offers"][1]["html"]
+                .as_str()
+                .unwrap()
+                .replace(" active", ""),
+            before["offers"][3]["html"]
+                .as_str()
+                .unwrap()
+                .replace(" active", "")
+        );
+        let after = serde_json::json!({"schema":CAPTURE_SCHEMA,"capturedAt":"2000-01-01T00:00:01.000Z","url":url,"viewPlayerId":"100","move":"Move #4","gameAreaHtml":selected,"selectedPlayerTiles":[{"id":"player_wealthtiles_100","html":selected}]});
+        let atlas: Atlas = styles
+            .into_iter()
+            .zip(["w10", "w12", "w06", "w04"])
+            .map(|(sprite, id)| ((release.into(), sprite), id.into()))
+            .collect();
+        assert_eq!(decode_choice(&before, &after, &atlas).unwrap().2, 4);
+        let mut with_extra_event = before.clone();
+        with_extra_event["move"] = Value::String("Move #7".into());
+        let mut later_confirmation = after.clone();
+        later_confirmation["move"] = Value::String("Move #12".into());
+        assert_eq!(
+            decode_choice(&with_extra_event, &later_confirmation, &atlas)
+                .unwrap()
+                .2,
+            4
+        );
+        assert!(
+            decode_choice(&before, &after, &BTreeMap::new())
+                .unwrap_err()
+                .contains("Uncalibrated")
+        );
+        let wrong_atlas = atlas
+            .clone()
+            .into_iter()
+            .map(|((_, s), v)| (("000001-0000".into(), s), v))
+            .collect();
+        assert!(decode_choice(&before, &after, &wrong_atlas).is_err());
+        let mut corrupt = after.clone();
+        corrupt["selectedPlayerTiles"][0]["html"] =
+            Value::String(selected.replace("wealth_tile_4", "wealth_tile_9"));
+        corrupt["gameAreaHtml"] = corrupt["selectedPlayerTiles"][0]["html"].clone();
+        assert!(
+            decode_choice(&before, &corrupt, &atlas)
+                .unwrap_err()
+                .contains("outside")
+        );
+        let mut already = before;
+        already["selectedPlayerTiles"] = after["selectedPlayerTiles"].clone();
+        assert!(
+            decode_choice(&already, &after, &atlas)
+                .unwrap_err()
+                .contains("before selection")
+        );
+    }
+    #[test]
+    fn optional_setup_counter_crosscheck_refuses_wrong_resources_markers_and_dom() {
+        let url =
+            "https://boardgamearena.com/archive/replay/000000-0000/?table=123&player=100&comments=";
+        let counters: Vec<_> = ["corn", "wood", "stone", "gold", "skull", "worker"].into_iter()
+            .zip([15, 1, 2, 0, 0, 3]).map(|(kind, value)| {
+                let id = format!("{kind}_number_player_100");
+                serde_json::json!({"id":id,"html":format!("<span id=\"{id}\">{value}</span>"),"valueText":value.to_string(),"visible":true})
+            }).collect();
+        let temples: Vec<_> = ["chaac", "quetzalcoatl", "kukulcan"].into_iter().map(|name| {
+            let id = format!("marker_100_temple_{name}");
+            serde_json::json!({"id":id,"html":format!("<div id=\"{id}\" style=\"top: 191px; left: 17px;\"></div>")})
+        }).collect();
+        let technologies: Vec<_> = ["agriculture", "extraction", "architecture", "theology"].into_iter().map(|name| {
+            let id = format!("marker_100_technology_{name}");
+            serde_json::json!({"id":id,"html":format!("<div id=\"{id}\" style=\"left: 1px;\"></div>")})
+        }).collect();
+        let board = serde_json::json!({"schema":"tzolkin-bga-public-playing-initial-board-witness-v1","url":url,"move":"Move #4","visibleLogText":"各プレイヤーは対応する資源を手に入れた","gearWorkerNodes":[],"publicCounters":counters,"templeMarkers":temples,"technologyMarkers":technologies});
+        let after = serde_json::json!({"move":"Move #4"});
+        let id = archive_url(url).unwrap();
+        selected_crosscheck(&board, &id, &input(), 4, &after).unwrap();
+        assert!(selected_crosscheck(&board, &id, &input(), 0, &after).is_err());
+        let mut wrong = board.clone();
+        wrong["publicCounters"][0]["valueText"] = Value::String("14".into());
+        assert!(selected_crosscheck(&wrong, &id, &input(), 4, &after).is_err());
+        let mut wrong = board.clone();
+        wrong["publicCounters"][0]["html"] =
+            Value::String("<span id=\"corn_number_player_100\">14</span>".into());
+        assert!(selected_crosscheck(&wrong, &id, &input(), 4, &after).is_err());
+        let mut wrong = board;
+        wrong["technologyMarkers"][0]["html"] = Value::String(
+            "<div id=\"marker_100_technology_agriculture\" style=\"left: 38px;\"></div>".into(),
+        );
+        assert!(selected_crosscheck(&wrong, &id, &input(), 4, &after).is_err());
+    }
+    #[test]
+    fn table_family_split_is_shared_by_all_actors_and_training_requires_isolation() {
+        let family = table_family_id("123").unwrap();
+        let split = split_for_family(&family).unwrap();
+        assert_eq!(
+            split_for_family(&table_family_id("123").unwrap()).unwrap(),
+            split
+        );
+        let mut seen = BTreeMap::new();
+        for table in 100..150 {
+            let id = table_family_id(&table.to_string()).unwrap();
+            for _actor in 0..4 {
+                assert!(
+                    seen.insert(id.clone(), split_for_family(&id).unwrap())
+                        .is_none_or(|old| old == split_for_family(&id).unwrap())
+                );
+            }
+        }
+        let held_out = table_family_id("124").unwrap();
+        for _actor in 0..4 {
+            assert_eq!(
+                family_split(&held_out, Some(&held_out)).unwrap(),
+                DatasetSplit::Validation
+            );
+            assert_eq!(
+                family_split(&family, Some(&held_out)).unwrap(),
+                DatasetSplit::Train
+            );
+        }
+        let dataset = ValidatedInitialDataset {
+            rows: vec![],
+            manifest_sha256: "0".repeat(64),
+            atlas_sha256: "0".repeat(64),
+            nomination_sha256: "0".repeat(64),
+            held_out_family: None,
+        };
+        assert!(
+            train(
+                &dataset,
+                &InitialTrainConfig {
+                    epochs: 1,
+                    learning_rate: 0.01,
+                    max_weight_delta: 0.01
+                }
+            )
+            .is_err()
+        );
+    }
+}

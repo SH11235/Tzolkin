@@ -6,6 +6,7 @@ pub mod arena;
 pub mod dataset;
 pub mod experiment;
 pub mod features;
+pub mod human_initial_wealth;
 pub mod kernel;
 pub mod model;
 pub mod policy_dataset;
