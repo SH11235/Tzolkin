@@ -1,9 +1,8 @@
+use crate::test_temp_root;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};

@@ -1,7 +1,6 @@
+use crate::test_temp_root;
 use std::fs;
 use std::path::PathBuf;
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 
 use kernel::Kernel;
 use sha2::{Digest, Sha256};

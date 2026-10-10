@@ -1,5 +1,4 @@
-#[path = "support/temp_root.rs"]
-mod temp_root;
+use crate::test_temp_root as temp_root;
 
 #[test]
 fn acquisition_preserves_collision_markers_and_returns_other_errors_without_retry() {

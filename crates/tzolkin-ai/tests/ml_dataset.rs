@@ -1,9 +1,8 @@
+use crate::test_temp_root;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 use tzolkin_ai::dataset::{self, DatasetManifest, DatasetSplit, TrainingSample};
 use tzolkin_ai::features::{FEATURE_COUNT, FeatureEncoder, encode_action};
 use tzolkin_ai::replay::{self, GameReplay, ReplaySource};

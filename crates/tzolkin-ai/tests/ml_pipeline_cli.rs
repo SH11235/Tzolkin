@@ -1,11 +1,10 @@
+use crate::test_temp_root;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use tzolkin_ai::{dataset, experiment, model::ModelArtifact, replay, training::TrainingCheckpoint};
 use tzolkin_core::{GameOptions, create_game, observation::observe};
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 
 struct Temporary(PathBuf);
 impl Drop for Temporary {

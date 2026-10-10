@@ -1,7 +1,6 @@
+use crate::test_temp_root;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 
 use sha2::{Digest, Sha256};
 use tzolkin_ai::dataset::{

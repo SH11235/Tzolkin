@@ -1,11 +1,10 @@
+use crate::test_temp_root;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 use tzolkin_ai::dataset::{self, DatasetSplit};
 use tzolkin_ai::policy_dataset::{export_native_files, load_policy_dataset};
 use tzolkin_ai::policy_training::{PolicyBcConfig, train_dataset};

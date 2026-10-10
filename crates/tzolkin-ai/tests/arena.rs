@@ -23,8 +23,7 @@ fn config(players: usize, count: usize) -> ArenaConfig {
     }
 }
 struct Temporary(PathBuf);
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
+use crate::test_temp_root;
 impl Temporary {
     fn new(name: &str) -> Self {
         let path = test_temp_root::create(&format!("tzolkin-arena-{name}")).unwrap();

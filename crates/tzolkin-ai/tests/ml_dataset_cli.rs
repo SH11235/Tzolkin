@@ -1,9 +1,8 @@
+use crate::test_temp_root;
 use std::fs;
 use std::process::Command;
 use tzolkin_ai::{dataset::load_dataset, replay};
 use tzolkin_core::GameOptions;
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 
 #[test]
 fn dataset_cli_exports_native_replays_and_refuses_partial_or_existing_outputs() {

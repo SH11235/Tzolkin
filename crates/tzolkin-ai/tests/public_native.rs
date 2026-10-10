@@ -1,10 +1,9 @@
+use crate::test_temp_root;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[path = "support/temp_root.rs"]
-mod test_temp_root;
 use tzolkin_ai::arena::{ArenaConfig, Partition, PolicyConfig, partition_seeds, run_arena};
 use tzolkin_ai::dataset::{self, DatasetSplit};
 use tzolkin_ai::kernel::Kernel;
