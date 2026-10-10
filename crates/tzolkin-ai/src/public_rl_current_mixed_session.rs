@@ -44,6 +44,13 @@ pub struct AdmittedCurrentMixedRoot<'a> {
     next: u64,
     consumed: BTreeSet<String>,
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OriginalLivePins {
+    pub(crate) directory: PathBuf,
+    pub(crate) files: Vec<FilePin>,
+    pub(crate) admission_checksum: String,
+}
 impl<'a> AdmittedCurrentMixedRoot<'a> {
     pub fn restore_one_batch(
         parent: ImportedMixedRlParent,
@@ -95,17 +102,68 @@ impl<'a> AdmittedCurrentMixedRoot<'a> {
     pub fn consumed_families(&self) -> &BTreeSet<String> {
         &self.consumed
     }
-    fn require_current(&self) -> Result<(), String> {
+    pub(crate) fn require_current(&self) -> Result<(), String> {
         if self.session.current_data_snapshot()? != self.snapshot {
             return Err("Admitted current mixed root bytes changed".into());
         }
         Ok(())
     }
+    pub(crate) fn initial_owner(
+        &self,
+    ) -> Result<&crate::public_policy_mixed::MixedJointOwner, String> {
+        self.session
+            .owner()
+            .ok_or_else(|| "Missing admitted initial mixed owner".into())
+    }
+    pub(crate) fn prepared(&self) -> Result<&'a PreparedPublicPolicy, String> {
+        self.session.current_data_context().map(|(p, _)| p)
+    }
+    pub(crate) fn prefix(&self) -> [u64; 2] {
+        self.prefix
+    }
+    pub(crate) fn require_output(&self, directory: &Path) -> Result<(), String> {
+        self.session.require_current_data_output(directory)
+    }
+    pub(crate) fn live_pins(&self) -> Result<OriginalLivePins, String> {
+        let all: Vec<FilePin> = serde_json::from_value(
+            self.snapshot
+                .get("rootFiles")
+                .ok_or("Missing original root file pins")?
+                .clone(),
+        )
+        .map_err(|e| e.to_string())?;
+        let tip = self.session.status().head_file().to_owned();
+        let files = all
+            .into_iter()
+            .filter(|p| {
+                p.name == tip
+                    || matches!(
+                        p.name.as_str(),
+                        "training-spec.json"
+                            | "collection-spec.json"
+                            | "source-receipt.json"
+                            | "report.json"
+                            | "artifact.json"
+                    )
+            })
+            .collect::<Vec<_>>();
+        if files.len() != 6 {
+            return Err("Original current mixed live-control pin shape".into());
+        }
+        Ok(OriginalLivePins {
+            directory: self.session.current_data_directory().to_owned(),
+            files,
+            admission_checksum: crate::public_policy_update::hash(
+                b"tzolkin-current-mixed-original-admission-v2\0",
+                &self.snapshot,
+            )?,
+        })
+    }
 }
 
 #[derive(Clone)]
 pub struct CurrentMixedCollectionSpec {
-    inner: MixedRlCollectionSpec,
+    pub(crate) inner: MixedRlCollectionSpec,
 }
 impl CurrentMixedCollectionSpec {
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
@@ -113,7 +171,7 @@ impl CurrentMixedCollectionSpec {
             inner: MixedRlCollectionSpec::from_json_schema(raw, SPEC_SCHEMA)?,
         })
     }
-    fn pool_checksum(&self) -> Result<String, String> {
+    pub(crate) fn pool_checksum(&self) -> Result<String, String> {
         crate::public_policy_update::hash(
             b"tzolkin-current-mixed-frozen-pool-v2\0",
             &(

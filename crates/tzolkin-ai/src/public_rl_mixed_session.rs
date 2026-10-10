@@ -542,7 +542,7 @@ fn require_imported_output(
     }
     Ok(())
 }
-#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct FilePin {
     pub(crate) name: String,

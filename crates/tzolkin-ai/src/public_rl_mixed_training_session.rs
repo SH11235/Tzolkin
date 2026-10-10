@@ -677,6 +677,9 @@ impl<'a> MixedOneBatchSession<'a> {
     pub fn owner(&self) -> Option<&MixedJointOwner> {
         self.owner.as_ref()
     }
+    pub(crate) fn current_data_directory(&self) -> &Path {
+        &self.directory
+    }
     pub(crate) fn current_data_context(
         &self,
     ) -> Result<(&'a PreparedPublicPolicy, [u64; 2]), String> {

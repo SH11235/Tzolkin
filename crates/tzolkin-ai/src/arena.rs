@@ -434,26 +434,33 @@ struct PolicyHandle<'a> {
 /// Train eligibility. The mixed collector separately excludes this full closure.
 pub(crate) struct FrozenReactiveOpponent<'a> {
     handle: PolicyHandle<'a>,
-    families: Vec<String>,
+    families: FrozenFamilies<'a>,
     max_search_steps: usize,
+}
+enum FrozenFamilies<'a> {
+    Owned(Vec<String>),
+    Continued(&'a std::collections::BTreeSet<String>),
 }
 impl<'a> FrozenReactiveOpponent<'a> {
     pub(crate) fn new(policy: BorrowedArenaPolicy<'a>) -> Result<Self, String> {
         let (handle, _) = PolicyHandle::borrowed(policy, &[])?;
         let families = match policy {
-            BorrowedArenaPolicy::Count1(p) => p.artifact().report().family_closure().to_vec(),
-            BorrowedArenaPolicy::Repeated(p) => p.artifact().report().family_closure().to_vec(),
-            BorrowedArenaPolicy::Long(p) => p.family_set().iter().cloned().collect(),
-            BorrowedArenaPolicy::Paired(p) => p.family_set().iter().cloned().collect(),
-            BorrowedArenaPolicy::Mixed(p) => p.family_closure().cloned().collect(),
-            BorrowedArenaPolicy::ContinuedMixed(p) => p.family_set().iter().cloned().collect(),
-            BorrowedArenaPolicy::PublicBc(p) => {
-                p.initialization_families().1.iter().cloned().collect()
-            }
-            BorrowedArenaPolicy::Search(_)
-            | BorrowedArenaPolicy::Heuristic(_)
-            | BorrowedArenaPolicy::CornFirstSetup(_)
-            | BorrowedArenaPolicy::CornFirstUxmalOpening(_) => Vec::new(),
+            BorrowedArenaPolicy::ContinuedMixed(p) => FrozenFamilies::Continued(p.family_set()),
+            _ => FrozenFamilies::Owned(match policy {
+                BorrowedArenaPolicy::Count1(p) => p.artifact().report().family_closure().to_vec(),
+                BorrowedArenaPolicy::Repeated(p) => p.artifact().report().family_closure().to_vec(),
+                BorrowedArenaPolicy::Long(p) => p.family_set().iter().cloned().collect(),
+                BorrowedArenaPolicy::Paired(p) => p.family_set().iter().cloned().collect(),
+                BorrowedArenaPolicy::Mixed(p) => p.family_closure().cloned().collect(),
+                BorrowedArenaPolicy::ContinuedMixed(_) => unreachable!("handled borrowed closure"),
+                BorrowedArenaPolicy::PublicBc(p) => {
+                    p.initialization_families().1.iter().cloned().collect()
+                }
+                BorrowedArenaPolicy::Search(_)
+                | BorrowedArenaPolicy::Heuristic(_)
+                | BorrowedArenaPolicy::CornFirstSetup(_)
+                | BorrowedArenaPolicy::CornFirstUxmalOpening(_) => Vec::new(),
+            }),
         };
         let max_search_steps = match policy {
             BorrowedArenaPolicy::Search(p) => p.config().max_total_steps,
@@ -469,7 +476,10 @@ impl<'a> FrozenReactiveOpponent<'a> {
         &self.handle.description
     }
     pub(crate) fn contains_family(&self, family: &str) -> bool {
-        self.families.iter().any(|f| f == family)
+        match &self.families {
+            FrozenFamilies::Owned(v) => v.iter().any(|f| f == family),
+            FrozenFamilies::Continued(s) => s.contains(family),
+        }
     }
     pub(crate) fn max_search_steps(&self) -> usize {
         self.max_search_steps
@@ -664,7 +674,13 @@ impl<'a> PolicyHandle<'a> {
                     crate::public_policy_mixed_continued::CurrentMixedPolicyHandle::from_continued(
                         owner,
                     )?;
-                let overlap = validation_overlap(handle.family_closure(), seeds)?;
+                // The opaque owner admitted its closure already. Train roster
+                // freezing has no evaluation request or history traversal.
+                let overlap = if seeds.is_empty() {
+                    Vec::new()
+                } else {
+                    validation_overlap(handle.family_closure(), seeds)?
+                };
                 let provenance = handle.provenance();
                 (
                     PolicyChooser::PublicRlContinuedMixed(Box::new(handle)),
