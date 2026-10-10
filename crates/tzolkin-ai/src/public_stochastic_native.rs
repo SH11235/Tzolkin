@@ -181,6 +181,9 @@ pub struct AuditedStochasticGame {
     record: Record,
 }
 impl AuditedStochasticGame {
+    pub(crate) fn record(&self) -> &Record {
+        &self.record
+    }
     pub fn complete(&self) -> bool {
         self.record.terminal.is_some() && self.record.failure.is_none()
     }
@@ -761,6 +764,7 @@ mod tests {
         ));
     }
     use crate::public_native::integration_fixture;
+    use crate::public_policy_episode::ValidatedPolicyEpisode;
     use crate::public_stochastic::SamplingSeed;
     use crate::public_stochastic_record::{audit_record_bytes, encode_record};
 
@@ -843,6 +847,69 @@ mod tests {
             assert!(!receipt.training_admission_available());
             assert!(!receipt.producer_authenticated());
             assert!(!receipt.independent_seed_origins_verified());
+            let mut unapplied = receipt.record.clone();
+            if players == 3 {
+                unapplied.callbacks[0].apply_succeeded = false;
+            } else {
+                unapplied.callbacks[0].state_after = None;
+            }
+            assert!(
+                ValidatedPolicyEpisode::from_audited(AuditedStochasticGame { record: unapplied })
+                    .is_err()
+            );
+            let episode = ValidatedPolicyEpisode::from_audited(receipt).unwrap();
+            assert_eq!(episode.source_config(), &config);
+            assert_eq!(episode.len(), game.applied_choices());
+            assert_eq!(
+                episode.terminal_state_key(),
+                game.terminal_state_key().unwrap()
+            );
+            assert_eq!(episode.canonical_record_checksum().len(), 64);
+            assert!(!episode.training_admission_available());
+            let scores = &game.record.terminal.as_ref().unwrap().final_scores;
+            let winners = scores.iter().filter(|score| score.rank == 1).count();
+            let mut own_indices = [0; 4];
+            for step in episode.steps() {
+                let actor = step.actor();
+                assert_eq!(step.actor_step_index(), own_indices[actor]);
+                assert_eq!(step.actor_draw_ordinal(), own_indices[actor]);
+                own_indices[actor] += 1;
+                assert_eq!(step.observation().actor, actor);
+                assert_eq!(
+                    step.chosen(),
+                    &step.observation().legal_actions[step.chosen_index()]
+                );
+                assert_eq!(step.session_sample_index(), step.global_callback_index());
+                let rank = scores
+                    .iter()
+                    .find(|score| score.player_id == actor)
+                    .unwrap()
+                    .rank;
+                let target = if rank == 1 { 1.0 / winners as f64 } else { 0.0 };
+                assert_eq!(step.actor_terminal_rank(), rank);
+                assert_eq!(step.return_target(), target);
+                if let Some(next) = step.next_own_global_index() {
+                    assert_eq!(episode.step(next).unwrap().actor(), actor);
+                    assert_eq!(
+                        step.intervening_callbacks(),
+                        next - step.global_callback_index() - 1
+                    );
+                    assert_eq!(step.reward(), 0.0);
+                    assert_eq!(step.terminal_bootstrap(), None);
+                } else {
+                    assert_eq!(
+                        step.intervening_callbacks(),
+                        episode.len() - step.global_callback_index() - 1
+                    );
+                    assert_eq!(step.reward(), target);
+                    assert_eq!(step.terminal_bootstrap(), Some(0.0));
+                }
+            }
+            assert!(
+                episode
+                    .steps()
+                    .any(|step| step.actor() != step.observation().turn_player)
+            );
             // Both runs construct fresh worlds/sessions; no counters/RNG leak.
             assert_eq!(
                 bytes,
@@ -884,7 +951,8 @@ mod tests {
                 .all(|draw| draw == &hex64(0))
         );
         assert!(game.record.counts.candidate_rows_reserved > 0);
-        assert!(audit_record_bytes(&encode_record(&game).unwrap(), &policy).is_ok());
+        let receipt = audit_record_bytes(&encode_record(&game).unwrap(), &policy).unwrap();
+        assert!(ValidatedPolicyEpisode::from_audited(receipt).is_err());
     }
 
     #[test]
@@ -919,7 +987,8 @@ mod tests {
                 game.accepted_samples() < game.observed_callbacks()
                     || reason == FailureReason::CallbackLimit
             );
-            assert!(audit_record_bytes(&encode_record(&game).unwrap(), &policy).is_ok());
+            let receipt = audit_record_bytes(&encode_record(&game).unwrap(), &policy).unwrap();
+            assert!(ValidatedPolicyEpisode::from_audited(receipt).is_err());
             if reason == FailureReason::CandidateLimit {
                 assert_eq!(game.sampler_attempts(), 0);
                 assert_eq!(game.accepted_samples(), 0);

@@ -201,7 +201,7 @@ fn context(state: &GameState, step: &ReplayStep) -> Result<PublicStateContext, S
     }
     PublicStateContext::from_observation(&obs)
 }
-fn winner_shares(
+pub(crate) fn winner_shares(
     scores: &[FinalScore],
     players: usize,
 ) -> Result<(Vec<f32>, Vec<usize>, usize), String> {
