@@ -391,12 +391,7 @@ impl SessionState {
         }
         let ticks = TickDistribution::new(&prediction.logits)?;
         let ordered_legal_digest = legal_digest(&observation.legal_actions)?;
-        let mut logit_hash = Sha256::new();
-        logit_hash.update(b"tzolkin-stochastic-full-f32-logits-v1\0");
-        for z in &prediction.logits {
-            logit_hash.update(z.to_bits().to_le_bytes());
-        }
-        let logits_digest = format!("{:x}", logit_hash.finalize());
+        let logits_digest = full_logits_digest(&prediction.logits);
         let distribution_digest = ticks.digest();
         let sample_index = self.accepted;
         let draw = self.choose(observation.actor, &ticks)?;
@@ -450,6 +445,15 @@ struct Draw {
     draws_before: u64,
     draws_after: u64,
 }
+pub(crate) fn full_logits_digest(logits: &[f32]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"tzolkin-stochastic-full-f32-logits-v1\0");
+    for z in logits {
+        hash.update(z.to_bits().to_le_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
 // The original max/exp/ordered-sum body is shared without changing arithmetic,
 // finite checks or error strings. exp/ln bits remain platform-bound.
 pub(crate) fn nominal_weights(logits: &[f32]) -> Result<(Vec<f64>, f64), String> {
