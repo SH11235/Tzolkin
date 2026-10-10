@@ -112,11 +112,41 @@ pub(crate) struct Callback {
     pub observation: Option<Observation>,
     pub state_before: String,
     pub sample: Option<Sample>,
+    /// Only the distinct mixed schema permits this field. Old wire bytes omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opponent_choice: Option<OpponentChoice>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub opponent_attempted: bool,
     pub sampler_attempted: bool,
     pub apply_attempted: bool,
     pub apply_succeeded: bool,
     pub state_after: Option<String>,
     pub failure: Option<Failure>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OpponentChoice {
+    pub decision: DecisionWire,
+    pub chosen: LegalAction,
+}
+impl OpponentChoice {
+    pub(crate) fn from_decision(decision: &crate::Decision, chosen: LegalAction) -> Self {
+        Self {
+            decision: DecisionWire {
+                actor: decision.actor,
+                observation_key: decision.observation_key.clone(),
+                policy_version: decision.policy_version.clone(),
+                r#move: decision.r#move.clone(),
+                score_bits: hex64(decision.score.to_bits()),
+            },
+            chosen,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -371,6 +401,24 @@ fn validate_wire<P>(record: &Record<P>) -> Result<(), String> {
         parse_hex64(value)?;
     }
     for callback in &record.callbacks {
+        if record.schema != crate::public_mixed_native::RECORD_SCHEMA
+            && (callback.opponent_choice.is_some() || callback.opponent_attempted)
+        {
+            return Err("Opponent fields are forbidden in an all-seat stochastic schema".into());
+        }
+        if let Some(opponent) = &callback.opponent_choice {
+            if !callback.opponent_attempted
+                || callback.sampler_attempted
+                || callback.sample.is_some()
+            {
+                return Err("Opponent and learner choices must be distinct".into());
+            }
+            parse_hex64(&opponent.decision.observation_key)?;
+            finite64(&opponent.decision.score_bits)?;
+        }
+        if callback.opponent_attempted && callback.sampler_attempted {
+            return Err("A callback cannot attempt both roster policies".into());
+        }
         parse_hex64(&callback.observation_key)?;
         parse_hex64(&callback.state_before)?;
         if let Some(after) = &callback.state_after {
@@ -516,6 +564,22 @@ pub(crate) fn decode_typed_record<P: serde::de::DeserializeOwned + Serialize>(
         return Err("Stochastic record byte bound".into());
     }
     let raw: UniqueValue = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    // Extending the private DTO must not broaden any old source's closed shape,
+    // including explicit null/false forms that serde could otherwise omit.
+    if raw.0.get("schema").and_then(serde_json::Value::as_str)
+        != Some(crate::public_mixed_native::RECORD_SCHEMA)
+        && raw
+            .0
+            .get("callbacks")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|callbacks| {
+                callbacks.iter().any(|c| {
+                    c.get("opponentChoice").is_some() || c.get("opponentAttempted").is_some()
+                })
+            })
+    {
+        return Err("Opponent fields are forbidden in an all-seat stochastic schema".into());
+    }
     let record: Record<P> = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if raw.0 != serde_json::to_value(&record).map_err(|e| e.to_string())? {
         return Err("Nested unknown, omitted nullable, or noncanonical wire fields".into());
@@ -636,6 +700,11 @@ mod tests {
             assert_eq!(game.accepted_samples(), 2);
             assert_eq!(game.applied_choices(), 2);
             let bytes = encode_record(&game).unwrap();
+            let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            for callback in wire["callbacks"].as_array().unwrap() {
+                assert!(callback.get("opponentChoice").is_none());
+                assert!(callback.get("opponentAttempted").is_none());
+            }
             let checked = audit_record_bytes(&bytes, &policy).unwrap();
             assert!(!checked.complete());
             assert_eq!(checked.accepted_samples(), 2);
@@ -677,6 +746,18 @@ mod tests {
         let policy = integration_fixture::handle(&model);
         let bytes = encode_record(&collected(&policy, 3)).unwrap();
         let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for (key, value) in [
+            ("opponentChoice", serde_json::Value::Null),
+            ("opponentAttempted", serde_json::Value::Null),
+            ("opponentAttempted", serde_json::Value::Bool(false)),
+        ] {
+            let mut corrupt = original.clone();
+            corrupt["callbacks"][0][key] = value;
+            let error = decode_record(&serde_json::to_vec(&corrupt).unwrap())
+                .err()
+                .unwrap();
+            assert!(error.contains("Opponent fields are forbidden"), "{error}");
+        }
         for pointer in [
             "",
             "/header",
