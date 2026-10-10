@@ -355,6 +355,50 @@ impl<'a> Iterator for HtmlTags<'a> {
             if name.is_empty() {
                 return Some(Err("Missing retained HTML tag name".into()));
             }
+            if !closing && name.eq_ignore_ascii_case("template") {
+                self.offset = self.html.len();
+                return Some(Err("Unsupported inert retained HTML template".into()));
+            }
+            if !closing && name.eq_ignore_ascii_case("plaintext") {
+                self.offset = self.html.len();
+                return None;
+            }
+            if !closing
+                && [
+                    "script", "style", "textarea", "title", "xmp", "iframe", "noembed", "noframes",
+                    "noscript",
+                ]
+                .iter()
+                .any(|raw| name.eq_ignore_ascii_case(raw))
+            {
+                // Raw-text/RCDATA contents are text, even when they contain literal tags.
+                let mut cursor = self.offset;
+                let mut closed = false;
+                while let Some(relative) = self.html[cursor..].find("</") {
+                    let start = cursor + relative;
+                    let bytes = self.html.as_bytes();
+                    let name_start = start + 2;
+                    let name_end = name_start + name.len();
+                    if bytes
+                        .get(name_start..name_end)
+                        .is_some_and(|found| found.eq_ignore_ascii_case(name.as_bytes()))
+                        && bytes.get(name_end).is_some_and(|next| {
+                            next.is_ascii_whitespace() || *next == b'>' || *next == b'/'
+                        })
+                        && let Some(end) = self.html[name_end..].find('>')
+                    {
+                        self.offset = name_end + end + 1;
+                        closed = true;
+                        break;
+                    }
+                    cursor = start + 2;
+                }
+                if !closed {
+                    self.offset = self.html.len();
+                    return Some(Err("Unterminated retained HTML text element".into()));
+                }
+                continue;
+            }
             return Some(Ok(HtmlTag {
                 start: at,
                 end: self.offset,
@@ -801,7 +845,12 @@ fn selected_crosscheck(
     if text(board, "schema")? != "tzolkin-bga-public-playing-initial-board-witness-v1"
         || archive_url(text(board, "url")?)? != *id
         || move_number(board)? != move_number(after)?
-        || !text(board, "visibleLogText")?.contains("各プレイヤーは対応する資源を手に入れた")
+        || capture_time(board)? < capture_time(after)?
+        || !text(board, "visibleLogText")?
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| line.contains("各プレイヤーは対応する資源を手に入れた"))
         || array(board, "gearWorkerNodes")?
             .iter()
             .any(|w| !text(w, "id").is_ok_and(|id| id.starts_with("worker_dummy_")))
@@ -1763,6 +1812,23 @@ mod tests {
                 .unwrap_err()
                 .contains("Declared offer panel")
         );
+        for inert in [
+            "script", "STYLE", "textarea", "title", "xmp", "iframe", "noembed", "noframes",
+            "noscript", "template",
+        ] {
+            let mut inert_before = before.clone();
+            inert_before["gameAreaHtml"] =
+                Value::String(format!("<{inert}>{offer_html}</{inert}>{empty}"));
+            assert!(decode_choice(&inert_before, &after, &atlas).is_err());
+            let mut inert_after = after.clone();
+            inert_after["gameAreaHtml"] = Value::String(format!("<{inert}>{selected}</{inert}>"));
+            assert!(decode_choice(&before, &inert_after, &atlas).is_err());
+        }
+        let mut with_templates = before.clone();
+        with_templates["gameAreaHtml"] = Value::String(format!(
+            "<script type=\"text/template\">{different}</SCRIPT><style>{different}</style>{offer_html}{empty}"
+        ));
+        assert!(decode_choice(&with_templates, &after, &atlas).is_ok());
         let mut with_extra_event = before.clone();
         with_extra_event["move"] = Value::String("Move #7".into());
         let mut later_confirmation = after.clone();
@@ -1861,11 +1927,18 @@ mod tests {
             let id = format!("marker_100_technology_{name}");
             serde_json::json!({"id":id,"html":format!("<div id=\"{id}\" style=\"left: 1px;\"></div>")})
         }).collect();
-        let board = serde_json::json!({"schema":"tzolkin-bga-public-playing-initial-board-witness-v1","url":url,"move":"Move #4","visibleLogText":"各プレイヤーは対応する資源を手に入れた","gearWorkerNodes":[],"publicCounters":counters,"templeMarkers":temples,"technologyMarkers":technologies});
-        let after = serde_json::json!({"move":"Move #4"});
+        let board = serde_json::json!({"schema":"tzolkin-bga-public-playing-initial-board-witness-v1","capturedAt":"2000-01-01T00:00:02.000Z","url":url,"move":"Move #4","visibleLogText":"各プレイヤーは対応する資源を手に入れた","gearWorkerNodes":[],"publicCounters":counters,"templeMarkers":temples,"technologyMarkers":technologies});
+        let after = serde_json::json!({"move":"Move #4","capturedAt":"2000-01-01T00:00:01.000Z"});
         let id = archive_url(url).unwrap();
         selected_crosscheck(&board, &id, &input(), 4, &after).unwrap();
         assert!(selected_crosscheck(&board, &id, &input(), 0, &after).is_err());
+        let mut later = board.clone();
+        later["visibleLogText"] =
+            Value::String("各プレイヤーは対応する資源を手に入れた\nPlayer places a worker".into());
+        assert!(selected_crosscheck(&later, &id, &input(), 4, &after).is_err());
+        let mut stale = board.clone();
+        stale["capturedAt"] = Value::String("2000-01-01T00:00:00.000Z".into());
+        assert!(selected_crosscheck(&stale, &id, &input(), 4, &after).is_err());
         let mut wrong = board.clone();
         wrong["publicCounters"][0]["valueText"] = Value::String("14".into());
         assert!(selected_crosscheck(&wrong, &id, &input(), 4, &after).is_err());
