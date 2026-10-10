@@ -10,6 +10,7 @@ pub mod kernel;
 pub mod model;
 pub mod policy_dataset;
 pub mod policy_training;
+pub mod public_deployment;
 pub mod public_model;
 pub mod public_native;
 pub mod public_policy_cohort;

@@ -106,12 +106,30 @@ fn actual_trained_policy_completes_three_four_players_roundtrips_and_runs_qualif
     assert_eq!(initialized.artifact().family_closure().len(), 2);
     assert_eq!(prepared.backend(), "scalar");
     assert_eq!(handle.backend(), "scalar");
+    let deployment_bytes = tzolkin_ai::public_deployment::export_prepared_bc(&prepared).unwrap();
+    let deployed =
+        tzolkin_inference::deployment::LoadedDeployment::load(&deployment_bytes).unwrap();
+    assert_eq!(deployed.source_role(), "bcPrepared");
+    assert_eq!(deployed.source_checksum(), prepared.model().checksum);
+    assert_eq!(deployed.update_count(), None);
     let state =
         tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 11235, false).unwrap();
     let observation = observe(&state, state.current_player).unwrap();
     assert_eq!(
         handle.choose_move(&observation).unwrap(),
         direct.choose_move(&observation).unwrap()
+    );
+    let deployed_setup = deployed.choose_move(&observation).unwrap();
+    let original_setup = direct.choose_move(&observation).unwrap();
+    assert_eq!(deployed_setup.actor, original_setup.actor);
+    assert_eq!(
+        deployed_setup.observation_key,
+        original_setup.observation_key
+    );
+    assert_eq!(deployed_setup.r#move, original_setup.r#move);
+    assert_eq!(
+        deployed_setup.score.to_bits(),
+        original_setup.score.to_bits()
     );
     let provenance = serde_json::to_value(handle.provenance()).unwrap();
     assert_eq!(provenance["kind"], "publicLearned");
@@ -162,6 +180,32 @@ fn actual_trained_policy_completes_three_four_players_roundtrips_and_runs_qualif
             assert_eq!(
                 handle.choose_move(&step.observation).unwrap(),
                 direct.choose_move(&step.observation).unwrap()
+            );
+            let old = direct.distribution(&step.observation).unwrap();
+            let new = deployed.distribution(&step.observation).unwrap();
+            assert_eq!(
+                new.logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                old.logits
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                new.probabilities
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                old.probabilities
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                deployed.choose_move(&step.observation).unwrap().r#move,
+                step.chosen.r#move
             );
         }
         completed_records.push(record);
