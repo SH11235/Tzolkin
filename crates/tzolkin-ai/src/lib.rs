@@ -22,6 +22,7 @@ pub mod public_policy_pullback;
 pub mod public_policy_repeat;
 pub mod public_policy_update;
 pub mod public_rl_artifact;
+pub mod public_rl_controller;
 pub mod public_rl_long_stochastic_native;
 pub mod public_rl_native;
 pub mod public_rl_policy_cohort;
