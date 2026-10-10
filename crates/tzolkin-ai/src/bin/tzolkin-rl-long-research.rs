@@ -336,6 +336,19 @@ fn run(args: &[String]) -> Result<i32, String> {
         .count1_checkpoint
         .read(tzolkin_ai::public_rl_session::MAX_CHECKPOINT_BYTES)?;
     let output = Path::new(flags["--output"]);
+    // Keep the closed session journal directory free of research receipts, so
+    // the existing Long restore can validate it independently of this CLI.
+    let mut research_name = output
+        .file_name()
+        .ok_or("Output needs a directory name")?
+        .to_os_string();
+    research_name.push(".research");
+    let research_output = output.with_file_name(research_name);
+    match fs::symlink_metadata(&research_output) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.to_string()),
+        Ok(_) => return Err("Research output already exists; automatic retry is forbidden".into()),
+    }
     match fs::symlink_metadata(output) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.to_string()),
@@ -357,8 +370,11 @@ fn run(args: &[String]) -> Result<i32, String> {
         output,
     )?;
     session.require_unused_validation_families(&evaluation.seeds)?;
+    // from_count1 has checked the shared existing parent and created the
+    // session with no links. create_dir refuses any concurrent collision.
+    fs::create_dir(&research_output).map_err(|e| e.to_string())?;
     let bytes = save_new(
-        output,
+        &research_output,
         "research-controls.json",
         &json!({
             "inputs":inputs, "inputControlSha256":sha(&raw), "evaluationSpec":evaluation,
@@ -367,15 +383,16 @@ fn run(args: &[String]) -> Result<i32, String> {
             "absolutePool4":["heuristic","cornFirstUxmalOpening","preparedBc","search"],
             "qualification":{"calls":1,"seconds":qualification_seconds,"instrumentedForwardCalls":null},
             "resumeImplemented":false, "externalWallWatchdogRequired":true,
+            "sessionDirectory":output,
         }),
     )?;
-    let controls = read_bounded(&output.join("research-controls.json"), SMALL)?;
+    let controls = read_bounded(&research_output.join("research-controls.json"), SMALL)?;
     let mut research = Research {
         session,
         bc: &prepared,
         evaluation,
         search,
-        output,
+        output: &research_output,
         controls_sha256: sha(&controls),
         recorded_due: 0,
         recorded_points: 0,
