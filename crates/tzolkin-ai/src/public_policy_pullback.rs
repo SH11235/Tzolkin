@@ -10,6 +10,21 @@ use crate::model::{MAX_CANDIDATES, dot};
 use crate::public_model::{B1, BP, HIDDEN, PARAMETER_COUNT, PublicPolicyModel, WP};
 
 pub const PULLBACK_VERSION: &str = "public-scalar-f32-tanh-f64-pullback-v1";
+const PREFIX_COUNT: usize = 384;
+
+fn same_context_bits(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn continue_dot(initial: f32, left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .fold(initial, |sum, (left, right)| sum + left * right)
+}
 
 /// Borrows immutable parameters and tagged rows; owns only bounded forward scratch.
 /// At most 4096 rows, 4096 logits and 4096 x 32 hidden activations are cached.
@@ -25,23 +40,46 @@ impl<'a> ScalarPolicyPullback<'a> {
         if rows.is_empty() || rows.len() > MAX_CANDIDATES {
             return Err("Invalid scalar pullback candidate count".into());
         }
-        let context = &rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384];
+        let context = &rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..PREFIX_COUNT];
         let mut values = Vec::with_capacity(rows.len());
         let mut hidden = Vec::with_capacity(rows.len());
         let mut logits = Vec::with_capacity(rows.len());
+        let mut prefix: Option<[f32; HIDDEN]> = None;
         for row in rows {
-            if &row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384] != context {
+            if &row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..PREFIX_COUNT] != context {
                 return Err("Scalar pullback candidates do not share one context".into());
             }
             let input = PublicPolicyModel::validated_values(row)?;
+            // Keep validation row-by-row. Numeric context equality also accepts
+            // signed-zero differences; those rows retain the original full dot.
+            let cached = if rows.len() > 1 && same_context_bits(context, &input[..PREFIX_COUNT]) {
+                Some(&*prefix.get_or_insert_with(|| {
+                    std::array::from_fn(|unit| {
+                        dot(
+                            &model.parameters
+                                [unit * FEATURE_COUNT..unit * FEATURE_COUNT + PREFIX_COUNT],
+                            context,
+                        )
+                    })
+                }))
+            } else {
+                None
+            };
             let mut activation = [0.0; HIDDEN];
             for (unit, value) in activation.iter_mut().enumerate() {
                 // The Scalar kernel and its context-prefix continuation use this
                 // same left-to-right f32 multiply/add order, with no mul_add.
-                let affine = dot(
-                    &model.parameters[unit * FEATURE_COUNT..(unit + 1) * FEATURE_COUNT],
-                    input,
-                ) + model.parameters[B1 + unit];
+                let weights = &model.parameters[unit * FEATURE_COUNT..(unit + 1) * FEATURE_COUNT];
+                let sum = if let Some(prefix) = cached {
+                    continue_dot(
+                        prefix[unit],
+                        &weights[PREFIX_COUNT..],
+                        &input[PREFIX_COUNT..],
+                    )
+                } else {
+                    dot(weights, input)
+                };
+                let affine = sum + model.parameters[B1 + unit];
                 if !affine.is_finite() {
                     return Err("Nonfinite scalar pullback hidden affine".into());
                 }
@@ -156,6 +194,51 @@ mod tests {
         })
     }
 
+    // The previous full-dot implementation remains an independent bit oracle.
+    fn uncached<'a>(
+        model: &'a PublicPolicyModel,
+        rows: &'a [EncodedCandidate],
+    ) -> Result<ScalarPolicyPullback<'a>, String> {
+        model.validate()?;
+        if rows.is_empty() || rows.len() > MAX_CANDIDATES {
+            return Err("Invalid scalar pullback candidate count".into());
+        }
+        let context = &rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384];
+        let mut values = Vec::with_capacity(rows.len());
+        let mut hidden = Vec::with_capacity(rows.len());
+        let mut logits = Vec::with_capacity(rows.len());
+        for row in rows {
+            if &row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384] != context {
+                return Err("Scalar pullback candidates do not share one context".into());
+            }
+            let input = PublicPolicyModel::validated_values(row)?;
+            let mut activation = [0.0; HIDDEN];
+            for (unit, value) in activation.iter_mut().enumerate() {
+                let affine = dot(
+                    &model.parameters[unit * FEATURE_COUNT..(unit + 1) * FEATURE_COUNT],
+                    input,
+                ) + model.parameters[B1 + unit];
+                if !affine.is_finite() {
+                    return Err("Nonfinite scalar pullback hidden affine".into());
+                }
+                *value = affine.tanh();
+            }
+            let logit = dot(&model.parameters[WP..BP], &activation) + model.parameters[BP];
+            if !logit.is_finite() {
+                return Err("Nonfinite scalar pullback logit".into());
+            }
+            values.push(input);
+            hidden.push(activation);
+            logits.push(logit);
+        }
+        Ok(ScalarPolicyPullback {
+            model,
+            values,
+            hidden,
+            logits,
+        })
+    }
+
     #[test]
     fn cached_forward_bits_match_loaded_scalar_and_zero_pullback_preserves_accumulator() {
         let artifact = PublicPolicyArtifact::new(11235).unwrap();
@@ -167,6 +250,28 @@ mod tests {
             for count in [1, 2, rows.len()] {
                 let rows = &rows[..count];
                 let cache = ScalarPolicyPullback::new(&artifact.model, rows).unwrap();
+                let old = uncached(&artifact.model, rows).unwrap();
+                assert_eq!(
+                    cache
+                        .hidden
+                        .iter()
+                        .flatten()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    old.hidden
+                        .iter()
+                        .flatten()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    cache
+                        .logits()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    old.logits().iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
                 let expected = loaded.predict(rows).unwrap().logits;
                 assert_eq!(cache.version(), PULLBACK_VERSION);
                 assert!(
@@ -181,8 +286,59 @@ mod tests {
                     .accumulate_parameter_gradient(&vec![0.0; count], &mut gradient)
                     .unwrap();
                 assert!(gradient.iter().all(|value| *value == 0.125));
+                let dlogits: Vec<f64> = (0..count).map(|i| [0.7, -0.2, 0.35][i % 3]).collect();
+                let mut old_gradient = gradient.clone();
+                cache
+                    .accumulate_parameter_gradient(&dlogits, &mut gradient)
+                    .unwrap();
+                old.accumulate_parameter_gradient(&dlogits, &mut old_gradient)
+                    .unwrap();
+                assert_eq!(
+                    gradient.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    old_gradient.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+                let proposal = |gradient: &[f64]| {
+                    artifact
+                        .model
+                        .parameters
+                        .iter()
+                        .zip(gradient)
+                        .flat_map(|(&old, &g)| ((f64::from(old) - 0.01 * g) as f32).to_le_bytes())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    crate::model::digest(&proposal(&gradient)),
+                    crate::model::digest(&proposal(&old_gradient))
+                );
             }
         }
+        // Cancellation straddles the prefix boundary. Reducing the suffix
+        // separately or adding bias before continuation changes these bits.
+        let mut input = [0.0; FEATURE_COUNT];
+        input[383..386].fill(1.0);
+        let mut weights = [0.0; FEATURE_COUNT];
+        weights[383] = 16_777_216.0;
+        weights[384] = -16_777_216.0;
+        weights[385] = 1.0;
+        let prefix = dot(&weights[..PREFIX_COUNT], &input[..PREFIX_COUNT]);
+        let affine = continue_dot(prefix, &weights[PREFIX_COUNT..], &input[PREFIX_COUNT..]) + 0.25;
+        assert_eq!(affine.to_bits(), 1.25_f32.to_bits());
+        assert_eq!(affine.to_bits(), (dot(&weights, &input) + 0.25).to_bits());
+        let mut signed_zero = input;
+        signed_zero[0] = -0.0;
+        assert_eq!(&input[..PREFIX_COUNT], &signed_zero[..PREFIX_COUNT]);
+        assert!(same_context_bits(
+            &input[..PREFIX_COUNT],
+            &input[..PREFIX_COUNT]
+        ));
+        assert!(!same_context_bits(
+            &input[..PREFIX_COUNT],
+            &signed_zero[..PREFIX_COUNT]
+        ));
+        assert_eq!(
+            dot(&weights, &signed_zero).to_bits(),
+            dot(&weights, &input).to_bits()
+        );
     }
 
     #[test]
@@ -285,11 +441,28 @@ mod tests {
         bad.parameters[231] = f32::MAX;
         bad.parameters[B1] = f32::MAX;
         assert!(ScalarPolicyPullback::new(&bad, &rows).is_err());
+        let mismatched = [rows[0].clone(), other[0].clone()];
+        assert_eq!(
+            ScalarPolicyPullback::new(&bad, &mismatched).err(),
+            uncached(&bad, &mismatched).err()
+        );
+        assert_eq!(
+            uncached(&bad, &mismatched).err().as_deref(),
+            Some("Nonfinite scalar pullback hidden affine")
+        );
         let mut bad = artifact.model.clone();
         bad.parameters.fill(0.0);
         bad.parameters[B1..WP].fill(1.0);
         bad.parameters[WP..BP].fill(f32::MAX);
         assert!(ScalarPolicyPullback::new(&bad, &rows).is_err());
+        assert_eq!(
+            ScalarPolicyPullback::new(&bad, &mismatched).err(),
+            uncached(&bad, &mismatched).err()
+        );
+        assert_eq!(
+            uncached(&bad, &mismatched).err().as_deref(),
+            Some("Nonfinite scalar pullback logit")
+        );
         let cache = ScalarPolicyPullback::new(&artifact.model, &rows).unwrap();
         let mut gradient = vec![0.0; PARAMETER_COUNT];
         assert!(
