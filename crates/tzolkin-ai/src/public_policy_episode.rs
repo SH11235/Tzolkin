@@ -368,7 +368,55 @@ pub(crate) fn applied_plan<P>(
     sampling_version: &str,
     binding: impl FnOnce() -> Result<String, String>,
 ) -> Result<(Vec<ActorLink>, Vec<usize>, usize), String> {
-    complete_counts(&record.counts, record.callbacks.len())?;
+    applied_plan_for(record, config, sampling_version, binding, None)
+}
+
+/// Only fresh-audited mixed wrappers call this mask. Every global transition
+/// remains checked; links/likelihood targets are created only for the learner.
+pub(crate) fn applied_mixed_plan<P>(
+    record: &Record<P>,
+    config: &NativeStochasticConfig,
+    sampling_version: &str,
+    binding: impl FnOnce() -> Result<String, String>,
+    learner: usize,
+) -> Result<(Vec<ActorLink>, Vec<usize>, usize), String> {
+    if learner >= config.players() {
+        return Err("Mixed episode learner seat".into());
+    }
+    applied_plan_for(record, config, sampling_version, binding, Some(learner))
+}
+fn applied_plan_for<P>(
+    record: &Record<P>,
+    config: &NativeStochasticConfig,
+    sampling_version: &str,
+    binding: impl FnOnce() -> Result<String, String>,
+    learner: Option<usize>,
+) -> Result<(Vec<ActorLink>, Vec<usize>, usize), String> {
+    match learner {
+        None => complete_counts(&record.counts, record.callbacks.len())?,
+        Some(actor) => {
+            let n = record.callbacks.iter().filter(|c| c.actor == actor).count();
+            let counts = &record.counts;
+            if n == 0
+                || record.callbacks.len() > MAX_SAMPLES
+                || !counts.session_stopped
+                || counts.sampler_attempts != n
+                || counts.accepted_samples != n
+                || [
+                    counts.observed_callbacks,
+                    counts.apply_attempts,
+                    counts.apply_successes,
+                    counts.validated_applied_steps,
+                ]
+                .iter()
+                .any(|&n| n != record.callbacks.len())
+            {
+                return Err(
+                    "Mixed episode requires all transitions and complete learner draws".into(),
+                );
+            }
+        }
+    }
     let terminal = record
         .terminal
         .as_ref()
@@ -403,6 +451,26 @@ pub(crate) fn applied_plan<P>(
             .observation
             .as_ref()
             .ok_or("Actor episode is missing an observation")?;
+        if learner.is_some_and(|actor| callback.actor != actor) {
+            if callback.global_callback_index != index
+                || callback.failure.is_some()
+                || callback.sampler_attempted
+                || callback.sample.is_some()
+                || !callback.opponent_attempted
+                || callback.opponent_choice.is_none()
+                || !callback.apply_attempted
+                || !callback.apply_succeeded
+                || observation.actor != callback.actor
+                || observation.turn_player != callback.turn_player
+                || observation.observation_key != callback.observation_key
+                || observation.players.len() != config.players()
+                || !matches!(observation.phase, Phase::Setup | Phase::Playing)
+            {
+                return Err("Mixed episode opponent applied transition differs".into());
+            }
+            previous = callback.state_after.as_deref();
+            continue;
+        }
         let sample = callback
             .sample
             .as_ref()
@@ -423,7 +491,7 @@ pub(crate) fn applied_plan<P>(
             || sample.decision.observation_key != callback.observation_key
             || sample.decision.policy_version != sampling_version
             || sample.decision.r#move != sample.chosen.r#move
-            || trace.sample_index != index
+            || trace.sample_index != links.len()
             || trace.actor != actor
             || trace.policy_binding_key != binding
             || trace.legal_count != observation.legal_actions.len()

@@ -422,6 +422,67 @@ struct PolicyHandle<'a> {
     chooser: PolicyChooser<'a>,
     description: PolicyDescription,
 }
+
+/// Closed reactive dispatch shared with mixed Train collection. Construction
+/// still borrows qualified/sealed owners; an empty evaluation list grants no
+/// Train eligibility. The mixed collector separately excludes this full closure.
+pub(crate) struct FrozenReactiveOpponent<'a> {
+    handle: PolicyHandle<'a>,
+    families: Vec<String>,
+    max_search_steps: usize,
+}
+impl<'a> FrozenReactiveOpponent<'a> {
+    pub(crate) fn new(policy: BorrowedArenaPolicy<'a>) -> Result<Self, String> {
+        let (handle, _) = PolicyHandle::borrowed(policy, &[])?;
+        let families = match policy {
+            BorrowedArenaPolicy::Count1(p) => p.artifact().report().family_closure().to_vec(),
+            BorrowedArenaPolicy::Repeated(p) => p.artifact().report().family_closure().to_vec(),
+            BorrowedArenaPolicy::Long(p) => p.family_set().iter().cloned().collect(),
+            BorrowedArenaPolicy::Paired(p) => p.family_set().iter().cloned().collect(),
+            BorrowedArenaPolicy::PublicBc(p) => {
+                p.initialization_families().1.iter().cloned().collect()
+            }
+            BorrowedArenaPolicy::Search(_)
+            | BorrowedArenaPolicy::Heuristic(_)
+            | BorrowedArenaPolicy::CornFirstSetup(_)
+            | BorrowedArenaPolicy::CornFirstUxmalOpening(_) => Vec::new(),
+        };
+        let max_search_steps = match policy {
+            BorrowedArenaPolicy::Search(p) => p.config().max_total_steps,
+            _ => 0,
+        };
+        Ok(Self {
+            handle,
+            families,
+            max_search_steps,
+        })
+    }
+    pub(crate) fn description(&self) -> &PolicyDescription {
+        &self.handle.description
+    }
+    pub(crate) fn contains_family(&self, family: &str) -> bool {
+        self.families.iter().any(|f| f == family)
+    }
+    pub(crate) fn max_search_steps(&self) -> usize {
+        self.max_search_steps
+    }
+    pub(crate) fn choose(&self, observation: &Observation) -> Result<Decision, String> {
+        Ok(self.handle.choose_with_diagnostics(observation)?.0)
+    }
+    pub(crate) fn policy_version(&self) -> &str {
+        match &self.handle.description.provenance {
+            SeatPolicy::PublicRlPaired { policy_version, .. }
+            | SeatPolicy::PublicRl { policy_version, .. }
+            | SeatPolicy::PublicLearnedTradeGuard { policy_version, .. }
+            | SeatPolicy::PublicLearned { policy_version, .. }
+            | SeatPolicy::Search { policy_version, .. }
+            | SeatPolicy::Heuristic { policy_version, .. }
+            | SeatPolicy::CornFirstSetup { policy_version, .. }
+            | SeatPolicy::CornFirstUxmalOpening { policy_version, .. }
+            | SeatPolicy::Learned { policy_version, .. } => policy_version,
+        }
+    }
+}
 impl<'a> PolicyHandle<'a> {
     fn new(policy: &'a PreparedPolicy) -> Result<Self, String> {
         let (chooser, provenance, dataset_fingerprint) = match policy {
