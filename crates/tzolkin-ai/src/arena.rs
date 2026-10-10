@@ -7,9 +7,12 @@ use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
 use crate::public_native::{PreparedPublicPolicy, PublicPolicyHandle};
 use crate::public_policy_long::LongRlPolicy;
+use crate::public_policy_paired_long::PairedRlPolicy;
 use crate::public_policy_repeat::RepeatedPublicRlPolicy;
 use crate::public_policy_update::UpdatedPublicRlPolicy;
-use crate::public_rl_native::{LongRlHandle, RepeatedPublicRlHandle, UpdatedPublicRlHandle};
+use crate::public_rl_native::{
+    LongRlHandle, PairedRlHandle, RepeatedPublicRlHandle, UpdatedPublicRlHandle,
+};
 use crate::public_trade_guard::{
     self, TradeGuardCapture, TradeGuardConfig, TradeGuardSession, TradeGuardSummary,
 };
@@ -167,6 +170,7 @@ pub enum BorrowedArenaPolicy<'a> {
     Count1(&'a UpdatedPublicRlPolicy),
     Repeated(&'a RepeatedPublicRlPolicy),
     Long(&'a LongRlPolicy),
+    Paired(&'a PairedRlPolicy),
     PublicBc(&'a PreparedPublicPolicy),
     Heuristic(&'a HeuristicWeights),
     CornFirstSetup(&'a HeuristicWeights),
@@ -391,7 +395,7 @@ impl PreparedPolicy {
 pub struct PolicyDescription {
     pub provenance: SeatPolicy,
     pub dataset_fingerprint: Option<String>,
-    /// Present for Long-v2; its sealed artifact binds this exact numeric model.
+    /// Present for Long and Paired owners; the sealed artifact binds the actor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version: Option<&'static str>,
 }
@@ -399,6 +403,7 @@ enum PolicyChooser<'a> {
     PublicRlCount1(Box<UpdatedPublicRlHandle<'a>>),
     PublicRlRepeated(Box<RepeatedPublicRlHandle<'a>>),
     PublicRlLong(Box<LongRlHandle<'a>>),
+    PublicRlPaired(Box<PairedRlHandle<'a>>),
     PublicLearnedTradeGuard {
         policy: Box<PublicPolicyHandle<'a>>,
         guard: &'a TradeGuardConfig,
@@ -562,6 +567,16 @@ impl<'a> PolicyHandle<'a> {
                     overlap,
                 )
             }
+            BorrowedArenaPolicy::Paired(owner) => {
+                let handle = PairedRlHandle::new(owner)?;
+                let overlap = validation_overlap(handle.family_set(), seeds)?;
+                (
+                    PolicyChooser::PublicRlPaired(Box::new(handle)),
+                    paired_rl_provenance(owner),
+                    None,
+                    overlap,
+                )
+            }
             BorrowedArenaPolicy::PublicBc(policy) => {
                 // This also explicitly excludes the immutable audited Train set.
                 policy.require_validation_families(seeds)?;
@@ -637,8 +652,11 @@ impl<'a> PolicyHandle<'a> {
                 description: PolicyDescription {
                     provenance,
                     dataset_fingerprint,
-                    model_version: matches!(policy, BorrowedArenaPolicy::Long(_))
-                        .then_some(crate::public_model::MODEL_VERSION),
+                    model_version: matches!(
+                        policy,
+                        BorrowedArenaPolicy::Long(_) | BorrowedArenaPolicy::Paired(_)
+                    )
+                    .then_some(crate::public_model::MODEL_VERSION),
                 },
             },
             overlap,
@@ -652,6 +670,7 @@ impl<'a> PolicyHandle<'a> {
             PolicyChooser::PublicRlCount1(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicRlRepeated(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicRlLong(policy) => Ok((policy.choose_move(observation)?, None)),
+            PolicyChooser::PublicRlPaired(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicLearnedTradeGuard { .. } => {
                 Err("Guarded chooser requires its game-local indexed session".into())
             }
@@ -684,6 +703,30 @@ fn rl_provenance(checksum: &str, count: u64, task: &str, version: &str) -> SeatP
         task: task.into(),
         feature_schema: crate::features::PUBLIC_FEATURE_SCHEMA,
         input_contract: crate::public_model::INPUT_CONTRACT.into(),
+        numerical_target: crate::public_stochastic_native::numerical_target(),
+        inference_backend: "scalar".into(),
+        selection_version: replay::RL_ARGMAX_SELECTION_VERSION.into(),
+        guard: (),
+    }
+}
+fn paired_rl_provenance(owner: &PairedRlPolicy) -> SeatPolicy {
+    let report = owner.artifact().report();
+    SeatPolicy::PublicRlPaired {
+        policy_version: crate::public_policy_paired_long::POLICY_VERSION.into(),
+        artifact_checksum: owner.artifact().checksum().into(),
+        update_count: owner.artifact().update_count(),
+        task: crate::public_policy_paired_long::TASK.into(),
+        actor_model_version: crate::public_model::MODEL_VERSION.into(),
+        critic_model_version: crate::public_state_critic::MODEL_VERSION.into(),
+        feature_schema: crate::features::PUBLIC_FEATURE_SCHEMA,
+        input_contract: crate::public_model::INPUT_CONTRACT.into(),
+        context_schema: crate::public_state_critic::CONTEXT_SCHEMA,
+        context_contract: crate::public_state_critic::CONTEXT_CONTRACT.into(),
+        root_init_checksum: report.root_init_checksum().into(),
+        root_count1_checksum: report.root_count1_checksum().into(),
+        root_residual_checksum: report.root_residual_checksum().into(),
+        residual_seed: report.residual_seed(),
+        lineage_checksum: report.lineage_checksum().into(),
         numerical_target: crate::public_stochastic_native::numerical_target(),
         inference_backend: "scalar".into(),
         selection_version: replay::RL_ARGMAX_SELECTION_VERSION.into(),
@@ -752,6 +795,7 @@ fn borrowed_work_bounds(
                     PolicyChooser::PublicRlCount1(_)
                     | PolicyChooser::PublicRlRepeated(_)
                     | PolicyChooser::PublicRlLong(_)
+                    | PolicyChooser::PublicRlPaired(_)
                     | PolicyChooser::PublicLearned(_) => public_policy = true,
                     PolicyChooser::Search(policy) => {
                         search_cap = search_cap.max(
@@ -1278,6 +1322,7 @@ pub fn run_public_rl_validation_arena<'a>(
         BorrowedArenaPolicy::Count1(_)
             | BorrowedArenaPolicy::Repeated(_)
             | BorrowedArenaPolicy::Long(_)
+            | BorrowedArenaPolicy::Paired(_)
     ) {
         return Err("Borrowed RL Arena candidate must be a sealed RL policy".into());
     }

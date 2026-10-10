@@ -201,6 +201,25 @@ impl<'a> PairedRlHandle<'a> {
             observation,
         )
     }
+    /// Evaluation uses only the actor and the first maximum in native legal order.
+    /// The residual remains a training baseline, not an action score or game value.
+    pub(crate) fn choose_move(&self, observation: &Observation) -> Result<Decision, String> {
+        let prediction = self.distribution(observation)?;
+        let best = (1..prediction.logits.len()).fold(0, |best, index| {
+            if prediction.logits[index] > prediction.logits[best] {
+                index
+            } else {
+                best
+            }
+        });
+        Ok(Decision {
+            actor: observation.actor,
+            observation_key: observation.observation_key.clone(),
+            policy_version: crate::public_policy_paired_long::POLICY_VERSION.into(),
+            r#move: observation.legal_actions[best].r#move.clone(),
+            score: f64::from(prediction.logits[best]),
+        })
+    }
 }
 
 /// Scalar inference from the controlled repeated owner, count2..10. The owner
