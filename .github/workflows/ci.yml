@@ -125,8 +125,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: wasm32-unknown-unknown
+      # vitest and e2e build the same Wasm and helper binaries.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: wasm
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - id: bindgen
         run: |
@@ -163,8 +165,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: wasm32-unknown-unknown
+      # vitest and e2e build the same Wasm and helper binaries.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: wasm
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - id: bindgen
         run: |
@@ -219,8 +223,8 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
       # The installer keeps the archives it downloads. Seeding apt's archive
-      # directory from last week's copy skips most of the download; apt checks
-      # every archive against the signed index before using it.
+      # directory from last week's copy skips most of the download. apt accepts
+      # a seeded archive whose size matches, so only master saves this cache.
       - id: apt
         run: |
           echo "key=apt-desktop-$RUNNER_OS-$RUNNER_ARCH-${{ hashFiles('scripts/ci-install-linux-dependencies.sh') }}" >> "$GITHUB_OUTPUT"
@@ -237,12 +241,20 @@ jobs:
           fi
       - name: Install Linux dependencies
         run: bash scripts/ci-install-linux-dependencies.sh
-      - if: github.ref == 'refs/heads/master' && steps.apt-cache.outputs.cache-hit != 'true'
+      # Refreshing the cache must not fail the job.
+      - id: apt-archives
+        if: github.ref == 'refs/heads/master' && steps.apt-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         run: |
+          sudo apt-get autoclean
           rm -rf "$HOME/apt-archives"
           mkdir -p "$HOME/apt-archives"
-          cp /var/cache/apt/archives/*.deb "$HOME/apt-archives/"
-      - if: github.ref == 'refs/heads/master' && steps.apt-cache.outputs.cache-hit != 'true'
+          if compgen -G "/var/cache/apt/archives/*.deb" >/dev/null; then
+            cp /var/cache/apt/archives/*.deb "$HOME/apt-archives/"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.apt-archives.outputs.found == 'true'
+        continue-on-error: true
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/apt-archives
