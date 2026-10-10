@@ -164,14 +164,16 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     fail('Invalid witness list');
   const raw =
     declaredProfile === null ? JSON.parse(rawBytes) : uniqueJson(rawBytes, MAX_BYTES, 'raw log');
-  const observedOptions =
+  const table =
     declaredProfile === null
       ? null
-      : observedBasicUnlimitedOptions(
-          raw,
-          tableBytes === null ? null : uniqueJson(tableBytes, MAX_BYTES, 'table evidence'),
-        );
+      : tableBytes === null
+        ? null
+        : uniqueJson(tableBytes, MAX_BYTES, 'table evidence');
+  if (declaredProfile !== null) observedBasicUnlimitedOptions(raw, table);
   const game = normalizeGame(raw, sha(rawBytes), tableBytes);
+  const observedOptions =
+    declaredProfile === null ? null : observedBasicUnlimitedOptions(raw, table, game.context);
   if (game.source.adapter !== 'bga-public-ui-dom-v1' && tableBytes !== null)
     fail('Legacy input requires embedded table settings, not separate table evidence');
   if (

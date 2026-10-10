@@ -77,7 +77,7 @@ export function uniqueJson(bytes, max, label) {
 /** Only concrete observed scalar context fields and explicit option label/value
  * text are decoded. Missing expansion switches never become disabled switches.
  * This is compatibility evidence, not source authentication or BC admission. */
-export function observedBasicUnlimitedOptions(raw, table = null) {
+export function observedBasicUnlimitedOptions(raw, table = null, normalizedContext = null) {
   if (!object(raw)) fail('Invalid option source');
   const result = {
     mode: null,
@@ -114,11 +114,12 @@ export function observedBasicUnlimitedOptions(raw, table = null) {
     result[key] = known;
     result.evidence.push({ source, key, rawValue, value: known });
   }
-  function optionText(value, source) {
+  function optionText(value, source, allowConfigurationPrefix = false) {
     if (value === undefined || value === null || value === '') return;
     if (typeof value !== 'string' || value.length > 65536) fail('Invalid observed option text');
     const sections = value.replaceAll('\r\n', '\n').split('ゲーム構成\n');
-    if (sections.length > 2) fail('Ambiguous observed game configuration');
+    if (sections.length > 2 || (!allowConfigurationPrefix && sections.length !== 1))
+      fail('Ambiguous observed game configuration');
     const lines = sections
       .at(-1)
       .split('\n')
@@ -143,12 +144,15 @@ export function observedBasicUnlimitedOptions(raw, table = null) {
   }
   // Embedded text is inspected even for the newer UI adapter, whose normalizer
   // otherwise substitutes separate table evidence and would discard it.
-  optionText(raw.table_details_text, 'raw.table_details_text');
-  if (raw.context !== null && raw.context !== undefined) {
-    if (!object(raw.context)) fail('Invalid observed context');
-    set('mode', raw.context.mode, 'raw.context.mode');
-    set('marketLimit', raw.context.marketOption, 'raw.context.marketOption');
-    if (raw.context.extensionOptions !== null && raw.context.extensionOptions !== undefined)
+  optionText(raw.table_details_text, 'raw.table_details_text', true);
+  if (normalizedContext !== null) {
+    if (!object(normalizedContext)) fail('Invalid normalized context');
+    set('mode', normalizedContext.mode, 'normalized.context.mode');
+    set('marketLimit', normalizedContext.marketOption, 'normalized.context.marketOption');
+    if (
+      normalizedContext.extensionOptions !== null &&
+      normalizedContext.extensionOptions !== undefined
+    )
       fail('Unsupported observed extension options');
   }
   if (table !== null) {

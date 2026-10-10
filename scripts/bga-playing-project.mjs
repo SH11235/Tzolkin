@@ -374,20 +374,11 @@ function atlasFrom(value, release, captureSha256) {
   if (value.geometry !== null) {
     closed(
       value.geometry,
-      [
-        'captureSha256',
-        'evidenceSha256',
-        'coordinateSpace',
-        'boardSize',
-        'workerSize',
-        'offset',
-        'tolerance',
-      ],
+      ['captureSha256', 'coordinateSpace', 'boardSize', 'workerSize', 'offset', 'tolerance'],
       'geometry calibration',
     );
     if (
       value.geometry.captureSha256 !== captureSha256 ||
-      !/^[a-f0-9]{64}$/.test(value.geometry.evidenceSha256) ||
       value.geometry.coordinateSpace !== 'retained-client-rect'
     )
       fail('Unbound geometry calibration');
@@ -560,7 +551,7 @@ export function projectCapturedInitial(
   const calibration = uniqueJson(calibrationBytes, MAX_ATLAS_BYTES, 'calibration');
   const raw = uniqueJson(rawLogBytes, MAX_BYTES, 'raw log');
   const table = tableBytes === null ? null : uniqueJson(tableBytes, MAX_BYTES, 'table evidence');
-  const observedOptions = observedBasicUnlimitedOptions(raw, table);
+  observedBasicUnlimitedOptions(raw, table);
   const mechanicalProfile = profile(control.mechanicalProfile);
   if (!CAPTURE_SCHEMAS.has(capture.schema)) fail('Unsupported Playing capture schema');
   const url = urlIdentity(capture.url);
@@ -575,6 +566,7 @@ export function projectCapturedInitial(
   const match = /^Move #([1-9]\d*)$/.exec(capture.move ?? '');
   const actionId = integer(match ? Number(match[1]) : null, 1, 100000, 'capture move');
   const game = normalizeGame(raw, sha(rawLogBytes), tableBytes);
+  const observedOptions = observedBasicUnlimitedOptions(raw, table, game.context);
   if (tableBytes !== null && game.source.adapter !== 'bga-public-ui-dom-v1')
     fail('Legacy input requires embedded table settings, not separate table evidence');
   if (
@@ -620,13 +612,20 @@ export function projectCapturedInitial(
       control.turnOrderEvidence.knownAfterActionId !== null)
   )
     fail('Invalid noncausal turn order provenance');
-  if (control.turnOrderEvidence.kind === 'later-inferred')
+  if (control.turnOrderEvidence.kind === 'later-inferred') {
     integer(
       control.turnOrderEvidence.knownAfterActionId,
       actionId + 1,
       100000,
       'later order boundary',
     );
+    if (
+      !game.rawEntries.some(
+        (entry) => entry.action_id === control.turnOrderEvidence.knownAfterActionId,
+      )
+    )
+      fail('Later order boundary is absent from raw log');
+  }
   retained(
     boards,
     capture.publicCounters,
@@ -901,6 +900,7 @@ export function projectCapturedInitial(
       ],
       limits: [
         'Caller pins establish byte consistency, not source authentication or independent image review.',
+        'Image bytes and independent artwork or geometry interpretation are not verified by this producer.',
         'Seat cycle is an explicit noncausal mechanical declaration.',
         'A standalone replay record cannot carry this separate conditional provenance in the current app.',
       ],

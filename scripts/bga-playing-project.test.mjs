@@ -277,7 +277,6 @@ function fixture(n) {
       n === 3
         ? {
             captureSha256: '',
-            evidenceSha256: 'a'.repeat(64),
             coordinateSpace: 'retained-client-rect',
             boardSize: { width: 1500, height: 300 },
             workerSize: { width: 10, height: 15 },
@@ -316,7 +315,7 @@ function fixture(n) {
       market: 'unlimited',
       sourceOptions: 'unknown',
     },
-    turnOrderEvidence: { kind: 'later-inferred', knownAfterActionId: 12 },
+    turnOrderEvidence: { kind: 'declared', knownAfterActionId: null },
   };
   return { capture, atlas, raw, control };
 }
@@ -329,6 +328,21 @@ function inputs(value) {
   value.control.calibration = pin(atlas);
   value.control.rawLog = pin(raw);
   return [capture, atlas, raw, bytes(value.control)];
+}
+function currentUi(value) {
+  value.raw = {
+    ...value.raw,
+    schema_version: 1,
+    source_type: 'public_ui_dom',
+    export_scope: 'all_rendered_gamereview_log_entries',
+    dom_entry_count: value.raw.dom_entries.length,
+    metadata: {
+      tableUrl: 'https://boardgamearena.com/table?table=123',
+      playerCount: value.raw.metadata.player_count,
+      players: value.raw.metadata.players.map(({ text }) => ({ name: text })),
+    },
+  };
+  return value;
 }
 
 test('three/four-player captured projection preserves counters, dummy slots and conditional provenance', () => {
@@ -353,6 +367,15 @@ test('three/four-player captured projection preserves counters, dummy slots and 
     assert.equal(projected.provenance.sourceOptions.additionalBuildings, null);
     assert.equal(Object.hasOwn(initial, 'sourceOptions'), false); // Core DTO stays closed.
   }
+  const later = fixture(4);
+  later.control.turnOrderEvidence = { kind: 'later-inferred', knownAfterActionId: 12 };
+  later.raw.entries.push({ action_id: 12, raw_text: '', timestamp_display: '12:01:00' });
+  later.raw.dom_entries.push({ action_id: 12, messages: [], timestamp_display: '12:01:00' });
+  later.raw.entry_count++;
+  assert.equal(
+    projectCapturedInitial(...inputs(later)).provenance.turnOrder.knownAfterActionId,
+    12,
+  );
 });
 
 test('detached HTML, unknown/wrong-release sprites, duplicate JSON and ambiguous dummy geometry block', () => {
@@ -388,6 +411,12 @@ test('detached HTML, unknown/wrong-release sprites, duplicate JSON and ambiguous
   const scale = fixture(3);
   scale.capture.boardGeometry.rect.width = 1000;
   assert.throws(() => projectCapturedInitial(...inputs(scale)), /board scale/);
+  const unverified = fixture(3);
+  unverified.atlas.geometry.evidenceSha256 = 'a'.repeat(64);
+  assert.throws(() => projectCapturedInitial(...inputs(unverified)), /geometry calibration/);
+  const unknownOrder = fixture(4);
+  unknownOrder.control.turnOrderEvidence = { kind: 'later-inferred', knownAfterActionId: 12 };
+  assert.throws(() => projectCapturedInitial(...inputs(unknownOrder)), /absent from raw log/);
   const duplicate = inputs(fixture(4));
   duplicate[3] = Buffer.from(
     duplicate[3].toString().replace('"seatOrder":', '"schema":"duplicate","seatOrder":'),
@@ -462,42 +491,72 @@ test('conditional decode reaches shared core path with warnings while ordinary d
     );
   }
   const limited = fixture(4);
-  limited.raw.context = { mode: 'Arena', marketOption: '20', extensionOptions: null };
+  limited.raw.table_details_text =
+    'ゲーム構成\nゲームモード\nアリーナモード\nウシュマルコーンの制限\n20';
   assert.throws(() => projectCapturedInitial(...inputs(limited)), /contradicts/);
   assert.equal(calls, 2);
 
   const compatible = fixture(4);
-  compatible.raw.context = { mode: 'Arena', marketOption: 'Unlimited', extensionOptions: null };
-  const partial = projectCapturedInitial(...inputs(compatible));
+  compatible.raw.table_details_text =
+    'ゲーム構成\nゲームモード\nアリーナモード\nウシュマルコーンの制限\n制限なし';
+  const compatibleInputs = inputs(compatible);
+  const partial = projectCapturedInitial(...compatibleInputs);
   assert.equal(partial.provenance.mode, 'arena');
   assert.equal(partial.provenance.sourceOptions.marketLimit, 'unlimited');
   assert.equal(partial.provenance.sourceOptions.tribes, null);
   assert.equal(partial.provenance.observedOptions.complete, false);
-  compatible.raw.table_details_text = 'ゲーム構成\n部族\n無効';
+  assert.ok(
+    partial.provenance.observedOptions.evidence.some(
+      ({ source }) => source === 'normalized.context.marketOption',
+    ),
+  );
+  const partialDecode = decodeConditionalPublicGame(
+    compatibleInputs[2],
+    partial.witness,
+    dispatch,
+    partial.provenance.mechanicalProfile,
+  );
+  assert.ok(
+    partialDecode.manifest.observedOptions.evidence.some(
+      ({ source }) => source === 'normalized.context.mode',
+    ),
+  );
+  compatible.raw.table_details_text += '\n部族\n無効';
   const explicitlyDisabled = projectCapturedInitial(...inputs(compatible));
   assert.equal(explicitlyDisabled.provenance.sourceOptions.tribes, false);
   assert.equal(explicitlyDisabled.provenance.sourceOptions.prophecies, null);
 
   // Supplied table text is inspected as well, never substituted for the context
   // or embedded settings. Unsupported evidence cannot disappear in normalization.
-  const tableBytes = bytes({
-    schema: 'tzolkin-bga-public-table-ui-v1',
-    url: 'https://boardgamearena.com/table?table=123',
-    optionsText: '部族\n有効',
-  });
-  compatible.control.table = pin(tableBytes);
-  const tableInputs = inputs(compatible);
-  assert.throws(() => projectCapturedInitial(...tableInputs, tableBytes), /contradicts/);
-  assert.throws(
-    () =>
-      decodeConditionalPublicGame(
-        tableInputs[2],
-        { ...projected.witness, rawSha256: sha(tableInputs[2]) },
-        dispatch,
-        projected.provenance.mechanicalProfile,
-        tableBytes,
-      ),
-    /contradicts/,
-  );
-  assert.equal(calls, 2);
+  for (const optionsText of [
+    '部族\n有効',
+    '部族\n有効\nゲーム構成\n',
+    'ウシュマルコーンの制限\n20\nゲーム構成\nウシュマルコーンの制限\n制限なし',
+    'ゲームモード\nノーマルモード',
+  ]) {
+    const supplied = currentUi(structuredClone(compatible));
+    const tableBytes = bytes({
+      schema: 'tzolkin-bga-public-table-ui-v1',
+      url: 'https://boardgamearena.com/table?table=123',
+      optionsText,
+    });
+    supplied.control.table = pin(tableBytes);
+    const tableInputs = inputs(supplied);
+    assert.throws(
+      () => projectCapturedInitial(...tableInputs, tableBytes),
+      /contradicts|Ambiguous|Conflicting/,
+    );
+    assert.throws(
+      () =>
+        decodeConditionalPublicGame(
+          tableInputs[2],
+          { ...projected.witness, rawSha256: sha(tableInputs[2]) },
+          dispatch,
+          projected.provenance.mechanicalProfile,
+          tableBytes,
+        ),
+      /contradicts|Ambiguous|Conflicting/,
+    );
+  }
+  assert.equal(calls, 4);
 });
