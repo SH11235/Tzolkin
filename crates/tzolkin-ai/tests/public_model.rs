@@ -454,8 +454,15 @@ fn cli(args: &[&str], input: &[u8]) -> std::process::Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    write_stdin(&mut child, input);
     child.wait_with_output().unwrap()
+}
+// A CLI that rejects its arguments can exit before it reads stdin.
+fn write_stdin(child: &mut std::process::Child, input: &[u8]) {
+    match child.stdin.take().unwrap().write_all(input) {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("{error:?}"),
+        _ => {}
+    }
 }
 #[test]
 fn dedicated_choose_cli_preserves_library_decision_and_rejects_flags_wrong_models_and_bounds() {
