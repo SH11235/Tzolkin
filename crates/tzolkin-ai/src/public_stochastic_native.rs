@@ -281,6 +281,7 @@ pub(crate) enum NativePolicy<'handle, 'model> {
     Repeated(&'handle RepeatedPublicRlHandle<'model>),
     Long(&'handle crate::public_rl_native::LongRlHandle<'model>),
     Paired(&'handle crate::public_rl_native::PairedRlHandle<'model>),
+    Mixed(&'handle crate::public_rl_mixed_handle::MixedPolicyHandle<'model>),
 }
 impl<'handle, 'model> NativePolicy<'handle, 'model> {
     fn session(
@@ -301,6 +302,10 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
                 crate::public_stochastic::PairedStochasticSession::new(policy, identity)
                     .map(NativeSession::Paired)
             }
+            Self::Mixed(policy) => {
+                crate::public_stochastic::MixedStochasticSession::new(policy, identity)
+                    .map(NativeSession::Mixed)
+            }
         }
     }
     fn sampling_version(self) -> &'static str {
@@ -310,6 +315,7 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
             Self::Repeated(_) => REPEATED_SAMPLING_VERSION,
             Self::Long(_) => crate::public_policy_long::SAMPLING_VERSION,
             Self::Paired(_) => crate::public_policy_paired_long::SAMPLING_VERSION,
+            Self::Mixed(_) => crate::public_rl_mixed_handle::SAMPLING_VERSION,
         }
     }
 }
@@ -319,6 +325,7 @@ enum NativeSession<'handle, 'model> {
     Repeated(RepeatedStochasticSession<'handle, 'model>),
     Long(crate::public_stochastic::LongStochasticSession<'handle, 'model>),
     Paired(crate::public_stochastic::PairedStochasticSession<'handle, 'model>),
+    Mixed(crate::public_stochastic::MixedStochasticSession<'handle, 'model>),
 }
 impl NativeSession<'_, '_> {
     fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
@@ -328,6 +335,7 @@ impl NativeSession<'_, '_> {
             Self::Repeated(session) => session.sample(observation),
             Self::Long(session) => session.sample(observation),
             Self::Paired(session) => session.sample(observation),
+            Self::Mixed(session) => session.sample(observation),
         }
     }
     fn counters(&self) -> SamplingCounters {
@@ -337,6 +345,7 @@ impl NativeSession<'_, '_> {
             Self::Repeated(session) => session.counters(),
             Self::Long(session) => session.counters(),
             Self::Paired(session) => session.counters(),
+            Self::Mixed(session) => session.counters(),
         }
     }
     fn stop(&mut self) {
@@ -346,6 +355,7 @@ impl NativeSession<'_, '_> {
             Self::Repeated(session) => session.stop(),
             Self::Long(session) => session.stop(),
             Self::Paired(session) => session.stop(),
+            Self::Mixed(session) => session.stop(),
         }
     }
 }
@@ -524,25 +534,48 @@ pub(crate) fn run_frozen_mixed_shared<P: Serialize + PartialEq>(
     )
 }
 
+pub(crate) fn run_current_mixed_shared(
+    config: &NativeStochasticConfig,
+    policy: &crate::public_rl_mixed_handle::MixedPolicyHandle<'_>,
+    roster: &crate::public_rl_mixed_native::FrozenMixedRoster<'_>,
+    header: Header<crate::public_rl_current_mixed_source::CurrentMixedSource>,
+    expected: Option<&Record<crate::public_rl_current_mixed_source::CurrentMixedSource>>,
+) -> Result<Record<crate::public_rl_current_mixed_source::CurrentMixedSource>, String> {
+    header
+        .base_policy
+        .parent
+        .require_initial(policy.identity())?;
+    run_loop(
+        config,
+        NativePolicy::Mixed(policy),
+        SamplingActors::CurrentFrozen(roster),
+        crate::public_rl_current_mixed_source::RECORD_SCHEMA,
+        header,
+        expected,
+        apply_move,
+    )
+}
+
 #[derive(Clone, Copy)]
 enum SamplingActors<'roster, 'owner> {
     All,
     One(usize),
     Frozen(&'roster crate::public_rl_mixed_native::FrozenMixedRoster<'owner>),
+    CurrentFrozen(&'roster crate::public_rl_mixed_native::FrozenMixedRoster<'owner>),
 }
 impl SamplingActors<'_, '_> {
     fn learner_seat(self) -> Option<usize> {
         match self {
             Self::All => None,
             Self::One(learner) => Some(learner),
-            Self::Frozen(roster) => Some(roster.learner_seat()),
+            Self::Frozen(roster) | Self::CurrentFrozen(roster) => Some(roster.learner_seat()),
         }
     }
     fn samples(self, actor: usize) -> bool {
         match self {
             Self::All => true,
             Self::One(learner) => actor == learner,
-            Self::Frozen(roster) => actor == roster.learner_seat(),
+            Self::Frozen(roster) | Self::CurrentFrozen(roster) => actor == roster.learner_seat(),
         }
     }
     fn mixed_schema(self) -> Option<&'static str> {
@@ -550,6 +583,7 @@ impl SamplingActors<'_, '_> {
             Self::All => None,
             Self::One(_) => Some(crate::public_mixed_native::RECORD_SCHEMA),
             Self::Frozen(_) => Some(crate::public_rl_mixed_native::RECORD_SCHEMA),
+            Self::CurrentFrozen(_) => Some(crate::public_rl_current_mixed_source::RECORD_SCHEMA),
         }
     }
 }
@@ -580,6 +614,11 @@ fn run_loop<P: Serialize + PartialEq>(
     expected: Option<&Record<P>>,
     mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
 ) -> Result<Record<P>, String> {
+    if matches!(policy, NativePolicy::Mixed(_))
+        != matches!(actors, SamplingActors::CurrentFrozen(_))
+    {
+        return Err("Current mixed sampler requires its distinct frozen v2 route".into());
+    }
     if let Some(learner) = actors.learner_seat()
         && (learner >= config.players || actors.mixed_schema() != Some(schema))
     {
@@ -836,7 +875,9 @@ fn run_loop<P: Serialize + PartialEq>(
         } else {
             record.callbacks[index].opponent_attempted = true;
             let opponent = match actors {
-                SamplingActors::Frozen(roster) => Some(roster.opponent(observation.actor)?),
+                SamplingActors::Frozen(roster) | SamplingActors::CurrentFrozen(roster) => {
+                    Some(roster.opponent(observation.actor)?)
+                }
                 _ => None,
             };
             let expected_version = opponent
