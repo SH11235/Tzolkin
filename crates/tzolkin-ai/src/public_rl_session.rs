@@ -214,6 +214,25 @@ impl RlTrainingSession {
     pub fn progress(&self) -> Result<SessionProgress, String> {
         Ok(self.derive()?.1)
     }
+    pub(crate) fn mixed_sampling_prefix(&self) -> Result<(u64, u64, u64), String> {
+        Ok((
+            self.config.sampling_seed,
+            self.config.replicate_ordinal,
+            self.progress()?.next_episode_ordinal(),
+        ))
+    }
+    /// Data-only mixed collection must also avoid resolved failed/NoChange
+    /// reservations, not merely the current owner's trained family closure.
+    pub(crate) fn require_unused_training_families(&self, seeds: &[u32]) -> Result<(), String> {
+        let consumed = self.consumed_families()?;
+        for seed in seeds {
+            let family = seed_family_id(*seed);
+            if split_for_family(&family)? != DatasetSplit::Train || consumed.contains(&family) {
+                return Err("Imported session Train family already consumed or non-Train".into());
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn consumed_families(&self) -> Result<BTreeSet<String>, String> {
         Ok(self.derive()?.0)
     }
