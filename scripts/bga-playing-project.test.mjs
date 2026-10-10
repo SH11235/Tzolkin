@@ -335,6 +335,7 @@ function currentUi(value) {
     schema_version: 1,
     source_type: 'public_ui_dom',
     export_scope: 'all_rendered_gamereview_log_entries',
+    entries: [{ action_id: 7, raw_text: '行動 7 :\n12:00:00\n', timestamp_display: '12:00:00' }],
     dom_entry_count: value.raw.dom_entries.length,
     metadata: {
       tableUrl: 'https://boardgamearena.com/table?table=123',
@@ -422,9 +423,14 @@ test('detached HTML, unknown/wrong-release sprites, duplicate JSON and ambiguous
     duplicate[3].toString().replace('"seatOrder":', '"schema":"duplicate","seatOrder":'),
   );
   assert.throws(() => projectCapturedInitial(...duplicate), /duplicate JSON key/);
-  const inert = fixture(4);
-  inert.capture.gameAreaHtml += '<template><div class="worker worker_dummy"></div></template>';
-  assert.throws(() => projectCapturedInitial(...inputs(inert)), /unsupported inert/);
+  for (const tag of ['template', 'canvas', 'object', 'video', 'audio', 'select']) {
+    const inert = fixture(4);
+    inert.capture.gameAreaHtml += `<${tag}><div class="worker worker_dummy"></div></${tag}>`;
+    assert.throws(() => projectCapturedInitial(...inputs(inert)), /unsupported inert/);
+  }
+  const port = fixture(4);
+  port.capture.url = port.capture.url.replace('boardgamearena.com/', 'boardgamearena.com:8443/');
+  assert.throws(() => projectCapturedInitial(...inputs(port)), /Unsupported BGA source URL/);
 });
 
 test('conditional decode reaches shared core path with warnings while ordinary decode still requires options', () => {
@@ -494,6 +500,27 @@ test('conditional decode reaches shared core path with warnings while ordinary d
   limited.raw.table_details_text =
     'ゲーム構成\nゲームモード\nアリーナモード\nウシュマルコーンの制限\n20';
   assert.throws(() => projectCapturedInitial(...inputs(limited)), /contradicts/);
+  for (const prefix of ['部族\n有効', 'ウシュマルコーンの制限\n20']) {
+    const prefixed = fixture(4);
+    prefixed.raw.table_details_text =
+      `${prefix}\nゲーム構成\nウシュマルコーンの制限\n制限なし\n` +
+      '部族\n無効\n予言\n無効\n追加建物\n無効\nクイックアクション\n無効';
+    const prefixedInputs = inputs(prefixed);
+    assert.throws(
+      () => projectCapturedInitial(...prefixedInputs),
+      /prefix contains option evidence/,
+    );
+    assert.throws(
+      () =>
+        decodeConditionalPublicGame(
+          prefixedInputs[2],
+          { ...projected.witness, rawSha256: sha(prefixedInputs[2]) },
+          dispatch,
+          projected.provenance.mechanicalProfile,
+        ),
+      /prefix contains option evidence/,
+    );
+  }
   assert.equal(calls, 2);
 
   const compatible = fixture(4);
@@ -525,6 +552,39 @@ test('conditional decode reaches shared core path with warnings while ordinary d
   const explicitlyDisabled = projectCapturedInitial(...inputs(compatible));
   assert.equal(explicitlyDisabled.provenance.sourceOptions.tribes, false);
   assert.equal(explicitlyDisabled.provenance.sourceOptions.prophecies, null);
+
+  const current = currentUi(structuredClone(compatible));
+  const currentTable = bytes({
+    schema: 'tzolkin-bga-public-table-ui-v1',
+    url: 'https://boardgamearena.com/table?table=123',
+    optionsText: 'ゲームモード\nアリーナモード\nウシュマルコーンの制限\n制限なし\n部族\n無効',
+  });
+  current.control.table = pin(currentTable);
+  const currentInputs = inputs(current);
+  const currentProjection = projectCapturedInitial(...currentInputs, currentTable);
+  assert.equal(currentProjection.provenance.mode, 'arena');
+  assert.equal(currentProjection.provenance.sourceOptions.marketLimit, 'unlimited');
+  assert.equal(currentProjection.provenance.sourceOptions.tribes, false);
+  assert.equal(currentProjection.provenance.sourceOptions.prophecies, null);
+  assert.equal(currentProjection.provenance.policyTrainingReady, false);
+  assert.ok(
+    currentProjection.provenance.observedOptions.evidence.some(
+      ({ source }) => source === 'normalized.context.marketOption',
+    ),
+  );
+  const currentDecode = decodeConditionalPublicGame(
+    currentInputs[2],
+    currentProjection.witness,
+    dispatch,
+    currentProjection.provenance.mechanicalProfile,
+    currentTable,
+  );
+  assert.ok(
+    currentDecode.manifest.observedOptions.evidence.some(
+      ({ source }) => source === 'normalized.context.mode',
+    ),
+  );
+  assert.equal(currentDecode.manifest.trainingReady, false);
 
   // Supplied table text is inspected as well, never substituted for the context
   // or embedded settings. Unsupported evidence cannot disappear in normalization.
@@ -558,5 +618,5 @@ test('conditional decode reaches shared core path with warnings while ordinary d
       /contradicts|Ambiguous|Conflicting/,
     );
   }
-  assert.equal(calls, 4);
+  assert.equal(calls, 6);
 });

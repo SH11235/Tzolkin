@@ -159,6 +159,11 @@ function htmlTree(source, label) {
         'noembed',
         'noframes',
         'plaintext',
+        'canvas',
+        'object',
+        'video',
+        'audio',
+        'select',
       ].includes(tag)
     )
       fail(`${label}: unsupported inert/embedded container`);
@@ -284,6 +289,7 @@ function urlIdentity(value) {
     !/^(?:(?:en|ja)\.)?boardgamearena\.com$/.test(url.hostname) ||
     url.username ||
     url.password ||
+    url.port ||
     url.hash ||
     url.searchParams.getAll('table').length !== 1 ||
     !/^\d+$/.test(url.searchParams.get('table'))

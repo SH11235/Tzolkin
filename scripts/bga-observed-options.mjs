@@ -120,6 +120,11 @@ export function observedBasicUnlimitedOptions(raw, table = null, normalizedConte
     const sections = value.replaceAll('\r\n', '\n').split('ゲーム構成\n');
     if (sections.length > 2 || (!allowConfigurationPrefix && sections.length !== 1))
       fail('Ambiguous observed game configuration');
+    if (
+      sections.length === 2 &&
+      sections[0].split('\n').some((line) => LABELS.some(([pattern]) => pattern.test(line.trim())))
+    )
+      fail('Observed configuration prefix contains option evidence');
     const lines = sections
       .at(-1)
       .split('\n')
