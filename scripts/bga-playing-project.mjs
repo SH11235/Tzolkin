@@ -11,6 +11,7 @@ import { decodeConditionalPublicGame, WITNESS_SCHEMA } from './bga-decode.mjs';
 export const PROJECTION_SCHEMA = 'tzolkin-bga-playing-projection-v1';
 export const CONTROL_SCHEMA = 'tzolkin-bga-playing-projection-control-v1';
 export const ATLAS_SCHEMA = 'tzolkin-bga-playing-atlas-v1';
+export const LATER_WITNESS_SCHEMA = 'tzolkin-bga-playing-later-witnesses-v1';
 const CAPTURE_SCHEMAS = new Set([
   'tzolkin-bga-public-playing-initial-board-witness-v1',
   'tzolkin-bga-public-setup-complete-playing-board-v1',
@@ -310,6 +311,60 @@ function profile(value) {
   return structuredClone(value);
 }
 
+// An independently pinned collection supplies the ordinary decoder's later
+// observations. Identity bindings prove consistency with these inputs, not that
+// the observations were authenticated or independently interpreted from BGA.
+function laterWitnessesFrom(bytes, binding, game) {
+  const value = uniqueJson(bytes, MAX_BYTES, 'later witnesses');
+  closed(value, ['schema', ...Object.keys(binding), 'witnesses'], 'later witnesses');
+  if (value.schema !== LATER_WITNESS_SCHEMA) fail('Unsupported later witness schema');
+  for (const [field, expected] of Object.entries(binding))
+    if (value[field] !== expected) fail(`Later witness ${field} binding mismatch`);
+  list(value.witnesses, 4000, 'later witnesses');
+  const ids = new Set(game.rawEntries.map((entry) => entry.action_id));
+  const seen = new Set();
+  const buildings = new Map(catalog.BUILDINGS.map((card) => [card.id, card.age]));
+  const monuments = new Set(catalog.MONUMENTS.map((card) => card.id));
+  for (const witness of value.witnesses) {
+    closed(witness, ['actionId'], 'later witness', [
+      'expected',
+      'refills',
+      'buildings',
+      'monuments',
+      'pendingTask',
+    ]);
+    integer(witness.actionId, binding.initialActionId + 1, 100000, 'later witness action');
+    if (!ids.has(witness.actionId) || seen.has(witness.actionId))
+      fail('Duplicate/unknown later witness action ID');
+    seen.add(witness.actionId);
+    if (Object.keys(witness).length === 1) fail('Later witness has no observation');
+    if (
+      witness.expected !== undefined &&
+      (!object(witness.expected) || !Object.keys(witness.expected).length)
+    )
+      fail('Empty later witness checkpoint');
+    if (witness.pendingTask !== undefined && witness.pendingTask !== null)
+      text(witness.pendingTask, 64, 'later pending task');
+    const cards = (values, known, label) => {
+      list(values, 6, label);
+      if (new Set(values).size !== values.length || values.some((id) => !known(id)))
+        fail(`Invalid ${label} catalog IDs`);
+    };
+    if (witness.buildings !== undefined)
+      cards(witness.buildings, (id) => buildings.has(id), 'later buildings');
+    if (witness.monuments !== undefined)
+      cards(witness.monuments, (id) => monuments.has(id), 'later monuments');
+    if (witness.refills !== undefined) {
+      closed(witness.refills, [], 'later refills', ['currentAge', 'age2']);
+      if (witness.refills.currentAge !== undefined)
+        cards(witness.refills.currentAge, (id) => buildings.has(id), 'later current-age reveals');
+      if (witness.refills.age2 !== undefined)
+        cards(witness.refills.age2, (id) => buildings.get(id) === 2, 'later age-II reveals');
+    }
+  }
+  return structuredClone(value.witnesses);
+}
+
 function atlasFrom(value, release, captureSha256) {
   closed(
     value,
@@ -515,6 +570,7 @@ export function projectCapturedInitial(
   rawLogBytes,
   controlBytes,
   tableBytes = null,
+  laterWitnessBytes = null,
 ) {
   if (
     [
@@ -523,12 +579,14 @@ export function projectCapturedInitial(
       rawLogBytes,
       controlBytes,
       ...(tableBytes === null ? [] : [tableBytes]),
+      ...(laterWitnessBytes === null ? [] : [laterWitnessBytes]),
     ].some((input) => !Buffer.isBuffer(input)) ||
     captureBytes.length +
       calibrationBytes.length +
       rawLogBytes.length +
       controlBytes.length +
-      (tableBytes?.length ?? 0) >
+      (tableBytes?.length ?? 0) +
+      (laterWitnessBytes?.length ?? 0) >
       32 * 1024 * 1024
   )
     fail('Projection input aggregate byte limit');
@@ -545,7 +603,7 @@ export function projectCapturedInitial(
       'turnOrderEvidence',
     ],
     'control',
-    ['table'],
+    ['table', 'laterWitnesses'],
   );
   if (control.schema !== CONTROL_SCHEMA) fail('Unsupported projection control');
   pin(captureBytes, control.capture, MAX_BYTES, 'capture');
@@ -554,6 +612,10 @@ export function projectCapturedInitial(
   if (tableBytes !== null) pin(tableBytes, control.table, MAX_BYTES, 'table evidence');
   else if (control.table !== undefined && control.table !== null)
     fail('Missing declared table evidence');
+  if (laterWitnessBytes !== null)
+    pin(laterWitnessBytes, control.laterWitnesses, MAX_BYTES, 'later witnesses');
+  else if (control.laterWitnesses !== undefined && control.laterWitnesses !== null)
+    fail('Missing declared later witnesses');
   const capture = uniqueJson(captureBytes, MAX_BYTES, 'capture');
   const calibration = uniqueJson(calibrationBytes, MAX_ATLAS_BYTES, 'calibration');
   const raw = uniqueJson(rawLogBytes, MAX_BYTES, 'raw log');
@@ -866,7 +928,25 @@ export function projectCapturedInitial(
     catalogHash: catalogFingerprint(catalogBytes),
     initialActionId: actionId,
     initial: structuredClone(initial),
-    witnesses: [],
+    witnesses:
+      laterWitnessBytes === null
+        ? []
+        : laterWitnessesFrom(
+            laterWitnessBytes,
+            {
+              tableId: game.tableId,
+              rawLogReference: game.source.reference,
+              initialCaptureReference: capture.url,
+              rawLogSha256: sha(rawLogBytes),
+              initialCaptureSha256: sha(captureBytes),
+              calibrationSha256: sha(calibrationBytes),
+              tableEvidenceSha256: tableBytes === null ? null : sha(tableBytes),
+              archiveRelease: release,
+              catalogHash: catalogFingerprint(catalogBytes),
+              initialActionId: actionId,
+            },
+            game,
+          ),
   };
   const record = {
     schema: 'tzolkin-public-replay-v1',
@@ -888,6 +968,16 @@ export function projectCapturedInitial(
       calibrationSha256: sha(calibrationBytes),
       rawLogSha256: sha(rawLogBytes),
       tableEvidenceSha256: tableBytes === null ? null : sha(tableBytes),
+      ...(laterWitnessBytes === null
+        ? {}
+        : {
+            laterWitnesses: {
+              schema: LATER_WITNESS_SCHEMA,
+              sha256: sha(laterWitnessBytes),
+              bytes: laterWitnessBytes.length,
+              count: witness.witnesses.length,
+            },
+          }),
       archiveRelease: release,
       initialActionId: actionId,
       playerCount: n,
@@ -933,6 +1023,7 @@ export function decodeProjectedInitial(
   controlBytes,
   dispatch,
   tableBytes = null,
+  laterWitnessBytes = null,
 ) {
   const projection = projectCapturedInitial(
     captureBytes,
@@ -940,6 +1031,7 @@ export function decodeProjectedInitial(
     rawLogBytes,
     controlBytes,
     tableBytes,
+    laterWitnessBytes,
   );
   const decoded = decodeConditionalPublicGame(
     rawLogBytes,
@@ -983,6 +1075,7 @@ export async function projectPlayingFiles(
   controlPath,
   outputPath,
   cliPath = null,
+  laterWitnessPath = null,
 ) {
   // Read the small control through a bounded handle before parsing its file declarations.
   const file = await open(controlPath, 'r');
@@ -1006,14 +1099,21 @@ export async function projectPlayingFiles(
   const control = uniqueJson(controlBytes, MAX_CONTROL_BYTES, 'control');
   if (control.table !== undefined && control.table !== null)
     fail('Separate table evidence requires the pinned byte API');
+  if (laterWitnessPath === null && control.laterWitnesses != null)
+    fail('Missing declared later witnesses');
+  const laterSize = laterWitnessPath === null ? 0 : control.laterWitnesses?.bytes;
   if (
     !object(control.capture) ||
     !object(control.calibration) ||
     !object(control.rawLog) ||
     !Number.isSafeInteger(
-      control.capture.bytes + control.calibration.bytes + control.rawLog.bytes,
+      control.capture.bytes + control.calibration.bytes + control.rawLog.bytes + laterSize,
     ) ||
-    control.capture.bytes + control.calibration.bytes + control.rawLog.bytes + controlBytes.length >
+    control.capture.bytes +
+      control.calibration.bytes +
+      control.rawLog.bytes +
+      laterSize +
+      controlBytes.length >
       32 * 1024 * 1024
   )
     fail('Projection input aggregate byte limit');
@@ -1022,10 +1122,19 @@ export async function projectPlayingFiles(
     boundedPinnedRead(calibrationPath, control.calibration, MAX_ATLAS_BYTES, 'calibration'),
     boundedPinnedRead(rawLogPath, control.rawLog, MAX_BYTES, 'raw log'),
   ]);
+  const laterBytes =
+    laterWitnessPath === null
+      ? null
+      : await boundedPinnedRead(
+          laterWitnessPath,
+          control.laterWitnesses,
+          MAX_BYTES,
+          'later witnesses',
+        );
   const result =
     cliPath === null
-      ? { projection: projectCapturedInitial(...inputs, controlBytes) }
-      : decodeProjectedInitial(...inputs, controlBytes, coreDispatcher(cliPath));
+      ? { projection: projectCapturedInitial(...inputs, controlBytes, null, laterBytes) }
+      : decodeProjectedInitial(...inputs, controlBytes, coreDispatcher(cliPath), null, laterBytes);
   // Publish together using the same create-only reservation as replay exports.
   // Sidecar provenance is mandatory in this artifact, even though the app's
   // existing standalone PublicReplayRecord format cannot carry it itself.
@@ -1075,14 +1184,28 @@ export async function projectPlayingFiles(
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
-  if (![5, 6].includes(args.length) || args.some((arg) => !arg)) {
+  let laterWitnessPath = null;
+  if (args.at(-2) === '--later-witnesses') {
+    laterWitnessPath = args.pop();
+    args.pop();
+  }
+  if (
+    ![5, 6].includes(args.length) ||
+    args.some((arg) => !arg || arg.startsWith('--')) ||
+    laterWitnessPath === '' ||
+    laterWitnessPath?.startsWith('--')
+  ) {
     console.error(
-      'Usage: node scripts/bga-playing-project.mjs capture.json atlas.json raw-log.json control.json new-output-directory [core-cli]',
+      'Usage: node scripts/bga-playing-project.mjs capture.json atlas.json raw-log.json control.json new-output-directory [core-cli] [--later-witnesses later.json]',
     );
     process.exitCode = 1;
   } else {
     try {
-      const result = await projectPlayingFiles(...args);
+      const result = await projectPlayingFiles(
+        ...args.slice(0, 5),
+        args[5] ?? null,
+        laterWitnessPath,
+      );
       console.log(
         JSON.stringify({
           schema: PROJECTION_SCHEMA,
