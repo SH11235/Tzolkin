@@ -7,6 +7,7 @@ use crate::Decision;
 use crate::features::{FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::public_model::{self, PublicPolicyModel, ValueValidity};
+use crate::public_policy_long::LongRlPolicy;
 use crate::public_policy_repeat::RepeatedPublicRlPolicy;
 use crate::public_policy_update::UpdatedPublicRlPolicy;
 
@@ -199,5 +200,62 @@ impl<'a> RepeatedPublicRlHandle<'a> {
             r#move: observation.legal_actions[best].r#move.clone(),
             score: f64::from(prediction.logits[best]),
         })
+    }
+}
+
+/// Sampling-only Scalar view of a controlled Long-v2 owner. No v1 inference,
+/// Arena, deployment or raw-model admission is extended by this constructor.
+pub struct LongRlHandle<'a> {
+    owner: &'a LongRlPolicy,
+    kernel: ResolvedKernel,
+}
+impl<'a> LongRlHandle<'a> {
+    pub fn new(owner: &'a LongRlPolicy) -> Result<Self, String> {
+        owner.validate_for_sampling()?;
+        Ok(Self {
+            owner,
+            kernel: Kernel::Scalar.resolve()?,
+        })
+    }
+    pub fn artifact_checksum(&self) -> &str {
+        self.owner.artifact().checksum()
+    }
+    pub fn update_count(&self) -> u64 {
+        self.owner.artifact().update_count()
+    }
+    pub fn backend(&self) -> &'static str {
+        self.kernel.backend()
+    }
+    pub(crate) fn family_set(&self) -> &std::collections::BTreeSet<String> {
+        self.owner.family_set()
+    }
+    pub(crate) fn contains_family(&self, family: &str) -> bool {
+        self.owner.contains_family(family)
+    }
+    pub(crate) fn check_rollout_capacity(&self, families: usize) -> Result<(), String> {
+        let limits = self.owner.limits();
+        if self.update_count() >= limits.max_updates()
+            || self
+                .family_set()
+                .len()
+                .checked_add(families)
+                .is_none_or(|n| n > limits.max_families())
+        {
+            return Err("Long rollout would exceed lineage update/family limit".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<PublicRlPolicyDistribution, String> {
+        distribution(
+            self.owner.model(),
+            self.kernel,
+            self.artifact_checksum(),
+            self.update_count(),
+            crate::public_policy_long::POLICY_VERSION,
+            observation,
+        )
     }
 }

@@ -279,6 +279,7 @@ pub(crate) enum NativePolicy<'handle, 'model> {
     Bc(&'handle PublicPolicyHandle<'model>),
     Rl(&'handle UpdatedPublicRlHandle<'model>),
     Repeated(&'handle RepeatedPublicRlHandle<'model>),
+    Long(&'handle crate::public_rl_native::LongRlHandle<'model>),
 }
 impl<'handle, 'model> NativePolicy<'handle, 'model> {
     fn session(
@@ -291,6 +292,10 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
             Self::Repeated(policy) => {
                 RepeatedStochasticSession::new(policy, identity).map(NativeSession::Repeated)
             }
+            Self::Long(policy) => {
+                crate::public_stochastic::LongStochasticSession::new(policy, identity)
+                    .map(NativeSession::Long)
+            }
         }
     }
     fn sampling_version(self) -> &'static str {
@@ -298,6 +303,7 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
             Self::Bc(_) => SAMPLING_VERSION,
             Self::Rl(_) => RL_SAMPLING_VERSION,
             Self::Repeated(_) => REPEATED_SAMPLING_VERSION,
+            Self::Long(_) => crate::public_policy_long::SAMPLING_VERSION,
         }
     }
 }
@@ -305,6 +311,7 @@ enum NativeSession<'handle, 'model> {
     Bc(StochasticSession<'handle, 'model>),
     Rl(RlStochasticSession<'handle, 'model>),
     Repeated(RepeatedStochasticSession<'handle, 'model>),
+    Long(crate::public_stochastic::LongStochasticSession<'handle, 'model>),
 }
 impl NativeSession<'_, '_> {
     fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
@@ -312,6 +319,7 @@ impl NativeSession<'_, '_> {
             Self::Bc(session) => session.sample(observation),
             Self::Rl(session) => session.sample(observation),
             Self::Repeated(session) => session.sample(observation),
+            Self::Long(session) => session.sample(observation),
         }
     }
     fn counters(&self) -> SamplingCounters {
@@ -319,6 +327,7 @@ impl NativeSession<'_, '_> {
             Self::Bc(session) => session.counters(),
             Self::Rl(session) => session.counters(),
             Self::Repeated(session) => session.counters(),
+            Self::Long(session) => session.counters(),
         }
     }
     fn stop(&mut self) {
@@ -326,6 +335,7 @@ impl NativeSession<'_, '_> {
             Self::Bc(session) => session.stop(),
             Self::Rl(session) => session.stop(),
             Self::Repeated(session) => session.stop(),
+            Self::Long(session) => session.stop(),
         }
     }
 }
