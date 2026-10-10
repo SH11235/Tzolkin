@@ -6,6 +6,9 @@ use crate::kernel::Kernel;
 use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
 use crate::public_native::{PreparedPublicPolicy, PublicPolicyHandle};
+use crate::public_policy_repeat::RepeatedPublicRlPolicy;
+use crate::public_policy_update::UpdatedPublicRlPolicy;
+use crate::public_rl_native::{RepeatedPublicRlHandle, UpdatedPublicRlHandle};
 use crate::public_trade_guard::{
     self, TradeGuardCapture, TradeGuardConfig, TradeGuardSession, TradeGuardSummary,
 };
@@ -154,6 +157,86 @@ impl ArenaConfig {
         Ok(())
     }
 }
+pub const BORROWED_RL_ARENA_SCHEMA: &str = "tzolkin-borrowed-rl-validation-arena-v1";
+
+/// In-process identities only. No raw model, artifact DTO, callback or path can
+/// construct the RL choices. Every role remains fixed for all seats and arms.
+#[derive(Clone, Copy)]
+pub enum BorrowedArenaPolicy<'a> {
+    Count1(&'a UpdatedPublicRlPolicy),
+    Repeated(&'a RepeatedPublicRlPolicy),
+    PublicBc(&'a PreparedPublicPolicy),
+    Heuristic(&'a HeuristicWeights),
+    Search(&'a PreparedSearch),
+}
+
+/// Explicit development comparison. Validation reuse is allowed; this is not
+/// a fresh Test or producer-authentication gate. A game family is shared by seats.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BorrowedArenaConfig {
+    pub schema: String,
+    pub players: usize,
+    pub seeds: Vec<u32>,
+    pub bootstrap_seed: u64,
+}
+impl BorrowedArenaConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != BORROWED_RL_ARENA_SCHEMA
+            || !(3..=4).contains(&self.players)
+            || self.seeds.is_empty()
+            || self.seeds.len() > MAX_SEEDS
+        {
+            return Err(
+                "Borrowed RL Arena requires base 3/4p and 1..1024 Validation families".into(),
+            );
+        }
+        for (index, seed) in self.seeds.iter().enumerate() {
+            if self.seeds[..index].contains(seed)
+                || seed_partition(*seed)? != DatasetSplit::Validation
+            {
+                return Err("Borrowed RL Arena rejects repeated or non-Validation families".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Conservative declared work, not timing or exact low-level instructions/I/O.
+/// Each callback selects one actor, so each roster uses its largest Search cap.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BorrowedArenaWorkBounds {
+    pub planned_games: u64,
+    pub max_callbacks: u64,
+    pub max_public_policy_candidate_rows: u64,
+    pub max_search_atomic_steps: u64,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationLineageOverlap {
+    pub candidate: Vec<String>,
+    pub reference: Vec<String>,
+    pub opponent_pool: Vec<Vec<String>>,
+}
+/// Separate outer schema; the shared Arena report retains all failures/nulls
+/// and its explicitly conditional complete-block statistics.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BorrowedRlArenaReport {
+    pub schema: &'static str,
+    pub development: bool,
+    pub fresh_holdout_claimed: bool,
+    pub work_bounds: BorrowedArenaWorkBounds,
+    pub validation_lineage_overlap: ValidationLineageOverlap,
+    pub arena: ArenaReport,
+}
+impl BorrowedRlArenaReport {
+    pub fn save_new(&self, path: &Path) -> Result<(), String> {
+        crate::model::write_new_json_bounded(path, self, 32 * 1024 * 1024)
+    }
+}
+
 enum PreparedPolicy {
     PublicLearnedTradeGuard {
         policy: PreparedPublicPolicy,
@@ -306,6 +389,8 @@ pub struct PolicyDescription {
     pub dataset_fingerprint: Option<String>,
 }
 enum PolicyChooser<'a> {
+    PublicRlCount1(Box<UpdatedPublicRlHandle<'a>>),
+    PublicRlRepeated(Box<RepeatedPublicRlHandle<'a>>),
     PublicLearnedTradeGuard {
         policy: Box<PublicPolicyHandle<'a>>,
         guard: &'a TradeGuardConfig,
@@ -415,11 +500,107 @@ impl<'a> PolicyHandle<'a> {
             },
         })
     }
+    fn borrowed(
+        policy: BorrowedArenaPolicy<'a>,
+        seeds: &[u32],
+    ) -> Result<(Self, Vec<String>), String> {
+        let (chooser, provenance, dataset_fingerprint, overlap) = match policy {
+            BorrowedArenaPolicy::Count1(owner) => {
+                let handle = UpdatedPublicRlHandle::new(owner)?;
+                let overlap = validation_overlap(handle.family_closure(), seeds)?;
+                let provenance = rl_provenance(
+                    handle.artifact_checksum(),
+                    handle.update_count(),
+                    handle.task(),
+                    crate::public_rl_native::POLICY_VERSION,
+                );
+                (
+                    PolicyChooser::PublicRlCount1(Box::new(handle)),
+                    provenance,
+                    None,
+                    overlap,
+                )
+            }
+            BorrowedArenaPolicy::Repeated(owner) => {
+                let handle = RepeatedPublicRlHandle::new(owner)?;
+                let overlap = validation_overlap(handle.family_closure(), seeds)?;
+                let provenance = rl_provenance(
+                    handle.artifact_checksum(),
+                    handle.update_count(),
+                    crate::public_policy_repeat::TASK,
+                    crate::public_policy_repeat::POLICY_VERSION,
+                );
+                (
+                    PolicyChooser::PublicRlRepeated(Box::new(handle)),
+                    provenance,
+                    None,
+                    overlap,
+                )
+            }
+            BorrowedArenaPolicy::PublicBc(policy) => {
+                // This also explicitly excludes the immutable audited Train set.
+                policy.require_validation_families(seeds)?;
+                if policy.backend() != "scalar" {
+                    return Err("Borrowed public-policy Arena requires Scalar inference".into());
+                }
+                let (_, closure) = policy.initialization_families();
+                let families = closure.iter().cloned().collect::<Vec<_>>();
+                let overlap = validation_overlap(&families, seeds)?;
+                let handle = policy.handle()?;
+                let provenance = handle.provenance().clone();
+                let SeatPolicy::PublicLearned {
+                    dataset_fingerprint,
+                    ..
+                } = &provenance
+                else {
+                    return Err("Prepared public policy provenance mismatch".into());
+                };
+                let fingerprint = dataset_fingerprint.clone();
+                (
+                    PolicyChooser::PublicLearned(Box::new(handle)),
+                    provenance,
+                    Some(fingerprint),
+                    overlap,
+                )
+            }
+            BorrowedArenaPolicy::Heuristic(weights) => {
+                weights.validate()?;
+                (
+                    PolicyChooser::Heuristic(weights),
+                    SeatPolicy::Heuristic {
+                        policy_version: crate::POLICY_VERSION.into(),
+                        weights: weights.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                )
+            }
+            BorrowedArenaPolicy::Search(policy) => (
+                PolicyChooser::Search(policy),
+                crate::search_native::provenance(policy),
+                None,
+                Vec::new(),
+            ),
+        };
+        provenance.validate()?;
+        Ok((
+            Self {
+                chooser,
+                description: PolicyDescription {
+                    provenance,
+                    dataset_fingerprint,
+                },
+            },
+            overlap,
+        ))
+    }
     fn choose_with_diagnostics(
         &self,
         observation: &Observation,
     ) -> Result<(Decision, Option<SearchTrace>), String> {
         match &self.chooser {
+            PolicyChooser::PublicRlCount1(policy) => Ok((policy.choose_move(observation)?, None)),
+            PolicyChooser::PublicRlRepeated(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicLearnedTradeGuard { .. } => {
                 Err("Guarded chooser requires its game-local indexed session".into())
             }
@@ -444,6 +625,109 @@ impl<'a> PolicyHandle<'a> {
         Ok(self.choose_with_diagnostics(observation)?.0)
     }
 }
+fn rl_provenance(checksum: &str, count: u64, task: &str, version: &str) -> SeatPolicy {
+    SeatPolicy::PublicRl {
+        policy_version: version.into(),
+        artifact_checksum: checksum.into(),
+        update_count: count,
+        task: task.into(),
+        feature_schema: crate::features::PUBLIC_FEATURE_SCHEMA,
+        input_contract: crate::public_model::INPUT_CONTRACT.into(),
+        numerical_target: crate::public_stochastic_native::numerical_target(),
+        inference_backend: "scalar".into(),
+        selection_version: replay::RL_ARGMAX_SELECTION_VERSION.into(),
+        guard: (),
+    }
+}
+fn validation_overlap(closure: &[String], seeds: &[u32]) -> Result<Vec<String>, String> {
+    for family in closure {
+        if !matches!(
+            split_for_family(family)?,
+            DatasetSplit::Train | DatasetSplit::Validation
+        ) {
+            return Err("Borrowed policy lineage contains an unsupported or Test family".into());
+        }
+    }
+    let mut overlap = std::collections::BTreeSet::new();
+    for seed in seeds {
+        let family = family_id(*seed);
+        if seed_partition(*seed)? != DatasetSplit::Validation {
+            return Err("Borrowed policy requires a non-training Validation family".into());
+        }
+        if closure.contains(&family) {
+            overlap.insert(family);
+        }
+    }
+    Ok(overlap.into_iter().collect())
+}
+fn borrowed_work_bounds(
+    config: &BorrowedArenaConfig,
+    candidate: &PolicyHandle<'_>,
+    reference: &PolicyHandle<'_>,
+    pool: &[PolicyHandle<'_>],
+) -> Result<BorrowedArenaWorkBounds, String> {
+    let mut bounds = BorrowedArenaWorkBounds {
+        planned_games: 0,
+        max_callbacks: 0,
+        max_public_policy_candidate_rows: 0,
+        max_search_atomic_steps: 0,
+    };
+    let add = |sum: &mut u64, value: u64| -> Result<(), String> {
+        *sum = sum
+            .checked_add(value)
+            .ok_or("Borrowed Arena work bound overflow")?;
+        Ok(())
+    };
+    let callbacks = u64::try_from(replay::MAX_DECISIONS).map_err(|e| e.to_string())?;
+    let families = u64::try_from(config.seeds.len()).map_err(|e| e.to_string())?;
+    let candidates =
+        u64::try_from(tzolkin_inference::policy::MAX_CANDIDATES).map_err(|e| e.to_string())?;
+    for seat in 0..config.players {
+        for focal in [candidate, reference] {
+            let roster = pool
+                .iter()
+                .enumerate()
+                .map(|(index, opponent)| if index == seat { focal } else { opponent });
+            let mut public_policy = false;
+            let mut search_cap = 0u64;
+            for handle in roster {
+                match &handle.chooser {
+                    PolicyChooser::PublicRlCount1(_)
+                    | PolicyChooser::PublicRlRepeated(_)
+                    | PolicyChooser::PublicLearned(_) => public_policy = true,
+                    PolicyChooser::Search(policy) => {
+                        search_cap = search_cap.max(
+                            u64::try_from(policy.config().max_total_steps)
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let arm_callbacks = callbacks
+                .checked_mul(families)
+                .ok_or("Borrowed Arena work bound overflow")?;
+            add(&mut bounds.planned_games, families)?;
+            add(&mut bounds.max_callbacks, arm_callbacks)?;
+            if public_policy {
+                add(
+                    &mut bounds.max_public_policy_candidate_rows,
+                    arm_callbacks
+                        .checked_mul(candidates)
+                        .ok_or("Borrowed Arena work bound overflow")?,
+                )?;
+            }
+            add(
+                &mut bounds.max_search_atomic_steps,
+                arm_callbacks
+                    .checked_mul(search_cap)
+                    .ok_or("Borrowed Arena work bound overflow")?,
+            )?;
+        }
+    }
+    Ok(bounds)
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ArmResult {
@@ -901,13 +1185,117 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
         .iter()
         .map(PolicyHandle::new)
         .collect::<Result<Vec<_>, _>>()?;
-    let mut blocks = Vec::with_capacity(config.seeds.len());
+    Ok(run_handles(
+        ArenaRun {
+            players: config.players,
+            partition: config.partition,
+            seeds: &config.seeds,
+            bootstrap_seed: config.bootstrap_seed,
+            config_sha256: format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(config).map_err(|error| error.to_string())?)
+            ),
+        },
+        candidate,
+        reference,
+        pool,
+    ))
+}
+
+/// Compare one sealed RL learner seat against immutable reactive opponents.
+/// All roles/families are checked before world creation. No model error fallback,
+/// subset retry or training admission is performed. This is development only.
+pub fn run_public_rl_validation_arena<'a>(
+    config: &BorrowedArenaConfig,
+    candidate: BorrowedArenaPolicy<'a>,
+    reference: BorrowedArenaPolicy<'a>,
+    opponent_pool: &[BorrowedArenaPolicy<'a>],
+) -> Result<BorrowedRlArenaReport, String> {
+    config.validate()?;
+    if opponent_pool.len() != config.players {
+        return Err("Borrowed Arena absolute opponent pool must match player count".into());
+    }
+    if !matches!(
+        candidate,
+        BorrowedArenaPolicy::Count1(_) | BorrowedArenaPolicy::Repeated(_)
+    ) {
+        return Err("Borrowed RL Arena candidate must be a sealed RL policy".into());
+    }
+    let (candidate, candidate_overlap) = PolicyHandle::borrowed(candidate, &config.seeds)?;
+    let (reference, reference_overlap) = PolicyHandle::borrowed(reference, &config.seeds)?;
+    let mut pool = Vec::with_capacity(config.players);
+    let mut pool_overlap = Vec::with_capacity(config.players);
+    for policy in opponent_pool {
+        let (handle, overlap) = PolicyHandle::borrowed(*policy, &config.seeds)?;
+        pool.push(handle);
+        pool_overlap.push(overlap);
+    }
+    let work_bounds = borrowed_work_bounds(config, &candidate, &reference, &pool)?;
+    let descriptions = pool
+        .iter()
+        .map(|handle| &handle.description)
+        .collect::<Vec<_>>();
+    let config_sha256 = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(
+                BORROWED_RL_ARENA_SCHEMA,
+                replay::RULES_VERSION,
+                replay::RULES_BASELINE,
+                replay::catalog_hash(),
+                config,
+                &candidate.description,
+                &reference.description,
+                descriptions
+            ))
+            .map_err(|e| e.to_string())?
+        )
+    );
+    let arena = run_handles(
+        ArenaRun {
+            players: config.players,
+            partition: Partition::Validation,
+            seeds: &config.seeds,
+            bootstrap_seed: config.bootstrap_seed,
+            config_sha256,
+        },
+        candidate,
+        reference,
+        pool,
+    );
+    Ok(BorrowedRlArenaReport {
+        schema: BORROWED_RL_ARENA_SCHEMA,
+        development: true,
+        fresh_holdout_claimed: false,
+        work_bounds,
+        validation_lineage_overlap: ValidationLineageOverlap {
+            candidate: candidate_overlap,
+            reference: reference_overlap,
+            opponent_pool: pool_overlap,
+        },
+        arena,
+    })
+}
+struct ArenaRun<'a> {
+    players: usize,
+    partition: Partition,
+    seeds: &'a [u32],
+    bootstrap_seed: u64,
+    config_sha256: String,
+}
+fn run_handles(
+    run: ArenaRun<'_>,
+    candidate: PolicyHandle<'_>,
+    reference: PolicyHandle<'_>,
+    pool: Vec<PolicyHandle<'_>>,
+) -> ArenaReport {
+    let mut blocks = Vec::with_capacity(run.seeds.len());
     // Shared capture only, never shared controller history. Original run order
     // determines retained examples when this budget is exhausted.
     let mut capture = TradeGuardCapture::new(public_trade_guard::MAX_ARENA_EXAMPLES);
-    for (index, seed) in config.seeds.iter().enumerate() {
-        let mut pairs = Vec::with_capacity(config.players);
-        for seat in 0..config.players {
+    for (index, seed) in run.seeds.iter().enumerate() {
+        let mut pairs = Vec::with_capacity(run.players);
+        for seat in 0..run.players {
             // Alternate paired run order to avoid measuring one arm systematically later.
             let (candidate_result, reference_result) = if (index + seat) % 2 == 0 {
                 (
@@ -930,8 +1318,8 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
         }
         blocks.push(block(*seed, pairs));
     }
-    let statistics = summarize(&blocks, config.bootstrap_seed);
-    let mut search = vec![None; config.players];
+    let statistics = summarize(&blocks, run.bootstrap_seed);
+    let mut search = vec![None; run.players];
     for pair in blocks.iter().flat_map(|block| &block.pairs) {
         for arm in [&pair.candidate, &pair.reference] {
             for (total, summary) in search.iter_mut().zip(&arm.search) {
@@ -943,16 +1331,13 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
             }
         }
     }
-    Ok(ArenaReport {
+    ArenaReport {
         search,
         schema: ARENA_SCHEMA,
-        config_sha256: format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(config).map_err(|error| error.to_string())?)
-        ),
-        players: config.players,
+        config_sha256: run.config_sha256,
+        players: run.players,
         options: GameOptions::default(),
-        partition: config.partition,
+        partition: run.partition,
         candidate: candidate.description,
         reference: reference.description,
         opponent_pool: pool
@@ -974,12 +1359,176 @@ pub fn run_arena(config: &ArenaConfig, relative_to: &Path) -> Result<ArenaReport
         .into(),
         target_arch: std::env::consts::ARCH.into(),
         target_os: std::env::consts::OS.into(),
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_validation_preflight_and_actual_roster_work_bounds() {
+        let config = BorrowedArenaConfig {
+            schema: BORROWED_RL_ARENA_SCHEMA.into(),
+            players: 3,
+            seeds: vec![3],
+            bootstrap_seed: 17,
+        };
+        assert_eq!(seed_partition(3).unwrap(), DatasetSplit::Validation);
+        config.validate().unwrap();
+        let weights = HeuristicWeights::default();
+        let h = BorrowedArenaPolicy::Heuristic(&weights);
+        assert!(
+            run_public_rl_validation_arena(&config, h, h, &[h; 2])
+                .unwrap_err()
+                .contains("pool")
+        );
+        assert!(
+            run_public_rl_validation_arena(&config, h, h, &[h; 3])
+                .unwrap_err()
+                .contains("sealed RL")
+        );
+        for seeds in [vec![0], vec![10], vec![3, 3]] {
+            let mut invalid = config.clone();
+            invalid.seeds = seeds;
+            assert!(invalid.validate().is_err());
+        }
+        let mut wire = serde_json::to_value(&config).unwrap();
+        wire["allowTrain"] = true.into();
+        assert!(serde_json::from_value::<BorrowedArenaConfig>(wire).is_err());
+        assert_eq!(
+            validation_overlap(&[family_id(0), family_id(3)], &[3]).unwrap(),
+            vec![family_id(3)]
+        );
+        assert!(validation_overlap(&[], &[0]).is_err());
+        assert!(validation_overlap(&[family_id(10)], &[3]).is_err());
+
+        let search = PreparedSearch::new(&SearchConfig {
+            worlds_per_action: 1,
+            horizon_days: 1,
+            max_rollout_steps: 1,
+            max_total_steps: 1,
+            min_completed_worlds: 1,
+            sampling_salt: 17,
+        })
+        .unwrap();
+        let (focal, _) = PolicyHandle::borrowed(h, &config.seeds).unwrap();
+        let (reference, _) = PolicyHandle::borrowed(h, &config.seeds).unwrap();
+        let pool = [h, BorrowedArenaPolicy::Search(&search), h]
+            .into_iter()
+            .map(|policy| PolicyHandle::borrowed(policy, &config.seeds).unwrap().0)
+            .collect::<Vec<_>>();
+        let bounds = borrowed_work_bounds(&config, &focal, &reference, &pool).unwrap();
+        assert_eq!(bounds.planned_games, 6);
+        assert_eq!(bounds.max_callbacks, 6 * replay::MAX_DECISIONS as u64);
+        assert_eq!(bounds.max_public_policy_candidate_rows, 0);
+        // The two arms with focal seat 1 replace Search; four rosters retain it.
+        assert_eq!(
+            bounds.max_search_atomic_steps,
+            4 * replay::MAX_DECISIONS as u64
+        );
+    }
+
+    #[test]
+    fn rl_metadata_is_closed_and_all_training_exporters_reject_before_output() {
+        mod temp_root {
+            include!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/temp_root.rs"
+            ));
+        }
+        let root = temp_root::create("tzolkin-rl-arena-admission").unwrap();
+        for (count, version, task) in [
+            (
+                1,
+                crate::public_rl_native::POLICY_VERSION,
+                crate::public_policy_update::TASK,
+            ),
+            (
+                2,
+                crate::public_policy_repeat::POLICY_VERSION,
+                crate::public_policy_repeat::TASK,
+            ),
+        ] {
+            // Valid metadata is not a model/owner qualification or a complete game.
+            let rl = rl_provenance(&"a".repeat(64), count, task, version);
+            rl.validate().unwrap();
+            let wire = serde_json::to_value(&rl).unwrap();
+            assert_eq!(
+                serde_json::from_value::<SeatPolicy>(wire.clone()).unwrap(),
+                rl
+            );
+            for guard in [
+                serde_json::json!({}),
+                serde_json::json!(false),
+                serde_json::json!([]),
+            ] {
+                let mut invalid_wire = wire.clone();
+                invalid_wire["guard"] = guard;
+                assert!(serde_json::from_value::<SeatPolicy>(invalid_wire).is_err());
+            }
+            let mut missing_guard = wire;
+            missing_guard.as_object_mut().unwrap().remove("guard");
+            assert!(serde_json::from_value::<SeatPolicy>(missing_guard).is_err());
+            let mut invalid = rl_provenance(&"a".repeat(64), count, task, version);
+            if let SeatPolicy::PublicRl { task, .. } = &mut invalid {
+                *task = "policyOnlyBc".into();
+            }
+            assert!(invalid.validate().is_err());
+            for slot in 0..=3 {
+                let mut policies = vec![
+                    SeatPolicy::Heuristic {
+                        policy_version: crate::POLICY_VERSION.into(),
+                        weights: Default::default(),
+                    };
+                    3
+                ];
+                if slot == 3 {
+                    policies.fill(rl.clone());
+                } else {
+                    policies[slot] = rl.clone();
+                }
+                let record = replay::GameReplay {
+                    header: replay::ReplayHeader {
+                        replay_schema: replay::REPLAY_SCHEMA,
+                        rules_version: replay::RULES_VERSION,
+                        rules_baseline: replay::RULES_BASELINE.into(),
+                        catalog_hash: replay::catalog_hash(),
+                        move_schema: tzolkin_core::observation::MOVE_SCHEMA,
+                        observation_schema: tzolkin_core::observation::OBSERVATION_SCHEMA,
+                        source: ReplaySource::PolicySelfPlay { policies },
+                        names: vec!["A".into(), "B".into(), "C".into()],
+                        seed: 17,
+                        options: Default::default(),
+                    },
+                    steps: Vec::new(),
+                    final_scores: Vec::new(),
+                    final_state: String::new(),
+                    verified_complete: false,
+                };
+                let prefix = format!("{count}-{slot}");
+                let source = root.join(format!("{prefix}.json"));
+                std::fs::write(&source, serde_json::to_vec(&record).unwrap()).unwrap();
+                let a1 = root.join(format!("{prefix}-a1"));
+                let a2 = root.join(format!("{prefix}-a2"));
+                let a6 = root.join(format!("{prefix}-a6"));
+                for error in [
+                    crate::dataset::export_dataset(std::slice::from_ref(&record), &a1).unwrap_err(),
+                    crate::policy_dataset::export_native_files(std::slice::from_ref(&source), &a2)
+                        .unwrap_err(),
+                    crate::state_mc_dataset::export_native_files(
+                        std::slice::from_ref(&source),
+                        &a6,
+                    )
+                    .unwrap_err(),
+                ] {
+                    assert!(error.contains("RL evaluation source"), "{error}");
+                }
+                assert!(!a1.exists() && !a2.exists() && !a6.exists());
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn synthetic_guard_handle<'a>(
         model: &'a crate::public_model::PublicPolicyArtifact,
