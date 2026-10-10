@@ -3,6 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeGame } from './bga-import.mjs';
+import { observedBasicUnlimitedOptions, uniqueJson } from './bga-observed-options.mjs';
 import {
   assertBasicUnlimitedOptions,
   coreDispatcher,
@@ -117,6 +118,30 @@ function sourceGroups(events, initialId, actionIds) {
  * Unknown decisions/reveals stop at the previous whole source event. A returned
  * replay is mechanical evidence, not authenticated source or training admission. */
 export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = null) {
+  return decodeGame(rawBytes, witnesses, dispatch, tableBytes, null);
+}
+
+/** Conditional mechanical reconstruction. This declaration does not turn missing
+ * source options into observed options and cannot admit human training rows. */
+export function decodeConditionalPublicGame(
+  rawBytes,
+  witnesses,
+  dispatch,
+  profile,
+  tableBytes = null,
+) {
+  closed(profile, ['schema', 'rules', 'market', 'sourceOptions'], 'declared mechanical profile');
+  if (
+    profile.schema !== 'tzolkin-bga-declared-mechanical-profile-v1' ||
+    profile.rules !== 'basic' ||
+    profile.market !== 'unlimited' ||
+    profile.sourceOptions !== 'unknown'
+  )
+    fail('Unsupported declared mechanical profile');
+  return decodeGame(rawBytes, witnesses, dispatch, tableBytes, profile);
+}
+
+function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) {
   if (!Buffer.isBuffer(rawBytes) || rawBytes.length > MAX_BYTES) fail('Raw input exceeds 16 MiB');
   closed(
     witnesses,
@@ -137,8 +162,18 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
   positive(witnesses.initialActionId, 'initialActionId');
   if (!Array.isArray(witnesses.witnesses) || witnesses.witnesses.length > MAX_STEPS)
     fail('Invalid witness list');
-  const raw = JSON.parse(rawBytes);
+  const raw =
+    declaredProfile === null ? JSON.parse(rawBytes) : uniqueJson(rawBytes, MAX_BYTES, 'raw log');
+  const table =
+    declaredProfile === null
+      ? null
+      : tableBytes === null
+        ? null
+        : uniqueJson(tableBytes, MAX_BYTES, 'table evidence');
+  if (declaredProfile !== null) observedBasicUnlimitedOptions(raw, table);
   const game = normalizeGame(raw, sha(rawBytes), tableBytes);
+  const observedOptions =
+    declaredProfile === null ? null : observedBasicUnlimitedOptions(raw, table, game.context);
   if (game.source.adapter !== 'bga-public-ui-dom-v1' && tableBytes !== null)
     fail('Legacy input requires embedded table settings, not separate table evidence');
   if (
@@ -146,13 +181,14 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     !game.rawEntries.some((entry) => entry.action_id === witnesses.initialActionId)
   )
     fail('Witness table/initial source mismatch');
-  assertBasicUnlimitedOptions(
-    game.source.adapter === 'bga-public-ui-dom-v1'
-      ? tableBytes === null
-        ? ''
-        : JSON.parse(tableBytes).optionsText
-      : raw.table_details_text.split('ゲーム構成\n').slice(1).join('ゲーム構成\n'),
-  );
+  if (declaredProfile === null)
+    assertBasicUnlimitedOptions(
+      game.source.adapter === 'bga-public-ui-dom-v1'
+        ? tableBytes === null
+          ? ''
+          : JSON.parse(tableBytes).optionsText
+        : raw.table_details_text.split('ゲーム構成\n').slice(1).join('ゲーム構成\n'),
+    );
   const knownActionIds = game.rawEntries.map((entry) => entry.action_id);
   const knownIds = new Set(knownActionIds);
   const eventIds = new Set(game.events.map((event) => event.actionId));
@@ -1384,6 +1420,16 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       sourceAuthenticated: false,
       strictExporterAccepted: false,
       trainingReady: false,
+      ...(declaredProfile === null
+        ? {}
+        : {
+            conditionalMechanicalProfile: copy(declaredProfile),
+            observedOptions: copy(observedOptions),
+            sourceOptionsObserved: observedOptions.evidence.length > 0,
+            sourceOptionsFullyObserved: observedOptions.complete,
+            policyTrainingReady: false,
+            valueTrainingReady: false,
+          }),
       blocked,
       coreCalls: calls,
       audit,
