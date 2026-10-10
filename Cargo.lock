@@ -3665,6 +3665,7 @@ dependencies = [
  "sha2",
  "tzolkin-bot",
  "tzolkin-core",
+ "tzolkin-inference",
 ]
 
 [[package]]
@@ -3682,6 +3683,15 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "tzolkin-inference"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tzolkin-core",
 ]
 
 [[package]]
