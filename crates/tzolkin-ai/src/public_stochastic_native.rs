@@ -216,7 +216,7 @@ impl AuditedStochasticGame {
     }
 }
 
-fn numerical_target() -> String {
+pub(crate) fn numerical_target() -> String {
     // exp/ln is a same-target contract. No unobserved cross-platform bit claim.
     format!(
         "scalar-f32-f64-tick53-v1:{}:{}:{}",
