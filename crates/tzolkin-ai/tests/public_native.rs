@@ -91,6 +91,19 @@ fn actual_trained_policy_completes_three_four_players_roundtrips_and_runs_qualif
     let prepared = PreparedPublicPolicy::new(checkpoint.clone(), &dataset, Kernel::Scalar).unwrap();
     let handle = prepared.handle().unwrap();
     let direct = LoadedPublicPolicy::new(prepared.model()).unwrap();
+    let initialized =
+        tzolkin_ai::public_rl_artifact::InitializedPublicRlPolicy::from_bc(&prepared).unwrap();
+    initialized.artifact().validate().unwrap();
+    assert!(
+        initialized
+            .model()
+            .parameters()
+            .iter()
+            .zip(prepared.model().model.parameters())
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+    );
+    assert_eq!(initialized.artifact().bc_source(), handle.provenance());
+    assert_eq!(initialized.artifact().family_closure().len(), 2);
     assert_eq!(prepared.backend(), "scalar");
     assert_eq!(handle.backend(), "scalar");
     let state =
