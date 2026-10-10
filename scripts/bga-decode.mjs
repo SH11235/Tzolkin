@@ -117,6 +117,30 @@ function sourceGroups(events, initialId, actionIds) {
  * Unknown decisions/reveals stop at the previous whole source event. A returned
  * replay is mechanical evidence, not authenticated source or training admission. */
 export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = null) {
+  return decodeGame(rawBytes, witnesses, dispatch, tableBytes, null);
+}
+
+/** Conditional mechanical reconstruction. This declaration does not turn missing
+ * source options into observed options and cannot admit human training rows. */
+export function decodeConditionalPublicGame(
+  rawBytes,
+  witnesses,
+  dispatch,
+  profile,
+  tableBytes = null,
+) {
+  closed(profile, ['schema', 'rules', 'market', 'sourceOptions'], 'declared mechanical profile');
+  if (
+    profile.schema !== 'tzolkin-bga-declared-mechanical-profile-v1' ||
+    profile.rules !== 'basic' ||
+    profile.market !== 'unlimited' ||
+    profile.sourceOptions !== 'unknown'
+  )
+    fail('Unsupported declared mechanical profile');
+  return decodeGame(rawBytes, witnesses, dispatch, tableBytes, profile);
+}
+
+function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) {
   if (!Buffer.isBuffer(rawBytes) || rawBytes.length > MAX_BYTES) fail('Raw input exceeds 16 MiB');
   closed(
     witnesses,
@@ -146,13 +170,14 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     !game.rawEntries.some((entry) => entry.action_id === witnesses.initialActionId)
   )
     fail('Witness table/initial source mismatch');
-  assertBasicUnlimitedOptions(
-    game.source.adapter === 'bga-public-ui-dom-v1'
-      ? tableBytes === null
-        ? ''
-        : JSON.parse(tableBytes).optionsText
-      : raw.table_details_text.split('ゲーム構成\n').slice(1).join('ゲーム構成\n'),
-  );
+  if (declaredProfile === null)
+    assertBasicUnlimitedOptions(
+      game.source.adapter === 'bga-public-ui-dom-v1'
+        ? tableBytes === null
+          ? ''
+          : JSON.parse(tableBytes).optionsText
+        : raw.table_details_text.split('ゲーム構成\n').slice(1).join('ゲーム構成\n'),
+    );
   const knownActionIds = game.rawEntries.map((entry) => entry.action_id);
   const knownIds = new Set(knownActionIds);
   const eventIds = new Set(game.events.map((event) => event.actionId));
@@ -1384,6 +1409,14 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       sourceAuthenticated: false,
       strictExporterAccepted: false,
       trainingReady: false,
+      ...(declaredProfile === null
+        ? {}
+        : {
+            conditionalMechanicalProfile: copy(declaredProfile),
+            sourceOptionsObserved: false,
+            policyTrainingReady: false,
+            valueTrainingReady: false,
+          }),
       blocked,
       coreCalls: calls,
       audit,
