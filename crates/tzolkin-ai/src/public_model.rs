@@ -57,7 +57,9 @@ impl PublicPolicyModel {
         }
         Ok(())
     }
-    fn validated_values(row: &EncodedCandidate) -> Result<&[f32; FEATURE_COUNT], String> {
+    pub(crate) fn validated_values(
+        row: &EncodedCandidate,
+    ) -> Result<&[f32; FEATURE_COUNT], String> {
         let values = row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
         if values
             .iter()
