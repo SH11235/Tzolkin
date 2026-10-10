@@ -16,7 +16,29 @@ export const QUALIFICATION_SCHEMA = 'tzolkin-human-bc-qualification-v1';
 export const MAX_REPORT_BYTES = 32 * 1024 * 1024;
 export const MAX_DEPENDENCY_IDS = 100_000;
 const REPORT_SCHEMA = 'tzolkin-human-bc-audit-v1';
-const FEATURE_SOURCE_SHA256 = 'bdc0b98745ce523fe58a8058e1209845a2a7dc1b2f0f30c3fc3ad0ea3b0cc425';
+const FEATURE_SOURCE_SHA256 = 'f93d7f102822af80d93ccfde2eac5fd8ee7664e5af3ccf3252caebe7fdd3f1a8';
+const FEATURE_SOURCE_CHAIN = [
+  {
+    path: 'crates/tzolkin-inference/src/features.rs',
+    sha256: 'f93d7f102822af80d93ccfde2eac5fd8ee7664e5af3ccf3252caebe7fdd3f1a8',
+  },
+  {
+    path: 'crates/tzolkin-inference/src/lib.rs',
+    sha256: '6aeccc816f230857b6708ddb6e86bf7fa43b7836f38f07ab95bee408e7900612',
+  },
+  {
+    path: 'crates/tzolkin-inference/Cargo.toml',
+    sha256: '7d4ef2233aac4baeeb497d36df73acdbf5854dea7c0a7356272e11a961677d3d',
+  },
+  {
+    path: 'crates/tzolkin-ai/src/features.rs',
+    sha256: '43261972b339d3c7606a2b5b154931af7c14486b26ced0aa0005abd006b46d7a',
+  },
+  {
+    path: 'crates/tzolkin-ai/Cargo.toml',
+    sha256: 'd608d70ab4cd872e5c66501e7408694bbce0499b8572fe48f8b03d2834d63d76',
+  },
+];
 const GEARS = ['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'];
 const RESOURCES = ['corn', 'wood', 'stone', 'gold', 'skull'];
 const TEMPLES = ['chaac', 'quetzalcoatl', 'kukulkan'];
@@ -625,8 +647,10 @@ export function auditQualification(
   )
     fail('Qualification input SHA-256 mismatch');
   if (
-    sha256(readFileSync(new URL('../crates/tzolkin-ai/src/features.rs', import.meta.url))) !==
-    FEATURE_SOURCE_SHA256
+    FEATURE_SOURCE_CHAIN.some(
+      ({ path, sha256: expected }) =>
+        sha256(readFileSync(new URL('../' + path, import.meta.url))) !== expected,
+    )
   )
     fail('Feature dependency decoder needs review for this encoder source');
   const strict = auditReconstruction(rawBytes, companion, strictDocuments, dispatch);
@@ -832,6 +856,7 @@ export function auditQualification(
     featureSchema: 2,
     featureCount: 512,
     featureEncoderSourceSha256: FEATURE_SOURCE_SHA256,
+    featureEncoderSourceChain: FEATURE_SOURCE_CHAIN.map((entry) => ({ ...entry })),
     dependencyDecoder: 'public-v2-basic-four-player-first-day-v1',
     rawSha256: sha256(rawBytes),
     reconstructionSha256: sha256(reconstructionBytes),

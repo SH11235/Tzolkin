@@ -17,7 +17,7 @@ pub const MODEL_VERSION: &str = "tiny-policy-value-mlp-v1";
 pub const LEARNED_POLICY_VERSION: &str = "learned-policy-v1";
 pub const HIDDEN: usize = 32;
 pub const VALUE_SIDES: usize = 5;
-pub const MAX_CANDIDATES: usize = 4096;
+pub use tzolkin_inference::policy::MAX_CANDIDATES;
 pub const MAX_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const W1: usize = 0;
 pub(crate) const B1: usize = FEATURE_COUNT * HIDDEN;
@@ -157,26 +157,7 @@ pub(crate) fn value_softmax(
 }
 
 pub(crate) fn policy_softmax(logits: &[f32], output: &mut [f32]) -> Result<(), String> {
-    if logits.is_empty()
-        || logits.len() > MAX_CANDIDATES
-        || output.len() != logits.len()
-        || logits.iter().any(|value| !value.is_finite())
-    {
-        return Err("Invalid ragged policy logits".into());
-    }
-    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut total = 0.0;
-    for (probability, logit) in output.iter_mut().zip(logits) {
-        *probability = (*logit - maximum).exp();
-        total += *probability;
-    }
-    if !total.is_finite() || total <= 0.0 {
-        return Err("Invalid policy softmax".into());
-    }
-    for value in output {
-        *value /= total;
-    }
-    Ok(())
+    tzolkin_inference::policy::policy_softmax(logits, output)
 }
 
 #[derive(Clone, Copy)]

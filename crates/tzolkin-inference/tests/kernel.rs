@@ -1,8 +1,4 @@
-// 独立 module としても検証できるよう、lib wiring に先立って path import を使用する。
-#[path = "../src/kernel.rs"]
-mod kernel;
-
-use kernel::{Kernel, ResolvedKernel};
+use tzolkin_inference::kernel::{Kernel, ResolvedKernel};
 
 fn kernels() -> Vec<ResolvedKernel> {
     [

@@ -3,10 +3,11 @@ members = [
   "crates/tzolkin-core",
   "crates/tzolkin-bot",
   "crates/tzolkin-ai",
+  "crates/tzolkin-inference",
   "crates/tzolkin-wasm",
   "src-tauri",
 ]
-default-members = ["crates/tzolkin-core", "crates/tzolkin-bot", "crates/tzolkin-ai"]
+default-members = ["crates/tzolkin-core", "crates/tzolkin-bot", "crates/tzolkin-ai", "crates/tzolkin-inference"]
 resolver = "3"
 
 [profile.release]
