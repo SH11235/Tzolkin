@@ -1,9 +1,17 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
 import { decodeConditionalPublicGame, decodePublicGame } from './bga-decode.mjs';
-import { ATLAS_SCHEMA, CONTROL_SCHEMA, projectCapturedInitial } from './bga-playing-project.mjs';
+import {
+  ATLAS_SCHEMA,
+  CONTROL_SCHEMA,
+  projectCapturedInitial,
+  projectPlayingFiles,
+} from './bga-playing-project.mjs';
 
 const bytes = (value) => Buffer.from(JSON.stringify(value));
 const sha = (value) => createHash('sha256').update(value).digest('hex');
@@ -431,6 +439,40 @@ test('detached HTML, unknown/wrong-release sprites, duplicate JSON and ambiguous
   const port = fixture(4);
   port.capture.url = port.capture.url.replace('boardgamearena.com/', 'boardgamearena.com:8443/');
   assert.throws(() => projectCapturedInitial(...inputs(port)), /Unsupported BGA source URL/);
+  for (const tag of ['script', 'style']) {
+    const hidden = fixture(4);
+    const visible = element(
+      'div',
+      'wealth_tile_1',
+      '',
+      ' class="wealth_tile" style="background-position: -10px 0px;"',
+    );
+    const opaque = visible.replace('<div ', `<${tag} `).replace('</div>', `</${tag}>`);
+    hidden.capture.gameAreaHtml = hidden.capture.gameAreaHtml.replace(visible, opaque);
+    hidden.capture.selectedPlayerTiles[0].html = hidden.capture.selectedPlayerTiles[0].html.replace(
+      visible,
+      opaque,
+    );
+    assert.throws(
+      () => projectCapturedInitial(...inputs(hidden)),
+      /Incomplete player setup fields|Malformed selected wealth|incomplete retained/,
+    );
+    const hiddenCounter = fixture(4);
+    const original = hiddenCounter.capture.publicCounters[0].html;
+    const counter = original.replace('<span ', `<${tag} `).replace('</span>', `</${tag}>`);
+    hiddenCounter.capture.playerBoardsHtml = hiddenCounter.capture.playerBoardsHtml.replace(
+      original,
+      counter,
+    );
+    hiddenCounter.capture.publicCounters[0].html = counter;
+    assert.throws(
+      () => projectCapturedInitial(...inputs(hiddenCounter)),
+      /Incomplete player setup fields|incomplete retained|Missing retained DOM/,
+    );
+  }
+  const misplaced = fixture(4);
+  misplaced.capture.gameAreaHtml += '<div id="unowned_card" class="construction"></div>';
+  assert.throws(() => projectCapturedInitial(...inputs(misplaced)), /outside initial markets/);
 });
 
 test('conditional decode reaches shared core path with warnings while ordinary decode still requires options', () => {
@@ -500,7 +542,12 @@ test('conditional decode reaches shared core path with warnings while ordinary d
   limited.raw.table_details_text =
     'ゲーム構成\nゲームモード\nアリーナモード\nウシュマルコーンの制限\n20';
   assert.throws(() => projectCapturedInitial(...inputs(limited)), /contradicts/);
-  for (const prefix of ['部族\n有効', 'ウシュマルコーンの制限\n20']) {
+  for (const prefix of [
+    '部族\n有効',
+    'ウシュマルコーンの制限\n20',
+    '部族: 有効',
+    'Tribes enabled',
+  ]) {
     const prefixed = fixture(4);
     prefixed.raw.table_details_text =
       `${prefix}\nゲーム構成\nウシュマルコーンの制限\n制限なし\n` +
@@ -521,11 +568,29 @@ test('conditional decode reaches shared core path with warnings while ordinary d
       /prefix contains option evidence/,
     );
   }
+  const detail = fixture(4);
+  detail.raw.table_details_text =
+    'ゲーム構成\nゲームモード\nアリーナモード\nアリーナモード: Tribes enabled\nウシュマルコーンの制限\n制限なし';
+  const detailInputs = inputs(detail);
+  assert.throws(
+    () => projectCapturedInitial(...detailInputs),
+    /mode detail contains option evidence/,
+  );
+  assert.throws(
+    () =>
+      decodeConditionalPublicGame(
+        detailInputs[2],
+        { ...projected.witness, rawSha256: sha(detailInputs[2]) },
+        dispatch,
+        projected.provenance.mechanicalProfile,
+      ),
+    /mode detail contains option evidence/,
+  );
   assert.equal(calls, 2);
 
   const compatible = fixture(4);
   compatible.raw.table_details_text =
-    'ゲーム構成\nゲームモード\nアリーナモード\nウシュマルコーンの制限\n制限なし';
+    'ゲーム構成\nゲームモード\nアリーナモード\nアリーナモード: Synthetic details\nウシュマルコーンの制限\n制限なし';
   const compatibleInputs = inputs(compatible);
   const partial = projectCapturedInitial(...compatibleInputs);
   assert.equal(partial.provenance.mode, 'arena');
@@ -619,4 +684,182 @@ test('conditional decode reaches shared core path with warnings while ordinary d
     );
   }
   assert.equal(calls, 6);
+});
+
+test('pinned parse and create-only file boundaries refuse malformed evidence', async () => {
+  const base = currentUi(fixture(3));
+  const table = bytes({
+    schema: 'tzolkin-bga-public-table-ui-v1',
+    url: 'https://boardgamearena.com/table?table=123',
+    optionsText: 'ゲームモード\nアリーナモード\nウシュマルコーンの制限\n制限なし',
+  });
+  base.control.table = pin(table);
+  for (const [label, mutate, pattern] of [
+    [
+      'wrong table pin',
+      (v) => {
+        v.control.table.sha256 = '0'.repeat(64);
+      },
+      /table evidence: pin mismatch/,
+    ],
+    [
+      'missing table pin',
+      (v) => {
+        delete v.control.table;
+      },
+      /table evidence pin/,
+    ],
+    [
+      'noscript',
+      (v) => {
+        v.capture.gameAreaHtml += '<noscript></noscript>';
+      },
+      /unsupported inert/,
+    ],
+    [
+      'incomplete comment',
+      (v) => {
+        v.capture.gameAreaHtml += '<!-- missing end';
+      },
+      /incomplete comment/,
+    ],
+    [
+      'duplicate attribute',
+      (v) => {
+        v.capture.gameAreaHtml += '<div class="a" class="b"></div>';
+      },
+      /duplicate attribute/,
+    ],
+    [
+      'duplicate ID',
+      (v) => {
+        v.capture.gameAreaHtml += '<div id="current_round"></div>';
+      },
+      /duplicate\/empty DOM ID/,
+    ],
+    [
+      'empty ID',
+      (v) => {
+        v.capture.gameAreaHtml += '<div id=""></div>';
+      },
+      /duplicate\/empty DOM ID/,
+    ],
+    [
+      'missing geometry',
+      (v) => {
+        v.atlas.geometry = null;
+      },
+      /Missing calibrated dummy geometry/,
+    ],
+    [
+      'worker scale',
+      (v) => {
+        v.capture.gearWorkerNodes[0].rect.width += 1;
+      },
+      /worker scale/,
+    ],
+    [
+      'noninjective atlas',
+      (v) => {
+        v.atlas.faces[1].catalogIds = [...v.atlas.faces[0].catalogIds];
+      },
+      /not injective/,
+    ],
+    [
+      'different building effects',
+      (v) => {
+        v.atlas.faces.find((f) => f.kind === 'building').catalogIds = ['b01', 'b04'];
+      },
+      /Different building effects/,
+    ],
+    [
+      'URL userinfo',
+      (v) => {
+        v.capture.url = v.capture.url.replace('https://', 'https://user@');
+      },
+      /Unsupported BGA source URL/,
+    ],
+    [
+      'URL fragment',
+      (v) => {
+        v.capture.url += '#part';
+      },
+      /Unsupported BGA source URL/,
+    ],
+    [
+      'URL host',
+      (v) => {
+        v.capture.url = v.capture.url.replace('boardgamearena.com', 'example.invalid');
+      },
+      /Unsupported BGA source URL/,
+    ],
+    [
+      'duplicate table',
+      (v) => {
+        v.capture.url += '&table=123';
+      },
+      /Unsupported BGA source URL/,
+    ],
+  ]) {
+    const v = structuredClone(base);
+    mutate(v);
+    assert.throws(() => projectCapturedInitial(...inputs(v), table), pattern, label);
+  }
+  assert.throws(
+    () => projectCapturedInitial(...inputs(structuredClone(base))),
+    /Missing declared table evidence/,
+  );
+  const commented = structuredClone(base);
+  commented.capture.gameAreaHtml += '<!-- <div id="wealth_tile_999" class="wealth_tile"></div> -->';
+  assert.equal(
+    projectCapturedInitial(...inputs(commented), table).record.initial.players.length,
+    3,
+  );
+
+  for (const index of [0, 1, 2, 3, 4]) {
+    const prepared = [...inputs(structuredClone(base)), table];
+    prepared[index] = Buffer.from(
+      prepared[index].toString().replace(/}$/, ',"duplicateProbe":{"key":1,"key":2}}'),
+    );
+    if (index !== 3) {
+      const control = JSON.parse(prepared[3]);
+      control[['capture', 'calibration', 'rawLog', null, 'table'][index]] = pin(prepared[index]);
+      prepared[3] = bytes(control);
+    }
+    assert.throws(
+      () => projectCapturedInitial(...prepared),
+      /duplicate JSON key/,
+      `nested duplicate input ${index}`,
+    );
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), 'tzolkin-playing-boundary-'));
+  try {
+    const prepared = inputs(structuredClone(base));
+    const names = ['capture.json', 'atlas.json', 'raw.json', 'control.json'];
+    const paths = names.map((name) => join(directory, name));
+    for (const [i, file] of paths.entries()) await writeFile(file, prepared[i], { flag: 'wx' });
+    const output = join(directory, 'projected');
+    await assert.rejects(
+      projectPlayingFiles(...paths, output),
+      /Separate table evidence requires the pinned byte API/,
+    );
+    const withoutTable = JSON.parse(prepared[3]);
+    delete withoutTable.table;
+    await writeFile(paths[3], bytes(withoutTable));
+    const saved = await projectPlayingFiles(...paths, output);
+    assert.equal(saved.projection.provenance.coreInitialVerified, false);
+    const original = await readFile(join(output, 'projection.json'));
+    await assert.rejects(projectPlayingFiles(...paths, output), { code: 'EEXIST' });
+    assert.deepEqual(await readFile(join(output, 'projection.json')), original);
+    withoutTable.capture.bytes++;
+    await writeFile(paths[3], bytes(withoutTable));
+    await assert.rejects(
+      projectPlayingFiles(...paths, join(directory, 'invalid-output')),
+      /size\/pin|size mismatch|pin mismatch/,
+    );
+  } finally {
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    await rm(directory, { recursive: true, force: true });
+  }
 });

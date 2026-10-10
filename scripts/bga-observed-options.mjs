@@ -11,6 +11,10 @@ const LABELS = [
   [/^(?:追加建物|追加建築|Additional buildings?)$/i, 'additionalBuildings'],
   [/^(?:クイックアクション|Quick actions?)$/i, 'quickActions'],
 ];
+const LABEL_SUBSTRING = new RegExp(
+  LABELS.map(([pattern]) => pattern.source.slice(1, -1)).join('|'),
+  'i',
+);
 
 // Shared duplicate-key guard; validation precedes JSON.parse so an overwritten
 // option cannot suppress explicit contradictory source evidence.
@@ -120,10 +124,7 @@ export function observedBasicUnlimitedOptions(raw, table = null, normalizedConte
     const sections = value.replaceAll('\r\n', '\n').split('ゲーム構成\n');
     if (sections.length > 2 || (!allowConfigurationPrefix && sections.length !== 1))
       fail('Ambiguous observed game configuration');
-    if (
-      sections.length === 2 &&
-      sections[0].split('\n').some((line) => LABELS.some(([pattern]) => pattern.test(line.trim())))
-    )
+    if (sections.length === 2 && LABEL_SUBSTRING.test(sections[0]))
       fail('Observed configuration prefix contains option evidence');
     const lines = sections
       .at(-1)
@@ -144,7 +145,10 @@ export function observedBasicUnlimitedOptions(raw, table = null, normalizedConte
       if (!key || i === lines.length) fail('Unsupported/partial observed option text');
       const observed = lines[i++];
       set(key, observed, source);
-      if (key === 'mode' && lines[i]?.startsWith(`${observed}: `)) i++;
+      if (key === 'mode' && lines[i]?.startsWith(`${observed}: `)) {
+        if (LABEL_SUBSTRING.test(lines[i])) fail('Observed mode detail contains option evidence');
+        i++;
+      }
     }
   }
   // Embedded text is inspected even for the newer UI adapter, whose normalizer

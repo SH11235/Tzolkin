@@ -129,7 +129,8 @@ function htmlTree(source, label) {
   const stack = [root],
     nodes = [],
     ids = new Map();
-  let at = 0;
+  let at = 0,
+    elements = 0;
   while (at < source.length) {
     if (source.startsWith('<!--', at)) {
       const end = source.indexOf('-->', at + 4);
@@ -208,26 +209,26 @@ function htmlTree(source, label) {
     }
     const selfClosing = source.startsWith('/>', at);
     at += selfClosing ? 2 : 1;
-    const node = { tag, attrs, children: [], start, innerStart: at, innerEnd: at, end: at };
-    stack.at(-1).children.push(node);
-    nodes.push(node);
-    if (nodes.length > 20000 || stack.length > 64) fail(`${label}: HTML complexity limit`);
-    if (attrs.id !== undefined) {
-      if (!attrs.id || ids.has(attrs.id)) fail(`${label}: duplicate/empty DOM ID`);
-      ids.set(attrs.id, node);
-    }
-    if (!selfClosing && ['script', 'style'].includes(tag)) {
+    if (++elements > 20000 || stack.length > 64) fail(`${label}: HTML complexity limit`);
+    if (['script', 'style'].includes(tag)) {
       // BGA retains HTML template strings inside scripts. These are raw text,
-      // not rendered tiles/workers/markers and must never enter the ID index.
+      // and neither the element nor its body is rendered board evidence.
+      if (selfClosing) fail(`${label}: unsupported self-closing raw-text element`);
       const closing = new RegExp(`</${tag}\\s*>`, 'gi');
       closing.lastIndex = at;
       const end = closing.exec(source);
       if (!end) fail(`${label}: incomplete raw-text element`);
-      node.children.push(source.slice(at, end.index));
-      node.innerEnd = end.index;
-      node.end = closing.lastIndex;
-      at = node.end;
-    } else if (!selfClosing && !VOID.has(tag)) stack.push(node);
+      at = closing.lastIndex;
+      continue;
+    }
+    const node = { tag, attrs, children: [], start, innerStart: at, innerEnd: at, end: at };
+    stack.at(-1).children.push(node);
+    nodes.push(node);
+    if (attrs.id !== undefined) {
+      if (!attrs.id || ids.has(attrs.id)) fail(`${label}: duplicate/empty DOM ID`);
+      ids.set(attrs.id, node);
+    }
+    if (!selfClosing && !VOID.has(tag)) stack.push(node);
   }
   if (stack.length !== 1) fail(`${label}: incomplete markup`);
   return { source, nodes, ids };
@@ -828,6 +829,8 @@ export function projectCapturedInitial(
   };
   const buildings = construction('building', capture.buildingsHtml, 'buildings', 6);
   const monuments = construction('monument', capture.monumentsHtml, 'monuments', n + 2);
+  if (tree.nodes.filter((node) => token(node, 'construction')).length !== 6 + n + 2)
+    fail('Unexpected construction outside initial markets');
   const initial = {
     version: 1,
     additionalBuildings: false,
@@ -903,6 +906,7 @@ export function projectCapturedInitial(
         'Basic setup declares covered corn below visible wood tiles.',
         'Feeding benefit is derived only from calibrated selected artwork.',
         'Remaining deck counts derive from the pinned current basic catalog.',
+        'Market order follows DOM ID suffixes; identical-card sprites use the lowest unused catalog ID mechanically.',
       ],
       limits: [
         'Caller pins establish byte consistency, not source authentication or independent image review.',
