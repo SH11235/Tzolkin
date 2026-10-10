@@ -6,21 +6,77 @@ use crate::public_policy_episode::{
     ActorLink, AppliedActorStep, TARGET_CONTRACT, applied_plan, applied_step,
     canonical_record_checksum,
 };
+use crate::public_policy_repeat::{MAX_UPDATE_COUNT, REPEATED_SAMPLING_VERSION};
+use crate::public_rl_repeated_stochastic_native::{
+    AuditedRepeatedRlStochasticGame, RECORD_SCHEMA as REPEATED_RECORD_SCHEMA,
+    SOURCE_KIND as REPEATED_SOURCE_KIND,
+};
 use crate::public_rl_stochastic_native::{AuditedRlStochasticGame, RECORD_SCHEMA, SOURCE_KIND};
 use crate::public_stochastic::{
     DENOMINATOR_BITS, RL_SAMPLING_VERSION, RNG_VERSION, RlSamplingPolicy, UNIFORM_MIXTURE,
 };
 use crate::public_stochastic_native::{NativeStochasticConfig, numerical_target};
+use crate::public_stochastic_record::Record;
 use crate::public_stochastic_record::hex64;
 use crate::replay::{RULES_BASELINE, RULES_VERSION, catalog_hash};
 use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA};
 
 pub const EPISODE_CONTRACT: &str = "applied-rl-count1-actor-gamma1-terminal-winner-share-v1";
+pub const REPEATED_EPISODE_CONTRACT: &str =
+    "applied-rl-repeat-actor-gamma1-terminal-winner-share-v1";
+
+enum EpisodeSource {
+    Count1(AuditedRlStochasticGame),
+    Repeated(AuditedRepeatedRlStochasticGame),
+}
+struct SourceContract {
+    schema: &'static str,
+    kind: &'static str,
+    sampling: &'static str,
+    episode: &'static str,
+    domain: &'static [u8],
+    counts: std::ops::RangeInclusive<u64>,
+}
+impl EpisodeSource {
+    fn record(&self) -> &Record<RlSamplingPolicy> {
+        match self {
+            Self::Count1(source) => source.record(),
+            Self::Repeated(source) => source.record(),
+        }
+    }
+    fn contract(&self) -> SourceContract {
+        match self {
+            Self::Count1(_) => SourceContract {
+                schema: RECORD_SCHEMA,
+                kind: SOURCE_KIND,
+                sampling: RL_SAMPLING_VERSION,
+                episode: EPISODE_CONTRACT,
+                domain: b"tzolkin-applied-rl-count1-actor-episode-v1\0",
+                counts: 1..=1,
+            },
+            Self::Repeated(_) => SourceContract {
+                schema: REPEATED_RECORD_SCHEMA,
+                kind: REPEATED_SOURCE_KIND,
+                sampling: REPEATED_SAMPLING_VERSION,
+                episode: REPEATED_EPISODE_CONTRACT,
+                domain: b"tzolkin-applied-rl-repeat-actor-episode-v1\0",
+                counts: 2..=MAX_UPDATE_COUNT,
+            },
+        }
+    }
+    fn binding_key(&self) -> Result<String, String> {
+        let source = &self.record().header.base_policy;
+        match self {
+            Self::Count1(_) => source.binding_key(),
+            Self::Repeated(_) => source.repeated_binding_key(),
+        }
+    }
+}
 
 /// Owns only a freshly audited RL record. No raw constructor, deserialization,
 /// BC episode conversion or model selection is exposed.
 pub struct ValidatedRlPolicyEpisode {
-    source: AuditedRlStochasticGame,
+    source: EpisodeSource,
     config: NativeStochasticConfig,
     links: Vec<ActorLink>,
     ranks: Vec<usize>,
@@ -29,11 +85,18 @@ pub struct ValidatedRlPolicyEpisode {
 }
 impl ValidatedRlPolicyEpisode {
     pub fn from_audited(source: AuditedRlStochasticGame) -> Result<Self, String> {
+        Self::from_source(EpisodeSource::Count1(source))
+    }
+    pub fn from_repeated_audited(source: AuditedRepeatedRlStochasticGame) -> Result<Self, String> {
+        Self::from_source(EpisodeSource::Repeated(source))
+    }
+    fn from_source(source: EpisodeSource) -> Result<Self, String> {
+        let contract = source.contract();
         let record = source.record();
         let header = &record.header;
         let config = header.config.checked_config()?;
-        if record.schema != RECORD_SCHEMA
-            || header.source_kind != SOURCE_KIND
+        if record.schema != contract.schema
+            || header.source_kind != contract.kind
             || record.training_admission != "unavailable-distinct-codec-required"
             || record.failure.is_some()
             || header.rules_version != RULES_VERSION
@@ -42,24 +105,22 @@ impl ValidatedRlPolicyEpisode {
             || header.observation_schema != OBSERVATION_SCHEMA
             || header.move_schema != MOVE_SCHEMA
             || header.backend != "scalar"
-            || header.sampling_version != RL_SAMPLING_VERSION
+            || header.sampling_version != contract.sampling
             || header.rng_version != RNG_VERSION
             || header.denominator_bits != DENOMINATOR_BITS
             || header.uniform_mixture_bits != hex64(UNIFORM_MIXTURE.to_bits())
             || header.native_family_id != seed_family_id(config.environment_seed())
             || header.numerical_target != numerical_target()
-            || header.base_policy.update_count() != 1
+            || !contract.counts.contains(&header.base_policy.update_count())
             || record.callbacks.len() > config.limits().max_callbacks()
         {
             return Err("Incompatible completed RL actor episode source".into());
         }
-        // The owned audited source already binds its full DTO to the sealed
-        // count1 owner. Here, the same link checks use that distinct RL binding.
-        let (links, ranks, winners) = applied_plan(record, &config, RL_SAMPLING_VERSION, || {
-            header.base_policy.binding_key()
-        })?;
-        let checksum =
-            canonical_record_checksum(record, b"tzolkin-applied-rl-count1-actor-episode-v1\0")?;
+        // The private source variant is chosen only by a sealed audit factory,
+        // never from untrusted metadata. Each role retains its distinct domain.
+        let (links, ranks, winners) =
+            applied_plan(record, &config, contract.sampling, || source.binding_key())?;
+        let checksum = canonical_record_checksum(record, contract.domain)?;
         Ok(Self {
             source,
             config,
@@ -74,7 +135,7 @@ impl ValidatedRlPolicyEpisode {
         &self.checksum
     }
     pub fn episode_contract(&self) -> &'static str {
-        EPISODE_CONTRACT
+        self.source.contract().episode
     }
     pub fn target_contract(&self) -> &'static str {
         TARGET_CONTRACT
