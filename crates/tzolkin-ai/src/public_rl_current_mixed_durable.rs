@@ -744,6 +744,23 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         self.require_live()?;
         self.handle()
     }
+    /// Borrows the actual current owner for a development Arena comparison.
+    /// The borrow prevents updating or consuming this session during evaluation.
+    pub fn current_policy_for_arena(&self) -> Result<BorrowedArenaPolicy<'_>, String> {
+        self.current_policy()?;
+        match &self.continued {
+            Some(owner) => Ok(BorrowedArenaPolicy::ContinuedMixed(owner)),
+            None => Ok(BorrowedArenaPolicy::Mixed(self.root.initial_owner()?)),
+        }
+    }
+    /// Borrows the unchanged original Mixed count1 baseline, including its critic
+    /// lineage. Uses the same readiness and current-owner guards as evaluation
+    /// of the current policy; stopped or unresolved sessions expose neither.
+    /// The returned policy cannot outlive this session or overlap its mutation.
+    pub fn original_policy_for_arena(&self) -> Result<BorrowedArenaPolicy<'_>, String> {
+        self.current_policy()?;
+        Ok(BorrowedArenaPolicy::Mixed(self.root.initial_owner()?))
+    }
     pub fn continued_owner(&self) -> Option<&ContinuedMixedOwner> {
         self.continued.as_ref()
     }
