@@ -290,6 +290,7 @@ enum SamplingPolicyKind {
     Long,
     Paired,
     Mixed,
+    ContinuedMixed,
 }
 impl SamplingPolicyKind {
     fn sampling_version(self) -> &'static str {
@@ -300,6 +301,9 @@ impl SamplingPolicyKind {
             Self::Long => crate::public_policy_long::SAMPLING_VERSION,
             Self::Paired => crate::public_policy_paired_long::SAMPLING_VERSION,
             Self::Mixed => crate::public_rl_mixed_handle::SAMPLING_VERSION,
+            Self::ContinuedMixed => {
+                crate::public_rl_current_mixed_source::CONTINUED_SAMPLING_VERSION
+            }
         }
     }
 }
@@ -309,6 +313,7 @@ enum SamplingPrediction {
     Bc(PublicPolicyDistribution),
     Rl(PublicRlPolicyDistribution),
     Mixed(Box<crate::public_rl_mixed_handle::MixedPolicyDistribution>),
+    CurrentMixed(Box<crate::public_policy_mixed_continued::CurrentMixedDistribution>),
 }
 impl SamplingPrediction {
     fn compatible(&self, kind: SamplingPolicyKind) -> bool {
@@ -351,6 +356,14 @@ impl SamplingPrediction {
                 p.identity().validate().is_ok()
                     && p.value_validity() == ValueValidity::UnavailablePolicyOnly
             }
+            (Self::CurrentMixed(p), SamplingPolicyKind::Mixed) => {
+                matches!(p.identity(),crate::public_rl_current_mixed_source::CurrentMixedParentIdentity::InitialMixedV1{..})
+                    && p.identity().validate().is_ok() && p.value_validity()==ValueValidity::UnavailablePolicyOnly
+            }
+            (Self::CurrentMixed(p), SamplingPolicyKind::ContinuedMixed) => {
+                matches!(p.identity(),crate::public_rl_current_mixed_source::CurrentMixedParentIdentity::ContinuedMixedV2{..})
+                    && p.identity().validate().is_ok() && p.value_validity()==ValueValidity::UnavailablePolicyOnly
+            }
             _ => false,
         }
     }
@@ -359,6 +372,7 @@ impl SamplingPrediction {
             Self::Bc(p) => &p.logits,
             Self::Rl(p) => p.logits(),
             Self::Mixed(p) => p.logits(),
+            Self::CurrentMixed(p) => p.logits(),
         }
     }
     fn probability_count(&self) -> usize {
@@ -366,6 +380,7 @@ impl SamplingPrediction {
             Self::Bc(p) => p.probabilities.len(),
             Self::Rl(p) => p.probabilities().len(),
             Self::Mixed(p) => p.probabilities().len(),
+            Self::CurrentMixed(p) => p.probabilities().len(),
         }
     }
 }
@@ -1049,6 +1064,44 @@ pub struct MixedStochasticSession<'handle, 'owner> {
     policy_binding_key: String,
     state: SessionState,
 }
+
+/// Current sealed initial/continued owner sampling. This standalone session
+/// grants no family reservation, source audit or durable owner admission.
+pub struct CurrentMixedStochasticSession<'handle, 'owner> {
+    policy: &'handle crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'owner>,
+    policy_binding_key: String,
+    state: SessionState,
+}
+impl<'handle, 'owner> CurrentMixedStochasticSession<'handle, 'owner> {
+    pub fn new(
+        policy: &'handle crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'owner>,
+        identity: SamplingStreamIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            policy_binding_key: policy.identity().binding_key()?,
+            state: SessionState::new(identity)?,
+        })
+    }
+    pub fn counters(&self) -> SamplingCounters {
+        self.state.counters()
+    }
+    pub fn stop(&mut self) {
+        self.state.stopped = true;
+    }
+    pub fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
+        let kind=match self.policy.identity(){
+            crate::public_rl_current_mixed_source::CurrentMixedParentIdentity::InitialMixedV1{..}=>SamplingPolicyKind::Mixed,
+            crate::public_rl_current_mixed_source::CurrentMixedParentIdentity::ContinuedMixedV2{..}=>SamplingPolicyKind::ContinuedMixed,
+        };
+        self.state
+            .sample_with_kind(&self.policy_binding_key, kind, observation, |o| {
+                self.policy
+                    .distribution(o)
+                    .map(|p| SamplingPrediction::CurrentMixed(Box::new(p)))
+            })
+    }
+}
 impl<'handle, 'owner> MixedStochasticSession<'handle, 'owner> {
     pub fn new(
         policy: &'handle crate::public_rl_mixed_handle::MixedPolicyHandle<'owner>,
@@ -1106,6 +1159,11 @@ mod tests {
             value_validity: ValueValidity::UnavailablePolicyOnly,
         });
         assert!(!p.compatible(SamplingPolicyKind::Mixed));
+        assert!(!p.compatible(SamplingPolicyKind::ContinuedMixed));
+        assert_ne!(
+            SamplingPolicyKind::Mixed.sampling_version(),
+            SamplingPolicyKind::ContinuedMixed.sampling_version()
+        );
         assert_eq!(
             SamplingPolicyKind::Mixed.sampling_version(),
             crate::public_rl_mixed_handle::SAMPLING_VERSION

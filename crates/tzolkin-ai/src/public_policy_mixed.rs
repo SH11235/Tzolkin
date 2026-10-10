@@ -2,6 +2,7 @@
 use crate::dataset::{DatasetSplit, split_for_family};
 use crate::public_model::{self, PublicPolicyModel};
 use crate::public_policy_baseline::{self, InitializedResidualBaseline, ResidualFitConfig};
+use crate::public_policy_episode::AppliedActorStep;
 use crate::public_policy_paired_long::PairedRlParent;
 use crate::public_policy_update::{self, Deltas, NumericReport, OneStepConfig, hash};
 use crate::public_rl_artifact::InitializedPublicRlPolicy;
@@ -261,6 +262,21 @@ pub struct MixedJointOwner {
     artifact: MixedJointArtifact,
 }
 impl MixedJointOwner {
+    pub(crate) fn continued_root_reference(
+        &self,
+    ) -> Result<crate::public_policy_mixed_continued::MixedRootReference, String> {
+        Ok(crate::public_policy_mixed_continued::MixedRootReference {
+            original_root_checksum: hash(
+                b"tzolkin-continued-mixed-original-root-v2\0",
+                &self.artifact.report.root,
+            )?,
+            first_mixed_checksum: self.artifact.checksum.clone(),
+            root_init_checksum: self.artifact.report.root.root_init_checksum.clone(),
+            imported_update_count: self.imported_update_count(),
+            residual_seed: self.artifact.report.root.residual_seed,
+            bc_source: self.artifact.report.root.bc_source.clone(),
+        })
+    }
     pub fn artifact(&self) -> &MixedJointArtifact {
         &self.artifact
     }
@@ -360,8 +376,12 @@ pub(crate) fn restore_owner(
     }
     Ok(MixedJointOwner { artifact })
 }
-fn rounded_delta(old: &[f32], new: &[f32], cap: f64) -> Result<(usize, f64, f64), String> {
-    if old.len() != new.len() || old.is_empty() {
+pub(crate) fn rounded_delta(
+    old: &[f32],
+    new: &[f32],
+    cap: f64,
+) -> Result<(usize, f64, f64), String> {
+    if old.len() != new.len() || old.is_empty() || !cap.is_finite() || cap < 0.0 {
         return Err("Mixed delta shape".into());
     }
     let mut changed = 0;
@@ -417,50 +437,27 @@ pub(crate) fn prepare(
         }
     }
     let model = parent_model(imported);
-    let mut gradient = vec![0.0; public_model::PARAMETER_COUNT];
-    let mut observed = [0; 3];
-    let mut deltas = Deltas::default();
-    for (member, e) in cohort.episodes().iter().enumerate() {
-        let mut own = vec![0.0; public_model::PARAMETER_COUNT];
-        for step in e.steps() {
-            if step.actor() != e.learner_seat()
-                || step.observation().players.len() != e.source_config().players()
-            {
-                return Err("Mixed update opponent/absolute learner actor mismatch".into());
-            }
-            public_policy_update::accumulate_step_with_baseline(
-                model,
-                step,
-                actor_config,
-                &mut own,
-                &mut observed,
-                &mut deltas,
-                |o| {
-                    public_policy_baseline::baseline(
-                        residual,
-                        &PublicStateContext::from_observation(o)?,
-                    )
-                },
-            )?;
-        }
-        add_learner_actor(
-            &mut gradient,
-            &own,
-            e.learner_seat(),
-            e.source_config().players(),
-            e.learner_seat(),
-            cohort.actor_coefficient(member, e.learner_seat())?,
-        )?;
-    }
-    if observed != counts {
-        return Err("Mixed update sealed learner count mismatch".into());
-    }
-    let actor =
-        public_policy_update::propose_parameters(model.parameters(), &gradient, actor_config)?;
-    let critic = public_policy_baseline::fit_applied(
+    let members = cohort
+        .episodes()
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            Ok(MixedNumericMember {
+                learner: e.learner_seat(),
+                players: e.source_config().players(),
+                coefficient: cohort.actor_coefficient(i, e.learner_seat())?,
+                steps: e.steps().collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .try_into()
+        .map_err(|_| "Mixed numeric whole-four shape")?;
+    let (deltas, actor, critic) = prepare_numeric(
+        model,
         residual,
-        cohort.episodes().iter().flat_map(|e| e.steps()),
-        counts[0],
+        &members,
+        counts,
+        actor_config,
         critic_config,
     )?;
     let mut report = MixedJointReport {
@@ -518,6 +515,84 @@ pub(crate) fn prepare(
         model,
         residual,
     )?))
+}
+pub(crate) struct MixedNumericMember<'a> {
+    pub(crate) learner: usize,
+    pub(crate) players: usize,
+    pub(crate) coefficient: f64,
+    pub(crate) steps: Vec<AppliedActorStep<'a>>,
+}
+pub(crate) fn prepare_numeric(
+    model: &PublicPolicyModel,
+    residual: &[f32],
+    members: &[MixedNumericMember<'_>; 4],
+    counts: [usize; 3],
+    actor_config: &OneStepConfig,
+    critic_config: &ResidualFitConfig,
+) -> Result<
+    (
+        Deltas,
+        public_policy_update::Proposal,
+        public_policy_baseline::NumericResidualFit,
+    ),
+    String,
+> {
+    actor_config.validate()?;
+    critic_config.check_callbacks(counts[0])?;
+    model.validate()?;
+    if counts[1] > actor_config.max_candidate_rows()
+        || residual.len() != crate::public_state_critic::PARAMETER_COUNT
+        || residual.iter().any(|x| !x.is_finite())
+    {
+        return Err("Mixed numeric current actor/residual/count bound".into());
+    }
+    let mut gradient = vec![0.0; public_model::PARAMETER_COUNT];
+    let mut observed = [0; 3];
+    let mut deltas = Deltas::default();
+    for e in members {
+        let mut own = vec![0.0; public_model::PARAMETER_COUNT];
+        for step in e.steps.iter().map(AppliedActorStep::reborrow) {
+            if step.actor() != e.learner || step.observation().players.len() != e.players {
+                return Err("Mixed update opponent/absolute learner actor mismatch".into());
+            }
+            public_policy_update::accumulate_step_with_baseline(
+                model,
+                step,
+                actor_config,
+                &mut own,
+                &mut observed,
+                &mut deltas,
+                |o| {
+                    public_policy_baseline::baseline(
+                        residual,
+                        &PublicStateContext::from_observation(o)?,
+                    )
+                },
+            )?;
+        }
+        add_learner_actor(
+            &mut gradient,
+            &own,
+            e.learner,
+            e.players,
+            e.learner,
+            e.coefficient,
+        )?;
+    }
+    if observed != counts {
+        return Err("Mixed update sealed learner count mismatch".into());
+    }
+    let actor =
+        public_policy_update::propose_parameters(model.parameters(), &gradient, actor_config)?;
+    let critic = public_policy_baseline::fit_applied(
+        residual,
+        members
+            .iter()
+            .flat_map(|e| e.steps.iter().map(AppliedActorStep::reborrow)),
+        counts[0],
+        critic_config,
+    )?;
+    Ok((deltas, actor, critic))
 }
 fn add_learner_actor(
     total: &mut [f64],

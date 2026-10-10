@@ -135,6 +135,14 @@ pub struct AppliedActorStep<'a> {
     share: f64,
 }
 impl AppliedActorStep<'_> {
+    pub(crate) fn reborrow(&self) -> Self {
+        Self {
+            callback: self.callback,
+            link: self.link,
+            rank: self.rank,
+            share: self.share,
+        }
+    }
     pub fn observation(&self) -> &Observation {
         self.callback
             .observation
