@@ -4,32 +4,14 @@
 //! sampled behavior has integer tick masses; its rounding map has no derivative
 //! here. Diagnostics describe the difference between those two distributions.
 //! No observations, source admission, model updates or optimizer are performed.
-use crate::model::MAX_CANDIDATES;
-use crate::public_stochastic::{SAMPLING_VERSION, TICKS, UNIFORM_MIXTURE, behavior_distribution};
+//! Arbitrary logits and indices establish numeric consistency only. They do not
+//! prove an actual sample, legal action order, or the policy that produced it.
+use crate::public_stochastic::{
+    SAMPLING_VERSION, TICKS, UNIFORM_MIXTURE, behavior_distribution, nominal_weights,
+};
 
 pub const LIKELIHOOD_VERSION: &str = "public-smoothed-categorical-f64-eta2m20-v1";
 pub const CORRECTION_VERSION: &str = "public-old-nominal-over-tick53-measured-delta-v1";
-
-// The sampler's original max/exp/ordered-sum body is shared without changing its
-// arithmetic, finite checks or error strings. exp/ln bits remain platform-bound.
-pub(crate) fn nominal_weights(logits: &[f32]) -> Result<(Vec<f64>, f64), String> {
-    if logits.is_empty() || logits.len() > MAX_CANDIDATES || logits.iter().any(|z| !z.is_finite()) {
-        return Err("Invalid finite full-mask sampling logits".into());
-    }
-    let maximum = logits
-        .iter()
-        .map(|z| f64::from(*z))
-        .fold(f64::NEG_INFINITY, f64::max);
-    let weights: Vec<f64> = logits
-        .iter()
-        .map(|z| (f64::from(*z) - maximum).exp())
-        .collect();
-    let sum = weights.iter().fold(0.0_f64, |a, b| a + b);
-    if !sum.is_finite() || sum <= 0.0 {
-        return Err("Invalid f64 softmax denominator".into());
-    }
-    Ok((weights, sum))
-}
 
 /// Smooth `p=(1-eta)*softmax+eta/n` for one chosen index in a full ordered mask.
 /// This checks numeric shape only; it does not certify that the mask is legal.
@@ -77,6 +59,9 @@ impl SmoothedLikelihood {
     pub fn chosen_index(&self) -> usize {
         self.chosen
     }
+    pub fn likelihood_version(&self) -> &'static str {
+        LIKELIHOOD_VERSION
+    }
     pub fn probabilities(&self) -> &[f64] {
         &self.nominal
     }
@@ -84,6 +69,7 @@ impl SmoothedLikelihood {
         self.log_probability
     }
     /// Analytic real-valued logit derivative; floating-point rounding is not differentiated.
+    /// Contents of `output` are unspecified if this returns an error.
     pub fn logit_gradient(&self, output: &mut [f64]) -> Result<(), String> {
         if output.len() != self.nominal.len() {
             return Err("Logit gradient shape differs from the full mask".into());
@@ -103,6 +89,7 @@ impl SmoothedLikelihood {
 /// Old-policy `p/q` correction reconstructed from logits and the sampler's CDF.
 /// The factor is constant for a later update. A one-action correction does not
 /// correct the trajectory's state distribution or its subsequent policy.
+/// Reconstruction from arbitrary logits/index does not prove an actual sample.
 #[derive(Clone, Debug)]
 pub struct BehaviorLikelihood {
     smooth: SmoothedLikelihood,
@@ -169,15 +156,6 @@ impl BehaviorLikelihood {
             importance_weight,
         })
     }
-    /// Optional full-mass comparison for callers that have that representation.
-    /// Existing sampler records are unchanged and do not require a full mass array.
-    pub fn with_mass_ticks(logits: &[f32], chosen: usize, masses: &[u64]) -> Result<Self, String> {
-        let expected = Self::from_logits(logits, chosen)?;
-        if masses != expected.mass_ticks.as_slice() {
-            return Err("Recorded behavior masses differ from the sampler CDF".into());
-        }
-        Ok(expected)
-    }
     pub fn smooth(&self) -> &SmoothedLikelihood {
         &self.smooth
     }
@@ -211,8 +189,12 @@ impl BehaviorLikelihood {
     pub fn sampling_version(&self) -> &'static str {
         SAMPLING_VERSION
     }
+    pub fn correction_version(&self) -> &'static str {
+        CORRECTION_VERSION
+    }
     /// `w_old * advantage * d ln(p_new)/d logits`, with `w_old` held fixed.
     /// Caller supplies the return/baseline and determines episode aggregation.
+    /// Contents of `output` are unspecified if this returns an error.
     pub fn weighted_logit_gradient(
         &self,
         new: &SmoothedLikelihood,
@@ -243,6 +225,7 @@ impl BehaviorLikelihood {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MAX_CANDIDATES;
     use sha2::{Digest, Sha256};
 
     // Original sampler arithmetic before the helper extraction. Keeping a
@@ -441,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_logits_indices_masses_and_gradient_inputs_are_rejected() {
+    fn malformed_logits_indices_and_gradient_inputs_are_rejected() {
         for logits in [
             vec![],
             vec![f32::NAN],
@@ -452,14 +435,6 @@ mod tests {
         }
         assert!(SmoothedLikelihood::from_logits(&[0.0], 1).is_err());
         let old = BehaviorLikelihood::from_logits(&[1.0, -1.0], 0).unwrap();
-        let mut wrong = old.mass_ticks().to_vec();
-        wrong.swap(0, 1);
-        assert!(BehaviorLikelihood::with_mass_ticks(&[1.0, -1.0], 0, &wrong).is_err());
-        wrong = old.mass_ticks().to_vec();
-        wrong[0] -= 1;
-        wrong[1] += 1;
-        assert!(BehaviorLikelihood::with_mass_ticks(&[1.0, -1.0], 0, &wrong).is_err());
-        assert!(BehaviorLikelihood::with_mass_ticks(&[1.0, -1.0], 0, &[]).is_err());
         assert!(old.smooth().logit_gradient(&mut [0.0]).is_err());
         assert!(
             old.weighted_logit_gradient(old.smooth(), f64::NAN, &mut [0.0; 2])
