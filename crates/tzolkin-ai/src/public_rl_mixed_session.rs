@@ -429,6 +429,16 @@ impl<'a> MixedRlCollectionSession<'a> {
         let saved = self.saved_inputs(source, raw, expected)?;
         Ok(serde_json::json!({"plan":saved.plan.receipt(),"inventory":saved.before}))
     }
+    pub(crate) fn current_saved_inventory(
+        &self,
+        source: &Path,
+    ) -> Result<serde_json::Value, String> {
+        serde_json::to_value(collection_inventory(
+            source,
+            self.spec.wire.max_output_bytes,
+        )?)
+        .map_err(|e| e.to_string())
+    }
     fn saved_inputs(
         &self,
         source: &Path,

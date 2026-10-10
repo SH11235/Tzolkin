@@ -76,6 +76,9 @@ pub(crate) fn root(
             PairedRlParent::Paired(p) => {
                 p.validate_for_sampling()?;
                 let r = p.artifact().report();
+                if seed != r.residual_seed() {
+                    return Err("Mixed spec residual seed differs from imported Paired root".into());
+                }
                 (
                     p.artifact().checksum(),
                     p.artifact().update_count(),

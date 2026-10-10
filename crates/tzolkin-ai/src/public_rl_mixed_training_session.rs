@@ -520,10 +520,14 @@ impl<'a> MixedOneBatchSession<'a> {
             spec: spec_pin,
             receipt,
         })?;
+        if let Err(e) = self.require_live_inputs(&spec, &source) {
+            self.fail(&e)?;
+            return Ok(self.status());
+        }
         self.save(Event::AuditStart)?;
         let result = self
             .parent
-            .collection_session(spec, self.prepared)?
+            .collection_session(spec.clone(), self.prepared)?
             .audit_saved(
                 &source,
                 collection_raw,
@@ -537,6 +541,10 @@ impl<'a> MixedOneBatchSession<'a> {
                 return Ok(self.status());
             }
         };
+        if let Err(e) = self.require_live_inputs(&spec, &source) {
+            self.fail(&e)?;
+            return Ok(self.status());
+        }
         let audit_raw = read_bounded(&self.directory.join("audit/cohort.json"), MAX_SPEC_BYTES)?;
         if unique_json(&audit_raw, MAX_SPEC_BYTES)? != cohort.receipt() {
             return Err("Mixed saved audit receipt differs before gradient".into());
@@ -567,24 +575,38 @@ impl<'a> MixedOneBatchSession<'a> {
         match result {
             Err(e) => self.fail(&e)?,
             Ok(proposal) => {
+                if let Err(e) = self.require_live_inputs(&spec, &source) {
+                    self.fail(&e)?;
+                    return Ok(self.status());
+                }
                 let report = self.publish(
                     "report.json",
                     &bytes(proposal.report(), MAX_HEAD_BYTES)?,
                     MAX_HEAD_BYTES,
                 )?;
                 match proposal {
-                    MixedProposal::NoChange(_) => self.save(Event::Resolve {
-                        outcome: "noChange".into(),
-                        report: Some(report),
-                        owner: None,
-                        error: None,
-                    })?,
+                    MixedProposal::NoChange(_) => {
+                        if let Err(e) = self.require_live_inputs(&spec, &source) {
+                            self.fail(&e)?;
+                            return Ok(self.status());
+                        }
+                        self.save(Event::Resolve {
+                            outcome: "noChange".into(),
+                            report: Some(report),
+                            owner: None,
+                            error: None,
+                        })?;
+                    }
                     MixedProposal::Updated(owner) => {
                         let artifact = self.publish(
                             "artifact.json",
                             &bytes(owner.artifact(), ARTIFACT_BYTES)?,
                             ARTIFACT_BYTES,
                         )?;
+                        if let Err(e) = self.require_live_inputs(&spec, &source) {
+                            self.fail(&e)?;
+                            return Ok(self.status());
+                        }
                         self.save(Event::Resolve {
                             outcome: "updated".into(),
                             report: Some(report),
@@ -598,6 +620,42 @@ impl<'a> MixedOneBatchSession<'a> {
         }
         self.usage()?;
         Ok(self.status())
+    }
+    fn require_live_inputs(
+        &self,
+        spec: &MixedRlCollectionSpec,
+        source: &Path,
+    ) -> Result<(), String> {
+        let reserved = self
+            .progress
+            .source_inventory
+            .as_ref()
+            .and_then(|v| v.get("inventory"))
+            .ok_or("Missing reserved mixed source inventory")?;
+        let current = self
+            .parent
+            .collection_session(spec.clone(), self.prepared)?
+            .current_saved_inventory(source)?;
+        if &current != reserved {
+            return Err("Mixed saved source changed after reservation".into());
+        }
+        for (p, name) in [
+            (&self.progress.source_spec, "collection-spec.json"),
+            (&self.progress.source_receipt, "source-receipt.json"),
+        ] {
+            read_pin(
+                &self.directory,
+                p.as_ref().ok_or("Missing adopted mixed input pin")?,
+                name,
+                MAX_SPEC_BYTES,
+            )?;
+        }
+        if self.progress.audit.is_some()
+            && audit_inventory(&self.directory)? != self.progress.audit_inventory
+        {
+            return Err("Mixed returned audit files changed before resolution".into());
+        }
+        Ok(())
     }
     fn fail(&mut self, error: &str) -> Result<(), String> {
         self.save(Event::Resolve {
