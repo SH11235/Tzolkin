@@ -42,7 +42,7 @@ fn cli(args: &[&str], input: Option<&[u8]>) -> Output {
     if let Some(input) = input {
         // A CLI that rejects its arguments can exit before it reads stdin.
         match child.stdin.take().unwrap().write_all(input) {
-            Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("{error}"),
+            Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("{error:?}"),
             _ => {}
         }
     } else {

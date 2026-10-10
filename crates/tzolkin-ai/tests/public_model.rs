@@ -460,7 +460,7 @@ fn cli(args: &[&str], input: &[u8]) -> std::process::Output {
 // A CLI that rejects its arguments can exit before it reads stdin.
 fn write_stdin(child: &mut std::process::Child, input: &[u8]) {
     match child.stdin.take().unwrap().write_all(input) {
-        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("{error}"),
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => panic!("{error:?}"),
         _ => {}
     }
 }
