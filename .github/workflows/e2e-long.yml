@@ -46,7 +46,8 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/wasm-bindgen-build
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e:long
+      # The long games keep two workers; the pull request suite uses four.
+      - run: npm run test:e2e:long -- --workers=2
 
   ml-slow:
     runs-on: ubuntu-24.04
