@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, open, rename, rm, rmdir, writeFile } from 'node:fs/prom
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeGame } from './bga-import.mjs';
+import { observedBasicUnlimitedOptions, uniqueJson } from './bga-observed-options.mjs';
 import { catalogFingerprint, coreDispatcher } from './bga-replay.mjs';
 import { decodeConditionalPublicGame, WITNESS_SCHEMA } from './bga-decode.mjs';
 
@@ -62,10 +63,10 @@ const list = (value, max, label) => {
   if (!Array.isArray(value) || value.length > max) fail(`${label}: invalid list`);
   return value;
 };
-function closed(value, keys, label) {
+function closed(value, keys, label, optional = []) {
   if (
     !object(value) ||
-    Object.keys(value).some((key) => !keys.includes(key)) ||
+    Object.keys(value).some((key) => !keys.includes(key) && !optional.includes(key)) ||
     keys.some((key) => !Object.hasOwn(value, key))
   )
     fail(`${label}: missing/unknown field`);
@@ -89,67 +90,6 @@ function one(items, predicate, label) {
   return result[0];
 }
 
-// Validate object keys before JSON.parse can discard duplicates, including nested
-// objects in retained captures and external controls. Depth and token count are bounded.
-function uniqueJson(bytes, max, label) {
-  if (!Buffer.isBuffer(bytes) || bytes.length > max) fail(`${label}: byte limit`);
-  const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  let at = 0,
-    tokens = 0;
-  const whitespace = () => {
-    while (/\s/.test(source[at] ?? '') && at < source.length) at++;
-  };
-  function string() {
-    const start = at++;
-    while (at < source.length) {
-      const char = source[at++];
-      if (char === '"') return JSON.parse(source.slice(start, at));
-      if (char === '\\') at++;
-    }
-    fail(`${label}: unterminated JSON string`);
-  }
-  function value(depth) {
-    if (depth > 64 || ++tokens > 250000) fail(`${label}: JSON complexity limit`);
-    whitespace();
-    if (source[at] === '{' || source[at] === '[') {
-      const isObject = source[at++] === '{';
-      const end = isObject ? '}' : ']';
-      const keys = new Set();
-      whitespace();
-      if (source[at] === end) {
-        at++;
-        return;
-      }
-      for (;;) {
-        if (isObject) {
-          whitespace();
-          if (source[at] !== '"') fail(`${label}: invalid JSON key`);
-          const key = string();
-          if (keys.has(key)) fail(`${label}: duplicate JSON key`);
-          keys.add(key);
-          whitespace();
-          if (source[at++] !== ':') fail(`${label}: invalid JSON colon`);
-        }
-        value(depth + 1);
-        whitespace();
-        const next = source[at++];
-        if (next === end) break;
-        if (next !== ',') fail(`${label}: invalid JSON separator`);
-      }
-    } else if (source[at] === '"') string();
-    else {
-      const match = /^(?:true|false|null|-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(
-        source.slice(at),
-      );
-      if (!match) fail(`${label}: invalid JSON value`);
-      at += match[0].length;
-    }
-  }
-  value(0);
-  whitespace();
-  if (at !== source.length) fail(`${label}: trailing JSON`);
-  return JSON.parse(source);
-}
 function pin(bytes, declaration, max, label) {
   closed(declaration, ['bytes', 'sha256'], `${label} pin`);
   integer(declaration.bytes, 1, max, `${label} size`);
@@ -208,7 +148,20 @@ function htmlTree(source, label) {
     const match = /^<(\/)?([A-Za-z][A-Za-z0-9:-]*)/.exec(source.slice(at));
     if (!match) fail(`${label}: unsupported markup`);
     const tag = match[2].toLowerCase();
-    if (tag === 'iframe') fail(`${label}: unsupported embedded document`);
+    if (
+      [
+        'iframe',
+        'template',
+        'noscript',
+        'textarea',
+        'title',
+        'xmp',
+        'noembed',
+        'noframes',
+        'plaintext',
+      ].includes(tag)
+    )
+      fail(`${label}: unsupported inert/embedded container`);
     at += match[0].length;
     if (match[1]) {
       while (/\s/.test(source[at] ?? '') && at < source.length) at++;
@@ -558,12 +511,26 @@ function dummyProjection(capture, tree, atlas, n) {
 
 /** Pure source-pinned projector. Caller pins prove byte consistency, not BGA
  * authenticity or independent image review. Unknown sprites always block. */
-export function projectCapturedInitial(captureBytes, calibrationBytes, rawLogBytes, controlBytes) {
+export function projectCapturedInitial(
+  captureBytes,
+  calibrationBytes,
+  rawLogBytes,
+  controlBytes,
+  tableBytes = null,
+) {
   if (
-    [captureBytes, calibrationBytes, rawLogBytes, controlBytes].some(
-      (input) => !Buffer.isBuffer(input),
-    ) ||
-    captureBytes.length + calibrationBytes.length + rawLogBytes.length + controlBytes.length >
+    [
+      captureBytes,
+      calibrationBytes,
+      rawLogBytes,
+      controlBytes,
+      ...(tableBytes === null ? [] : [tableBytes]),
+    ].some((input) => !Buffer.isBuffer(input)) ||
+    captureBytes.length +
+      calibrationBytes.length +
+      rawLogBytes.length +
+      controlBytes.length +
+      (tableBytes?.length ?? 0) >
       32 * 1024 * 1024
   )
     fail('Projection input aggregate byte limit');
@@ -580,14 +547,20 @@ export function projectCapturedInitial(captureBytes, calibrationBytes, rawLogByt
       'turnOrderEvidence',
     ],
     'control',
+    ['table'],
   );
   if (control.schema !== CONTROL_SCHEMA) fail('Unsupported projection control');
   pin(captureBytes, control.capture, MAX_BYTES, 'capture');
   pin(calibrationBytes, control.calibration, MAX_ATLAS_BYTES, 'calibration');
   pin(rawLogBytes, control.rawLog, MAX_BYTES, 'raw log');
+  if (tableBytes !== null) pin(tableBytes, control.table, MAX_BYTES, 'table evidence');
+  else if (control.table !== undefined && control.table !== null)
+    fail('Missing declared table evidence');
   const capture = uniqueJson(captureBytes, MAX_BYTES, 'capture');
   const calibration = uniqueJson(calibrationBytes, MAX_ATLAS_BYTES, 'calibration');
   const raw = uniqueJson(rawLogBytes, MAX_BYTES, 'raw log');
+  const table = tableBytes === null ? null : uniqueJson(tableBytes, MAX_BYTES, 'table evidence');
+  const observedOptions = observedBasicUnlimitedOptions(raw, table);
   const mechanicalProfile = profile(control.mechanicalProfile);
   if (!CAPTURE_SCHEMAS.has(capture.schema)) fail('Unsupported Playing capture schema');
   const url = urlIdentity(capture.url);
@@ -601,7 +574,9 @@ export function projectCapturedInitial(captureBytes, calibrationBytes, rawLogByt
     fail('Capture archive identity mismatch');
   const match = /^Move #([1-9]\d*)$/.exec(capture.move ?? '');
   const actionId = integer(match ? Number(match[1]) : null, 1, 100000, 'capture move');
-  const game = normalizeGame(raw, sha(rawLogBytes));
+  const game = normalizeGame(raw, sha(rawLogBytes), tableBytes);
+  if (tableBytes !== null && game.source.adapter !== 'bga-public-ui-dom-v1')
+    fail('Legacy input requires embedded table settings, not separate table evidence');
   if (
     game.tableId !== String(capture.tableId) ||
     urlIdentity(game.source.reference).searchParams.get('table') !== game.tableId ||
@@ -904,17 +879,21 @@ export function projectCapturedInitial(captureBytes, calibrationBytes, rawLogByt
       captureSha256: sha(captureBytes),
       calibrationSha256: sha(calibrationBytes),
       rawLogSha256: sha(rawLogBytes),
+      tableEvidenceSha256: tableBytes === null ? null : sha(tableBytes),
       archiveRelease: release,
       initialActionId: actionId,
       playerCount: n,
       mechanicalProfile,
       turnOrder: structuredClone(control.turnOrderEvidence),
       sourceOptions: {
-        tribesAndProphecies: null,
-        additionalBuildings: null,
-        quickActions: null,
-        marketLimit: null,
+        tribes: observedOptions.tribes,
+        prophecies: observedOptions.prophecies,
+        additionalBuildings: observedOptions.additionalBuildings,
+        quickActions: observedOptions.quickActions,
+        marketLimit: observedOptions.marketLimit,
       },
+      observedOptions,
+      mode: observedOptions.mode,
       derivations: [
         'Basic setup declares covered corn below visible wood tiles.',
         'Feeding benefit is derived only from calibrated selected artwork.',
@@ -950,6 +929,7 @@ export function decodeProjectedInitial(
     calibrationBytes,
     rawLogBytes,
     controlBytes,
+    tableBytes,
   );
   const decoded = decodeConditionalPublicGame(
     rawLogBytes,
@@ -1014,6 +994,8 @@ export async function projectPlayingFiles(
     await file.close();
   }
   const control = uniqueJson(controlBytes, MAX_CONTROL_BYTES, 'control');
+  if (control.table !== undefined && control.table !== null)
+    fail('Separate table evidence requires the pinned byte API');
   if (
     !object(control.capture) ||
     !object(control.calibration) ||

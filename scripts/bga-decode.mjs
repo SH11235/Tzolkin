@@ -3,6 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeGame } from './bga-import.mjs';
+import { observedBasicUnlimitedOptions, uniqueJson } from './bga-observed-options.mjs';
 import {
   assertBasicUnlimitedOptions,
   coreDispatcher,
@@ -161,7 +162,15 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   positive(witnesses.initialActionId, 'initialActionId');
   if (!Array.isArray(witnesses.witnesses) || witnesses.witnesses.length > MAX_STEPS)
     fail('Invalid witness list');
-  const raw = JSON.parse(rawBytes);
+  const raw =
+    declaredProfile === null ? JSON.parse(rawBytes) : uniqueJson(rawBytes, MAX_BYTES, 'raw log');
+  const observedOptions =
+    declaredProfile === null
+      ? null
+      : observedBasicUnlimitedOptions(
+          raw,
+          tableBytes === null ? null : uniqueJson(tableBytes, MAX_BYTES, 'table evidence'),
+        );
   const game = normalizeGame(raw, sha(rawBytes), tableBytes);
   if (game.source.adapter !== 'bga-public-ui-dom-v1' && tableBytes !== null)
     fail('Legacy input requires embedded table settings, not separate table evidence');
@@ -1413,7 +1422,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         ? {}
         : {
             conditionalMechanicalProfile: copy(declaredProfile),
-            sourceOptionsObserved: false,
+            observedOptions: copy(observedOptions),
+            sourceOptionsObserved: observedOptions.evidence.length > 0,
+            sourceOptionsFullyObserved: observedOptions.complete,
             policyTrainingReady: false,
             valueTrainingReady: false,
           }),

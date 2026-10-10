@@ -393,6 +393,9 @@ test('detached HTML, unknown/wrong-release sprites, duplicate JSON and ambiguous
     duplicate[3].toString().replace('"seatOrder":', '"schema":"duplicate","seatOrder":'),
   );
   assert.throws(() => projectCapturedInitial(...duplicate), /duplicate JSON key/);
+  const inert = fixture(4);
+  inert.capture.gameAreaHtml += '<template><div class="worker worker_dummy"></div></template>';
+  assert.throws(() => projectCapturedInitial(...inputs(inert)), /unsupported inert/);
 });
 
 test('conditional decode reaches shared core path with warnings while ordinary decode still requires options', () => {
@@ -433,4 +436,68 @@ test('conditional decode reaches shared core path with warnings while ordinary d
       }),
     /Unsupported declared/,
   );
+
+  // These source settings must fail before any core dispatch, in both the pure
+  // producer and its direct conditional decoder entry point.
+  for (const setting of [
+    'ウシュマルコーンの制限\n20',
+    '部族\n有効',
+    '予言\n有効',
+    '追加建物\n有効',
+    'クイックアクション\n有効',
+  ]) {
+    const incompatible = fixture(4);
+    incompatible.raw.table_details_text = `ゲーム構成\n${setting}`;
+    const pinned = inputs(incompatible);
+    assert.throws(() => projectCapturedInitial(...pinned), /contradicts/);
+    assert.throws(
+      () =>
+        decodeConditionalPublicGame(
+          pinned[2],
+          { ...projected.witness, rawSha256: sha(pinned[2]) },
+          dispatch,
+          projected.provenance.mechanicalProfile,
+        ),
+      /contradicts/,
+    );
+  }
+  const limited = fixture(4);
+  limited.raw.context = { mode: 'Arena', marketOption: '20', extensionOptions: null };
+  assert.throws(() => projectCapturedInitial(...inputs(limited)), /contradicts/);
+  assert.equal(calls, 2);
+
+  const compatible = fixture(4);
+  compatible.raw.context = { mode: 'Arena', marketOption: 'Unlimited', extensionOptions: null };
+  const partial = projectCapturedInitial(...inputs(compatible));
+  assert.equal(partial.provenance.mode, 'arena');
+  assert.equal(partial.provenance.sourceOptions.marketLimit, 'unlimited');
+  assert.equal(partial.provenance.sourceOptions.tribes, null);
+  assert.equal(partial.provenance.observedOptions.complete, false);
+  compatible.raw.table_details_text = 'ゲーム構成\n部族\n無効';
+  const explicitlyDisabled = projectCapturedInitial(...inputs(compatible));
+  assert.equal(explicitlyDisabled.provenance.sourceOptions.tribes, false);
+  assert.equal(explicitlyDisabled.provenance.sourceOptions.prophecies, null);
+
+  // Supplied table text is inspected as well, never substituted for the context
+  // or embedded settings. Unsupported evidence cannot disappear in normalization.
+  const tableBytes = bytes({
+    schema: 'tzolkin-bga-public-table-ui-v1',
+    url: 'https://boardgamearena.com/table?table=123',
+    optionsText: '部族\n有効',
+  });
+  compatible.control.table = pin(tableBytes);
+  const tableInputs = inputs(compatible);
+  assert.throws(() => projectCapturedInitial(...tableInputs, tableBytes), /contradicts/);
+  assert.throws(
+    () =>
+      decodeConditionalPublicGame(
+        tableInputs[2],
+        { ...projected.witness, rawSha256: sha(tableInputs[2]) },
+        dispatch,
+        projected.provenance.mechanicalProfile,
+        tableBytes,
+      ),
+    /contradicts/,
+  );
+  assert.equal(calls, 2);
 });
