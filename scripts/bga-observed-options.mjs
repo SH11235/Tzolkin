@@ -12,7 +12,12 @@ const LABELS = [
   [/^(?:クイックアクション|Quick actions?)$/i, 'quickActions'],
 ];
 const LABEL_SUBSTRING = new RegExp(
-  LABELS.map(([pattern]) => pattern.source.slice(1, -1)).join('|'),
+  [
+    ...LABELS.map(([pattern]) => pattern.source.slice(1, -1)),
+    '拡張',
+    'expansion',
+    'extension',
+  ].join('|'),
   'i',
 );
 

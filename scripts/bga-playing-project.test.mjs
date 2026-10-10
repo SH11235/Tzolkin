@@ -547,6 +547,9 @@ test('conditional decode reaches shared core path with warnings while ordinary d
     'ウシュマルコーンの制限\n20',
     '部族: 有効',
     'Tribes enabled',
+    '拡張 有効',
+    'Expansion enabled',
+    'Extension enabled',
   ]) {
     const prefixed = fixture(4);
     prefixed.raw.table_details_text =
@@ -569,23 +572,31 @@ test('conditional decode reaches shared core path with warnings while ordinary d
     );
   }
   const detail = fixture(4);
-  detail.raw.table_details_text =
-    'ゲーム構成\nゲームモード\nアリーナモード\nアリーナモード: Tribes enabled\nウシュマルコーンの制限\n制限なし';
-  const detailInputs = inputs(detail);
-  assert.throws(
-    () => projectCapturedInitial(...detailInputs),
-    /mode detail contains option evidence/,
-  );
-  assert.throws(
-    () =>
-      decodeConditionalPublicGame(
-        detailInputs[2],
-        { ...projected.witness, rawSha256: sha(detailInputs[2]) },
-        dispatch,
-        projected.provenance.mechanicalProfile,
-      ),
-    /mode detail contains option evidence/,
-  );
+  for (const skippedDetail of [
+    'Tribes enabled',
+    '拡張 有効',
+    'Expansion enabled',
+    'Extension enabled',
+  ]) {
+    detail.raw.table_details_text =
+      `ゲーム構成\nゲームモード\nアリーナモード\nアリーナモード: ${skippedDetail}\n` +
+      'ウシュマルコーンの制限\n制限なし';
+    const detailInputs = inputs(detail);
+    assert.throws(
+      () => projectCapturedInitial(...detailInputs),
+      /mode detail contains option evidence/,
+    );
+    assert.throws(
+      () =>
+        decodeConditionalPublicGame(
+          detailInputs[2],
+          { ...projected.witness, rawSha256: sha(detailInputs[2]) },
+          dispatch,
+          projected.provenance.mechanicalProfile,
+        ),
+      /mode detail contains option evidence/,
+    );
+  }
   assert.equal(calls, 2);
 
   const compatible = fixture(4);
