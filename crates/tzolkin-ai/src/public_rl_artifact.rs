@@ -271,6 +271,14 @@ mod tests {
         (bc, source, train, non_test)
     }
     #[test]
+    fn checkpoint_resume_numeric_boundary() {
+        let (bc, source, train, non_test) = parts();
+        let artifact = initialize(&bc, source, &train, &non_test).unwrap();
+        crate::public_rl_session::tests::roundtrip(|| InitializedPublicRlPolicy {
+            artifact: artifact.clone(),
+        });
+    }
+    #[test]
     fn initialization_copies_bits_and_keeps_distinct_identity() {
         let (bc, source, train, non_test) = parts();
         let artifact = initialize(&bc, source.clone(), &train, &non_test).unwrap();

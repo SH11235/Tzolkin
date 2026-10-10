@@ -7,7 +7,7 @@
 //! Checksums bind consistency, not producer/time/independent-origin proof.
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::dataset::{DatasetSplit, split_for_family};
 use crate::features::PUBLIC_FEATURE_SCHEMA;
@@ -35,7 +35,7 @@ pub const REPEATED_COHORT_CONTRACT: &str = "four-train-games-all-seat-rl-repeat-
 pub const REPEATED_SAMPLING_VERSION: &str = "public-stochastic-rl-repeat-uniform-tick53-v1";
 const MAX_FAMILIES: usize = crate::policy_dataset::MAX_FILES + 4 * MAX_UPDATE_COUNT as usize;
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum ParentKind {
     Count1,
@@ -88,13 +88,13 @@ impl RlUpdateParent<'_> {
             Self::Repeated(policy) => policy.model(),
         }
     }
-    fn root_init_checksum(&self) -> &str {
+    pub(crate) fn root_init_checksum(&self) -> &str {
         match self {
             Self::Count1(policy) => policy.artifact().report().parent_init_checksum(),
             Self::Repeated(policy) => &policy.artifact.report.root_init_checksum,
         }
     }
-    fn bc_source(&self) -> &SeatPolicy {
+    pub(crate) fn bc_source(&self) -> &SeatPolicy {
         match self {
             Self::Count1(policy) => policy.artifact().report().bc_source(),
             Self::Repeated(policy) => &policy.artifact.report.bc_source,
@@ -158,8 +158,8 @@ fn contract() -> Contract {
         max_update_count: MAX_UPDATE_COUNT,
     }
 }
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ParentIdentity {
     kind: ParentKind,
     artifact_checksum: String,
@@ -188,6 +188,9 @@ pub struct RepeatedStepReport {
     checksum: String,
 }
 impl RepeatedStepReport {
+    pub(crate) fn checkpoint_plan_checksum(&self) -> &str {
+        &self.cohort_plan_checksum
+    }
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
@@ -269,7 +272,8 @@ impl RepeatedPublicRlPolicy {
         &self.artifact.model
     }
     /// For a future typed repeated handle, not raw-content qualification or
-    /// producer authentication. The current producer is the only owner factory.
+    /// producer authentication. The dedicated pinned-checkpoint session can
+    /// restore the same content without replaying the optimization history.
     pub(crate) fn validate_for_handle(&self) -> Result<(), String> {
         let artifact = &self.artifact;
         let report = &artifact.report;
@@ -303,6 +307,95 @@ impl RepeatedPublicRlPolicy {
         }
         Ok(())
     }
+}
+pub(crate) fn restore_checkpoint_owner(
+    value: serde_json::Value,
+) -> Result<RepeatedPublicRlPolicy, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Report {
+        contract: serde_json::Value,
+        parent: ParentIdentity,
+        attempted_update_count: u64,
+        root_init_checksum: String,
+        bc_source: SeatPolicy,
+        cohort_contract: String,
+        sampling_version: String,
+        cohort_plan_checksum: String,
+        cohort_receipt_checksum: String,
+        episode_checksums: [String; 4],
+        config: serde_json::Value,
+        counts: [usize; 3],
+        deltas: Deltas,
+        numeric: NumericReport,
+        family_closure: Vec<String>,
+        checksum: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Artifact {
+        update_count: u64,
+        report: Report,
+        model: PublicPolicyModel,
+        checksum: String,
+    }
+    let decoded: Artifact = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let r = decoded.report;
+    let source = r.parent.kind.source_contracts();
+    if r.contract != serde_json::to_value(contract()).map_err(|e| e.to_string())?
+        || r.cohort_contract != source.0
+        || r.sampling_version != source.1
+    {
+        return Err("Checkpoint repeated contract mismatch".into());
+    }
+    let config = OneStepConfig::from_checkpoint(r.config)?;
+    crate::public_policy_update::validate_checkpoint_report(
+        &r.counts,
+        &r.deltas,
+        &r.numeric,
+        &config,
+        (
+            [
+                &r.root_init_checksum,
+                &r.cohort_plan_checksum,
+                &r.cohort_receipt_checksum,
+                &r.checksum,
+            ],
+            &r.episode_checksums,
+        ),
+        &r.family_closure,
+        &r.bc_source,
+    )?;
+    let owner = RepeatedPublicRlPolicy {
+        artifact: RepeatedPublicRlArtifact {
+            update_count: decoded.update_count,
+            report: RepeatedStepReport {
+                contract: contract(),
+                parent: r.parent,
+                attempted_update_count: r.attempted_update_count,
+                root_init_checksum: r.root_init_checksum,
+                bc_source: r.bc_source,
+                cohort_contract: source.0,
+                sampling_version: source.1,
+                cohort_plan_checksum: r.cohort_plan_checksum,
+                cohort_receipt_checksum: r.cohort_receipt_checksum,
+                episode_checksums: r.episode_checksums,
+                config,
+                counts: r.counts,
+                deltas: r.deltas,
+                numeric: r.numeric,
+                family_closure: r.family_closure,
+                checksum: r.checksum,
+            },
+            model: decoded.model,
+            checksum: decoded.checksum,
+        },
+    };
+    owner.validate_for_handle()?;
+    if serde_json::to_value(owner.artifact()).map_err(|e| e.to_string())? != value {
+        return Err("Noncanonical checkpoint repeated fields".into());
+    }
+    Ok(owner)
 }
 pub enum RepeatedStepOutcome {
     Updated(RepeatedPublicRlPolicy),
@@ -460,6 +553,56 @@ fn digest_id(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+#[cfg(test)]
+pub(crate) fn checkpoint_test_owner(
+    parent: RlUpdateParent<'_>,
+    plan: &str,
+    families: Vec<String>,
+    counts: [usize; 3],
+    config: &OneStepConfig,
+) -> RepeatedPublicRlPolicy {
+    // Private format/numeric fixture. No rollout, likelihood or forward occurs.
+    let mut gradient = vec![0.0; PARAMETER_COUNT];
+    gradient[2] = -3.0;
+    let proposal = propose_parameters(parent.model().parameters(), &gradient, config).unwrap();
+    let source = parent.kind().source_contracts();
+    let count = next_count(parent.update_count()).unwrap();
+    let mut report = RepeatedStepReport {
+        contract: contract(),
+        parent: ParentIdentity {
+            kind: parent.kind(),
+            artifact_checksum: parent.checksum().into(),
+            update_count: parent.update_count(),
+        },
+        attempted_update_count: count,
+        root_init_checksum: parent.root_init_checksum().into(),
+        bc_source: parent.bc_source().clone(),
+        cohort_contract: source.0,
+        sampling_version: source.1,
+        cohort_plan_checksum: plan.into(),
+        cohort_receipt_checksum: "b".repeat(64),
+        episode_checksums: std::array::from_fn(|i| format!("{:064x}", i + 1)),
+        config: *config,
+        counts,
+        deltas: Deltas::default(),
+        numeric: proposal.numeric,
+        family_closure: families,
+        checksum: String::new(),
+    };
+    report.checksum = report.expected_checksum().unwrap();
+    let model = PublicPolicyModel {
+        parameters: proposal.parameters,
+    };
+    let checksum = artifact_checksum(count, &report, &model).unwrap();
+    RepeatedPublicRlPolicy {
+        artifact: RepeatedPublicRlArtifact {
+            update_count: count,
+            report,
+            model,
+            checksum,
+        },
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

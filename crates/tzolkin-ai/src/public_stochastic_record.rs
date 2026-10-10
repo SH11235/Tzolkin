@@ -557,19 +557,25 @@ impl<'de> Deserialize<'de> for UniqueValue {
 fn decode_record(bytes: &[u8]) -> Result<Record, String> {
     decode_typed_record(bytes)
 }
+pub(crate) fn unique_json(bytes: &[u8], max_bytes: usize) -> Result<serde_json::Value, String> {
+    if bytes.is_empty() || bytes.len() > max_bytes {
+        return Err("JSON byte bound".into());
+    }
+    let raw: UniqueValue = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    Ok(raw.0)
+}
 pub(crate) fn decode_typed_record<P: serde::de::DeserializeOwned + Serialize>(
     bytes: &[u8],
 ) -> Result<Record<P>, String> {
     if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
         return Err("Stochastic record byte bound".into());
     }
-    let raw: UniqueValue = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let raw = unique_json(bytes, MAX_RECORD_BYTES)?;
     // Extending the private DTO must not broaden any old source's closed shape,
     // including explicit null/false forms that serde could otherwise omit.
-    if raw.0.get("schema").and_then(serde_json::Value::as_str)
+    if raw.get("schema").and_then(serde_json::Value::as_str)
         != Some(crate::public_mixed_native::RECORD_SCHEMA)
         && raw
-            .0
             .get("callbacks")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|callbacks| {
@@ -581,7 +587,7 @@ pub(crate) fn decode_typed_record<P: serde::de::DeserializeOwned + Serialize>(
         return Err("Opponent fields are forbidden in an all-seat stochastic schema".into());
     }
     let record: Record<P> = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if raw.0 != serde_json::to_value(&record).map_err(|e| e.to_string())? {
+    if raw != serde_json::to_value(&record).map_err(|e| e.to_string())? {
         return Err("Nested unknown, omitted nullable, or noncanonical wire fields".into());
     }
     validate_wire(&record)?;
