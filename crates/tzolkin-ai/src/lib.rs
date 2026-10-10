@@ -14,6 +14,7 @@ pub mod public_model;
 pub mod public_native;
 pub mod public_policy_episode;
 pub mod public_policy_likelihood;
+pub mod public_policy_pullback;
 pub mod public_state_critic;
 pub mod public_stochastic;
 pub mod public_stochastic_native;
