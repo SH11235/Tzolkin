@@ -727,14 +727,17 @@ pub(crate) struct RlSamplingPolicy {
 }
 impl RlSamplingPolicy {
     pub(crate) fn from_handle(policy: &UpdatedPublicRlHandle<'_>) -> Result<Self, String> {
-        if policy.backend() != "scalar" || policy.update_count() != 1 {
+        if policy.backend() != "scalar"
+            || policy.update_count() != 1
+            || policy.task() != crate::public_policy_update::TASK
+        {
             return Err("RL sampling requires a sealed Scalar count1 handle".into());
         }
         Ok(Self {
             policy_version: crate::public_rl_native::POLICY_VERSION.into(),
             artifact_checksum: policy.artifact_checksum().into(),
             update_count: policy.update_count(),
-            task: "policyOnlyRlOneStep".into(),
+            task: policy.task().into(),
             model_version: crate::public_model::MODEL_VERSION.into(),
             input_contract: crate::public_model::INPUT_CONTRACT.into(),
             feature_schema: PUBLIC_FEATURE_SCHEMA,
@@ -742,7 +745,13 @@ impl RlSamplingPolicy {
             numerical_target: crate::public_stochastic_native::numerical_target(),
         })
     }
-    fn binding_key(&self) -> Result<String, String> {
+    pub(crate) fn artifact_checksum(&self) -> &str {
+        &self.artifact_checksum
+    }
+    pub(crate) fn update_count(&self) -> u64 {
+        self.update_count
+    }
+    pub(crate) fn binding_key(&self) -> Result<String, String> {
         let mut hash = Sha256::new();
         hash.update(b"tzolkin-public-stochastic-rl-count1-policy-v1\0");
         hash.update(serde_json::to_vec(self).map_err(|e| e.to_string())?);
@@ -752,6 +761,8 @@ impl RlSamplingPolicy {
 
 /// Fresh actor-local streams borrowing only an immutable, sealed RL handle.
 /// CDF/RNG/caps match BC; identity and Decision version remain distinctly RL.
+/// Standalone sampling does not enforce Train/family exclusion. Those checks
+/// belong to the native collector/auditor, before world creation or NN use.
 pub struct RlStochasticSession<'handle, 'model> {
     policy: &'handle UpdatedPublicRlHandle<'model>,
     policy_binding_key: String,

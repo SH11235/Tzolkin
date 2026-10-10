@@ -26,6 +26,7 @@ use crate::public_stochastic_native::numerical_target;
 use crate::replay::{RULES_BASELINE, RULES_VERSION, SeatPolicy, catalog_hash};
 
 pub const UPDATE_VERSION: &str = "public-fixed-old-one-ascent-f64-to-f32-v1";
+pub(crate) const TASK: &str = "policyOnlyRlOneStep";
 pub const NORMALIZER_VERSION: &str = "member-actor-own-sum-four-game-half-3p-4p-v1";
 // Measured same-target tripwire, not a universal exp/ln error bound.
 pub const MAX_ALL_LOG_DELTA: f64 = 0.01;
@@ -107,7 +108,7 @@ struct Contract {
 fn contract() -> Contract {
     Contract {
         schema: "tzolkin-public-rl-one-step-v1",
-        task: "policyOnlyRlOneStep",
+        task: TASK,
         update_version: UPDATE_VERSION,
         normalizer_version: NORMALIZER_VERSION,
         likelihood_version: LIKELIHOOD_VERSION,
@@ -239,6 +240,9 @@ impl UpdatedPublicRlArtifact {
     }
     pub fn update_count(&self) -> u64 {
         self.update_count
+    }
+    pub(crate) fn task(&self) -> &str {
+        self.report.contract.task
     }
 }
 /// The only creation route executes the sealed old-policy update below.
