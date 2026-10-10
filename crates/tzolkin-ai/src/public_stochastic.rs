@@ -27,9 +27,11 @@ use crate::public_model::{
     MAX_OBSERVATION_BYTES, POLICY_VERSION, PublicPolicyDistribution, ValueValidity,
 };
 use crate::public_native::PublicPolicyHandle;
+use crate::public_rl_native::{PublicRlPolicyDistribution, UpdatedPublicRlHandle};
 use crate::replay::SeatPolicy;
 
 pub const SAMPLING_VERSION: &str = "public-stochastic-bc-uniform-tick53-v1";
+pub const RL_SAMPLING_VERSION: &str = "public-stochastic-rl-count1-uniform-tick53-v1";
 pub const RNG_VERSION: &str = "splitmix64-actor-domain-sha256-v1";
 pub const DENOMINATOR_BITS: u32 = 53;
 pub const TICKS: u64 = 1_u64 << DENOMINATOR_BITS;
@@ -115,6 +117,7 @@ impl SamplingStreamIdentity {
 /// let _: SamplingTrace = serde_json::from_str("{}").unwrap();
 /// ```
 pub struct SamplingTrace {
+    sampling_version: &'static str,
     identity: SamplingStreamIdentity,
     policy_binding_key: String,
     sample_index: usize,
@@ -212,7 +215,7 @@ impl SamplingTrace {
         "scalar"
     }
     pub fn sampling_version(&self) -> &'static str {
-        SAMPLING_VERSION
+        self.sampling_version
     }
     pub fn rng_version(&self) -> &'static str {
         RNG_VERSION
@@ -276,6 +279,57 @@ fn next_splitmix(state: u64) -> (u64, u64) {
     z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
     (after, z ^ (z >> 31))
 }
+#[derive(Clone, Copy)]
+enum SamplingPolicyKind {
+    Bc,
+    Rl,
+}
+impl SamplingPolicyKind {
+    fn sampling_version(self) -> &'static str {
+        match self {
+            Self::Bc => SAMPLING_VERSION,
+            Self::Rl => RL_SAMPLING_VERSION,
+        }
+    }
+}
+// Only sealed BC/RL wrappers can produce these inputs outside private tests.
+// No arbitrary-logit prediction provider is exposed.
+enum SamplingPrediction {
+    Bc(PublicPolicyDistribution),
+    Rl(PublicRlPolicyDistribution),
+}
+impl SamplingPrediction {
+    fn compatible(&self, kind: SamplingPolicyKind) -> bool {
+        match (self, kind) {
+            (Self::Bc(p), SamplingPolicyKind::Bc) => {
+                p.policy_version == POLICY_VERSION
+                    && p.feature_schema == PUBLIC_FEATURE_SCHEMA
+                    && p.value_validity == ValueValidity::UnavailablePolicyOnly
+            }
+            (Self::Rl(p), SamplingPolicyKind::Rl) => {
+                p.policy_version() == crate::public_rl_native::POLICY_VERSION
+                    && p.feature_schema() == PUBLIC_FEATURE_SCHEMA
+                    && p.value_validity() == ValueValidity::UnavailablePolicyOnly
+                    && p.update_count() == 1
+                    && p.backend() == "scalar"
+            }
+            _ => false,
+        }
+    }
+    fn logits(&self) -> &[f32] {
+        match self {
+            Self::Bc(p) => &p.logits,
+            Self::Rl(p) => p.logits(),
+        }
+    }
+    fn probability_count(&self) -> usize {
+        match self {
+            Self::Bc(p) => p.probabilities.len(),
+            Self::Rl(p) => p.probabilities().len(),
+        }
+    }
+}
+
 struct SessionState {
     identity: SamplingStreamIdentity,
     streams: [ActorStream; 4],
@@ -363,7 +417,21 @@ impl SessionState {
         observation: &Observation,
         predict: impl FnOnce(&Observation) -> Result<PublicPolicyDistribution, String>,
     ) -> Result<SampledDecision, String> {
-        let result = self.sample_inner(policy_binding_key, observation, predict);
+        self.sample_with_kind(
+            policy_binding_key,
+            SamplingPolicyKind::Bc,
+            observation,
+            |o| predict(o).map(SamplingPrediction::Bc),
+        )
+    }
+    fn sample_with_kind(
+        &mut self,
+        policy_binding_key: &str,
+        kind: SamplingPolicyKind,
+        observation: &Observation,
+        predict: impl FnOnce(&Observation) -> Result<SamplingPrediction, String>,
+    ) -> Result<SampledDecision, String> {
+        let result = self.sample_inner(policy_binding_key, kind, observation, predict);
         if result.is_err() {
             self.stopped = true;
         }
@@ -372,8 +440,9 @@ impl SessionState {
     fn sample_inner(
         &mut self,
         policy_binding_key: &str,
+        kind: SamplingPolicyKind,
         observation: &Observation,
-        predict: impl FnOnce(&Observation) -> Result<PublicPolicyDistribution, String>,
+        predict: impl FnOnce(&Observation) -> Result<SamplingPrediction, String>,
     ) -> Result<SampledDecision, String> {
         let before_rows = self.reserve(
             observation.actor,
@@ -381,35 +450,34 @@ impl SessionState {
             observation.legal_actions.len(),
         )?;
         let prediction = predict(observation)?;
-        if prediction.policy_version != POLICY_VERSION
-            || prediction.feature_schema != PUBLIC_FEATURE_SCHEMA
-            || prediction.value_validity != ValueValidity::UnavailablePolicyOnly
-            || prediction.logits.len() != observation.legal_actions.len()
-            || prediction.probabilities.len() != prediction.logits.len()
+        if !prediction.compatible(kind)
+            || prediction.logits().len() != observation.legal_actions.len()
+            || prediction.probability_count() != prediction.logits().len()
         {
             return Err("Unsupported stochastic policy distribution contract".into());
         }
-        let ticks = TickDistribution::new(&prediction.logits)?;
+        let ticks = TickDistribution::new(prediction.logits())?;
         let ordered_legal_digest = legal_digest(&observation.legal_actions)?;
-        let logits_digest = full_logits_digest(&prediction.logits);
+        let logits_digest = full_logits_digest(prediction.logits());
         let distribution_digest = ticks.digest();
         let sample_index = self.accepted;
         let draw = self.choose(observation.actor, &ticks)?;
         let legal = observation.legal_actions[draw.index].clone();
-        let chosen_logit = prediction.logits[draw.index];
+        let chosen_logit = prediction.logits()[draw.index];
         let decision = Decision {
             actor: observation.actor,
             observation_key: observation.observation_key.clone(),
-            policy_version: SAMPLING_VERSION.into(),
+            policy_version: kind.sampling_version().into(),
             r#move: legal.r#move.clone(),
             score: f64::from(chosen_logit),
         };
         let trace = SamplingTrace {
+            sampling_version: kind.sampling_version(),
             identity: self.identity,
             policy_binding_key: policy_binding_key.into(),
             sample_index,
             actor: observation.actor,
-            legal_count: prediction.logits.len(),
+            legal_count: prediction.logits().len(),
             chosen_index: draw.index,
             state_before: draw.state_before,
             state_after: draw.state_after,
@@ -639,6 +707,80 @@ impl<'handle, 'model> StochasticSession<'handle, 'model> {
             .sample_with(&self.policy_binding_key, observation, |o| {
                 self.policy.distribution(o)
             })
+    }
+}
+
+/// Logical identity only: no path, BC resealing or raw artifact ownership.
+/// Strict record decoding uses this DTO internally; it cannot construct a handle.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RlSamplingPolicy {
+    policy_version: String,
+    artifact_checksum: String,
+    update_count: u64,
+    task: String,
+    model_version: String,
+    input_contract: String,
+    feature_schema: u32,
+    backend: String,
+    numerical_target: String,
+}
+impl RlSamplingPolicy {
+    pub(crate) fn from_handle(policy: &UpdatedPublicRlHandle<'_>) -> Result<Self, String> {
+        if policy.backend() != "scalar" || policy.update_count() != 1 {
+            return Err("RL sampling requires a sealed Scalar count1 handle".into());
+        }
+        Ok(Self {
+            policy_version: crate::public_rl_native::POLICY_VERSION.into(),
+            artifact_checksum: policy.artifact_checksum().into(),
+            update_count: policy.update_count(),
+            task: "policyOnlyRlOneStep".into(),
+            model_version: crate::public_model::MODEL_VERSION.into(),
+            input_contract: crate::public_model::INPUT_CONTRACT.into(),
+            feature_schema: PUBLIC_FEATURE_SCHEMA,
+            backend: policy.backend().into(),
+            numerical_target: crate::public_stochastic_native::numerical_target(),
+        })
+    }
+    fn binding_key(&self) -> Result<String, String> {
+        let mut hash = Sha256::new();
+        hash.update(b"tzolkin-public-stochastic-rl-count1-policy-v1\0");
+        hash.update(serde_json::to_vec(self).map_err(|e| e.to_string())?);
+        Ok(format!("{:x}", hash.finalize()))
+    }
+}
+
+/// Fresh actor-local streams borrowing only an immutable, sealed RL handle.
+/// CDF/RNG/caps match BC; identity and Decision version remain distinctly RL.
+pub struct RlStochasticSession<'handle, 'model> {
+    policy: &'handle UpdatedPublicRlHandle<'model>,
+    policy_binding_key: String,
+    state: SessionState,
+}
+impl<'handle, 'model> RlStochasticSession<'handle, 'model> {
+    pub fn new(
+        policy: &'handle UpdatedPublicRlHandle<'model>,
+        identity: SamplingStreamIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            policy_binding_key: RlSamplingPolicy::from_handle(policy)?.binding_key()?,
+            state: SessionState::new(identity)?,
+        })
+    }
+    pub fn counters(&self) -> SamplingCounters {
+        self.state.counters()
+    }
+    pub fn stop(&mut self) {
+        self.state.stopped = true;
+    }
+    pub fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
+        self.state.sample_with_kind(
+            &self.policy_binding_key,
+            SamplingPolicyKind::Rl,
+            observation,
+            |o| self.policy.distribution(o).map(SamplingPrediction::Rl),
+        )
     }
 }
 

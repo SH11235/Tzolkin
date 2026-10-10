@@ -8,10 +8,14 @@
 use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, observe};
 use tzolkin_core::{GameMove, GameOptions, GameState, Phase, apply_move, create_game_with_options};
 
+use serde::Serialize;
+
 use crate::dataset::seed_family_id;
 use crate::public_native::PublicPolicyHandle;
+use crate::public_rl_native::UpdatedPublicRlHandle;
 use crate::public_stochastic::{
-    MAX_RESERVED_CANDIDATE_ROWS, MAX_SAMPLES, RNG_VERSION, SAMPLING_VERSION,
+    MAX_RESERVED_CANDIDATE_ROWS, MAX_SAMPLES, RL_SAMPLING_VERSION, RNG_VERSION,
+    RlStochasticSession, SAMPLING_VERSION, SampledDecision, SamplingCounters,
     SamplingStreamIdentity, StochasticSession, UNIFORM_MIXTURE,
 };
 use crate::public_stochastic_record::{
@@ -266,6 +270,55 @@ pub fn collect_native(
     run(config, policy, None).map(|record| CollectedStochasticGame { record })
 }
 
+/// Closed internal dispatch: both variants borrow an already sealed handle.
+/// Caller-supplied prediction providers or raw models are never accepted.
+#[derive(Clone, Copy)]
+pub(crate) enum NativePolicy<'handle, 'model> {
+    Bc(&'handle PublicPolicyHandle<'model>),
+    Rl(&'handle UpdatedPublicRlHandle<'model>),
+}
+impl<'handle, 'model> NativePolicy<'handle, 'model> {
+    fn session(
+        self,
+        identity: SamplingStreamIdentity,
+    ) -> Result<NativeSession<'handle, 'model>, String> {
+        match self {
+            Self::Bc(policy) => StochasticSession::new(policy, identity).map(NativeSession::Bc),
+            Self::Rl(policy) => RlStochasticSession::new(policy, identity).map(NativeSession::Rl),
+        }
+    }
+    fn sampling_version(self) -> &'static str {
+        match self {
+            Self::Bc(_) => SAMPLING_VERSION,
+            Self::Rl(_) => RL_SAMPLING_VERSION,
+        }
+    }
+}
+enum NativeSession<'handle, 'model> {
+    Bc(StochasticSession<'handle, 'model>),
+    Rl(RlStochasticSession<'handle, 'model>),
+}
+impl NativeSession<'_, '_> {
+    fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
+        match self {
+            Self::Bc(session) => session.sample(observation),
+            Self::Rl(session) => session.sample(observation),
+        }
+    }
+    fn counters(&self) -> SamplingCounters {
+        match self {
+            Self::Bc(session) => session.counters(),
+            Self::Rl(session) => session.counters(),
+        }
+    }
+    fn stop(&mut self) {
+        match self {
+            Self::Bc(session) => session.stop(),
+            Self::Rl(session) => session.stop(),
+        }
+    }
+}
+
 fn blank_counts() -> Counts {
     Counts {
         observed_callbacks: 0,
@@ -279,8 +332,8 @@ fn blank_counts() -> Counts {
         session_stopped: false,
     }
 }
-fn fail(
-    record: &mut Record,
+fn fail<P>(
+    record: &mut Record<P>,
     reason: FailureReason,
     stage: AttemptStage,
     index: Option<usize>,
@@ -295,8 +348,8 @@ fn fail(
     record.failure = Some(failure);
     record.terminal = None;
 }
-fn precheck(
-    expected: Option<&Record>,
+fn precheck<P>(
+    expected: Option<&Record<P>>,
     index: usize,
     observation: &Observation,
     state_before: &str,
@@ -340,7 +393,11 @@ fn precheck(
     }
     Ok(())
 }
-fn check_callback(expected: Option<&Record>, record: &Record, index: usize) -> Result<(), String> {
+fn check_callback<P>(
+    expected: Option<&Record<P>>,
+    record: &Record<P>,
+    index: usize,
+) -> Result<(), String> {
     if let Some(expected) = expected
         && expected.callbacks.get(index) != record.callbacks.get(index)
     {
@@ -377,16 +434,43 @@ fn run_with_apply(
     config: &NativeStochasticConfig,
     policy: &PublicPolicyHandle<'_>,
     expected: Option<&Record>,
-    mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
+    apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
 ) -> Result<Record, String> {
-    let header = header(config, policy)?;
+    run_shared_with_apply(
+        config,
+        NativePolicy::Bc(policy),
+        RECORD_SCHEMA,
+        header(config, policy)?,
+        expected,
+        apply,
+    )
+}
+
+/// Generic only over a private wire identity. Sampling dispatch stays closed.
+pub(crate) fn run_shared<P: Serialize + PartialEq>(
+    config: &NativeStochasticConfig,
+    policy: NativePolicy<'_, '_>,
+    schema: &str,
+    header: Header<P>,
+    expected: Option<&Record<P>>,
+) -> Result<Record<P>, String> {
+    run_shared_with_apply(config, policy, schema, header, expected, apply_move)
+}
+fn run_shared_with_apply<P: Serialize + PartialEq>(
+    config: &NativeStochasticConfig,
+    policy: NativePolicy<'_, '_>,
+    schema: &str,
+    header: Header<P>,
+    expected: Option<&Record<P>>,
+    mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
+) -> Result<Record<P>, String> {
     if let Some(expected) = expected
         && expected.header != header
     {
         return Err("Stochastic record header/content binding mismatch".into());
     }
     let mut record = Record {
-        schema: RECORD_SCHEMA.into(),
+        schema: schema.into(),
         header,
         callbacks: vec![],
         terminal: None,
@@ -403,7 +487,7 @@ fn run_with_apply(
     if record.source_payload_reserved_bytes > config.limits.source_bytes {
         return Err("Header and final diagnostic reservation exceed source cap".into());
     }
-    let mut session = StochasticSession::new(policy, config.sampling_identity)?;
+    let mut session = policy.session(config.sampling_identity)?;
     let start = create_game_with_options(
         (0..config.players)
             .map(|p| format!("Stochastic P{p}"))
@@ -579,7 +663,7 @@ fn run_with_apply(
         let d = sample.decision();
         if d.actor != observation.actor
             || d.observation_key != observation.observation_key
-            || d.policy_version != SAMPLING_VERSION
+            || d.policy_version != policy.sampling_version()
             || !d.score.is_finite()
             || observation
                 .legal_actions
@@ -693,18 +777,18 @@ fn run_with_apply(
     finish_counts(&mut record, &session);
     finish(record, config, expected)
 }
-fn finish_counts(record: &mut Record, session: &StochasticSession<'_, '_>) {
+fn finish_counts<P>(record: &mut Record<P>, session: &NativeSession<'_, '_>) {
     let counters = session.counters();
     record.counts.accepted_samples = counters.accepted_samples();
     record.counts.candidate_rows_reserved = counters.reserved_candidate_rows();
     record.counts.actor_draws = counters.actor_draws().iter().copied().map(hex64).collect();
     record.counts.session_stopped = counters.stopped();
 }
-fn finish(
-    record: Record,
+fn finish<P: Serialize + PartialEq>(
+    record: Record<P>,
     config: &NativeStochasticConfig,
-    expected: Option<&Record>,
-) -> Result<Record, String> {
+    expected: Option<&Record<P>>,
+) -> Result<Record<P>, String> {
     // Verify actual serialization stays within the conservative reservations.
     // This is a late invariant, not a license to perform work before admission.
     let traces = record

@@ -31,9 +31,9 @@ pub(crate) const TRACE_RESERVE: usize = 4 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Record {
+pub(crate) struct Record<P = SeatPolicy> {
     pub schema: String,
-    pub header: Header,
+    pub header: Header<P>,
     pub callbacks: Vec<Callback>,
     pub terminal: Option<Terminal>,
     pub failure: Option<Failure>,
@@ -45,7 +45,7 @@ pub(crate) struct Record {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Header {
+pub(crate) struct Header<P = SeatPolicy> {
     pub source_kind: String,
     pub rules_version: u32,
     pub rules_baseline: String,
@@ -53,7 +53,7 @@ pub(crate) struct Header {
     pub observation_schema: u32,
     pub move_schema: u32,
     pub config: Config,
-    pub base_policy: SeatPolicy,
+    pub base_policy: P,
     pub sampling_version: String,
     pub rng_version: String,
     pub denominator_bits: u32,
@@ -355,7 +355,7 @@ fn sha_digest(value: &str) -> Result<(), String> {
 /// Validate representation before any reconstruction/model work. Existing
 /// FNV fingerprints are sixteen hex digits; SHA digests are sixty-four.
 /// These shape checks neither authenticate a source nor validate likelihood.
-fn validate_wire(record: &Record) -> Result<(), String> {
+fn validate_wire<P>(record: &Record<P>) -> Result<(), String> {
     let header = &record.header;
     parse_hex64(&header.catalog_hash)?;
     finite64(&header.uniform_mixture_bits)?;
@@ -507,11 +507,16 @@ impl<'de> Deserialize<'de> for UniqueValue {
 }
 
 fn decode_record(bytes: &[u8]) -> Result<Record, String> {
+    decode_typed_record(bytes)
+}
+pub(crate) fn decode_typed_record<P: serde::de::DeserializeOwned + Serialize>(
+    bytes: &[u8],
+) -> Result<Record<P>, String> {
     if bytes.is_empty() || bytes.len() > MAX_RECORD_BYTES {
         return Err("Stochastic record byte bound".into());
     }
     let raw: UniqueValue = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    let record: Record = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let record: Record<P> = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if raw.0 != serde_json::to_value(&record).map_err(|e| e.to_string())? {
         return Err("Nested unknown, omitted nullable, or noncanonical wire fields".into());
     }
@@ -585,7 +590,9 @@ pub(crate) fn serialized_size<T: Serialize>(value: &T, max: usize) -> Result<usi
 
 /// Encode only a collected sealed record. No filesystem publication occurs here.
 pub fn encode_record(game: &CollectedStochasticGame) -> Result<Vec<u8>, String> {
-    let record = game.record();
+    encode_typed_record(game.record())
+}
+pub(crate) fn encode_typed_record<P: Serialize>(record: &Record<P>) -> Result<Vec<u8>, String> {
     validate_wire(record)?;
     serialized_size(record, MAX_RECORD_BYTES)?;
     let bytes = serde_json::to_vec(record).map_err(|e| e.to_string())?;
