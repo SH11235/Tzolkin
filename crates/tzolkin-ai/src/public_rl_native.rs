@@ -78,6 +78,9 @@ impl<'a> UpdatedPublicRlHandle<'a> {
     pub fn backend(&self) -> &'static str {
         self.kernel.backend()
     }
+    pub(crate) fn family_closure(&self) -> &[String] {
+        self.owner.artifact().report().family_closure()
+    }
     pub fn distribution(
         &self,
         observation: &Observation,
