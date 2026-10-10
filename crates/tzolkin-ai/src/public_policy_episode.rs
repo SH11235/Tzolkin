@@ -22,7 +22,7 @@ pub const TARGET_CONTRACT: &str = "applied-actor-gamma1-terminal-winner-share-v1
 pub const GAMMA: u32 = 1;
 
 #[derive(Clone, Copy)]
-struct ActorLink {
+pub(crate) struct ActorLink {
     actor_index: usize,
     next: Option<usize>,
     gap: usize,
@@ -242,6 +242,21 @@ impl AppliedActorStep<'_> {
     }
 }
 
+/// Construct the same immutable numeric step view for a sealed RL episode.
+pub(crate) fn applied_step<'a>(
+    callback: &'a Callback,
+    link: &'a ActorLink,
+    rank: usize,
+    winners: usize,
+) -> AppliedActorStep<'a> {
+    AppliedActorStep {
+        callback,
+        link,
+        rank,
+        share: utility(rank, winners),
+    }
+}
+
 fn complete_counts(counts: &Counts, length: usize) -> Result<(), String> {
     if length == 0
         || length > MAX_SAMPLES
@@ -338,6 +353,21 @@ fn plan(
     {
         return Err("Incompatible completed actor episode source".into());
     }
+    applied_plan(record, config, SAMPLING_VERSION, || {
+        Ok(crate::model::digest(
+            &serde_json::to_vec(&header.base_policy).map_err(|e| e.to_string())?,
+        ))
+    })
+}
+
+/// Mechanical target/link checks shared only by sealed BC/RL episode wrappers.
+/// This private numeric view grants no raw-source or training admission.
+pub(crate) fn applied_plan<P>(
+    record: &Record<P>,
+    config: &NativeStochasticConfig,
+    sampling_version: &str,
+    binding: impl FnOnce() -> Result<String, String>,
+) -> Result<(Vec<ActorLink>, Vec<usize>, usize), String> {
     complete_counts(&record.counts, record.callbacks.len())?;
     let terminal = record
         .terminal
@@ -354,8 +384,7 @@ fn plan(
         &record.callbacks.iter().map(|c| c.actor).collect::<Vec<_>>(),
         config.players(),
     )?;
-    let binding =
-        crate::model::digest(&serde_json::to_vec(&header.base_policy).map_err(|e| e.to_string())?);
+    let binding = binding()?;
     let mut previous = None;
     let mut rows = 0;
     let mut rng_states = [0; 4];
@@ -392,7 +421,7 @@ fn plan(
             || !matches!(observation.phase, Phase::Setup | Phase::Playing)
             || sample.decision.actor != actor
             || sample.decision.observation_key != callback.observation_key
-            || sample.decision.policy_version != SAMPLING_VERSION
+            || sample.decision.policy_version != sampling_version
             || sample.decision.r#move != sample.chosen.r#move
             || trace.sample_index != index
             || trace.actor != actor
@@ -474,11 +503,18 @@ impl Write for CanonicalHash {
     }
 }
 fn canonical_checksum(record: &Record) -> Result<String, String> {
+    canonical_record_checksum(record, b"tzolkin-applied-actor-episode-v1\0")
+}
+
+pub(crate) fn canonical_record_checksum<P: serde::Serialize>(
+    record: &Record<P>,
+    domain: &[u8],
+) -> Result<String, String> {
     let mut writer = CanonicalHash {
         hash: Sha256::new(),
         bytes: 0,
     };
-    writer.hash.update(b"tzolkin-applied-actor-episode-v1\0");
+    writer.hash.update(domain);
     writer.hash.update(TARGET_CONTRACT.as_bytes());
     writer.hash.update(b"\0");
     serde_json::to_writer(&mut writer, record).map_err(|e| e.to_string())?;
