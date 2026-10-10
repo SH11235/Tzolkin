@@ -92,12 +92,12 @@ pub struct PairedStepReport {
     cohort_plan_checksum: String,
     cohort_receipt_checksum: String,
     episode_checksums: [String; 4],
-    configurations: [Config; 4],
-    actor_config: OneStepConfig,
-    critic_config: ResidualFitConfig,
+    pub(crate) configurations: [Config; 4],
+    pub(crate) actor_config: OneStepConfig,
+    pub(crate) critic_config: ResidualFitConfig,
     counts: [usize; 3],
-    actor_deltas: Deltas,
-    actor_numeric: NumericReport,
+    pub(crate) actor_deltas: Deltas,
+    pub(crate) actor_numeric: NumericReport,
     mean_raw_residual_mse: f64,
     critic_changed_parameters: usize,
     family_closure: Vec<String>,
@@ -192,6 +192,38 @@ pub struct PairedPublicRlPolicy {
     artifact: PairedPublicRlArtifact,
 }
 impl PairedPublicRlPolicy {
+    pub(crate) fn into_parts(
+        self,
+    ) -> Result<(PairedStepReport, PublicPolicyModel, Vec<f32>), String> {
+        let a = self.artifact;
+        let r = &a.report;
+        if a.update_count != 2
+            || r.parent_update_count != 1
+            || r.attempted_update_count != 2
+            || serde_json::to_value(&r.contract).map_err(|e| e.to_string())?
+                != serde_json::to_value(contract()).map_err(|e| e.to_string())?
+            || r.expected_checksum()? != r.checksum
+            || r.changed_parameters() == [0, 0]
+            || r.family_closure.len() > crate::policy_dataset::MAX_FILES + 8
+            || r.family_closure.windows(2).any(|p| p[0] >= p[1])
+            || r.family_closure
+                .iter()
+                .any(|f| split_for_family(f) == Ok(DatasetSplit::Test))
+            || a.residual_parameters.len() != crate::public_state_critic::PARAMETER_COUNT
+            || a.residual_parameters.iter().any(|p| !p.is_finite())
+            || hash(
+                b"tzolkin-public-rl-paired-residual-artifact-v1\0",
+                &(a.update_count, &a.report, &a.actor, &a.residual_parameters),
+            )? != a.checksum
+        {
+            return Err("Paired bootstrap content/shape/lineage mismatch".into());
+        }
+        a.actor.validate()?;
+        for family in &r.family_closure {
+            split_for_family(family)?;
+        }
+        Ok((a.report, a.actor, a.residual_parameters))
+    }
     pub fn artifact(&self) -> &PairedPublicRlArtifact {
         &self.artifact
     }

@@ -288,6 +288,7 @@ enum SamplingPolicyKind {
     Rl,
     Repeated,
     Long,
+    Paired,
 }
 impl SamplingPolicyKind {
     fn sampling_version(self) -> &'static str {
@@ -296,6 +297,7 @@ impl SamplingPolicyKind {
             Self::Rl => RL_SAMPLING_VERSION,
             Self::Repeated => REPEATED_SAMPLING_VERSION,
             Self::Long => crate::public_policy_long::SAMPLING_VERSION,
+            Self::Paired => crate::public_policy_paired_long::SAMPLING_VERSION,
         }
     }
 }
@@ -332,6 +334,14 @@ impl SamplingPrediction {
                     && p.feature_schema() == PUBLIC_FEATURE_SCHEMA
                     && p.value_validity() == ValueValidity::UnavailablePolicyOnly
                     && (2..=crate::public_policy_long::MAX_UPDATES).contains(&p.update_count())
+                    && p.backend() == "scalar"
+            }
+            (Self::Rl(p), SamplingPolicyKind::Paired) => {
+                p.policy_version() == crate::public_policy_paired_long::POLICY_VERSION
+                    && p.feature_schema() == PUBLIC_FEATURE_SCHEMA
+                    && p.value_validity() == ValueValidity::UnavailablePolicyOnly
+                    && (2..=crate::public_policy_paired_long::MAX_UPDATES)
+                        .contains(&p.update_count())
                     && p.backend() == "scalar"
             }
             _ => false,
@@ -933,6 +943,89 @@ impl<'handle, 'model> LongStochasticSession<'handle, 'model> {
             &self.policy_binding_key,
             SamplingPolicyKind::Long,
             observation,
+            |o| self.policy.distribution(o).map(SamplingPrediction::Rl),
+        )
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PairedSamplingPolicy {
+    policy_version: String,
+    task: String,
+    artifact_checksum: String,
+    update_count: u64,
+    model_version: String,
+    input_contract: String,
+    feature_schema: u32,
+    context_contract: String,
+    context_schema: u32,
+    backend: String,
+    numerical_target: String,
+}
+impl PairedSamplingPolicy {
+    pub(crate) fn from_handle(
+        policy: &crate::public_rl_native::PairedRlHandle<'_>,
+    ) -> Result<Self, String> {
+        if policy.backend() != "scalar"
+            || !(2..=crate::public_policy_paired_long::MAX_UPDATES).contains(&policy.update_count())
+        {
+            return Err("Paired sampling requires sealed Scalar joint owner".into());
+        }
+        Ok(Self {
+            policy_version: crate::public_policy_paired_long::POLICY_VERSION.into(),
+            task: crate::public_policy_paired_long::TASK.into(),
+            artifact_checksum: policy.artifact_checksum().into(),
+            update_count: policy.update_count(),
+            model_version: crate::public_model::MODEL_VERSION.into(),
+            input_contract: crate::public_model::INPUT_CONTRACT.into(),
+            feature_schema: PUBLIC_FEATURE_SCHEMA,
+            context_contract: crate::public_state_critic::CONTEXT_CONTRACT.into(),
+            context_schema: crate::public_state_critic::CONTEXT_SCHEMA,
+            backend: policy.backend().into(),
+            numerical_target: crate::public_stochastic_native::numerical_target(),
+        })
+    }
+    pub(crate) fn binding_key(&self) -> Result<String, String> {
+        let mut h = Sha256::new();
+        h.update(b"tzolkin-public-stochastic-paired-policy-v1\0");
+        h.update(serde_json::to_vec(self).map_err(|e| e.to_string())?);
+        Ok(format!("{:x}", h.finalize()))
+    }
+    pub(crate) fn artifact_checksum(&self) -> &str {
+        &self.artifact_checksum
+    }
+    pub(crate) fn update_count(&self) -> u64 {
+        self.update_count
+    }
+}
+pub struct PairedStochasticSession<'handle, 'model> {
+    policy: &'handle crate::public_rl_native::PairedRlHandle<'model>,
+    policy_binding_key: String,
+    state: SessionState,
+}
+impl<'handle, 'model> PairedStochasticSession<'handle, 'model> {
+    pub fn new(
+        policy: &'handle crate::public_rl_native::PairedRlHandle<'model>,
+        identity: SamplingStreamIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            policy_binding_key: PairedSamplingPolicy::from_handle(policy)?.binding_key()?,
+            state: SessionState::new(identity)?,
+        })
+    }
+    pub fn counters(&self) -> SamplingCounters {
+        self.state.counters()
+    }
+    pub fn stop(&mut self) {
+        self.state.stopped = true;
+    }
+    pub fn sample(&mut self, o: &Observation) -> Result<SampledDecision, String> {
+        self.state.sample_with_kind(
+            &self.policy_binding_key,
+            SamplingPolicyKind::Paired,
+            o,
             |o| self.policy.distribution(o).map(SamplingPrediction::Rl),
         )
     }

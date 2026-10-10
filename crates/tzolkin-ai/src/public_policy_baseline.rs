@@ -29,6 +29,17 @@ pub struct ResidualFitConfig {
     max_callbacks: usize,
 }
 impl ResidualFitConfig {
+    pub(crate) fn from_checkpoint(value: serde_json::Value) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Fields {
+            learning_rate: f64,
+            max_abs_actual_delta: f64,
+            max_callbacks: usize,
+        }
+        let f: Fields = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        Self::new(f.learning_rate, f.max_abs_actual_delta, f.max_callbacks)
+    }
     pub fn new(rate: f64, delta: f64, callbacks: usize) -> Result<Self, String> {
         if !rate.is_finite()
             || !(0.0..=0.01).contains(&rate)
@@ -61,6 +72,7 @@ impl ResidualFitConfig {
 /// a matching observation key does not establish causal source provenance.
 pub struct InitializedResidualBaseline<'a> {
     initial: &'a InitializedPublicRlPolicy,
+    seed: u64,
     parameters: Vec<f32>,
     checksum: String,
 }
@@ -68,28 +80,19 @@ impl<'a> InitializedResidualBaseline<'a> {
     pub fn new(initial: &'a InitializedPublicRlPolicy, seed: u64) -> Result<Self, String> {
         initial.artifact().validate()?;
         let parameters = zero_output_parameters(seed);
-        let checksum = hash(
-            b"tzolkin-public-zero-residual-baseline-v1\0",
-            &(
-                BASELINE_VERSION,
-                TASK,
-                CONTEXT_CONTRACT,
-                CONTEXT_SCHEMA,
-                initial.artifact().checksum(),
-                seed,
-                numerical_target(),
-                crate::replay::catalog_hash(),
-                &parameters,
-            ),
-        )?;
+        let checksum = zero_checksum(initial.artifact().checksum(), seed)?;
         Ok(Self {
             initial,
+            seed,
             parameters,
             checksum,
         })
     }
     pub fn checksum(&self) -> &str {
         &self.checksum
+    }
+    pub(crate) fn seed(&self) -> u64 {
+        self.seed
     }
     pub fn root_init_checksum(&self) -> &str {
         self.initial.artifact().checksum()
@@ -171,6 +174,22 @@ impl<'a> InitializedResidualBaseline<'a> {
             changed_parameters: fit.changed_parameters,
         })
     }
+}
+pub(crate) fn zero_checksum(root_init_checksum: &str, seed: u64) -> Result<String, String> {
+    hash(
+        b"tzolkin-public-zero-residual-baseline-v1\0",
+        &(
+            BASELINE_VERSION,
+            TASK,
+            CONTEXT_CONTRACT,
+            CONTEXT_SCHEMA,
+            root_init_checksum,
+            seed,
+            numerical_target(),
+            crate::replay::catalog_hash(),
+            zero_output_parameters(seed),
+        ),
+    )
 }
 
 pub(crate) struct NumericResidualFit {
@@ -254,7 +273,7 @@ fn zero_output_parameters(seed: u64) -> Vec<f32> {
     parameters[WV..].fill(0.0);
     parameters
 }
-fn baseline(parameters: &[f32], context: &PublicStateContext) -> Result<f64, String> {
+pub(crate) fn baseline(parameters: &[f32], context: &PublicStateContext) -> Result<f64, String> {
     let mut hidden = [0.0; HIDDEN];
     let delta = state_forward(
         parameters,

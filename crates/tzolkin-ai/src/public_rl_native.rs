@@ -145,6 +145,64 @@ fn distribution(
     })
 }
 
+/// Immutable Scalar view of a joint actor/residual owner. The residual is bound
+/// by owner identity; action inference remains actor-only and carries no value.
+pub struct PairedRlHandle<'a> {
+    owner: &'a crate::public_policy_paired_long::PairedRlPolicy,
+    kernel: ResolvedKernel,
+}
+impl<'a> PairedRlHandle<'a> {
+    pub fn new(
+        owner: &'a crate::public_policy_paired_long::PairedRlPolicy,
+    ) -> Result<Self, String> {
+        owner.validate_for_sampling()?;
+        Ok(Self {
+            owner,
+            kernel: Kernel::Scalar.resolve()?,
+        })
+    }
+    pub fn artifact_checksum(&self) -> &str {
+        self.owner.artifact().checksum()
+    }
+    pub fn update_count(&self) -> u64 {
+        self.owner.artifact().update_count()
+    }
+    pub fn backend(&self) -> &'static str {
+        self.kernel.backend()
+    }
+    pub(crate) fn family_set(&self) -> &std::collections::BTreeSet<String> {
+        self.owner.family_set()
+    }
+    pub(crate) fn contains_family(&self, family: &str) -> bool {
+        self.owner.contains_family(family)
+    }
+    pub(crate) fn check_rollout_capacity(&self, n: usize) -> Result<(), String> {
+        if self.update_count() >= self.owner.limits().max_updates()
+            || self
+                .family_set()
+                .len()
+                .checked_add(n)
+                .is_none_or(|k| k > self.owner.limits().max_families())
+        {
+            return Err("Paired rollout exceeds update/family cap".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<PublicRlPolicyDistribution, String> {
+        distribution(
+            self.owner.actor_model(),
+            self.kernel,
+            self.artifact_checksum(),
+            self.update_count(),
+            crate::public_policy_paired_long::POLICY_VERSION,
+            observation,
+        )
+    }
+}
+
 /// Scalar inference from the controlled repeated owner, count2..10. The owner
 /// is validated once and borrowed immutably; there is no raw model constructor.
 pub struct RepeatedPublicRlHandle<'a> {
