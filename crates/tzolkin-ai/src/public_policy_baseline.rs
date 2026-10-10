@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::dataset::{DatasetSplit, split_for_family};
 use crate::kernel::Kernel;
 use crate::public_policy_cohort::ValidatedBcCohort;
+use crate::public_policy_episode::AppliedActorStep;
 use crate::public_policy_update::{OneStepOutcome, hash};
 use crate::public_rl_artifact::InitializedPublicRlPolicy;
 use crate::public_state_critic::{
@@ -46,6 +47,12 @@ impl ResidualFitConfig {
             max_callbacks: callbacks,
         })
     }
+    pub(crate) fn check_callbacks(&self, callbacks: usize) -> Result<(), String> {
+        if callbacks == 0 || callbacks > self.max_callbacks {
+            return Err("Residual fit callback count exceeds configured bound".into());
+        }
+        Ok(())
+    }
 }
 
 /// Borrows the immutable qualified initialization; only its zero-output numeric
@@ -86,6 +93,9 @@ impl<'a> InitializedResidualBaseline<'a> {
     }
     pub fn root_init_checksum(&self) -> &str {
         self.initial.artifact().checksum()
+    }
+    pub(crate) fn initial(&self) -> &InitializedPublicRlPolicy {
+        self.initial
     }
     pub fn parameters(&self) -> &[f32] {
         &self.parameters
@@ -140,25 +150,12 @@ impl<'a> InitializedResidualBaseline<'a> {
                 );
             }
         }
-        let weight = 1.0 / callbacks as f64;
-        let mut gradient = vec![0.0; PARAMETER_COUNT];
-        let mut mean_loss = 0.0;
-        for episode in cohort.episodes() {
-            for step in episode.steps() {
-                let context = PublicStateContext::from_observation(step.observation())?;
-                mean_loss += mse_pullback(
-                    &self.parameters,
-                    &context,
-                    step.return_target(),
-                    weight,
-                    &mut gradient,
-                )?;
-            }
-        }
-        if !mean_loss.is_finite() {
-            return Err("Nonfinite residual mean MSE".into());
-        }
-        let (parameters, changed_parameters) = descend(&self.parameters, &gradient, config)?;
+        let fit = fit_applied(
+            &self.parameters,
+            cohort.episodes().iter().flat_map(|episode| episode.steps()),
+            callbacks,
+            config,
+        )?;
         Ok(ResidualFitProposal {
             task: TASK,
             fit_version: FIT_VERSION,
@@ -168,12 +165,58 @@ impl<'a> InitializedResidualBaseline<'a> {
             cohort_receipt_checksum: cohort.receipt_checksum().into(),
             config: *config,
             callbacks,
-            mean_raw_residual_mse: mean_loss,
-            gradient,
-            parameters,
-            changed_parameters,
+            mean_raw_residual_mse: fit.mean_loss,
+            gradient: fit.gradient,
+            parameters: fit.parameters,
+            changed_parameters: fit.changed_parameters,
         })
     }
+}
+
+pub(crate) struct NumericResidualFit {
+    pub(crate) parameters: Vec<f32>,
+    pub(crate) gradient: Vec<f64>,
+    pub(crate) mean_loss: f64,
+    pub(crate) changed_parameters: usize,
+}
+
+// The caller admits the whole sealed cohort before this private numeric loop.
+// Contexts and returns remain inseparable from immutable applied actor steps.
+pub(crate) fn fit_applied<'a>(
+    parameters: &[f32],
+    steps: impl Iterator<Item = AppliedActorStep<'a>>,
+    callbacks: usize,
+    config: &ResidualFitConfig,
+) -> Result<NumericResidualFit, String> {
+    config.check_callbacks(callbacks)?;
+    let weight = 1.0 / callbacks as f64;
+    let mut gradient = vec![0.0; PARAMETER_COUNT];
+    let mut mean_loss = 0.0;
+    let mut observed = 0;
+    for step in steps {
+        if observed == callbacks {
+            return Err("Residual fit has more applied steps than its sealed count".into());
+        }
+        let context = PublicStateContext::from_observation(step.observation())?;
+        mean_loss += mse_pullback(
+            parameters,
+            &context,
+            step.return_target(),
+            weight,
+            &mut gradient,
+        )?;
+        observed += 1;
+    }
+    if observed != callbacks || !mean_loss.is_finite() {
+        return Err("Residual fit applied-step count/finite mean mismatch".into());
+    }
+    let (parameters, changed_parameters) = descend(parameters, &gradient, config)?;
+    Ok(NumericResidualFit {
+        parameters,
+        gradient,
+        mean_loss,
+        changed_parameters,
+    })
 }
 
 /// Serialize-only numerical result. Its parameters cannot construct a baseline

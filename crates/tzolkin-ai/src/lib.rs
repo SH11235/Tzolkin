@@ -19,6 +19,7 @@ pub mod public_policy_cohort;
 pub mod public_policy_episode;
 pub mod public_policy_likelihood;
 pub mod public_policy_long;
+pub mod public_policy_paired;
 pub mod public_policy_pullback;
 pub mod public_policy_repeat;
 pub mod public_policy_update;
