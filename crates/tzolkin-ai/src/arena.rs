@@ -7,9 +7,11 @@ use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
 use crate::public_native::{PreparedPublicPolicy, PublicPolicyHandle};
 use crate::public_policy_long::LongRlPolicy;
+use crate::public_policy_mixed::MixedJointOwner;
 use crate::public_policy_paired_long::PairedRlPolicy;
 use crate::public_policy_repeat::RepeatedPublicRlPolicy;
 use crate::public_policy_update::UpdatedPublicRlPolicy;
+use crate::public_rl_mixed_handle::MixedPolicyHandle;
 use crate::public_rl_native::{
     LongRlHandle, PairedRlHandle, RepeatedPublicRlHandle, UpdatedPublicRlHandle,
 };
@@ -171,6 +173,7 @@ pub enum BorrowedArenaPolicy<'a> {
     Repeated(&'a RepeatedPublicRlPolicy),
     Long(&'a LongRlPolicy),
     Paired(&'a PairedRlPolicy),
+    Mixed(&'a MixedJointOwner),
     PublicBc(&'a PreparedPublicPolicy),
     Heuristic(&'a HeuristicWeights),
     CornFirstSetup(&'a HeuristicWeights),
@@ -395,7 +398,7 @@ impl PreparedPolicy {
 pub struct PolicyDescription {
     pub provenance: SeatPolicy,
     pub dataset_fingerprint: Option<String>,
-    /// Present for Long and Paired owners; the sealed artifact binds the actor.
+    /// Present for Long, Paired and Mixed owners; the sealed artifact binds the actor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version: Option<&'static str>,
 }
@@ -404,6 +407,7 @@ enum PolicyChooser<'a> {
     PublicRlRepeated(Box<RepeatedPublicRlHandle<'a>>),
     PublicRlLong(Box<LongRlHandle<'a>>),
     PublicRlPaired(Box<PairedRlHandle<'a>>),
+    PublicRlMixed(Box<MixedPolicyHandle<'a>>),
     PublicLearnedTradeGuard {
         policy: Box<PublicPolicyHandle<'a>>,
         guard: &'a TradeGuardConfig,
@@ -439,6 +443,7 @@ impl<'a> FrozenReactiveOpponent<'a> {
             BorrowedArenaPolicy::Repeated(p) => p.artifact().report().family_closure().to_vec(),
             BorrowedArenaPolicy::Long(p) => p.family_set().iter().cloned().collect(),
             BorrowedArenaPolicy::Paired(p) => p.family_set().iter().cloned().collect(),
+            BorrowedArenaPolicy::Mixed(p) => p.family_closure().cloned().collect(),
             BorrowedArenaPolicy::PublicBc(p) => {
                 p.initialization_families().1.iter().cloned().collect()
             }
@@ -471,6 +476,7 @@ impl<'a> FrozenReactiveOpponent<'a> {
     }
     pub(crate) fn policy_version(&self) -> &str {
         match &self.handle.description.provenance {
+            SeatPolicy::PublicRlMixed { identity, .. } => identity.policy_version(),
             SeatPolicy::PublicRlPaired { policy_version, .. }
             | SeatPolicy::PublicRl { policy_version, .. }
             | SeatPolicy::PublicLearnedTradeGuard { policy_version, .. }
@@ -638,6 +644,17 @@ impl<'a> PolicyHandle<'a> {
                     overlap,
                 )
             }
+            BorrowedArenaPolicy::Mixed(owner) => {
+                let handle = MixedPolicyHandle::new(owner)?;
+                let overlap = validation_overlap(handle.family_closure(), seeds)?;
+                let provenance = handle.provenance();
+                (
+                    PolicyChooser::PublicRlMixed(Box::new(handle)),
+                    provenance,
+                    None,
+                    overlap,
+                )
+            }
             BorrowedArenaPolicy::PublicBc(policy) => {
                 // This also explicitly excludes the immutable audited Train set.
                 policy.require_validation_families(seeds)?;
@@ -715,7 +732,9 @@ impl<'a> PolicyHandle<'a> {
                     dataset_fingerprint,
                     model_version: matches!(
                         policy,
-                        BorrowedArenaPolicy::Long(_) | BorrowedArenaPolicy::Paired(_)
+                        BorrowedArenaPolicy::Long(_)
+                            | BorrowedArenaPolicy::Paired(_)
+                            | BorrowedArenaPolicy::Mixed(_)
                     )
                     .then_some(crate::public_model::MODEL_VERSION),
                 },
@@ -732,6 +751,7 @@ impl<'a> PolicyHandle<'a> {
             PolicyChooser::PublicRlRepeated(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicRlLong(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicRlPaired(policy) => Ok((policy.choose_move(observation)?, None)),
+            PolicyChooser::PublicRlMixed(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicLearnedTradeGuard { .. } => {
                 Err("Guarded chooser requires its game-local indexed session".into())
             }
@@ -857,6 +877,7 @@ fn borrowed_work_bounds(
                     | PolicyChooser::PublicRlRepeated(_)
                     | PolicyChooser::PublicRlLong(_)
                     | PolicyChooser::PublicRlPaired(_)
+                    | PolicyChooser::PublicRlMixed(_)
                     | PolicyChooser::PublicLearned(_) => public_policy = true,
                     PolicyChooser::Search(policy) => {
                         search_cap = search_cap.max(
@@ -1384,6 +1405,7 @@ pub fn run_public_rl_validation_arena<'a>(
             | BorrowedArenaPolicy::Repeated(_)
             | BorrowedArenaPolicy::Long(_)
             | BorrowedArenaPolicy::Paired(_)
+            | BorrowedArenaPolicy::Mixed(_)
     ) {
         return Err("Borrowed RL Arena candidate must be a sealed RL policy".into());
     }

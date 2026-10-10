@@ -32,6 +32,7 @@ pub mod public_rl_long_session;
 pub mod public_rl_long_stochastic_native;
 pub mod public_rl_mixed_cohort;
 pub mod public_rl_mixed_episode;
+pub mod public_rl_mixed_handle;
 pub mod public_rl_mixed_native;
 pub mod public_rl_mixed_session;
 pub mod public_rl_mixed_training_session;

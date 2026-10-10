@@ -55,6 +55,13 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    /// Mixed joint owner evaluation only; identity DTOs mint no executable owner.
+    PublicRlMixed {
+        identity: crate::public_rl_mixed_handle::MixedInferenceIdentity,
+        selection_version: String,
+        #[serde(deserialize_with = "required_null")]
+        guard: (),
+    },
     /// Joint owner identity for deterministic actor-only development evaluation.
     /// This metadata is not a joint owner constructor or training source.
     PublicRlPaired {
@@ -139,10 +146,29 @@ pub enum SeatPolicy {
 
 impl SeatPolicy {
     pub(crate) fn is_rl_evaluation(&self) -> bool {
-        matches!(self, Self::PublicRl { .. } | Self::PublicRlPaired { .. })
+        self.rl_evaluation_policy_version().is_some()
+    }
+    pub(crate) fn rl_evaluation_policy_version(&self) -> Option<&str> {
+        match self {
+            Self::PublicRl { policy_version, .. } | Self::PublicRlPaired { policy_version, .. } => {
+                Some(policy_version)
+            }
+            Self::PublicRlMixed { identity, .. } => Some(identity.policy_version()),
+            _ => None,
+        }
     }
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PublicRlMixed {
+                identity,
+                selection_version,
+                guard: (),
+            } => {
+                if selection_version != RL_ARGMAX_SELECTION_VERSION {
+                    return Err("Unsupported mixed evaluation selection version".into());
+                }
+                identity.validate()
+            }
             Self::PublicRlPaired {
                 policy_version,
                 artifact_checksum,
@@ -712,9 +738,8 @@ fn play_game_internal(
         let observation = observe(&state, state.current_player)?;
         let (decision, search, trade_guard) = decide(&observation)?;
         if let ReplaySource::PolicySelfPlay { policies } = &source
-            && let SeatPolicy::PublicRl { policy_version, .. }
-            | SeatPolicy::PublicRlPaired { policy_version, .. } = &policies[observation.actor]
-            && (decision.policy_version != *policy_version || !decision.score.is_finite())
+            && let Some(policy_version) = policies[observation.actor].rl_evaluation_policy_version()
+            && (decision.policy_version != policy_version || !decision.score.is_finite())
         {
             return Err("RL evaluation decision/provenance mismatch".into());
         }
