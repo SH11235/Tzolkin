@@ -193,6 +193,15 @@ pub fn audit_rl_record_bytes(
     policy: &UpdatedPublicRlHandle<'_>,
 ) -> Result<AuditedRlStochasticGame, String> {
     let record: Record<RlSamplingPolicy> = decode_typed_record(bytes)?;
+    audit_rl_record(&record, policy)
+}
+
+/// Internal path for a record already strictly decoded from pinned saved bytes.
+/// The source/header checks and fresh replay are shared with the public codec.
+pub(crate) fn audit_rl_record(
+    record: &Record<RlSamplingPolicy>,
+    policy: &UpdatedPublicRlHandle<'_>,
+) -> Result<AuditedRlStochasticGame, String> {
     if record.schema != RECORD_SCHEMA
         || record.header.source_kind != SOURCE_KIND
         || record.callbacks.len() > MAX_SAMPLES
@@ -209,7 +218,7 @@ pub fn audit_rl_record_bytes(
         NativePolicy::Rl(policy),
         RECORD_SCHEMA,
         header(&config, policy)?,
-        Some(&record),
+        Some(record),
     )?;
     Ok(AuditedRlStochasticGame { record: checked })
 }
