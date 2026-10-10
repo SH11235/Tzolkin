@@ -23,36 +23,42 @@ pub const COHORT_CONTRACT: &str = "four-train-games-all-seat-rl-count1-actor-sum
 enum CohortRole {
     Count1,
     Repeated,
+    Long,
 }
 impl CohortRole {
     fn contract(self) -> &'static str {
         match self {
             Self::Count1 => COHORT_CONTRACT,
             Self::Repeated => REPEATED_COHORT_CONTRACT,
+            Self::Long => crate::public_policy_long::COHORT_VERSION,
         }
     }
     fn episode_contract(self) -> &'static str {
         match self {
             Self::Count1 => EPISODE_CONTRACT,
             Self::Repeated => REPEATED_EPISODE_CONTRACT,
+            Self::Long => crate::public_rl_policy_episode::LONG_EPISODE_CONTRACT,
         }
     }
     fn plan_domain(self) -> &'static [u8] {
         match self {
             Self::Count1 => b"tzolkin-planned-rl-count1-cohort-v1\0",
             Self::Repeated => b"tzolkin-planned-rl-repeat-cohort-v1\0",
+            Self::Long => b"tzolkin-planned-rl-long-cohort-v2\0",
         }
     }
     fn receipt_domain(self) -> &'static [u8] {
         match self {
             Self::Count1 => b"tzolkin-completed-rl-count1-cohort-v1\0",
             Self::Repeated => b"tzolkin-completed-rl-repeat-cohort-v1\0",
+            Self::Long => b"tzolkin-completed-rl-long-cohort-v2\0",
         }
     }
     fn accepts_count(self, count: u64) -> bool {
         match self {
             Self::Count1 => count == 1,
             Self::Repeated => (2..=MAX_UPDATE_COUNT).contains(&count),
+            Self::Long => (2..=crate::public_policy_long::MAX_UPDATES).contains(&count),
         }
     }
 }
@@ -78,7 +84,7 @@ impl PlannedRlCohort {
         plan_parts(
             CohortRole::Count1,
             RlSamplingPolicy::from_handle(parent)?,
-            parent.family_closure(),
+            FamilySet::V1(parent.family_closure()),
             configurations,
         )
     }
@@ -89,7 +95,19 @@ impl PlannedRlCohort {
         plan_parts(
             CohortRole::Repeated,
             RlSamplingPolicy::from_repeated_handle(parent)?,
-            parent.family_closure(),
+            FamilySet::V1(parent.family_closure()),
+            configurations,
+        )
+    }
+    pub fn new_long(
+        parent: &crate::public_rl_native::LongRlHandle<'_>,
+        configurations: [NativeStochasticConfig; GAMES],
+    ) -> Result<Self, String> {
+        parent.check_rollout_capacity(GAMES)?;
+        plan_parts(
+            CohortRole::Long,
+            RlSamplingPolicy::from_long_handle(parent)?,
+            FamilySet::Long(parent.family_set()),
             configurations,
         )
     }
@@ -196,10 +214,22 @@ fn completed(
         )
     })
 }
+enum FamilySet<'a> {
+    V1(&'a [String]),
+    Long(&'a std::collections::BTreeSet<String>),
+}
+impl FamilySet<'_> {
+    fn contains(&self, family: &str) -> bool {
+        match self {
+            Self::V1(set) => set.iter().any(|f| f == family),
+            Self::Long(set) => set.contains(family),
+        }
+    }
+}
 fn plan_parts(
     role: CohortRole,
     source: RlSamplingPolicy,
-    inherited_closure: &[String],
+    inherited_closure: FamilySet<'_>,
     configurations: [NativeStochasticConfig; GAMES],
 ) -> Result<PlannedRlCohort, String> {
     if !role.accepts_count(source.update_count())
@@ -213,6 +243,9 @@ fn plan_parts(
             }
             CohortRole::Repeated => {
                 "RL cohort requires a sealed count2..10 parent and two 3p/two 4p games"
+            }
+            CohortRole::Long => {
+                "RL cohort requires a sealed Long-v2 parent and two 3p/two 4p games"
             }
         }
         .into());

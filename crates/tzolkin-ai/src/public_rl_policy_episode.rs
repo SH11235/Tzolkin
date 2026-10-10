@@ -25,9 +25,12 @@ pub const EPISODE_CONTRACT: &str = "applied-rl-count1-actor-gamma1-terminal-winn
 pub const REPEATED_EPISODE_CONTRACT: &str =
     "applied-rl-repeat-actor-gamma1-terminal-winner-share-v1";
 
+pub const LONG_EPISODE_CONTRACT: &str = "applied-rl-long-actor-gamma1-terminal-winner-share-v2";
+
 enum EpisodeSource {
     Count1(AuditedRlStochasticGame),
     Repeated(AuditedRepeatedRlStochasticGame),
+    Long(crate::public_rl_long_stochastic_native::AuditedLongRlStochasticGame),
 }
 struct SourceContract {
     schema: &'static str,
@@ -42,6 +45,7 @@ impl EpisodeSource {
         match self {
             Self::Count1(source) => source.record(),
             Self::Repeated(source) => source.record(),
+            Self::Long(source) => source.record(),
         }
     }
     fn contract(&self) -> SourceContract {
@@ -62,6 +66,14 @@ impl EpisodeSource {
                 domain: b"tzolkin-applied-rl-repeat-actor-episode-v1\0",
                 counts: 2..=MAX_UPDATE_COUNT,
             },
+            Self::Long(_) => SourceContract {
+                schema: crate::public_rl_long_stochastic_native::RECORD_SCHEMA,
+                kind: crate::public_rl_long_stochastic_native::SOURCE_KIND,
+                sampling: crate::public_policy_long::SAMPLING_VERSION,
+                episode: LONG_EPISODE_CONTRACT,
+                domain: b"tzolkin-applied-rl-long-actor-episode-v2\0",
+                counts: 2..=crate::public_policy_long::MAX_UPDATES,
+            },
         }
     }
     fn binding_key(&self) -> Result<String, String> {
@@ -69,6 +81,7 @@ impl EpisodeSource {
         match self {
             Self::Count1(_) => source.binding_key(),
             Self::Repeated(_) => source.repeated_binding_key(),
+            Self::Long(_) => source.long_binding_key(),
         }
     }
 }
@@ -89,6 +102,11 @@ impl ValidatedRlPolicyEpisode {
     }
     pub fn from_repeated_audited(source: AuditedRepeatedRlStochasticGame) -> Result<Self, String> {
         Self::from_source(EpisodeSource::Repeated(source))
+    }
+    pub fn from_long_audited(
+        source: crate::public_rl_long_stochastic_native::AuditedLongRlStochasticGame,
+    ) -> Result<Self, String> {
+        Self::from_source(EpisodeSource::Long(source))
     }
     fn from_source(source: EpisodeSource) -> Result<Self, String> {
         let contract = source.contract();

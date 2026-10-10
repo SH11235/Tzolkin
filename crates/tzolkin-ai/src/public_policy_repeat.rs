@@ -429,35 +429,7 @@ pub fn ascent_repeated(
         return Err("Repeated update parent/cohort/sampler/target/budget mismatch".into());
     }
     let families = extend_closure(parent.family_closure(), cohort.plan().rollout_families())?;
-    let mut gradient = vec![0.0; PARAMETER_COUNT];
-    let mut counts = [0usize; 3];
-    let mut deltas = Deltas::default();
-    for (member, episode) in cohort.episodes().iter().enumerate() {
-        let players = episode.source_config().players();
-        for actor in 0..players {
-            let mut own = vec![0.0; PARAMETER_COUNT];
-            for step in episode.steps().filter(|step| step.actor() == actor) {
-                let index = step.global_callback_index();
-                accumulate_step(parent.model(), step, players, config, &mut own, &mut counts, &mut deltas)
-                    .map_err(|error| format!("Whole repeated cohort rejected: member {member} actor {actor} callback {index}: {error}"))?;
-            }
-            add_actor(
-                &mut gradient,
-                &own,
-                cohort.actor_coefficient(member, actor)?,
-            )?;
-        }
-    }
-    if counts
-        != [
-            cohort.total_callbacks(),
-            cohort.total_candidate_rows(),
-            cohort.total_singletons(),
-        ]
-    {
-        return Err("Reconstructed repeated cohort counts differ from sealed receipt".into());
-    }
-    let proposal = propose_parameters(parent.model().parameters(), &gradient, config)?;
+    let (proposal, counts, deltas) = propose_cohort(parent.model(), cohort, config)?;
     let mut report = RepeatedStepReport {
         contract: contract(),
         parent: ParentIdentity {
@@ -500,6 +472,44 @@ pub fn ascent_repeated(
             checksum,
         },
     }))
+}
+// Shared ordered numeric loop; callers retain their own sealed source/parent guards.
+// This extraction leaves v1 accumulation order and its serialized reports unchanged.
+pub(crate) fn propose_cohort(
+    model: &PublicPolicyModel,
+    cohort: &ValidatedRlCohort,
+    config: &OneStepConfig,
+) -> Result<(crate::public_policy_update::Proposal, [usize; 3], Deltas), String> {
+    let mut gradient = vec![0.0; PARAMETER_COUNT];
+    let mut counts = [0usize; 3];
+    let mut deltas = Deltas::default();
+    for (member, episode) in cohort.episodes().iter().enumerate() {
+        let players = episode.source_config().players();
+        for actor in 0..players {
+            let mut own = vec![0.0; PARAMETER_COUNT];
+            for step in episode.steps().filter(|step| step.actor() == actor) {
+                let index = step.global_callback_index();
+                accumulate_step(model, step, players, config, &mut own, &mut counts, &mut deltas)
+                    .map_err(|error| format!("Whole repeated cohort rejected: member {member} actor {actor} callback {index}: {error}"))?;
+            }
+            add_actor(
+                &mut gradient,
+                &own,
+                cohort.actor_coefficient(member, actor)?,
+            )?;
+        }
+    }
+    if counts
+        != [
+            cohort.total_callbacks(),
+            cohort.total_candidate_rows(),
+            cohort.total_singletons(),
+        ]
+    {
+        return Err("Reconstructed repeated cohort counts differ from sealed receipt".into());
+    }
+    let proposal = propose_parameters(model.parameters(), &gradient, config)?;
+    Ok((proposal, counts, deltas))
 }
 fn next_count(parent_count: u64) -> Result<u64, String> {
     if !(1..MAX_UPDATE_COUNT).contains(&parent_count) {
