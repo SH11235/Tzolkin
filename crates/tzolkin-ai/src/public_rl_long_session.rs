@@ -302,6 +302,16 @@ struct Progress {
     last_outcome: Option<String>,
     last_error: Option<String>,
 }
+impl Progress {
+    fn evaluation_ready(&self, last_evaluated_due: u64) -> Result<bool, String> {
+        if last_evaluated_due > self.due {
+            return Err("Evaluation cursor exceeds the current due notice".into());
+        }
+        Ok(self.pending.is_none()
+            && self.last_outcome.as_deref() == Some("updated")
+            && self.due > last_evaluated_due)
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields, tag = "kind")]
 enum Event {
@@ -394,6 +404,11 @@ impl LongTrainingSession {
             .as_ref()
             .expect("session always retains its owner")
             .parent()
+    }
+    /// Check a fixed Validation set against this session's retained reservations
+    /// and explicit exclusions. This is scoped non-overlap, not global freshness.
+    pub fn require_unused_validation_families(&self, seeds: &[u32]) -> Result<(), String> {
+        require_unused_validation(seeds, &self.consumed, &self.spec.excluded_families)
     }
     fn bootstrap(
         spec: LongRunSpec,
@@ -781,7 +796,12 @@ impl LongTrainingSession {
             }
         }
     }
-    fn execute(&mut self, resume_pending: bool, abandon: Option<&str>) -> Result<String, String> {
+    fn execute(
+        &mut self,
+        resume_pending: bool,
+        abandon: Option<&str>,
+        last_evaluated_due: Option<u64>,
+    ) -> Result<String, String> {
         if let Some(reason) = abandon {
             if self.progress.pending.is_none() || reason.is_empty() || reason.chars().count() > 1024
             {
@@ -799,6 +819,11 @@ impl LongTrainingSession {
         }
         let mut saved_only = resume_pending;
         loop {
+            if let Some(due) = last_evaluated_due
+                && self.progress.evaluation_ready(due)?
+            {
+                return Ok("evaluationDue".into());
+            }
             if self.progress.pending.is_none() {
                 if self.progress.known.accepted >= self.spec.decision_budget {
                     return Ok("decisionBudget".into());
@@ -955,11 +980,35 @@ impl LongTrainingSession {
     ) -> Result<Self, String> {
         restore(spec, prepared, checkpoint_bytes, expected_sha256, directory)
     }
+    /// Read the current durable head and known progress without collecting,
+    /// auditing, updating or evaluating. This can bind the Count1 baseline.
+    pub fn snapshot(&self) -> LongRunReport {
+        self.report("snapshot".into(), 0.0)
+    }
     /// Resume pending work only from four saved pinned records. An unknown
     /// gradient stops; explicit abandon resolves it without reusing families.
     pub fn run(&mut self, abandon: Option<&str>) -> Result<LongRunReport, String> {
         let began = Instant::now();
-        let reason = self.execute(self.progress.pending.is_some(), abandon)?;
+        let reason = self.execute(self.progress.pending.is_some(), abandon, None)?;
+        Ok(self.report(reason, began.elapsed().as_secs_f64()))
+    }
+    /// Drive the shared loop until a durable successful update crosses a notice
+    /// not covered by the caller's completed-evaluation cursor. No evaluation is
+    /// performed here. Whole batches may cross multiple notices at once; borrow
+    /// the actual current parent before resuming. Pending/unknown work keeps its
+    /// existing saved-record-only semantics. An updated notice precedes budget
+    /// stops, so the final successful update can still be evaluated.
+    pub fn run_until_evaluation(
+        &mut self,
+        last_evaluated_due: u64,
+    ) -> Result<LongRunReport, String> {
+        self.progress.evaluation_ready(last_evaluated_due)?;
+        let began = Instant::now();
+        let reason = self.execute(
+            self.progress.pending.is_some(),
+            None,
+            Some(last_evaluated_due),
+        )?;
         Ok(self.report(reason, began.elapsed().as_secs_f64()))
     }
 }
@@ -991,6 +1040,45 @@ impl LongRunReport {
     pub fn stop_reason(&self) -> &str {
         &self.stop_reason
     }
+    /// Known returned sampling decisions in the Long segment, including failed
+    /// prefixes. Bootstrap work and uninstrumented forward calls are separate.
+    pub fn known_accepted_decisions(&self) -> u64 {
+        self.progress.known.accepted
+    }
+    /// Crossed notice count, not the number of Arena evaluations performed.
+    pub fn evaluation_due(&self) -> u64 {
+        self.progress.due
+    }
+    pub fn checkpoint_file(&self) -> &str {
+        &self.checkpoint_file
+    }
+    pub fn checkpoint_sha256(&self) -> &str {
+        &self.checkpoint_sha256
+    }
+}
+
+fn require_unused_validation(
+    seeds: &[u32],
+    consumed: &BTreeSet<String>,
+    excluded: &[String],
+) -> Result<(), String> {
+    if !(1..=1024).contains(&seeds.len()) {
+        return Err("Validation requires 1..=1024 distinct families".into());
+    }
+    let mut seen = BTreeSet::new();
+    for seed in seeds {
+        let family = seed_family_id(*seed);
+        if split_for_family(&family)? != DatasetSplit::Validation
+            || !seen.insert(family.clone())
+            || consumed.contains(&family)
+            || excluded.binary_search(&family).is_ok()
+        {
+            return Err(
+                "Validation family is non-Validation, duplicate or already reserved".into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn apply(
@@ -1650,6 +1738,8 @@ mod tests {
         let spec = spec();
         spec.validate().unwrap();
         let mut p = progress(&spec);
+        assert!(!p.evaluation_ready(0).unwrap());
+        assert!(p.evaluation_ready(1).is_err());
         let mut consumed = BTreeSet::new();
         let mut cursor = p.cursor;
         let configs = spec
@@ -1680,6 +1770,24 @@ mod tests {
         consumed.extend(configs.iter().map(|c| seed_family_id(c.environment_seed)));
         assert_eq!(p.next_ordinal, 44);
         assert!(apply(&spec, &mut p.clone(), &event, &consumed).is_err());
+        let mut notices = progress(&spec);
+        notices.known.accepted = spec.decision_budget + 25;
+        notices.due = notices.known.accepted / spec.evaluation_interval;
+        notices.last_outcome = Some("updated".into());
+        // A whole batch can cross several thresholds and the budget together.
+        assert!(notices.evaluation_ready(0).unwrap());
+        assert!(notices.evaluation_ready(notices.due - 1).unwrap());
+        assert!(!notices.evaluation_ready(notices.due).unwrap());
+        assert!(notices.evaluation_ready(notices.due + 1).is_err());
+        for outcome in [None, Some("noChange"), Some("failed"), Some("abandoned")] {
+            notices.last_outcome = outcome.map(str::to_owned);
+            assert!(!notices.evaluation_ready(0).unwrap());
+        }
+        notices.last_outcome = Some("updated".into());
+        notices.pending = p.pending.clone();
+        assert!(!notices.evaluation_ready(0).unwrap());
+        notices.pending.as_mut().unwrap().gradient_unknown = true;
+        assert!(!notices.evaluation_ready(0).unwrap());
         apply(
             &spec,
             &mut p,
@@ -1703,6 +1811,26 @@ mod tests {
             next.iter()
                 .all(|c| !consumed.contains(&seed_family_id(c.environment_seed)))
         );
+        let validation = (0..1000)
+            .find(|seed| {
+                split_for_family(&seed_family_id(*seed)).unwrap() == DatasetSplit::Validation
+            })
+            .unwrap();
+        let empty = BTreeSet::new();
+        require_unused_validation(&[validation], &empty, &[]).unwrap();
+        for seeds in [
+            vec![],
+            vec![validation, validation],
+            vec![configs[0].environment_seed],
+        ] {
+            assert!(require_unused_validation(&seeds, &empty, &[]).is_err());
+        }
+        let family = seed_family_id(validation);
+        assert!(
+            require_unused_validation(&[validation], &BTreeSet::from([family.clone()]), &[])
+                .is_err()
+        );
+        assert!(require_unused_validation(&[validation], &empty, &[family]).is_err());
         let mut cap = spec.clone();
         cap.max_families = 7;
         assert!(
