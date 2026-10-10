@@ -442,7 +442,10 @@ impl<'a> FrozenReactiveOpponent<'a> {
             BorrowedArenaPolicy::PublicBc(p) => {
                 p.initialization_families().1.iter().cloned().collect()
             }
-            _ => Vec::new(),
+            BorrowedArenaPolicy::Search(_)
+            | BorrowedArenaPolicy::Heuristic(_)
+            | BorrowedArenaPolicy::CornFirstSetup(_)
+            | BorrowedArenaPolicy::CornFirstUxmalOpening(_) => Vec::new(),
         };
         let max_search_steps = match policy {
             BorrowedArenaPolicy::Search(p) => p.config().max_total_steps,

@@ -545,6 +545,13 @@ impl SamplingActors<'_, '_> {
             Self::Frozen(roster) => actor == roster.learner_seat(),
         }
     }
+    fn mixed_schema(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::One(_) => Some(crate::public_mixed_native::RECORD_SCHEMA),
+            Self::Frozen(_) => Some(crate::public_rl_mixed_native::RECORD_SCHEMA),
+        }
+    }
 }
 fn run_shared_with_apply<P: Serialize + PartialEq>(
     config: &NativeStochasticConfig,
@@ -574,7 +581,7 @@ fn run_loop<P: Serialize + PartialEq>(
     mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
 ) -> Result<Record<P>, String> {
     if let Some(learner) = actors.learner_seat()
-        && (learner >= config.players || !crate::public_stochastic_record::allows_opponents(schema))
+        && (learner >= config.players || actors.mixed_schema() != Some(schema))
     {
         return Err("Invalid mixed learner seat or schema".into());
     }

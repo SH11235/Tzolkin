@@ -643,6 +643,13 @@ impl PairedTrainingSession {
     pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
+    pub(crate) fn mixed_sampling_prefix(&self) -> (u64, u64, u64) {
+        (
+            self.spec.sampling_seed,
+            self.spec.replicate_ordinal,
+            self.progress.next_ordinal,
+        )
+    }
     /// Check a fixed Validation set against this session's retained reservations
     /// and explicit exclusions. This is scoped non-overlap, not global freshness.
     pub fn require_unused_validation_families(&self, seeds: &[u32]) -> Result<(), String> {

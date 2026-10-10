@@ -7,12 +7,14 @@ use crate::public_policy_paired_long::PairedRlParent;
 use crate::public_rl_mixed_cohort::{PlannedMixedRlCohort, ValidatedMixedRlCohort};
 use crate::public_rl_mixed_episode::ValidatedMixedRlEpisode;
 use crate::public_rl_mixed_native::{
-    FrozenMixedRoster, MixedRlLearner, audit_mixed_rl_record_bytes, collect_mixed_rl_native,
-    encode_mixed_rl_record,
+    FrozenMixedRoster, MixedRlLearner, MixedRlSource, RECORD_SCHEMA, SOURCE_KIND,
+    audit_mixed_rl_record_bytes, collect_mixed_rl_native, encode_mixed_rl_record,
 };
 use crate::public_rl_paired_session::read_bounded;
 use crate::public_stochastic_native::NativeStochasticConfig;
-use crate::public_stochastic_record::{Config, MAX_RECORD_BYTES, unique_json};
+use crate::public_stochastic_record::{
+    Config, MAX_RECORD_BYTES, Record, decode_typed_record, unique_json,
+};
 use crate::search::{PreparedSearch, SearchConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,11 +40,6 @@ pub struct ImportedMixedRlParent {
     replicate: u64,
     next_ordinal: u64,
 }
-fn integer(v: &serde_json::Value, key: &str) -> Result<u64, String> {
-    v[key]
-        .as_u64()
-        .ok_or_else(|| format!("Missing imported stream integer {key}"))
-}
 impl ImportedMixedRlParent {
     pub fn from_count1(
         prepared: &PreparedPublicPolicy,
@@ -62,11 +59,11 @@ impl ImportedMixedRlParent {
         {
             return Err("Mixed import requires genuine resolved Count1".into());
         }
-        let config = serde_json::to_value(owner.config()).map_err(|e| e.to_string())?;
+        let (sampling_seed, replicate, next_ordinal) = owner.mixed_sampling_prefix()?;
         Ok(Self {
-            sampling_seed: integer(&config, "samplingSeed")?,
-            replicate: integer(&config, "replicateOrdinal")?,
-            next_ordinal: progress.next_episode_ordinal(),
+            sampling_seed,
+            replicate,
+            next_ordinal,
             owner: ImportedOwner::Count1(Box::new(owner)),
         })
     }
@@ -77,7 +74,6 @@ impl ImportedMixedRlParent {
         expected_sha256: &str,
         directory: &Path,
     ) -> Result<Self, String> {
-        let config = serde_json::to_value(&spec).map_err(|e| e.to_string())?;
         let owner = crate::public_rl_paired_session::PairedTrainingSession::restore(
             spec,
             prepared,
@@ -89,11 +85,11 @@ impl ImportedMixedRlParent {
         if !matches!(owner.current_parent(), PairedRlParent::Paired(_)) {
             return Err("Paired mixed import requires a genuine joint owner".into());
         }
-        let report = serde_json::to_value(owner.snapshot()).map_err(|e| e.to_string())?;
+        let (sampling_seed, replicate, next_ordinal) = owner.mixed_sampling_prefix();
         Ok(Self {
-            sampling_seed: integer(&config, "samplingSeed")?,
-            replicate: integer(&config, "replicateOrdinal")?,
-            next_ordinal: integer(&report["progress"], "nextOrdinal")?,
+            sampling_seed,
+            replicate,
+            next_ordinal,
             owner: ImportedOwner::Paired(Box::new(owner)),
         })
     }
@@ -113,7 +109,7 @@ impl ImportedMixedRlParent {
         spec: MixedRlCollectionSpec,
         prepared: &'a PreparedPublicPolicy,
     ) -> Result<MixedRlCollectionSession<'a>, String> {
-        for (i, c) in spec.configurations.iter().enumerate() {
+        for (i, c) in spec.wire.configurations.iter().enumerate() {
             let ordinal = self
                 .next_ordinal
                 .checked_add(i as u64)
@@ -125,12 +121,20 @@ impl ImportedMixedRlParent {
                 return Err("Mixed import cannot reset or relabel parent sampler prefix".into());
             }
         }
-        let seeds = spec.configurations.each_ref().map(|c| c.environment_seed);
+        let seeds = spec
+            .wire
+            .configurations
+            .each_ref()
+            .map(|c| c.environment_seed);
         match &self.owner {
             ImportedOwner::Count1(s) => s.require_unused_training_families(&seeds)?,
             ImportedOwner::Paired(s) => s.require_unused_training_families(&seeds)?,
         }
-        MixedRlCollectionSession::new(spec, self.parent(), prepared)
+        let protected_directory = match &self.owner {
+            ImportedOwner::Count1(_) => None,
+            ImportedOwner::Paired(s) => Some(s.directory()),
+        };
+        MixedRlCollectionSession::new(spec, self.parent(), prepared, protected_directory)
     }
 }
 
@@ -144,11 +148,9 @@ enum OpponentSpec {
     ParentArgmax,
     Search,
 }
-/// Every member names its absolute learner slot (`null`) and frozen opponents.
-/// Configurations include exact environment/sampling/replicate/episode identities.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MixedRlCollectionSpec {
+struct MixedRlSpecWire {
     schema: String,
     catalog_hash: String,
     configurations: [Config; 4],
@@ -156,6 +158,12 @@ pub struct MixedRlCollectionSpec {
     weights: HeuristicWeights,
     search: SearchConfig,
     max_output_bytes: u64,
+}
+/// Opaque checked spec. Only from_json can mint it; serde cannot discard
+/// unknown opponent payloads or bypass catalog/schema/whole-four reservations.
+#[derive(Clone)]
+pub struct MixedRlCollectionSpec {
+    wire: MixedRlSpecWire,
 }
 impl MixedRlCollectionSpec {
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
@@ -181,13 +189,15 @@ impl MixedRlCollectionSpec {
         {
             return Err("Mixed roster opponent requires exactly its closed kind field".into());
         }
-        let s: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
-        s.weights.validate()?;
-        s.search.validate()?;
-        if s.schema != SPEC_SCHEMA
-            || s.catalog_hash != crate::replay::catalog_hash()
+        let s = Self {
+            wire: serde_json::from_value(value).map_err(|e| e.to_string())?,
+        };
+        s.wire.weights.validate()?;
+        s.wire.search.validate()?;
+        if s.wire.schema != SPEC_SCHEMA
+            || s.wire.catalog_hash != crate::replay::catalog_hash()
             || !(4 * MAX_RECORD_BYTES as u64 + METADATA_RESERVE..=512 * 1024 * 1024)
-                .contains(&s.max_output_bytes)
+                .contains(&s.wire.max_output_bytes)
         {
             return Err(
                 "Mixed spec requires canonical catalog and whole4 bounded output reserve".into(),
@@ -199,7 +209,7 @@ impl MixedRlCollectionSpec {
         {
             return Err("Mixed spec requires two 3p and two 4p members".into());
         }
-        for (c, r) in configs.iter().zip(&s.rosters) {
+        for (c, r) in configs.iter().zip(&s.wire.rosters) {
             if r.len() != c.players() || r.iter().filter(|p| p.is_none()).count() != 1 {
                 return Err("Mixed spec absolute roster/learner coverage differs".into());
             }
@@ -207,7 +217,8 @@ impl MixedRlCollectionSpec {
         Ok(s)
     }
     fn configs(&self) -> Result<[NativeStochasticConfig; 4], String> {
-        self.configurations
+        self.wire
+            .configurations
             .iter()
             .map(Config::checked_config)
             .collect::<Result<Vec<_>, _>>()?
@@ -223,24 +234,28 @@ pub struct MixedRlCollectionSession<'a> {
     prepared: &'a PreparedPublicPolicy,
     parent: PairedRlParent<'a>,
     search: PreparedSearch,
+    protected_directory: Option<&'a Path>,
 }
 impl<'a> MixedRlCollectionSession<'a> {
-    pub(crate) fn new(
+    fn new(
         spec: MixedRlCollectionSpec,
         learner: PairedRlParent<'a>,
         prepared: &'a PreparedPublicPolicy,
+        protected_directory: Option<&'a Path>,
     ) -> Result<Self, String> {
-        let search = PreparedSearch::new(&spec.search)?;
+        let search = PreparedSearch::new(&spec.wire.search)?;
         Ok(Self {
             learner: MixedRlLearner::new(learner)?,
             parent: learner,
             prepared,
             search,
             spec,
+            protected_directory,
         })
     }
     fn rosters(&self) -> Result<[FrozenMixedRoster<'_>; 4], String> {
         self.spec
+            .wire
             .rosters
             .iter()
             .map(|seats| {
@@ -250,13 +265,15 @@ impl<'a> MixedRlCollectionSession<'a> {
                         .map(|s| {
                             s.as_ref().map(|p| match p {
                                 OpponentSpec::Heuristic => {
-                                    BorrowedArenaPolicy::Heuristic(&self.spec.weights)
+                                    BorrowedArenaPolicy::Heuristic(&self.spec.wire.weights)
                                 }
                                 OpponentSpec::CornFirstSetup => {
-                                    BorrowedArenaPolicy::CornFirstSetup(&self.spec.weights)
+                                    BorrowedArenaPolicy::CornFirstSetup(&self.spec.wire.weights)
                                 }
                                 OpponentSpec::CornFirstUxmalOpening => {
-                                    BorrowedArenaPolicy::CornFirstUxmalOpening(&self.spec.weights)
+                                    BorrowedArenaPolicy::CornFirstUxmalOpening(
+                                        &self.spec.wire.weights,
+                                    )
                                 }
                                 OpponentSpec::PreparedBc => {
                                     BorrowedArenaPolicy::PublicBc(self.prepared)
@@ -282,9 +299,10 @@ impl<'a> MixedRlCollectionSession<'a> {
     /// unresolved/Unknown attempt if killed before its returned receipt. Every
     /// fixed member is retained, including failed prefixes; no success subset.
     pub fn collect_new(self, output: &Path) -> Result<MixedRlCollectionReport, String> {
+        require_imported_output(self.protected_directory, output)?;
         let rosters = self.rosters()?;
         let plan = self.plan(&rosters)?;
-        let mut writer = Writer::new(output, self.spec.max_output_bytes)?;
+        let mut writer = Writer::new(output, self.spec.wire.max_output_bytes)?;
         let plan_pin = writer.save("plan.json", &plan.receipt())?;
         let mut records = Vec::new();
         let started = Instant::now();
@@ -331,6 +349,7 @@ impl<'a> MixedRlCollectionSession<'a> {
         expected_sha256: &str,
         output: &Path,
     ) -> Result<ValidatedMixedRlCohort, String> {
+        require_imported_output(self.protected_directory, output)?;
         require_output_outside_directory(source, output)?;
         if sha(collection_raw) != expected_sha256 {
             return Err("Mixed collection external raw pin differs".into());
@@ -365,7 +384,17 @@ impl<'a> MixedRlCollectionSession<'a> {
                 read_pin(source, &m.record, MAX_RECORD_BYTES)
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let before = collection_inventory(source, self.spec.max_output_bytes)?;
+        let before = collection_inventory(source, self.spec.wire.max_output_bytes)?;
+        for (member, bytes) in raw.iter().enumerate() {
+            let record: Record<MixedRlSource> = decode_typed_record(bytes)?;
+            if record.schema != RECORD_SCHEMA
+                || record.header.source_kind != SOURCE_KIND
+                || record.training_admission != "unavailable-distinct-codec-required"
+            {
+                return Err("Mixed saved record source contract differs before audit".into());
+            }
+            plan.require_header(member, &record.header)?;
+        }
         if read_bounded(&source.join("collection.json"), RECEIPT_CAP)? != collection_raw {
             return Err("Mixed saved collection bytes differ from pinned manifest".into());
         }
@@ -413,7 +442,7 @@ impl<'a> MixedRlCollectionSession<'a> {
             writer.save(&format!("audit-returned-{member}.json"),&serde_json::json!({"schema":"tzolkin-mixed-rl-audit-returned-v1","member":member,"passed":result.is_ok(),"error":result.as_ref().err(),"seconds":began.elapsed().as_secs_f64()}))?;
             results.push(result);
         }
-        if collection_inventory(source, self.spec.max_output_bytes)? != before {
+        if collection_inventory(source, self.spec.wire.max_output_bytes)? != before {
             return Err("Mixed saved source changed during fresh audit".into());
         }
         let cohort = plan.finish(
@@ -424,6 +453,15 @@ impl<'a> MixedRlCollectionSession<'a> {
         writer.save("cohort.json", &cohort.receipt())?;
         Ok(cohort)
     }
+}
+fn require_imported_output(
+    protected_directory: Option<&Path>,
+    output: &Path,
+) -> Result<(), String> {
+    if let Some(directory) = protected_directory {
+        require_output_outside_directory(directory, output)?;
+    }
+    Ok(())
 }
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -637,6 +675,22 @@ mod tests {
         let mut players = good.clone();
         players["configurations"][2]["players"] = 3.into();
         assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&players).unwrap()).is_err());
+        for (field, invalid) in [
+            ("schema", serde_json::json!("different-schema")),
+            ("catalogHash", serde_json::json!("0000000000000000")),
+            ("maxOutputBytes", serde_json::json!(4 * MAX_RECORD_BYTES)),
+            (
+                "maxOutputBytes",
+                serde_json::json!(512 * 1024 * 1024_u64 + 1),
+            ),
+        ] {
+            let mut invalid_spec = good.clone();
+            invalid_spec[field] = invalid;
+            assert!(
+                MixedRlCollectionSpec::from_json(&serde_json::to_vec(&invalid_spec).unwrap())
+                    .is_err()
+            );
+        }
         let mut roles = good;
         roles["rosters"][0][1] = serde_json::Value::Null;
         assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&roles).unwrap()).is_err());
@@ -687,6 +741,10 @@ mod tests {
         assert!(require_output_outside_directory(&source, &alias).is_err());
         assert!(require_output_outside_directory(&source, &directory).is_err());
         assert!(require_output_outside_directory(&source, &directory.join("audit")).is_ok());
+        assert!(require_imported_output(Some(&source), &source.join("collect")).is_err());
+        assert!(require_imported_output(Some(&source), &alias).is_err());
+        assert!(require_imported_output(Some(&source), &directory.join("collect")).is_ok());
+        assert!(require_imported_output(None, &directory.join("collect")).is_ok());
         assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
         assert!(!directory.join("audit").exists());
         fs::remove_dir(&source).unwrap();

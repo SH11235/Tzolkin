@@ -75,6 +75,16 @@ impl PlannedMixedRlCohort {
     pub fn parent_update_count(&self) -> u64 {
         self.headers[0].base_policy.learner.count()
     }
+    pub(crate) fn require_header(
+        &self,
+        member: usize,
+        header: &Header<MixedRlSource>,
+    ) -> Result<(), String> {
+        if self.headers.get(member) != Some(header) {
+            return Err("Mixed saved record header differs from its planned member".into());
+        }
+        Ok(())
+    }
     pub fn receipt(&self) -> serde_json::Value {
         json!({"schema":"tzolkin-planned-mixed-rl-cohort-v1","cohortContract":COHORT_CONTRACT,
             "episodeContract":EPISODE_CONTRACT,"rosterContract":ROSTER_CONTRACT,"checksum":self.checksum,
