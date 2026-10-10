@@ -214,6 +214,9 @@ impl RlTrainingSession {
     pub fn progress(&self) -> Result<SessionProgress, String> {
         Ok(self.derive()?.1)
     }
+    pub(crate) fn consumed_families(&self) -> Result<BTreeSet<String>, String> {
+        Ok(self.derive()?.0)
+    }
     /// Recreate the same reserved plan after resume, without allocating new
     /// families or streams. Saved collection outcomes must still be audited.
     pub fn pending_first_plan(&self) -> Result<PlannedBcCohort, String> {
