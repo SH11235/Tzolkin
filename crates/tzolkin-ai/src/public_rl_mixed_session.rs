@@ -39,6 +39,7 @@ pub struct ImportedMixedRlParent {
     sampling_seed: u64,
     replicate: u64,
     next_ordinal: u64,
+    import_identity: serde_json::Value,
 }
 impl ImportedMixedRlParent {
     pub fn from_count1(
@@ -65,6 +66,7 @@ impl ImportedMixedRlParent {
             replicate,
             next_ordinal,
             owner: ImportedOwner::Count1(Box::new(owner)),
+            import_identity: serde_json::json!({"kind":"count1","rawSha256":expected_sha256}),
         })
     }
     pub fn from_paired(
@@ -74,6 +76,8 @@ impl ImportedMixedRlParent {
         expected_sha256: &str,
         directory: &Path,
     ) -> Result<Self, String> {
+        let spec_identity =
+            crate::public_policy_update::hash(b"tzolkin-mixed-import-paired-spec-v1\0", &spec)?;
         let owner = crate::public_rl_paired_session::PairedTrainingSession::restore(
             spec,
             prepared,
@@ -91,9 +95,10 @@ impl ImportedMixedRlParent {
             replicate,
             next_ordinal,
             owner: ImportedOwner::Paired(Box::new(owner)),
+            import_identity: serde_json::json!({"kind":"paired","rawSha256":expected_sha256,"specChecksum":spec_identity}),
         })
     }
-    fn parent(&self) -> PairedRlParent<'_> {
+    pub(crate) fn parent(&self) -> PairedRlParent<'_> {
         match &self.owner {
             ImportedOwner::Count1(s) => match s.parent() {
                 Some(crate::public_policy_repeat::RlUpdateParent::Count1(p)) => {
@@ -102,6 +107,24 @@ impl ImportedMixedRlParent {
                 _ => unreachable!("checked Count1"),
             },
             ImportedOwner::Paired(s) => s.current_parent(),
+        }
+    }
+    pub(crate) fn import_identity(&self) -> &serde_json::Value {
+        &self.import_identity
+    }
+    pub(crate) fn sampling_prefix(&self) -> (u64, u64, u64) {
+        (self.sampling_seed, self.replicate, self.next_ordinal)
+    }
+    pub(crate) fn reserved_families(&self) -> Result<std::collections::BTreeSet<String>, String> {
+        match &self.owner {
+            ImportedOwner::Count1(s) => s.consumed_families(),
+            ImportedOwner::Paired(s) => Ok(s.mixed_reserved_families()),
+        }
+    }
+    pub(crate) fn protected_directory(&self) -> Option<&Path> {
+        match &self.owner {
+            ImportedOwner::Count1(_) => None,
+            ImportedOwner::Paired(s) => Some(s.directory()),
         }
     }
     pub fn collection_session<'a>(
@@ -166,6 +189,9 @@ pub struct MixedRlCollectionSpec {
     wire: MixedRlSpecWire,
 }
 impl MixedRlCollectionSpec {
+    pub(crate) fn to_json(&self) -> Result<Vec<u8>, String> {
+        serde_json::to_vec(&self.wire).map_err(|e| e.to_string())
+    }
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
         let value = unique_json(raw, MAX_SPEC_BYTES)?;
         if !value
@@ -237,6 +263,9 @@ pub struct MixedRlCollectionSession<'a> {
     protected_directory: Option<&'a Path>,
 }
 impl<'a> MixedRlCollectionSession<'a> {
+    pub(crate) fn training_plan(&self) -> Result<PlannedMixedRlCohort, String> {
+        self.plan(&self.rosters()?)
+    }
     fn new(
         spec: MixedRlCollectionSpec,
         learner: PairedRlParent<'a>,
@@ -351,6 +380,71 @@ impl<'a> MixedRlCollectionSession<'a> {
     ) -> Result<ValidatedMixedRlCohort, String> {
         require_imported_output(self.protected_directory, output)?;
         require_output_outside_directory(source, output)?;
+        let SavedInputs {
+            rosters,
+            plan,
+            receipt,
+            raw,
+            before,
+        } = self.saved_inputs(source, collection_raw, expected_sha256)?;
+        let mut writer = Writer::new(output, METADATA_RESERVE)?;
+        writer.save("plan.json", &plan.receipt())?;
+        let mut results = Vec::new();
+        for (member, (bytes, roster)) in raw.iter().zip(&rosters).enumerate() {
+            writer.save(&format!("audit-started-{member}.json"),&serde_json::json!({"schema":"tzolkin-mixed-rl-audit-started-v1","member":member,"record":receipt.records[member].record,"unknownUntilReturned":true}))?;
+            let began = Instant::now();
+            let result =
+                audit_mixed_rl_record_bytes(bytes, &self.learner, roster).and_then(|game| {
+                    let m = &receipt.records[member];
+                    if game.complete() != m.complete
+                        || game.observed_callbacks() != m.observed_callbacks
+                        || game.learner_callbacks() != m.learner_callbacks
+                        || game.learner_candidate_rows() != m.learner_candidate_rows
+                        || game.opponent_attempts() != m.opponent_attempts
+                    {
+                        return Err("Mixed fresh source counters differ from saved return".into());
+                    }
+                    ValidatedMixedRlEpisode::from_audited(game)
+                });
+            writer.save(&format!("audit-returned-{member}.json"),&serde_json::json!({"schema":"tzolkin-mixed-rl-audit-returned-v1","member":member,"passed":result.is_ok(),"error":result.as_ref().err(),"seconds":began.elapsed().as_secs_f64()}))?;
+            results.push(result);
+        }
+        if collection_inventory(source, self.spec.wire.max_output_bytes)? != before {
+            return Err("Mixed saved source changed during fresh audit".into());
+        }
+        let cohort = plan.finish(
+            results
+                .try_into()
+                .map_err(|_| "Mixed audited result shape")?,
+        )?;
+        writer.save("cohort.json", &cohort.receipt())?;
+        Ok(cohort)
+    }
+    pub(crate) fn verify_saved(
+        &self,
+        source: &Path,
+        raw: &[u8],
+        expected: &str,
+    ) -> Result<serde_json::Value, String> {
+        let saved = self.saved_inputs(source, raw, expected)?;
+        Ok(serde_json::json!({"plan":saved.plan.receipt(),"inventory":saved.before}))
+    }
+    pub(crate) fn current_saved_inventory(
+        &self,
+        source: &Path,
+    ) -> Result<serde_json::Value, String> {
+        serde_json::to_value(collection_inventory(
+            source,
+            self.spec.wire.max_output_bytes,
+        )?)
+        .map_err(|e| e.to_string())
+    }
+    fn saved_inputs(
+        &self,
+        source: &Path,
+        collection_raw: &[u8],
+        expected_sha256: &str,
+    ) -> Result<SavedInputs<'_>, String> {
         if sha(collection_raw) != expected_sha256 {
             return Err("Mixed collection external raw pin differs".into());
         }
@@ -420,39 +514,21 @@ impl<'a> MixedRlCollectionSession<'a> {
                 return Err("Mixed saved started/returned receipt differs".into());
             }
         }
-        let mut writer = Writer::new(output, METADATA_RESERVE)?;
-        writer.save("plan.json", &plan.receipt())?;
-        let mut results = Vec::new();
-        for (member, (bytes, roster)) in raw.iter().zip(&rosters).enumerate() {
-            writer.save(&format!("audit-started-{member}.json"),&serde_json::json!({"schema":"tzolkin-mixed-rl-audit-started-v1","member":member,"record":receipt.records[member].record,"unknownUntilReturned":true}))?;
-            let began = Instant::now();
-            let result =
-                audit_mixed_rl_record_bytes(bytes, &self.learner, roster).and_then(|game| {
-                    let m = &receipt.records[member];
-                    if game.complete() != m.complete
-                        || game.observed_callbacks() != m.observed_callbacks
-                        || game.learner_callbacks() != m.learner_callbacks
-                        || game.learner_candidate_rows() != m.learner_candidate_rows
-                        || game.opponent_attempts() != m.opponent_attempts
-                    {
-                        return Err("Mixed fresh source counters differ from saved return".into());
-                    }
-                    ValidatedMixedRlEpisode::from_audited(game)
-                });
-            writer.save(&format!("audit-returned-{member}.json"),&serde_json::json!({"schema":"tzolkin-mixed-rl-audit-returned-v1","member":member,"passed":result.is_ok(),"error":result.as_ref().err(),"seconds":began.elapsed().as_secs_f64()}))?;
-            results.push(result);
-        }
-        if collection_inventory(source, self.spec.wire.max_output_bytes)? != before {
-            return Err("Mixed saved source changed during fresh audit".into());
-        }
-        let cohort = plan.finish(
-            results
-                .try_into()
-                .map_err(|_| "Mixed audited result shape")?,
-        )?;
-        writer.save("cohort.json", &cohort.receipt())?;
-        Ok(cohort)
+        Ok(SavedInputs {
+            rosters,
+            plan,
+            receipt,
+            raw,
+            before,
+        })
     }
+}
+struct SavedInputs<'a> {
+    rosters: [FrozenMixedRoster<'a>; 4],
+    plan: PlannedMixedRlCohort,
+    receipt: MixedRlCollectionReport,
+    raw: Vec<Vec<u8>>,
+    before: Vec<FilePin>,
 }
 fn require_imported_output(
     protected_directory: Option<&Path>,

@@ -650,6 +650,12 @@ impl PairedTrainingSession {
             self.progress.next_ordinal,
         )
     }
+    pub(crate) fn mixed_reserved_families(&self) -> BTreeSet<String> {
+        self.consumed
+            .union(&self.spec.excluded_families.iter().cloned().collect())
+            .cloned()
+            .collect()
+    }
     /// Check a fixed Validation set against this session's retained reservations
     /// and explicit exclusions. This is scoped non-overlap, not global freshness.
     pub fn require_unused_validation_families(&self, seeds: &[u32]) -> Result<(), String> {
@@ -2100,6 +2106,13 @@ fn absent(path: &Path) -> Result<(), String> {
 
 fn publish(directory: &Path, name: &str, bytes: &[u8]) -> Result<Pin, String> {
     publish_with_ceiling(directory, name, bytes, MAX_RECORD_BYTES)
+}
+pub(crate) fn publish_mixed_metadata(
+    directory: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    publish(directory, name, bytes).map(|_| ())
 }
 fn publish_with_ceiling(
     directory: &Path,
