@@ -637,13 +637,19 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
   assert.equal(restoredBonus.manifest.extractionRewardReceipt.remaining, 0);
   assert.deepEqual(restoredBonus.manifest.extractionRewardReceipt.materials, ['wood', 'wood']);
 
-  const purchaseFixture = ({ monument = false, task = 'build' } = {}) => {
+  const purchaseFixture = ({
+    monument = false,
+    task = 'build',
+    resourceFirst = false,
+    unique = false,
+    templeGains = false,
+  } = {}) => {
     const start = clone(saved.core.initialFrame);
     start.snapshot.state.players[0].resources.corn = 20;
     start.snapshot.state.players[0].resources.wood = 4;
     start.snapshot.state.players[0].buildings = ['b04', 'b05'];
     start.observation.pendingTask = { type: 'build', remaining: 2 };
-    start.observation.legalActions = ['bonus', 'reserve'].map((mode) => ({
+    const purchaseRows = (unique ? ['bonus'] : ['bonus', 'reserve']).map((mode) => ({
       action: {
         type: monument ? 'monument' : 'build',
         id: monument ? 'm01' : 'b06',
@@ -654,10 +660,28 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
       },
       move: { type: 'choose', choiceId: `purchase:${mode}` },
     }));
+    start.observation.legalActions = purchaseRows;
+    if (resourceFirst) {
+      start.observation.pendingTask = { type: 'resource', remaining: 1 };
+      start.observation.legalActions = [
+        {
+          action: { type: 'resource', resource: 'wood' },
+          move: { type: 'choose', choiceId: 'resource:wood' },
+        },
+      ];
+    }
     const choices = [];
     const frames = [];
     const apply = (request) => {
       choices.push(request.move.choiceId);
+      if (request.move.choiceId === 'resource:wood') {
+        const next = clone(start);
+        next.snapshot.state = clone(request.state);
+        next.snapshot.state.players[0].resources.wood++;
+        next.observation.pendingTask = { type: 'build', remaining: 2 };
+        next.observation.legalActions = clone(purchaseRows);
+        return next;
+      }
       const bonus = request.move.choiceId === 'purchase:bonus';
       assert.ok(bonus || request.move.choiceId === 'purchase:reserve');
       const next = clone(start);
@@ -673,6 +697,10 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
         if (bonus) {
           player.resources.corn++;
           player.score += 2;
+          if (templeGains) {
+            player.temples.chaac++;
+            player.temples.kukulkan++;
+          }
         }
       }
       next.observation.pendingTask = task === null ? null : { type: task, remaining: 1 };
@@ -712,6 +740,52 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
   assert.deepEqual(architecture.choices.slice(0, 2), ['purchase:bonus', 'purchase:reserve']);
   assert.equal(architecture.frames.at(-1).snapshot.state.players[0].resources.corn, 17);
   assert.equal(architecture.frames.at(-1).snapshot.state.players[0].resources.wood, 3);
+  for (const unique of [false, true]) {
+    const fixture = purchaseFixture({ resourceFirst: true, unique });
+    const result = decode(
+      fixture.make([[6, [material('wood'), ...purchasePayment, build, refund, points]]]),
+      fixture.dispatch,
+    );
+    assert.equal(result.manifest.blocked, null);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.move.choiceId),
+      ['resource:wood', 'purchase:bonus'],
+    );
+  }
+  const templeMessages = [
+    { raw_text: 'AはChaacの信仰を1段上げた' },
+    { raw_text: 'AはKukulcanの信仰を1段上げた' },
+  ];
+  const templePurchase = purchaseFixture({ templeGains: true });
+  const templeResult = decode(
+    templePurchase.make([[6, [...purchasePayment, build, refund, points, ...templeMessages]]]),
+    templePurchase.dispatch,
+  );
+  assert.equal(templeResult.manifest.blocked, null);
+  assert.equal(templeResult.record.steps[0].move.choiceId, 'purchase:bonus');
+  for (const messages of [
+    [...templeMessages, templeMessages[0]],
+    [{ raw_text: 'AはChaacの信仰を2段上げた' }],
+    [{ raw_text: 'Aは未知の神殿の信仰を1段上げた' }],
+  ]) {
+    const fixture = purchaseFixture({ templeGains: true });
+    const rejected = decode(
+      fixture.make([[6, [...purchasePayment, build, refund, points, ...messages]]]),
+      fixture.dispatch,
+    );
+    assert.notEqual(rejected.manifest.blocked, null);
+    assert.equal(rejected.record.steps.length, 0);
+  }
+  const withoutTempleEffects = purchaseFixture();
+  assert.match(
+    decode(
+      withoutTempleEffects.make([
+        [6, [...purchasePayment, build, refund, points, ...templeMessages]],
+      ]),
+      withoutTempleEffects.dispatch,
+    ).manifest.blocked.reason,
+    /No legal outcome/,
+  );
   for (const [messages, reason] of [
     [[...purchasePayment, build], /Ambiguous legal operation/],
     [[...purchasePayment, build, material('corn', 2), points], /No legal outcome/],

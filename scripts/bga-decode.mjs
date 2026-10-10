@@ -557,7 +557,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     reason,
     derived = false,
     visibleCalendar = false,
-    acceptOutcome = null,
+    outcomeFilter = null,
   ) {
     if (record.steps.length >= MAX_STEPS) fail('Move limit reached');
     let candidates = legal().filter((row) => predicate(row.action));
@@ -575,9 +575,18 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     if (calls + candidates.length * 3 >= MAX_CALLS)
       fail('Core call budget exhausted before the final replay verification');
     // Trial every legal candidate before changing history, effects or reveal pools.
-    const outcomes = candidates
-      .map((row) => ({ row, ...trial(row) }))
-      .filter((outcome) => acceptOutcome === null || acceptOutcome(outcome));
+    let outcomes = candidates.map((row) => ({ row, ...trial(row) }));
+    if (
+      outcomeFilter !== null &&
+      outcomes.some(
+        (outcome) =>
+          !same(
+            mechanical(outcome.frame.snapshot.state),
+            mechanical(outcomes[0].frame.snapshot.state),
+          ),
+      )
+    )
+      outcomes = outcomes.filter(outcomeFilter());
     if (!outcomes.length) fail(`No legal outcome matches source evidence for ${reason}`);
     if (
       outcomes.length > 1 &&
@@ -774,14 +783,17 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
   }
   function purchaseOutcome(event, events, witness) {
     const actor = actorId(event.actor);
+    const remaining = events.slice(events.indexOf(event) + 1);
     const gains = {};
     if (
       actor < 0 ||
       events.filter((item) => ['build', 'monument'].includes(item.kind)).length !== 1 ||
-      events.some((item) => item.actor !== event.actor)
+      remaining.some((item) => item.actor !== event.actor)
     )
       fail('Purchase source requires one purchased card and one actor');
-    for (const item of events) {
+    // Earlier operations and claims have already been validated. Only the
+    // unconsumed suffix can constrain this purchase's trial outcome.
+    for (const item of remaining) {
       if (['resourcePayment', 'build', 'monument'].includes(item.kind)) continue;
       if (item.kind === 'resourceGain') {
         for (const [index, amount] of resourceAmounts(item).entries())
@@ -791,6 +803,17 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
           }
       } else if (item.kind === 'workerGain') gains.workers = (gains.workers ?? 0) + 1;
       else {
+        const temple =
+          item.kind === 'unparsed'
+            ? item.rawText
+                .slice(item.actor.length)
+                .match(/^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段上げた$/)
+            : null;
+        if (temple) {
+          const field = `temple:${TEMPLES[temple[1]]}`;
+          gains[field] = (gains[field] ?? 0) + 1;
+          continue;
+        }
         const score =
           item.kind === 'unparsed'
             ? item.rawText.slice(item.actor.length).match(/^は(\d+)点を獲得した$/)
@@ -813,9 +836,12 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       const cost = typedResourceCost(outcome.row.action);
       for (const [field, amount] of Object.entries(gains)) {
         const resource = field.startsWith('resource:') ? field.slice(9) : null;
+        const temple = field.startsWith('temple:') ? field.slice(7) : null;
         const delta = resource
           ? next.resources[resource] - previous.resources[resource]
-          : next[field] - previous[field];
+          : temple
+            ? next.temples[temple] - previous.temples[temple]
+            : next[field] - previous[field];
         const knownCost = resource ? cost[RESOURCES.indexOf(resource)] : 0;
         const key = `${actor}:${field}:1`;
         const gross = (context.effects[key] ?? 0) + Math.max(0, delta + knownCost);
@@ -1139,7 +1165,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
               `observed ${event.kind}`,
               false,
               false,
-              purchaseOutcome(event, events, witness),
+              () => purchaseOutcome(event, events, witness),
             );
           } else if (event.kind === 'workerGain') automatic(event, 'workers', 1);
           else if (event.kind === 'resourceGain') {
