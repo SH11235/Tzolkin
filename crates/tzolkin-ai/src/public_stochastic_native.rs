@@ -22,7 +22,8 @@ use crate::public_stochastic::{
 use crate::public_stochastic_record::{
     AttemptStage, CALLBACK_RESERVE, Callback, Config, Counts, FINAL_RESERVE, Failure,
     FailureReason, FinalScoreWire, Header, MAX_RECORD_BYTES, MAX_SOURCE_BYTES, MAX_TRACE_BYTES,
-    RECORD_SCHEMA, Record, SOURCE_KIND, Sample, TRACE_RESERVE, Terminal, hex64, serialized_size,
+    OpponentChoice, RECORD_SCHEMA, Record, SOURCE_KIND, Sample, TRACE_RESERVE, Terminal, hex64,
+    serialized_size,
 };
 use crate::replay::{RULES_BASELINE, RULES_VERSION, catalog_hash, state_key};
 
@@ -466,14 +467,80 @@ pub(crate) fn run_shared<P: Serialize + PartialEq>(
 ) -> Result<Record<P>, String> {
     run_shared_with_apply(config, policy, schema, header, expected, apply_move)
 }
+
+pub(crate) fn run_mixed_shared<P: Serialize + PartialEq>(
+    config: &NativeStochasticConfig,
+    policy: NativePolicy<'_, '_>,
+    learner_seat: usize,
+    header: Header<P>,
+    expected: Option<&Record<P>>,
+) -> Result<Record<P>, String> {
+    run_loop(
+        config,
+        policy,
+        SamplingActors::One(learner_seat),
+        crate::public_mixed_native::RECORD_SCHEMA,
+        header,
+        expected,
+        apply_move,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SamplingActors {
+    All,
+    One(usize),
+}
+impl SamplingActors {
+    fn samples(self, actor: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::One(learner) => actor == learner,
+        }
+    }
+}
 fn run_shared_with_apply<P: Serialize + PartialEq>(
     config: &NativeStochasticConfig,
     policy: NativePolicy<'_, '_>,
     schema: &str,
     header: Header<P>,
     expected: Option<&Record<P>>,
+    apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
+) -> Result<Record<P>, String> {
+    run_loop(
+        config,
+        policy,
+        SamplingActors::All,
+        schema,
+        header,
+        expected,
+        apply,
+    )
+}
+fn run_loop<P: Serialize + PartialEq>(
+    config: &NativeStochasticConfig,
+    policy: NativePolicy<'_, '_>,
+    actors: SamplingActors,
+    schema: &str,
+    header: Header<P>,
+    expected: Option<&Record<P>>,
     mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
 ) -> Result<Record<P>, String> {
+    if let SamplingActors::One(learner) = actors
+        && (learner >= config.players || schema != crate::public_mixed_native::RECORD_SCHEMA)
+    {
+        return Err("Invalid mixed learner seat or schema".into());
+    }
+    if matches!(actors, SamplingActors::All)
+        && expected.is_some_and(|record| {
+            record
+                .callbacks
+                .iter()
+                .any(|callback| callback.opponent_choice.is_some() || callback.opponent_attempted)
+        })
+    {
+        return Err("Opponent fields are forbidden in an all-seat stochastic schema".into());
+    }
     if let Some(expected) = expected
         && expected.header != header
     {
@@ -498,6 +565,14 @@ fn run_shared_with_apply<P: Serialize + PartialEq>(
         return Err("Header and final diagnostic reservation exceed source cap".into());
     }
     let mut session = policy.session(config.sampling_identity)?;
+    // This fixed opponent snapshot is used only by the closed mixed route.
+    // Its action-row work is bounded by callbacks * the full-legal cap.
+    config
+        .limits
+        .callbacks
+        .checked_mul(4096)
+        .ok_or("Opponent action-row work bound overflow")?;
+    let opponent_weights = crate::policy::HeuristicWeights::default();
     let start = create_game_with_options(
         (0..config.players)
             .map(|p| format!("Stochastic P{p}"))
@@ -598,6 +673,8 @@ fn run_shared_with_apply<P: Serialize + PartialEq>(
             observation: admitted.map(|_| observation.clone()),
             state_before: before,
             sample: None,
+            opponent_choice: None,
+            opponent_attempted: false,
             sampler_attempted: false,
             apply_attempted: false,
             apply_succeeded: false,
@@ -620,9 +697,11 @@ fn run_shared_with_apply<P: Serialize + PartialEq>(
         };
         record.source_payload_reserved_bytes = admitted;
         let candidates = observation.legal_actions.len();
+        let sampling = actors.samples(observation.actor);
         let rows = session.counters().reserved_candidate_rows();
         if !(1..=4096).contains(&candidates)
-            || checked_add_with_cap(rows, candidates, config.limits.candidate_rows).is_none()
+            || (sampling
+                && checked_add_with_cap(rows, candidates, config.limits.candidate_rows).is_none())
         {
             fail(
                 &mut record,
@@ -634,73 +713,118 @@ fn run_shared_with_apply<P: Serialize + PartialEq>(
             check_callback(expected, &record, index)?;
             break;
         }
-        let Some(trace_reservation) = checked_add_with_cap(
-            record.trace_payload_reserved_bytes,
-            TRACE_RESERVE,
-            config.limits.trace_bytes,
-        ) else {
-            fail(
-                &mut record,
-                FailureReason::TracePayloadLimit,
-                AttemptStage::BeforeSample,
-                Some(index),
-                "Trace payload refused before sampling",
-            );
-            check_callback(expected, &record, index)?;
-            break;
-        };
-        record.trace_payload_reserved_bytes = trace_reservation;
-        record.callbacks[index].sampler_attempted = true;
-        record.counts.sampler_attempts += 1;
-        let sample = match session.sample(&observation) {
-            Ok(sample) => sample,
-            Err(error) => {
+        let decision = if sampling {
+            let Some(trace_reservation) = checked_add_with_cap(
+                record.trace_payload_reserved_bytes,
+                TRACE_RESERVE,
+                config.limits.trace_bytes,
+            ) else {
                 fail(
                     &mut record,
-                    FailureReason::ModelOrSamplingError,
+                    FailureReason::TracePayloadLimit,
                     AttemptStage::BeforeSample,
                     Some(index),
-                    &error,
+                    "Trace payload refused before sampling",
+                );
+                check_callback(expected, &record, index)?;
+                break;
+            };
+            record.trace_payload_reserved_bytes = trace_reservation;
+            record.callbacks[index].sampler_attempted = true;
+            record.counts.sampler_attempts += 1;
+            let sample = match session.sample(&observation) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    fail(
+                        &mut record,
+                        FailureReason::ModelOrSamplingError,
+                        AttemptStage::BeforeSample,
+                        Some(index),
+                        &error,
+                    );
+                    check_callback(expected, &record, index)?;
+                    break;
+                }
+            };
+            let wire = Sample::from_sample(&sample);
+            // Every successful draw is retained even if the following operation
+            // cannot be applied. No poisoned session can return another decision.
+            record.callbacks[index].sample = Some(wire);
+            let d = sample.decision();
+            if d.actor != observation.actor
+                || d.observation_key != observation.observation_key
+                || d.policy_version != policy.sampling_version()
+                || !d.score.is_finite()
+                || observation
+                    .legal_actions
+                    .iter()
+                    .filter(|a| **a == *sample.legal_action())
+                    .count()
+                    != 1
+                || sample.legal_action().r#move != d.r#move
+                || serialized_size(
+                    &record.callbacks[index].sample.as_ref().unwrap().trace,
+                    TRACE_RESERVE,
+                )
+                .is_err()
+            {
+                fail(
+                    &mut record,
+                    FailureReason::DecisionMismatch,
+                    AttemptStage::BeforeApply,
+                    Some(index),
+                    "Returned sample/decision/trace binding mismatch",
                 );
                 check_callback(expected, &record, index)?;
                 break;
             }
-        };
-        let wire = Sample::from_sample(&sample);
-        // Every successful draw is retained even if the following operation
-        // cannot be applied. No poisoned session can return another decision.
-        record.callbacks[index].sample = Some(wire);
-        let d = sample.decision();
-        if d.actor != observation.actor
-            || d.observation_key != observation.observation_key
-            || d.policy_version != policy.sampling_version()
-            || !d.score.is_finite()
-            || observation
+            d.clone()
+        } else {
+            record.callbacks[index].opponent_attempted = true;
+            let decision = match crate::choose_move_with_weights(&observation, &opponent_weights) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    fail(
+                        &mut record,
+                        FailureReason::ModelOrSamplingError,
+                        AttemptStage::BeforeSample,
+                        Some(index),
+                        &error,
+                    );
+                    check_callback(expected, &record, index)?;
+                    break;
+                }
+            };
+            let chosen = observation
                 .legal_actions
                 .iter()
-                .filter(|a| **a == *sample.legal_action())
-                .count()
-                != 1
-            || sample.legal_action().r#move != d.r#move
-            || serialized_size(
-                &record.callbacks[index].sample.as_ref().unwrap().trace,
-                TRACE_RESERVE,
-            )
-            .is_err()
-        {
-            fail(
-                &mut record,
-                FailureReason::DecisionMismatch,
-                AttemptStage::BeforeApply,
-                Some(index),
-                "Returned sample/decision/trace binding mismatch",
-            );
-            check_callback(expected, &record, index)?;
-            break;
-        }
+                .filter(|action| action.r#move == decision.r#move)
+                .collect::<Vec<_>>();
+            if decision.actor != observation.actor
+                || decision.observation_key != observation.observation_key
+                || decision.policy_version != crate::POLICY_VERSION
+                || !decision.score.is_finite()
+                || chosen.len() != 1
+            {
+                fail(
+                    &mut record,
+                    FailureReason::DecisionMismatch,
+                    AttemptStage::BeforeApply,
+                    Some(index),
+                    "Opponent decision/full legal binding mismatch",
+                );
+                check_callback(expected, &record, index)?;
+                break;
+            }
+            record.callbacks[index].opponent_choice = Some(OpponentChoice::from_decision(
+                &decision,
+                (*chosen[0]).clone(),
+            ));
+            decision
+        };
         record.callbacks[index].apply_attempted = true;
         record.counts.apply_attempts += 1;
-        match apply(&state, d.r#move.clone()) {
+        match apply(&state, decision.r#move) {
             Err(error) => {
                 fail(
                     &mut record,
