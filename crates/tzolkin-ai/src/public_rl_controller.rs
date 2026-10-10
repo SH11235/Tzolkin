@@ -251,6 +251,10 @@ impl ControllerReport {
 struct Driver<'a> {
     prepared: &'a PreparedPublicPolicy,
     session: RlTrainingSession,
+    store: Store,
+}
+
+struct Store {
     state: State,
     io: Phase,
     last_pin: Option<Pin>,
@@ -286,11 +290,14 @@ pub fn train(
     let mut driver = Driver {
         prepared,
         session,
-        state,
-        io: Phase::default(),
-        last_pin: None,
+        store: Store {
+            state,
+            io: Phase::default(),
+            last_pin: None,
+        },
     };
-    driver.save(directory)?;
+    driver.store.refresh_session(&driver.session)?;
+    driver.store.save(directory)?;
     driver.run(directory, true, None)
 }
 
@@ -324,31 +331,43 @@ pub fn resume(
     let driver = Driver {
         prepared,
         session,
-        state,
-        io: Phase::default(),
-        last_pin: Some(Pin {
-            bytes: bytes.len(),
-            sha256: expected_sha256.into(),
-        }),
+        store: Store {
+            state,
+            io: Phase::default(),
+            last_pin: Some(Pin {
+                bytes: bytes.len(),
+                sha256: expected_sha256.into(),
+            }),
+        },
     };
     driver.run(directory, false, abandon)
 }
 
-impl Driver<'_> {
-    fn save(&mut self, directory: &Path) -> Result<(), String> {
+impl Store {
+    fn refresh_session(&mut self, session: &RlTrainingSession) -> Result<(), String> {
         self.state.session_json =
-            String::from_utf8(self.session.checkpoint_bytes()?).map_err(|e| e.to_string())?;
+            String::from_utf8(session.checkpoint_bytes()?).map_err(|e| e.to_string())?;
         self.state.session_sha256 = sha(self.state.session_json.as_bytes());
-        self.state.sequence = self
+        Ok(())
+    }
+    fn save(&mut self, directory: &Path) -> Result<(), String> {
+        let sequence = self
             .state
             .sequence
             .checked_add(1)
-            .ok_or("Controller sequence overflow")?;
-        let bytes = serde_json::to_vec(&self.state).map_err(|e| e.to_string())?;
+            .filter(|n| *n <= 1000)
+            .ok_or("Controller sequence bound")?;
+        let previous = self.state.sequence;
+        self.state.sequence = sequence;
+        let encoded = serde_json::to_vec(&self.state);
+        self.state.sequence = previous;
+        let bytes = encoded.map_err(|e| e.to_string())?;
         if bytes.len() > MAX_STATE_BYTES {
             return Err("Controller checkpoint byte bound".into());
         }
-        self.last_pin = Some(self.publish(directory, &state_name(self.state.sequence), &bytes)?);
+        let pin = self.publish(directory, &state_name(sequence), &bytes)?;
+        self.state.sequence = sequence;
+        self.last_pin = Some(pin);
         Ok(())
     }
     fn publish(&mut self, directory: &Path, name: &str, bytes: &[u8]) -> Result<Pin, String> {
@@ -391,129 +410,31 @@ impl Driver<'_> {
         self.io.returned(began);
         result
     }
-    fn run(
-        mut self,
-        directory: &Path,
-        mut fresh: bool,
-        abandon: Option<&str>,
-    ) -> Result<ControllerReport, String> {
-        if let Some(reason) = abandon {
-            self.session.abandon_pending(reason)?;
-            let batch = self
-                .state
-                .batches
-                .last_mut()
-                .ok_or("No pending controller batch")?;
-            batch.outcome = Some("abandoned".into());
-            batch.error = Some(capped(reason));
-            self.save(directory)?;
-            return self.report("explicitAbandon", None);
+    fn read_records(&mut self, directory: &Path, batch: usize) -> Result<[Vec<u8>; 4], String> {
+        let mut records = Vec::with_capacity(4);
+        for member in 0..4 {
+            records.push(self.read_record(directory, batch, member)?);
         }
-        loop {
-            let progress = self.session.progress()?;
-            if !progress.unresolved_batch() {
-                if self.state.seed_range_exhausted {
-                    return self.report(
-                        "seedRangeExhausted",
-                        Some("Run exhausted its fixed metadata seed range".into()),
-                    );
-                }
-                if self.known_decisions() >= self.state.spec.decision_budget {
-                    return self.report("decisionBudget", None);
-                }
-                if progress.completed_updates() >= MAX_UPDATE_COUNT {
-                    return self.report("v1Count10Limit", None);
-                }
-                if progress.reserved_batches() >= self.state.spec.max_batches {
-                    return self.report("batchLimit", None);
-                }
-                let configs = match self.state.spec.allocate(
-                    &mut self.state.seed_cursor,
-                    progress.next_episode_ordinal(),
-                    self.session.consumed_families()?,
-                ) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        self.state.seed_range_exhausted = true;
-                        self.save(directory)?;
-                        return self.report("seedRangeExhausted", Some(e));
-                    }
-                };
-                if self.session.parent().is_some() {
-                    self.session.plan_next(configs.clone())?;
-                } else {
-                    self.session.plan_first(configs.clone())?;
-                }
-                self.state.batches.push(Batch {
-                    configurations: configs.each_ref().map(Config::from_config),
-                    members: std::array::from_fn(|_| Member::default()),
-                    outcome: None,
-                    error: None,
-                });
-                self.save(directory)?; // The reservation exists before any collection.
-                fresh = true;
-            }
-            let index = self.state.batches.len() - 1;
-            if fresh {
-                for member in 0..4 {
-                    self.collect_member(directory, index, member)?;
-                }
-            } else if self.state.batches[index].outcome.as_deref() == Some("gradientUnknown")
-                || self.state.batches[index]
-                    .members
-                    .iter()
-                    .any(|m| m.record.is_none())
-            {
-                return self.report("unknownPendingWork", None);
-            }
-            let result = self.audit_and_apply(directory, index);
-            match result {
-                Ok(changed) => {
-                    self.state.batches[index].outcome =
-                        Some(if changed { "updated" } else { "noChange" }.into());
-                    self.notices();
-                    self.save(directory)?;
-                    if !changed {
-                        return self.report("noChange", None);
-                    }
-                }
-                Err(error) => {
-                    if self.session.progress()?.unresolved_batch() {
-                        self.session.abandon_pending(&error)?;
-                    }
-                    self.state.batches[index].outcome = Some("failed".into());
-                    self.state.batches[index].error = Some(capped(&error));
-                    self.save(directory)?;
-                    return self.report("batchFailed", Some(capped(&error)));
-                }
-            }
-            fresh = true;
-        }
+        records
+            .try_into()
+            .map_err(|_| "Controller record member count".into())
     }
     fn collect_member(
         &mut self,
         directory: &Path,
         batch: usize,
         member: usize,
+        collect: impl FnOnce() -> Result<Vec<u8>, String>,
     ) -> Result<(), String> {
-        let config = self.state.batches[batch].configurations[member].checked_config()?;
         self.state.batches[batch].members[member].collection_started = true;
         self.state.collect.started_calls += 1;
-        self.save(directory)?;
+        if let Err(error) = self.save(directory) {
+            self.state.batches[batch].members[member].collection_started = false;
+            self.state.collect.started_calls -= 1;
+            return Err(error);
+        }
         let began = Instant::now();
-        let result = match self.session.parent() {
-            None => {
-                collect_native(&config, &self.prepared.handle()?).and_then(|g| encode_record(&g))
-            }
-            Some(RlUpdateParent::Count1(p)) => {
-                collect_rl_native(&config, &UpdatedPublicRlHandle::new(p)?)
-                    .and_then(|g| encode_rl_record(&g))
-            }
-            Some(RlUpdateParent::Repeated(p)) => {
-                collect_repeated_rl_native(&config, &RepeatedPublicRlHandle::new(p)?)
-                    .and_then(|g| encode_repeated_rl_record(&g))
-            }
-        };
+        let result = collect();
         self.state.collect.returned(began);
         match result {
             Ok(bytes) => {
@@ -531,22 +452,19 @@ impl Driver<'_> {
         &mut self,
         directory: &Path,
         batch: usize,
+        records: [Vec<u8>; 4],
         mut audit: impl FnMut(&[u8]) -> Result<T, String>,
     ) -> Result<[Result<T, String>; 4], String> {
         let mut results = Vec::with_capacity(4);
-        for member in 0..4 {
-            let bytes = self.read_record(directory, batch, member);
-            let result = match bytes {
-                Ok(bytes) => {
-                    self.state.audit.started_calls += 1;
-                    self.save(directory)?;
-                    let began = Instant::now();
-                    let result = audit(&bytes);
-                    self.state.audit.returned(began);
-                    result
-                }
-                Err(error) => Err(error),
-            };
+        for (member, bytes) in records.into_iter().enumerate() {
+            self.state.audit.started_calls += 1;
+            if let Err(error) = self.save(directory) {
+                self.state.audit.started_calls -= 1;
+                return Err(error);
+            }
+            let began = Instant::now();
+            let result = audit(&bytes);
+            self.state.audit.returned(began);
             self.state.batches[batch].members[member].audit_passed = result.is_ok();
             self.state.batches[batch].members[member].audit_error =
                 result.as_ref().err().map(|e| capped(e));
@@ -557,59 +475,222 @@ impl Driver<'_> {
             .try_into()
             .map_err(|_| "Controller audit member count".into())
     }
-    fn audit_and_apply(&mut self, directory: &Path, batch: usize) -> Result<bool, String> {
-        if self.session.parent().is_none() {
+    fn before_gradient(&mut self, directory: &Path, batch: usize) -> Result<(), String> {
+        let previous = self.state.batches[batch]
+            .outcome
+            .replace("gradientUnknown".into());
+        self.state.gradient.started_calls += 1;
+        if let Err(error) = self.save(directory) {
+            self.state.batches[batch].outcome = previous;
+            self.state.gradient.started_calls -= 1;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+impl Driver<'_> {
+    fn run(
+        mut self,
+        directory: &Path,
+        mut fresh: bool,
+        abandon: Option<&str>,
+    ) -> Result<ControllerReport, String> {
+        if let Some(reason) = abandon {
+            self.session.abandon_pending(reason)?;
+            let batch = self
+                .store
+                .state
+                .batches
+                .last_mut()
+                .ok_or("No pending controller batch")?;
+            batch.outcome = Some("abandoned".into());
+            batch.error = Some(capped(reason));
+            self.store.refresh_session(&self.session)?;
+            self.store.save(directory)?;
+            return self.report("explicitAbandon", None);
+        }
+        loop {
+            let progress = self.session.progress()?;
+            if !progress.unresolved_batch() {
+                if self.store.state.seed_range_exhausted {
+                    return self.report(
+                        "seedRangeExhausted",
+                        Some("Run exhausted its fixed metadata seed range".into()),
+                    );
+                }
+                if self.known_decisions() >= self.store.state.spec.decision_budget {
+                    return self.report("decisionBudget", None);
+                }
+                if progress.completed_updates() >= MAX_UPDATE_COUNT {
+                    return self.report("v1Count10Limit", None);
+                }
+                if progress.reserved_batches() >= self.store.state.spec.max_batches {
+                    return self.report("batchLimit", None);
+                }
+                let configs = match self.store.state.spec.allocate(
+                    &mut self.store.state.seed_cursor,
+                    progress.next_episode_ordinal(),
+                    self.session.consumed_families()?,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        if self.store.state.seed_cursor == self.store.state.spec.end_seed() {
+                            self.store.state.seed_range_exhausted = true;
+                            self.store.save(directory)?;
+                            return self.report("seedRangeExhausted", Some(e));
+                        }
+                        return Err(e);
+                    }
+                };
+                if self.session.parent().is_some() {
+                    self.session.plan_next(configs.clone())?;
+                } else {
+                    self.session.plan_first(configs.clone())?;
+                }
+                self.store.state.batches.push(Batch {
+                    configurations: configs.each_ref().map(Config::from_config),
+                    members: std::array::from_fn(|_| Member::default()),
+                    outcome: None,
+                    error: None,
+                });
+                self.store.refresh_session(&self.session)?;
+                self.store.save(directory)?; // The reservation exists before any collection.
+                fresh = true;
+            }
+            let index = self.store.state.batches.len() - 1;
+            if fresh {
+                for member in 0..4 {
+                    self.collect_member(directory, index, member)?;
+                }
+            } else if self.store.state.batches[index].outcome.as_deref() == Some("gradientUnknown")
+                || self.store.state.batches[index]
+                    .members
+                    .iter()
+                    .any(|m| m.record.is_none())
+            {
+                return self.report("unknownPendingWork", None);
+            }
+            // Infrastructure failure must not resolve/abandon pending work.
+            let result = self.audit_and_apply(directory, index)?;
+            match result {
+                Ok(changed) => {
+                    self.store.state.batches[index].outcome =
+                        Some(if changed { "updated" } else { "noChange" }.into());
+                    self.notices();
+                    self.store.save(directory)?;
+                    if !changed {
+                        return self.report("noChange", None);
+                    }
+                }
+                Err(error) => {
+                    if self.session.progress()?.unresolved_batch() {
+                        self.session.abandon_pending(&error)?;
+                    }
+                    self.store.state.batches[index].outcome = Some("failed".into());
+                    self.store.state.batches[index].error = Some(capped(&error));
+                    self.store.refresh_session(&self.session)?;
+                    self.store.save(directory)?;
+                    return self.report("batchFailed", Some(capped(&error)));
+                }
+            }
+            fresh = true;
+        }
+    }
+    fn collect_member(
+        &mut self,
+        directory: &Path,
+        batch: usize,
+        member: usize,
+    ) -> Result<(), String> {
+        let config = self.store.state.batches[batch].configurations[member].checked_config()?;
+        match self.session.parent() {
+            None => {
+                let handle = self.prepared.handle()?;
+                self.store.collect_member(directory, batch, member, || {
+                    collect_native(&config, &handle).and_then(|g| encode_record(&g))
+                })
+            }
+            Some(RlUpdateParent::Count1(p)) => {
+                let handle = UpdatedPublicRlHandle::new(p)?;
+                self.store.collect_member(directory, batch, member, || {
+                    collect_rl_native(&config, &handle).and_then(|g| encode_rl_record(&g))
+                })
+            }
+            Some(RlUpdateParent::Repeated(p)) => {
+                let handle = RepeatedPublicRlHandle::new(p)?;
+                self.store.collect_member(directory, batch, member, || {
+                    collect_repeated_rl_native(&config, &handle)
+                        .and_then(|g| encode_repeated_rl_record(&g))
+                })
+            }
+        }
+    }
+    // Outer errors are storage/handle failures. Only a finished cohort or
+    // attempted update can produce an inner rejection that resolves a batch.
+    fn audit_and_apply(
+        &mut self,
+        directory: &Path,
+        batch: usize,
+    ) -> Result<Result<bool, String>, String> {
+        if self.store.state.batches[batch]
+            .members
+            .iter()
+            .any(|m| m.record.is_none())
+        {
+            return Ok(Err("Cohort contains a failed collection".into()));
+        }
+        // Verify every pin before any audit, metadata save or session mutation.
+        let records = self.store.read_records(directory, batch)?;
+        let result = if self.session.parent().is_none() {
             let plan = self.session.pending_first_plan()?;
             let handle = self.prepared.handle()?;
-            let results = self.audit_members(directory, batch, |b| {
+            let results = self.store.audit_members(directory, batch, records, |b| {
                 ValidatedPolicyEpisode::from_audited(audit_record_bytes(b, &handle)?)
             })?;
-            let cohort = plan.finish(results)?;
-            self.before_gradient(directory, batch)?;
+            let cohort = match plan.finish(results) {
+                Ok(cohort) => cohort,
+                Err(error) => return Ok(Err(error)),
+            };
+            self.store.before_gradient(directory, batch)?;
             let began = Instant::now();
             let result = self.session.apply_first(&cohort);
-            self.state.gradient.returned(began);
+            self.store.state.gradient.returned(began);
             result
         } else {
             let plan = self.session.pending_next_plan()?;
-            // Audit against the immutable parent. A temporary restored session
-            // holds its borrow while this driver's progress metadata is saved.
-            let parent = RlTrainingSession::restore(
-                InitializedPublicRlPolicy::from_bc(self.prepared)?,
-                self.state.session_json.as_bytes(),
-                &self.state.session_sha256,
-            )?;
-            let results = match parent.parent().ok_or("Missing RL parent")? {
+            let results = match self.session.parent().ok_or("Missing RL parent")? {
                 RlUpdateParent::Count1(p) => {
                     let handle = UpdatedPublicRlHandle::new(p)?;
-                    self.audit_members(directory, batch, |b| {
+                    self.store.audit_members(directory, batch, records, |b| {
                         ValidatedRlPolicyEpisode::from_audited(audit_rl_record_bytes(b, &handle)?)
                     })?
                 }
                 RlUpdateParent::Repeated(p) => {
                     let handle = RepeatedPublicRlHandle::new(p)?;
-                    self.audit_members(directory, batch, |b| {
+                    self.store.audit_members(directory, batch, records, |b| {
                         ValidatedRlPolicyEpisode::from_repeated_audited(
                             audit_repeated_rl_record_bytes(b, &handle)?,
                         )
                     })?
                 }
             };
-            let cohort = plan.finish(results)?;
-            self.before_gradient(directory, batch)?;
+            let cohort = match plan.finish(results) {
+                Ok(cohort) => cohort,
+                Err(error) => return Ok(Err(error)),
+            };
+            self.store.before_gradient(directory, batch)?;
             let began = Instant::now();
             let result = self.session.apply_next(&cohort);
-            self.state.gradient.returned(began);
+            self.store.state.gradient.returned(began);
             result
-        }
-    }
-    fn before_gradient(&mut self, directory: &Path, batch: usize) -> Result<(), String> {
-        self.state.batches[batch].outcome = Some("gradientUnknown".into());
-        self.state.gradient.started_calls += 1;
-        self.save(directory)
+        };
+        self.store.refresh_session(&self.session)?;
+        Ok(result)
     }
     fn known_decisions(&self) -> u64 {
-        self.state
+        self.store
+            .state
             .batches
             .iter()
             .flat_map(|b| &b.members)
@@ -618,13 +699,14 @@ impl Driver<'_> {
             .sum()
     }
     fn notices(&mut self) {
-        self.state.evaluation_due = self.known_decisions() / self.state.spec.evaluation_interval;
+        self.store.state.evaluation_due =
+            self.known_decisions() / self.store.state.spec.evaluation_interval;
     }
     fn report(self, reason: &str, error: Option<String>) -> Result<ControllerReport, String> {
         let decisions = self.known_decisions();
         let mut counts = [0u64; 7];
         let mut unknown = 0;
-        for m in self.state.batches.iter().flat_map(|b| &b.members) {
+        for m in self.store.state.batches.iter().flat_map(|b| &b.members) {
             if let Some(w) = &m.known_work {
                 for (sum, value) in counts.iter_mut().zip([
                     w.observed_callbacks,
@@ -644,8 +726,10 @@ impl Driver<'_> {
         Ok(ControllerReport {
             schema: "tzolkin-public-rl-controller-report-v1",
             stop_reason: reason.into(),
+            decision_budget_reached: reason == "decisionBudget"
+                && error.is_none()
+                && decisions >= self.store.state.spec.decision_budget,
             error,
-            decision_budget_reached: decisions >= self.state.spec.decision_budget,
             session_progress: self.session.progress()?,
             known_collection_work: Work {
                 observed_callbacks: counts[0],
@@ -660,15 +744,16 @@ impl Driver<'_> {
             accepted_multi_candidate_rows: counts[5] - counts[6],
             unknown_collection_calls: unknown,
             native_forward_calls: None,
-            collect: self.state.collect,
-            audit: self.state.audit,
-            gradient: self.state.gradient,
-            invocation_io: self.io,
-            evaluation_due_notice_count: self.state.evaluation_due,
-            evaluation_interval: self.state.spec.evaluation_interval,
+            collect: self.store.state.collect,
+            audit: self.store.state.audit,
+            gradient: self.store.state.gradient,
+            invocation_io: self.store.io,
+            evaluation_due_notice_count: self.store.state.evaluation_due,
+            evaluation_interval: self.store.state.spec.evaluation_interval,
             evaluations_performed: 0,
-            checkpoint_file: state_name(self.state.sequence),
+            checkpoint_file: state_name(self.store.state.sequence),
             checkpoint_sha256: self
+                .store
                 .last_pin
                 .ok_or("Controller checkpoint unavailable")?
                 .sha256,
@@ -738,13 +823,23 @@ fn validate_metadata(
         {
             return Err("Controller/session batch outcomes differ".into());
         }
-        for (m, c) in batch.members.iter().zip(&batch.configurations) {
+        for (member, (m, c)) in batch.members.iter().zip(&batch.configurations).enumerate() {
             let seed = c.environment_seed as u64;
             if seed < state.spec.environment_seed_start as u64
                 || seed >= state.spec.end_seed()
                 || seed >= state.seed_cursor
+                || c.players != if member < 2 { 3 } else { 4 }
+                || c.checked_config()?.limits() != &state.spec.limits()?
+                || state
+                    .spec
+                    .excluded_families
+                    .binary_search(&seed_family_id(c.environment_seed))
+                    .is_ok()
             {
-                return Err("Controller reserved seed lies outside its cursor/range".into());
+                return Err(
+                    "Controller reserved configuration differs from fixed range/limits/exclusions"
+                        .into(),
+                );
             }
             if m.record
                 .as_ref()
@@ -955,6 +1050,27 @@ mod tests {
             excluded_families: vec![],
         }
     }
+    fn state(spec: RunSpec, configs: [NativeStochasticConfig; 4], cursor: u64) -> State {
+        State {
+            schema: STATE_SCHEMA.into(),
+            spec,
+            session_json: String::new(),
+            session_sha256: String::new(),
+            seed_cursor: cursor,
+            seed_range_exhausted: false,
+            sequence: 10,
+            batches: vec![Batch {
+                configurations: configs.each_ref().map(Config::from_config),
+                members: std::array::from_fn(|_| Member::default()),
+                outcome: None,
+                error: None,
+            }],
+            collect: Phase::default(),
+            audit: Phase::default(),
+            gradient: Phase::default(),
+            evaluation_due: 0,
+        }
+    }
     #[test]
     fn fixed_plan_and_resume_metadata_reject_inconsistency() {
         let spec = spec();
@@ -980,25 +1096,7 @@ mod tests {
             spec.allocate(&mut replay_cursor, 0, excluded).unwrap()
         );
         assert_eq!(cursor, replay_cursor);
-        let mut state = State {
-            schema: STATE_SCHEMA.into(),
-            spec,
-            session_json: String::new(),
-            session_sha256: String::new(),
-            seed_cursor: cursor,
-            seed_range_exhausted: false,
-            sequence: 10,
-            batches: vec![Batch {
-                configurations: configs.each_ref().map(Config::from_config),
-                members: std::array::from_fn(|_| Member::default()),
-                outcome: None,
-                error: None,
-            }],
-            collect: Phase::default(),
-            audit: Phase::default(),
-            gradient: Phase::default(),
-            evaluation_due: 0,
-        };
+        let mut state = state(spec, configs, cursor);
         // Two known returned prefixes and an interrupted third call retain
         // work separately from any completed-cohort session progress.
         for member in &mut state.batches[0].members[..2] {
@@ -1033,6 +1131,18 @@ mod tests {
         state.batches[0].outcome = None;
         state.collect.returned_calls = 3;
         assert!(validate_metadata(&state, &reservations, 1).is_err());
+        state.collect.returned_calls = 2;
+        let original = state.batches[0].configurations[0].clone();
+        state.batches[0].configurations[0].max_callbacks -= 1;
+        let mut matching = reservations.clone();
+        matching[0]["configurations"] =
+            serde_json::to_value(&state.batches[0].configurations).unwrap();
+        assert!(validate_metadata(&state, &matching, 1).is_err());
+        state.batches[0].configurations[0] = original;
+        state.spec.excluded_families.push(seed_family_id(
+            state.batches[0].configurations[0].environment_seed,
+        ));
+        assert!(validate_metadata(&state, &reservations, 1).is_err());
     }
     #[test]
     fn new_only_io_preserves_collisions_and_rejects_corruption() {
@@ -1054,9 +1164,57 @@ mod tests {
             .is_err()
         );
         assert!(closed::<Member>(br#"{"collectionStarted":false}"#, 1024).is_err());
-        fs::remove_file(root.join("record.json")).unwrap();
-        fs::remove_file(root.join("other.json.tmp")).unwrap();
-        fs::remove_file(root.join("other.json")).unwrap();
-        fs::remove_dir(root).unwrap();
+        let spec = spec();
+        let mut cursor = 0;
+        let configs = spec.allocate(&mut cursor, 0, BTreeSet::new()).unwrap();
+        let mut store = Store {
+            state: state(spec, configs, cursor),
+            io: Phase::default(),
+            last_pin: None,
+        };
+        store.state.sequence = 0;
+        // Synthetic counters exercise storage only, not native audit or a policy.
+        let record = serde_json::to_vec(&serde_json::json!({
+            "counts": {"observedCallbacks":0, "samplerAttempts":0, "acceptedSamples":0,
+                "applySuccesses":0, "candidateRowsReserved":0}, "callbacks":[]
+        }))
+        .unwrap();
+        for member in 0..4 {
+            store.state.batches[0].members[member].record =
+                Some(publish(&root, &record_name(0, member), &record).unwrap());
+            store.state.batches[0].members[member].known_work = Some(work(&record).unwrap());
+        }
+        store.save(&root).unwrap();
+        let unchanged = serde_json::to_vec(&store.state).unwrap();
+        fs::remove_file(root.join(record_name(0, 3))).unwrap();
+        assert!(store.read_records(&root, 0).is_err());
+        assert_eq!(serde_json::to_vec(&store.state).unwrap(), unchanged);
+        fs::write(root.join(record_name(0, 3)), b"corrupt").unwrap();
+        assert!(store.read_records(&root, 0).is_err());
+        assert_eq!(serde_json::to_vec(&store.state).unwrap(), unchanged);
+        fs::write(root.join(record_name(0, 3)), &record).unwrap();
+        let records = store.read_records(&root, 0).unwrap();
+        fs::write(root.join(state_name(2)), b"existing checkpoint").unwrap();
+        let mut audit_called = false;
+        assert!(
+            store
+                .audit_members(&root, 0, records, |_| {
+                    audit_called = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(!audit_called);
+        assert!(store.before_gradient(&root, 0).is_err());
+        assert_eq!(serde_json::to_vec(&store.state).unwrap(), unchanged);
+        assert_eq!(
+            fs::read(root.join(state_name(2))).unwrap(),
+            b"existing checkpoint"
+        );
+        assert!(!root.join(state_name(3)).exists());
+        store.state.sequence = 1000;
+        assert!(store.save(&root).is_err());
+        assert_eq!(store.state.sequence, 1000);
+        fs::remove_dir_all(root).unwrap();
     }
 }
