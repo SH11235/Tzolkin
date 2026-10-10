@@ -63,6 +63,9 @@ impl PreparedPublicPolicy {
     pub fn backend(&self) -> &'static str {
         self.kernel.backend()
     }
+    pub(crate) fn initialization_families(&self) -> (&BTreeSet<String>, &BTreeSet<String>) {
+        (&self.train_families, &self.non_test_families)
+    }
     pub fn handle(&self) -> Result<PublicPolicyHandle<'_>, String> {
         let checkpoint = &self.checkpoint;
         let loaded = LoadedPublicPolicy::with_resolved(&checkpoint.model, self.kernel)?;
