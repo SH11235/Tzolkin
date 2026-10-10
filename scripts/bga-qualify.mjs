@@ -311,6 +311,102 @@ function initialOrder(document, tableId, names) {
   return order;
 }
 
+// Decode only retained first-day turn boundaries. The order becomes usable
+// after the third distinct actor's prompt, never retroactively for earlier rows.
+export function causalTurnOrder(companion, documents, record, names) {
+  if (names.length !== 4 || new Set(names).size !== 4)
+    fail('Causal turn order requires four distinct players');
+  const read = (witnessId) => {
+    const witness = one(companion.witnesses, (w) => w.id === witnessId, 'order witness');
+    const definition = one(
+      companion.evidenceFiles,
+      (f) => f.id === witness.fileId,
+      'order evidence',
+    );
+    const board = JSON.parse(documents.get(witness.fileId))[witness.index];
+    if (board.sourceActionId !== witness.actionId || board.round !== 1)
+      fail('Causal order needs a first-day source boundary');
+    return { witness, definition, board };
+  };
+  const initial = read(companion.initialWitnessId);
+  const identities = names.map((name) => {
+    const player = one(initial.board.players, (p) => p.name === name, 'order source actor');
+    if (typeof player.id !== 'string' || !/^[1-9][0-9]{0,15}$/.test(player.id))
+      fail('Invalid order source actor ID');
+    return { name, id: player.id };
+  });
+  if (new Set(identities.map((p) => p.id)).size !== 4) fail('Duplicate order source actor ID');
+  const actor = ({ board, definition }) => {
+    if (
+      !same(
+        board.players
+          ?.map((p) => ({ name: p.name, id: p.id }))
+          .sort((a, b) => a.id.localeCompare(b.id)),
+        [...identities].sort((a, b) => a.id.localeCompare(b.id)),
+      )
+    )
+      fail('Causal order source roster changed');
+    const suffix = 'はワーカーを置くか取り除くかしてください';
+    if (board.title === `あなた${suffix}`) {
+      const viewers = new URL(definition.reference).searchParams.getAll('player');
+      if (viewers.length !== 1) fail('Ambiguous causal order viewer');
+      return one(identities, (p) => p.id === viewers[0], 'causal order viewer').name;
+    }
+    return one(identities, (p) => board.title === `${p.name}${suffix}`, 'causal order prompt').name;
+  };
+  const first = actor(initial);
+  const firstIdentity = identities.find((p) => p.name === first);
+  if (initial.board.firstPlayer !== `firstplayer_${firstIdentity.id}`)
+    fail('Causal initial prompt/first-player token mismatch');
+  const order = [first];
+  const boundaries = [];
+  const receipt = ({ witness, definition }) => ({
+    witnessId: witness.id,
+    fileId: witness.fileId,
+    index: witness.index,
+    actionId: witness.actionId,
+    sha256: definition.sha256,
+  });
+  let previousId = initial.witness.actionId;
+  for (const step of record.steps) {
+    if (names[step.actor] !== order.at(-1)) fail('Causal order prior actor mismatch');
+    if (step.move.type === 'place') continue;
+    if (
+      step.move.type !== 'endTurn' ||
+      step.move.doubleAdvance ||
+      step.sourceActionIds.length !== 1
+    )
+      fail('Unsupported operation before causal order is known');
+    const node = one(
+      companion.timeline,
+      (n) => n.kind === 'move' && same(n.step, step),
+      'causal end-turn operation',
+    );
+    const boundary = read(node.witnessId);
+    if (
+      boundary.witness.actionId !== step.sourceActionIds[0] ||
+      boundary.witness.actionId <= previousId
+    )
+      fail('Causal order boundary is not strictly ordered');
+    const next = actor(boundary);
+    if (order.includes(next)) fail('Repeated actor before first-day order is known');
+    order.push(next);
+    boundaries.push(receipt(boundary));
+    previousId = boundary.witness.actionId;
+    if (order.length === 3) {
+      // The unchanged basic four-player cycle fixes the sole remaining actor.
+      order.push(one(identities, (p) => !order.includes(p.name), 'remaining cycle actor').name);
+      return {
+        names: order,
+        knownAfterActionId: previousId,
+        initial: receipt(initial),
+        boundaries,
+      };
+    }
+  }
+  fail('Causal turn order has not reached three distinct actor prompts');
+}
+
 // Only four-player, initial setup-complete board captures are supported. This
 // decodes DOM counters/styles/empty spaces, not the reconstructed native state.
 export function decodeInitialBoard(board, names) {
@@ -676,6 +772,7 @@ export function auditQualification(
   const proofResults = [];
   const seenKinds = new Set();
   let fixedNames;
+  let causalOrder;
   let initialBoard;
   const names = record.initial.players.map((p) => p.name);
   // Even rejected labels use the captured player's stable BGA ID. This is an
@@ -720,6 +817,16 @@ export function auditQualification(
           sha256: source.definition.sha256,
           interpretation: 'explicit initial order field is immutable table setup metadata',
         });
+      } else if (proof.kind === 'causalTurnOrderV1') {
+        keys(proof, ['kind'], 'causal order proof');
+        causalOrder = causalTurnOrder(companion, strictDocuments, record, names);
+        fixedNames = causalOrder.names;
+        proofResults.push({
+          kind: proof.kind,
+          ...causalOrder,
+          interpretation:
+            'retained day-one public prompts plus the basic four-player cycle; earlier labels deferred',
+        });
       } else if (proof.kind === 'initialBoardV1') {
         keys(proof, ['kind', 'witnessId'], 'initial board proof');
         if (proof.witnessId !== companion.initialWitnessId)
@@ -749,8 +856,12 @@ export function auditQualification(
       reasons.push(`${proof.kind}: ${error.message}`);
     }
   }
-  for (const kind of ['fixedTableSettingsV1', 'initialTurnOrderV1', 'initialBoardV1'])
+  for (const kind of ['fixedTableSettingsV1', 'initialBoardV1'])
     if (!seenKinds.has(kind)) reasons.push(`Missing proof decoder: ${kind}`);
+  if (!seenKinds.has('initialTurnOrderV1') && !seenKinds.has('causalTurnOrderV1'))
+    reasons.push('Missing proof decoder: initialTurnOrderV1');
+  if (seenKinds.has('initialTurnOrderV1') && seenKinds.has('causalTurnOrderV1'))
+    reasons.push('Choose exactly one fixed or causal order proof');
   if (fixedNames && !same(fixedNames, names))
     reasons.push('Initial roster must use the independently decoded cycle order');
   let publicInput;
@@ -788,6 +899,8 @@ export function auditQualification(
         state: native.frames[index].snapshot.state,
       }).observation;
       let chosen = null;
+      if (causalOrder && Math.min(...sourceIds) <= causalOrder.knownAfterActionId)
+        candidateReasons.push('Turn order is not yet established at this decision');
       if (nativeInput?.phase !== 'playing' || nativeInput.pendingTask !== null)
         candidateReasons.push('Setup/pending task labels are not supported');
       if (sourceIds.length !== 1)
@@ -857,7 +970,9 @@ export function auditQualification(
     featureCount: 512,
     featureEncoderSourceSha256: FEATURE_SOURCE_SHA256,
     featureEncoderSourceChain: FEATURE_SOURCE_CHAIN.map((entry) => ({ ...entry })),
-    dependencyDecoder: 'public-v2-basic-four-player-first-day-v1',
+    dependencyDecoder: causalOrder
+      ? 'public-v2-basic-four-player-first-day-causal-order-v1'
+      : 'public-v2-basic-four-player-first-day-v1',
     rawSha256: sha256(rawBytes),
     reconstructionSha256: sha256(reconstructionBytes),
     recordSha256: strict.manifest.recordSha256,
@@ -886,8 +1001,12 @@ export function auditQualification(
     limitations: [
       'An audit report only: no feature arrays, samples, model or value supervision are exported.',
       'Checksums bind local evidence bytes; they do not authenticate BGA or certify how a capture was collected.',
-      'Supported placement inputs require four players, basic rules, initial empty board, fixed initial order and day 1.',
-      'Settings/order are explicitly named immutable setup fields; later dynamic state never supplies earlier inputs.',
+      causalOrder
+        ? 'Supported placement inputs require four players, basic rules, initial empty board, causally established initial cycle order and day 1.'
+        : 'Supported placement inputs require four players, basic rules, initial empty board, fixed initial order and day 1.',
+      causalOrder
+        ? 'Causal order uses retained public turn prompts; rows before its evidence boundary stay rejected.'
+        : 'Settings/order are explicitly named immutable setup fields; later dynamic state never supplies earlier inputs.',
       'Basic setup defaults and catalog effects are conditional derivations, not direct DOM observations.',
       'The closed artwork decoder refuses other sprite layouts; identical small-farm copies are canonical equivalents.',
       'Private offer/selection/key fields are excluded in Playing v2; they are not replaced with feature zeros.',

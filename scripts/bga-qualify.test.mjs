@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import {
   auditQualification,
+  causalTurnOrder,
   decodeInitialBoard,
   dependencyPrefixes,
   MAX_DEPENDENCY_IDS,
@@ -20,9 +21,12 @@ import {
 } from './bga-qualify.mjs';
 import { coreDispatcher, counterCheckpoint } from './bga-replay.mjs';
 
-const nativeCli = resolve(
+const nativeCliPath = resolve(
   'target/debug/' + (process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai'),
 );
+// The offline path validator needs a regular executable, including when the
+// test workspace shares a target directory through a junction.
+const nativeCli = existsSync(nativeCliPath) ? realpathSync(nativeCliPath) : nativeCliPath;
 const integration = {
   skip: !existsSync(nativeCli) && 'Build tzolkin-ai for authoritative integration',
 };
@@ -325,6 +329,192 @@ function audit(input, dispatch = coreDispatcher(nativeCli)) {
     dispatch,
   );
 }
+
+function causalFixture() {
+  const input = fixture();
+  const { boards, companion, raw, qualification } = input;
+  // Extend the independently authored source with first-day public prompts and
+  // placements. No native output supplies counters, positions or prompt actors.
+  const append = (id, actor, gear = null) => {
+    const board = structuredClone(boards.at(-1));
+    board.sourceActionId = id;
+    board.title = `${names[actor]}はワーカーを置くか取り除くかしてください`;
+    const move = gear ? { type: 'place', gear } : { type: 'endTurn' };
+    if (gear) {
+      const position = board.workers.filter((w) =>
+        w.parent.startsWith(`workerplace_${gear}_`),
+      ).length;
+      board.players[actor].counters.worker--;
+      board.players[actor].counters.corn -= position;
+      const place = board.workerPlaces.find((p) => p.id === `workerplace_${gear}_${position}`);
+      board.workers.push({
+        id: `worker_${id}`,
+        class: `worker ${['green', 'red', 'blue', 'white'][actor]}`,
+        parent: place.id,
+        rect: structuredClone(place.rect),
+      });
+      const label = { palenque: 'Palenque', uxmal: 'Uxmal', tikal: 'Tikal' }[gear];
+      const text = `${names[actor]}は${label}の歯車に${position}\nを支払ってワーカーを置いた`;
+      raw.entries.push({ action_id: id, raw_text: text, timestamp_display: '12:00:00' });
+      raw.dom_entries.push({
+        action_id: id,
+        timestamp_display: '12:00:00',
+        messages: [{ raw_text: text, html: text, icons: [{ classes: 'resource_corn' }] }],
+      });
+      raw.entry_count++;
+      companion.coverage.push({
+        actionId: id,
+        messageIndex: 0,
+        kind: 'move',
+        moveIds: [`op${id}`],
+      });
+    }
+    boards.push(board);
+    const expected = counterCheckpoint(board, names);
+    const step = {
+      actor: gear ? actor : actor - 1,
+      move,
+      sourceActionIds: [id],
+      refills: { currentAge: [], age2: [] },
+      checkpoint: { source: { reference, actionIds: [id] }, expected },
+    };
+    companion.witnesses.push({
+      id: `w${id}`,
+      actionId: id,
+      fileId: 'boards',
+      index: boards.length - 1,
+      expected,
+    });
+    companion.timeline.push({ kind: 'move', id: `op${id}`, step, witnessId: `w${id}` });
+    companion.record.steps.push(step);
+  };
+  append(11, 1);
+  append(12, 1, 'palenque');
+  append(13, 2);
+  append(14, 2, 'uxmal');
+  append(15, 3);
+  append(16, 3, 'tikal');
+  companion.cutoffActionId = 16;
+  // A viewer-relative prompt resolves to this capture's stable source ID.
+  companion.evidenceFiles[0].reference = reference.replace('player=100', 'player=102');
+  boards.find((b) => b.sourceActionId === 13).title =
+    'あなたはワーカーを置くか取り除くかしてください';
+  qualification.sourceFiles = qualification.sourceFiles.filter((s) => s.id !== 'order');
+  qualification.proofs[1] = { kind: 'causalTurnOrderV1' };
+  return input;
+}
+
+test('causal prompt order resolves every cycle and refuses ambiguous or future-only evidence', () => {
+  for (let rotation = 0; rotation < 4; rotation++) {
+    const input = causalFixture();
+    const order = [...names.slice(rotation), ...names.slice(0, rotation)];
+    input.boards[0].title = `${order[0]}はワーカーを置くか取り除くかしてください`;
+    input.boards[0].firstPlayer = `firstplayer_${100 + names.indexOf(order[0])}`;
+    for (const [id, name] of [
+      [11, order[1]],
+      [13, order[2]],
+    ])
+      input.boards.find((b) => b.sourceActionId === id).title =
+        `${name}はワーカーを置くか取り除くかしてください`;
+    const decoded = causalTurnOrder(
+      input.companion,
+      new Map([['boards', bytes(input.boards)]]),
+      input.companion.record,
+      order,
+    );
+    assert.deepEqual(decoded.names, order);
+    assert.equal(decoded.knownAfterActionId, 13);
+  }
+  for (const mutate of [
+    (i) => {
+      i.boards.find((b) => b.sourceActionId === 13).title =
+        'Bはワーカーを置くか取り除くかしてください';
+    },
+    (i) => {
+      i.boards.find((b) => b.sourceActionId === 13).title = '未知の公開prompt';
+    },
+    (i) => {
+      i.companion.evidenceFiles[0].reference += '&player=103';
+    },
+    (i) => {
+      i.boards.find((b) => b.sourceActionId === 13).round = 2;
+    },
+    (i) => {
+      i.boards.find((b) => b.sourceActionId === 13).players.pop();
+    },
+    (i) => {
+      const players = i.boards.find((b) => b.sourceActionId === 13).players;
+      players[3].id = players[2].id;
+    },
+    (i) => {
+      i.companion.record.steps = i.companion.record.steps.filter((s) => s.sourceActionIds[0] < 13);
+    },
+  ]) {
+    const input = causalFixture();
+    mutate(input);
+    assert.throws(() =>
+      causalTurnOrder(
+        input.companion,
+        new Map([['boards', bytes(input.boards)]]),
+        input.companion.record,
+        names,
+      ),
+    );
+  }
+});
+
+test(
+  'native causal qualification defers early rows and preserves settings and exclusive-proof gates',
+  integration,
+  () => {
+    const input = causalFixture();
+    const report = audit(input);
+    assert.deepEqual(report.counts, {
+      candidates: 5,
+      accepted: 2,
+      rejected: 3,
+      emittedSamples: 0,
+      valueLabels: 0,
+    });
+    assert.deepEqual(
+      report.candidates.filter((c) => c.accepted).map((c) => [c.sourceActionIds, c.chosenIndex]),
+      [
+        [[14], 3],
+        [[16], 2],
+      ],
+    );
+    assert.ok(
+      report.candidates
+        .slice(0, 3)
+        .every(
+          (c) =>
+            c.reasons.includes('Turn order is not yet established at this decision') &&
+            c.chosenIndex === null &&
+            c.qualifiedLegalCandidates === null,
+        ),
+    );
+    assert.equal(report.proofs.find((p) => p.kind === 'causalTurnOrderV1').knownAfterActionId, 13);
+    for (const candidate of report.candidates.filter((c) => c.accepted)) {
+      assert.ok([11, 13].every((id) => candidate.inputDynamicActionIds.includes(id)));
+      assert.ok(candidate.inputDynamicActionIds.every((id) => id < candidate.inputBeforeActionId));
+    }
+    assert.equal(report.sourceAuditPassed, false);
+    assert.equal(report.trainingReady, false);
+    for (const mutate of [
+      (i) => {
+        i.source.settings.visibleConfiguration = i.source.settings.visibleConfiguration.slice(0, 2);
+      },
+      (i) => {
+        i.qualification.sourceFiles.push(fixture().qualification.sourceFiles[1]);
+        i.qualification.proofs.push({ kind: 'initialTurnOrderV1', fileId: 'order' });
+      },
+    ]) {
+      const invalid = causalFixture();
+      mutate(invalid);
+      assert.equal(audit(invalid).counts.accepted, 0);
+    }
+  },
+);
 
 test('table-family identity uses the frozen domain and excludes native actor indices', () => {
   assert.equal(
