@@ -25,6 +25,7 @@ pub mod public_rl_native;
 pub mod public_rl_policy_cohort;
 pub mod public_rl_policy_episode;
 pub mod public_rl_repeated_stochastic_native;
+pub mod public_rl_session;
 pub mod public_rl_stochastic_native;
 pub mod public_state_critic;
 pub mod public_stochastic;

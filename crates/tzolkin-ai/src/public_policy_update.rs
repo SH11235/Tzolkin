@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dataset::{DatasetSplit, split_for_family};
@@ -52,6 +52,21 @@ impl Default for OneStepConfig {
     }
 }
 impl OneStepConfig {
+    pub(crate) fn from_checkpoint(value: serde_json::Value) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Fields {
+            learning_rate: f64,
+            max_abs_actual_delta: f64,
+            max_candidate_rows: usize,
+        }
+        let fields: Fields = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        Self::new(
+            fields.learning_rate,
+            fields.max_abs_actual_delta,
+            fields.max_candidate_rows,
+        )
+    }
     pub fn new(
         learning_rate: f64,
         max_abs_actual_delta: f64,
@@ -133,8 +148,8 @@ fn contract() -> Contract {
         max_all_log_delta: MAX_ALL_LOG_DELTA,
     }
 }
-#[derive(Default, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Default, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Deltas {
     max_abs_all_log_delta: f64,
     max_abs_chosen_log_delta: f64,
@@ -159,8 +174,8 @@ impl Deltas {
         Ok(())
     }
 }
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NumericReport {
     raw_gradient_l2: f64,
     raw_gradient_max_abs: f64,
@@ -188,6 +203,9 @@ pub struct OneStepReport {
     checksum: String,
 }
 impl OneStepReport {
+    pub(crate) fn checkpoint_plan_checksum(&self) -> &str {
+        &self.cohort_plan_checksum
+    }
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
@@ -254,9 +272,144 @@ impl UpdatedPublicRlArtifact {
         self.report.contract.task
     }
 }
-/// The only creation route executes the sealed old-policy update below.
+/// Created by the sealed update or restored by the dedicated pinned-checkpoint
+/// session. Restoring content does not authenticate optimization history.
 pub struct UpdatedPublicRlPolicy {
     artifact: UpdatedPublicRlArtifact,
+}
+// Only the dedicated checkpoint consumer calls this after checking its external
+// raw-content pin. This restores consistency, not proof of optimization history.
+pub(crate) fn restore_checkpoint_owner(
+    value: serde_json::Value,
+) -> Result<UpdatedPublicRlPolicy, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Report {
+        contract: serde_json::Value,
+        parent_init_checksum: String,
+        bc_source: SeatPolicy,
+        cohort_plan_checksum: String,
+        cohort_receipt_checksum: String,
+        episode_checksums: [String; 4],
+        config: serde_json::Value,
+        counts: [usize; 3],
+        deltas: Deltas,
+        numeric: NumericReport,
+        family_closure: Vec<String>,
+        checksum: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Artifact {
+        update_count: u64,
+        report: Report,
+        model: PublicPolicyModel,
+        checksum: String,
+    }
+    let decoded: Artifact = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let r = decoded.report;
+    if r.contract != serde_json::to_value(contract()).map_err(|e| e.to_string())? {
+        return Err("Checkpoint count1 contract mismatch".into());
+    }
+    let config = OneStepConfig::from_checkpoint(r.config)?;
+    validate_checkpoint_report(
+        &r.counts,
+        &r.deltas,
+        &r.numeric,
+        &config,
+        (
+            [
+                &r.parent_init_checksum,
+                &r.cohort_plan_checksum,
+                &r.cohort_receipt_checksum,
+                &r.checksum,
+            ],
+            &r.episode_checksums,
+        ),
+        &r.family_closure,
+        &r.bc_source,
+    )?;
+    let owner = UpdatedPublicRlPolicy {
+        artifact: UpdatedPublicRlArtifact {
+            update_count: decoded.update_count,
+            report: OneStepReport {
+                contract: contract(),
+                parent_init_checksum: r.parent_init_checksum,
+                bc_source: r.bc_source,
+                cohort_plan_checksum: r.cohort_plan_checksum,
+                cohort_receipt_checksum: r.cohort_receipt_checksum,
+                episode_checksums: r.episode_checksums,
+                config,
+                counts: r.counts,
+                deltas: r.deltas,
+                numeric: r.numeric,
+                family_closure: r.family_closure,
+                checksum: r.checksum,
+            },
+            model: decoded.model,
+            checksum: decoded.checksum,
+        },
+    };
+    owner.validate_for_inference()?;
+    if serde_json::to_value(owner.artifact()).map_err(|e| e.to_string())? != value {
+        return Err("Noncanonical checkpoint count1 fields".into());
+    }
+    Ok(owner)
+}
+pub(crate) fn validate_checkpoint_report(
+    counts: &[usize; 3],
+    deltas: &Deltas,
+    numeric: &NumericReport,
+    config: &OneStepConfig,
+    identities: ([&str; 4], &[String; 4]),
+    families: &[String],
+    source: &SeatPolicy,
+) -> Result<(), String> {
+    let finite = [
+        deltas.max_abs_all_log_delta,
+        deltas.max_abs_chosen_log_delta,
+        deltas.max_abs_final_log_delta,
+        deltas.max_abs_nominal_sum_drift,
+        numeric.raw_gradient_l2,
+        numeric.raw_gradient_max_abs,
+        numeric.actual_delta_l2,
+        numeric.actual_delta_max_abs,
+    ];
+    source.validate()?;
+    if finite.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || deltas.max_abs_all_log_delta > MAX_ALL_LOG_DELTA
+        || numeric.actual_delta_max_abs > config.max_abs_actual_delta
+        || numeric.changed_parameters == 0
+        || numeric.changed_parameters > PARAMETER_COUNT
+        || counts[0] == 0
+        || counts[0] > 4 * crate::public_stochastic::MAX_SAMPLES
+        || counts[1] < counts[0]
+        || counts[1] > config.max_candidate_rows
+        || counts[2] > counts[0]
+        || identities
+            .0
+            .into_iter()
+            .chain(identities.1.iter().map(String::as_str))
+            .any(|s| !checkpoint_digest(s))
+        || !matches!(source, SeatPolicy::PublicLearned { inference_backend, .. } if inference_backend == "scalar")
+        || families.is_empty()
+        || families.len() > crate::policy_dataset::MAX_FILES + 40
+        || families.windows(2).any(|p| p[0] >= p[1])
+    {
+        return Err("Invalid checkpoint numeric/source/count metadata".into());
+    }
+    for family in families {
+        if split_for_family(family)? == DatasetSplit::Test {
+            return Err("Checkpoint lineage includes Test".into());
+        }
+    }
+    Ok(())
+}
+pub(crate) fn checkpoint_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 impl UpdatedPublicRlPolicy {
     pub fn artifact(&self) -> &UpdatedPublicRlArtifact {
@@ -569,6 +722,50 @@ impl Write for HashSink {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn checkpoint_test_owner(
+    initial: &InitializedPublicRlPolicy,
+    plan: &str,
+    families: Vec<String>,
+    counts: [usize; 3],
+    config: &OneStepConfig,
+) -> UpdatedPublicRlPolicy {
+    // Private format/numeric fixture, not a collected or trained episode.
+    let mut gradient = vec![0.0; PARAMETER_COUNT];
+    gradient[1] = 2.0;
+    let proposal = propose_parameters(initial.model().parameters(), &gradient, config).unwrap();
+    let mut report = OneStepReport {
+        contract: contract(),
+        parent_init_checksum: initial.artifact().checksum().into(),
+        bc_source: initial.artifact().bc_source().clone(),
+        cohort_plan_checksum: plan.into(),
+        cohort_receipt_checksum: "a".repeat(64),
+        episode_checksums: std::array::from_fn(|i| format!("{:064x}", i + 1)),
+        config: *config,
+        counts,
+        deltas: Deltas::default(),
+        numeric: proposal.numeric,
+        family_closure: families,
+        checksum: String::new(),
+    };
+    report.checksum = report.expected_checksum().unwrap();
+    let model = PublicPolicyModel {
+        parameters: proposal.parameters,
+    };
+    let checksum = hash(
+        b"tzolkin-public-rl-one-step-artifact-v1\0",
+        &(1u64, &report, &model),
+    )
+    .unwrap();
+    UpdatedPublicRlPolicy {
+        artifact: UpdatedPublicRlArtifact {
+            update_count: 1,
+            report,
+            model,
+            checksum,
+        },
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
