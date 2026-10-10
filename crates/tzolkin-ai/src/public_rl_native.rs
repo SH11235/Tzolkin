@@ -203,8 +203,8 @@ impl<'a> RepeatedPublicRlHandle<'a> {
     }
 }
 
-/// Sampling-only Scalar view of a controlled Long-v2 owner. No v1 inference,
-/// Arena, deployment or raw-model admission is extended by this constructor.
+/// Scalar view of a controlled Long-v2 owner for typed sampling and borrowed
+/// Arena argmax. No deployment codec or raw-model admission is provided.
 pub struct LongRlHandle<'a> {
     owner: &'a LongRlPolicy,
     kernel: ResolvedKernel,
@@ -257,5 +257,24 @@ impl<'a> LongRlHandle<'a> {
             crate::public_policy_long::POLICY_VERSION,
             observation,
         )
+    }
+    /// Deterministic evaluation uses the first maximum in native legal order,
+    /// rather than the actor-stream sampling distribution and its tick masses.
+    pub(crate) fn choose_move(&self, observation: &Observation) -> Result<Decision, String> {
+        let prediction = self.distribution(observation)?;
+        let best = (1..prediction.logits.len()).fold(0, |best, index| {
+            if prediction.logits[index] > prediction.logits[best] {
+                index
+            } else {
+                best
+            }
+        });
+        Ok(Decision {
+            actor: observation.actor,
+            observation_key: observation.observation_key.clone(),
+            policy_version: crate::public_policy_long::POLICY_VERSION.into(),
+            r#move: observation.legal_actions[best].r#move.clone(),
+            score: f64::from(prediction.logits[best]),
+        })
     }
 }
