@@ -287,6 +287,7 @@ enum SamplingPolicyKind {
     Bc,
     Rl,
     Repeated,
+    Long,
 }
 impl SamplingPolicyKind {
     fn sampling_version(self) -> &'static str {
@@ -294,6 +295,7 @@ impl SamplingPolicyKind {
             Self::Bc => SAMPLING_VERSION,
             Self::Rl => RL_SAMPLING_VERSION,
             Self::Repeated => REPEATED_SAMPLING_VERSION,
+            Self::Long => crate::public_policy_long::SAMPLING_VERSION,
         }
     }
 }
@@ -323,6 +325,13 @@ impl SamplingPrediction {
                     && p.feature_schema() == PUBLIC_FEATURE_SCHEMA
                     && p.value_validity() == ValueValidity::UnavailablePolicyOnly
                     && (2..=MAX_UPDATE_COUNT).contains(&p.update_count())
+                    && p.backend() == "scalar"
+            }
+            (Self::Rl(p), SamplingPolicyKind::Long) => {
+                p.policy_version() == crate::public_policy_long::POLICY_VERSION
+                    && p.feature_schema() == PUBLIC_FEATURE_SCHEMA
+                    && p.value_validity() == ValueValidity::UnavailablePolicyOnly
+                    && (2..=crate::public_policy_long::MAX_UPDATES).contains(&p.update_count())
                     && p.backend() == "scalar"
             }
             _ => false,
@@ -776,6 +785,32 @@ impl RlSamplingPolicy {
             numerical_target: crate::public_stochastic_native::numerical_target(),
         })
     }
+    pub(crate) fn from_long_handle(
+        policy: &crate::public_rl_native::LongRlHandle<'_>,
+    ) -> Result<Self, String> {
+        if policy.backend() != "scalar"
+            || !(2..=crate::public_policy_long::MAX_UPDATES).contains(&policy.update_count())
+        {
+            return Err("Long sampling requires a sealed Scalar Long-v2 handle".into());
+        }
+        Ok(Self {
+            policy_version: crate::public_policy_long::POLICY_VERSION.into(),
+            artifact_checksum: policy.artifact_checksum().into(),
+            update_count: policy.update_count(),
+            task: crate::public_policy_long::TASK.into(),
+            model_version: crate::public_model::MODEL_VERSION.into(),
+            input_contract: crate::public_model::INPUT_CONTRACT.into(),
+            feature_schema: PUBLIC_FEATURE_SCHEMA,
+            backend: policy.backend().into(),
+            numerical_target: crate::public_stochastic_native::numerical_target(),
+        })
+    }
+    pub(crate) fn long_binding_key(&self) -> Result<String, String> {
+        let mut hash = Sha256::new();
+        hash.update(b"tzolkin-public-stochastic-rl-long-policy-v2\0");
+        hash.update(serde_json::to_vec(self).map_err(|e| e.to_string())?);
+        Ok(format!("{:x}", hash.finalize()))
+    }
     pub(crate) fn artifact_checksum(&self) -> &str {
         &self.artifact_checksum
     }
@@ -862,6 +897,41 @@ impl<'handle, 'model> RepeatedStochasticSession<'handle, 'model> {
         self.state.sample_with_kind(
             &self.policy_binding_key,
             SamplingPolicyKind::Repeated,
+            observation,
+            |o| self.policy.distribution(o).map(SamplingPrediction::Rl),
+        )
+    }
+}
+
+/// Long-v2 actor-local session. CDF/draw/error/cap mechanics are unchanged.
+/// Standalone sampling enforces neither Train nor lineage exclusion; the typed
+/// native collector/auditor performs those checks before world/NN creation.
+pub struct LongStochasticSession<'handle, 'model> {
+    policy: &'handle crate::public_rl_native::LongRlHandle<'model>,
+    policy_binding_key: String,
+    state: SessionState,
+}
+impl<'handle, 'model> LongStochasticSession<'handle, 'model> {
+    pub fn new(
+        policy: &'handle crate::public_rl_native::LongRlHandle<'model>,
+        identity: SamplingStreamIdentity,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            policy_binding_key: RlSamplingPolicy::from_long_handle(policy)?.long_binding_key()?,
+            state: SessionState::new(identity)?,
+        })
+    }
+    pub fn counters(&self) -> SamplingCounters {
+        self.state.counters()
+    }
+    pub fn stop(&mut self) {
+        self.state.stopped = true;
+    }
+    pub fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
+        self.state.sample_with_kind(
+            &self.policy_binding_key,
+            SamplingPolicyKind::Long,
             observation,
             |o| self.policy.distribution(o).map(SamplingPrediction::Rl),
         )
