@@ -403,10 +403,11 @@ fn sprite(style: &str) -> Result<[i64; 2], String> {
     };
     Ok([parse(tokens[0])?, parse(tokens[1])?])
 }
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Tile {
     id: String,
     sprite: [i64; 2],
+    active: bool,
 }
 fn tile(opening: &str, active: bool) -> Result<Tile, String> {
     let id = attribute(opening, "id")?;
@@ -421,6 +422,7 @@ fn tile(opening: &str, active: bool) -> Result<Tile, String> {
     Ok(Tile {
         id: id.into(),
         sprite: sprite(attribute(opening, "style")?)?,
+        active: classes.contains(&"active"),
     })
 }
 fn panel_tiles(html: &str) -> Result<Vec<Tile>, String> {
@@ -443,7 +445,11 @@ fn panel_tiles(html: &str) -> Result<Vec<Tile>, String> {
     }
     Ok(found)
 }
-fn retained_own_panel<'a>(area: &'a str, wanted: &str) -> Result<&'a str, String> {
+fn retained_panel<'a>(
+    area: &'a str,
+    wanted: &str,
+    expected_class: Option<&str>,
+) -> Result<&'a str, String> {
     let mut start = None;
     let mut depth = 0_usize;
     let mut panel = None;
@@ -457,10 +463,12 @@ fn retained_own_panel<'a>(area: &'a str, wanted: &str) -> Result<&'a str, String
                 if start.is_some() || panel.is_some() {
                     return Err("Duplicate retained own player panel".into());
                 }
-                if !attribute(tag.opening, "class")?
-                    .split_whitespace()
-                    .any(|c| c == "player_wealthtiles")
-                {
+                if expected_class.is_some_and(|expected| {
+                    !optional_attribute(tag.opening, "class")
+                        .ok()
+                        .flatten()
+                        .is_some_and(|classes| classes.split_whitespace().any(|c| c == expected))
+                }) {
                     return Err("Retained own panel class mismatch".into());
                 }
                 start = Some(tag.start);
@@ -483,7 +491,11 @@ fn retained_own_panel<'a>(area: &'a str, wanted: &str) -> Result<&'a str, String
 }
 fn own_panel<'a>(capture: &'a Value, actor: &str) -> Result<&'a str, String> {
     let wanted = format!("player_wealthtiles_{actor}");
-    let retained = retained_own_panel(text(capture, "gameAreaHtml")?, &wanted)?;
+    let retained = retained_panel(
+        text(capture, "gameAreaHtml")?,
+        &wanted,
+        Some("player_wealthtiles"),
+    )?;
     if let Some(panels) = capture["selectedPlayerTiles"].as_array() {
         let matching: Vec<_> = panels
             .iter()
@@ -583,6 +595,9 @@ fn decode_choice(
     }
     let area = text(before, "gameAreaHtml")?;
     let offer_area = text(before, "wealthTilesHtml")?;
+    if retained_panel(area, "wealth_tiles", None)? != offer_area {
+        return Err("Declared offer panel differs from retained game DOM".into());
+    }
     let mut captured = Vec::new();
     let mut catalog_ids = Vec::new();
     for offer in offers {
@@ -608,13 +623,15 @@ fn decode_choice(
         catalog_ids.push(catalog.clone());
         captured.push(parsed);
     }
+    let retained_offers = panel_tiles(offer_area)?;
     if captured
         .iter()
         .map(|t| &t.id)
         .collect::<BTreeSet<_>>()
         .len()
         != 4
-        || panel_tiles(offer_area)?.len() != 4
+        || retained_offers.len() != 4
+        || captured.iter().any(|tile| !retained_offers.contains(tile))
     {
         return Err("Incomplete/duplicate four-offer panel".into());
     }
@@ -1345,7 +1362,9 @@ pub struct InitialTrainingReport {
     pub model_checksum: String,
     pub config: InitialTrainConfig,
     pub optimizer: String,
+    /// Epochs that changed at least one represented coefficient.
     pub updates: usize,
+    pub unchanged_epochs: usize,
     pub initial_train: InitialLossReport,
     pub initial_validation: InitialLossReport,
     pub final_train: InitialLossReport,
@@ -1473,6 +1492,7 @@ pub fn train(
     let mut artifact = InitialWealthArtifact::new()?;
     let initial_train = evaluate(dataset, &artifact.coefficients, DatasetSplit::Train)?;
     let initial_validation = evaluate(dataset, &artifact.coefficients, DatasetSplit::Validation)?;
+    let mut updates = 0;
     for _ in 0..config.epochs {
         let mut gradient = [0.0; FEATURE_COUNT];
         for row in dataset.rows.iter().filter(|r| {
@@ -1505,7 +1525,16 @@ pub fn train(
             *value =
                 bounded_coefficient(artifact.coefficients[i], deltas[i], config.max_weight_delta)?;
         }
+        updates += usize::from(
+            proposed
+                .iter()
+                .zip(artifact.coefficients)
+                .any(|(new, old)| new.to_bits() != old.to_bits()),
+        );
         artifact.coefficients = proposed;
+    }
+    if updates == 0 {
+        return Err("No represented initial-wealth parameter updates".into());
     }
     let final_train = evaluate(dataset, &artifact.coefficients, DatasetSplit::Train)?;
     let final_validation = evaluate(dataset, &artifact.coefficients, DatasetSplit::Validation)?;
@@ -1521,7 +1550,8 @@ pub fn train(
         model_checksum: artifact.checksum.clone(),
         config: config.clone(),
         optimizer: "boundedFullBatchClippedSgd".into(),
-        updates: config.epochs,
+        updates,
+        unchanged_epochs: config.epochs - updates,
         initial_train,
         initial_validation,
         final_train,
@@ -1571,7 +1601,9 @@ pub fn publish_new(
             || report.atlas_sha256 != dataset.atlas_sha256
             || report.nomination_sha256 != dataset.nomination_sha256
             || report.model_checksum != model.checksum
-            || report.updates != report.config.epochs
+            || report.updates == 0
+            || report.updates > report.config.epochs
+            || report.unchanged_epochs != report.config.epochs - report.updates
             || report.optimizer != "boundedFullBatchClippedSgd"
             || report.value_rows != 0
             || report.strength_measured
@@ -1679,6 +1711,7 @@ mod tests {
             .iter()
             .map(|o| o["html"].as_str().unwrap())
             .collect::<String>();
+        let offer_html = format!("<div id=\"wealth_tiles\">{offer_html}</div>");
         let empty = "<div id=\"player_wealthtiles_100\" class=\"player_wealthtiles\"></div>";
         let url = format!(
             "https://boardgamearena.com/archive/replay/{release}/?table=123&player=100&comments="
@@ -1702,6 +1735,34 @@ mod tests {
             .map(|(sprite, id)| ((release.into(), sprite), id.into()))
             .collect();
         assert_eq!(decode_choice(&before, &after, &atlas).unwrap().2, 4);
+        let mut reordered = before.clone();
+        reordered["offers"].as_array_mut().unwrap().reverse();
+        assert!(decode_choice(&reordered, &after, &atlas).is_ok());
+        let declared = before["offers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["html"].as_str().unwrap())
+            .collect::<String>();
+        let different = declared.replace("wealth_tile_", "wealth_tile_9");
+        let comment_panel = format!("<div id=\"wealth_tiles\"><!--{declared}-->{different}</div>");
+        let mut commented = before.clone();
+        commented["wealthTilesHtml"] = Value::String(comment_panel.clone());
+        commented["gameAreaHtml"] = Value::String(format!("{comment_panel}{empty}"));
+        assert!(
+            decode_choice(&commented, &after, &atlas)
+                .unwrap_err()
+                .contains("Incomplete")
+        );
+        let mut detached_offers = before.clone();
+        detached_offers["gameAreaHtml"] = Value::String(format!(
+            "<!--{offer_html}--><div id=\"wealth_tiles\">{different}</div>{empty}"
+        ));
+        assert!(
+            decode_choice(&detached_offers, &after, &atlas)
+                .unwrap_err()
+                .contains("Declared offer panel")
+        );
         let mut with_extra_event = before.clone();
         with_extra_event["move"] = Value::String("Move #7".into());
         let mut later_confirmation = after.clone();
