@@ -88,6 +88,21 @@ function paymentOf(events) {
     });
   return result;
 }
+function typedResourceCost(action) {
+  const values =
+    action.type === 'useAction'
+      ? [action.cornCost, 0, 0, 0, 0]
+      : ['build', 'monument'].includes(action.type)
+        ? action.cost
+        : RESOURCES.map(() => 0);
+  if (
+    !Array.isArray(values) ||
+    values.length !== RESOURCES.length ||
+    values.some((amount) => !Number.isSafeInteger(amount) || amount < 0)
+  )
+    fail('Core typed resource cost is not a bounded nonnegative vector');
+  return values;
+}
 function sourceGroups(events, initialId, actionIds) {
   const groups = new Map(actionIds.filter((id) => id > initialId).map((id) => [id, []]));
   for (const event of events) {
@@ -537,7 +552,13 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     }
     fail('Refill planner did not converge');
   }
-  function choose(predicate, reason, derived = false, visibleCalendar = false) {
+  function choose(
+    predicate,
+    reason,
+    derived = false,
+    visibleCalendar = false,
+    acceptOutcome = null,
+  ) {
     if (record.steps.length >= MAX_STEPS) fail('Move limit reached');
     let candidates = legal().filter((row) => predicate(row.action));
     // The following visible decision can establish declining an optional
@@ -553,7 +574,11 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     if (!candidates.length) fail(`No legal operation for ${reason}; pending=${pending()}`);
     if (calls + candidates.length * 3 >= MAX_CALLS)
       fail('Core call budget exhausted before the final replay verification');
-    const outcomes = candidates.map((row) => ({ row, ...trial(row) }));
+    // Trial every legal candidate before changing history, effects or reveal pools.
+    const outcomes = candidates
+      .map((row) => ({ row, ...trial(row) }))
+      .filter((outcome) => acceptOutcome === null || acceptOutcome(outcome));
+    if (!outcomes.length) fail(`No legal outcome matches source evidence for ${reason}`);
     if (
       outcomes.length > 1 &&
       outcomes.some(
@@ -589,9 +614,7 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
       context.feeding.push(...feeding);
       context.feedingDay = chosen.frame.snapshot.state.foodDays.at(-1);
     }
-    const cornCost = chosen.row.action.type === 'useAction' ? chosen.row.action.cornCost : 0;
-    if (!Number.isSafeInteger(cornCost) || cornCost < 0)
-      fail('Core useAction corn cost is not a bounded nonnegative integer');
+    const resourceCost = typedResourceCost(chosen.row.action);
     for (const player of previous.players) {
       const next = chosen.frame.snapshot.state.players[player.id];
       const food = feeding.find((receipt) => receipt.actor === player.id);
@@ -606,12 +629,13 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
           : field.startsWith('temple:')
             ? next.temples[field.slice(7)] - player.temples[field.slice(7)]
             : next[field] - player[field];
-        const cost =
-          field === 'resource:corn'
-            ? (player.id === previous.currentPlayer ? cornCost : 0) + (food?.cost ?? 0)
-            : field === 'score'
-              ? (food?.penalty ?? 0)
-              : 0;
+        const cost = field.startsWith('resource:')
+          ? (player.id === previous.currentPlayer
+              ? resourceCost[RESOURCES.indexOf(field.slice(9))]
+              : 0) + (field === 'resource:corn' ? (food?.cost ?? 0) : 0)
+          : field === 'score'
+            ? (food?.penalty ?? 0)
+            : 0;
         const gain = delta + cost;
         for (const [direction, amount] of [
           [1, Math.max(0, gain)],
@@ -747,6 +771,64 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
     if (id < 0) fail('Automatic effect has no known actor');
     const key = `${id}:${field}:${direction}`;
     return (context.effects[key] ?? 0) - (context.claims[key] ?? 0);
+  }
+  function purchaseOutcome(event, events, witness) {
+    const actor = actorId(event.actor);
+    const gains = {};
+    if (
+      actor < 0 ||
+      events.filter((item) => ['build', 'monument'].includes(item.kind)).length !== 1 ||
+      events.some((item) => item.actor !== event.actor)
+    )
+      fail('Purchase source requires one purchased card and one actor');
+    for (const item of events) {
+      if (['resourcePayment', 'build', 'monument'].includes(item.kind)) continue;
+      if (item.kind === 'resourceGain') {
+        for (const [index, amount] of resourceAmounts(item).entries())
+          if (amount) {
+            const field = `resource:${RESOURCES[index]}`;
+            gains[field] = (gains[field] ?? 0) + amount;
+          }
+      } else if (item.kind === 'workerGain') gains.workers = (gains.workers ?? 0) + 1;
+      else {
+        const score =
+          item.kind === 'unparsed'
+            ? item.rawText.slice(item.actor.length).match(/^は(\d+)点を獲得した$/)
+            : null;
+        if (!score) fail('Purchase source has an unsupported or independent operation');
+        const amount = Number(score[1]);
+        if (!Number.isSafeInteger(amount)) fail('Observed purchase score is out of bounds');
+        gains.score = (gains.score ?? 0) + amount;
+      }
+    }
+    if (Object.values(gains).some((amount) => !Number.isSafeInteger(amount) || amount < 0))
+      fail('Observed purchase gain is out of bounds');
+    return (outcome) => {
+      const task = outcome.frame.observation?.pendingTask?.type ?? null;
+      // Later resource/temple/technology choices can change the observed fields.
+      // Leave these candidates ambiguous instead of filtering with a future end board.
+      if (task !== null && task !== 'build') return true;
+      const previous = state().players[actor];
+      const next = outcome.frame.snapshot.state.players[actor];
+      const cost = typedResourceCost(outcome.row.action);
+      for (const [field, amount] of Object.entries(gains)) {
+        const resource = field.startsWith('resource:') ? field.slice(9) : null;
+        const delta = resource
+          ? next.resources[resource] - previous.resources[resource]
+          : next[field] - previous[field];
+        const knownCost = resource ? cost[RESOURCES.indexOf(resource)] : 0;
+        const key = `${actor}:${field}:1`;
+        const gross = (context.effects[key] ?? 0) + Math.max(0, delta + knownCost);
+        if (gross - (context.claims[key] ?? 0) !== amount) return false;
+      }
+      // This source contains no further operation. Only an already settled trial
+      // can be compared with its own end checkpoint; unresolved tasks are excluded.
+      return (
+        task !== null ||
+        !witness.expected ||
+        matches(outcome.frame.snapshot.state, witness.expected)
+      );
+    };
   }
 
   let blocked = null;
@@ -1055,6 +1137,9 @@ export function decodePublicGame(rawBytes, witnesses, dispatch, tableBytes = nul
                 action.id === ids[0] &&
                 (!payments.some(Boolean) || same(action.cost, payments)),
               `observed ${event.kind}`,
+              false,
+              false,
+              purchaseOutcome(event, events, witness),
             );
           } else if (event.kind === 'workerGain') automatic(event, 'workers', 1);
           else if (event.kind === 'resourceGain') {

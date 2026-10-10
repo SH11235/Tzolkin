@@ -636,6 +636,141 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
   assert.equal(restoredBonus.manifest.audit.find((row) => row.cancellation).removedSteps, 1);
   assert.equal(restoredBonus.manifest.extractionRewardReceipt.remaining, 0);
   assert.deepEqual(restoredBonus.manifest.extractionRewardReceipt.materials, ['wood', 'wood']);
+
+  const purchaseFixture = ({ monument = false, task = 'build' } = {}) => {
+    const start = clone(saved.core.initialFrame);
+    start.snapshot.state.players[0].resources.corn = 20;
+    start.snapshot.state.players[0].resources.wood = 4;
+    start.snapshot.state.players[0].buildings = ['b04', 'b05'];
+    start.observation.pendingTask = { type: 'build', remaining: 2 };
+    start.observation.legalActions = ['bonus', 'reserve'].map((mode) => ({
+      action: {
+        type: monument ? 'monument' : 'build',
+        id: monument ? 'm01' : 'b06',
+        cost: [4, 1, 0, 0, 0],
+        ...(monument
+          ? { renovation: mode === 'bonus' ? 'b04' : 'b05' }
+          : { architecture: mode === 'bonus' }),
+      },
+      move: { type: 'choose', choiceId: `purchase:${mode}` },
+    }));
+    const choices = [];
+    const frames = [];
+    const apply = (request) => {
+      choices.push(request.move.choiceId);
+      const bonus = request.move.choiceId === 'purchase:bonus';
+      assert.ok(bonus || request.move.choiceId === 'purchase:reserve');
+      const next = clone(start);
+      next.snapshot.state = clone(request.state);
+      const player = next.snapshot.state.players[0];
+      player.resources.corn -= 4;
+      player.resources.wood--;
+      if (monument) {
+        player.buildings = player.buildings.filter((id) => id !== (bonus ? 'b04' : 'b05'));
+        player.monuments.push('m01');
+      } else {
+        player.buildings.push('b06');
+        if (bonus) {
+          player.resources.corn++;
+          player.score += 2;
+        }
+      }
+      next.observation.pendingTask = task === null ? null : { type: task, remaining: 1 };
+      next.observation.legalActions = [];
+      frames.push(next);
+      return next;
+    };
+    const make = (rows, expected) => {
+      const next = input();
+      next.witness.initial = clone(start.snapshot.state);
+      replaceEvents(next, rows);
+      next.witness.witnesses = [
+        {
+          actionId: 6,
+          [monument ? 'monuments' : 'buildings']: [monument ? 'm01' : 'b06'],
+          ...(expected ? { expected } : {}),
+        },
+      ];
+      return next;
+    };
+    return { start, choices, frames, make, dispatch: dispatcher(start, apply) };
+  };
+  const purchasePayment = [
+    { raw_text: 'Aは4\nを支払った', icons: [{ classes: 'tz_icon resource_corn' }] },
+    { raw_text: 'Aは\nを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+  ];
+  const build = { raw_text: 'Aは建物を建てた' };
+  const refund = material('corn');
+  const points = { raw_text: 'Aは2点を獲得した' };
+  const architecture = purchaseFixture();
+  const resolved = decode(
+    architecture.make([[6, [...purchasePayment, build, refund, points]]]),
+    architecture.dispatch,
+  );
+  assert.equal(resolved.manifest.blocked, null);
+  assert.equal(resolved.record.steps[0].move.choiceId, 'purchase:bonus');
+  assert.deepEqual(architecture.choices.slice(0, 2), ['purchase:bonus', 'purchase:reserve']);
+  assert.equal(architecture.frames.at(-1).snapshot.state.players[0].resources.corn, 17);
+  assert.equal(architecture.frames.at(-1).snapshot.state.players[0].resources.wood, 3);
+  for (const [messages, reason] of [
+    [[...purchasePayment, build], /Ambiguous legal operation/],
+    [[...purchasePayment, build, material('corn', 2), points], /No legal outcome/],
+    [[...purchasePayment, build, refund, refund, points], /No legal outcome/],
+    [[...purchasePayment, purchasePayment[0], build, refund, points], /No legal operation/],
+    [
+      [...purchasePayment, build, material('corn', 1, 'B'), points],
+      /one purchased card and one actor/,
+    ],
+    [
+      [...purchasePayment, build, technology, refund, points],
+      /unsupported or independent operation/,
+    ],
+    [[...purchasePayment, build, build], /one purchased card and one actor/],
+  ]) {
+    const fixture = purchaseFixture();
+    const rejected = decode(fixture.make([[6, messages]]), fixture.dispatch);
+    assert.match(rejected.manifest.blocked.reason, reason);
+    assert.equal(rejected.record.steps.length, 0);
+  }
+
+  const renovationEnd = { players: [{ buildings: ['b05'] }, {}, {}, {}] };
+  const monument = { raw_text: 'Aは記念碑を建てた' };
+  for (const task of [null, 'resource', 'temple', 'technology', 'build']) {
+    const fixture = purchaseFixture({ monument: true, task });
+    const result = decode(
+      fixture.make([[6, [...purchasePayment, monument]]], renovationEnd),
+      fixture.dispatch,
+    );
+    if (task === null) {
+      assert.equal(result.manifest.blocked, null);
+      assert.equal(result.record.steps[0].move.choiceId, 'purchase:bonus');
+    } else {
+      assert.match(result.manifest.blocked.reason, /Ambiguous legal operation/);
+      assert.equal(result.record.steps.length, 0);
+    }
+  }
+  const cancelledPurchase = architecture.make([
+    [6, [...purchasePayment, build, refund, points]],
+    [7, [{ raw_text: 'Aは行動をキャンセルした' }]],
+    [8, [refund]],
+  ]);
+  const original = architecture.start.snapshot.state;
+  cancelledPurchase.witness.witnesses.push({
+    actionId: 7,
+    pendingTask: 'build',
+    expected: {
+      round: original.round,
+      gears: clone(original.gears),
+      players: original.players.map((player) => ({
+        resources: clone(player.resources),
+        workers: player.workers,
+      })),
+    },
+  });
+  const noCancelledGain = decode(cancelledPurchase, architecture.dispatch);
+  assert.equal(noCancelledGain.manifest.audit.find((row) => row.cancellation).removedSteps, 1);
+  assert.equal(noCancelledGain.record.steps.length, 0);
+  assert.match(noCancelledGain.manifest.blocked.reason, /not established by this macro/);
   value.witness.witnesses = [{ actionId: 6, refills: { age2: ['b15'] } }];
   const future = decode(value, dispatch);
   assert.equal(future.record.steps.length, 0);
