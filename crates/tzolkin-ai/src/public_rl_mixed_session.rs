@@ -310,6 +310,7 @@ impl<'a> MixedRlCollectionSession<'a> {
         expected_sha256: &str,
         output: &Path,
     ) -> Result<ValidatedMixedRlCohort, String> {
+        require_separate_audit_output(source, output)?;
         if sha(collection_raw) != expected_sha256 {
             return Err("Mixed collection external raw pin differs".into());
         }
@@ -410,7 +411,7 @@ struct FilePin {
     bytes: usize,
     sha256: String,
 }
-fn collection_inventory(dir: &Path, cap: u64) -> Result<Vec<FilePin>, String> {
+fn expected_collection_names() -> Vec<String> {
     let mut expected = vec!["plan.json".to_owned(), "collection.json".to_owned()];
     for member in 0..4 {
         for stem in ["collect-started", "collect-returned", "record"] {
@@ -418,21 +419,35 @@ fn collection_inventory(dir: &Path, cap: u64) -> Result<Vec<FilePin>, String> {
         }
     }
     expected.sort();
-    let mut names = fs::read_dir(dir)
-        .map_err(|e| e.to_string())?
-        .map(|p| {
-            p.map_err(|e| e.to_string()).and_then(|p| {
-                p.file_name()
-                    .to_str()
-                    .map(str::to_owned)
-                    .ok_or("Mixed saved name is not UTF8".into())
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    expected
+}
+fn bounded_inventory_names(
+    entries: impl Iterator<Item = Result<std::ffi::OsString, String>>,
+) -> Result<Vec<String>, String> {
+    let expected = expected_collection_names();
+    let mut names = Vec::with_capacity(expected.len());
+    for entry in entries {
+        if names.len() == expected.len() {
+            return Err("Mixed saved source exceeds fourteen outputs".into());
+        }
+        let entry = entry?;
+        let name = entry.to_str().ok_or("Mixed saved name is not UTF8")?;
+        if !expected.iter().any(|allowed| allowed == name) {
+            return Err("Mixed saved source has an unreferenced output".into());
+        }
+        names.push(name.to_owned());
+    }
     names.sort();
     if names != expected {
         return Err("Mixed saved source has missing/unreferenced outputs".into());
     }
+    Ok(names)
+}
+fn collection_inventory(dir: &Path, cap: u64) -> Result<Vec<FilePin>, String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .map(|entry| entry.map(|e| e.file_name()).map_err(|e| e.to_string()));
+    let names = bounded_inventory_names(entries)?;
     let mut total = 0u64;
     names
         .into_iter()
@@ -456,6 +471,29 @@ fn collection_inventory(dir: &Path, cap: u64) -> Result<Vec<FilePin>, String> {
             })
         })
         .collect()
+}
+fn require_separate_audit_output(source: &Path, output: &Path) -> Result<(), String> {
+    let source = fs::canonicalize(source).map_err(|e| e.to_string())?;
+    let resolved_output = match fs::canonicalize(output) {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let leaf = output
+                .file_name()
+                .ok_or("Mixed audit output needs a leaf")?;
+            let parent = output
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            fs::canonicalize(parent)
+                .map_err(|e| e.to_string())?
+                .join(leaf)
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    if resolved_output.starts_with(source) {
+        return Err("Mixed audit output must remain outside the saved source directory".into());
+    }
+    Ok(())
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -545,5 +583,62 @@ impl<'a> Writer<'a> {
             &serde_json::to_vec(value).map_err(|e| e.to_string())?,
             RECEIPT_CAP,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::ffi::OsString;
+
+    #[test]
+    fn saved_inventory_rejects_unexpected_or_fifteenth_entry_without_draining() {
+        let visited = Cell::new(0);
+        let unexpected = std::iter::from_fn(|| {
+            let n = visited.get() + 1;
+            visited.set(n);
+            assert_eq!(n, 1, "must stop at first unreferenced entry");
+            Some(Ok(OsString::from("unreferenced.json")))
+        });
+        assert!(bounded_inventory_names(unexpected).is_err());
+        assert_eq!(visited.get(), 1);
+        visited.set(0);
+        let excessive = std::iter::from_fn(|| {
+            let n = visited.get() + 1;
+            visited.set(n);
+            assert!(n <= 15, "must stop at the fifteenth directory entry");
+            Some(Ok(OsString::from("plan.json")))
+        });
+        assert!(bounded_inventory_names(excessive).is_err());
+        assert_eq!(visited.get(), 15);
+        let valid = expected_collection_names()
+            .into_iter()
+            .map(|n| Ok(n.into()));
+        assert_eq!(bounded_inventory_names(valid).unwrap().len(), 14);
+    }
+
+    #[test]
+    fn audit_output_rejects_saved_source_descendants_and_canonical_parent_aliases() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "tzolkin-mixed-output-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("saved");
+        fs::create_dir(&source).unwrap();
+        assert!(require_separate_audit_output(&source, &source).is_err());
+        assert!(require_separate_audit_output(&source, &source.join("audit")).is_err());
+        let alias = source.join("..").join("saved").join("audit");
+        assert!(require_separate_audit_output(&source, &alias).is_err());
+        assert!(require_separate_audit_output(&source, &directory.join("audit")).is_ok());
+        assert_eq!(fs::read_dir(&source).unwrap().count(), 0);
+        assert!(!directory.join("audit").exists());
+        fs::remove_dir(&source).unwrap();
+        fs::remove_dir(&directory).unwrap();
     }
 }

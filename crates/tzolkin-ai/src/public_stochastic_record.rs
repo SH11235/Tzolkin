@@ -577,8 +577,10 @@ pub(crate) fn decode_typed_record<P: serde::de::DeserializeOwned + Serialize>(
     let raw = unique_json(bytes, MAX_RECORD_BYTES)?;
     // Extending the private DTO must not broaden any old source's closed shape,
     // including explicit null/false forms that serde could otherwise omit.
-    if raw.get("schema").and_then(serde_json::Value::as_str)
-        != Some(crate::public_mixed_native::RECORD_SCHEMA)
+    if !raw
+        .get("schema")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(allows_opponents)
         && raw
             .get("callbacks")
             .and_then(serde_json::Value::as_array)
@@ -692,6 +694,66 @@ mod tests {
     use crate::public_native::integration_fixture;
     use crate::public_stochastic::{SamplingSeed, SamplingStreamIdentity};
     use crate::public_stochastic_native::{CollectionLimits, collect_native};
+
+    #[test]
+    fn mixed_opponent_wire_roundtrip_preserves_closed_self_only_gate() {
+        // A tiny codec-only prefix: no model, environment or native audit.
+        let mut raw = serde_json::json!({
+            "schema":crate::public_rl_mixed_native::RECORD_SCHEMA,
+            "header":{
+                "sourceKind":"codecFixture","rulesVersion":1,"rulesBaseline":"fixture",
+                "catalogHash":"0000000000000000","observationSchema":1,"moveSchema":1,
+                "config":{"players":3,"environmentSeed":1,"options":Options::base(),
+                    "samplingSeed":"0000000000000001","episodeOrdinal":"0000000000000000",
+                    "replicateOrdinal":"0000000000000000","maxCallbacks":2,"maxCandidateRows":100,
+                    "maxSourceBytes":MAX_SOURCE_BYTES,"maxTraceBytes":MAX_TRACE_BYTES},
+                "basePolicy":null,"samplingVersion":"fixture","rngVersion":"fixture","denominatorBits":53,
+                "uniformMixtureBits":"0000000000000000","backend":"scalar","numericalTarget":"fixture",
+                "nativeFamilyId":"0".repeat(64),"rawArtifactIdentityAvailable":false,
+                "producerAuthenticated":false,"independentSeedOriginsVerified":false
+            },
+            "callbacks":[{"globalCallbackIndex":0,"actor":1,"turnPlayer":1,
+                "observationKey":"0000000000000000","observation":null,"stateBefore":"0000000000000000",
+                "sample":null,"opponentChoice":{"decision":{"actor":1,"observationKey":"0000000000000000",
+                    "policyVersion":"fixture","move":{"type":"beg"},"scoreBits":"0000000000000000"},
+                    "chosen":{"action":{"type":"beg"},"move":{"type":"beg"}}},
+                "opponentAttempted":true,"samplerAttempted":false,"applyAttempted":true,"applySucceeded":true,
+                "stateAfter":"0000000000000001","failure":null}],
+            "terminal":null,"failure":null,"counts":{"observedCallbacks":1,"samplerAttempts":0,
+                "acceptedSamples":0,"candidateRowsReserved":0,"actorDraws":vec!["0000000000000000";3],
+                "applyAttempts":1,"applySuccesses":1,"validatedAppliedSteps":0,"sessionStopped":false},
+            "sourcePayloadReservedBytes":0,"tracePayloadReservedBytes":0,"trainingAdmission":"unavailable"
+        });
+        for schema in [
+            crate::public_rl_mixed_native::RECORD_SCHEMA,
+            crate::public_mixed_native::RECORD_SCHEMA,
+        ] {
+            raw["schema"] = schema.into();
+            let bytes = serde_json::to_vec(&raw).unwrap();
+            let record: Record<serde_json::Value> = decode_typed_record(&bytes).unwrap();
+            assert!(record.callbacks[0].opponent_attempted);
+            assert!(record.callbacks[0].opponent_choice.is_some());
+            assert_eq!(serde_json::to_value(&record).unwrap(), raw);
+        }
+        for schema in [RECORD_SCHEMA, "unknownMixedSchema"] {
+            raw["schema"] = schema.into();
+            for (key, value) in [
+                ("opponentChoice", serde_json::Value::Null),
+                ("opponentAttempted", serde_json::Value::Bool(false)),
+            ] {
+                let mut closed = raw.clone();
+                let callback = closed["callbacks"][0].as_object_mut().unwrap();
+                callback.remove("opponentChoice");
+                callback.remove("opponentAttempted");
+                callback.insert(key.into(), value);
+                let error =
+                    decode_typed_record::<serde_json::Value>(&serde_json::to_vec(&closed).unwrap())
+                        .err()
+                        .unwrap();
+                assert!(error.contains("Opponent fields are forbidden"), "{error}");
+            }
+        }
+    }
 
     fn collected(policy: &PublicPolicyHandle<'_>, players: usize) -> CollectedStochasticGame {
         let identity = SamplingStreamIdentity::new(SamplingSeed::new(17), 0, 0, players).unwrap();
