@@ -252,6 +252,29 @@ impl UpdatedPublicRlPolicy {
     pub fn model(&self) -> &PublicPolicyModel {
         &self.artifact.model
     }
+    /// Narrow internal boundary for the count1 Scalar inference handle.
+    /// Checksum consistency does not authenticate optimization history.
+    pub(crate) fn validate_for_inference(&self) -> Result<(), String> {
+        let artifact = &self.artifact;
+        if artifact.update_count != 1
+            || artifact.report.contract != contract()
+            || artifact.report.numeric.changed_parameters == 0
+        {
+            return Err("Incompatible count1 RL inference contract".into());
+        }
+        artifact.report.config.validate()?;
+        artifact.model.validate()?;
+        if artifact.report.checksum != artifact.report.expected_checksum()?
+            || artifact.checksum
+                != hash(
+                    b"tzolkin-public-rl-one-step-artifact-v1\0",
+                    &(artifact.update_count, &artifact.report, &artifact.model),
+                )?
+        {
+            return Err("Count1 RL inference checksum mismatch".into());
+        }
+        Ok(())
+    }
 }
 pub enum OneStepOutcome {
     Updated(UpdatedPublicRlPolicy),

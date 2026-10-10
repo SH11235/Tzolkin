@@ -279,54 +279,12 @@ impl<'a> LoadedPublicPolicy<'a> {
     }
     /// Classify a supplied ordered candidate batch, not an authenticated legal set.
     pub fn predict(&self, rows: &[EncodedCandidate]) -> Result<PublicPolicyDistribution, String> {
-        if rows.is_empty() || rows.len() > crate::model::MAX_CANDIDATES {
-            return Err("Invalid public policy candidate count".into());
-        }
-        let context = rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
-        // This is only an optimization predicate, not a new acceptance guard.
-        // Numeric-equal contexts with different signed-zero bits retain the
-        // old path. A bad tag also retains the old per-row error ordering.
-        let reusable = rows.len() > 1
-            && rows.iter().all(|row| {
-                row.values_for_schema(PUBLIC_FEATURE_SCHEMA)
-                    .is_ok_and(|values| {
-                        prefix_bits_equal(&context[..CONTEXT_COLUMNS], &values[..CONTEXT_COLUMNS])
-                    })
-            });
-        let mut prefix = None;
-        let mut logits = Vec::with_capacity(rows.len());
-        for row in rows {
-            if row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..CONTEXT_COLUMNS]
-                != context[..CONTEXT_COLUMNS]
-            {
-                return Err("Public policy candidates do not share one context".into());
-            }
-            let logit = if reusable {
-                // Every candidate's full 512-value guard runs before its dot.
-                // Initialization occurs only after the first row is validated;
-                // the cache cannot escape this call or its immutable model.
-                let values = PublicPolicyModel::validated_values(row)?;
-                let saved = prefix.get_or_insert_with(|| {
-                    self.kernel.policy_prefix_validated(
-                        &self.artifact.model.parameters[..B1],
-                        &context[..CONTEXT_COLUMNS],
-                    )
-                });
-                let mut hidden = [0.0; HIDDEN];
-                saved.continue_validated(&values[CONTEXT_COLUMNS..], &mut hidden);
-                self.artifact.model.finish_hidden(hidden, self.kernel)?
-            } else {
-                self.policy_logit(row)?
-            };
-            logits.push(logit);
-        }
-        let mut probabilities = vec![0.0; logits.len()];
-        policy_softmax(&logits, &mut probabilities)?;
+        let numeric = predict_numeric(&self.artifact.model, self.kernel, rows)?;
         Ok(PublicPolicyDistribution {
             policy_version: POLICY_VERSION.into(),
             feature_schema: PUBLIC_FEATURE_SCHEMA,
-            logits,
-            probabilities,
+            logits: numeric.logits,
+            probabilities: numeric.probabilities,
             value: (),
             value_validity: ValueValidity::UnavailablePolicyOnly,
         })
@@ -359,6 +317,65 @@ impl<'a> LoadedPublicPolicy<'a> {
             score: f64::from(prediction.logits[best]),
         })
     }
+}
+
+/// Numeric-only result: it carries no BC/RL ownership or policy metadata.
+pub(crate) struct NumericPolicyDistribution {
+    pub(crate) logits: Vec<f32>,
+    pub(crate) probabilities: Vec<f32>,
+}
+
+/// Both callers retain a checked immutable model. This function preserves the
+/// existing batch guard/error order and unreduced prefix continuation exactly.
+pub(crate) fn predict_numeric(
+    model: &PublicPolicyModel,
+    kernel: ResolvedKernel,
+    rows: &[EncodedCandidate],
+) -> Result<NumericPolicyDistribution, String> {
+    if rows.is_empty() || rows.len() > crate::model::MAX_CANDIDATES {
+        return Err("Invalid public policy candidate count".into());
+    }
+    let context = rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    // This is only an optimization predicate, not a new acceptance guard.
+    // Numeric-equal contexts with different signed-zero bits retain the
+    // old path. A bad tag also retains the old per-row error ordering.
+    let reusable = rows.len() > 1
+        && rows.iter().all(|row| {
+            row.values_for_schema(PUBLIC_FEATURE_SCHEMA)
+                .is_ok_and(|values| {
+                    prefix_bits_equal(&context[..CONTEXT_COLUMNS], &values[..CONTEXT_COLUMNS])
+                })
+        });
+    let mut prefix = None;
+    let mut logits = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..CONTEXT_COLUMNS]
+            != context[..CONTEXT_COLUMNS]
+        {
+            return Err("Public policy candidates do not share one context".into());
+        }
+        let logit = if reusable {
+            // Every candidate's full 512-value guard runs before its dot.
+            // Initialization occurs only after the first row is validated;
+            // the cache cannot escape this call or its immutable model.
+            let values = PublicPolicyModel::validated_values(row)?;
+            let saved = prefix.get_or_insert_with(|| {
+                kernel.policy_prefix_validated(&model.parameters[..B1], &context[..CONTEXT_COLUMNS])
+            });
+            let mut hidden = [0.0; HIDDEN];
+            saved.continue_validated(&values[CONTEXT_COLUMNS..], &mut hidden);
+            model.finish_hidden(hidden, kernel)?
+        } else {
+            model.logit(row, kernel)?
+        };
+        logits.push(logit);
+    }
+    let mut probabilities = vec![0.0; logits.len()];
+    policy_softmax(&logits, &mut probabilities)?;
+    Ok(NumericPolicyDistribution {
+        logits,
+        probabilities,
+    })
 }
 
 struct ByteLimit(usize);
