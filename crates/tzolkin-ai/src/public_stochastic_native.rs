@@ -1026,6 +1026,18 @@ fn finish<P: Serialize + PartialEq>(
     config: &NativeStochasticConfig,
     expected: Option<&Record<P>>,
 ) -> Result<Record<P>, String> {
+    require_payload_reservations(&record, config)?;
+    if let Some(expected) = expected
+        && *expected != record
+    {
+        return Err("Stochastic record final counts/terminal/failure/budget mismatch".into());
+    }
+    Ok(record)
+}
+pub(crate) fn require_payload_reservations<P: Serialize>(
+    record: &Record<P>,
+    config: &NativeStochasticConfig,
+) -> Result<(), String> {
     // Verify actual serialization stays within the conservative reservations.
     // This is a late invariant, not a license to perform work before admission.
     let traces = record
@@ -1037,7 +1049,7 @@ fn finish<P: Serialize + PartialEq>(
     let trace_bytes = traces.into_iter().try_fold(0usize, |sum, size| {
         sum.checked_add(size).ok_or("Trace bytes overflow")
     })?;
-    let total = serialized_size(&record, MAX_RECORD_BYTES)?;
+    let total = serialized_size(record, MAX_RECORD_BYTES)?;
     let source_bytes = total
         .checked_sub(trace_bytes)
         .ok_or("Source bytes underflow")?;
@@ -1048,12 +1060,7 @@ fn finish<P: Serialize + PartialEq>(
     {
         return Err("Internal payload reservation invariant failed".into());
     }
-    if let Some(expected) = expected
-        && *expected != record
-    {
-        return Err("Stochastic record final counts/terminal/failure/budget mismatch".into());
-    }
-    Ok(record)
+    Ok(())
 }
 
 pub(crate) fn audit_record(

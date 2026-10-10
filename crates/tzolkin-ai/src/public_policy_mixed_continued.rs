@@ -106,6 +106,49 @@ impl ContinuedMixedReport {
     pub fn families(&self) -> &[String; 4] {
         &self.families
     }
+    pub(crate) fn plan_checksum(&self) -> &str {
+        &self.plan_checksum
+    }
+    pub(crate) fn require_saved_cohort(
+        &self,
+        plan: &serde_json::Value,
+        cohort: &serde_json::Value,
+        actor: &OneStepConfig,
+        critic: &ResidualFitConfig,
+    ) -> Result<(), String> {
+        self.validate_content()?;
+        if plan["checksum"] != self.plan_checksum
+            || plan["families"]
+                != serde_json::to_value(&self.families).map_err(|e| e.to_string())?
+            || cohort["checksum"] != self.cohort_checksum
+            || cohort["planChecksum"] != self.plan_checksum
+            || cohort["episodeChecksums"]
+                != serde_json::to_value(&self.episode_checksums).map_err(|e| e.to_string())?
+            || cohort["learnerCounts"]
+                != serde_json::to_value(self.counts).map_err(|e| e.to_string())?
+            || cohort["observedCallbacks"] != self.observed_callbacks
+            || self.actor_config != serde_json::to_value(actor).map_err(|e| e.to_string())?
+            || self.critic_config != serde_json::to_value(critic).map_err(|e| e.to_string())?
+        {
+            return Err("Continued report differs from saved plan/cohort/configuration".into());
+        }
+        let headers = plan["headers"]
+            .as_array()
+            .filter(|h| h.len() == 4)
+            .ok_or("Saved current mixed planned headers")?;
+        for (i, h) in headers.iter().enumerate() {
+            if h["config"]
+                != serde_json::to_value(&self.configurations[i]).map_err(|e| e.to_string())?
+                || h["basePolicy"]["parent"]
+                    != serde_json::to_value(&self.parent).map_err(|e| e.to_string())?
+                || h["basePolicy"]["learnerSeat"] != self.learner_seats[i]
+                || h["basePolicy"]["rosterChecksum"] != self.roster_checksums[i]
+            {
+                return Err("Continued report full immediate-parent planned headers differ".into());
+            }
+        }
+        Ok(())
+    }
     fn expected_checksum(&self) -> Result<String, String> {
         let mut value = serde_json::to_value(self).map_err(|e| e.to_string())?;
         value
@@ -473,6 +516,36 @@ enum ProposalOutcome {
 pub struct ContinuedMixedProposal {
     outcome: ProposalOutcome,
 }
+/// Candidate and initial union are checked before any durable Resolve.
+pub(crate) struct PreparedContinuedPromotion {
+    artifact: ContinuedMixedArtifact,
+    initial_families: Option<BTreeSet<String>>,
+}
+impl PreparedContinuedPromotion {
+    pub(crate) fn artifact(&self) -> &ContinuedMixedArtifact {
+        &self.artifact
+    }
+}
+pub(crate) fn admit_resolved(
+    proof: crate::public_rl_current_mixed_durable::DurableMixedResolve,
+    current: &mut Option<ContinuedMixedOwner>,
+) {
+    let staged = proof.into_promotion();
+    let mut families = match staged.initial_families {
+        Some(s) => s,
+        None => {
+            current
+                .take()
+                .expect("sealed immediate continued owner")
+                .families
+        }
+    };
+    families.extend(staged.artifact.report.families.iter().cloned());
+    *current = Some(ContinuedMixedOwner {
+        artifact: staged.artifact,
+        families,
+    });
+}
 impl ContinuedMixedProposal {
     pub fn report(&self) -> &ContinuedMixedReport {
         match &self.outcome {
@@ -485,6 +558,64 @@ impl ContinuedMixedProposal {
             ProposalOutcome::Updated(a) => Some(a),
             ProposalOutcome::NoChange(_) => None,
         }
+    }
+    pub(crate) fn require_parent(
+        &self,
+        parent: &CurrentMixedPolicyHandle<'_>,
+    ) -> Result<(), String> {
+        match &self.outcome {
+            ProposalOutcome::Updated(a) => a.validate_against(parent),
+            ProposalOutcome::NoChange(r) => {
+                r.validate_content()?;
+                if &r.parent != parent.identity()
+                    || r.root != parent.root
+                    || r.changed_parameters() != [0, 0]
+                    || r.families.iter().any(|f| parent.contains_family(f))
+                {
+                    return Err("Continued NoChange differs from genuine parent".into());
+                }
+                Ok(())
+            }
+        }
+    }
+    pub(crate) fn restored(
+        artifact: ContinuedMixedArtifact,
+        parent: &CurrentMixedPolicyHandle<'_>,
+    ) -> Result<Self, String> {
+        artifact.validate_against(parent)?;
+        Ok(Self {
+            outcome: ProposalOutcome::Updated(artifact),
+        })
+    }
+    pub(crate) fn restored_no_change(
+        report: ContinuedMixedReport,
+        parent: &CurrentMixedPolicyHandle<'_>,
+    ) -> Result<Self, String> {
+        let proposal = Self {
+            outcome: ProposalOutcome::NoChange(report),
+        };
+        proposal.require_parent(parent)?;
+        Ok(proposal)
+    }
+    pub(crate) fn stage(
+        self,
+        parent: &CurrentMixedPolicyHandle<'_>,
+    ) -> Result<PreparedContinuedPromotion, String> {
+        let artifact = match self.outcome {
+            ProposalOutcome::Updated(a) => a,
+            ProposalOutcome::NoChange(_) => {
+                return Err("NoChange cannot promote a continued owner".into());
+            }
+        };
+        artifact.validate_against(parent)?;
+        let initial_families = match parent.parent {
+            CurrentMixedParent::Initial(o) => Some(o.family_closure().cloned().collect()),
+            CurrentMixedParent::Continued(_) => None,
+        };
+        Ok(PreparedContinuedPromotion {
+            artifact,
+            initial_families,
+        })
     }
 }
 /// Exactly one joint calculation from a genuine current parent and four sealed

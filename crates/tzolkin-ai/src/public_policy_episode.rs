@@ -379,8 +379,8 @@ pub(crate) fn applied_plan<P>(
     applied_plan_for(record, config, sampling_version, binding, None)
 }
 
-/// Only fresh-audited mixed wrappers call this mask. Every global transition
-/// remains checked; links/likelihood targets are created only for the learner.
+/// Check global applied links and the learner mask. Returned private links do
+/// not seal an episode; metadata restore may inspect them without fresh audit.
 pub(crate) fn applied_mixed_plan<P>(
     record: &Record<P>,
     config: &NativeStochasticConfig,

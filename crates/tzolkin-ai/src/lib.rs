@@ -29,6 +29,7 @@ pub mod public_policy_repeat;
 pub mod public_policy_update;
 pub mod public_rl_artifact;
 pub mod public_rl_controller;
+pub mod public_rl_current_mixed_durable;
 pub mod public_rl_current_mixed_session;
 pub mod public_rl_current_mixed_source;
 pub mod public_rl_long_session;
