@@ -16,6 +16,16 @@ pub const REPLAY_SCHEMA: u32 = 1;
 pub const RULES_VERSION: u32 = 1;
 pub const RULES_BASELINE: &str = "1ec8fdbb61f671ca2cbf0dbac7f3662c160be677";
 pub const MAX_DECISIONS: usize = 4000;
+pub const RL_ARGMAX_SELECTION_VERSION: &str = "public-rl-argmax-first-legal-tie-v1";
+fn required_null<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
+    if serde_json::Value::deserialize(deserializer)?.is_null() {
+        Ok(())
+    } else {
+        Err(serde::de::Error::custom(
+            "RL evaluation guard must be explicit null",
+        ))
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(
     tag = "kind",
@@ -45,6 +55,20 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    /// Evaluation provenance only. Metadata validation is not an RL owner constructor.
+    PublicRl {
+        policy_version: String,
+        artifact_checksum: String,
+        update_count: u64,
+        task: String,
+        feature_schema: u32,
+        input_contract: String,
+        numerical_target: String,
+        inference_backend: String,
+        selection_version: String,
+        #[serde(deserialize_with = "required_null")]
+        guard: (),
+    },
     PublicLearnedTradeGuard {
         policy_version: String,
         base: PublicLearnedSource,
@@ -92,6 +116,36 @@ pub enum SeatPolicy {
 impl SeatPolicy {
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PublicRl {
+                policy_version,
+                artifact_checksum,
+                update_count,
+                task,
+                feature_schema,
+                input_contract,
+                numerical_target,
+                inference_backend,
+                selection_version,
+                guard: (),
+            } if ((*update_count == 1
+                && policy_version == crate::public_rl_native::POLICY_VERSION
+                && task == crate::public_policy_update::TASK)
+                || ((2..=crate::public_policy_repeat::MAX_UPDATE_COUNT)
+                    .contains(update_count)
+                    && policy_version == crate::public_policy_repeat::POLICY_VERSION
+                    && task == crate::public_policy_repeat::TASK))
+                && *feature_schema == crate::features::PUBLIC_FEATURE_SCHEMA
+                && input_contract == crate::public_model::INPUT_CONTRACT
+                && numerical_target == &crate::public_stochastic_native::numerical_target()
+                && inference_backend == "scalar"
+                && selection_version == RL_ARGMAX_SELECTION_VERSION
+                && artifact_checksum.len() == 64
+                && artifact_checksum
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+            {
+                Ok(())
+            }
             Self::PublicLearnedTradeGuard {
                 policy_version,
                 base,
@@ -548,6 +602,13 @@ fn play_game_internal(
         }
         if policies
             .iter()
+            .any(|policy| matches!(policy, SeatPolicy::PublicRl { .. }))
+            && (!(3..=4).contains(&players) || options != GameOptions::default())
+        {
+            return Err("RL evaluation provenance requires base 3..4p".into());
+        }
+        if policies
+            .iter()
             .any(|policy| matches!(policy, SeatPolicy::PublicLearnedTradeGuard { .. }))
             && (!(3..=4).contains(&players) || options != GameOptions::default())
         {
@@ -573,6 +634,12 @@ fn play_game_internal(
         }
         let observation = observe(&state, state.current_player)?;
         let (decision, search, trade_guard) = decide(&observation)?;
+        if let ReplaySource::PolicySelfPlay { policies } = &source
+            && let SeatPolicy::PublicRl { policy_version, .. } = &policies[observation.actor]
+            && (decision.policy_version != *policy_version || !decision.score.is_finite())
+        {
+            return Err("RL evaluation decision/provenance mismatch".into());
+        }
         validate_search_trace(&source, &observation, &search)?;
         if search.as_ref().is_some_and(|trace| {
             decision.policy_version != trace.policy_version || decision.score != trace.score
@@ -689,6 +756,13 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
             && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
         {
             return Err("Public learned provenance requires base 3..4p".into());
+        }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::PublicRl { .. }))
+            && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
+        {
+            return Err("RL evaluation provenance requires base 3..4p".into());
         }
         if policies
             .iter()
