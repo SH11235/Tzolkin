@@ -20,15 +20,13 @@ use crate::public_policy_repeat::RlUpdateParent;
 use crate::public_policy_update::{OneStepConfig, UpdatedPublicRlPolicy, checkpoint_digest, hash};
 use crate::public_rl_artifact::InitializedPublicRlPolicy;
 use crate::public_rl_long_stochastic_native::{
-    audit_long_rl_record_bytes, collect_long_rl_native, encode_long_rl_record,
+    audit_long_rl_record, collect_long_rl_native, encode_long_rl_record,
 };
 use crate::public_rl_native::{LongRlHandle, UpdatedPublicRlHandle};
 use crate::public_rl_policy_cohort::{PlannedRlCohort, ValidatedRlCohort};
 use crate::public_rl_policy_episode::ValidatedRlPolicyEpisode;
 use crate::public_rl_session::RlTrainingSession;
-use crate::public_rl_stochastic_native::{
-    audit_rl_record_bytes, collect_rl_native, encode_rl_record,
-};
+use crate::public_rl_stochastic_native::{audit_rl_record, collect_rl_native, encode_rl_record};
 use crate::public_stochastic::{RlSamplingPolicy, SamplingSeed, SamplingStreamIdentity};
 use crate::public_stochastic_native::{CollectionLimits, NativeStochasticConfig};
 use crate::public_stochastic_record::{
@@ -625,13 +623,15 @@ impl LongTrainingSession {
         }
         Ok(())
     }
-    fn preflight_records(&self) -> Result<[Vec<u8>; 4], String> {
+    // Retain only the strict decoded records, not a second copy of raw payloads.
+    // All four saved pins and closed headers pass before any AuditStart.
+    fn preflight_records(&self) -> Result<[Record<RlSamplingPolicy>; 4], String> {
         let batch = self
             .progress
             .pending
             .as_ref()
             .ok_or("No Long pending reservation")?;
-        let mut bytes = Vec::with_capacity(4);
+        let mut records = Vec::with_capacity(4);
         let expected_policy = match self.current.as_ref().ok_or("Missing current owner")? {
             Current::Count1(p) => RlSamplingPolicy::from_handle(&UpdatedPublicRlHandle::new(p)?)?,
             Current::Long(p) => RlSamplingPolicy::from_long_handle(&LongRlHandle::new(p)?)?,
@@ -652,13 +652,16 @@ impl LongTrainingSession {
                     "Saved record configuration/current policy differs before audit".into(),
                 );
             }
-            bytes.push(raw);
+            records.push(record);
         }
-        bytes
+        records
             .try_into()
             .map_err(|_| "Expected four saved records".into())
     }
-    fn audit(&mut self, bytes: [Vec<u8>; 4]) -> Result<Result<ValidatedRlCohort, String>, String> {
+    fn audit(
+        &mut self,
+        records: [Record<RlSamplingPolicy>; 4],
+    ) -> Result<Result<ValidatedRlCohort, String>, String> {
         let configs = checked_configs(
             &self
                 .progress
@@ -682,19 +685,19 @@ impl LongTrainingSession {
             return Err("Restored Long plan mismatch".into());
         }
         let mut episodes = Vec::with_capacity(4);
-        for (i, bytes) in bytes.iter().enumerate() {
+        for (i, record) in records.into_iter().enumerate() {
             self.save(Event::AuditStart { member: i })?;
             let began = Instant::now();
             // Handle/infrastructure errors are outer errors, never failed cohorts.
             let result = match self.current.as_ref().ok_or("Missing Long current owner")? {
                 Current::Count1(p) => {
                     let handle = UpdatedPublicRlHandle::new(p)?;
-                    audit_rl_record_bytes(bytes, &handle)
+                    audit_rl_record(&record, &handle)
                         .and_then(ValidatedRlPolicyEpisode::from_audited)
                 }
                 Current::Long(p) => {
                     let handle = LongRlHandle::new(p)?;
-                    audit_long_rl_record_bytes(bytes, &handle)
+                    audit_long_rl_record(&record, &handle)
                         .and_then(ValidatedRlPolicyEpisode::from_long_audited)
                 }
             };
@@ -900,8 +903,8 @@ impl LongTrainingSession {
             if saved_only {
                 resume_headroom(&self.spec, &self.progress, self.sequence)?;
             }
-            let bytes = self.preflight_records()?;
-            match self.audit(bytes)? {
+            let records = self.preflight_records()?;
+            match self.audit(records)? {
                 Ok(cohort) => self.update(&cohort)?,
                 Err(error) => {
                     self.save(Event::Resolve {
