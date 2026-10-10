@@ -35,6 +35,53 @@ describe('validated save import through the production Rust adapter', () => {
     expect((await inspectGame(imported.state)).state).toEqual(state);
   });
 
+  it('preserves a closed NN checksum and rejects unsupported current or undo states', async () => {
+    const { state } = await createGame(['a', 'b', 'c'], 17);
+    const { state: four } = await createGame(['a', 'b', 'c', 'd'], 11235);
+    const policy = { mode: 'nn', modelChecksum: 'a'.repeat(64) };
+    const text = JSON.stringify({
+      state,
+      history: [state],
+      controllers: ['cpu', 'human', 'cpu'],
+      cpuPolicy: policy,
+    });
+    const imported = await parseSession(text);
+    expect(imported.cpuPolicy).toEqual(policy);
+    expect(controllersFor(imported)).toEqual(['cpu', 'human', 'cpu']);
+    expect(JSON.parse(JSON.stringify(imported))).toEqual(JSON.parse(text));
+    expect(
+      (await parseSession(JSON.stringify({ state: four, history: [], cpuPolicy: policy })))
+        .cpuPolicy,
+    ).toEqual(policy);
+    for (const cpuPolicy of [
+      null,
+      {},
+      { ...policy, mode: 'heuristic' },
+      { ...policy, modelChecksum: 'A'.repeat(64) },
+      { ...policy, body: '{}' },
+    ]) {
+      await expect(parseSession(JSON.stringify({ state, history: [], cpuPolicy }))).rejects.toThrow(
+        'NN CPU',
+      );
+    }
+    const { state: two } = await createGame(['a', 'b'], 17);
+    const { state: expanded } = await createGame(['a', 'b', 'c'], 17, {
+      additionalBuildings: true,
+    });
+    const { state: tribal } = await createGame(['a', 'b', 'c'], 17, { tribes: true });
+    for (const unsupported of [two, expanded, tribal]) {
+      await expect(
+        parseSession(JSON.stringify({ state: unsupported, history: [], cpuPolicy: policy })),
+      ).rejects.toThrow('NN CPU');
+      await expect(
+        parseSession(JSON.stringify({ state, history: [unsupported], cpuPolicy: policy })),
+      ).rejects.toThrow('NN CPU');
+    }
+    await expect(
+      parseSession(JSON.stringify({ state, history: [four], cpuPolicy: policy })),
+    ).rejects.toThrow('NN CPU');
+  });
+
   it('rejects unknown catalog IDs and invalid state through the production boundary', async () => {
     const { state } = await createGame(['a', 'b'], 42);
     state.players[0]!.wealthOffer[0] = 'constructor';

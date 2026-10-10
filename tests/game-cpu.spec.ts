@@ -13,6 +13,66 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+test('NN setup requires a model and rejects an oversized import before starting a game', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const start = page.getByRole('button', { name: '対局をはじめる', exact: true });
+  await page.getByLabel('CPUの判断方法').selectOption('nn');
+  await expect(start).toBeDisabled();
+  await page.getByRole('button', { name: '3人', exact: true }).click();
+  await expect(start).toBeDisabled();
+  await page.getByLabel('NNモデルファイル').setInputFiles({
+    name: 'synthetic.json',
+    mimeType: 'application/json',
+    buffer: Buffer.alloc(1024 * 1024 + 1),
+  });
+  await expect(page.getByRole('alert')).toContainText('上限1MiB');
+  expect(await sessionOf(page)).toBeNull();
+  await expect(start).toBeDisabled();
+  await page.getByLabel('CPUの判断方法').selectOption('heuristic');
+  await expect(start).toBeEnabled();
+});
+
+test('a saved NN game resumes and imports paused without silently changing its CPU policy', async ({
+  page,
+}) => {
+  await page.goto('/');
+  await page.evaluate(() => {
+    Date.now = () => 17;
+  });
+  await page.getByRole('button', { name: '3人', exact: true }).click();
+  await page.getByRole('button', { name: '対局をはじめる', exact: true }).click();
+  await expect.poll(async () => (await sessionOf(page))?.state.players.length).toBe(3);
+  const original = await sessionOf(page);
+  const saved: Session = {
+    ...original,
+    controllers: ['cpu', 'cpu', 'cpu'],
+    cpuPolicy: { mode: 'nn', modelChecksum: 'a'.repeat(64) },
+  };
+  await page.evaluate(
+    (value) => localStorage.setItem('tzolkin.game.v1', JSON.stringify(value)),
+    saved,
+  );
+  await page.reload();
+  await page.getByRole('button', { name: /保存した対局を続ける/ }).click();
+  await expect(page.getByRole('status').filter({ hasText: '同じモデル' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'CPUを再開', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'CPUを再開', exact: true }).click();
+  await expect(page.getByRole('alert')).toContainText('同じモデル');
+  await page.waitForTimeout(150);
+  expect(await sessionOf(page)).toEqual(saved);
+  await page.getByLabel('対局の保存ファイル').setInputFiles({
+    name: 'synthetic-save.json',
+    mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(saved)),
+  });
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'CPUを再開', exact: true })).toBeVisible();
+  expect(await sessionOf(page)).toEqual(saved);
+  expect(Object.keys((await sessionOf(page)).cpuPolicy!)).toEqual(['mode', 'modelChecksum']);
+});
+
 test('a human can finish setup and take a turn against a CPU seat', async ({ page }) => {
   await page.goto('/');
   await page.getByLabel('プレイヤー 1の操作').selectOption('cpu');
