@@ -206,6 +206,9 @@ impl OneStepReport {
     pub(crate) fn checkpoint_plan_checksum(&self) -> &str {
         &self.cohort_plan_checksum
     }
+    pub(crate) fn cohort_receipt_checksum(&self) -> &str {
+        &self.cohort_receipt_checksum
+    }
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
@@ -541,10 +544,26 @@ pub(crate) fn accumulate_step(
     counts: &mut [usize; 3],
     deltas: &mut Deltas,
 ) -> Result<(), String> {
+    if step.observation().players.len() != players {
+        return Err("Invalid sealed actor/full legal order".into());
+    }
+    accumulate_step_with_baseline(model, step, config, own, counts, deltas, |_| {
+        Ok(1.0 / players as f64)
+    })
+}
+
+pub(crate) fn accumulate_step_with_baseline(
+    model: &PublicPolicyModel,
+    step: AppliedActorStep<'_>,
+    config: &OneStepConfig,
+    own: &mut [f64],
+    counts: &mut [usize; 3],
+    deltas: &mut Deltas,
+    baseline: impl FnOnce(&tzolkin_core::observation::Observation) -> Result<f64, String>,
+) -> Result<(), String> {
     let observation = step.observation();
     let count = observation.legal_actions.len();
     if !(1..=MAX_CANDIDATES).contains(&count)
-        || observation.players.len() != players
         || observation.actor != step.actor()
         || observation.legal_actions.get(step.chosen_index()) != Some(step.chosen())
     {
@@ -580,12 +599,12 @@ pub(crate) fn accumulate_step(
     if !target.is_finite() || !(0.0..=1.0).contains(&target) {
         return Err("Invalid terminal winner-share return".into());
     }
+    let baseline = baseline(observation)?;
+    if !baseline.is_finite() || !(0.0..=1.0).contains(&baseline) {
+        return Err("Invalid frozen state baseline".into());
+    }
     let mut dlogits = vec![0.0; count];
-    likelihood.weighted_logit_gradient(
-        likelihood.smooth(),
-        target - 1.0 / players as f64,
-        &mut dlogits,
-    )?;
+    likelihood.weighted_logit_gradient(likelihood.smooth(), target - baseline, &mut dlogits)?;
     cache.accumulate_parameter_gradient(&dlogits, own)
 }
 fn closure(

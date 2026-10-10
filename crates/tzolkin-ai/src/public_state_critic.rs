@@ -20,10 +20,45 @@ pub const CONTEXT_SCHEMA: u32 = 1;
 pub const CONTEXT_COUNT: usize = 384;
 pub const HIDDEN: usize = 32;
 pub const PARAMETER_COUNT: usize = CONTEXT_COUNT * HIDDEN + HIDDEN + HIDDEN + 1;
-const B1: usize = CONTEXT_COUNT * HIDDEN;
-const WV: usize = B1 + HIDDEN;
-const BV: usize = WV + HIDDEN;
+pub(crate) const B1: usize = CONTEXT_COUNT * HIDDEN;
+pub(crate) const WV: usize = B1 + HIDDEN;
+pub(crate) const BV: usize = WV + HIDDEN;
 const TASK: &str = "actorWinnerShareStateCritic";
+
+pub(crate) fn initialized_parameters(seed: u64) -> Vec<f32> {
+    let mut random = Random { state: seed };
+    let mut parameters = vec![0.0; PARAMETER_COUNT];
+    let input_scale = (6.0 / (CONTEXT_COUNT + HIDDEN) as f32).sqrt();
+    for value in &mut parameters[..B1] {
+        *value = (random.unit() * 2.0 - 1.0) * input_scale;
+    }
+    let output_scale = (6.0 / (HIDDEN + 1) as f32).sqrt();
+    for value in &mut parameters[WV..BV] {
+        *value = (random.unit() * 2.0 - 1.0) * output_scale;
+    }
+    parameters
+}
+
+pub(crate) fn state_forward(
+    parameters: &[f32],
+    values: &[f32; CONTEXT_COUNT],
+    kernel: ResolvedKernel,
+    hidden: &mut [f32; HIDDEN],
+) -> Result<f32, String> {
+    kernel.dot_rows_validated(&parameters[..B1], values, hidden);
+    for (unit, value) in hidden.iter_mut().enumerate() {
+        *value += parameters[B1 + unit];
+        if !value.is_finite() {
+            return Err("Non-finite state critic hidden activation".into());
+        }
+        *value = value.tanh();
+    }
+    let output = kernel.dot_validated(&parameters[WV..BV], hidden) + parameters[BV];
+    if !output.is_finite() {
+        return Err("Non-finite state critic return estimate".into());
+    }
+    Ok(output)
+}
 
 /// Only the Observation constructor can create this context. It validates base 3/4p
 /// Setup/Playing and uses the candidate-independent V2 prefix, including legal count.
@@ -187,16 +222,6 @@ impl PublicStateCriticArtifact {
     }
     /// Deterministically initialized and untrained. This does not run value training.
     pub fn new(seed: u64) -> Result<Self, String> {
-        let mut random = Random { state: seed };
-        let mut parameters = vec![0.0; PARAMETER_COUNT];
-        let input_scale = (6.0 / (CONTEXT_COUNT + HIDDEN) as f32).sqrt();
-        for value in &mut parameters[..B1] {
-            *value = (random.unit() * 2.0 - 1.0) * input_scale;
-        }
-        let output_scale = (6.0 / (HIDDEN + 1) as f32).sqrt();
-        for value in &mut parameters[WV..BV] {
-            *value = (random.unit() * 2.0 - 1.0) * output_scale;
-        }
         let mut artifact = Self {
             schema: MODEL_SCHEMA.into(),
             model_version: MODEL_VERSION.into(),
@@ -215,7 +240,9 @@ impl PublicStateCriticArtifact {
             observation_schema: OBSERVATION_SCHEMA,
             move_schema: MOVE_SCHEMA,
             catalog_hash: crate::replay::catalog_hash(),
-            model: PublicStateCriticModel { parameters },
+            model: PublicStateCriticModel {
+                parameters: initialized_parameters(seed),
+            },
             checksum: String::new(),
         };
         artifact.checksum = artifact.expected_checksum()?;
@@ -335,20 +362,8 @@ impl<'a> LoadedPublicStateCritic<'a> {
         }
         let parameters = &self.artifact.model.parameters;
         let mut hidden = [0.0; HIDDEN];
-        self.kernel
-            .dot_rows_validated(&parameters[..B1], &context.values, &mut hidden);
-        for (unit, value) in hidden.iter_mut().enumerate() {
-            *value += parameters[B1 + unit];
-            if !value.is_finite() {
-                return Err("Non-finite state critic hidden activation".into());
-            }
-            *value = value.tanh();
-        }
         let raw_return_estimate =
-            self.kernel.dot_validated(&parameters[WV..BV], &hidden) + parameters[BV];
-        if !raw_return_estimate.is_finite() {
-            return Err("Non-finite state critic return estimate".into());
-        }
+            state_forward(parameters, &context.values, self.kernel, &mut hidden)?;
         Ok(StateCriticEstimate {
             actor: context.actor,
             player_count: context.player_count,

@@ -14,6 +14,7 @@ pub mod public_deployment;
 pub mod public_mixed_native;
 pub mod public_model;
 pub mod public_native;
+pub mod public_policy_baseline;
 pub mod public_policy_cohort;
 pub mod public_policy_episode;
 pub mod public_policy_likelihood;
