@@ -345,7 +345,7 @@ fn export_sources<'a>(
                     return Err("Selfplay policy/seat count mismatch".into());
                 }
                 for policy in policies {
-                    if matches!(policy, replay::SeatPolicy::PublicRl { .. }) {
+                    if policy.is_rl_evaluation() {
                         return Err(
                             "RL evaluation source training admission is not implemented".into()
                         );
