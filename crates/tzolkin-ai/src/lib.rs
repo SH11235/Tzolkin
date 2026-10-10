@@ -31,6 +31,7 @@ pub mod public_rl_long_stochastic_native;
 pub mod public_rl_native;
 pub mod public_rl_paired_policy_cohort;
 pub mod public_rl_paired_policy_episode;
+pub mod public_rl_paired_research;
 pub mod public_rl_paired_session;
 pub mod public_rl_paired_stochastic_native;
 pub mod public_rl_policy_cohort;

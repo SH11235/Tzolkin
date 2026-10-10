@@ -391,7 +391,7 @@ fn source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
                 return Err("Native source policy/seat mismatch".into());
             }
             for policy in policies {
-                if matches!(policy, replay::SeatPolicy::PublicRl { .. }) {
+                if policy.is_rl_evaluation() {
                     return Err("RL evaluation source training admission is not implemented".into());
                 }
                 if matches!(policy, replay::SeatPolicy::PublicLearnedTradeGuard { .. }) {

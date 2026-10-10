@@ -497,6 +497,25 @@ impl PairedTrainingSession {
             .expect("session always retains its owner")
             .parent()
     }
+    /// A curve point must describe a closed durable parent, never pending work.
+    pub(crate) fn require_evaluation_ready(&self) -> Result<(), String> {
+        if self.progress.pending.is_some()
+            || self.progress.unknown_collections != 0
+            || self.progress.gradient.started != self.progress.gradient.returned
+            || !matches!(
+                self.progress.last_outcome.as_deref(),
+                None | Some("updated")
+            )
+        {
+            return Err(
+                "Paired evaluation requires an initial or successfully updated closed owner".into(),
+            );
+        }
+        Ok(())
+    }
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
     /// Check a fixed Validation set against this session's retained reservations
     /// and explicit exclusions. This is scoped non-overlap, not global freshness.
     pub fn require_unused_validation_families(&self, seeds: &[u32]) -> Result<(), String> {
@@ -1778,7 +1797,7 @@ pub fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
-fn local(path: &Path, allow_missing: bool) -> Result<PathBuf, String> {
+pub(crate) fn local(path: &Path, allow_missing: bool) -> Result<PathBuf, String> {
     let text = path.to_string_lossy();
     if text.starts_with('/') && text.get(1..2).is_some_and(|s| s == "/" || s == "\\")
         || text.starts_with('\\')

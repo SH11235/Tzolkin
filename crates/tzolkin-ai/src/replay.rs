@@ -55,6 +55,30 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    /// Joint owner identity for deterministic actor-only development evaluation.
+    /// This metadata is not a joint owner constructor or training source.
+    PublicRlPaired {
+        policy_version: String,
+        artifact_checksum: String,
+        update_count: u64,
+        task: String,
+        actor_model_version: String,
+        critic_model_version: String,
+        feature_schema: u32,
+        input_contract: String,
+        context_schema: u32,
+        context_contract: String,
+        root_init_checksum: String,
+        root_count1_checksum: String,
+        root_residual_checksum: String,
+        residual_seed: u64,
+        lineage_checksum: String,
+        numerical_target: String,
+        inference_backend: String,
+        selection_version: String,
+        #[serde(deserialize_with = "required_null")]
+        guard: (),
+    },
     /// Evaluation provenance only. Metadata validation is not an RL owner constructor.
     PublicRl {
         policy_version: String,
@@ -114,8 +138,60 @@ pub enum SeatPolicy {
 }
 
 impl SeatPolicy {
+    pub(crate) fn is_rl_evaluation(&self) -> bool {
+        matches!(self, Self::PublicRl { .. } | Self::PublicRlPaired { .. })
+    }
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PublicRlPaired {
+                policy_version,
+                artifact_checksum,
+                update_count,
+                task,
+                actor_model_version,
+                critic_model_version,
+                feature_schema,
+                input_contract,
+                context_schema,
+                context_contract,
+                root_init_checksum,
+                root_count1_checksum,
+                root_residual_checksum,
+                residual_seed,
+                lineage_checksum,
+                numerical_target,
+                inference_backend,
+                selection_version,
+                guard: (),
+            } if (2..=crate::public_policy_paired_long::MAX_UPDATES).contains(update_count)
+                && policy_version == crate::public_policy_paired_long::POLICY_VERSION
+                && task == crate::public_policy_paired_long::TASK
+                && actor_model_version == crate::public_model::MODEL_VERSION
+                && critic_model_version == crate::public_state_critic::MODEL_VERSION
+                && *feature_schema == crate::features::PUBLIC_FEATURE_SCHEMA
+                && input_contract == crate::public_model::INPUT_CONTRACT
+                && *context_schema == crate::public_state_critic::CONTEXT_SCHEMA
+                && context_contract == crate::public_state_critic::CONTEXT_CONTRACT
+                && [
+                    artifact_checksum,
+                    root_init_checksum,
+                    root_count1_checksum,
+                    root_residual_checksum,
+                    lineage_checksum,
+                ]
+                .iter()
+                .all(|s| crate::public_policy_update::checkpoint_digest(s))
+                && *root_residual_checksum
+                    == crate::public_policy_baseline::zero_checksum(
+                        root_init_checksum,
+                        *residual_seed,
+                    )?
+                && numerical_target == &crate::public_stochastic_native::numerical_target()
+                && inference_backend == "scalar"
+                && selection_version == RL_ARGMAX_SELECTION_VERSION =>
+            {
+                Ok(())
+            }
             Self::PublicRl {
                 policy_version,
                 artifact_checksum,
@@ -603,9 +679,7 @@ fn play_game_internal(
         {
             return Err("Public learned provenance requires base 3..4p".into());
         }
-        if policies
-            .iter()
-            .any(|policy| matches!(policy, SeatPolicy::PublicRl { .. }))
+        if policies.iter().any(SeatPolicy::is_rl_evaluation)
             && (!(3..=4).contains(&players) || options != GameOptions::default())
         {
             return Err("RL evaluation provenance requires base 3..4p".into());
@@ -638,7 +712,8 @@ fn play_game_internal(
         let observation = observe(&state, state.current_player)?;
         let (decision, search, trade_guard) = decide(&observation)?;
         if let ReplaySource::PolicySelfPlay { policies } = &source
-            && let SeatPolicy::PublicRl { policy_version, .. } = &policies[observation.actor]
+            && let SeatPolicy::PublicRl { policy_version, .. }
+            | SeatPolicy::PublicRlPaired { policy_version, .. } = &policies[observation.actor]
             && (decision.policy_version != *policy_version || !decision.score.is_finite())
         {
             return Err("RL evaluation decision/provenance mismatch".into());
@@ -760,9 +835,7 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
         {
             return Err("Public learned provenance requires base 3..4p".into());
         }
-        if policies
-            .iter()
-            .any(|policy| matches!(policy, SeatPolicy::PublicRl { .. }))
+        if policies.iter().any(SeatPolicy::is_rl_evaluation)
             && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
         {
             return Err("RL evaluation provenance requires base 3..4p".into());
