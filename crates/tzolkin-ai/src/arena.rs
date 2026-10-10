@@ -6,9 +6,10 @@ use crate::kernel::Kernel;
 use crate::model::{LoadedPolicy, ModelArtifact};
 use crate::policy::HeuristicWeights;
 use crate::public_native::{PreparedPublicPolicy, PublicPolicyHandle};
+use crate::public_policy_long::LongRlPolicy;
 use crate::public_policy_repeat::RepeatedPublicRlPolicy;
 use crate::public_policy_update::UpdatedPublicRlPolicy;
-use crate::public_rl_native::{RepeatedPublicRlHandle, UpdatedPublicRlHandle};
+use crate::public_rl_native::{LongRlHandle, RepeatedPublicRlHandle, UpdatedPublicRlHandle};
 use crate::public_trade_guard::{
     self, TradeGuardCapture, TradeGuardConfig, TradeGuardSession, TradeGuardSummary,
 };
@@ -165,8 +166,11 @@ pub const BORROWED_RL_ARENA_SCHEMA: &str = "tzolkin-borrowed-rl-validation-arena
 pub enum BorrowedArenaPolicy<'a> {
     Count1(&'a UpdatedPublicRlPolicy),
     Repeated(&'a RepeatedPublicRlPolicy),
+    Long(&'a LongRlPolicy),
     PublicBc(&'a PreparedPublicPolicy),
     Heuristic(&'a HeuristicWeights),
+    CornFirstSetup(&'a HeuristicWeights),
+    CornFirstUxmalOpening(&'a HeuristicWeights),
     Search(&'a PreparedSearch),
 }
 
@@ -387,10 +391,14 @@ impl PreparedPolicy {
 pub struct PolicyDescription {
     pub provenance: SeatPolicy,
     pub dataset_fingerprint: Option<String>,
+    /// Present for Long-v2; its sealed artifact binds this exact numeric model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version: Option<&'static str>,
 }
 enum PolicyChooser<'a> {
     PublicRlCount1(Box<UpdatedPublicRlHandle<'a>>),
     PublicRlRepeated(Box<RepeatedPublicRlHandle<'a>>),
+    PublicRlLong(Box<LongRlHandle<'a>>),
     PublicLearnedTradeGuard {
         policy: Box<PublicPolicyHandle<'a>>,
         guard: &'a TradeGuardConfig,
@@ -497,6 +505,7 @@ impl<'a> PolicyHandle<'a> {
             description: PolicyDescription {
                 provenance,
                 dataset_fingerprint,
+                model_version: None,
             },
         })
     }
@@ -537,6 +546,22 @@ impl<'a> PolicyHandle<'a> {
                     overlap,
                 )
             }
+            BorrowedArenaPolicy::Long(owner) => {
+                let handle = LongRlHandle::new(owner)?;
+                let overlap = validation_overlap(handle.family_set(), seeds)?;
+                let provenance = rl_provenance(
+                    handle.artifact_checksum(),
+                    handle.update_count(),
+                    crate::public_policy_long::TASK,
+                    crate::public_policy_long::POLICY_VERSION,
+                );
+                (
+                    PolicyChooser::PublicRlLong(Box::new(handle)),
+                    provenance,
+                    None,
+                    overlap,
+                )
+            }
             BorrowedArenaPolicy::PublicBc(policy) => {
                 // This also explicitly excludes the immutable audited Train set.
                 policy.require_validation_families(seeds)?;
@@ -544,8 +569,7 @@ impl<'a> PolicyHandle<'a> {
                     return Err("Borrowed public-policy Arena requires Scalar inference".into());
                 }
                 let (_, closure) = policy.initialization_families();
-                let families = closure.iter().cloned().collect::<Vec<_>>();
-                let overlap = validation_overlap(&families, seeds)?;
+                let overlap = validation_overlap(closure, seeds)?;
                 let handle = policy.handle()?;
                 let provenance = handle.provenance().clone();
                 let SeatPolicy::PublicLearned {
@@ -575,6 +599,30 @@ impl<'a> PolicyHandle<'a> {
                     Vec::new(),
                 )
             }
+            BorrowedArenaPolicy::CornFirstSetup(weights) => {
+                weights.validate()?;
+                (
+                    PolicyChooser::CornFirstSetup(weights),
+                    SeatPolicy::CornFirstSetup {
+                        policy_version: crate::setup_policy::POLICY_VERSION.into(),
+                        weights: weights.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                )
+            }
+            BorrowedArenaPolicy::CornFirstUxmalOpening(weights) => {
+                weights.validate()?;
+                (
+                    PolicyChooser::CornFirstUxmalOpening(weights),
+                    SeatPolicy::CornFirstUxmalOpening {
+                        policy_version: crate::setup_policy::UXMAL_OPENING_POLICY_VERSION.into(),
+                        weights: weights.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                )
+            }
             BorrowedArenaPolicy::Search(policy) => (
                 PolicyChooser::Search(policy),
                 crate::search_native::provenance(policy),
@@ -589,6 +637,8 @@ impl<'a> PolicyHandle<'a> {
                 description: PolicyDescription {
                     provenance,
                     dataset_fingerprint,
+                    model_version: matches!(policy, BorrowedArenaPolicy::Long(_))
+                        .then_some(crate::public_model::MODEL_VERSION),
                 },
             },
             overlap,
@@ -601,6 +651,7 @@ impl<'a> PolicyHandle<'a> {
         match &self.chooser {
             PolicyChooser::PublicRlCount1(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicRlRepeated(policy) => Ok((policy.choose_move(observation)?, None)),
+            PolicyChooser::PublicRlLong(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::PublicLearnedTradeGuard { .. } => {
                 Err("Guarded chooser requires its game-local indexed session".into())
             }
@@ -639,7 +690,15 @@ fn rl_provenance(checksum: &str, count: u64, task: &str, version: &str) -> SeatP
         guard: (),
     }
 }
-fn validation_overlap(closure: &[String], seeds: &[u32]) -> Result<Vec<String>, String> {
+fn validation_overlap<'a>(
+    closure: impl IntoIterator<Item = &'a String>,
+    seeds: &[u32],
+) -> Result<Vec<String>, String> {
+    let mut requested = std::collections::BTreeSet::new();
+    for seed in seeds {
+        requested.insert(family_id(*seed));
+    }
+    let mut overlap = std::collections::BTreeSet::new();
     for family in closure {
         if !matches!(
             split_for_family(family)?,
@@ -647,15 +706,13 @@ fn validation_overlap(closure: &[String], seeds: &[u32]) -> Result<Vec<String>, 
         ) {
             return Err("Borrowed policy lineage contains an unsupported or Test family".into());
         }
+        if requested.contains(family) {
+            overlap.insert(family.clone());
+        }
     }
-    let mut overlap = std::collections::BTreeSet::new();
     for seed in seeds {
-        let family = family_id(*seed);
         if seed_partition(*seed)? != DatasetSplit::Validation {
             return Err("Borrowed policy requires a non-training Validation family".into());
-        }
-        if closure.contains(&family) {
-            overlap.insert(family);
         }
     }
     Ok(overlap.into_iter().collect())
@@ -694,6 +751,7 @@ fn borrowed_work_bounds(
                 match &handle.chooser {
                     PolicyChooser::PublicRlCount1(_)
                     | PolicyChooser::PublicRlRepeated(_)
+                    | PolicyChooser::PublicRlLong(_)
                     | PolicyChooser::PublicLearned(_) => public_policy = true,
                     PolicyChooser::Search(policy) => {
                         search_cap = search_cap.max(
@@ -1217,7 +1275,9 @@ pub fn run_public_rl_validation_arena<'a>(
     }
     if !matches!(
         candidate,
-        BorrowedArenaPolicy::Count1(_) | BorrowedArenaPolicy::Repeated(_)
+        BorrowedArenaPolicy::Count1(_)
+            | BorrowedArenaPolicy::Repeated(_)
+            | BorrowedArenaPolicy::Long(_)
     ) {
         return Err("Borrowed RL Arena candidate must be a sealed RL policy".into());
     }
@@ -1402,6 +1462,45 @@ mod tests {
         );
         assert!(validation_overlap(&[], &[0]).is_err());
         assert!(validation_overlap(&[family_id(10)], &[3]).is_err());
+        let set = std::collections::BTreeSet::from([family_id(0), family_id(3)]);
+        assert_eq!(validation_overlap(&set, &[3]).unwrap(), vec![family_id(3)]);
+
+        for (opening, expected) in [
+            (
+                BorrowedArenaPolicy::CornFirstSetup(&weights),
+                SeatPolicy::CornFirstSetup {
+                    policy_version: crate::setup_policy::POLICY_VERSION.into(),
+                    weights: weights.clone(),
+                },
+            ),
+            (
+                BorrowedArenaPolicy::CornFirstUxmalOpening(&weights),
+                SeatPolicy::CornFirstUxmalOpening {
+                    policy_version: crate::setup_policy::UXMAL_OPENING_POLICY_VERSION.into(),
+                    weights: weights.clone(),
+                },
+            ),
+        ] {
+            let (handle, overlap) = PolicyHandle::borrowed(opening, &config.seeds).unwrap();
+            assert_eq!(handle.description.provenance, expected);
+            assert!(overlap.is_empty());
+            assert!(
+                serde_json::to_value(&handle.description)
+                    .unwrap()
+                    .get("modelVersion")
+                    .is_none()
+            );
+        }
+        let invalid_weights = HeuristicWeights {
+            corn_base: f64::NAN,
+            ..weights.clone()
+        };
+        for opening in [
+            BorrowedArenaPolicy::CornFirstSetup(&invalid_weights),
+            BorrowedArenaPolicy::CornFirstUxmalOpening(&invalid_weights),
+        ] {
+            assert!(PolicyHandle::borrowed(opening, &config.seeds).is_err());
+        }
 
         let search = PreparedSearch::new(&SearchConfig {
             worlds_per_action: 1,
@@ -1414,10 +1513,14 @@ mod tests {
         .unwrap();
         let (focal, _) = PolicyHandle::borrowed(h, &config.seeds).unwrap();
         let (reference, _) = PolicyHandle::borrowed(h, &config.seeds).unwrap();
-        let pool = [h, BorrowedArenaPolicy::Search(&search), h]
-            .into_iter()
-            .map(|policy| PolicyHandle::borrowed(policy, &config.seeds).unwrap().0)
-            .collect::<Vec<_>>();
+        let pool = [
+            BorrowedArenaPolicy::CornFirstSetup(&weights),
+            BorrowedArenaPolicy::Search(&search),
+            BorrowedArenaPolicy::CornFirstUxmalOpening(&weights),
+        ]
+        .into_iter()
+        .map(|policy| PolicyHandle::borrowed(policy, &config.seeds).unwrap().0)
+        .collect::<Vec<_>>();
         let bounds = borrowed_work_bounds(&config, &focal, &reference, &pool).unwrap();
         assert_eq!(bounds.planned_games, 6);
         assert_eq!(bounds.max_callbacks, 6 * replay::MAX_DECISIONS as u64);
@@ -1448,6 +1551,16 @@ mod tests {
                 2,
                 crate::public_policy_repeat::POLICY_VERSION,
                 crate::public_policy_repeat::TASK,
+            ),
+            (
+                2,
+                crate::public_policy_long::POLICY_VERSION,
+                crate::public_policy_long::TASK,
+            ),
+            (
+                11,
+                crate::public_policy_long::POLICY_VERSION,
+                crate::public_policy_long::TASK,
             ),
         ] {
             // Valid metadata is not a model/owner qualification or a complete game.
@@ -1527,6 +1640,36 @@ mod tests {
                 assert!(!a1.exists() && !a2.exists() && !a6.exists());
             }
         }
+        rl_provenance(
+            &"a".repeat(64),
+            crate::public_policy_long::MAX_UPDATES,
+            crate::public_policy_long::TASK,
+            crate::public_policy_long::POLICY_VERSION,
+        )
+        .validate()
+        .unwrap();
+        for count in [0, 1, crate::public_policy_long::MAX_UPDATES + 1] {
+            assert!(
+                rl_provenance(
+                    &"a".repeat(64),
+                    count,
+                    crate::public_policy_long::TASK,
+                    crate::public_policy_long::POLICY_VERSION,
+                )
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            rl_provenance(
+                &"a".repeat(64),
+                11,
+                crate::public_policy_repeat::TASK,
+                crate::public_policy_repeat::POLICY_VERSION,
+            )
+            .validate()
+            .is_err()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1544,6 +1687,7 @@ mod tests {
             description: PolicyDescription {
                 provenance,
                 dataset_fingerprint: Some("c".repeat(64)),
+                model_version: None,
             },
         }
     }

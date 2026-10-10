@@ -133,7 +133,10 @@ impl SeatPolicy {
                 || ((2..=crate::public_policy_repeat::MAX_UPDATE_COUNT)
                     .contains(update_count)
                     && policy_version == crate::public_policy_repeat::POLICY_VERSION
-                    && task == crate::public_policy_repeat::TASK))
+                    && task == crate::public_policy_repeat::TASK)
+                || ((2..=crate::public_policy_long::MAX_UPDATES).contains(update_count)
+                    && policy_version == crate::public_policy_long::POLICY_VERSION
+                    && task == crate::public_policy_long::TASK))
                 && *feature_schema == crate::features::PUBLIC_FEATURE_SCHEMA
                 && input_contract == crate::public_model::INPUT_CONTRACT
                 && numerical_target == &crate::public_stochastic_native::numerical_target()
