@@ -13,7 +13,7 @@ use crate::public_rl_mixed_session::{
     require_output_outside_directory,
 };
 use crate::public_rl_mixed_training_session::{MixedOneBatchSession, MixedOneBatchSpec};
-use crate::public_rl_paired_session::read_bounded;
+use crate::public_rl_paired_session::{local, read_bounded};
 use crate::public_stochastic_record::{MAX_RECORD_BYTES, unique_json};
 use crate::search::PreparedSearch;
 use serde::{Deserialize, Serialize};
@@ -110,7 +110,11 @@ impl CurrentMixedCollectionSpec {
     fn pool_checksum(&self) -> Result<String, String> {
         crate::public_policy_update::hash(
             b"tzolkin-current-mixed-frozen-pool-v2\0",
-            &(&self.inner.wire.weights, &self.inner.wire.search),
+            &(
+                &self.inner.wire.weights,
+                &self.inner.wire.search,
+                &self.inner.wire.rosters,
+            ),
         )
     }
 }
@@ -276,9 +280,10 @@ impl<'a> CurrentMixedDataSession<'a> {
             return Err("Current mixed data session stopped or batch budget consumed".into());
         }
         self.require_prior_pins()?;
-        self.root.session.require_current_data_output(output)?;
+        let directory = local(output, true)?;
+        self.root.session.require_current_data_output(&directory)?;
         for r in &self.reservations {
-            require_output_outside_directory(&r.directory, output)?;
+            require_output_outside_directory(&r.directory, &directory)?;
         }
         let plan = self.plan(&spec, &self.root.consumed)?;
         let (next, used) = reserve(
@@ -289,7 +294,7 @@ impl<'a> CurrentMixedDataSession<'a> {
             self.limits.max_families,
         )?;
         let batch = self.batches;
-        let mut writer = Writer::new(output, spec.inner.wire.max_output_bytes)?;
+        let mut writer = Writer::new(&directory, spec.inner.wire.max_output_bytes)?;
         // Conservatively consume locally even if persisting the reservation fails.
         self.blocked = true;
         self.batches += 1;
@@ -302,9 +307,8 @@ impl<'a> CurrentMixedDataSession<'a> {
             "collectionSpec":spec_pin,"poolChecksum":self.pool,
             "samplingPrefix":self.root.prefix,"nextEpisodeOrdinal":next,"families":plan.rollout_families(),
             "planChecksum":plan.checksum(),"unknownUntilWholeReturned":true,"globalSeedNoveltyVerified":false}))?;
-        let directory = fs::canonicalize(output).map_err(|e| e.to_string())?;
         self.reservations.push(ReservedBatch {
-            directory,
+            directory: directory.clone(),
             spec: spec.clone(),
             plan: plan.receipt(),
             reservation: reservation.clone(),
@@ -365,8 +369,13 @@ impl<'a> CurrentMixedDataSession<'a> {
             recollection_available: false,
         };
         writer.save("collection.json", &report)?;
-        let pins = inventory(output, spec.inner.wire.max_output_bytes)?;
+        let pins = retain_written_inventory(
+            &writer,
+            inventory(&directory, spec.inner.wire.max_output_bytes)?,
+        )?;
         self.reservations[batch].inventory = Some(pins);
+        self.require_prior_pins()?;
+        writer.require_current()?;
         self.blocked = !all_complete;
         Ok(batch)
     }
@@ -490,10 +499,23 @@ impl<'a> CurrentMixedDataSession<'a> {
                 .map_err(|_| "Current mixed whole-four result shape")?,
         )?;
         writer.save("cohort.json", &cohort.receipt())?;
-        self.reservations[batch].audit_pins = audit_inventory(&output)?;
+        self.reservations[batch].audit_pins =
+            retain_written_inventory(&writer, audit_inventory(&output)?)?;
+        self.require_prior_pins()?;
+        writer.require_current()?;
         self.blocked = false;
         Ok(cohort)
     }
+}
+fn retain_written_inventory(
+    writer: &Writer<'_>,
+    observed: Vec<FilePin>,
+) -> Result<Vec<FilePin>, String> {
+    if observed != writer.pinned_inventory() {
+        return Err("Current mixed final inventory differs from originally written bytes".into());
+    }
+    writer.require_current()?;
+    Ok(observed)
 }
 fn reserve(
     plan: &PlannedCurrentMixedCohort,
@@ -649,5 +671,88 @@ mod tests {
         assert!(reserve(&plan, [7, 11], u64::MAX - 2, &used, 8).is_err());
         assert!(CurrentMixedDataLimits::new(0, 8).is_err());
         assert!(CurrentMixedDataLimits::new(1, 3).is_err());
+
+        let opponent = json!({"kind":"heuristic"});
+        let mut spec = json!({"schema":SPEC_SCHEMA,"catalogHash":crate::replay::catalog_hash(),
+            "configurations":plan.headers.each_ref().map(|h|&h.config),
+            "rosters":[[null,opponent,opponent],[opponent,null,opponent],
+                [null,opponent,opponent,opponent],[opponent,opponent,opponent,null]],
+            "weights":crate::policy::HeuristicWeights::default(),"search":crate::search::SearchConfig::default(),
+            "maxOutputBytes":4*MAX_RECORD_BYTES+2*1024*1024});
+        let checksum = CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap())
+            .unwrap()
+            .pool_checksum()
+            .unwrap();
+        for (i, c) in spec["configurations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .enumerate()
+        {
+            c["environmentSeed"] = json!(100 + i);
+            c["episodeOrdinal"] = json!(format!("{:016x}", 13 + i));
+        }
+        let next =
+            CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap()).unwrap();
+        assert_eq!(next.pool_checksum().unwrap(), checksum);
+        spec["rosters"][0][1]["kind"] = json!("preparedBc");
+        let changed =
+            CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap()).unwrap();
+        assert_ne!(changed.pool_checksum().unwrap(), checksum);
+    }
+
+    #[test]
+    fn current_mixed_final_inventory_retains_original_pins_on_local_paths() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::temp_dir().join(format!(
+            "tzolkin-current-mixed-pins-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&base).unwrap();
+        let directory = local(&base.join("collection"), true).unwrap();
+        let mut writer = Writer::new(&directory, 4096).unwrap();
+        for name in ["reservation.json", "collection-spec.json", "plan.json"] {
+            writer.raw(name, b"{}", META_CAP).unwrap();
+        }
+        for i in 0..4 {
+            for stem in ["collect-started", "collect-returned", "record"] {
+                writer
+                    .raw(&format!("{stem}-{i}.json"), b"{}", META_CAP)
+                    .unwrap();
+            }
+        }
+        writer.raw("collection.json", b"{}", META_CAP).unwrap();
+        let pins = writer.pinned_inventory();
+        assert_eq!(pins.len(), 16);
+        assert!(pins.iter().any(|p| p.name == "collection.json"));
+        assert!(retain_written_inventory(&writer, inventory(&directory, 4096).unwrap()).is_ok());
+        #[cfg(windows)]
+        assert!(local(&fs::canonicalize(&directory).unwrap(), false).is_err());
+        fs::write(directory.join("record-0.json"), b"changed").unwrap();
+        assert!(retain_written_inventory(&writer, inventory(&directory, 4096).unwrap()).is_err());
+        assert!(writer.pinned_inventory() == pins);
+
+        let output = directory.join("audit");
+        let mut audit = Writer::new(&output, 4096).unwrap();
+        audit.raw("plan.json", b"{}", META_CAP).unwrap();
+        for i in 0..4 {
+            for stem in ["audit-started", "audit-returned"] {
+                audit
+                    .raw(&format!("{stem}-{i}.json"), b"{}", META_CAP)
+                    .unwrap();
+            }
+        }
+        audit.raw("cohort.json", b"{}", META_CAP).unwrap();
+        let pins = audit.pinned_inventory();
+        assert_eq!(pins.len(), 10);
+        assert!(pins.iter().any(|p| p.name == "cohort.json"));
+        assert!(retain_written_inventory(&audit, audit_inventory(&output).unwrap()).is_ok());
+        fs::write(output.join("audit-returned-0.json"), b"changed").unwrap();
+        assert!(retain_written_inventory(&audit, audit_inventory(&output).unwrap()).is_err());
+        assert!(audit.pinned_inventory() == pins);
+        fs::remove_dir_all(base).unwrap();
     }
 }

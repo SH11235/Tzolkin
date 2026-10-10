@@ -731,6 +731,11 @@ impl<'a> Writer<'a> {
         }
         Ok(())
     }
+    pub(crate) fn pinned_inventory(&self) -> Vec<FilePin> {
+        let mut pins = self.pins.clone();
+        pins.sort_by(|a, b| a.name.cmp(&b.name));
+        pins
+    }
     pub(crate) fn save(&mut self, name: &str, value: &impl Serialize) -> Result<FilePin, String> {
         self.raw(
             name,
