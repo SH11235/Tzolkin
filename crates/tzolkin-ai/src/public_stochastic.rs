@@ -450,30 +450,34 @@ struct Draw {
     draws_before: u64,
     draws_after: u64,
 }
+// The original max/exp/ordered-sum body is shared without changing arithmetic,
+// finite checks or error strings. exp/ln bits remain platform-bound.
+pub(crate) fn nominal_weights(logits: &[f32]) -> Result<(Vec<f64>, f64), String> {
+    if logits.is_empty() || logits.len() > MAX_CANDIDATES || logits.iter().any(|z| !z.is_finite()) {
+        return Err("Invalid finite full-mask sampling logits".into());
+    }
+    let maximum = logits
+        .iter()
+        .map(|z| f64::from(*z))
+        .fold(f64::NEG_INFINITY, f64::max);
+    let weights: Vec<f64> = logits
+        .iter()
+        .map(|z| (f64::from(*z) - maximum).exp())
+        .collect();
+    let sum = weights.iter().fold(0.0_f64, |a, b| a + b);
+    if !sum.is_finite() || sum <= 0.0 {
+        return Err("Invalid f64 softmax denominator".into());
+    }
+    Ok((weights, sum))
+}
+
 struct TickDistribution {
     nominal: Vec<f64>,
     boundaries: Vec<u64>,
 }
 impl TickDistribution {
     fn new(logits: &[f32]) -> Result<Self, String> {
-        if logits.is_empty()
-            || logits.len() > MAX_CANDIDATES
-            || logits.iter().any(|z| !z.is_finite())
-        {
-            return Err("Invalid finite full-mask sampling logits".into());
-        }
-        let maximum = logits
-            .iter()
-            .map(|z| f64::from(*z))
-            .fold(f64::NEG_INFINITY, f64::max);
-        let weights: Vec<f64> = logits
-            .iter()
-            .map(|z| (f64::from(*z) - maximum).exp())
-            .collect();
-        let sum = weights.iter().fold(0.0_f64, |a, b| a + b);
-        if !sum.is_finite() || sum <= 0.0 {
-            return Err("Invalid f64 softmax denominator".into());
-        }
+        let (weights, sum) = nominal_weights(logits)?;
         let floor = UNIFORM_MIXTURE / logits.len() as f64;
         let mut nominal = Vec::with_capacity(logits.len());
         let mut boundaries = Vec::with_capacity(logits.len());
@@ -544,6 +548,16 @@ impl TickDistribution {
         }
         format!("{:x}", hash.finalize())
     }
+}
+pub(crate) fn behavior_distribution(
+    logits: &[f32],
+) -> Result<(Vec<f64>, Vec<u64>, String), String> {
+    let distribution = TickDistribution::new(logits)?;
+    let masses = (0..logits.len())
+        .map(|index| distribution.mass(index))
+        .collect::<Result<_, _>>()?;
+    let digest = distribution.digest();
+    Ok((distribution.nominal, masses, digest))
 }
 struct BoundedHash {
     hash: Sha256,
@@ -629,6 +643,7 @@ mod tests {
     use super::*;
     use crate::public_model::{LoadedPublicPolicy, PublicPolicyArtifact};
     use crate::public_native::integration_fixture;
+    use crate::public_policy_likelihood::BehaviorLikelihood;
     use tzolkin_core::compact::catalog::WEALTH_IDS;
     use tzolkin_core::observation::{observation_key, observe};
     use tzolkin_core::tribes::TribeId;
@@ -818,6 +833,18 @@ mod tests {
                 let result = a.sample(&o).unwrap();
                 let repeated = b.sample(&o).unwrap();
                 let t = result.trace();
+                let likelihood =
+                    BehaviorLikelihood::from_logits(&logits, t.chosen_index()).unwrap();
+                assert_eq!(likelihood.mass_ticks()[t.chosen_index()], t.mass_ticks());
+                assert_eq!(likelihood.distribution_digest(), t.distribution_digest());
+                assert_eq!(
+                    likelihood.smooth().probabilities()[t.chosen_index()].to_bits(),
+                    t.nominal_probability().to_bits()
+                );
+                assert_eq!(
+                    likelihood.behavior_log_probability().to_bits(),
+                    t.behavior_logp().to_bits()
+                );
                 assert_eq!(result.decision(), repeated.decision());
                 assert_eq!(t.raw_u64(), repeated.trace().raw_u64());
                 assert_eq!(result.legal_action(), &o.legal_actions[t.chosen_index()]);
