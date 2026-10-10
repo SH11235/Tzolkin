@@ -78,6 +78,9 @@ impl OneStepConfig {
         }
         Ok(())
     }
+    pub(crate) fn max_candidate_rows(&self) -> usize {
+        self.max_candidate_rows
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -132,7 +135,7 @@ fn contract() -> Contract {
 }
 #[derive(Default, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Deltas {
+pub(crate) struct Deltas {
     max_abs_all_log_delta: f64,
     max_abs_chosen_log_delta: f64,
     max_abs_final_log_delta: f64,
@@ -158,12 +161,12 @@ impl Deltas {
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NumericReport {
+pub(crate) struct NumericReport {
     raw_gradient_l2: f64,
     raw_gradient_max_abs: f64,
     actual_delta_l2: f64,
     actual_delta_max_abs: f64,
-    changed_parameters: usize,
+    pub(crate) changed_parameters: usize,
 }
 
 /// Serialize-only receipt. NoChange is an attempted calculation, not an update.
@@ -199,6 +202,12 @@ impl OneStepReport {
     }
     pub fn family_closure(&self) -> &[String] {
         &self.family_closure
+    }
+    pub(crate) fn parent_init_checksum(&self) -> &str {
+        &self.parent_init_checksum
+    }
+    pub(crate) fn bc_source(&self) -> &SeatPolicy {
+        &self.bc_source
     }
     fn expected_checksum(&self) -> Result<String, String> {
         hash(
@@ -370,7 +379,7 @@ pub fn ascent_one_step(
     }))
 }
 
-fn accumulate_step(
+pub(crate) fn accumulate_step(
     model: &PublicPolicyModel,
     step: AppliedActorStep<'_>,
     players: usize,
@@ -450,7 +459,7 @@ fn closure(
     }
     Ok(families.into_iter().collect())
 }
-fn add_actor(total: &mut [f64], own: &[f64], coefficient: f64) -> Result<(), String> {
+pub(crate) fn add_actor(total: &mut [f64], own: &[f64], coefficient: f64) -> Result<(), String> {
     if total.is_empty()
         || total.len() != own.len()
         || !coefficient.is_finite()
@@ -467,11 +476,11 @@ fn add_actor(total: &mut [f64], own: &[f64], coefficient: f64) -> Result<(), Str
     }
     Ok(())
 }
-struct Proposal {
-    parameters: Vec<f32>,
-    numeric: NumericReport,
+pub(crate) struct Proposal {
+    pub(crate) parameters: Vec<f32>,
+    pub(crate) numeric: NumericReport,
 }
-fn propose_parameters(
+pub(crate) fn propose_parameters(
     old: &[f32],
     gradient: &[f64],
     config: &OneStepConfig,
@@ -532,7 +541,7 @@ fn norm(values: &[f64]) -> Result<(f64, f64), String> {
     }
     Ok((square.sqrt(), maximum))
 }
-fn hash(domain: &[u8], value: &impl Serialize) -> Result<String, String> {
+pub(crate) fn hash(domain: &[u8], value: &impl Serialize) -> Result<String, String> {
     let mut sink = HashSink {
         digest: Sha256::new(),
         bytes: 0,

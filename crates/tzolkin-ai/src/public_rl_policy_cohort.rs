@@ -43,6 +43,9 @@ impl PlannedRlCohort {
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
+    pub(crate) fn cohort_contract(&self) -> &'static str {
+        COHORT_CONTRACT
+    }
     pub fn parent_artifact_checksum(&self) -> &str {
         self.source.artifact_checksum()
     }

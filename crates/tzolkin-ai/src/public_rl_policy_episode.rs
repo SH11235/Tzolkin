@@ -97,6 +97,9 @@ impl ValidatedRlPolicyEpisode {
     pub fn numerical_target(&self) -> &str {
         &self.source.record().header.numerical_target
     }
+    pub(crate) fn sampling_version(&self) -> &str {
+        &self.source.record().header.sampling_version
+    }
     pub fn terminal_state_key(&self) -> &str {
         &self
             .source
