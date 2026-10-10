@@ -203,6 +203,24 @@ impl AppliedActorStep<'_> {
     pub fn behavior_logp(&self) -> f64 {
         self.link.logp
     }
+    pub fn logits_digest(&self) -> &str {
+        &self
+            .callback
+            .sample
+            .as_ref()
+            .expect("validated sample")
+            .trace
+            .logits_digest
+    }
+    pub fn distribution_digest(&self) -> &str {
+        &self
+            .callback
+            .sample
+            .as_ref()
+            .expect("validated sample")
+            .trace
+            .distribution_digest
+    }
     pub fn nominal_probability(&self) -> f64 {
         self.link.nominal
     }
