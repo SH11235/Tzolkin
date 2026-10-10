@@ -5,10 +5,12 @@
 use crate::dataset::{DatasetSplit, split_for_family};
 use crate::model::{digest, dot, policy_softmax, write_new_json};
 use crate::public_model::ValueValidity;
+use crate::public_stochastic_record::unique_json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use tzolkin_core::catalog::wealth;
 use tzolkin_core::{Effect, FeedWorkers, Resource, Target, TechnologyId, TempleId};
@@ -26,6 +28,7 @@ const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ROWS: usize = 10_000;
 const MAX_CANDIDATE_EVALUATIONS: usize = 10_000_000;
 const MAX_SOURCE_MOVE: usize = 100_000;
+const MAX_MODE_BYTES: usize = 128;
 const CAPTURE_SCHEMA: &str = "tzolkin-bga-public-initial-selection-observation-v1";
 const SELECTION_PROMPT: &str = "あなたは初期財産タイルを2個選んでください";
 
@@ -176,14 +179,29 @@ fn read_pin(pin: &ContentPin, base: &Path, total: &mut u64) -> Result<Vec<u8>, S
     if *total > MAX_TOTAL_BYTES {
         return Err("Aggregate evidence budget exceeded".into());
     }
-    let bytes = fs::read(&path).map_err(|e| e.to_string())?;
-    if bytes.len() as u64 != pin.bytes || digest(&bytes) != pin.sha256 {
+    let bytes = read_bounded(fs::File::open(&path).map_err(|e| e.to_string())?, pin.bytes)?;
+    if digest(&bytes) != pin.sha256 {
         return Err("Evidence content pin mismatch".into());
     }
     Ok(bytes)
 }
+fn read_bounded(reader: impl Read, declared_bytes: u64) -> Result<Vec<u8>, String> {
+    if declared_bytes == 0 || declared_bytes > MAX_FILE_BYTES {
+        return Err("Evidence file size outside bound".into());
+    }
+    let mut limited = reader.take(declared_bytes + 1);
+    let mut bytes = Vec::with_capacity(declared_bytes as usize + 1);
+    limited.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() as u64 != declared_bytes {
+        return Err("Actual evidence length differs from bounded declaration".into());
+    }
+    Ok(bytes)
+}
 fn load_json(bytes: &[u8]) -> Result<Value, String> {
-    serde_json::from_slice(bytes).map_err(|e| format!("Invalid evidence JSON: {e}"))
+    unique_json(bytes, MAX_FILE_BYTES as usize).map_err(|e| format!("Invalid evidence JSON: {e}"))
+}
+fn load_typed<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
+    serde_json::from_value(load_json(bytes)?).map_err(|e| e.to_string())
 }
 fn release(value: &str) -> Result<(), String> {
     if value.len() != 11
@@ -239,15 +257,113 @@ fn archive_url(url: &str) -> Result<ArchiveIdentity, String> {
     })
 }
 fn attribute<'a>(opening: &'a str, key: &str) -> Result<&'a str, String> {
-    let token = format!(" {key}=\"");
-    if opening.matches(&token).count() != 1 {
-        return Err(format!("Missing/duplicate HTML {key}"));
+    optional_attribute(opening, key)?.ok_or_else(|| format!("Missing HTML {key}"))
+}
+fn optional_attribute<'a>(opening: &'a str, key: &str) -> Result<Option<&'a str>, String> {
+    let body = opening
+        .strip_prefix('<')
+        .and_then(|s| s.strip_suffix('>'))
+        .ok_or("Expected retained HTML opening tag")?;
+    let name_end = body
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let mut tail = &body[name_end..];
+    let mut found = None;
+    while !tail.trim().is_empty() && tail.trim() != "/" {
+        tail = tail.trim_start();
+        let end = tail
+            .find(|c: char| c.is_ascii_whitespace() || c == '=')
+            .ok_or("Missing HTML attribute value")?;
+        let name = &tail[..end];
+        if name.is_empty() {
+            return Err("Empty HTML attribute name".into());
+        }
+        tail = tail[end..]
+            .trim_start()
+            .strip_prefix('=')
+            .ok_or("Missing HTML equals")?
+            .trim_start();
+        tail = tail
+            .strip_prefix('"')
+            .ok_or("Expected retained double-quoted HTML attribute")?;
+        let (value, rest) = tail.split_once('"').ok_or("Unterminated HTML attribute")?;
+        if name == key {
+            if found.is_some() {
+                return Err(format!("Duplicate HTML {key}"));
+            }
+            found = Some(value);
+        }
+        if !rest.is_empty() && !rest.starts_with(|c: char| c.is_ascii_whitespace() || c == '/') {
+            return Err("Missing HTML attribute separator".into());
+        }
+        tail = rest;
     }
-    let at = opening.find(&token).ok_or("Missing HTML attribute")? + token.len();
-    opening[at..]
-        .split_once('"')
-        .map(|(value, _)| value)
-        .ok_or("Unterminated HTML attribute".into())
+    Ok(found)
+}
+struct HtmlTag<'a> {
+    start: usize,
+    end: usize,
+    opening: &'a str,
+    name: &'a str,
+    closing: bool,
+}
+struct HtmlTags<'a> {
+    html: &'a str,
+    offset: usize,
+}
+impl<'a> HtmlTags<'a> {
+    fn new(html: &'a str) -> Self {
+        Self { html, offset: 0 }
+    }
+}
+impl<'a> Iterator for HtmlTags<'a> {
+    type Item = Result<HtmlTag<'a>, String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let at = self.html[self.offset..].find('<')? + self.offset;
+            let rest = &self.html[at..];
+            if rest.starts_with("<!--") {
+                if let Some(end) = rest.find("-->") {
+                    self.offset = at + end + 3;
+                    continue;
+                }
+                self.offset = self.html.len();
+                return Some(Err("Unterminated retained HTML comment".into()));
+            }
+            let mut quoted = false;
+            let end = rest.bytes().enumerate().find_map(|(i, c)| {
+                if c == b'"' {
+                    quoted = !quoted;
+                }
+                (c == b'>' && !quoted).then_some(i)
+            });
+            let Some(end) = end else {
+                self.offset = self.html.len();
+                return Some(Err("Unterminated retained HTML tag".into()));
+            };
+            self.offset = at + end + 1;
+            let body = &rest[1..end];
+            if body.starts_with('!') || body.starts_with('?') {
+                continue;
+            }
+            let closing = body.starts_with('/');
+            let body = if closing { &body[1..] } else { body };
+            let name_end = body
+                .find(|c: char| c.is_ascii_whitespace() || c == '/')
+                .unwrap_or(body.len());
+            let name = &body[..name_end];
+            if name.is_empty() {
+                return Some(Err("Missing retained HTML tag name".into()));
+            }
+            return Some(Ok(HtmlTag {
+                start: at,
+                end: self.offset,
+                opening: &rest[..end + 1],
+                name,
+                closing,
+            }));
+        }
+    }
 }
 fn css_number(style: &str, key: &str) -> Result<i64, String> {
     let values: Vec<_> = style
@@ -309,20 +425,65 @@ fn tile(opening: &str, active: bool) -> Result<Tile, String> {
 }
 fn panel_tiles(html: &str) -> Result<Vec<Tile>, String> {
     let mut found = Vec::new();
-    let mut tail = html;
-    while let Some(at) = tail.find("<div ") {
-        tail = &tail[at..];
-        let end = tail.find('>').ok_or("Unterminated HTML div")?;
-        let opening = &tail[..end + 1];
-        if opening.contains("class=\"wealth_tile") {
-            found.push(tile(opening, false)?);
+    for tag in HtmlTags::new(html) {
+        let tag = tag?;
+        if tag.closing {
+            continue;
         }
-        tail = &tail[end + 1..];
+        let wealth_id =
+            optional_attribute(tag.opening, "id")?.is_some_and(|id| id.starts_with("wealth_tile_"));
+        let wealth_class = optional_attribute(tag.opening, "class")?
+            .is_some_and(|classes| classes.split_whitespace().any(|c| c == "wealth_tile"));
+        if wealth_id || wealth_class {
+            if tag.name != "div" {
+                return Err("Wealth tile is not a retained div".into());
+            }
+            found.push(tile(tag.opening, false)?);
+        }
     }
     Ok(found)
 }
+fn retained_own_panel<'a>(area: &'a str, wanted: &str) -> Result<&'a str, String> {
+    let mut start = None;
+    let mut depth = 0_usize;
+    let mut panel = None;
+    for tag in HtmlTags::new(area) {
+        let tag = tag?;
+        if tag.name != "div" {
+            continue;
+        }
+        if !tag.closing {
+            if optional_attribute(tag.opening, "id")? == Some(wanted) {
+                if start.is_some() || panel.is_some() {
+                    return Err("Duplicate retained own player panel".into());
+                }
+                if !attribute(tag.opening, "class")?
+                    .split_whitespace()
+                    .any(|c| c == "player_wealthtiles")
+                {
+                    return Err("Retained own panel class mismatch".into());
+                }
+                start = Some(tag.start);
+                depth = 1;
+            } else if start.is_some() {
+                depth += 1;
+            }
+        } else if let Some(at) = start {
+            depth -= 1;
+            if depth == 0 {
+                panel = Some(&area[at..tag.end]);
+                start = None;
+            }
+        }
+    }
+    if start.is_some() {
+        return Err("Unterminated retained own panel".into());
+    }
+    panel.ok_or_else(|| "Missing retained own player panel".into())
+}
 fn own_panel<'a>(capture: &'a Value, actor: &str) -> Result<&'a str, String> {
     let wanted = format!("player_wealthtiles_{actor}");
+    let retained = retained_own_panel(text(capture, "gameAreaHtml")?, &wanted)?;
     if let Some(panels) = capture["selectedPlayerTiles"].as_array() {
         let matching: Vec<_> = panels
             .iter()
@@ -332,28 +493,11 @@ fn own_panel<'a>(capture: &'a Value, actor: &str) -> Result<&'a str, String> {
             return Err("Missing/duplicate chosen-player panel".into());
         }
         let html = text(matching[0], "html")?;
-        let opening = &html[..html.find('>').ok_or("Invalid chosen panel HTML")? + 1];
-        if attribute(opening, "id")? != wanted
-            || !attribute(opening, "class")?
-                .split_whitespace()
-                .any(|c| c == "player_wealthtiles")
-        {
-            return Err("Chosen panel HTML identity mismatch".into());
+        if html != retained {
+            return Err("Declared own panel differs from retained game DOM".into());
         }
-        return Ok(html);
     }
-    let area = text(capture, "gameAreaHtml")?;
-    let prefix = format!("<div id=\"{wanted}\"");
-    if area.matches(&prefix).count() != 1 {
-        return Err("Missing/duplicate initial player panel".into());
-    }
-    let start = area.find(&prefix).ok_or("Missing initial panel")?;
-    let end = area[start..]
-        .find("</div>")
-        .ok_or("Unterminated initial panel")?
-        + start
-        + 6;
-    Ok(&area[start..end])
+    Ok(retained)
 }
 fn move_number(capture: &Value) -> Result<usize, String> {
     text(capture, "move")?
@@ -443,11 +587,16 @@ fn decode_choice(
     let mut catalog_ids = Vec::new();
     for offer in offers {
         let html = text(offer, "html")?;
-        let end = html.find('>').ok_or("Invalid offered tile HTML")?;
-        let parsed = tile(&html[..end + 1], true)?;
+        let tag = HtmlTags::new(html)
+            .next()
+            .ok_or("Missing offered tile HTML")??;
+        if tag.start != 0 || tag.name != "div" || tag.closing {
+            return Err("Expected retained offered div".into());
+        }
+        let parsed = tile(tag.opening, true)?;
         if offer["visible"].as_bool() != Some(true)
             || text(offer, "id")? != parsed.id
-            || html[end + 1..].trim() != "</div>"
+            || html[tag.end..].trim() != "</div>"
             || !area.contains(html)
             || !offer_area.contains(html)
         {
@@ -812,7 +961,7 @@ impl ValidatedInitialDataset {
         };
         let mut total = 0;
         let bytes = read_pin(&pin, Path::new("."), &mut total)?;
-        let manifest: ManifestWire = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let manifest: ManifestWire = load_typed(&bytes)?;
         if manifest.schema != INPUT_SCHEMA
             || manifest.sources.is_empty()
             || manifest.sources.len() > MAX_ROWS
@@ -826,8 +975,7 @@ impl ValidatedInitialDataset {
         }
         let base = manifest_path.parent().unwrap_or(Path::new("."));
         let atlas_bytes = read_pin(&manifest.atlas, base, &mut total)?;
-        let atlas_wire: AtlasWire =
-            serde_json::from_slice(&atlas_bytes).map_err(|e| e.to_string())?;
+        let atlas_wire: AtlasWire = load_typed(&atlas_bytes)?;
         if atlas_wire.schema != ATLAS_SCHEMA
             || atlas_wire.catalog_hash != crate::replay::catalog_hash()
             || atlas_wire.entries.is_empty()
@@ -837,11 +985,13 @@ impl ValidatedInitialDataset {
         }
         let atlas_base = resolved_parent(&manifest.atlas, base);
         let mut atlas = BTreeMap::new();
+        let mut catalog_faces = BTreeSet::new();
         let mut images = BTreeMap::new();
         for entry in atlas_wire.entries {
             release(&entry.archive_release)?;
             if wealth(&entry.catalog_id).is_none()
                 || entry.sprite.iter().any(|v| !(-4096..=0).contains(v))
+                || !catalog_faces.insert((entry.archive_release.clone(), entry.catalog_id.clone()))
                 || atlas
                     .insert((entry.archive_release, entry.sprite), entry.catalog_id)
                     .is_some()
@@ -867,8 +1017,7 @@ impl ValidatedInitialDataset {
             }
         }
         let nomination_bytes = read_pin(&manifest.nominations, base, &mut total)?;
-        let nomination: NominationWire =
-            serde_json::from_slice(&nomination_bytes).map_err(|e| e.to_string())?;
+        let nomination: NominationWire = load_typed(&nomination_bytes)?;
         let nominated: BTreeSet<_> = nomination
             .player_ids
             .iter()
@@ -918,15 +1067,20 @@ impl ValidatedInitialDataset {
                     return Err("Table UI identity mismatch".into());
                 }
                 if let Some(rows) = ui["optionRows"].as_array() {
-                    mode = rows
+                    let observed_mode = rows
                         .iter()
                         .find(|r| {
                             r["id"].as_str() == Some("gameoption_201_wrap")
                                 && r["visible"].as_bool() == Some(true)
                         })
                         .and_then(|r| r["text"].as_str())
-                        .and_then(|s| s.lines().nth(1))
-                        .map(str::to_owned);
+                        .and_then(|s| s.lines().nth(1));
+                    if let Some(value) = observed_mode {
+                        if value.len() > MAX_MODE_BYTES || value.chars().any(char::is_control) {
+                            return Err("Mode provenance exceeds bounded text contract".into());
+                        }
+                        mode = Some(value.to_owned());
+                    }
                 }
             }
             let family = table_family_id(&id.table)?;
@@ -996,6 +1150,7 @@ impl ValidatedInitialDataset {
                 "Content pins establish local consistency, not BGA authentication or automated artwork recognition.".into(),
                 "Externally reviewed atlas and user nomination are declared provenance; neither verifies current player strength.".into(),
                 "Model conditions only on own catalog pair effects; seat, mode, options and later order are excluded.".into(),
+                "Table-family isolation permits the same nominated player in Train and Validation; it is not unseen-player generalization.".into(),
                 "No whole-game, Playing-BC, exact terminal/value or application deployment admission.".into(),
                 "Table/actor metadata and recoverable family hashes belong in private artifacts.".into(),
             ],
@@ -1108,7 +1263,7 @@ impl InitialWealthArtifact {
             sha256: expected_sha256.into(),
         };
         let bytes = read_pin(&pin, Path::new("."), &mut 0)?;
-        let out: Self = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let out: Self = load_typed(&bytes)?;
         out.validate()?;
         Ok(out)
     }
@@ -1201,6 +1356,19 @@ pub struct InitialTrainingReport {
     pub strength_measured: bool,
     pub deployment_admitted: bool,
 }
+/// Only the validated-source trainer can construct this publication input.
+pub struct TrainedInitialWealth {
+    artifact: InitialWealthArtifact,
+    report: InitialTrainingReport,
+}
+impl TrainedInitialWealth {
+    pub fn artifact(&self) -> &InitialWealthArtifact {
+        &self.artifact
+    }
+    pub fn report(&self) -> &InitialTrainingReport {
+        &self.report
+    }
+}
 fn loss_gradient(
     coefficients: &[f32; FEATURE_COUNT],
     input: &InitialChoiceInput,
@@ -1291,7 +1459,7 @@ fn bounded_coefficient(old: f32, delta: f64, limit: f32) -> Result<f32, String> 
 pub fn train(
     dataset: &ValidatedInitialDataset,
     config: &InitialTrainConfig,
-) -> Result<(InitialWealthArtifact, InitialTrainingReport), String> {
+) -> Result<TrainedInitialWealth, String> {
     config.validate()?;
     let evaluations = dataset
         .rows
@@ -1364,15 +1532,26 @@ pub fn train(
         strength_measured: false,
         deployment_admitted: false,
     };
-    Ok((artifact, report))
+    Ok(TrainedInitialWealth { artifact, report })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitialPublicationReceipt {
+    pub schema: String,
+    pub task: String,
+    pub manifest_sha256: String,
+    pub model_raw_bytes: Option<u64>,
+    pub model_raw_sha256: Option<String>,
 }
 
 /// Creates only a fresh local output directory; partial publication is retained on error.
 pub fn publish_new(
     directory: &Path,
     dataset: &ValidatedInitialDataset,
-    training: Option<(&InitialWealthArtifact, &InitialTrainingReport)>,
-) -> Result<(), String> {
+    training: Option<&TrainedInitialWealth>,
+) -> Result<InitialPublicationReceipt, String> {
+    let training = training.map(|trained| (&trained.artifact, &trained.report));
     local_path(directory)?;
     let parent = directory
         .parent()
@@ -1403,11 +1582,28 @@ pub fn publish_new(
     }
     fs::create_dir(directory).map_err(|e| format!("Cannot create fresh output directory: {e}"))?;
     write_new_json(&directory.join("dataset-report.json"), &dataset.report())?;
+    let mut receipt = InitialPublicationReceipt {
+        schema: "tzolkin-human-initial-wealth-publication-v1".into(),
+        task: TASK.into(),
+        manifest_sha256: dataset.manifest_sha256.clone(),
+        model_raw_bytes: None,
+        model_raw_sha256: None,
+    };
     if let Some((model, report)) = training {
-        model.save_new(&directory.join("model.json"))?;
+        let model_path = directory.join("model.json");
+        model.save_new(&model_path)?;
         write_new_json(&directory.join("training-report.json"), report)?;
+        let bytes = serde_json::to_vec(model).map_err(|e| e.to_string())?;
+        let pin = ContentPin {
+            path: model_path.to_string_lossy().into(),
+            bytes: bytes.len() as u64,
+            sha256: digest(&bytes),
+        };
+        read_pin(&pin, Path::new("."), &mut 0)?;
+        receipt.model_raw_bytes = Some(pin.bytes);
+        receipt.model_raw_sha256 = Some(pin.sha256);
     }
-    Ok(())
+    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -1536,13 +1732,56 @@ mod tests {
                 .unwrap_err()
                 .contains("outside")
         );
+        let mut detached = before.clone();
+        detached["gameAreaHtml"] = Value::String(format!("{offer_html}{selected}"));
+        assert!(
+            decode_choice(&detached, &after, &atlas)
+                .unwrap_err()
+                .contains("retained")
+        );
+        let mut duplicate_panel = before.clone();
+        duplicate_panel["gameAreaHtml"] = Value::String(format!("{offer_html}{empty}{empty}"));
+        assert!(
+            decode_choice(&duplicate_panel, &after, &atlas)
+                .unwrap_err()
+                .contains("Duplicate retained")
+        );
         let mut already = before;
         already["selectedPlayerTiles"] = after["selectedPlayerTiles"].clone();
+        already["gameAreaHtml"] = Value::String(format!("{offer_html}{selected}"));
         assert!(
             decode_choice(&already, &after, &atlas)
                 .unwrap_err()
                 .contains("before selection")
         );
+    }
+    #[test]
+    fn raw_and_typed_json_reject_duplicate_keys_and_reads_stop_at_declared_limit() {
+        assert!(load_json(br#"{"header":"before","header":"after"}"#).is_err());
+        assert!(load_json(br#"{"extra":{"id":"1","\u0069d":"2"}}"#).is_err());
+        assert!(
+            load_typed::<ContentPin>(br#"{"path":"a","path":"b","bytes":1,"sha256":"0"}"#).is_err()
+        );
+        assert!(load_json(br#"{"extra":{"id":"1"},"header":"before"}"#).is_ok());
+        let mut excess = std::io::Cursor::new(b"abcdef");
+        assert!(read_bounded(&mut excess, 2).is_err());
+        assert_eq!(excess.position(), 3);
+        assert_eq!(read_bounded(std::io::Cursor::new(b"ab"), 2).unwrap(), b"ab");
+        assert!(read_bounded(std::io::Cursor::new(b"a"), 2).is_err());
+    }
+    #[test]
+    fn tile_scanner_counts_reordered_classes_and_refuses_malformed_extra_ids() {
+        let face = "<div\n id=\"wealth_tile_1\" class=\"active wealth_tile\" style=\"background-position: 0px 0px;\"></div>";
+        assert_eq!(panel_tiles(face).unwrap().len(), 1);
+        assert_eq!(panel_tiles(&format!("{face}{face}")).unwrap().len(), 2);
+        assert!(
+            panel_tiles(&format!(
+                "{face}<div id=\"wealth_tile_2\" class=\"other\"></div>"
+            ))
+            .is_err()
+        );
+        assert!(panel_tiles(&face.replace("div", "span")).is_err());
+        assert!(panel_tiles(&format!("<!--{face}-->")).unwrap().is_empty());
     }
     #[test]
     fn optional_setup_counter_crosscheck_refuses_wrong_resources_markers_and_dom() {

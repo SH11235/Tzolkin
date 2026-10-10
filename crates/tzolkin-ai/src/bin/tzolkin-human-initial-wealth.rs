@@ -73,19 +73,16 @@ fn run() -> Result<(), String> {
         &atlas_sha,
         &nominations_sha,
     )?;
-    if let Some(config) = config {
-        let (artifact, report) = train(&dataset, &config)?;
-        publish_new(Path::new(&output), &dataset, Some((&artifact, &report)))?;
-        println!(
-            "Initial-choice training published; {} updates, no value or deployment admission",
-            report.updates
-        );
+    let receipt = if let Some(config) = config {
+        let trained = train(&dataset, &config)?;
+        publish_new(Path::new(&output), &dataset, Some(&trained))?
     } else {
-        publish_new(Path::new(&output), &dataset, None)?;
-        println!(
-            "Initial-choice source-bound rows published; no learning or full-replay admission"
-        );
-    }
+        publish_new(Path::new(&output), &dataset, None)?
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&receipt).map_err(|e| e.to_string())?
+    );
     Ok(())
 }
 fn main() {
