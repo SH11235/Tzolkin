@@ -30,6 +30,7 @@ use crate::public_rl_paired_stochastic_native::{
 };
 use crate::public_rl_policy_cohort::{PlannedRlCohort, ValidatedRlCohort};
 use crate::public_rl_policy_episode::ValidatedRlPolicyEpisode;
+use crate::public_rl_record_storage::{self as record_storage, MAX_STORED_RECORD_BYTES};
 use crate::public_rl_session::RlTrainingSession;
 use crate::public_rl_stochastic_native::{
     audit_rl_record_bytes, collect_rl_native, encode_rl_record,
@@ -43,10 +44,39 @@ use crate::public_stochastic_record::{
 };
 
 pub const SPEC_SCHEMA: &str = "tzolkin-public-rl-paired-run-spec-v1";
+pub const COMPRESSED_SPEC_SCHEMA: &str = "tzolkin-public-rl-paired-run-spec-v2";
 pub const MAX_SPEC_BYTES: usize = 64 * 1024;
 pub const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
 const OWNER_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STORAGE: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_LOGICAL_STORAGE_V2: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_DISK_STORAGE_V2: u64 = 16 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordStorageSpec {
+    schema: String,
+    max_stored_bytes: u64,
+    max_temporary_bytes: u64,
+    max_disk_bytes: u64,
+}
+impl RecordStorageSpec {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != record_storage::STORAGE_SCHEMA
+            || !(4 * MAX_STORED_RECORD_BYTES as u64..=MAX_STORAGE).contains(&self.max_stored_bytes)
+            || !(MAX_STORED_RECORD_BYTES as u64..=512 * 1024 * 1024)
+                .contains(&self.max_temporary_bytes)
+            || self.max_disk_bytes > MAX_DISK_STORAGE_V2
+            || self.max_disk_bytes
+                < 4 * MAX_STORED_RECORD_BYTES as u64
+                    + OWNER_BYTES as u64 * 2
+                    + self.max_temporary_bytes
+        {
+            return Err("Invalid explicit compressed record storage contract".into());
+        }
+        Ok(())
+    }
+}
 
 /// Fixed metadata allocation and capacities. Safety limits do not authorize an
 /// experiment. Decision work is the new Paired segment, excluding the bootstrap.
@@ -76,6 +106,8 @@ pub struct PairedRunSpec {
     max_trace_bytes: usize,
     max_metadata_bytes: u64,
     max_record_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_storage: Option<RecordStorageSpec>,
     excluded_families: Vec<String>,
 }
 impl PairedRunSpec {
@@ -89,8 +121,15 @@ impl PairedRunSpec {
         self.step()?;
         self.critic_step()?;
         self.collection_limits()?;
-        if self.schema != SPEC_SCHEMA
-            || self.decision_budget == 0
+        let logical_maximum = match (&self.record_storage, self.schema.as_str()) {
+            (None, SPEC_SCHEMA) => MAX_STORAGE,
+            (Some(storage), COMPRESSED_SPEC_SCHEMA) => {
+                storage.validate()?;
+                MAX_LOGICAL_STORAGE_V2
+            }
+            _ => return Err("Paired run schema/storage mode differs".into()),
+        };
+        if self.decision_budget == 0
             || self.evaluation_interval == 0
             || !(1..=1_000_000).contains(&self.max_seed_candidates)
             || self.end_seed() > u32::MAX as u64 + 1
@@ -107,7 +146,7 @@ impl PairedRunSpec {
             || self.excluded_families.iter().any(|f| !checkpoint_digest(f))
             || self.excluded_families.windows(2).any(|w| w[0] >= w[1])
             || !(OWNER_BYTES as u64 * 2..=MAX_STORAGE).contains(&self.max_metadata_bytes)
-            || !(4 * MAX_RECORD_BYTES as u64..=MAX_STORAGE).contains(&self.max_record_bytes)
+            || !(4 * MAX_RECORD_BYTES as u64..=logical_maximum).contains(&self.max_record_bytes)
         {
             return Err("Invalid explicit Paired run specification".into());
         }
@@ -144,7 +183,51 @@ impl PairedRunSpec {
         )
     }
     fn checksum(&self) -> Result<String, String> {
-        hash(b"tzolkin-rl-paired-run-spec-v1\0", self)
+        match self.record_storage {
+            None => hash(b"tzolkin-rl-paired-run-spec-v1\0", self),
+            Some(_) => hash(b"tzolkin-rl-paired-run-spec-v2\0", self),
+        }
+    }
+    fn checkpoint_schema(&self) -> &'static str {
+        if self.record_storage.is_some() {
+            "tzolkin-rl-paired-checkpoint-v2"
+        } else {
+            "tzolkin-rl-paired-checkpoint-v1"
+        }
+    }
+    // Disk scope is this session directory. External CLI reports, inventories,
+    // unrelated files and available filesystem capacity need their own budgets.
+    fn check_storage(
+        &self,
+        progress: &Progress,
+        additional_stored: u64,
+        additional_metadata: u64,
+    ) -> Result<(), String> {
+        let metadata = progress
+            .metadata_bytes
+            .checked_add(additional_metadata)
+            .ok_or("Paired metadata capacity overflow")?;
+        if metadata > self.max_metadata_bytes || progress.record_bytes > self.max_record_bytes {
+            return Err("Paired logical or metadata storage byte cap reached".into());
+        }
+        match (&self.record_storage, progress.stored_record_bytes) {
+            (None, None) if additional_stored == 0 => Ok(()),
+            (Some(storage), Some(stored)) => {
+                let stored = stored
+                    .checked_add(additional_stored)
+                    .ok_or("Paired stored record capacity overflow")?;
+                if stored > storage.max_stored_bytes
+                    || stored
+                        .checked_add(metadata)
+                        .and_then(|n| n.checked_add(storage.max_temporary_bytes))
+                        .is_none_or(|n| n > storage.max_disk_bytes)
+                {
+                    return Err("Paired physical record or total disk byte cap reached".into());
+                }
+                Ok(())
+            }
+            _ => Err("Paired progress storage mode differs".into()),
+        }
     }
     fn configs(
         &self,
@@ -204,6 +287,48 @@ impl Pin {
                 .name
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompressedRecordPin {
+    schema: String,
+    stored: Pin,
+    raw_bytes: usize,
+    raw_sha256: String,
+}
+// The untagged raw alternative serializes exactly as the original v1 Pin.
+// Both alternatives have closed shapes; the run contract selects exactly one.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum RecordPin {
+    Raw(Pin),
+    Compressed(CompressedRecordPin),
+}
+impl RecordPin {
+    fn file(&self) -> &Pin {
+        match self {
+            Self::Raw(pin) => pin,
+            Self::Compressed(pin) => &pin.stored,
+        }
+    }
+    fn raw_bytes(&self) -> usize {
+        match self {
+            Self::Raw(pin) => pin.bytes,
+            Self::Compressed(pin) => pin.raw_bytes,
+        }
+    }
+    fn valid(&self, spec: &PairedRunSpec) -> bool {
+        match (self, &spec.record_storage) {
+            (Self::Raw(pin), None) => pin.valid(MAX_RECORD_BYTES),
+            (Self::Compressed(pin), Some(_)) => {
+                pin.schema == record_storage::PIN_SCHEMA
+                    && checkpoint_digest(&pin.raw_sha256)
+                    && record_storage::maximum_stored_bytes(pin.raw_bytes)
+                        .is_ok_and(|maximum| pin.stored.valid(maximum))
+            }
+            _ => false,
+        }
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -286,7 +411,7 @@ impl Phase {
 struct Member {
     started: bool,
     returned: bool,
-    record: Option<Pin>,
+    record: Option<RecordPin>,
     work: Option<Work>,
     error: Option<String>,
     audit_started: bool,
@@ -317,6 +442,8 @@ struct Progress {
     audit: Phase,
     gradient: Phase,
     record_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stored_record_bytes: Option<u64>,
     metadata_bytes: u64,
     due: u64,
     last_outcome: Option<String>,
@@ -346,7 +473,7 @@ enum Event {
     },
     CollectReturn {
         member: usize,
-        record: Option<Pin>,
+        record: Option<RecordPin>,
         work: Option<Work>,
         error: Option<String>,
         seconds: f64,
@@ -608,11 +735,13 @@ impl PairedTrainingSession {
             audit: Phase::default(),
             gradient: Phase::default(),
             record_bytes: 0,
+            stored_record_bytes: spec.record_storage.as_ref().map(|_| 0),
             metadata_bytes: (bytes.len() + raw.len()) as u64,
             due: 0,
             last_outcome: None,
             last_error: None,
         };
+        spec.check_storage(&state, 0, 0)?;
         Ok(Self {
             initial: InitializedPublicRlPolicy::from_bc(prepared)?,
             spec,
@@ -640,7 +769,7 @@ impl PairedTrainingSession {
         let mut next = self.progress.clone();
         apply(&self.spec, &mut next, &event, &self.consumed)?;
         let checkpoint = Checkpoint {
-            schema: "tzolkin-rl-paired-checkpoint-v1".into(),
+            schema: self.spec.checkpoint_schema().into(),
             root: self.root.clone(),
             spec_checksum: self.spec.checksum()?,
             sequence,
@@ -653,9 +782,7 @@ impl PairedTrainingSession {
             .metadata_bytes
             .checked_add(bytes.len() as u64)
             .ok_or("Paired metadata capacity overflow")?;
-        if next.metadata_bytes > self.spec.max_metadata_bytes {
-            return Err("Paired metadata storage byte cap reached".into());
-        }
+        self.spec.check_storage(&next, 0, 0)?;
         // metadataBytes excludes this checkpoint until its publication commits.
         let published = publish(&self.directory, &head_name(sequence), &bytes)?;
         if let Event::Reserve { configs, .. } = event {
@@ -720,11 +847,7 @@ impl PairedTrainingSession {
             match returned {
                 Ok(bytes) => {
                     let work = record_work(&bytes)?;
-                    let record = publish(
-                        &self.directory,
-                        &record_name(self.progress.reservations, i),
-                        &bytes,
-                    )?;
+                    let record = self.publish_record(i, &bytes)?;
                     self.save(Event::CollectReturn {
                         member: i,
                         record: Some(record),
@@ -744,6 +867,35 @@ impl PairedTrainingSession {
         }
         Ok(())
     }
+    fn publish_record(&self, member: usize, raw: &[u8]) -> Result<RecordPin, String> {
+        let name = saved_record_name(&self.spec, self.progress.reservations, member);
+        let record = match &self.spec.record_storage {
+            None => RecordPin::Raw(publish(&self.directory, &name, raw)?),
+            Some(storage) => {
+                let stored = record_storage::encode(raw)?;
+                if stored.len() as u64 > storage.max_temporary_bytes {
+                    return Err("Paired temporary record byte cap reached".into());
+                }
+                self.spec
+                    .check_storage(&self.progress, stored.len() as u64, 0)?;
+                let pin =
+                    publish_with_ceiling(&self.directory, &name, &stored, MAX_STORED_RECORD_BYTES)?;
+                RecordPin::Compressed(CompressedRecordPin {
+                    schema: record_storage::PIN_SCHEMA.into(),
+                    stored: pin,
+                    raw_bytes: raw.len(),
+                    raw_sha256: sha(raw),
+                })
+            }
+        };
+        // Publication readback preserves the original bytes, not a JSON rewrite.
+        if self.spec.record_storage.is_some()
+            && read_record(&self.directory, &record, &self.spec)? != raw
+        {
+            return Err("Paired published record readback differs".into());
+        }
+        Ok(record)
+    }
     fn preflight_records(&self) -> Result<[SavedRecord; 4], String> {
         let batch = self
             .progress
@@ -756,12 +908,12 @@ impl PairedTrainingSession {
             .ok_or("Missing paired current owner")?;
         let mut records = Vec::with_capacity(4);
         for (i, m) in batch.members.iter().enumerate() {
-            let raw = read_pin(
+            let raw = read_record(
                 &self.directory,
                 m.record.as_ref().ok_or(
                     "All four saved pinned records required; abandon incomplete reservation",
                 )?,
-                MAX_RECORD_BYTES,
+                &self.spec,
             )?;
             let saved = match current {
                 Current::Count1(p) => {
@@ -910,17 +1062,8 @@ impl PairedTrainingSession {
                         artifact: artifact.checksum().into(),
                         lineage: artifact.report().lineage_checksum().into(),
                     };
-                    if self
-                        .progress
-                        .metadata_bytes
-                        .checked_add(raw.len() as u64)
-                        .ok_or("Paired metadata overflow")?
-                        > self.spec.max_metadata_bytes
-                    {
-                        return Err(
-                            "Paired model storage byte cap reached with pending gradient".into(),
-                        );
-                    }
+                    self.spec
+                        .check_storage(&self.progress, 0, raw.len() as u64)?;
                     publish(&self.directory, &owner.file.name, &raw)?;
                     self.save(Event::Resolve {
                         outcome: "updated".into(),
@@ -1029,6 +1172,18 @@ impl PairedTrainingSession {
                 {
                     return Ok("storageByteCap".into());
                 }
+                let stored_reserve = if self.spec.record_storage.is_some() {
+                    4 * MAX_STORED_RECORD_BYTES as u64
+                } else {
+                    0
+                };
+                if self
+                    .spec
+                    .check_storage(&self.progress, stored_reserve, metadata_reserve)
+                    .is_err()
+                {
+                    return Ok("storageByteCap".into());
+                }
                 if self.progress.cursor >= self.spec.end_seed() {
                     return Ok("seedRange".into());
                 }
@@ -1093,7 +1248,30 @@ impl PairedTrainingSession {
     }
     fn report(&self, reason: String, wall_seconds: f64) -> PairedRunReport {
         PairedRunReport {
-            schema: "tzolkin-public-rl-paired-report-v1",
+            schema: if self.spec.record_storage.is_some() {
+                "tzolkin-public-rl-paired-report-v2"
+            } else {
+                "tzolkin-public-rl-paired-report-v1"
+            },
+            record_storage: self.spec.record_storage.clone(),
+            storage_usage: self
+                .spec
+                .record_storage
+                .as_ref()
+                .map(|storage| StorageUsage {
+                    raw_record_bytes: self.progress.record_bytes,
+                    stored_record_bytes: self
+                        .progress
+                        .stored_record_bytes
+                        .expect("v2 stored usage"),
+                    metadata_bytes: self.progress.metadata_bytes,
+                    temporary_reserve_bytes: storage.max_temporary_bytes,
+                    retained_disk_bytes: self
+                        .progress
+                        .stored_record_bytes
+                        .expect("v2 stored usage")
+                        + self.progress.metadata_bytes,
+                }),
             decision_budget_reached: reason == "decisionBudget",
             stop_reason: reason,
             consumed_families: self.consumed.len(),
@@ -1185,6 +1363,10 @@ impl PairedTrainingSession {
 #[serde(rename_all = "camelCase")]
 pub struct PairedRunReport {
     schema: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record_storage: Option<RecordStorageSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_usage: Option<StorageUsage>,
     stop_reason: String,
     decision_budget_reached: bool,
     consumed_families: usize,
@@ -1197,6 +1379,15 @@ pub struct PairedRunReport {
     checkpoint_file: String,
     checkpoint_sha256: String,
     producer_authenticated: bool,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageUsage {
+    raw_record_bytes: u64,
+    stored_record_bytes: u64,
+    metadata_bytes: u64,
+    temporary_reserve_bytes: u64,
+    retained_disk_bytes: u64,
 }
 impl PairedRunReport {
     pub fn decision_budget_reached(&self) -> bool {
@@ -1332,18 +1523,23 @@ fn apply(
                 return Err("Invalid collection return".into());
             }
             if let (Some(pin), Some(w)) = (record, work) {
-                if !pin.valid(MAX_RECORD_BYTES)
-                    || pin.name != record_name(p.reservations, *member)
+                if !pin.valid(spec)
+                    || pin.file().name != saved_record_name(spec, p.reservations, *member)
                     || !w.valid(&b.configs[*member])
                 {
                     return Err("Invalid saved collection pin/work".into());
                 }
                 p.record_bytes = p
                     .record_bytes
-                    .checked_add(pin.bytes as u64)
+                    .checked_add(pin.raw_bytes() as u64)
                     .ok_or("Paired record bytes overflow")?;
                 if p.record_bytes > spec.max_record_bytes {
                     return Err("Paired record storage cap".into());
+                }
+                if let Some(stored) = &mut p.stored_record_bytes {
+                    *stored = stored
+                        .checked_add(pin.file().bytes as u64)
+                        .ok_or("Paired stored record bytes overflow")?;
                 }
                 p.known.add(w)?;
                 p.unknown_collections -= 1;
@@ -1472,7 +1668,7 @@ fn apply(
             p.pending = None;
         }
     }
-    Ok(())
+    spec.check_storage(p, 0, 0)
 }
 
 fn restore(
@@ -1495,7 +1691,8 @@ fn restore(
         &supplied.root.sha256,
         directory,
     )?;
-    if supplied.root != session.root
+    if supplied.schema != session.spec.checkpoint_schema()
+        || supplied.root != session.root
         || supplied.spec_checksum != session.spec.checksum()?
         || supplied.sequence == 0
         || supplied.sequence > session.spec.max_journal_entries
@@ -1526,7 +1723,7 @@ fn restore(
         let name = head_name(sequence);
         let raw = read_bounded(&session.directory.join(&name), MAX_CHECKPOINT_BYTES)?;
         let entry: Checkpoint = closed(&raw, MAX_CHECKPOINT_BYTES)?;
-        if entry.schema != "tzolkin-rl-paired-checkpoint-v1"
+        if entry.schema != session.spec.checkpoint_schema()
             || matches!(entry.event, Event::Start) != (sequence == 1)
             || entry.sequence != sequence
             || entry.previous != session.tip
@@ -1557,11 +1754,11 @@ fn restore(
                 work: Some(w),
                 ..
             } => {
-                let raw_record = read_pin(&session.directory, p, MAX_RECORD_BYTES)?;
+                let raw_record = read_record(&session.directory, p, &session.spec)?;
                 if record_work(&raw_record)? != *w {
                     return Err("Saved record logical counters differ".into());
                 }
-                names.insert(p.name.clone());
+                names.insert(p.file().name.clone());
             }
             Event::Resolve {
                 outcome,
@@ -1593,9 +1790,7 @@ fn restore(
             .metadata_bytes
             .checked_add(raw.len() as u64)
             .ok_or("Paired metadata overflow")?;
-        if session.progress.metadata_bytes > session.spec.max_metadata_bytes {
-            return Err("Paired metadata storage cap".into());
-        }
+        session.spec.check_storage(&session.progress, 0, 0)?;
         session.sequence = sequence;
         session.tip = sha(&raw);
         names.insert(name);
@@ -1688,6 +1883,7 @@ fn resume_headroom(spec: &PairedRunSpec, progress: &Progress, sequence: u64) -> 
     {
         return Err("Insufficient Paired headroom before resume audit; pending unchanged".into());
     }
+    spec.check_storage(progress, 0, metadata)?;
     Ok(())
 }
 
@@ -1765,11 +1961,44 @@ fn head_name(sequence: u64) -> String {
 fn record_name(batch: u64, member: usize) -> String {
     format!("batch-{batch:016}-member-{member}.json")
 }
+fn saved_record_name(spec: &PairedRunSpec, batch: u64, member: usize) -> String {
+    let name = record_name(batch, member);
+    if spec.record_storage.is_some() {
+        format!("{name}.gz")
+    } else {
+        name
+    }
+}
+fn read_record(directory: &Path, pin: &RecordPin, spec: &PairedRunSpec) -> Result<Vec<u8>, String> {
+    if !pin.valid(spec) {
+        return Err("Invalid Paired record pin/storage mode".into());
+    }
+    match pin {
+        RecordPin::Raw(pin) => read_pin(directory, pin, MAX_RECORD_BYTES),
+        RecordPin::Compressed(pin) => {
+            let stored = read_pin_with_ceiling(
+                directory,
+                &pin.stored,
+                record_storage::maximum_stored_bytes(pin.raw_bytes)?,
+                MAX_STORED_RECORD_BYTES,
+            )?;
+            record_storage::decode(&stored, pin.raw_bytes, &pin.raw_sha256)
+        }
+    }
+}
 fn read_pin(directory: &Path, p: &Pin, max: usize) -> Result<Vec<u8>, String> {
+    read_pin_with_ceiling(directory, p, max, MAX_RECORD_BYTES)
+}
+fn read_pin_with_ceiling(
+    directory: &Path,
+    p: &Pin,
+    max: usize,
+    ceiling: usize,
+) -> Result<Vec<u8>, String> {
     if !p.valid(max) {
         return Err("Invalid Paired file pin".into());
     }
-    let bytes = read_bounded(&directory.join(&p.name), max)?;
+    let bytes = read_bounded_with_ceiling(&directory.join(&p.name), max, ceiling)?;
     if bytes.len() != p.bytes || sha(&bytes) != p.sha256 {
         return Err("Paired file bytes/SHA mismatch".into());
     }
@@ -1778,7 +2007,10 @@ fn read_pin(directory: &Path, p: &Pin, max: usize) -> Result<Vec<u8>, String> {
 /// Local regular-file reading only. This is a single-writer persistence boundary,
 /// not a hostile-filesystem or producer-authentication claim.
 pub fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, String> {
-    if max == 0 || max > MAX_RECORD_BYTES {
+    read_bounded_with_ceiling(path, max, MAX_RECORD_BYTES)
+}
+fn read_bounded_with_ceiling(path: &Path, max: usize, ceiling: usize) -> Result<Vec<u8>, String> {
+    if max == 0 || max > ceiling || ceiling > MAX_STORED_RECORD_BYTES {
         return Err("Invalid Paired read byte limit".into());
     }
     let path = local(path, false)?;
@@ -1847,6 +2079,14 @@ fn absent(path: &Path) -> Result<(), String> {
 }
 
 fn publish(directory: &Path, name: &str, bytes: &[u8]) -> Result<Pin, String> {
+    publish_with_ceiling(directory, name, bytes, MAX_RECORD_BYTES)
+}
+fn publish_with_ceiling(
+    directory: &Path,
+    name: &str,
+    bytes: &[u8],
+    ceiling: usize,
+) -> Result<Pin, String> {
     static TEMP: AtomicU64 = AtomicU64::new(0);
     local(directory, false)?;
     let destination = local(&directory.join(name), true)?;
@@ -1867,7 +2107,7 @@ fn publish(directory: &Path, name: &str, bytes: &[u8]) -> Result<Pin, String> {
     drop(file);
     fs::hard_link(&temporary, &destination).map_err(|e| e.to_string())?;
     let expected = pin(name, bytes);
-    read_pin(directory, &expected, bytes.len())?;
+    read_pin_with_ceiling(directory, &expected, bytes.len(), ceiling)?;
     fs::remove_file(&temporary).map_err(|e| e.to_string())?;
     Ok(expected)
 }
@@ -1885,6 +2125,84 @@ mod tests {
             "maxCallbacks":8,"maxCandidateRows":1000,"maxSourceBytes":1048576,"maxTraceBytes":1048576,
             "maxMetadataBytes":67108864,"maxRecordBytes":MAX_STORAGE,"excludedFamilies":[]
         })).unwrap()).unwrap()
+    }
+    fn compressed_spec() -> PairedRunSpec {
+        let mut value = serde_json::to_value(spec()).unwrap();
+        value["schema"] = COMPRESSED_SPEC_SCHEMA.into();
+        value["maxRecordBytes"] = MAX_LOGICAL_STORAGE_V2.into();
+        value["recordStorage"] = serde_json::json!({
+            "schema":record_storage::STORAGE_SCHEMA,
+            "maxStoredBytes":MAX_STORAGE,
+            "maxTemporaryBytes":MAX_STORED_RECORD_BYTES,
+            "maxDiskBytes":MAX_DISK_STORAGE_V2,
+        });
+        PairedRunSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+    #[test]
+    fn raw_v1_shape_and_checksum_remain_exact_and_storage_modes_cannot_mix() {
+        let spec = spec();
+        let value = serde_json::to_value(&spec).unwrap();
+        assert!(value.get("recordStorage").is_none());
+        assert_eq!(
+            spec.checksum().unwrap(),
+            hash(b"tzolkin-rl-paired-run-spec-v1\0", &spec).unwrap()
+        );
+        let raw = pin("batch-0000000000000001-member-0.json", b"fixture");
+        let wire = serde_json::to_vec(&raw).unwrap();
+        let record: RecordPin = closed(&wire, 1024).unwrap();
+        assert_eq!(serde_json::to_vec(&record).unwrap(), wire);
+        assert!(record.valid(&spec));
+        let compressed = compressed_spec();
+        assert!(!record.valid(&compressed));
+        let mut mixed = serde_json::to_value(&compressed).unwrap();
+        mixed["schema"] = SPEC_SCHEMA.into();
+        assert!(PairedRunSpec::from_json(&serde_json::to_vec(&mixed).unwrap()).is_err());
+        mixed["schema"] = COMPRESSED_SPEC_SCHEMA.into();
+        mixed.as_object_mut().unwrap().remove("recordStorage");
+        assert!(PairedRunSpec::from_json(&serde_json::to_vec(&mixed).unwrap()).is_err());
+        let mut null = value;
+        null["recordStorage"] = Value::Null;
+        assert!(PairedRunSpec::from_json(&serde_json::to_vec(&null).unwrap()).is_err());
+    }
+    #[test]
+    fn compressed_publication_readback_binds_both_pins_and_is_create_new() {
+        let spec = compressed_spec();
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "tzolkin-compressed-record-{}-{id}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let raw = b" { \"preserve\": 1.0 }\n";
+        let stored = record_storage::encode(raw).unwrap();
+        let name = saved_record_name(&spec, 1, 0);
+        let file =
+            publish_with_ceiling(&directory, &name, &stored, MAX_STORED_RECORD_BYTES).unwrap();
+        let record = RecordPin::Compressed(CompressedRecordPin {
+            schema: record_storage::PIN_SCHEMA.into(),
+            stored: file,
+            raw_bytes: raw.len(),
+            raw_sha256: sha(raw),
+        });
+        assert_eq!(read_record(&directory, &record, &spec).unwrap(), raw);
+        assert!(!record.valid(&self::spec()));
+        assert!(
+            publish_with_ceiling(&directory, &name, b"replacement", MAX_STORED_RECORD_BYTES)
+                .is_err()
+        );
+        assert_eq!(fs::read(directory.join(&name)).unwrap(), stored);
+        let mut wrong_raw = record.clone();
+        if let RecordPin::Compressed(pin) = &mut wrong_raw {
+            pin.raw_sha256 = "a".repeat(64);
+        }
+        assert!(read_record(&directory, &wrong_raw, &spec).is_err());
+        fs::write(directory.join(&name), b"corruption").unwrap();
+        assert!(read_record(&directory, &record, &spec).is_err());
+        fs::remove_file(directory.join(&name)).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
     #[test]
     fn joint_update_unknown_failure_retains_parent_and_reserved_families() {
@@ -1931,7 +2249,7 @@ mod tests {
                 &mut p,
                 &Event::CollectReturn {
                     member: i,
-                    record: Some(pin(&record_name(1, i), b"fixture")),
+                    record: Some(RecordPin::Raw(pin(&record_name(1, i), b"fixture"))),
                     work: Some(Work {
                         callbacks: 1,
                         attempts: 1,
