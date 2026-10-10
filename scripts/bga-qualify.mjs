@@ -24,11 +24,11 @@ const FEATURE_SOURCE_CHAIN = [
   },
   {
     path: 'crates/tzolkin-inference/src/lib.rs',
-    sha256: '6aeccc816f230857b6708ddb6e86bf7fa43b7836f38f07ab95bee408e7900612',
+    sha256: 'f8e3aa4ef2612533291f19ccacee3ed2b3d8e077c08d1862886f27e341f91489',
   },
   {
     path: 'crates/tzolkin-inference/Cargo.toml',
-    sha256: '7d4ef2233aac4baeeb497d36df73acdbf5854dea7c0a7356272e11a961677d3d',
+    sha256: '0cb53a4db4ae4533c0dde17c31f723a88bb9d7e325d5bcc01fdccf3cd492b119',
   },
   {
     path: 'crates/tzolkin-ai/src/features.rs',

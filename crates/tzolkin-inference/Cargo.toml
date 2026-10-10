@@ -8,3 +8,4 @@ rust-version = "1.90"
 tzolkin-core = { path = "../tzolkin-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
