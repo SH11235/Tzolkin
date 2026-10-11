@@ -6,7 +6,7 @@ use crate::public_rl_mixed_session::require_output_outside_directory;
 pub const SEGMENT_SPEC_SCHEMA: &str = "tzolkin-current-mixed-segment-spec-v1";
 pub const SEGMENT_JOURNAL_SCHEMA: &str = "tzolkin-current-mixed-segment-journal-v1";
 pub const GLOBAL_CONTRACT_SCHEMA: &str = "tzolkin-current-mixed-global-contract-v1";
-const MAX_SEGMENTS: usize = 64;
+pub(super) const MAX_SEGMENTS: usize = 64;
 const MAX_PROTECTED_DIRECTORIES: usize = 16;
 
 /// A finite local run and immutable global limits. This is metadata, never a
@@ -408,10 +408,18 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         spec: &CurrentMixedSegmentSpec,
         directory: &Path,
     ) -> Result<SegmentBinding, String> {
+        self.segment_binding_with_validation(spec, directory, restore::ArchiveValidation::Immediate)
+    }
+    fn segment_binding_with_validation(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        directory: &Path,
+        validation: restore::ArchiveValidation,
+    ) -> Result<SegmentBinding, String> {
         self.progress
             .require_ready_continuation(self.blocked, self.head.is_some())?;
         self.current_policy()?;
-        self.successor_binding(spec, directory, self.pool.clone(), None)
+        self.successor_binding(spec, directory, self.pool.clone(), None, validation)
     }
     fn require_stopped_fork_source(&self) -> Result<(), String> {
         self.progress
@@ -436,6 +444,22 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         new_pool: &CurrentMixedCollectionSpec,
         directory: &Path,
     ) -> Result<SegmentBinding, String> {
+        self.pool_fork_binding_with_validation(
+            spec,
+            old_pool,
+            new_pool,
+            directory,
+            restore::ArchiveValidation::Immediate,
+        )
+    }
+    fn pool_fork_binding_with_validation(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        directory: &Path,
+        validation: restore::ArchiveValidation,
+    ) -> Result<SegmentBinding, String> {
         self.require_stopped_fork_source()?;
         let pool = require_guarded_pool_replacement(old_pool, new_pool, &self.pool)?;
         let fork = PoolForkBinding {
@@ -450,7 +474,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 .attempt,
             predecessor_own_counters: own_snapshot(self.progress.own_decisions),
         };
-        self.successor_binding(spec, directory, pool, Some(fork))
+        self.successor_binding(spec, directory, pool, Some(fork), validation)
     }
     fn successor_binding(
         &self,
@@ -458,10 +482,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         directory: &Path,
         pool: String,
         pool_fork: Option<PoolForkBinding>,
+        validation: restore::ArchiveValidation,
     ) -> Result<SegmentBinding, String> {
         spec.validate()?;
         self.handle()?;
-        self.require_full_archives()?;
+        validation.require(self)?;
         self.root.require_output(directory)?;
         spec.global_contract.require_output(directory)?;
         require_output_outside_directory(&self.directory, directory)?;
@@ -605,6 +630,38 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             blocked: false,
             segment: Some(SegmentContext { binding, archives }),
         })
+    }
+    pub(super) fn restore_chain_segment(
+        self,
+        spec: CurrentMixedSegmentSpec,
+        head_raw: &[u8],
+        directory: &Path,
+    ) -> Result<Self, String> {
+        let directory = local(directory, false)?;
+        let binding = self.segment_binding_with_validation(
+            &spec,
+            &directory,
+            restore::ArchiveValidation::AtChainClose,
+        )?;
+        Self::from_predecessor(self, spec, binding, directory)?.restore_entries_in_chain(head_raw)
+    }
+    pub(super) fn restore_chain_pool_fork(
+        self,
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        head_raw: &[u8],
+        directory: &Path,
+    ) -> Result<Self, String> {
+        let directory = local(directory, false)?;
+        let binding = self.pool_fork_binding_with_validation(
+            &spec,
+            old_pool,
+            new_pool,
+            &directory,
+            restore::ArchiveValidation::AtChainClose,
+        )?;
+        Self::from_predecessor(self, spec, binding, directory)?.restore_entries_in_chain(head_raw)
     }
     /// Start one bounded successor. Call the token's read-only preflight first
     /// to retain ownership on predictable validation failures. I/O failures can
