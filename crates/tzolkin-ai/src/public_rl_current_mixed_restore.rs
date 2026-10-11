@@ -487,4 +487,16 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         self.require_full_archives()?;
         Ok(self.root)
     }
+
+    /// Consumes only a resolved Ready session, retaining the actual joint owner,
+    /// original admission and every reservation/work/storage counter. The token
+    /// borrows policies; it cannot start another training segment.
+    pub fn into_ready_continuation(self) -> Result<ReadyCurrentMixedContinuation<'a>, String> {
+        self.progress
+            .require_ready_continuation(self.blocked, self.head.is_some())?;
+        self.current_policy()?;
+        self.require_full_archives()?;
+        self.current_policy()?;
+        Ok(ReadyCurrentMixedContinuation { session: self })
+    }
 }
