@@ -190,17 +190,14 @@ fn segment_start_binds_every_predecessor_field_and_rejects_legacy_context() {
             }
             _ => panic!("unexpected binding shape"),
         };
-        match serde_json::from_value::<SegmentBinding>(v) {
-            Ok(changed) => {
-                assert_ne!(
-                    b.checksum().unwrap(),
-                    changed.checksum().unwrap(),
-                    "{field}"
-                );
-                assert!(progress(&b).check(&start(&changed), &s).is_err(), "{field}");
-            }
-            Err(_) => {} // Closed typed fields also refuse malformed changes.
-        }
+        if let Ok(changed) = serde_json::from_value::<SegmentBinding>(v) {
+            assert_ne!(
+                b.checksum().unwrap(),
+                changed.checksum().unwrap(),
+                "{field}"
+            );
+            assert!(progress(&b).check(&start(&changed), &s).is_err(), "{field}");
+        } // Closed typed fields also refuse malformed changes.
     }
     let mut legacy = progress(&b);
     legacy.base = 1;
