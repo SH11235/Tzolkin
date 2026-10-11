@@ -2283,19 +2283,39 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           } else if (event.kind === 'beg') {
             const body = event.rawText.slice(event.actor?.length ?? 0);
             const temple = body.match(
-              /^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を(?:1段)?下げ(?:て|ることで|、)コーン3個を受け取った$/,
+              /^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を(?:1段)?下げ(?:て|ることで|、)コーン([1-3])個を受け取った$/,
             );
             if (!temple) fail('Begging requires one unambiguous temple in the actor-free phrase');
+            if (event.iconResources.length)
+              fail('Begging caption requires icon-free corn evidence');
             alignActor(event.actor);
+            const templeId = TEMPLES[temple[1]];
+            const before = state().players[actorId(event.actor)];
+            const beforeCorn = before.resources.corn;
+            const beforeTemple = before.temples[templeId];
+            const gained = Number(temple[2]);
+            if (
+              !legal().some((row) => row.action.type === 'beg') ||
+              !Number.isSafeInteger(beforeCorn) ||
+              beforeCorn < 0 ||
+              beforeCorn > 2 ||
+              gained !== 3 - beforeCorn
+            )
+              fail('Begging caption corn gain differs from the legal base Beg');
             choose((action) => action.type === 'beg', 'observed begging');
-            choose(
-              (action) =>
-                action.type === 'temple' &&
-                action.temple === TEMPLES[temple[1]] &&
-                action.direction === -1,
-              'observed begging temple',
-            );
-            automatic(event, `temple:${TEMPLES[temple[1]]}`, 1, -1);
+            const lowerTemple = (action) =>
+              action.type === 'temple' && action.temple === templeId && action.direction === -1;
+            if (pending() !== 'temple' || !legal().some((row) => lowerTemple(row.action)))
+              fail('Begging requires the actual named temple-down choice');
+            choose(lowerTemple, 'observed begging temple');
+            const after = state().players[actorId(event.actor)];
+            if (
+              after.resources.corn - beforeCorn !== gained ||
+              after.temples[templeId] - beforeTemple !== -1
+            )
+              fail('Begging caption differs from the actual corn and temple transition');
+            automatic(event, `temple:${templeId}`, 1, -1);
+            automatic(event, 'resource:corn', gained);
           } else if (event.kind === 'unparsed') {
             const architectureBonus = architectureScoreCaption(event);
             const theologyBonus = theologySkullCaption(event);
