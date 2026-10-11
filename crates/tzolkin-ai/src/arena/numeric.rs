@@ -146,6 +146,7 @@ pub enum Opponent<'a> {
     CornFirstSetup(&'a HeuristicWeights),
     CornFirstUxmalOpening(&'a HeuristicWeights),
     Search(&'a PreparedSearch),
+    ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -155,17 +156,29 @@ pub enum Opponent<'a> {
     rename_all_fields = "camelCase"
 )]
 pub enum PolicyIdentity {
-    GuardedNumeric { identity: NumericIdentity },
-    Reactive { provenance: SeatPolicy },
+    GuardedNumeric {
+        identity: NumericIdentity,
+    },
+    Reactive {
+        provenance: SeatPolicy,
+    },
+    ResourceCycle {
+        configuration: super::resource_cycle::ResourceCycleConfig,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
     Reactive(PolicyHandle<'a>),
+    ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
 impl<'a> Role<'a> {
     fn from_opponent(opponent: Opponent<'a>) -> Result<Self, String> {
         let reactive = match opponent {
             Opponent::GuardedNumeric(policy) => return Ok(Self::Numeric(*policy)),
+            Opponent::ResourceCycle(configuration) => {
+                configuration.validate()?;
+                return Ok(Self::ResourceCycle(configuration));
+            }
             Opponent::Heuristic(weights) => BorrowedArenaPolicy::Heuristic(weights),
             Opponent::CornFirstSetup(weights) => BorrowedArenaPolicy::CornFirstSetup(weights),
             Opponent::CornFirstUxmalOpening(weights) => {
@@ -182,6 +195,9 @@ impl<'a> Role<'a> {
             },
             Self::Reactive(policy) => PolicyIdentity::Reactive {
                 provenance: policy.description.provenance.clone(),
+            },
+            Self::ResourceCycle(configuration) => PolicyIdentity::ResourceCycle {
+                configuration: configuration.clone(),
             },
         }
     }
@@ -321,13 +337,17 @@ fn choose(
             score: decision.score,
         }
     } else {
-        let Role::Reactive(policy) = &**roster
+        let role = &**roster
             .get(actor)
-            .ok_or("Numeric Arena actor outside roster")?
-        else {
-            return Err("Numeric Arena missing game guard".into());
+            .ok_or("Numeric Arena actor outside roster")?;
+        let (decision, trace) = match role {
+            Role::Reactive(policy) => policy.choose_with_diagnostics(observation)?,
+            Role::ResourceCycle(configuration) => (
+                super::resource_cycle::choose_move(observation, configuration)?,
+                None,
+            ),
+            Role::Numeric(_) => return Err("Numeric Arena missing game guard".into()),
         };
-        let (decision, trace) = policy.choose_with_diagnostics(observation)?;
         match (roster[actor].search(), trace) {
             (Some(prepared), Some(trace)) => {
                 search[actor]
