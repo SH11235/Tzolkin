@@ -501,7 +501,7 @@ pub fn play_game_using(
         seed,
         options,
         record,
-        source,
+        Some(source),
         |o| Ok((decide(o)?, None, None)),
         true,
     )
@@ -540,7 +540,7 @@ pub fn play_game_using_fast(
         seed,
         options,
         record,
-        source,
+        Some(source),
         |o| Ok((decide(o)?, None, None)),
         false,
     )
@@ -560,7 +560,7 @@ pub fn play_game_using_diagnostics(
         seed,
         options,
         record,
-        source,
+        Some(source),
         |o| {
             let (decision, search) = decide(o)?;
             Ok((decision, search, None))
@@ -616,7 +616,7 @@ pub fn play_game_using_all_diagnostics(
         seed,
         options,
         record,
-        source,
+        Some(source),
         |o| {
             let result = decide(index, o)?;
             index += 1;
@@ -624,6 +624,33 @@ pub fn play_game_using_all_diagnostics(
         },
         !fast,
     )
+}
+
+/// Inference-only sibling: the same legal simulator and terminal checks, without
+/// a recorded source or a training-compatible policy provenance.
+pub(crate) fn play_unrecorded_inference(
+    players: usize,
+    seed: u32,
+    mut decide: impl FnMut(usize, &Observation) -> Result<crate::Decision, String>,
+) -> Result<(GameState, usize), String> {
+    if !(3..=4).contains(&players) {
+        return Err("Numeric inference evaluation requires base 3/4p".into());
+    }
+    let mut index = 0;
+    let (state, decisions, _) = play_game_internal(
+        players,
+        seed,
+        GameOptions::default(),
+        false,
+        None,
+        |o| {
+            let decision = decide(index, o)?;
+            index += 1;
+            Ok((decision, None, None))
+        },
+        false,
+    )?;
+    Ok((state, decisions))
 }
 
 struct GuardReplay {
@@ -710,7 +737,7 @@ fn play_game_internal(
     seed: u32,
     mut options: GameOptions,
     record: bool,
-    source: ReplaySource,
+    source: Option<ReplaySource>,
     mut decide: impl FnMut(
         &Observation,
     ) -> Result<
@@ -726,7 +753,10 @@ fn play_game_internal(
     if !(2..=5).contains(&players) {
         return Err("Players must be 2..5".into());
     }
-    if let ReplaySource::PolicySelfPlay { policies } = &source {
+    if source.is_none() && record {
+        return Err("Unrecorded inference has no replay source".into());
+    }
+    if let Some(ReplaySource::PolicySelfPlay { policies }) = &source {
         if policies.len() != players {
             return Err("Selfplay policy/seat count mismatch".into());
         }
@@ -770,7 +800,7 @@ fn play_game_internal(
     check_state(&state)?;
     let mut steps = Vec::new();
     let mut decisions = 0;
-    let mut guard_replay = GuardReplay::new(&source)?;
+    let mut guard_replay = source.as_ref().map(GuardReplay::new).transpose()?;
     while state.phase != Phase::Finished {
         if decisions >= MAX_DECISIONS {
             return Err(format!(
@@ -779,13 +809,17 @@ fn play_game_internal(
         }
         let observation = observe(&state, state.current_player)?;
         let (decision, search, trade_guard) = decide(&observation)?;
-        if let ReplaySource::PolicySelfPlay { policies } = &source
+        if let Some(ReplaySource::PolicySelfPlay { policies }) = &source
             && let Some(policy_version) = policies[observation.actor].rl_evaluation_policy_version()
             && (decision.policy_version != policy_version || !decision.score.is_finite())
         {
             return Err("RL evaluation decision/provenance mismatch".into());
         }
-        validate_search_trace(&source, &observation, &search)?;
+        if let Some(source) = &source {
+            validate_search_trace(source, &observation, &search)?;
+        } else if search.is_some() || trade_guard.is_some() {
+            return Err("Unrecorded inference diagnostics cannot claim replay provenance".into());
+        }
         if search.as_ref().is_some_and(|trace| {
             decision.policy_version != trace.policy_version || decision.score != trace.score
         }) {
@@ -802,13 +836,15 @@ fn play_game_internal(
             .find(|a| a.r#move == decision.r#move)
             .cloned()
             .ok_or("Policy returned a non-legal action")?;
-        guard_replay.check(
-            decisions,
-            &observation,
-            &chosen,
-            &trade_guard,
-            Some(&decision),
-        )?;
+        if let Some(guard_replay) = &mut guard_replay {
+            guard_replay.check(
+                decisions,
+                &observation,
+                &chosen,
+                &trade_guard,
+                Some(&decision),
+            )?;
+        }
         let before = if record {
             state_key(&state)?
         } else {
@@ -847,7 +883,7 @@ fn play_game_internal(
                 catalog_hash: catalog_hash(),
                 move_schema: MOVE_SCHEMA,
                 observation_schema: OBSERVATION_SCHEMA,
-                source,
+                source: source.ok_or("Recorded game requires its replay source")?,
                 names,
                 seed,
                 options,
