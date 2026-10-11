@@ -62,21 +62,63 @@ export interface CpuModelMetadata {
   readonly backend: 'scalar';
   readonly currentMixedIdentity?: CurrentMixedIdentity;
 }
+export const GUARDED_POLICY_VERSION = 'numeric-public-trade-guard-v1';
+const GUARD_VERSION = 'public-trade-cycle-guard-v1';
+const PROJECTION_VERSION = 'public-trading-state-v1';
+export interface CpuGameMetadata {
+  readonly gameId: string;
+  readonly modelChecksum: string;
+  readonly policyVersion: typeof GUARDED_POLICY_VERSION;
+  readonly rawPolicyVersion: string;
+  readonly guardVersion: string;
+  readonly projectionVersion: string;
+  readonly configurationKey: string;
+  readonly maxCallbacks: 4000;
+}
+export interface CpuCallback {
+  readonly game: CpuGameMetadata;
+  readonly index: number;
+  readonly observationJson: string;
+}
+export interface GuardedCpuDecision extends CpuDecision {
+  rawPolicyVersion: string;
+  deploymentChecksum: string;
+  guardVersion: string;
+  projectionVersion: string;
+  configurationKey: string;
+  callbackIndex: number;
+  rawLegalIndex: number;
+  effectiveLegalIndex: number;
+  trade: null | {
+    publicStateSha256: string;
+    firstSeenCallbackIndex: number | null;
+    repeatSeen: boolean;
+    budgetReached: boolean;
+    overridden: boolean;
+    tradeCountBefore: number;
+    tradeCountAfter: number;
+    episodeClosed: boolean;
+  };
+}
 export type CpuSelection = { mode: 'heuristic' } | { mode: 'nn'; modelChecksum: string };
 type Bindings = {
-  operation: 'load' | 'choose';
+  operation: 'load' | 'start' | 'notify' | 'choose';
+  gameId: string | null;
+  callbackIndex: number | null;
   mode: 'heuristic' | 'nn';
   modelChecksum: string | null;
   observationJson: string;
 };
 export type CpuRequestPayload =
   | (Bindings & { operation: 'load'; mode: 'nn'; deploymentBytes: Uint8Array })
-  | (Bindings & { operation: 'choose' });
+  | (Bindings & { operation: 'start' | 'notify' | 'choose' });
 export type CpuRequest = CpuRequestPayload & { requestId: number };
 interface Reply extends Bindings {
   requestId: number;
   decision?: CpuDecision;
   metadata?: CpuModelMetadata;
+  gameMetadata?: CpuGameMetadata;
+  notified?: boolean;
   error?: string;
 }
 
@@ -89,6 +131,30 @@ let nextRequestId = 0;
 let worker: Worker | undefined;
 let pending = false;
 let loaded: CpuModelMetadata | undefined;
+let nextGameId = 0;
+let game: CpuGameMetadata | undefined;
+let nextCallback = 0;
+let notified: CpuCallback | undefined;
+let pendingAbort: (() => void) | undefined;
+
+export function getActiveCpuGame(): CpuGameMetadata | undefined {
+  return game;
+}
+
+/** Discard after cancellation, stale authority or failed core application.
+ * A new Worker must acknowledge a model load and an explicit fresh epoch. */
+export function discardCpuGame(expected?: CpuGameMetadata): void {
+  if (expected && game !== expected) return;
+  if (!game) return;
+  if (pendingAbort) pendingAbort();
+  else {
+    worker?.terminate();
+    worker = undefined;
+    loaded = undefined;
+    game = undefined;
+    notified = undefined;
+  }
+}
 
 /** This Worker acknowledged a numeric model load; this is not learning qualification. */
 export function getLoadedCpuModel(): CpuModelMetadata | undefined {
@@ -239,7 +305,11 @@ function exchange<T>(
       reject(new Error('CPUのリクエスト番号を更新できません。'));
       return;
     }
-    if (request.operation === 'load') loaded = undefined;
+    if (request.operation === 'load') {
+      loaded = undefined;
+      game = undefined;
+      notified = undefined;
+    }
     try {
       worker ??= new Worker(new URL('./cpu.worker.ts', import.meta.url), { type: 'module' });
     } catch {
@@ -254,6 +324,7 @@ function exchange<T>(
       if (settled) return false;
       settled = true;
       pending = false;
+      pendingAbort = undefined;
       clearTimeout(timeout);
       signal.removeEventListener('abort', cancel);
       current.removeEventListener('message', receive);
@@ -266,6 +337,8 @@ function exchange<T>(
       if (worker === current) {
         worker = undefined;
         loaded = undefined;
+        game = undefined;
+        notified = undefined;
       }
       reject(error);
     }
@@ -295,11 +368,20 @@ function exchange<T>(
         reply.operation !== request.operation ||
         reply.mode !== request.mode ||
         reply.modelChecksum !== request.modelChecksum ||
-        reply.observationJson !== request.observationJson
+        reply.observationJson !== request.observationJson ||
+        reply.gameId !== request.gameId ||
+        reply.callbackIndex !== request.callbackIndex
       )
         return;
       if (reply.error !== undefined) {
-        if (typeof reply.error !== 'string' || !reply.error || reply.decision || reply.metadata) {
+        if (
+          typeof reply.error !== 'string' ||
+          !reply.error ||
+          reply.decision ||
+          reply.metadata ||
+          reply.gameMetadata ||
+          reply.notified
+        ) {
           terminate(new Error('CPUが不正な結果を返しました。'));
           return;
         }
@@ -314,6 +396,7 @@ function exchange<T>(
       }
     }
     pending = true;
+    pendingAbort = cancel;
     signal.addEventListener('abort', cancel, { once: true });
     current.addEventListener('message', receive);
     current.addEventListener('error', failed);
@@ -344,6 +427,8 @@ export function loadCpuModel(
   return exchange(
     {
       operation: 'load',
+      gameId: null,
+      callbackIndex: null,
       mode: 'nn',
       modelChecksum: expectedChecksum ?? null,
       observationJson: '',
@@ -352,7 +437,8 @@ export function loadCpuModel(
     signal,
     LOAD_DEADLINE_MS,
     (reply) => {
-      if (reply.decision) throw new Error('Unexpected decision during load');
+      if (reply.decision || reply.gameMetadata || reply.notified)
+        throw new Error('Unexpected result during load');
       const metadata = modelMetadata(reply.metadata);
       if (expectedChecksum !== undefined && metadata.checksum !== expectedChecksum)
         throw new Error('Unexpected model checksum');
@@ -362,14 +448,168 @@ export function loadCpuModel(
   );
 }
 
+/** Explicit new game/snapshot epoch; an idle pause does not call this. */
+export function startCpuGame(signal: AbortSignal, modelChecksum: string): Promise<CpuGameMetadata> {
+  const metadata = loaded;
+  if (!metadata || metadata.checksum !== modelChecksum || !Number.isSafeInteger(nextGameId + 1))
+    return Promise.reject(new Error('NNモデルを準備してから対局を開始してください。'));
+  const gameId = `cpu-game-${++nextGameId}`;
+  return exchange(
+    {
+      operation: 'start',
+      mode: 'nn',
+      modelChecksum,
+      gameId,
+      callbackIndex: null,
+      observationJson: '',
+    },
+    signal,
+    LOAD_DEADLINE_MS,
+    (reply) => {
+      const value = reply.gameMetadata;
+      if (
+        reply.decision ||
+        reply.metadata ||
+        reply.notified ||
+        !value ||
+        value.gameId !== gameId ||
+        value.modelChecksum !== modelChecksum ||
+        value.policyVersion !== GUARDED_POLICY_VERSION ||
+        value.rawPolicyVersion !== metadata.policyVersion ||
+        value.guardVersion !== GUARD_VERSION ||
+        value.projectionVersion !== PROJECTION_VERSION ||
+        typeof value.configurationKey !== 'string' ||
+        !SHA256.test(value.configurationKey) ||
+        value.maxCallbacks !== 4000
+      )
+        throw new Error('Invalid guarded game acknowledgement');
+      game = Object.freeze({ ...value });
+      nextCallback = 0;
+      notified = undefined;
+      return game;
+    },
+  );
+}
+
+/** Every actual decision callback, even a human/heuristic seat, is notified once.
+ * Callers retain core legality and must discard after an apply failure. */
+export function notifyCpuCallback(
+  observation: Observation,
+  signal: AbortSignal,
+  expected: CpuGameMetadata,
+): Promise<CpuCallback> {
+  if (
+    game !== expected ||
+    !loaded ||
+    loaded.checksum !== expected.modelChecksum ||
+    nextCallback >= expected.maxCallbacks
+  ) {
+    discardCpuGame(expected);
+    return Promise.reject(new Error('NN CPUの履歴をこの局面から再開してください。'));
+  }
+  let observationJson: string;
+  try {
+    observationJson = JSON.stringify(observation);
+    if (typeof observationJson !== 'string') throw new Error('Missing observation');
+  } catch {
+    discardCpuGame(expected);
+    return Promise.reject(new Error('CPUの観測入力が不正です。'));
+  }
+  const index = nextCallback;
+  return exchange(
+    {
+      operation: 'notify',
+      mode: 'nn',
+      modelChecksum: expected.modelChecksum,
+      gameId: expected.gameId,
+      callbackIndex: index,
+      observationJson,
+    },
+    signal,
+    NN_DEADLINE_MS,
+    (reply) => {
+      if (
+        reply.notified !== true ||
+        reply.decision ||
+        reply.metadata ||
+        reply.gameMetadata ||
+        game !== expected
+      )
+        throw new Error('Invalid callback acknowledgement');
+      nextCallback++;
+      notified = Object.freeze({ game: expected, index, observationJson });
+      return notified;
+    },
+  );
+}
+
+function guardedDecisionMatches(value: CpuDecision, callback: CpuCallback): boolean {
+  const d = value as GuardedCpuDecision;
+  const g = callback.game;
+  const o = JSON.parse(callback.observationJson) as {
+    phase?: string;
+    pendingTask?: { type?: string };
+    legalActions?: { action: { type: string }; move: GameMove }[];
+  };
+  const legal = o.legalActions;
+  if (
+    d.policyVersion !== g.policyVersion ||
+    d.rawPolicyVersion !== g.rawPolicyVersion ||
+    d.deploymentChecksum !== g.modelChecksum ||
+    d.configurationKey !== g.configurationKey ||
+    d.guardVersion !== g.guardVersion ||
+    d.projectionVersion !== g.projectionVersion ||
+    d.callbackIndex !== callback.index ||
+    !Number.isFinite(d.score) ||
+    !Array.isArray(legal) ||
+    !Number.isInteger(d.rawLegalIndex) ||
+    !Number.isInteger(d.effectiveLegalIndex) ||
+    d.rawLegalIndex < 0 ||
+    d.rawLegalIndex >= legal.length ||
+    d.effectiveLegalIndex < 0 ||
+    d.effectiveLegalIndex >= legal.length ||
+    JSON.stringify(d.move) !== JSON.stringify(legal[d.effectiveLegalIndex]!.move)
+  )
+    return false;
+  const trading = o.phase === 'playing' && o.pendingTask?.type === 'trade';
+  if (!trading) return d.trade === null && d.rawLegalIndex === d.effectiveLegalIndex;
+  const t = d.trade;
+  if (!t || typeof t !== 'object') return false;
+  const closed = legal[d.effectiveLegalIndex]!.action.type === 'skip';
+  return (
+    typeof t.publicStateSha256 === 'string' &&
+    SHA256.test(t.publicStateSha256) &&
+    typeof t.repeatSeen === 'boolean' &&
+    typeof t.budgetReached === 'boolean' &&
+    typeof t.overridden === 'boolean' &&
+    t.repeatSeen === (t.firstSeenCallbackIndex !== null) &&
+    (t.firstSeenCallbackIndex === null ||
+      (Number.isInteger(t.firstSeenCallbackIndex) &&
+        t.firstSeenCallbackIndex >= 0 &&
+        t.firstSeenCallbackIndex < callback.index)) &&
+    Number.isInteger(t.tradeCountBefore) &&
+    t.tradeCountBefore >= 0 &&
+    t.tradeCountBefore <= 64 &&
+    t.budgetReached === (t.tradeCountBefore === 64) &&
+    t.overridden === (d.rawLegalIndex !== d.effectiveLegalIndex) &&
+    (!t.overridden || (closed && (t.repeatSeen || t.budgetReached))) &&
+    t.episodeClosed === closed &&
+    t.tradeCountAfter === t.tradeCountBefore + (closed ? 0 : 1) &&
+    t.tradeCountAfter <= 64
+  );
+}
+
 /** Legacy calls remain heuristic. NN requires an acknowledged model and never falls back. */
 export function chooseCpu(
   observation: Observation,
   signal: AbortSignal,
   selection: CpuSelection = { mode: 'heuristic' },
+  callback?: CpuCallback,
 ): Promise<CpuDecision> {
-  if (signal.aborted)
+  if (signal.aborted) {
+    if (callback) discardCpuGame(callback.game);
     return Promise.reject(new DOMException('CPUの操作を中止しました。', 'AbortError'));
+  }
   if (pending) return Promise.reject(new Error('CPUはすでに考えています。'));
   const mode = selection.mode;
   const metadata = loaded;
@@ -379,6 +619,12 @@ export function chooseCpu(
     (!metadata || !SHA256.test(modelChecksum!) || metadata.checksum !== modelChecksum)
   )
     return Promise.reject(new Error('NNモデルが準備されていません。再読み込みしてください。'));
+  if (mode === 'nn' && !callback)
+    return Promise.reject(new Error('NN CPUには対局のコールバック通知が必要です。'));
+  if (callback && (game !== callback.game || notified !== callback)) {
+    if (game === callback.game) discardCpuGame(callback.game);
+    return Promise.reject(new Error('CPUのコールバックが古くなっています。'));
+  }
   const actor = observation.actor;
   const observationKey = observation.observationKey;
   let observationJson: string;
@@ -387,23 +633,43 @@ export function chooseCpu(
     if (typeof serialized !== 'string') throw new Error('Missing observation');
     observationJson = serialized;
   } catch {
+    if (callback) discardCpuGame(callback.game);
     return Promise.reject(new Error('CPUの観測入力が不正です。'));
   }
+  if (
+    callback &&
+    (callback.observationJson !== observationJson ||
+      (mode === 'nn' && callback.game.modelChecksum !== modelChecksum))
+  ) {
+    discardCpuGame(callback.game);
+    return Promise.reject(new Error('CPUのコールバック観測が一致しません。'));
+  }
   return exchange(
-    { operation: 'choose', mode, modelChecksum, observationJson },
+    {
+      operation: 'choose',
+      mode,
+      modelChecksum,
+      observationJson,
+      gameId: callback?.game.gameId ?? null,
+      callbackIndex: callback?.index ?? null,
+    },
     signal,
     mode === 'nn' ? NN_DEADLINE_MS : HEURISTIC_DEADLINE_MS,
     (reply) => {
       const decision = reply.decision;
       if (
         reply.metadata ||
+        reply.gameMetadata ||
+        reply.notified ||
         !decision ||
         decision.actor !== actor ||
         decision.observationKey !== observationKey ||
-        (mode === 'nn' && !Number.isFinite(decision.score)) ||
-        decision.policyVersion !== (mode === 'nn' ? metadata!.policyVersion : 'heuristic-v1')
+        (mode === 'nn'
+          ? !guardedDecisionMatches(decision, callback!)
+          : decision.policyVersion !== 'heuristic-v1')
       )
         throw new Error('Invalid decision binding');
+      if (callback) notified = undefined;
       return decision;
     },
   );

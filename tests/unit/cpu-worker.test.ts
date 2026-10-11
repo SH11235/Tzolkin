@@ -1,5 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { CpuDecision, CpuModelMetadata, CpuRequest, Observation } from '../../src/game/cpu';
+import type {
+  CpuDecision,
+  CpuGameMetadata,
+  CpuModelMetadata,
+  CpuRequest,
+  GuardedCpuDecision,
+  Observation,
+} from '../../src/game/cpu';
 
 class FakeWorker extends EventTarget {
   static instances: FakeWorker[] = [];
@@ -20,11 +27,17 @@ class FakeWorker extends EventTarget {
       new MessageEvent('message', { data: { ...this.request, ...result, ...override } }),
     );
   }
-  reply(decision: CpuDecision, override: Record<string, unknown> = {}) {
+  reply(decision: CpuDecision | GuardedCpuDecision, override: Record<string, unknown> = {}) {
     this.respond({ decision }, override);
   }
 }
-const observation: Observation = { actor: 1, observationKey: 'expected' };
+const observation: Observation = {
+  actor: 1,
+  observationKey: 'expected',
+  phase: 'playing',
+  pendingTask: null,
+  legalActions: [{ action: { type: 'endTurn' }, move: { type: 'endTurn' } }],
+};
 const decision: CpuDecision = {
   actor: 1,
   observationKey: 'expected',
@@ -41,7 +54,46 @@ const model: CpuModelMetadata = {
   backend: 'scalar',
 };
 const bytes = new Uint8Array([123, 125]);
-const nnDecision = { ...decision, policyVersion: model.policyVersion, score: 0 };
+const gameMetadata = {
+  modelChecksum: model.checksum,
+  policyVersion: 'numeric-public-trade-guard-v1' as const,
+  rawPolicyVersion: model.policyVersion,
+  guardVersion: 'public-trade-cycle-guard-v1',
+  projectionVersion: 'public-trading-state-v1',
+  configurationKey: 'c'.repeat(64),
+  maxCallbacks: 4000 as const,
+};
+const nnDecision: GuardedCpuDecision = {
+  ...decision,
+  policyVersion: gameMetadata.policyVersion,
+  score: 0,
+  rawPolicyVersion: model.policyVersion,
+  deploymentChecksum: model.checksum,
+  guardVersion: gameMetadata.guardVersion,
+  projectionVersion: gameMetadata.projectionVersion,
+  configurationKey: gameMetadata.configurationKey,
+  callbackIndex: 0,
+  rawLegalIndex: 0,
+  effectiveLegalIndex: 0,
+  trade: null,
+};
+type CpuModule = typeof import('../../src/game/cpu');
+async function start(api: CpuModule, worker: FakeWorker, signal: AbortSignal) {
+  const opening = api.startCpuGame(signal, model.checksum);
+  worker.respond({ gameMetadata: { ...gameMetadata, gameId: worker.request!.gameId } });
+  return opening;
+}
+async function notify(
+  api: CpuModule,
+  worker: FakeWorker,
+  game: CpuGameMetadata,
+  signal: AbortSignal,
+  o = observation,
+) {
+  const notification = api.notifyCpuCallback(o, signal, game);
+  worker.respond({ notified: true });
+  return notification;
+}
 
 beforeEach(() => {
   vi.resetModules();
@@ -84,7 +136,8 @@ describe('CPU Worker request lifecycle', () => {
   });
 
   it('loads a model once and binds NN replies to mode, checksum and an immutable input snapshot', async () => {
-    const { chooseCpu, loadCpuModel, getLoadedCpuModel } = await import('../../src/game/cpu');
+    const api = await import('../../src/game/cpu');
+    const { chooseCpu, loadCpuModel, getLoadedCpuModel } = api;
     const signal = new AbortController().signal;
     expect(getLoadedCpuModel()).toBeUndefined();
     const loading = loadCpuModel(bytes, signal);
@@ -92,9 +145,11 @@ describe('CPU Worker request lifecycle', () => {
     worker.respond({ metadata: model });
     await expect(loading).resolves.toEqual(model);
     expect(getLoadedCpuModel()).toEqual(model);
+    const game = await start(api, worker, signal);
+    const callback = await notify(api, worker, game, signal);
     const mutable = { ...observation };
     const selection = { mode: 'nn' as const, modelChecksum: model.checksum };
-    const choosing = chooseCpu(mutable, signal, selection);
+    const choosing = chooseCpu(mutable, signal, selection, callback);
     expect(worker.request?.operation).toBe('choose');
     expect(worker.request).not.toHaveProperty('deploymentBytes');
     mutable.actor = 2;
@@ -152,7 +207,8 @@ describe('CPU Worker request lifecycle', () => {
 
   it('separates preparation, NN and heuristic deadlines and clears cache on timeout', async () => {
     vi.useFakeTimers();
-    const { chooseCpu, loadCpuModel } = await import('../../src/game/cpu');
+    const api = await import('../../src/game/cpu');
+    const { chooseCpu, loadCpuModel } = api;
     const signal = new AbortController().signal;
     const loading = loadCpuModel(bytes, signal);
     const worker = FakeWorker.instances[0]!;
@@ -160,7 +216,14 @@ describe('CPU Worker request lifecycle', () => {
     expect(worker.terminated).toBe(false);
     worker.respond({ metadata: model });
     await loading;
-    const nn = chooseCpu(observation, signal, { mode: 'nn', modelChecksum: model.checksum });
+    const game = await start(api, worker, signal);
+    const callback = await notify(api, worker, game, signal);
+    const nn = chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: model.checksum },
+      callback,
+    );
     const rejected = expect(nn).rejects.toThrow('NNの判断が期限');
     await vi.advanceTimersByTimeAsync(1000);
     await rejected;
@@ -181,5 +244,77 @@ describe('CPU Worker request lifecycle', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     await loadRejected;
     expect(FakeWorker.instances[2]!.terminated).toBe(true);
+  });
+
+  it('binds all-seat callbacks, preserves idle history and rejects stale or altered callbacks', async () => {
+    const api = await import('../../src/game/cpu');
+    const signal = new AbortController().signal;
+    const loading = api.loadCpuModel(bytes, signal);
+    const worker = FakeWorker.instances[0]!;
+    worker.respond({ metadata: model });
+    await loading;
+    const game = await start(api, worker, signal);
+    const human = await notify(api, worker, game, signal);
+    expect(human.index).toBe(0);
+    // Human callback needs no model choice; the next actor still advances once.
+    const cpu = await notify(api, worker, game, signal);
+    expect(cpu.index).toBe(1);
+    expect(api.getActiveCpuGame()).toBe(game); // An idle pause needs no reset.
+    const choosing = api.chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: model.checksum },
+      cpu,
+    );
+    worker.reply({ ...nnDecision, callbackIndex: 1 });
+    await choosing;
+    expect(FakeWorker.instances).toHaveLength(1);
+    await expect(
+      api.chooseCpu(observation, signal, { mode: 'nn', modelChecksum: model.checksum }, human),
+    ).rejects.toThrow('古く');
+    expect(worker.terminated).toBe(true);
+    expect(api.getActiveCpuGame()).toBeUndefined();
+    expect(api.getLoadedCpuModel()).toBeUndefined();
+  });
+
+  it('requires an explicit fresh epoch after a failed application and binds the composite trace', async () => {
+    const api = await import('../../src/game/cpu');
+    const signal = new AbortController().signal;
+    let loading = api.loadCpuModel(bytes, signal);
+    let worker = FakeWorker.instances[0]!;
+    worker.respond({ metadata: model });
+    await loading;
+    const game = await start(api, worker, signal);
+    const callback = await notify(api, worker, game, signal);
+    const choosing = api.chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: model.checksum },
+      callback,
+    );
+    worker.reply(nnDecision);
+    await choosing;
+    api.discardCpuGame(game); // Downstream core apply failure.
+    expect(worker.terminated).toBe(true);
+    await expect(api.startCpuGame(signal, model.checksum)).rejects.toThrow('準備');
+    loading = api.loadCpuModel(bytes, signal);
+    worker = FakeWorker.instances[1]!;
+    worker.respond({ metadata: model });
+    await loading;
+    const fresh = await start(api, worker, signal);
+    expect(fresh.gameId).not.toBe(game.gameId);
+    const current = await notify(api, worker, fresh, signal);
+    expect(current.index).toBe(0);
+    api.discardCpuGame(game); // A stale cleanup cannot terminate the new epoch.
+    expect(worker.terminated).toBe(false);
+    const invalid = api.chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: model.checksum },
+      current,
+    );
+    worker.reply({ ...nnDecision, configurationKey: 'd'.repeat(64) });
+    await expect(invalid).rejects.toThrow('不正な結果');
+    expect(worker.terminated).toBe(true);
   });
 });

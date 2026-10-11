@@ -1,7 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { applyMove, createGame, inspectGame, observeGame, type GameSnapshot } from './game/engine';
-import { chooseCpu, getLoadedCpuModel, loadCpuModel, type CpuModelMetadata } from './game/cpu';
-import type { GameMove } from './game/types';
+import {
+  chooseCpu,
+  discardCpuGame,
+  getActiveCpuGame,
+  getLoadedCpuModel,
+  loadCpuModel,
+  notifyCpuCallback,
+  startCpuGame,
+  type CpuGameMetadata,
+  type CpuModelMetadata,
+  type GuardedCpuDecision,
+  type Observation,
+} from './game/cpu';
+import type { GameMove, GameState } from './game/types';
 import { CalendarArt, Icon } from './ui/Icons';
 import { PlayersSidebar } from './ui/PlayersSidebar';
 import { GameBoardView, type View } from './ui/GameBoardView';
@@ -42,6 +54,9 @@ function App() {
   const modelRef = useRef<{ bytes: Uint8Array; metadata: CpuModelMetadata } | null>(null);
   const modelOperationRef = useRef<AbortController | null>(null);
   const cpuAbortRef = useRef<AbortController | null>(null);
+  const actionAbortRef = useRef<AbortController | null>(null);
+  const cpuGameRef = useRef<CpuGameMetadata | null>(null);
+  const [guardMetadata, setGuardMetadata] = useState<CpuGameMetadata>();
   const [preparingCpuModel, setPreparingCpuModel] = useState(false);
   const [saving, setSaving] = useState(false);
   const [names, setNames] = useState(['翡翠の民', '黄金の民', '珊瑚の民', '藍の民', '紫水晶の民']);
@@ -70,6 +85,8 @@ function App() {
     () => () => {
       cpuAbortRef.current?.abort();
       modelOperationRef.current?.abort();
+      actionAbortRef.current?.abort();
+      discardCpuGame(cpuGameRef.current ?? undefined);
       modelRef.current = null;
     },
     [],
@@ -111,19 +128,22 @@ function App() {
         setError('保存した対局を読み込めませんでした。再試行してください。');
       });
   }
-  async function run(action: () => Promise<void>) {
+  async function run(action: (signal: AbortSignal) => Promise<void>) {
     if (busyRef.current || loading) return;
     cpuAbortRef.current?.abort();
     actionFocus.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     busyRef.current = true;
     setBusy(true);
+    const controller = new AbortController();
+    actionAbortRef.current = controller;
     try {
-      await action();
+      await action(controller.signal);
       setError('');
     } catch (e) {
       setError(e instanceof Error ? e.message : '操作を実行できませんでした。');
     } finally {
+      if (actionAbortRef.current === controller) actionAbortRef.current = null;
       busyRef.current = false;
       setBusy(false);
     }
@@ -132,11 +152,13 @@ function App() {
     if (busyRef.current) return;
     cpuAbortRef.current?.abort();
     setResetOpener(document.activeElement instanceof HTMLElement ? document.activeElement : null);
+    setCpuPaused(true);
     setConfirmReset(true);
   }
   function openReplay() {
     if (busyRef.current) return;
     cpuAbortRef.current?.abort();
+    setCpuPaused(true);
     replayOpenRef.current = true;
     setReplayOpen(true);
   }
@@ -162,18 +184,71 @@ function App() {
       ? 'このNN対局と同じモデルを読み込んでから、CPUを再開してください。'
       : '';
   }
+  function discardGuard(expected: CpuGameMetadata) {
+    discardCpuGame(expected);
+    if (cpuGameRef.current === expected) {
+      cpuGameRef.current = null;
+      setGuardMetadata(undefined);
+      setCpuPaused(true);
+    }
+  }
+  async function initializeGuard(
+    state: GameState,
+    signal: AbortSignal,
+    requiredChecksum?: string,
+    fresh = true,
+  ) {
+    const payload = modelRef.current;
+    if (requiredChecksum && payload?.metadata.checksum !== requiredChecksum)
+      throw new Error('このNN対局と同じモデルを読み込んでください。');
+    if (!payload || !supportsNnCpu(state)) {
+      if (cpuGameRef.current) discardGuard(cpuGameRef.current);
+      return;
+    }
+    const existing = cpuGameRef.current;
+    if (
+      !fresh &&
+      existing &&
+      getActiveCpuGame() === existing &&
+      existing.modelChecksum === payload.metadata.checksum
+    )
+      return;
+    if (getLoadedCpuModel()?.checksum !== payload.metadata.checksum)
+      await loadCpuModel(payload.bytes, signal, payload.metadata.checksum);
+    const next = await startCpuGame(signal, payload.metadata.checksum);
+    if (signal.aborted) {
+      discardCpuGame(next);
+      return;
+    }
+    cpuGameRef.current = next;
+    setGuardMetadata(next);
+  }
+  async function notifyGuard(observation: Observation, signal: AbortSignal) {
+    const current = cpuGameRef.current;
+    if (current) return notifyCpuCallback(observation, signal, current);
+    return undefined;
+  }
   function toggleCpu() {
     if (busyRef.current || !session) return;
-    if (cpuPaused) {
-      const missing = missingModel(session);
-      if (missing) {
-        setError(missing);
-        return;
-      }
+    if (!cpuPaused) {
+      cpuAbortRef.current?.abort();
+      setCpuPaused(true);
+      setError('');
+      return;
     }
-    cpuAbortRef.current?.abort();
-    setCpuPaused(!cpuPaused);
-    setError('');
+    const missing = missingModel(session);
+    if (missing) {
+      setError(missing);
+      return;
+    }
+    void run(async (signal) => {
+      const previous = cpuGameRef.current;
+      await initializeGuard(session.state, signal, session.cpuPolicy?.modelChecksum, false);
+      if (signal.aborted) return;
+      if (previous !== cpuGameRef.current && cpuGameRef.current)
+        setNotice('この局面からNN CPUの履歴を新しく開始します。');
+      setCpuPaused(false);
+    });
   }
   async function importModel(file?: File) {
     if (!file) return;
@@ -184,6 +259,7 @@ function App() {
       try {
         if (expected) setCpuPaused(true);
         if (file.size > 1024 * 1024) throw new Error('NNモデルが大きすぎます（上限1MiB）。');
+        if (cpuGameRef.current) discardGuard(cpuGameRef.current);
         // Keep one payload in memory; neither its body nor its filename is saved.
         modelRef.current = null;
         setModelMetadata(undefined);
@@ -202,6 +278,12 @@ function App() {
           return;
         modelRef.current = { bytes, metadata };
         setModelMetadata(metadata);
+        if (expected)
+          await initializeGuard(
+            expected.session.state,
+            controller.signal,
+            expected.session.cpuPolicy?.modelChecksum,
+          );
         setNotice(
           expected ? 'NNモデルを読み込みました。CPUを再開できます。' : 'NNモデルを読み込みました。',
         );
@@ -228,16 +310,41 @@ function App() {
   }, [busy, game?.pending, game?.phase, game?.currentPlayer]);
   function play(move: GameMove) {
     if (!session || cpuTurn) return;
-    void run(async () => {
-      const snapshot = await applyMove(session.state, move);
-      updateSession(
-        {
-          ...session,
-          state: snapshot.state,
-          history: [...session.history, session.state].slice(-60),
-        },
-        snapshot,
-      );
+    void run(async (signal) => {
+      const expected = activeRef.current;
+      if (!expected || expected.session !== session) return;
+      const guarded = cpuGameRef.current;
+      if (
+        modelRef.current &&
+        supportsNnCpu(session.state) &&
+        (!guarded || getActiveCpuGame() !== guarded)
+      ) {
+        if (guarded) discardGuard(guarded);
+        else setCpuPaused(true);
+        throw new Error('この局面からNN CPUの履歴を明示的に再開してください。');
+      }
+      let complete = false;
+      try {
+        if (guarded) {
+          const observation = await observeGame(session.state, session.state.currentPlayer);
+          if (signal.aborted || activeRef.current !== expected) return;
+          await notifyGuard(observation, signal);
+        }
+        if (signal.aborted || activeRef.current !== expected) return;
+        const snapshot = await applyMove(session.state, move);
+        if (signal.aborted || activeRef.current !== expected) return;
+        complete = true;
+        updateSession(
+          {
+            ...session,
+            state: snapshot.state,
+            history: [...session.history, session.state].slice(-60),
+          },
+          snapshot,
+        );
+      } finally {
+        if (!complete && guarded) discardGuard(guarded);
+      }
     });
   }
   useEffect(() => {
@@ -245,6 +352,8 @@ function App() {
     const controller = new AbortController();
     cpuAbortRef.current = controller;
     const expected = active;
+    let issuedGame: CpuGameMetadata | undefined;
+    let complete = false;
     // Keep each decision on its own task so pause, undo and reset stay responsive.
     const timer = setTimeout(() => {
       void (async () => {
@@ -254,16 +363,9 @@ function App() {
             const payload = modelRef.current;
             if (!payload || payload.metadata.checksum !== selection.modelChecksum)
               throw new Error(missingModel(expected.session));
-            if (getLoadedCpuModel()?.checksum !== selection.modelChecksum) {
-              setPreparingCpuModel(true);
-              await loadCpuModel(payload.bytes, controller.signal, selection.modelChecksum);
-              if (
-                controller.signal.aborted ||
-                replayOpenRef.current ||
-                activeRef.current !== expected
-              )
-                return;
-              setPreparingCpuModel(false);
+            if (getActiveCpuGame() !== cpuGameRef.current || !cpuGameRef.current) {
+              if (cpuGameRef.current) discardGuard(cpuGameRef.current);
+              throw new Error('この局面からNN CPUを明示的に再開してください。');
             }
           }
           const observation = await observeGame(
@@ -272,7 +374,19 @@ function App() {
           );
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
-          const decision = await chooseCpu(observation, controller.signal, selection);
+          if (
+            modelRef.current &&
+            supportsNnCpu(expected.session.state) &&
+            (!cpuGameRef.current || getActiveCpuGame() !== cpuGameRef.current)
+          ) {
+            if (cpuGameRef.current) discardGuard(cpuGameRef.current);
+            throw new Error('この局面からNN CPUの履歴を明示的に再開してください。');
+          }
+          issuedGame = cpuGameRef.current ?? undefined;
+          const callback = await notifyGuard(observation, controller.signal);
+          if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
+            return;
+          const decision = await chooseCpu(observation, controller.signal, selection, callback);
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
           const legal = [...expected.snapshot.choices, ...expected.snapshot.moves].some(
@@ -283,6 +397,9 @@ function App() {
           const snapshot = await applyMove(expected.session.state, decision.move);
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
+          complete = true;
+          if (selection.mode === 'nn' && (decision as GuardedCpuDecision).trade?.overridden)
+            setNotice('Tradeの反復を避けて終了しました。');
           updateSession(
             {
               ...expected.session,
@@ -299,6 +416,7 @@ function App() {
             failure instanceof Error ? failure.message : 'CPUの操作を実行できませんでした。',
           );
         } finally {
+          if (!complete && issuedGame) discardGuard(issuedGame);
           if (cpuAbortRef.current === controller) setPreparingCpuModel(false);
         }
       })();
@@ -306,6 +424,7 @@ function App() {
     return () => {
       clearTimeout(timer);
       controller.abort();
+      if (!complete && issuedGame) discardGuard(issuedGame);
       if (cpuAbortRef.current === controller) {
         cpuAbortRef.current = null;
         setPreparingCpuModel(false);
@@ -313,7 +432,7 @@ function App() {
     };
   }, [active, cpuTurn, cpuPaused, busy, confirmReset, replayOpen]);
   function start() {
-    void run(async () => {
+    void run(async (signal) => {
       const payload = modelRef.current;
       if (cpuMode === 'nn') {
         if (
@@ -333,6 +452,12 @@ function App() {
       );
       if (cpuMode === 'nn' && !supportsNnCpu(snapshot.state))
         throw new Error('NN CPUの対象外の対局です。');
+      await initializeGuard(
+        snapshot.state,
+        signal,
+        cpuMode === 'nn' ? payload?.metadata.checksum : undefined,
+      );
+      if (signal.aborted) return;
       updateSession(
         {
           state: snapshot.state,
@@ -354,8 +479,13 @@ function App() {
     setCpuPaused(true);
     const state = session.history.at(-1);
     if (state)
-      void run(async () => {
+      void run(async (signal) => {
         const snapshot = await inspectGame(state);
+        const missing = missingModel(session);
+        if (!missing)
+          await initializeGuard(snapshot.state, signal, session.cpuPolicy?.modelChecksum);
+        else if (cpuGameRef.current) discardGuard(cpuGameRef.current);
+        if (signal.aborted) return;
         updateSession(
           { ...session, state: snapshot.state, history: session.history.slice(0, -1) },
           snapshot,
@@ -364,12 +494,15 @@ function App() {
   }
   function resume() {
     if (!saved) return;
-    void run(async () => {
+    void run(async (signal) => {
       const snapshot = await inspectGame(saved.state);
+      const missing = missingModel(saved);
+      if (!missing) await initializeGuard(snapshot.state, signal, saved.cpuPolicy?.modelChecksum);
+      else if (cpuGameRef.current) discardGuard(cpuGameRef.current);
+      if (signal.aborted) return;
       const nextActive = { session: { ...saved, state: snapshot.state }, snapshot };
       activeRef.current = nextActive;
       setActive(nextActive);
-      const missing = missingModel(saved);
       setCpuPaused(!!missing);
       if (missing) setNotice(missing);
       setView('board');
@@ -393,13 +526,17 @@ function App() {
   }
   async function importSave(file?: File) {
     if (!file) return;
-    await run(async () => {
+    await run(async (signal) => {
       try {
         if (file.size > 5_000_000) throw new Error('保存ファイルが大きすぎます（上限5MB）。');
         const imported = await parseSession(await file.text());
         const snapshot = await inspectGame(imported.state);
-        updateSession({ ...imported, state: snapshot.state }, snapshot);
         const missing = missingModel(imported);
+        if (!missing)
+          await initializeGuard(snapshot.state, signal, imported.cpuPolicy?.modelChecksum);
+        else if (cpuGameRef.current) discardGuard(cpuGameRef.current);
+        if (signal.aborted) return;
+        updateSession({ ...imported, state: snapshot.state }, snapshot);
         setCpuPaused(!!missing);
         setView('board');
         setNotice(missing || '保存した対局を読み込みました。');
@@ -741,19 +878,25 @@ function App() {
           </button>
         </div>
       </header>
-      {session?.cpuPolicy && (
+      {session && modelMetadata && supportsNnCpu(session.state) && (
         <section className="nn-session-panel" aria-label="NN CPUのモデル">
           <div>
             <b>NN CPU</b>
             <span>
+              {guardMetadata
+                ? 'Tradeの反復を避ける判断を使用します。'
+                : 'この局面からの再開が必要です。'}
+            </span>
+            <span>
               {preparingCpuModel
                 ? 'モデルを準備しています。'
-                : modelMetadata?.checksum === session.cpuPolicy.modelChecksum
+                : modelMetadata.checksum ===
+                    (session.cpuPolicy?.modelChecksum ?? modelMetadata.checksum)
                   ? 'この対局のモデルを選択済み'
                   : '同じモデルの再読み込みが必要です。'}
             </span>
-            <code title={session.cpuPolicy.modelChecksum}>
-              {session.cpuPolicy.modelChecksum.slice(0, 12)}
+            <code title={session.cpuPolicy?.modelChecksum ?? modelMetadata.checksum}>
+              {(session.cpuPolicy?.modelChecksum ?? modelMetadata.checksum).slice(0, 12)}
             </code>
           </div>
           <button
@@ -763,6 +906,11 @@ function App() {
           >
             同じNNモデルを読み込む
           </button>
+          {!guardMetadata && (
+            <button className="text-button" onClick={toggleCpu} disabled={busy}>
+              この局面からCPUを再開
+            </button>
+          )}
         </section>
       )}
       <div className="day-track" aria-label="27日間の暦">

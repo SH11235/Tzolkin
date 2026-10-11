@@ -53,6 +53,12 @@ impl GuardedDeployment {
         &self.policy
     }
 
+    /// Discard this game's callback/history state and move the same immutable
+    /// model into a fresh session. This does not copy parameters or keep history.
+    pub fn into_policy(self) -> LoadedDeployment {
+        self.policy
+    }
+
     pub fn configuration_key(&self) -> &str {
         &self.configuration_key
     }
