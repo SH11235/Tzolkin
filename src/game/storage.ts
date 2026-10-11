@@ -22,6 +22,15 @@ export function supportsNnCpu(state: GameState): boolean {
     (state.players.length === 3 || state.players.length === 4)
   );
 }
+/** An actual NN CPU game needs every seat's callback, including human seats.
+ * A cached model or dormant NN selection in a hotseat game needs no history. */
+export function requiresNnCpuGuard(session: Session): boolean {
+  return (
+    supportsNnCpu(session.state) &&
+    session.cpuPolicy?.mode === 'nn' &&
+    controllersFor(session).includes('cpu')
+  );
+}
 class InvalidSaveError extends Error {}
 export async function parseSession(text: string): Promise<Session> {
   let value: unknown;
