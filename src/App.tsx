@@ -903,7 +903,7 @@ function App() {
           </button>
         </div>
       </header>
-      {session && modelMetadata && requiresNnCpuGuard(session) && (
+      {session && requiresNnCpuGuard(session) && (
         <section className="nn-session-panel" aria-label="NN CPUのモデル">
           <div>
             <b>NN CPU</b>
@@ -915,13 +915,12 @@ function App() {
             <span>
               {preparingCpuModel
                 ? 'モデルを準備しています。'
-                : modelMetadata.checksum ===
-                    (session.cpuPolicy?.modelChecksum ?? modelMetadata.checksum)
+                : modelMetadata?.checksum === session.cpuPolicy!.modelChecksum
                   ? 'この対局のモデルを選択済み'
                   : '同じモデルの再読み込みが必要です。'}
             </span>
-            <code title={session.cpuPolicy?.modelChecksum ?? modelMetadata.checksum}>
-              {(session.cpuPolicy?.modelChecksum ?? modelMetadata.checksum).slice(0, 12)}
+            <code title={session.cpuPolicy!.modelChecksum}>
+              {session.cpuPolicy!.modelChecksum.slice(0, 12)}
             </code>
           </div>
           <button
