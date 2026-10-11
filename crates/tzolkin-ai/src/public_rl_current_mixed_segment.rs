@@ -200,7 +200,6 @@ struct PoolForkBinding {
     // Fixed snapshot of [cohorts, missing counts, callbacks, rows, singletons]
     // for Updated, NoChange, Failed and Abandoned, including known missingness.
     predecessor_own_counters: [[u64; 5]; 4],
-    predecessor_pending_own: Option<[u64; 3]>,
 }
 fn own_snapshot(c: CurrentMixedOwnDecisionCounters) -> [[u64; 5]; 4] {
     [c.updated, c.no_change, c.failed, c.abandoned].map(|v| {
@@ -450,10 +449,6 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 .expect("checked failure")
                 .attempt,
             predecessor_own_counters: own_snapshot(self.progress.own_decisions),
-            predecessor_pending_own: self
-                .progress
-                .active_own
-                .map(|c| [c.callbacks, c.candidate_rows, c.singletons]),
         };
         self.successor_binding(spec, directory, pool, Some(fork))
     }

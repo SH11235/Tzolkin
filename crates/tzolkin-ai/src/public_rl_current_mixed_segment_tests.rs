@@ -422,6 +422,50 @@ fn stopped_pool_fork_requires_known_final_failure_and_keeps_all_charges() {
         own_snapshot(p.own_decisions),
         [[1, 0, 4, 4, 4], [1, 0, 4, 4, 4], [1, 1, 0, 0, 0], [0; 5]]
     );
+    let mut updating = progress(&b);
+    updating.apply(&start(&b), &s).unwrap();
+    let r = super::super::tests::later_reservation(&updating, &template);
+    updating
+        .apply(
+            &Event::ReserveWhole4 {
+                reservation: Box::new(r),
+            },
+            &s,
+        )
+        .unwrap();
+    super::super::tests::gradient(&mut updating, &s);
+    let charged = inherited()
+        .with_progress(&updating, 1024, 512, 256)
+        .unwrap();
+    updating
+        .apply(
+            &Event::Resolve {
+                resolution: Resolution::Failed {
+                    error: "known update failure".into(),
+                },
+            },
+            &s,
+        )
+        .unwrap();
+    updating.require_stopped_pool_fork(true, true).unwrap();
+    assert_eq!(
+        inherited()
+            .with_progress(&updating, 1024, 512, 256)
+            .unwrap(),
+        charged
+    );
+    assert_eq!(
+        own_snapshot(updating.own_decisions),
+        [[0; 5], [0; 5], [1, 0, 4, 4, 4], [0; 5]]
+    );
+    assert_eq!(
+        (
+            updating.parent_count().unwrap(),
+            updating.next,
+            updating.consumed.len()
+        ),
+        (49, 272, 272)
+    );
     assert!(p.require_stopped_pool_fork(false, true).is_err());
     assert!(p.require_stopped_pool_fork(true, false).is_err());
     p.unknown_work = true;
@@ -504,8 +548,13 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
         predecessor_outcome: "failed".into(),
         failed_attempt: 2,
         predecessor_own_counters: [[1, 0, 4, 4, 4], [1, 0, 4, 4, 4], [1, 1, 0, 0, 0], [0; 5]],
-        predecessor_pending_own: None,
     });
+    assert!(
+        serde_json::to_value(fork.pool_fork.as_ref().unwrap())
+            .unwrap()
+            .get("predecessorPendingOwn")
+            .is_none()
+    );
     assert_ne!(fork.checksum().unwrap(), b.checksum().unwrap());
     progress(&fork).check(&start(&fork), &run_spec()).unwrap();
     assert!(progress(&fork).check(&start(&b), &run_spec()).is_err());
