@@ -71,6 +71,7 @@ function App() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [replayOpen, setReplayOpen] = useState(false);
   const replayOpenRef = useRef(false);
+  const pausedBeforeReplayRef = useRef(true);
   const importInput = useRef<HTMLInputElement>(null);
   const modelInput = useRef<HTMLInputElement>(null);
   const choicesRef = useRef<HTMLHeadingElement>(null);
@@ -157,6 +158,7 @@ function App() {
   }
   function openReplay() {
     if (busyRef.current) return;
+    pausedBeforeReplayRef.current = cpuPaused;
     cpuAbortRef.current?.abort();
     setCpuPaused(true);
     replayOpenRef.current = true;
@@ -165,6 +167,12 @@ function App() {
   function closeReplay() {
     replayOpenRef.current = false;
     setReplayOpen(false);
+    const guardRequired = modelRef.current && session && supportsNnCpu(session.state);
+    if (
+      !pausedBeforeReplayRef.current &&
+      (!guardRequired || (cpuGameRef.current && getActiveCpuGame() === cpuGameRef.current))
+    )
+      setCpuPaused(false);
   }
   function updateSession(next: Session, snapshot: GameSnapshot) {
     try {
