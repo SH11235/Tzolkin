@@ -167,6 +167,9 @@ pub(crate) enum OpponentSpec {
     Heuristic,
     CornFirstSetup,
     CornFirstUxmalOpening,
+    ResourceCycle {
+        configuration: crate::arena::resource_cycle::ResourceCycleConfig,
+    },
     PreparedBc,
     PreparedBcTradeGuard {
         guard: crate::public_trade_guard::TradeGuardConfig,
@@ -211,11 +214,18 @@ impl MixedRlCollectionSpec {
                                 || seat.as_object().is_some_and(|fields| {
                                     (fields.len() == 1
                                         || (fields.len() == 2
-                                            && fields
+                                            && match fields
                                                 .get("kind")
                                                 .and_then(serde_json::Value::as_str)
-                                                == Some("preparedBcTradeGuard")
-                                            && fields.contains_key("guard")))
+                                            {
+                                                Some("preparedBcTradeGuard") => {
+                                                    fields.contains_key("guard")
+                                                }
+                                                Some("resourceCycle") => {
+                                                    fields.contains_key("configuration")
+                                                }
+                                                _ => false,
+                                            }))
                                         && fields
                                             .get("kind")
                                             .is_some_and(serde_json::Value::is_string)
@@ -235,8 +245,10 @@ impl MixedRlCollectionSpec {
         s.wire.weights.validate()?;
         s.wire.search.validate()?;
         for opponent in s.wire.rosters.iter().flatten().flatten() {
-            if let OpponentSpec::PreparedBcTradeGuard { guard } = opponent {
-                guard.validate()?;
+            match opponent {
+                OpponentSpec::PreparedBcTradeGuard { guard } => guard.validate()?,
+                OpponentSpec::ResourceCycle { configuration } => configuration.validate()?,
+                _ => (),
             }
         }
         if s.wire.schema != schema
@@ -322,6 +334,9 @@ impl<'a> MixedRlCollectionSession<'a> {
                                     BorrowedArenaPolicy::CornFirstUxmalOpening(
                                         &self.spec.wire.weights,
                                     )
+                                }
+                                OpponentSpec::ResourceCycle { configuration } => {
+                                    BorrowedArenaPolicy::ResourceCycle(configuration)
                                 }
                                 OpponentSpec::PreparedBc => {
                                     BorrowedArenaPolicy::PublicBc(self.prepared)
@@ -782,6 +797,33 @@ mod tests {
             "configurations":configs,"rosters":[[null,unit,unit],[unit,null,unit],[null,unit,unit,unit],[unit,unit,unit,null]],
             "weights":HeuristicWeights::default(),"search":SearchConfig::default(),"maxOutputBytes":4*MAX_RECORD_BYTES+METADATA_RESERVE as usize});
         assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&good).unwrap()).is_ok());
+        let mut resource_cycle = good.clone();
+        resource_cycle["rosters"][0][1] = serde_json::json!({
+            "kind":"resourceCycle",
+            "configuration":crate::arena::resource_cycle::ResourceCycleConfig::default()
+        });
+        assert!(
+            MixedRlCollectionSpec::from_json(&serde_json::to_vec(&resource_cycle).unwrap()).is_ok()
+        );
+        for configuration in [serde_json::Value::Null, serde_json::json!({"schema":1})] {
+            let mut invalid = resource_cycle.clone();
+            invalid["rosters"][0][1]["configuration"] = configuration;
+            assert!(
+                MixedRlCollectionSpec::from_json(&serde_json::to_vec(&invalid).unwrap()).is_err()
+            );
+        }
+        let mut invalid = resource_cycle.clone();
+        invalid["rosters"][0][1]["configuration"]["qualifiedInvestmentBonus"] = 2.into();
+        assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        let mut invalid = resource_cycle.clone();
+        invalid["rosters"][0][1]["guard"] = serde_json::json!({});
+        assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&invalid).unwrap()).is_err());
+        let mut invalid = resource_cycle;
+        invalid["rosters"][0][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("configuration");
+        assert!(MixedRlCollectionSpec::from_json(&serde_json::to_vec(&invalid).unwrap()).is_err());
         let mut unknown = good.clone();
         unknown["rosters"][0][1]["unknown"] = true.into();
         assert!(

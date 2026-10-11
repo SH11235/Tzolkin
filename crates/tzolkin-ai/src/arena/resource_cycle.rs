@@ -1,4 +1,4 @@
-//! Frozen, untrained base-game hypothesis used only by Numeric Arena opponents.
+//! Frozen, untrained base-game hypothesis for Numeric Arena and frozen opponents.
 use crate::Decision;
 use crate::policy::{HeuristicWeights, score_action};
 use serde::{Deserialize, Serialize};

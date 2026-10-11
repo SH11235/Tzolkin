@@ -187,6 +187,7 @@ pub enum BorrowedArenaPolicy<'a> {
     Heuristic(&'a HeuristicWeights),
     CornFirstSetup(&'a HeuristicWeights),
     CornFirstUxmalOpening(&'a HeuristicWeights),
+    ResourceCycle(&'a resource_cycle::ResourceCycleConfig),
     Search(&'a PreparedSearch),
 }
 
@@ -430,6 +431,7 @@ enum PolicyChooser<'a> {
     Heuristic(&'a HeuristicWeights),
     CornFirstSetup(&'a HeuristicWeights),
     CornFirstUxmalOpening(&'a HeuristicWeights),
+    ResourceCycle(&'a resource_cycle::ResourceCycleConfig),
     Learned(LoadedPolicy<'a>),
 }
 /// Borrowing the prepared policies keeps coefficients/model bytes immutable for
@@ -507,7 +509,8 @@ impl<'a> FrozenReactiveOpponent<'a> {
                 BorrowedArenaPolicy::Search(_)
                 | BorrowedArenaPolicy::Heuristic(_)
                 | BorrowedArenaPolicy::CornFirstSetup(_)
-                | BorrowedArenaPolicy::CornFirstUxmalOpening(_) => Vec::new(),
+                | BorrowedArenaPolicy::CornFirstUxmalOpening(_)
+                | BorrowedArenaPolicy::ResourceCycle(_) => Vec::new(),
             }),
         };
         let max_search_steps = match policy {
@@ -563,6 +566,7 @@ impl<'a> FrozenReactiveOpponent<'a> {
         match &self.handle.description.provenance {
             SeatPolicy::PublicRlMixed { identity, .. } => identity.policy_version(),
             SeatPolicy::PublicRlContinuedMixed { identity, .. } => identity.policy_version(),
+            SeatPolicy::ResourceCycle { configuration } => &configuration.policy_version,
             SeatPolicy::PublicRlPaired { policy_version, .. }
             | SeatPolicy::PublicRl { policy_version, .. }
             | SeatPolicy::PublicRlCurrentMixedTradeGuard { policy_version, .. }
@@ -853,6 +857,17 @@ impl<'a> PolicyHandle<'a> {
                     Vec::new(),
                 )
             }
+            BorrowedArenaPolicy::ResourceCycle(configuration) => {
+                configuration.validate()?;
+                (
+                    PolicyChooser::ResourceCycle(configuration),
+                    SeatPolicy::ResourceCycle {
+                        configuration: configuration.clone(),
+                    },
+                    None,
+                    Vec::new(),
+                )
+            }
             BorrowedArenaPolicy::Search(policy) => (
                 PolicyChooser::Search(policy),
                 crate::search_native::provenance(policy),
@@ -909,6 +924,10 @@ impl<'a> PolicyHandle<'a> {
             )),
             PolicyChooser::CornFirstUxmalOpening(weights) => Ok((
                 crate::setup_policy::choose_uxmal_opening_with_weights(observation, weights)?,
+                None,
+            )),
+            PolicyChooser::ResourceCycle(configuration) => Ok((
+                resource_cycle::choose_move(observation, configuration)?,
                 None,
             )),
             PolicyChooser::Learned(policy) => Ok((policy.choose_move(observation)?, None)),
@@ -1719,6 +1738,58 @@ fn run_handles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_resource_cycle_binds_untrained_configuration() {
+        let configuration = resource_cycle::ResourceCycleConfig::default();
+        let policy = BorrowedArenaPolicy::ResourceCycle(&configuration);
+        let (handle, overlap) = PolicyHandle::borrowed(policy, &[3]).unwrap();
+        let provenance = SeatPolicy::ResourceCycle {
+            configuration: configuration.clone(),
+        };
+        assert_eq!(handle.description.provenance, provenance);
+        assert!(overlap.is_empty());
+        assert!(handle.description.dataset_fingerprint.is_none());
+        assert!(handle.description.model_version.is_none());
+        let raw = serde_json::to_value(&provenance).unwrap();
+        assert_eq!(raw["kind"], "resourceCycle");
+        assert_eq!(
+            raw["configuration"],
+            serde_json::to_value(&configuration).unwrap()
+        );
+        let decoded: SeatPolicy = serde_json::from_value(raw.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, provenance);
+        let opponent = FrozenReactiveOpponent::new(policy).unwrap();
+        assert!(!opponent.contains_family(&family_id(3)));
+        assert_eq!(opponent.max_search_steps(), 0);
+        assert_eq!(opponent.policy_version(), resource_cycle::POLICY_VERSION);
+        assert!(opponent.trade_guard_session().unwrap().is_none());
+        let mut changed = configuration.clone();
+        changed.harvest_before_day += 1;
+        assert!(FrozenReactiveOpponent::new(BorrowedArenaPolicy::ResourceCycle(&changed)).is_err());
+        assert!(
+            SeatPolicy::ResourceCycle {
+                configuration: changed
+            }
+            .validate()
+            .is_err()
+        );
+        let mut extra = raw;
+        extra["configuration"]["unknown"] = true.into();
+        assert!(serde_json::from_value::<SeatPolicy>(extra).is_err());
+        let arena = BorrowedArenaConfig {
+            schema: BORROWED_RL_ARENA_SCHEMA.into(),
+            players: 3,
+            seeds: vec![3],
+            bootstrap_seed: 17,
+        };
+        assert!(
+            run_public_rl_validation_arena(&arena, policy, policy, &[policy; 3])
+                .unwrap_err()
+                .contains("sealed RL")
+        );
+    }
 
     #[test]
     fn borrowed_validation_preflight_and_actual_roster_work_bounds() {

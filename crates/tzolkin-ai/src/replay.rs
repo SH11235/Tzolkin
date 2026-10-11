@@ -151,6 +151,9 @@ pub enum SeatPolicy {
         policy_version: String,
         weights: HeuristicWeights,
     },
+    ResourceCycle {
+        configuration: crate::arena::resource_cycle::ResourceCycleConfig,
+    },
     Learned {
         policy_version: String,
         model_checksum: String,
@@ -365,6 +368,7 @@ impl SeatPolicy {
             } if policy_version == crate::setup_policy::UXMAL_OPENING_POLICY_VERSION => {
                 weights.validate()
             }
+            Self::ResourceCycle { configuration } => configuration.validate(),
             Self::Learned {
                 policy_version,
                 model_checksum,

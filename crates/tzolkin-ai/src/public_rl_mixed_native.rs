@@ -496,5 +496,26 @@ mod tests {
         assert_ne!(a.checksum(), b.checksum());
         assert!(a.opponent(0).is_err());
         assert_eq!(a.max_opponent_search_steps(4000).unwrap(), 0);
+        let configuration = crate::arena::resource_cycle::ResourceCycleConfig::default();
+        let resource_cycle = BorrowedArenaPolicy::ResourceCycle(&configuration);
+        let a = FrozenMixedRoster::new(vec![
+            None,
+            Some(resource_cycle),
+            Some(BorrowedArenaPolicy::Heuristic(&w)),
+        ])
+        .unwrap();
+        let b = FrozenMixedRoster::new(vec![
+            None,
+            Some(BorrowedArenaPolicy::Heuristic(&w)),
+            Some(resource_cycle),
+        ])
+        .unwrap();
+        assert_ne!(a.checksum(), b.checksum());
+        assert_eq!(a.max_opponent_search_steps(4000).unwrap(), 0);
+        assert!(matches!(
+            &a.opponent(1).unwrap().description().provenance,
+            crate::replay::SeatPolicy::ResourceCycle { configuration: actual }
+                if actual == &configuration
+        ));
     }
 }

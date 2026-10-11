@@ -1178,6 +1178,75 @@ mod tests {
         .unwrap()
     }
     #[test]
+    fn frozen_resource_cycle_prefix_matches_fresh_native_replay() {
+        use crate::arena::{BorrowedArenaPolicy, resource_cycle};
+        use crate::public_rl_mixed_native::FrozenMixedRoster;
+
+        // One opponent Setup callback; this prefix grants no episode admission.
+        let start = create_game_with_options(
+            vec!["A".into(), "B".into(), "C".into()],
+            17,
+            GameOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(start.current_player, 0);
+        let model = integration_fixture::model(false);
+        let policy = integration_fixture::handle(&model);
+        let configuration = resource_cycle::ResourceCycleConfig::default();
+        let weights = crate::policy::HeuristicWeights::default();
+        let roster = FrozenMixedRoster::new(vec![
+            Some(BorrowedArenaPolicy::ResourceCycle(&configuration)),
+            None,
+            Some(BorrowedArenaPolicy::Heuristic(&weights)),
+        ])
+        .unwrap();
+        let config = config(
+            3,
+            CollectionLimits {
+                callbacks: 1,
+                ..Default::default()
+            },
+        );
+        let run = |expected| {
+            run_loop_with_start(
+                &config,
+                NativePolicy::Bc(&policy),
+                SamplingActors::Frozen(&roster),
+                crate::public_rl_mixed_native::RECORD_SCHEMA,
+                header(&config, &policy).unwrap(),
+                expected,
+                apply_move,
+                || Ok(start.clone()),
+            )
+        };
+        let collected = run(None).unwrap();
+        assert_eq!(collected.callbacks.len(), 1);
+        assert_eq!(collected.counts.accepted_samples, 0);
+        let callback = &collected.callbacks[0];
+        assert!(callback.opponent_attempted && callback.apply_succeeded);
+        assert!(!callback.sampler_attempted);
+        assert!(callback.sample.is_none());
+        let observation = callback.observation.as_ref().unwrap();
+        let direct = resource_cycle::choose_move(observation, &configuration).unwrap();
+        let chosen = callback.opponent_choice.as_ref().unwrap();
+        assert_eq!(chosen.decision.r#move, direct.r#move);
+        assert_eq!(
+            chosen.decision.policy_version,
+            resource_cycle::POLICY_VERSION
+        );
+        assert_eq!(collected, run(Some(&collected)).unwrap());
+        let mut changed = collected;
+        changed.callbacks[0]
+            .opponent_choice
+            .as_mut()
+            .unwrap()
+            .decision
+            .policy_version
+            .push('2');
+        assert!(run(Some(&changed)).is_err());
+    }
+
+    #[test]
     fn guarded_bc_opponent_cycle_matches_fresh_audit_and_arena_selection() {
         use crate::public_rl_mixed_native::FrozenMixedRoster;
         use crate::public_trade_guard::TradeGuardConfig;
