@@ -786,6 +786,11 @@ pub(crate) mod tests {
         assert!(check_for_audit(duplicate.as_bytes(), &header).is_err());
         let mut wrong_counts = record.clone();
         wrong_counts.counts.observed_callbacks = 1;
+        let pending_audit =
+            check_for_audit(&serde_json::to_vec(&wrong_counts).unwrap(), &header).unwrap();
+        // Decoding preserves these counters; only fresh native replay validates them.
+        assert_eq!(pending_audit.record.counts.observed_callbacks, 1);
+        wrong_counts.counts.actor_draws[0] = "0".into();
         assert!(check_for_audit(&serde_json::to_vec(&wrong_counts).unwrap(), &header).is_err());
         let mut wrong = record;
         wrong.header.base_policy.opponents[0] = None;
