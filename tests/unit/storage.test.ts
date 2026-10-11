@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as core from '../../src/game/engine';
 import { createGame, inspectGame, validateGameState } from '../../src/game/engine';
-import { controllersFor, parseSession, readSession } from '../../src/game/storage';
+import {
+  controllersFor,
+  parseSession,
+  readSession,
+  requiresNnCpuGuard,
+  type Session,
+} from '../../src/game/storage';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -9,6 +15,34 @@ afterEach(() => {
 });
 
 describe('validated save import through the production Rust adapter', () => {
+  it('requires guard history only for an actual supported NN CPU game, on every seat', async () => {
+    const { state } = await createGame(['a', 'b', 'c'], 17);
+    const { state: four } = await createGame(['a', 'b', 'c', 'd'], 17);
+    const policy = { mode: 'nn' as const, modelChecksum: 'a'.repeat(64) };
+    const selected: Session = {
+      state,
+      history: [],
+      controllers: ['human', 'cpu', 'human'],
+      cpuPolicy: policy,
+    };
+    expect(controllersFor(selected)[state.currentPlayer]).toBe('human');
+    for (const [session, required] of [
+      [selected, true],
+      [{ ...selected, state: four, controllers: ['human', 'cpu', 'human', 'human'] }, true],
+      [{ state, history: [], controllers: ['human', 'cpu', 'human'] }, false],
+      [{ ...selected, controllers: ['human', 'human', 'human'] }, false],
+      [{ state, history: [], cpuPolicy: policy }, false],
+      [{ ...selected, state: { ...state, additionalBuildings: true } }, false],
+      [{ ...selected, state: { ...state, players: state.players.slice(0, 2) } }, false],
+    ] satisfies [Session, boolean][]) {
+      expect(requiresNnCpuGuard(session)).toBe(required);
+    }
+    const dormant = { ...selected, controllers: ['human', 'human', 'human'] };
+    const saved = JSON.stringify(dormant);
+    const imported = await parseSession(saved);
+    expect(requiresNnCpuGuard(imported)).toBe(false);
+    expect(JSON.stringify(imported)).toBe(saved);
+  });
   it('preserves CPU seats and treats old sessions as hotseat games', async () => {
     const { state } = await createGame(['a', 'b'], 42);
     const session = await parseSession(
