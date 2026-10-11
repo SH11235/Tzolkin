@@ -69,6 +69,38 @@ function mechanical(state) {
   delete value.log;
   return value;
 }
+// The witness declares calibrated local identities, not a physical card choice.
+export function validateBuildingEquivalenceClass(witness) {
+  const ids = witness.buildingEquivalenceClass;
+  if (ids === undefined) return null;
+  if (
+    witness.buildings !== undefined ||
+    !Array.isArray(ids) ||
+    ids.length < 2 ||
+    ids.length > 3 ||
+    new Set(ids).size !== ids.length ||
+    ids.some((id) => !buildings.has(id))
+  )
+    fail('Invalid building equivalence class');
+  const signature = (id) =>
+    Object.fromEntries(
+      Object.entries(buildings.get(id)).filter(([key]) => !['id', 'name'].includes(key)),
+    );
+  if (ids.some((id) => !same(signature(id), signature(ids[0]))))
+    fail('Building equivalence class has different catalog fields');
+  return [...ids].sort();
+}
+function equivalentBuildingState(state, ids) {
+  const value = mechanical(state);
+  const membership = new Set(ids);
+  const cards = (list) => ({
+    nonClassIds: list.filter((id) => !membership.has(id)),
+    classCount: list.filter((id) => membership.has(id)).length,
+  });
+  value.buildings = cards(value.buildings);
+  for (const player of value.players) player.buildings = cards(player.buildings);
+  return value;
+}
 function resourceAmounts(event) {
   const icons = event.detail.iconResources ?? event.iconResources;
   if (
@@ -249,10 +281,19 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   for (const witness of witnesses.witnesses) {
     closed(
       witness,
-      ['actionId', 'expected', 'refills', 'buildings', 'monuments', 'pendingTask'],
+      [
+        'actionId',
+        'expected',
+        'refills',
+        'buildings',
+        'buildingEquivalenceClass',
+        'monuments',
+        'pendingTask',
+      ],
       'witness',
     );
     positive(witness.actionId, 'witness.actionId');
+    validateBuildingEquivalenceClass(witness);
     if (!knownIds.has(witness.actionId) || observed.has(witness.actionId))
       fail('Duplicate/unknown witness action ID');
     if (
@@ -720,6 +761,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     outcomeFilter = null,
     validateSingleOutcome = false,
     allowOptionalSkip = true,
+    buildingClass = null,
   ) {
     if (record.steps.length >= MAX_STEPS) fail('Move limit reached');
     let candidates = legal().filter((row) => predicate(row.action));
@@ -755,15 +797,26 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     )
       outcomes = outcomes.filter(outcomeFilter());
     if (!outcomes.length) fail(`No legal outcome matches source evidence for ${reason}`);
+    if (buildingClass !== null) {
+      const action = (row) => ({ ...row.action, id: buildingClass[0] });
+      if (
+        outcomes.some(
+          ({ row }) =>
+            row.action.renovation !== null || !same(action(row), action(outcomes[0].row)),
+        )
+      )
+        fail('Equivalent building choices have different typed actions');
+      outcomes.sort((a, b) =>
+        a.row.action.id < b.row.action.id ? -1 : a.row.action.id > b.row.action.id ? 1 : 0,
+      );
+    }
+    const outcomeState = (outcome) =>
+      buildingClass === null
+        ? mechanical(outcome.frame.snapshot.state)
+        : equivalentBuildingState(outcome.frame.snapshot.state, buildingClass);
     if (
       outcomes.length > 1 &&
-      outcomes.some(
-        (outcome) =>
-          !same(
-            mechanical(outcome.frame.snapshot.state),
-            mechanical(outcomes[0].frame.snapshot.state),
-          ),
-      )
+      outcomes.some((outcome) => !same(outcomeState(outcome), outcomeState(outcomes[0])))
     )
       fail(`Ambiguous legal operation for ${reason}`);
     const chosen = outcomes[0];
@@ -871,6 +924,14 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       action: chosen.row.action,
       derivedFromVisibleBoundary: derived,
       equivalentChoices: outcomes.length,
+      ...(buildingClass === null
+        ? {}
+        : {
+            physicalSelectionUnknown: true,
+            buildingEquivalenceClass: copy(buildingClass),
+            equivalentLegalTargets: outcomes.map(({ row }) => copy(row)),
+            canonicalLocalTarget: copy(chosen.row),
+          }),
     });
     return chosen.row.action;
   }
@@ -2039,6 +2100,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         fail('Queued purchase requires the next same-actor technology or exact material choice');
       for (const [field, kind] of [
         ['buildings', 'build'],
+        ['buildingEquivalenceClass', 'build'],
         ['monuments', 'monument'],
       ])
         if (witness[field]?.length && !events.some((event) => event.kind === kind))
@@ -2346,28 +2408,41 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               fail('Observed market price mismatch');
           } else if (event.kind === 'build' || event.kind === 'monument') {
             alignActor(event.actor);
-            const ids = witness[event.kind === 'build' ? 'buildings' : 'monuments'];
-            if (ids?.length !== 1) fail('Observed purchased card identity is required');
+            const buildingClass = validateBuildingEquivalenceClass(witness);
+            const ids =
+              buildingClass ?? witness[event.kind === 'build' ? 'buildings' : 'monuments'];
+            if (
+              buildingClass !== null &&
+              (event.kind !== 'build' ||
+                state().version !== 1 ||
+                state().additionalBuildings !== false ||
+                state().expansion != null)
+            )
+              fail('Equivalent building witness requires base building rules');
+            if (buildingClass === null && ids?.length !== 1)
+              fail('Observed purchased card identity is required');
             const beforePurchase = copy(state());
             const action = choose(
               (action) =>
                 action.type === event.kind &&
-                action.id === ids[0] &&
+                (buildingClass === null ? action.id === ids[0] : ids.includes(action.id)) &&
                 (!payments.some(Boolean) || same(action.cost, payments)),
               `observed ${event.kind}`,
               false,
               false,
               () => purchaseOutcome(event, events, witness),
-              events.some(
-                (item) =>
-                  emptyPurchasePayment(item) ||
-                  architectureScoreCaption(item) ||
-                  cappedWorkerCaption(item),
-              ) ||
+              buildingClass !== null ||
+                events.some(
+                  (item) =>
+                    emptyPurchasePayment(item) ||
+                    architectureScoreCaption(item) ||
+                    cappedWorkerCaption(item),
+                ) ||
                 actionScorePair(ids[0]) !== null ||
                 (buildings.get(ids[0])?.effects[0]?.type === 'trade' &&
                   events.some((item) => fixedScoreCaption(item) !== null)),
               actionScorePair(ids[0]) === null,
+              buildingClass,
             );
             context.purchase = {
               actor: actorId(event.actor),
