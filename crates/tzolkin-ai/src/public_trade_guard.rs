@@ -22,6 +22,10 @@ pub const CURRENT_MIXED_POLICY_VERSION: &str = "current-mixed-public-trade-guard
 pub const PROJECTION_VERSION: &str = "public-trading-state-v1";
 pub const MAX_PUBLIC_STATE_BYTES: usize = 131_072;
 pub const MAX_TRADES: usize = 64;
+const _: () = assert!(
+    MAX_TRADES == tzolkin_inference::trade_guard::MAX_TRADES
+        && MAX_PUBLIC_STATE_BYTES == tzolkin_inference::trade_guard::MAX_STATE_BYTES
+);
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 pub const MAX_GAME_EXAMPLES: usize = 64;
 pub const MAX_ARENA_EXAMPLES: usize = 4096;
@@ -720,7 +724,7 @@ fn skip_index(o: &Observation) -> Result<usize, String> {
 /// ```compile_fail
 /// # use tzolkin_ai::public_trade_guard::TradeGuardSession;
 /// let session = TradeGuardSession::new(Default::default()).unwrap();
-/// session.seen;
+/// session.history;
 /// ```
 pub struct TradeGuardSession {
     configuration_key: String,
@@ -797,6 +801,9 @@ impl TradeGuardSession {
     ) -> Result<(Decision, Option<TradeGuardTrace>), String> {
         let result = (|| {
             self.check_callback(index, o)?;
+            if self.current_identity.is_some() {
+                return Err("BC distribution cannot substitute a current mixed handle".into());
+            }
             let output = distribution()?;
             if output.policy_version != crate::public_model::POLICY_VERSION
                 || output.feature_schema != crate::features::PUBLIC_FEATURE_SCHEMA
@@ -807,9 +814,6 @@ impl TradeGuardSession {
                 || output.logits.iter().any(|x| !x.is_finite())
             {
                 return Err("Invalid base NN distribution for public Trade guard".into());
-            }
-            if self.current_identity.is_some() {
-                return Err("BC distribution cannot substitute a current mixed handle".into());
             }
             self.choose_logits(index, o, &output.logits)
         })();

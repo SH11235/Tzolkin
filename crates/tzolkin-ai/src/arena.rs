@@ -1569,6 +1569,7 @@ pub fn run_public_rl_validation_arena<'a>(
             | BorrowedArenaPolicy::Paired(_)
             | BorrowedArenaPolicy::Mixed(_)
             | BorrowedArenaPolicy::ContinuedMixed(_)
+            | BorrowedArenaPolicy::CurrentMixedTradeGuard(..)
     ) {
         return Err("Borrowed RL Arena candidate must be a sealed RL policy".into());
     }
