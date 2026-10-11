@@ -756,7 +756,14 @@ fn run_loop_with_start<P: Serialize + PartialEq>(
                 break;
             }
         };
-        let before = match state_key(&state) {
+        // Only apply mutates this run's state, so the preceding actual after-key
+        // is also this before-key. The first callback still computes it fresh.
+        let before = match record
+            .callbacks
+            .last()
+            .and_then(|callback| callback.state_after.clone())
+            .map_or_else(|| state_key(&state), Ok)
+        {
             Ok(key) => key,
             Err(error) => {
                 fail(
@@ -1047,7 +1054,14 @@ fn run_loop_with_start<P: Serialize + PartialEq>(
                 "Terminal score coverage mismatch",
             );
         } else {
-            match state_key(&state) {
+            // Terminal validation does not mutate the state. An initially
+            // finished game has no callback key and uses the fresh fallback.
+            match record
+                .callbacks
+                .last()
+                .and_then(|callback| callback.state_after.clone())
+                .map_or_else(|| state_key(&state), Ok)
+            {
                 Ok(final_state) => {
                     record.terminal = Some(Terminal {
                         final_state,
