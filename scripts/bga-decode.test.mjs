@@ -1393,6 +1393,127 @@ test('binds empty payment and architecture captions to one settled purchase rece
   assert.equal(chosen.record.steps.length, 1);
 });
 
+test('binds selected capped Architecture captions to paid choices and refuses stale or duplicate credit', () => {
+  const fixture = () => {
+    const initial = clone(saved.core.initialFrame);
+    initial.snapshot.state.players[0].technologies.architecture = 3;
+    initial.snapshot.state.players[0].resources.wood = 3;
+    initial.snapshot.state.players[0].score = 7;
+    initial.observation.pendingTask = { type: 'technology', remaining: 2, free: false };
+    initial.snapshot.state.pending = { task: clone(initial.observation.pendingTask), after: [] };
+    const technology = {
+      action: { type: 'technology', technology: 'architecture' },
+      move: { type: 'choose', choiceId: 'technology:architecture' },
+    };
+    initial.observation.legalActions = [technology];
+    const messages = [
+      { raw_text: 'Aはを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+      { raw_text: 'Aは建築を1レベル進めた' },
+      { raw_text: '建築技術ボーナス: Aは3点を獲得した' },
+    ];
+    const value = input();
+    value.witness.initial = clone(initial.snapshot.state);
+    const apply = (request) => {
+      const next = clone(initial);
+      next.snapshot.state = clone(request.state);
+      if (request.move.choiceId === 'technology:architecture') {
+        const remaining = request.state.pending.task.remaining - 1;
+        next.observation.pendingTask = {
+          type: 'payTechnology',
+          technology: 'architecture',
+          amount: 1,
+        };
+        next.snapshot.state.pending = {
+          task: clone(next.observation.pendingTask),
+          after: [{ type: 'technology', remaining, free: false }],
+        };
+        next.observation.legalActions = [
+          {
+            action: { type: 'payment', resources: [0, 1, 0, 0, 0] },
+            move: { type: 'choose', choiceId: 'payment:wood' },
+          },
+        ];
+      } else {
+        assert.equal(request.move.choiceId, 'payment:wood');
+        next.snapshot.state.players[0].resources.wood--;
+        next.snapshot.state.players[0].score += 3;
+        const task = request.state.pending.after[0];
+        next.observation.pendingTask = task.remaining ? clone(task) : null;
+        next.snapshot.state.pending = task.remaining ? { task: clone(task), after: [] } : null;
+        next.observation.legalActions = task.remaining ? [technology] : [];
+      }
+      return next;
+    };
+    return { initial, messages, value, apply };
+  };
+  const accepted = fixture();
+  replaceEvents(accepted.value, [
+    [6, accepted.messages],
+    [7, accepted.messages],
+  ]);
+  accepted.value.witness.witnesses = [6, 7].map((actionId) => ({
+    actionId,
+    expected: {
+      players: [
+        {
+          score: actionId === 6 ? 10 : 13,
+          technologies: { architecture: 3 },
+          resources: { wood: actionId === 6 ? 2 : 1 },
+        },
+        {},
+        {},
+        {},
+      ],
+    },
+  }));
+  const result = decode(accepted.value, dispatcher(accepted.initial, accepted.apply));
+  assert.equal(result.manifest.blocked, null);
+  assert.equal(result.record.steps.length, 4);
+  assert.deepEqual(
+    result.record.steps[1].checkpoint.expected,
+    accepted.value.witness.witnesses[0].expected,
+  );
+  assert.equal(result.manifest.trainingReady, false);
+  for (const mutate of [
+    (f) => {
+      f.messages[2].raw_text = '建築技術ボーナス: Bは3点を獲得した';
+    },
+    (f) => {
+      f.messages[2].raw_text = '建築技術ボーナス: Aは2点を獲得した';
+    },
+    (f) => {
+      f.messages.push(clone(f.messages[2]));
+    },
+    (f) => {
+      f.initial.snapshot.state.players[0].technologies.architecture = 2;
+    },
+    (f) => {
+      const apply = f.apply;
+      f.apply = (request) => {
+        const next = apply(request);
+        if (request.move.choiceId === 'payment:wood') next.snapshot.state.players[0].score--;
+        return next;
+      };
+    },
+  ]) {
+    const f = fixture();
+    mutate(f);
+    f.value.witness.initial = clone(f.initial.snapshot.state);
+    replaceEvents(f.value, [[6, f.messages]]);
+    const rejected = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(rejected.manifest.blocked.actionId, 6);
+    assert.equal(rejected.record.steps.length, 0);
+  }
+  const stale = fixture();
+  replaceEvents(stale.value, [
+    [6, stale.messages],
+    [7, [stale.messages[2]]],
+  ]);
+  const prefix = decode(stale.value, dispatcher(stale.initial, stale.apply));
+  assert.equal(prefix.manifest.blocked.actionId, 7);
+  assert.equal(prefix.record.steps.length, 2);
+});
+
 function workerPurchaseFixture(remaining = 1) {
   const initial = clone(saved.core.initialFrame);
   const own = initial.snapshot.state.players[0];

@@ -1984,6 +1984,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       paymentActor: null,
       paymentOperations: 0,
       purchase: null,
+      architectureAdvance: null,
     };
     try {
       if (!events.length) fail('Raw source action has no observed messages');
@@ -2293,11 +2294,29 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               !context.purchase.advanceClaimed;
             if (capped) context.purchase.advanceClaimed = true;
             else if (unclaimed(event, field) < 1) {
+              const before = copy(state());
+              const selectedAtCap =
+                detail.technology === 'architecture' &&
+                before.players[actorId(event.actor)].technologies.architecture === 3 &&
+                pending() === 'technology';
               choose(
                 (action) => action.type === 'technology' && action.technology === detail.technology,
                 'technology advance',
               );
               pay(payments);
+              if (selectedAtCap) {
+                const actor = actorId(event.actor);
+                const after = state();
+                if (
+                  (context.architectureAdvance && !context.architectureAdvance.claimed) ||
+                  after.currentPlayer !== actor ||
+                  after.round !== before.round ||
+                  after.players[actor].technologies.architecture !== 3 ||
+                  after.players[actor].score - before.players[actor].score !== 3
+                )
+                  fail('Selected capped Architecture requires its actual same-source three points');
+                context.architectureAdvance = { actor, claimed: false };
+              }
             }
             // A fixed effect may already have advanced this track. Claim its
             // same-macro delta once; a genuine choice at level three has no level delta.
@@ -2540,6 +2559,17 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               automatic({ ...event, actor: theologyBonus }, 'resource:skull', 1);
               receipt.bonusClaimed = true;
             } else if (architectureBonus) {
+              const selected = context.architectureAdvance;
+              if (
+                selected &&
+                !selected.claimed &&
+                selected.actor === actorId(architectureBonus.actor) &&
+                architectureBonus.amount === 3
+              ) {
+                automatic({ ...event, actor: architectureBonus.actor }, 'score', 3);
+                selected.claimed = true;
+                continue;
+              }
               const receipt = context.purchase;
               if (
                 !receipt ||
