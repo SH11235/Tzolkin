@@ -2684,6 +2684,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 fail('Age-two announcement has no unique matching core food-day transition');
               context.ageAnnouncement = true;
             } else if (
+              event.actor === null &&
               state().phase === 'finished' &&
               /^(最終スコア|記念碑: |残り資源: )/.test(event.rawText)
             ) {

@@ -561,6 +561,28 @@ test('binds localized food-day score captions and age-two announcements to core 
   assert.deepEqual(finished.record.steps[0].checkpoint.expected, terminalExpected);
   assert.equal(finished.manifest.mechanicallyFinished, true);
   assert.equal(finished.manifest.trainingReady, false);
+  for (const name of ['最終スコア D', '記念碑: D', '残り資源: D']) {
+    const named = fixture(27);
+    for (const frame of [named.initial, named.after]) frame.snapshot.state.players[3].name = name;
+    named.after.snapshot.state.log = named.after.snapshot.state.log.map((line) =>
+      line.replace('食糧の日：D ', `食糧の日：${name} `),
+    );
+    const value = named.make([
+      ...[...named.feeding, ...named.scores].map((message) => ({
+        ...message,
+        raw_text: message.raw_text.replace('Dは', `${name}は`),
+      })),
+      { raw_text: `${name}は1点を獲得した` },
+      { raw_text: '歯車が進んだ' },
+    ]);
+    value.raw.metadata.players[3].text = name;
+    const refused = decode(
+      value,
+      dispatcher(named.initial, () => clone(named.after)),
+    );
+    assert.match(refused.manifest.blocked.reason, /Source effect score=1 is not established/);
+    assert.equal(refused.record.steps.length, 0);
+  }
   const playing = fixture(14);
   for (const caption of terminalCaptions.slice(1, 3)) {
     const refused = run(playing, [
