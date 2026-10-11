@@ -489,6 +489,10 @@ test('binds localized food-day score captions and age-two announcements to core 
     after.snapshot.state.age = 2;
     after.snapshot.state.foodDays.push(day);
     after.observation.legalActions = [];
+    if (day === 27) {
+      after.snapshot.state.phase = 'finished';
+      after.observation = null;
+    }
     for (const [index, amount] of [10, 8.5, 5, 0].entries()) {
       const player = after.snapshot.state.players[index];
       player.score += amount;

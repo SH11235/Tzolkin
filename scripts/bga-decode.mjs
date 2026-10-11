@@ -443,7 +443,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const before = state();
     const after = nextFrame.snapshot.state;
     const task = frame.observation.pendingTask;
-    const nextTask = nextFrame.observation.pendingTask;
+    const nextTask = nextFrame.observation?.pendingTask;
     const actor = before.currentPlayer;
     const opens =
       before.players[actor].technologies.extraction === 3 &&
