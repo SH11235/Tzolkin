@@ -5,6 +5,7 @@ export function NnLatency({ modelChecksum }: { modelChecksum: string }) {
   const summary = measurement.summary;
   return (
     <output
+      role="group"
       className="nn-latency-panel"
       aria-label="NNの判断時間"
       data-nn-latency-schema={measurement.schema}
