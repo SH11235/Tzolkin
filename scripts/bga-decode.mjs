@@ -967,6 +967,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       effects: {},
       feeding: [],
       feedingDay: null,
+      foodScoreClaims: new Set(),
+      ageAnnouncement: false,
       paymentActor: null,
       paymentOperations: 0,
     };
@@ -1292,6 +1294,10 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             const paidRemoval = body.match(
               /^は(Palenque|Yaxchilan|Tikal|Uxmal|Chichen Itza) (\d+)のワーカーを取り除き、\s*(\d+)コーンを支払ってn°(\d+)\s*アクションを行った$/,
             );
+            const leaderScore = body.match(
+              /^は(chaac|quetzalcoatl|kukulkan|kukulcan)の信仰が一番高い(?:うちの一人なので、半分の点を獲得した: (\d+)点|ので、(\d+)点を獲得した)$/,
+            );
+            const trackScore = body.match(/^は信仰により(\d+)点を獲得した$/);
             if (first) {
               alignActor(event.actor);
               choose(
@@ -1354,6 +1360,40 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 fail('Resource-reward caption has no matching core food-day receipt');
             } else if (shortageObserved(event.rawText)) {
               // The exact actor/count/penalty is bound to a core feeding receipt.
+            } else if (leaderScore || trackScore) {
+              const actor = actorId(event.actor);
+              const field = leaderScore
+                ? `leader:${leaderScore[1] === 'kukulcan' ? 'kukulkan' : leaderScore[1]}`
+                : 'track';
+              const key = `${actor}:${field}`;
+              const amount = Number(
+                leaderScore ? (leaderScore[2] ?? leaderScore[3]) : trackScore[1],
+              );
+              if (
+                actor < 0 ||
+                event.iconResources.length ||
+                !context.feeding.length ||
+                ![14, 27].includes(context.feedingDay) ||
+                state().foodDays.at(-1) !== context.feedingDay ||
+                !Number.isSafeInteger(amount) ||
+                context.foodScoreClaims.has(key)
+              )
+                fail('Food-day score caption has no unique matching core scoring receipt');
+              automatic(event, 'score', amount);
+              context.foodScoreClaims.add(key);
+            } else if (event.rawText === '建物が第2世代になりました') {
+              if (
+                event.actor !== null ||
+                event.iconResources.length ||
+                !context.feeding.length ||
+                context.feedingDay !== 14 ||
+                state().foodDays.at(-1) !== 14 ||
+                context.before.age !== 1 ||
+                state().age !== 2 ||
+                context.ageAnnouncement
+              )
+                fail('Age-two announcement has no unique matching core food-day transition');
+              context.ageAnnouncement = true;
             } else if (/は\d+点を獲得した$/.test(event.rawText))
               automatic(event, 'score', Number(event.rawText.match(/(\d+)点を獲得した$/)[1]));
             else if (

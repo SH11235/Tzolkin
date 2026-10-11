@@ -323,6 +323,157 @@ function replaceEvents(value, rows) {
   value.witness.witnesses = [];
 }
 
+test('binds localized food-day score captions and age-two announcements to core effects', () => {
+  const fixture = (day = 14) => {
+    const initial = clone(saved.core.initialFrame);
+    initial.snapshot.state.round = day;
+    initial.snapshot.state.age = day === 14 ? 1 : 2;
+    initial.snapshot.state.foodDays = day === 14 ? [8] : [8, 14, 21];
+    initial.observation.legalActions = [
+      { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
+    ];
+    for (const player of initial.snapshot.state.players) {
+      Object.assign(player, { workers: 1, feedAll: true, feedWorkers: 0, feedDiscount: 0 });
+    }
+    const after = clone(initial);
+    after.snapshot.state.round++;
+    after.snapshot.state.age = 2;
+    after.snapshot.state.foodDays.push(day);
+    after.observation.legalActions = [];
+    for (const [index, amount] of [10, 8.5, 5, 0].entries()) {
+      const player = after.snapshot.state.players[index];
+      player.score += amount;
+      after.snapshot.state.log.push(`食糧の日：${player.name} はコーン 0 を支払い`);
+    }
+    const feeding = ['A', 'B', 'C', 'D'].map((actor) => ({
+      raw_text: `食料供給日: ${actor}はワーカー1個で 0\nを支払った`,
+      icons: [{ classes: 'tz_icon resource_corn' }],
+    }));
+    const scores = [
+      { raw_text: 'Aはchaacの信仰が一番高いうちの一人なので、半分の点を獲得した: 3点' },
+      { raw_text: 'Bはquetzalcoatlの信仰が一番高いうちの一人なので、半分の点を獲得した: 1点' },
+      { raw_text: 'Bはkukulcanの信仰が一番高いので、4点を獲得した' },
+      { raw_text: 'Aは信仰により7点を獲得した' },
+      { raw_text: 'Bは信仰により3点を獲得した' },
+      { raw_text: 'Cは信仰により5点を獲得した' },
+      { raw_text: 'Dは信仰により0点を獲得した' },
+    ];
+    const make = (messages) => {
+      const value = input();
+      value.witness.initial = clone(initial.snapshot.state);
+      replaceEvents(value, [[6, messages]]);
+      return value;
+    };
+    return { initial, after, feeding, scores, make };
+  };
+  const run = (f, messages) =>
+    decode(
+      f.make(messages),
+      dispatcher(f.initial, (request) => {
+        assert.equal(request.move.type, 'endTurn');
+        return clone(f.after);
+      }),
+    );
+  for (const day of [14, 27]) {
+    const f = fixture(day);
+    const result = run(f, [...f.feeding, ...f.scores, { raw_text: '歯車が進んだ' }]);
+    assert.equal(result.manifest.blocked, null);
+    assert.equal(result.record.steps.length, 1);
+    assert.equal(result.manifest.trainingReady, false);
+  }
+  const f = fixture();
+  const era = { raw_text: '建物が第2世代になりました' };
+  const advance = { raw_text: '歯車が進んだ' };
+  const complete = [...f.feeding, ...f.scores, era, advance];
+  assert.equal(run(f, complete).manifest.blocked, null);
+  for (const temple of ['chaac', 'quetzalcoatl', 'kukulkan', 'kukulcan']) {
+    const scores = clone(f.scores);
+    scores[0].raw_text = scores[0].raw_text.replace('chaac', temple);
+    assert.equal(run(f, [...f.feeding, ...scores, advance]).manifest.blocked, null);
+  }
+  for (const extra of [
+    f.scores[0],
+    f.scores[2],
+    { raw_text: f.scores[2].raw_text.replace('kukulcan', 'kukulkan') },
+    f.scores.at(-1),
+  ]) {
+    const result = run(f, [...f.feeding, ...f.scores, extra, advance]);
+    assert.match(result.manifest.blocked.reason, /no unique matching core scoring receipt/);
+    assert.equal(result.record.steps.length, 0);
+  }
+  const excessive = clone(f.scores);
+  excessive[0].raw_text = excessive[0].raw_text.replace('3点', '4点');
+  const overclaimed = run(f, [...f.feeding, ...excessive, advance]);
+  assert.match(overclaimed.manifest.blocked.reason, /score=7 is not established/);
+  assert.equal(overclaimed.record.steps.length, 0);
+  const wrongActor = clone(f.scores);
+  wrongActor[0].raw_text = wrongActor[0].raw_text.replace('Aは', 'Dは');
+  assert.match(
+    run(f, [...f.feeding, ...wrongActor, advance]).manifest.blocked.reason,
+    /score=3 is not established/,
+  );
+  const noGain = fixture();
+  noGain.after.snapshot.state.players[0].score = noGain.initial.snapshot.state.players[0].score;
+  assert.match(run(noGain, complete).manifest.blocked.reason, /score=3 is not established/);
+  for (const text of [
+    f.scores[0].raw_text.replace('chaac', 'unknown'),
+    f.scores[0].raw_text.replace('3点', '-3点'),
+    f.scores[0].raw_text.replace('3点', '3.5点'),
+    `${f.scores[0].raw_text} unknown suffix`,
+  ]) {
+    const result = run(f, [...f.feeding, { raw_text: text }, advance]);
+    assert.match(result.manifest.blocked.reason, /Unsupported source message/);
+    assert.equal(result.record.steps.length, 0);
+  }
+  for (const invalid of [
+    { raw_text: 'Dは信仰により9007199254740992点を獲得した' },
+    { ...f.scores[0], icons: [{ classes: 'tz_icon resource_corn' }] },
+  ])
+    assert.match(
+      run(f, [...f.feeding, invalid, advance]).manifest.blocked.reason,
+      /no unique matching core scoring receipt/,
+    );
+  assert.match(
+    run(f, [f.scores.at(-1)]).manifest.blocked.reason,
+    /no unique matching core scoring receipt/,
+  );
+  for (const day of [8, 21]) {
+    const wrongDay = fixture(day);
+    assert.match(
+      run(wrongDay, [...wrongDay.feeding, ...wrongDay.scores, advance]).manifest.blocked.reason,
+      /no unique matching core scoring receipt/,
+    );
+  }
+  for (const invalid of [
+    [...f.feeding, ...f.scores, era, era, advance],
+    [...f.feeding, ...f.scores, { ...era, icons: [{ classes: 'tz_icon resource_corn' }] }, advance],
+  ]) {
+    const result = run(f, invalid);
+    assert.match(result.manifest.blocked.reason, /no unique matching core food-day transition/);
+    assert.equal(result.record.steps.length, 0);
+  }
+  for (const change of ['missing transition', 'wrong day', 'initial age two']) {
+    const invalid = fixture(change === 'wrong day' ? 27 : 14);
+    if (change === 'missing transition') invalid.after.snapshot.state.age = 1;
+    if (change === 'initial age two') invalid.initial.snapshot.state.age = 2;
+    assert.match(
+      run(invalid, [...invalid.feeding, ...invalid.scores, era, advance]).manifest.blocked.reason,
+      /no unique matching core food-day transition/,
+    );
+  }
+  const later = f.make([]);
+  replaceEvents(later, [
+    [6, complete],
+    [7, [f.scores[0]]],
+  ]);
+  const stale = decode(
+    later,
+    dispatcher(f.initial, () => clone(f.after)),
+  );
+  assert.equal(stale.record.steps.length, 1);
+  assert.match(stale.manifest.blocked.reason, /no unique matching core scoring receipt/);
+});
+
 test('uses the full typed legal rows for a two-operation technology/payment macro', () => {
   const value = input();
   replaceEvents(value, [
