@@ -1,14 +1,18 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { decodeConditionalPublicGame, decodePublicGame } from './bga-decode.mjs';
 import {
   ATLAS_SCHEMA,
   CONTROL_SCHEMA,
+  LATER_WITNESS_SCHEMA,
+  decodeProjectedInitial,
   projectCapturedInitial,
   projectPlayingFiles,
 } from './bga-playing-project.mjs';
@@ -353,6 +357,267 @@ function currentUi(value) {
   };
   return value;
 }
+
+function withLaterWitnesses(value, witnesses, table = null) {
+  if (table !== null) value.control.table = pin(table);
+  const prepared = inputs(value);
+  const initial = projectCapturedInitial(...prepared, table);
+  const collection = {
+    schema: LATER_WITNESS_SCHEMA,
+    tableId: initial.witness.tableId,
+    rawLogReference: initial.record.source.reference,
+    initialCaptureReference: value.capture.url,
+    rawLogSha256: sha(prepared[2]),
+    initialCaptureSha256: sha(prepared[0]),
+    calibrationSha256: sha(prepared[1]),
+    tableEvidenceSha256: table === null ? null : sha(table),
+    archiveRelease: initial.provenance.archiveRelease,
+    catalogHash: initial.witness.catalogHash,
+    initialActionId: initial.witness.initialActionId,
+    witnesses,
+  };
+  const repin = (document = collection) => {
+    const later = bytes(document);
+    const control = JSON.parse(prepared[3]);
+    control.laterWitnesses = pin(later);
+    return [...prepared.slice(0, 3), bytes(control), table, later];
+  };
+  return { initial, collection, repin };
+}
+
+function placementFixture() {
+  const value = fixture(4);
+  const raw_text = 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた';
+  value.raw.entries.push({ action_id: 8, timestamp_display: '12:01:00', raw_text });
+  value.raw.dom_entries.push({
+    action_id: 8,
+    timestamp_display: '12:01:00',
+    messages: [{ raw_text, html: raw_text, icons: [] }],
+  });
+  value.raw.entry_count++;
+  return value;
+}
+
+test('pinned later collection reaches ordinary decoder checkpoints without changing initial input', () => {
+  const value = placementFixture();
+  const retained = { actionId: 8, expected: { round: 1 }, pendingTask: null };
+  const { initial, repin } = withLaterWitnesses(value, [retained]);
+  const prepared = repin();
+  const projected = projectCapturedInitial(...prepared);
+  assert.deepEqual(projected.record, initial.record);
+  assert.deepEqual(projected.witness.initial, initial.witness.initial);
+  assert.deepEqual(projected.witness.witnesses, [retained]);
+  assert.equal(projected.provenance.laterWitnesses.sha256, sha(prepared[5]));
+  assert.equal(projected.provenance.laterWitnesses.count, 1);
+  retained.expected.round = 99;
+  assert.equal(projected.witness.witnesses[0].expected.round, 1);
+
+  const move = { type: 'place', gear: 'palenque' };
+  const action = { type: 'place', gear: 'palenque', position: 0, cornCost: 0 };
+  const first = {
+    snapshot: { state: structuredClone(initial.record.initial) },
+    observation: { actor: 0, pendingTask: null, legalActions: [{ action, move }] },
+  };
+  const after = structuredClone(first);
+  after.snapshot.state.gears.palenque[0] = { playerId: 0, dummy: false };
+  after.snapshot.state.players[0].availableWorkers--;
+  after.observation.legalActions = [];
+  let finalCheckpoint;
+  const dispatch = (request) => {
+    if (request.operation === 'publicApply') {
+      assert.deepEqual(request.move, move);
+      return structuredClone(after);
+    }
+    assert.equal(request.operation, 'publicReplay');
+    assert.deepEqual(request.replay.initial, initial.record.initial);
+    const steps = request.replay.steps;
+    if (steps.length) finalCheckpoint = structuredClone(steps[0].checkpoint);
+    return {
+      frames: [structuredClone(first), ...steps.map(() => structuredClone(after))],
+      verifiedSteps: steps.length,
+      checkpointsVerified: steps.filter((step) => step.checkpoint).length,
+      sourceCoverage: { complete: false },
+    };
+  };
+  const decode = (p) => decodeProjectedInitial(...p.slice(0, 4), dispatch, p[4], p[5]);
+  const result = decode(prepared);
+  assert.equal(result.decoded.manifest.blocked, null);
+  assert.equal(result.decoded.record.steps.length, 1);
+  assert.deepEqual(finalCheckpoint, {
+    source: { reference: value.raw.source_url, actionIds: [8] },
+    expected: { round: 1 },
+  });
+  assert.equal(result.decoded.manifest.checkpointsVerified, 1);
+  assert.deepEqual(
+    result.decoded.manifest.initialProjection.laterWitnesses,
+    projected.provenance.laterWitnesses,
+  );
+  assert.equal(result.decoded.manifest.trainingReady, false);
+  assert.equal(result.projection.provenance.strictHumanQualification, false);
+
+  const contradiction = withLaterWitnesses(value, [{ actionId: 8, expected: { round: 2 } }]);
+  const refused = decode(contradiction.repin());
+  assert.equal(refused.decoded.manifest.blocked.actionId, 8);
+  assert.match(refused.decoded.manifest.blocked.reason, /public checkpoint mismatch/);
+  assert.equal(refused.decoded.record.steps.length, 0);
+
+  const unused = withLaterWitnesses(value, [{ actionId: 8, buildings: ['b04'] }]);
+  assert.match(decode(unused.repin()).decoded.manifest.blocked.reason, /Unused buildings witness/);
+});
+
+test('later collection refuses mismatched input bindings and invalid observations before core dispatch', () => {
+  const table = bytes({
+    schema: 'tzolkin-bga-public-table-ui-v1',
+    url: 'https://boardgamearena.com/table?table=123',
+    optionsText: 'ゲームモード\nノーマルモード\nウシュマルコーンの制限\n制限なし',
+  });
+  const value = currentUi(placementFixture());
+  // Retain the later entry when converting this synthetic log to current UI schema.
+  value.raw.entries.push({
+    action_id: 8,
+    raw_text: `行動 8 :\n12:01:00\n${value.raw.dom_entries[1].messages[0].raw_text}`,
+    timestamp_display: '12:01:00',
+  });
+  const retained = { actionId: 8, expected: { round: 1 } };
+  const { collection, repin } = withLaterWitnesses(value, [retained], table);
+  for (const field of Object.keys(collection).filter((key) => key !== 'witnesses')) {
+    const altered = structuredClone(collection);
+    altered[field] = field === 'initialActionId' ? 8 : 'mismatch';
+    const prepared = repin(altered);
+    assert.throws(
+      () =>
+        decodeProjectedInitial(
+          ...prepared.slice(0, 4),
+          () => assert.fail('Mismatched proof reached core'),
+          prepared[4],
+          prepared[5],
+        ),
+      /binding mismatch|Unsupported later witness schema/,
+      field,
+    );
+  }
+  for (const [witnesses, pattern] of [
+    [[{ actionId: 7, expected: { round: 1 } }], /later witness action/],
+    [[{ actionId: 99, expected: { round: 1 } }], /unknown later witness/],
+    [[retained, retained], /Duplicate/],
+    [[{ actionId: 8 }], /no observation/],
+    [[{ ...retained, initial: {} }], /unknown field/],
+    [[{ actionId: 8, expected: {} }], /Empty later/],
+    [[{ actionId: 8, pendingTask: 1 }], /later pending task/],
+    [[{ actionId: 8, buildings: ['missing'] }], /catalog IDs/],
+    [[{ actionId: 8, monuments: ['b04'] }], /catalog IDs/],
+    [[{ actionId: 8, refills: { age2: ['b04'] } }], /catalog IDs/],
+    [[{ actionId: 8, refills: { currentAge: ['b04', 'b04'] } }], /catalog IDs/],
+    [[{ actionId: 8, refills: { unknown: [] } }], /unknown field/],
+    [Array(4001).fill(retained), /invalid list/],
+  ]) {
+    assert.throws(() => projectCapturedInitial(...repin({ ...collection, witnesses })), pattern);
+  }
+  const validCards = [
+    {
+      actionId: 8,
+      buildings: ['b04'],
+      monuments: ['m01'],
+      refills: { currentAge: ['b05'], age2: ['b15'] },
+      pendingTask: 'build',
+    },
+  ];
+  assert.deepEqual(
+    projectCapturedInitial(...repin({ ...collection, witnesses: validCards })).witness.witnesses,
+    validCards,
+  );
+  const prepared = repin();
+  assert.throws(() => projectCapturedInitial(...prepared.slice(0, 5)), /Missing declared later/);
+  const withoutPin = JSON.parse(prepared[3]);
+  delete withoutPin.laterWitnesses;
+  assert.throws(
+    () => projectCapturedInitial(...prepared.slice(0, 3), bytes(withoutPin), table, prepared[5]),
+    /later witnesses pin/,
+  );
+  assert.throws(
+    () => projectCapturedInitial(...prepared.slice(0, 5), Buffer.from('{}')),
+    /later witnesses: pin mismatch/,
+  );
+  const wrongPin = JSON.parse(prepared[3]);
+  wrongPin.laterWitnesses.sha256 = '0'.repeat(64);
+  assert.throws(
+    () => projectCapturedInitial(...prepared.slice(0, 3), bytes(wrongPin), table, prepared[5]),
+    /later witnesses: pin mismatch/,
+  );
+  const oversized = Buffer.alloc(16 * 1024 * 1024 + 1);
+  const oversizedControl = JSON.parse(prepared[3]);
+  oversizedControl.laterWitnesses = pin(oversized);
+  assert.throws(
+    () =>
+      projectCapturedInitial(...prepared.slice(0, 3), bytes(oversizedControl), table, oversized),
+    /later witnesses size/,
+  );
+  assert.throws(
+    () => projectCapturedInitial(...prepared.slice(0, 5), Buffer.alloc(32 * 1024 * 1024)),
+    /aggregate byte limit/,
+  );
+  const duplicated = Buffer.from(prepared[5].toString().replace(/}$/, ',"witnesses":[]}'));
+  const duplicateControl = JSON.parse(prepared[3]);
+  duplicateControl.laterWitnesses = pin(duplicated);
+  assert.throws(
+    () =>
+      projectCapturedInitial(...prepared.slice(0, 3), bytes(duplicateControl), table, duplicated),
+    /duplicate JSON key/,
+  );
+});
+
+test('file projector carries separately pinned later witnesses and refuses missing or changed files', async () => {
+  const { repin } = withLaterWitnesses(placementFixture(), [
+    { actionId: 8, expected: { round: 1 } },
+  ]);
+  const prepared = repin();
+  const directory = await mkdtemp(join(tmpdir(), 'tzolkin-playing-later-'));
+  try {
+    const paths = ['capture', 'atlas', 'raw', 'control', 'later'].map((name) =>
+      join(directory, `${name}.json`),
+    );
+    for (const [i, path] of paths.entries())
+      await writeFile(path, prepared[i === 4 ? 5 : i], { flag: 'wx' });
+    const output = join(directory, 'projected');
+    await assert.rejects(
+      projectPlayingFiles(...paths.slice(0, 4), output),
+      /Missing declared later/,
+    );
+    const result = await projectPlayingFiles(...paths.slice(0, 4), output, null, paths[4]);
+    const saved = JSON.parse(await readFile(join(output, 'witness.json')));
+    assert.deepEqual(saved.witnesses, [{ actionId: 8, expected: { round: 1 } }]);
+    assert.equal(result.projection.provenance.laterWitnesses.sha256, sha(prepared[5]));
+    const cliOutput = join(directory, 'cli-projected');
+    execFileSync(
+      process.execPath,
+      [
+        fileURLToPath(new URL('./bga-playing-project.mjs', import.meta.url)),
+        ...paths.slice(0, 4),
+        cliOutput,
+        '--later-witnesses',
+        paths[4],
+      ],
+      { encoding: 'utf8' },
+    );
+    assert.deepEqual(
+      JSON.parse(await readFile(join(cliOutput, 'witness.json'))).witnesses,
+      saved.witnesses,
+    );
+    await writeFile(paths[4], Buffer.alloc(prepared[5].length, 'x'));
+    await assert.rejects(
+      projectPlayingFiles(...paths.slice(0, 4), join(directory, 'invalid'), null, paths[4]),
+      /pin mismatch/,
+    );
+    await writeFile(paths[4], Buffer.from('changed'));
+    await assert.rejects(
+      projectPlayingFiles(...paths.slice(0, 4), join(directory, 'wrong-size'), null, paths[4]),
+      /file size mismatch/,
+    );
+  } finally {
+    assert.equal(dirname(resolve(directory)), resolve(tmpdir()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test('three/four-player captured projection preserves counters, dummy slots and conditional provenance', () => {
   for (const n of [3, 4]) {
