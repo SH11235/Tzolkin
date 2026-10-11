@@ -533,17 +533,32 @@ test('binds localized food-day score captions and age-two announcements to core 
     assert.equal(result.manifest.blocked, null);
     assert.equal(result.record.steps.length, 1);
     assert.equal(result.manifest.trainingReady, false);
-    f.after.snapshot.state.players[3].score -= 2;
-    f.scores.at(-1).raw_text = 'Dは信仰により-2点を獲得した';
-    assert.equal(
-      run(f, [...f.feeding, ...f.scores, { raw_text: '歯車が進んだ' }]).manifest.blocked,
-      null,
-    );
-    for (const amount of [2, -3]) {
-      f.scores.at(-1).raw_text = `Dは信仰により${amount}点を獲得した`;
-      const rejected = run(f, [...f.feeding, ...f.scores, { raw_text: '歯車が進んだ' }]);
-      assert.match(rejected.manifest.blocked.reason, /score=.*is not established/);
-      assert.equal(rejected.record.steps.length, 0);
+    for (const penalty of [0, 3]) {
+      f.initial.snapshot.state.players[3].feedAll = penalty === 0;
+      f.after.snapshot.state.players[3].feedAll = penalty === 0;
+      f.initial.snapshot.state.players[3].resources.corn = 0;
+      f.after.snapshot.state.players[3].resources.corn = 0;
+      f.after.snapshot.state.players[3].score =
+        f.initial.snapshot.state.players[3].score - 2 - penalty;
+      f.after.snapshot.state.log[f.after.snapshot.state.log.length - 1] =
+        `食糧の日：D はコーン 0 を支払い${penalty ? '、未給食で −3 点' : ''}`;
+      f.feeding[3].raw_text = `食料供給日: Dはワーカー${penalty ? 0 : 1}個で 0\nを支払った`;
+      const shortage = penalty
+        ? [{ raw_text: '食料供給日: Dはワーカー1個分の食料が足りないため3点失った' }]
+        : [];
+      const messages = () => [...f.feeding, ...shortage, ...f.scores, { raw_text: '歯車が進んだ' }];
+      f.scores.at(-1).raw_text = 'Dは信仰により-2点を獲得した';
+      assert.equal(run(f, messages()).manifest.blocked, null);
+      for (const amount of [2, -3, -5]) {
+        f.scores.at(-1).raw_text = `Dは信仰により${amount}点を獲得した`;
+        const rejected = run(f, messages());
+        assert.match(rejected.manifest.blocked.reason, /not established/);
+        assert.equal(rejected.record.steps.length, 0);
+      }
+      // A feeding penalty alone is never evidence of a negative temple score.
+      f.after.snapshot.state.players[3].score = f.initial.snapshot.state.players[3].score - penalty;
+      f.scores.at(-1).raw_text = 'Dは信仰により-3点を獲得した';
+      assert.match(run(f, messages()).manifest.blocked.reason, /temple loss is not established/);
     }
   }
   const terminalCaptions = [

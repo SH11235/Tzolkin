@@ -2828,6 +2828,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 context.foodScoreClaims.has(key)
               )
                 fail('Food-day score caption has no unique matching core scoring receipt');
+              if (amount < 0) {
+                const receipt = context.feeding.find((value) => value.actor === actor);
+                if (!receipt || unclaimed(event, 'score', -1) - receipt.penalty < -amount)
+                  fail('Food-day temple loss is not established separately from feeding penalties');
+              }
               automatic(event, 'score', Math.abs(amount), amount < 0 ? -1 : 1);
               context.foodScoreClaims.add(key);
             } else if (event.rawText === '建物が第2世代になりました') {
