@@ -448,6 +448,16 @@ test('legacy panels refuse conflicting duplicates, missing state and foreign ide
       /crosses player identity/,
     ],
     [
+      'discarded first-player token',
+      (v) => {
+        v.capture.playerPanels[2].html = v.capture.playerPanels[2].html.replace(
+          '<div id="player_board_200">',
+          `${element('div', 'firstplayer')}<div id="player_board_200">`,
+        );
+      },
+      /setup node outside retained board\/name/,
+    ],
+    [
       'missing selection',
       (v) => {
         v.capture.selectedPlayerTiles.pop();

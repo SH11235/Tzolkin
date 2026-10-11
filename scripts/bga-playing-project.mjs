@@ -354,15 +354,22 @@ function legacyInitialCapture(capture) {
     const id = board.attrs.id.slice('player_board_'.length);
     if (item.id !== board.attrs.id && !/^player_board_inner_[A-Za-z0-9]+$/.test(item.id))
       fail('Unsupported legacy player panel ID');
+    const name = tree.ids.get(`player_name_${id}`);
     for (const node of tree.nodes) {
       const owner =
         /^(?:(?:worker|corn|wood|stone|gold|skull)_number_player_|player_(?:name|score)_|firstplayer_|overall_player_board_)(\d+)$/.exec(
           node.attrs.id ?? '',
         )?.[1];
       if (owner !== undefined && owner !== id) fail('Legacy player panel crosses player identity');
+      if (
+        (owner !== undefined || node.attrs.id === 'firstplayer') &&
+        ![board, name].some(
+          (range) => range !== undefined && node.start >= range.start && node.end <= range.end,
+        )
+      )
+        fail('Legacy setup node outside retained board/name');
     }
     const boardHtml = outer(tree, board);
-    const name = tree.ids.get(`player_name_${id}`);
     const nameHtml = name === undefined ? null : outer(tree, name);
     const prior = panels.get(id);
     if (
