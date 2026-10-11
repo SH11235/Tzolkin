@@ -3614,6 +3614,7 @@ test('keeps automatic payments distinct from typed theology offerings and temple
   ]);
   const begInitial = clone(saved.core.initialFrame);
   begInitial.snapshot.state.players[0].name = 'ChaacReader';
+  begInitial.snapshot.state.players[0].resources.corn = 0;
   begInitial.observation.legalActions = [{ action: { type: 'beg' }, move: { type: 'beg' } }];
   begging.witness.initial = clone(begInitial.snapshot.state);
   const begged = clone(begInitial);
@@ -3677,6 +3678,176 @@ test('keeps automatic payments distinct from typed theology offerings and temple
   const excessiveGain = decode(paidGain, dispatch);
   assert.match(excessiveGain.manifest.blocked.reason, /resource:corn=3/);
   assert.equal(excessiveGain.record.steps.length, 0);
+});
+
+test('matches begging captions to the actual corn gain and rolls back every refused macro', () => {
+  const templeIds = { Chaac: 'chaac', Quetzalcoatl: 'quetzalcoatl', Kukulcan: 'kukulkan' };
+  function fixture(corn = 1, amount = 3 - corn, temple = 'Quetzalcoatl', connector = 'ることで') {
+    const value = input();
+    const name = 'ChaacReader';
+    value.raw.metadata.players[0].text = name;
+    replaceEvents(value, [
+      [
+        6,
+        [
+          {
+            raw_text: `${name}は${temple}の信仰を1段下げ${connector}コーン${amount}個を受け取った`,
+          },
+        ],
+      ],
+    ]);
+    const initial = clone(saved.core.initialFrame);
+    initial.snapshot.state.players[0].name = name;
+    initial.snapshot.state.players[0].resources.corn = corn;
+    initial.observation.legalActions = [{ action: { type: 'beg' }, move: { type: 'beg' } }];
+    value.witness.initial = clone(initial.snapshot.state);
+    const begged = clone(initial);
+    begged.snapshot.state.pending = {
+      task: { type: 'temple', remaining: 1, direction: -1, reason: 'beg', distinct: null },
+      after: [],
+    };
+    begged.observation.pendingTask = { type: 'temple', remaining: 1, direction: -1 };
+    begged.observation.legalActions = Object.values(templeIds).map((id) => ({
+      action: { type: 'temple', temple: id, direction: -1 },
+      move: { type: 'choose', choiceId: `temple:${id}` },
+    }));
+    const lowered = clone(begged);
+    const own = lowered.snapshot.state.players[0];
+    const templeId = templeIds[temple];
+    if (templeId) own.temples[templeId]--;
+    own.resources.corn = 3;
+    lowered.snapshot.state.turn.begged = true;
+    lowered.snapshot.state.pending = null;
+    lowered.observation.pendingTask = null;
+    lowered.observation.legalActions = [];
+    value.witness.witnesses = [
+      {
+        actionId: 6,
+        pendingTask: null,
+        expected: {
+          players: [{ resources: { corn: 3 }, temples: clone(own.temples) }, {}, {}, {}],
+        },
+      },
+    ];
+    const core = dispatcher(initial, (request) => {
+      if (request.move.type === 'beg') return clone(begged);
+      assert.equal(request.move.choiceId, `temple:${templeId}`);
+      return clone(lowered);
+    });
+    let finalReplay;
+    const dispatch = (request) => {
+      const response = core(request);
+      if (request.operation === 'publicReplay') finalReplay = clone(response);
+      return response;
+    };
+    return { value, initial, begged, lowered, dispatch, finalFrames: () => finalReplay.frames };
+  }
+  for (const [corn, temple, connector] of [
+    [0, 'Quetzalcoatl', 'て'],
+    [1, 'Chaac', 'ることで'],
+    [2, 'Kukulcan', '、'],
+  ]) {
+    const f = fixture(corn, 3 - corn, temple, connector);
+    const checkpoint = clone(f.value.witness.witnesses[0].expected);
+    const result = decode(f.value, f.dispatch);
+    assert.equal(result.manifest.blocked, null);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.move),
+      [{ type: 'beg' }, { type: 'choose', choiceId: `temple:${templeIds[temple]}` }],
+    );
+    assert.deepEqual(result.record.steps.at(-1).checkpoint.expected, checkpoint);
+    assert.deepEqual(f.value.witness.witnesses[0].expected, checkpoint);
+    assert.equal(f.finalFrames().at(-1).snapshot.state.players[0].resources.corn, 3);
+    assert.equal(result.manifest.trainingReady, false);
+    assert.equal(result.manifest.sourceAuthenticated, false);
+  }
+  for (const [label, make, edit, reason] of [
+    ['wrong gain', () => fixture(1, 3), () => {}, /corn gain differs/],
+    [
+      'illegal Beg',
+      () => fixture(),
+      (f) => {
+        f.initial.observation.legalActions = [];
+      },
+      /legal base Beg/,
+    ],
+    [
+      'unavailable named temple',
+      () => fixture(),
+      (f) => {
+        f.begged.observation.legalActions = f.begged.observation.legalActions.slice(0, 1);
+      },
+      /actual named temple-down/,
+    ],
+    [
+      'wrong temple direction',
+      () => fixture(),
+      (f) => {
+        f.begged.observation.legalActions.forEach((row) => {
+          row.action.direction = 1;
+        });
+      },
+      /actual named temple-down/,
+    ],
+    [
+      'wrong pending task',
+      () => fixture(),
+      (f) => {
+        f.begged.observation.pendingTask = { type: 'trade' };
+      },
+      /actual named temple-down/,
+    ],
+    [
+      'wrong actual corn',
+      () => fixture(),
+      (f) => {
+        f.lowered.snapshot.state.players[0].resources.corn = 4;
+      },
+      /actual corn and temple transition/,
+    ],
+    [
+      'wrong actual temple',
+      () => fixture(),
+      (f) => {
+        f.lowered.snapshot.state.players[0].temples.quetzalcoatl--;
+      },
+      /actual corn and temple transition/,
+    ],
+    [
+      'ambiguous temple',
+      () => fixture(1, 2, 'ChaacとQuetzalcoatl'),
+      () => {},
+      /one unambiguous temple/,
+    ],
+    [
+      'resource icon',
+      () => fixture(),
+      (f) => {
+        f.value.raw.dom_entries.at(-1).messages[0].icons = [{ classes: 'tz_icon resource_corn' }];
+      },
+      /icon-free corn evidence/,
+    ],
+    [
+      'late checkpoint mismatch',
+      () => fixture(),
+      (f) => {
+        f.value.witness.witnesses[0].expected.players[0].resources.corn = 2;
+      },
+      /checkpoint mismatch/,
+    ],
+  ]) {
+    const f = make();
+    edit(f);
+    const checkpoint = clone(f.value.witness.witnesses[0].expected);
+    const result = decode(f.value, f.dispatch);
+    assert.equal(result.manifest.blocked.actionId, 6, label);
+    assert.match(result.manifest.blocked.reason, reason, label);
+    assert.equal(result.record.steps.length, 0, label);
+    assert.equal(result.manifest.audit.length, 0, label);
+    assert.equal(f.finalFrames().length, 1, label);
+    assert.deepEqual(f.finalFrames()[0], f.initial, label);
+    assert.deepEqual(f.value.witness.witnesses[0].expected, checkpoint, label);
+  }
 });
 
 const cli =

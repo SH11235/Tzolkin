@@ -104,7 +104,7 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
     };
   } else if (actor && text === 'は建物を建てた') result.kind = 'build';
   else if (actor && /記念碑.*(建てた|獲得した)/.test(text)) result.kind = 'monument';
-  else if (actor && text.includes('の信仰を') && text.includes('コーン3個を受け取った'))
+  else if (actor && text.includes('の信仰を') && /コーン[1-3]個を受け取った/.test(text))
     result.kind = 'beg';
   else if (actor && text === 'は歯車を高速化し2段階回した!') result.kind = 'doubleAdvance';
   else if (actor && /がこのラウンドのスタートプレイヤーです$/.test(text))
