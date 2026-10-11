@@ -261,6 +261,13 @@ fn attribute<'a>(opening: &'a str, key: &str) -> Result<&'a str, String> {
     optional_attribute(opening, key)?.ok_or_else(|| format!("Missing HTML {key}"))
 }
 fn optional_attribute<'a>(opening: &'a str, key: &str) -> Result<Option<&'a str>, String> {
+    retained_attribute(opening, key, false)
+}
+fn retained_attribute<'a>(
+    opening: &'a str,
+    key: &str,
+    ignore_case: bool,
+) -> Result<Option<&'a str>, String> {
     let body = opening
         .strip_prefix('<')
         .and_then(|s| s.strip_suffix('>'))
@@ -274,13 +281,22 @@ fn optional_attribute<'a>(opening: &'a str, key: &str) -> Result<Option<&'a str>
         tail = tail.trim_start();
         let end = tail
             .find(|c: char| c.is_ascii_whitespace() || c == '=')
-            .ok_or("Missing HTML attribute value")?;
+            .unwrap_or(tail.len());
         let name = &tail[..end];
         if name.is_empty() {
             return Err("Empty HTML attribute name".into());
         }
-        tail = tail[end..]
-            .trim_start()
+        tail = tail[end..].trim_start();
+        let matches = name == key || (ignore_case && name.eq_ignore_ascii_case(key));
+        if !tail.starts_with('=')
+            && (name.eq_ignore_ascii_case("hidden") || name.eq_ignore_ascii_case("inert"))
+        {
+            if matches && found.replace("").is_some() {
+                return Err(format!("Duplicate HTML {key}"));
+            }
+            continue;
+        }
+        tail = tail
             .strip_prefix('=')
             .ok_or("Missing HTML equals")?
             .trim_start();
@@ -288,7 +304,7 @@ fn optional_attribute<'a>(opening: &'a str, key: &str) -> Result<Option<&'a str>
             .strip_prefix('"')
             .ok_or("Expected retained double-quoted HTML attribute")?;
         let (value, rest) = tail.split_once('"').ok_or("Unterminated HTML attribute")?;
-        if name == key {
+        if matches {
             if found.is_some() {
                 return Err(format!("Duplicate HTML {key}"));
             }
@@ -409,6 +425,74 @@ impl<'a> Iterator for HtmlTags<'a> {
             }));
         }
     }
+}
+fn explicitly_hidden(opening: &str) -> Result<bool, String> {
+    if retained_attribute(opening, "hidden", true)?.is_some()
+        || retained_attribute(opening, "inert", true)?.is_some()
+    {
+        return Ok(true);
+    }
+    let style = retained_attribute(opening, "style", true)?.unwrap_or("");
+    for declaration in style.split(';') {
+        let Some((property, value)) = declaration.split_once(':') else {
+            continue;
+        };
+        let property = property.trim().to_ascii_lowercase();
+        let normalized = value.trim().to_ascii_lowercase();
+        let value = match normalized.rsplit_once('!') {
+            Some((value, priority)) if priority.trim() == "important" => value.trim(),
+            _ => normalized.as_str(),
+        };
+        if (property == "display" && value == "none")
+            || (property == "visibility" && matches!(value, "hidden" | "collapse"))
+            || (property == "opacity"
+                && value
+                    .strip_suffix('%')
+                    .unwrap_or(value)
+                    .parse::<f64>()
+                    .is_ok_and(|opacity| opacity == 0.0))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+fn require_unhidden_wealth_ancestry(html: &str) -> Result<(), String> {
+    let mut stack: Vec<(&str, bool)> = Vec::new();
+    for tag in HtmlTags::new(html) {
+        let tag = tag?;
+        if tag.closing {
+            let (name, _) = stack.pop().ok_or("Unbalanced initial-choice HTML")?;
+            if !name.eq_ignore_ascii_case(tag.name) {
+                return Err("Mismatched initial-choice HTML ancestry".into());
+            }
+            continue;
+        }
+        let hidden =
+            stack.last().is_some_and(|(_, hidden)| *hidden) || explicitly_hidden(tag.opening)?;
+        let relevant = optional_attribute(tag.opening, "id")?.is_some_and(|id| {
+            matches!(id, "tzolkin-interface" | "board" | "wealth_tiles")
+                || id.starts_with("wealth_tile_")
+                || id.starts_with("player_wealthtiles_")
+        }) || optional_attribute(tag.opening, "class")?
+            .is_some_and(|classes| classes.split_whitespace().any(|c| c == "wealth_tile"));
+        if relevant && hidden {
+            return Err("Explicitly hidden/inert initial-choice wealth ancestry".into());
+        }
+        if ![
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param",
+            "source", "track", "wbr",
+        ]
+        .iter()
+        .any(|void| tag.name.eq_ignore_ascii_case(void))
+        {
+            stack.push((tag.name, hidden));
+        }
+    }
+    if !stack.is_empty() {
+        return Err("Unterminated initial-choice HTML ancestry".into());
+    }
+    Ok(())
 }
 fn css_number(style: &str, key: &str) -> Result<i64, String> {
     let values: Vec<_> = style
@@ -819,6 +903,8 @@ fn decode_choice(
     {
         return Err("Initial-choice actor/table/archive mismatch".into());
     }
+    require_unhidden_wealth_ancestry(choice_area(before)?)?;
+    require_unhidden_wealth_ancestry(choice_area(after)?)?;
     let dom_names = dom.then(|| dom_roster(before)).transpose()?;
     let names = if dom {
         &[][..]
@@ -2042,6 +2128,55 @@ mod tests {
         let (_, input, chosen, count) = decode_choice(&before, &after, &atlas).unwrap();
         assert_eq!((chosen, count, input.candidates().len()), (4, 4, 6));
         assert_eq!(input.offers(), &["w10", "w12", "w06", "w04"]);
+        let mut unrelated_hidden = before.clone();
+        let area = unrelated_hidden["interfaceHtml"].as_str().unwrap();
+        let at = area.rfind("</div>").unwrap();
+        let mut area = area.to_owned();
+        area.insert_str(at, "<div hidden><span>unrelated UI</span></div>");
+        unrelated_hidden["interfaceHtml"] = area.into();
+        assert!(decode_choice(&unrelated_hidden, &after, &atlas).is_ok());
+        for (before_side, needle, replacement) in [
+            (
+                true,
+                "id=\"wealth_tile_1\"",
+                "id=\"wealth_tile_1\" hidden=\"false\"",
+            ),
+            (true, "id=\"wealth_tiles\"", "id=\"wealth_tiles\" inert"),
+            (
+                true,
+                "id=\"tzolkin-interface\"",
+                "id=\"tzolkin-interface\" STYLE=\" DiSpLaY : NoNe ! IMPORTANT;\"",
+            ),
+            (
+                true,
+                "id=\"board\"",
+                "id=\"board\" style=\"visibility: COLLAPSE !important;\"",
+            ),
+            (
+                false,
+                "id=\"player_wealthtiles_100\"",
+                "id=\"player_wealthtiles_100\" inert=\"false\"",
+            ),
+            (
+                false,
+                "background-position: -60px 0px;",
+                "background-position: -60px 0px; Opacity: 0.00% !important;",
+            ),
+        ] {
+            let mut before = before.clone();
+            let mut after = after.clone();
+            let capture = if before_side { &mut before } else { &mut after };
+            capture["interfaceHtml"] = capture["interfaceHtml"]
+                .as_str()
+                .unwrap()
+                .replace(needle, replacement)
+                .into();
+            assert!(
+                decode_choice(&before, &after, &atlas)
+                    .unwrap_err()
+                    .contains("hidden/inert")
+            );
+        }
         for mutation in 0..6 {
             let mut before = before.clone();
             let mut after = after.clone();
