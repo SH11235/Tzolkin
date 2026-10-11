@@ -2,8 +2,13 @@
 //! Callers provide observations and own policy identity and callbacks.
 //! This state grants no model, game, replay or learning authority.
 
+mod configuration;
 mod observation;
+pub use configuration::TradeGuardConfig;
 pub use observation::{is_trade, public_bytes, skip_index};
+
+/// Version of the explicit repeated-state or episode-budget exit algorithm.
+pub const GUARD_VERSION: &str = "public-trade-cycle-guard-v1";
 
 /// Version of the canonical redacted public Trade-state byte projection.
 pub const PROJECTION_VERSION: &str = "public-trading-state-v1";
