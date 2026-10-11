@@ -623,6 +623,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             spec_pin: None,
             owner_pins: s.owner_pins,
             references: BTreeMap::new(),
+            active_record_bytes: ActiveRecordByteCache::default(),
             output_bytes: 0,
             metadata_bytes: 0,
             raw_record_bytes: 0,
