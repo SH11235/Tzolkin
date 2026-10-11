@@ -59,6 +59,7 @@ const MAX_FAMILIES: usize = 4096;
 const METADATA_HEADROOM: u64 =
     EVENTS_PER_ATTEMPT * HEAD_CAP as u64 + ARTIFACT_CAP as u64 + 2 * HEAD_CAP as u64;
 const MAX_STORAGE: u64 = 64 * 1024 * 1024 * 1024;
+const ACTIVE_RECORD_CACHE_BYTES: usize = MAX_RECORD_BYTES;
 fn sha(raw: &[u8]) -> String {
     format!("{:x}", Sha256::digest(raw))
 }
@@ -193,7 +194,7 @@ fn publish_record_file(
     pin: &RecordPin,
     member: usize,
     spec: &CurrentMixedRunSpec,
-) -> Result<(), String> {
+) -> Result<Option<VerifiedRecordBytes>, String> {
     pin.validate(member, spec)?;
     if stored.len() != pin.file().bytes || sha(stored) != pin.file().sha256 {
         return Err("Current mixed publication differs from stored record pin".into());
@@ -206,7 +207,90 @@ fn publish_record_file(
     if read_record(directory, pin, member, spec)? != raw {
         return Err("Current mixed record readback differs from original raw bytes".into());
     }
-    Ok(())
+    Ok(
+        (stored.len() <= ACTIVE_RECORD_CACHE_BYTES).then(|| VerifiedRecordBytes {
+            directory: directory.to_owned(),
+            pin: pin.file().clone(),
+            compressed: spec.record_storage.is_some(),
+            bytes: stored.to_vec(),
+        }),
+    )
+}
+
+// Only exact publication/readback supplies these bytes. This process-local
+// cache never replaces a current-path read or an archive/restore SHA check.
+struct VerifiedRecordBytes {
+    directory: PathBuf,
+    pin: FilePin,
+    compressed: bool,
+    bytes: Vec<u8>,
+}
+#[derive(Default)]
+struct ActiveRecordByteCache {
+    attempt: Option<u64>,
+    records: Vec<VerifiedRecordBytes>,
+    bytes: usize,
+}
+impl ActiveRecordByteCache {
+    fn remember(&mut self, attempt: u64, record: Option<VerifiedRecordBytes>) {
+        if self.attempt != Some(attempt) {
+            *self = Self {
+                attempt: Some(attempt),
+                ..Self::default()
+            };
+        }
+        if let Some(record) = record
+            && self.records.len() < 4
+            && let Some(total) = self
+                .bytes
+                .checked_add(record.bytes.len())
+                .filter(|total| *total <= ACTIVE_RECORD_CACHE_BYTES)
+        {
+            self.bytes = total;
+            self.records.push(record);
+        }
+    }
+    fn lookup(
+        &self,
+        attempt: u64,
+        directory: &Path,
+        pin: &FilePin,
+        spec: &CurrentMixedRunSpec,
+    ) -> Option<&[u8]> {
+        if self.attempt != Some(attempt) {
+            return None;
+        }
+        self.records
+            .iter()
+            .find(|record| {
+                record.directory == directory
+                    && record.pin == *pin
+                    && record.compressed == spec.record_storage.is_some()
+            })
+            .map(|record| record.bytes.as_slice())
+    }
+    fn require(
+        &self,
+        attempt: u64,
+        directory: &Path,
+        pin: &FilePin,
+        spec: &CurrentMixedRunSpec,
+    ) -> Result<(), String> {
+        if let Some(expected) = self.lookup(attempt, directory, pin, spec) {
+            let path = directory.join(&pin.name);
+            let actual = if spec.record_storage.is_some() {
+                read_mixed_stored_record(&path, pin.bytes)?
+            } else {
+                read_bounded(&path, pin.bytes)?
+            };
+            if actual.len() != pin.bytes || actual.as_slice() != expected {
+                return Err("Current mixed active record bytes changed".into());
+            }
+            Ok(())
+        } else {
+            read_physical_pin(directory, pin, spec).map(|_| ())
+        }
+    }
 }
 fn read_record(
     directory: &Path,
@@ -1031,6 +1115,7 @@ pub struct CurrentMixedTrainingSession<'a> {
     spec_pin: Option<FilePin>,
     owner_pins: Option<(PathBuf, FilePin, FilePin)>,
     references: BTreeMap<u64, Vec<FilePin>>,
+    active_record_bytes: ActiveRecordByteCache,
     output_bytes: u64,
     metadata_bytes: u64,
     raw_record_bytes: u64,
@@ -1318,6 +1403,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             spec_pin: None,
             owner_pins: None,
             references: BTreeMap::new(),
+            active_record_bytes: ActiveRecordByteCache::default(),
             output_bytes: 0,
             metadata_bytes: 0,
             raw_record_bytes: 0,
@@ -1463,7 +1549,12 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         }
         if let Some(r) = &self.progress.active {
             for p in self.references.get(&r.attempt).into_iter().flatten() {
-                read_physical_pin(&self.batch(r.attempt), p, &self.spec)?;
+                self.active_record_bytes.require(
+                    r.attempt,
+                    &self.batch(r.attempt),
+                    p,
+                    &self.spec,
+                )?;
             }
         }
         Ok(())
@@ -1549,7 +1640,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             return Err("Current mixed repeated record output".into());
         }
         let directory = self.batch(attempt);
-        publish_record_file(&directory, &stored, raw, &pin, member, &self.spec)?;
+        let verified = publish_record_file(&directory, &stored, raw, &pin, member, &self.spec)?;
         self.references
             .entry(attempt)
             .or_default()
@@ -1559,6 +1650,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             .ok_or("Current mixed retained storage overflow")?;
         self.raw_record_bytes = logical;
         self.stored_record_bytes = physical;
+        self.active_record_bytes.remember(attempt, verified);
         self.require_live()?;
         Ok(pin)
     }
@@ -2290,6 +2382,88 @@ mod tests {
         });
         assert!(read_record(&directory, &corrupt, 1, &spec).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn current_mixed_active_record_cache_keeps_current_bytes_and_scope_checks() {
+        for spec in [spec(), compressed_spec()] {
+            let directory = test_directory("active-record-cache");
+            let raw = br#"{"record":"original"}"#;
+            let (stored, pin) = encode_record(raw, 0, &spec).unwrap();
+            let verified = publish_record_file(&directory, &stored, raw, &pin, 0, &spec).unwrap();
+            let mut cache = ActiveRecordByteCache::default();
+            cache.remember(7, verified);
+            assert_eq!(
+                cache.lookup(7, &directory, pin.file(), &spec),
+                Some(stored.as_ref())
+            );
+            for _ in 0..2 {
+                cache.require(7, &directory, pin.file(), &spec).unwrap();
+            }
+            let path = directory.join(&pin.file().name);
+            let modified = fs::metadata(&path).unwrap().modified().unwrap();
+            let mut changed = stored.to_vec();
+            changed[0] ^= 1;
+            fs::write(&path, &changed).unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+            assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            assert!(cache.require(7, &directory, pin.file(), &spec).is_err());
+            assert!(read_record(&directory, &pin, 0, &spec).is_err());
+            fs::write(&path, &stored[..stored.len() - 1]).unwrap();
+            assert!(cache.require(7, &directory, pin.file(), &spec).is_err());
+            fs::write(&path, &stored).unwrap();
+            cache.require(7, &directory, pin.file(), &spec).unwrap();
+
+            let mut wrong = pin.file().clone();
+            wrong.sha256 = "f".repeat(64);
+            assert!(cache.lookup(7, &directory, &wrong, &spec).is_none());
+            assert!(cache.require(7, &directory, &wrong, &spec).is_err());
+            assert!(cache.lookup(8, &directory, pin.file(), &spec).is_none());
+            let other = directory.join("other");
+            fs::create_dir(&other).unwrap();
+            fs::write(other.join(&pin.file().name), &changed).unwrap();
+            assert!(cache.lookup(7, &other, pin.file(), &spec).is_none());
+            assert!(cache.require(7, &other, pin.file(), &spec).is_err());
+            let other_spec = if spec.record_storage.is_some() {
+                self::spec()
+            } else {
+                compressed_spec()
+            };
+            assert!(
+                cache
+                    .lookup(7, &directory, pin.file(), &other_spec)
+                    .is_none()
+            );
+            assert!(
+                cache
+                    .require(7, &directory, pin.file(), &other_spec)
+                    .is_err()
+            );
+
+            let (next_stored, next_pin) = encode_record(raw, 1, &spec).unwrap();
+            let next =
+                publish_record_file(&directory, &next_stored, raw, &next_pin, 1, &spec).unwrap();
+            cache.remember(8, next);
+            assert_eq!(cache.records.len(), 1);
+            assert_eq!(cache.bytes, next_stored.len());
+            assert!(cache.lookup(7, &directory, pin.file(), &spec).is_none());
+            cache
+                .require(8, &directory, next_pin.file(), &spec)
+                .unwrap();
+            let next_path = directory.join(&next_pin.file().name);
+            fs::remove_file(&next_path).unwrap();
+            fs::create_dir(&next_path).unwrap();
+            assert!(
+                cache
+                    .require(8, &directory, next_pin.file(), &spec)
+                    .is_err()
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
     #[test]
     fn current_mixed_storage_reserves_logical_physical_and_temporary_headroom() {
