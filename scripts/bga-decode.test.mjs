@@ -4527,6 +4527,203 @@ test('matches begging captions to the actual corn gain and rolls back every refu
   }
 });
 
+function equivalentBuildingFixture(alter = () => {}, exact = false) {
+  const initial = clone(saved.core.initialFrame);
+  const before = initial.snapshot.state;
+  before.age = 2;
+  before.round = 15;
+  before.players[0].resources.wood = 4;
+  before.buildings = ['b16', 'b04', 'b15', 'b05'];
+  const rows = (ids) =>
+    ids.map((id) => ({
+      action: {
+        type: 'build',
+        id,
+        cost: [0, 2, 0, 0, 0],
+        architecture: false,
+        discountResource: null,
+        renovation: null,
+      },
+      move: { type: 'choose', choiceId: `build:${id}` },
+    }));
+  const setTask = (frame, remaining) => {
+    frame.observation.pendingTask = remaining
+      ? { type: 'build', remaining, allowMonument: false, cornPayment: false }
+      : null;
+    frame.snapshot.state.pending = remaining
+      ? { title: 'Build', task: clone(frame.observation.pendingTask), after: [] }
+      : null;
+    frame.observation.legalActions = remaining
+      ? rows(frame.snapshot.state.buildings.filter((id) => ['b15', 'b16'].includes(id)))
+      : [];
+  };
+  setTask(initial, 2);
+  alter(initial, 'initial');
+  const value = input();
+  const purchase = [
+    {
+      raw_text: 'Aは\nを支払った',
+      icons: [{ classes: 'tz_icon resource_wood' }, { classes: 'tz_icon resource_wood' }],
+    },
+    { raw_text: 'Aは建物を建てた' },
+  ];
+  replaceEvents(value, [
+    [6, purchase],
+    [7, purchase],
+    [8, [{ raw_text: 'unobserved decision' }]],
+  ]);
+  value.witness.initial = clone(before);
+  value.witness.witnesses = [6, 7].map((actionId) => ({
+    actionId,
+    ...(exact
+      ? { buildings: [actionId === 6 ? 'b16' : 'b15'] }
+      : { buildingEquivalenceClass: ['b16', 'b15'] }),
+  }));
+  const apply = (request) => {
+    const id = request.move.choiceId.split(':')[1];
+    assert.ok(['b15', 'b16'].includes(id));
+    const next = clone(initial);
+    next.snapshot.state = clone(request.state);
+    const state = next.snapshot.state;
+    state.players[0].resources.wood -= 2;
+    state.players[0].feedWorkers += 3;
+    state.players[0].buildings.push(id);
+    state.buildings.splice(state.buildings.indexOf(id), 1);
+    setTask(next, state.pending.task.remaining - 1);
+    alter(next, id);
+    return next;
+  };
+  return { value, initial, dispatch: dispatcher(initial, apply) };
+}
+
+test('calibrated equivalent building witnesses retain unknown physical targets and exact local replay', () => {
+  const f = equivalentBuildingFixture();
+  const original = clone(f.value.witness);
+  const result = decode(f.value, f.dispatch);
+  assert.equal(result.record.steps.length, 2);
+  assert.deepEqual(
+    result.record.steps.map((step) => step.move.choiceId),
+    ['build:b15', 'build:b16'],
+  );
+  const [first, second] = result.manifest.audit;
+  assert.equal(first.physicalSelectionUnknown, true);
+  assert.equal(second.physicalSelectionUnknown, true);
+  assert.deepEqual(first.buildingEquivalenceClass, ['b15', 'b16']);
+  assert.equal(first.equivalentChoices, 2);
+  assert.equal(second.equivalentChoices, 1);
+  assert.deepEqual(
+    first.equivalentLegalTargets.map((row) => row.action.id),
+    ['b15', 'b16'],
+  );
+  assert.deepEqual(first.canonicalLocalTarget, first.equivalentLegalTargets[0]);
+  assert.deepEqual(first.action, first.canonicalLocalTarget.action);
+  assert.deepEqual(result.record.steps[0].move, first.canonicalLocalTarget.move);
+  assert.equal(result.manifest.trainingReady, false);
+  assert.equal(result.manifest.blocked.actionId, 8);
+  original.rawSha256 = f.value.witness.rawSha256;
+  assert.deepEqual(f.value.witness, original);
+});
+
+test('equivalent building witnesses refuse unrelated catalogs, typed actions and complete state differences atomically', () => {
+  for (const witness of [
+    { buildingEquivalenceClass: ['b15'] },
+    { buildingEquivalenceClass: ['b15', 'b15'] },
+    { buildingEquivalenceClass: ['b15', 'missing'] },
+    { buildingEquivalenceClass: ['b15', 'b18'] },
+    { buildingEquivalenceClass: ['b15', 'b16'], buildings: ['b15'] },
+  ]) {
+    const f = equivalentBuildingFixture();
+    f.value.witness.witnesses[0] = { actionId: 6, ...witness };
+    assert.throws(
+      () => decode(f.value, () => assert.fail('Invalid class reached core')),
+      /building equivalence class|different catalog/,
+    );
+  }
+  for (const [label, alter, reason] of [
+    [
+      'architecture',
+      (frame, stage) => {
+        if (stage === 'initial') frame.observation.legalActions[0].action.architecture = true;
+      },
+      /different typed actions/,
+    ],
+    [
+      'discount',
+      (frame, stage) => {
+        if (stage === 'initial') frame.observation.legalActions[0].action.discountResource = 'wood';
+      },
+      /different typed actions/,
+    ],
+    [
+      'renovation',
+      (frame, stage) => {
+        if (stage === 'initial') frame.observation.legalActions[0].action.renovation = 'b04';
+      },
+      /different typed actions/,
+    ],
+    [
+      'score',
+      (frame, stage) => {
+        if (stage === 'b16') frame.snapshot.state.players[1].score++;
+      },
+      /Ambiguous legal operation/,
+    ],
+    [
+      'gears',
+      (frame, stage) => {
+        if (stage === 'b16') frame.snapshot.state.gears.palenque[0] = { player: 1 };
+      },
+      /Ambiguous legal operation/,
+    ],
+    [
+      'hidden counts',
+      (frame, stage) => {
+        if (stage === 'b16') frame.snapshot.state.buildingDeckCount++;
+      },
+      /Ambiguous legal operation/,
+    ],
+    [
+      'nonclass order',
+      (frame, stage) => {
+        if (stage === 'b16') frame.snapshot.state.buildings.reverse();
+      },
+      /Ambiguous legal operation/,
+    ],
+    [
+      'foreign owned card',
+      (frame, stage) => {
+        if (stage === 'b16') frame.snapshot.state.players[1].buildings.push('b15');
+      },
+      /Ambiguous legal operation/,
+    ],
+    [
+      'additional buildings',
+      (frame, stage) => {
+        if (stage === 'initial') frame.snapshot.state.additionalBuildings = true;
+      },
+      /base building rules/,
+    ],
+  ]) {
+    const f = equivalentBuildingFixture(alter);
+    const result = decode(f.value, f.dispatch);
+    assert.equal(result.manifest.blocked.actionId, 6, label);
+    assert.match(result.manifest.blocked.reason, reason, label);
+    assert.equal(result.record.steps.length, 0, label);
+    assert.deepEqual(result.manifest.audit, [], label);
+  }
+});
+
+test('exact building identity witnesses preserve the observed route without equivalence audit', () => {
+  const f = equivalentBuildingFixture(() => {}, true);
+  const result = decode(f.value, f.dispatch);
+  assert.deepEqual(
+    result.record.steps.map((step) => step.move.choiceId),
+    ['build:b16', 'build:b15'],
+  );
+  assert.ok(result.manifest.audit.every((row) => !Object.hasOwn(row, 'physicalSelectionUnknown')));
+  assert.ok(result.manifest.audit.every((row) => row.equivalentChoices === 1));
+});
+
 const cli =
   process.env.BGA_NATIVE_CLI ??
   resolve('target/debug/' + (process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai'));

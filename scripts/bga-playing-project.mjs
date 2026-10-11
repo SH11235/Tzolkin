@@ -6,7 +6,11 @@ import { fileURLToPath } from 'node:url';
 import { normalizeGame } from './bga-import.mjs';
 import { observedBasicUnlimitedOptions, uniqueJson } from './bga-observed-options.mjs';
 import { catalogFingerprint, coreDispatcher } from './bga-replay.mjs';
-import { decodeConditionalPublicGame, WITNESS_SCHEMA } from './bga-decode.mjs';
+import {
+  decodeConditionalPublicGame,
+  validateBuildingEquivalenceClass,
+  WITNESS_SCHEMA,
+} from './bga-decode.mjs';
 
 export const PROJECTION_SCHEMA = 'tzolkin-bga-playing-projection-v1';
 export const CONTROL_SCHEMA = 'tzolkin-bga-playing-projection-control-v1';
@@ -471,6 +475,7 @@ function laterWitnessesFrom(bytes, binding, game) {
       'expected',
       'refills',
       'buildings',
+      'buildingEquivalenceClass',
       'monuments',
       'pendingTask',
     ]);
@@ -493,6 +498,7 @@ function laterWitnessesFrom(bytes, binding, game) {
     };
     if (witness.buildings !== undefined)
       cards(witness.buildings, (id) => buildings.has(id), 'later buildings');
+    validateBuildingEquivalenceClass(witness);
     if (witness.monuments !== undefined)
       cards(witness.monuments, (id) => monuments.has(id), 'later monuments');
     if (witness.refills !== undefined) {

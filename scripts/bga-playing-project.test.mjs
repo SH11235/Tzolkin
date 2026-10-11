@@ -683,6 +683,11 @@ test('later collection refuses mismatched input bindings and invalid observation
     [[{ actionId: 8, expected: {} }], /Empty later/],
     [[{ actionId: 8, pendingTask: 1 }], /later pending task/],
     [[{ actionId: 8, buildings: ['missing'] }], /catalog IDs/],
+    [[{ actionId: 8, buildingEquivalenceClass: ['b15', 'b18'] }], /different catalog fields/],
+    [
+      [{ actionId: 8, buildingEquivalenceClass: ['b15', 'b16'], buildings: ['b15'] }],
+      /Invalid building equivalence class/,
+    ],
     [[{ actionId: 8, monuments: ['b04'] }], /catalog IDs/],
     [[{ actionId: 8, refills: { age2: ['b04'] } }], /catalog IDs/],
     [[{ actionId: 8, refills: { currentAge: ['b04', 'b04'] } }], /catalog IDs/],
@@ -703,6 +708,12 @@ test('later collection refuses mismatched input bindings and invalid observation
   assert.deepEqual(
     projectCapturedInitial(...repin({ ...collection, witnesses: validCards })).witness.witnesses,
     validCards,
+  );
+  const equivalentCards = [{ actionId: 8, buildingEquivalenceClass: ['b16', 'b15'] }];
+  assert.deepEqual(
+    projectCapturedInitial(...repin({ ...collection, witnesses: equivalentCards })).witness
+      .witnesses,
+    equivalentCards,
   );
   const prepared = repin();
   assert.throws(() => projectCapturedInitial(...prepared.slice(0, 5)), /Missing declared later/);
