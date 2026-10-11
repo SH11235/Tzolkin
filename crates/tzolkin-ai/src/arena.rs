@@ -175,6 +175,11 @@ pub enum BorrowedArenaPolicy<'a> {
     Paired(&'a PairedRlPolicy),
     Mixed(&'a MixedJointOwner),
     ContinuedMixed(&'a crate::public_policy_mixed_continued::ContinuedMixedOwner),
+    /// Genuine borrowed current handle, explicit composition, evaluation only.
+    CurrentMixedTradeGuard(
+        &'a crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'a>,
+        &'a TradeGuardConfig,
+    ),
     PublicBc(&'a PreparedPublicPolicy),
     PublicBcTradeGuard(&'a PreparedPublicPolicy, &'a TradeGuardConfig),
     Heuristic(&'a HeuristicWeights),
@@ -405,6 +410,9 @@ pub struct PolicyDescription {
     pub model_version: Option<&'static str>,
 }
 enum PolicyChooser<'a> {
+    CurrentMixedTradeGuard {
+        policy: &'a crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'a>,
+    },
     PublicRlCount1(Box<UpdatedPublicRlHandle<'a>>),
     PublicRlRepeated(Box<RepeatedPublicRlHandle<'a>>),
     PublicRlLong(Box<LongRlHandle<'a>>),
@@ -474,6 +482,11 @@ impl<'a> FrozenReactiveOpponent<'a> {
         }
     }
     pub(crate) fn new(policy: BorrowedArenaPolicy<'a>) -> Result<Self, String> {
+        if matches!(policy, BorrowedArenaPolicy::CurrentMixedTradeGuard(..)) {
+            return Err(
+                "Guarded current mixed dispatch is Arena-only; native codec unavailable".into(),
+            );
+        }
         let (handle, _) = PolicyHandle::borrowed(policy, &[])?;
         let families = match policy {
             BorrowedArenaPolicy::ContinuedMixed(p) => FrozenFamilies::Continued(p.family_set()),
@@ -484,6 +497,7 @@ impl<'a> FrozenReactiveOpponent<'a> {
                 BorrowedArenaPolicy::Paired(p) => p.family_set().iter().cloned().collect(),
                 BorrowedArenaPolicy::Mixed(p) => p.family_closure().cloned().collect(),
                 BorrowedArenaPolicy::ContinuedMixed(_) => unreachable!("handled borrowed closure"),
+                BorrowedArenaPolicy::CurrentMixedTradeGuard(..) => unreachable!("Arena-only role"),
                 BorrowedArenaPolicy::PublicBc(p)
                 | BorrowedArenaPolicy::PublicBcTradeGuard(p, _) => {
                     p.initialization_families().1.iter().cloned().collect()
@@ -549,6 +563,7 @@ impl<'a> FrozenReactiveOpponent<'a> {
             SeatPolicy::PublicRlContinuedMixed { identity, .. } => identity.policy_version(),
             SeatPolicy::PublicRlPaired { policy_version, .. }
             | SeatPolicy::PublicRl { policy_version, .. }
+            | SeatPolicy::PublicRlCurrentMixedTradeGuard { policy_version, .. }
             | SeatPolicy::PublicLearnedTradeGuard { policy_version, .. }
             | SeatPolicy::PublicLearned { policy_version, .. }
             | SeatPolicy::Search { policy_version, .. }
@@ -714,6 +729,23 @@ impl<'a> PolicyHandle<'a> {
                     overlap,
                 )
             }
+            BorrowedArenaPolicy::CurrentMixedTradeGuard(handle, guard) => {
+                let overlap = validation_overlap(handle.family_closure(), seeds)?;
+                let provenance = SeatPolicy::PublicRlCurrentMixedTradeGuard {
+                    policy_version: public_trade_guard::CURRENT_MIXED_POLICY_VERSION.into(),
+                    identity: Box::new(handle.identity().clone()),
+                    selection_version: replay::RL_ARGMAX_SELECTION_VERSION.into(),
+                    guard: guard.clone(),
+                    configuration_key: guard.configuration_key()?,
+                };
+                provenance.validate()?;
+                (
+                    PolicyChooser::CurrentMixedTradeGuard { policy: handle },
+                    provenance,
+                    None,
+                    overlap,
+                )
+            }
             BorrowedArenaPolicy::Mixed(owner) => {
                 let handle = MixedPolicyHandle::new(owner)?;
                 let overlap = validation_overlap(handle.family_closure(), seeds)?;
@@ -839,6 +871,7 @@ impl<'a> PolicyHandle<'a> {
                             | BorrowedArenaPolicy::Paired(_)
                             | BorrowedArenaPolicy::Mixed(_)
                             | BorrowedArenaPolicy::ContinuedMixed(_)
+                            | BorrowedArenaPolicy::CurrentMixedTradeGuard(..)
                     )
                     .then_some(crate::public_model::MODEL_VERSION),
                 },
@@ -859,7 +892,8 @@ impl<'a> PolicyHandle<'a> {
             PolicyChooser::PublicRlContinuedMixed(policy) => {
                 Ok((policy.choose_move(observation)?, None))
             }
-            PolicyChooser::PublicLearnedTradeGuard { .. } => {
+            PolicyChooser::PublicLearnedTradeGuard { .. }
+            | PolicyChooser::CurrentMixedTradeGuard { .. } => {
                 Err("Guarded chooser requires its game-local indexed session".into())
             }
             PolicyChooser::PublicLearned(policy) => Ok((policy.choose_move(observation)?, None)),
@@ -884,10 +918,14 @@ impl<'a> PolicyHandle<'a> {
         observation: &Observation,
         session: &mut TradeGuardSession,
     ) -> Result<(Decision, Option<public_trade_guard::TradeGuardTrace>), String> {
-        let PolicyChooser::PublicLearnedTradeGuard { policy, .. } = &self.chooser else {
-            return Err("Trade guard requires declared guarded policy".into());
-        };
-        session.choose_with_distribution(index, observation, || policy.distribution(observation))
+        match &self.chooser {
+            PolicyChooser::PublicLearnedTradeGuard { policy, .. } => session
+                .choose_with_distribution(index, observation, || policy.distribution(observation)),
+            PolicyChooser::CurrentMixedTradeGuard { policy } => {
+                session.choose_current(index, observation, policy)
+            }
+            _ => Err("Trade guard requires declared guarded policy".into()),
+        }
     }
     #[cfg(test)]
     fn choose(&self, observation: &Observation) -> Result<Decision, String> {
@@ -998,7 +1036,8 @@ fn borrowed_work_bounds(
                     | PolicyChooser::PublicRlMixed(_)
                     | PolicyChooser::PublicRlContinuedMixed(_)
                     | PolicyChooser::PublicLearned(_)
-                    | PolicyChooser::PublicLearnedTradeGuard { .. } => public_policy = true,
+                    | PolicyChooser::PublicLearnedTradeGuard { .. }
+                    | PolicyChooser::CurrentMixedTradeGuard { .. } => public_policy = true,
                     PolicyChooser::Search(policy) => {
                         search_cap = search_cap.max(
                             u64::try_from(policy.config().max_total_steps)
@@ -1164,6 +1203,7 @@ fn play_arm_captured(
         matches!(
             handle.chooser,
             PolicyChooser::PublicLearnedTradeGuard { .. }
+                | PolicyChooser::CurrentMixedTradeGuard { .. }
         )
     });
     let mut trade_guard = guarded.then(|| {
@@ -1173,6 +1213,7 @@ fn play_arm_captured(
                 matches!(
                     handle.chooser,
                     PolicyChooser::PublicLearnedTradeGuard { .. }
+                        | PolicyChooser::CurrentMixedTradeGuard { .. }
                 )
                 .then(|| {
                     TradeGuardSummary::new(&handle.description.provenance)
@@ -1186,8 +1227,9 @@ fn play_arm_captured(
         let mut sessions = roster
             .iter()
             .map(|handle| match &handle.chooser {
-                PolicyChooser::PublicLearnedTradeGuard { guard, .. } => {
-                    TradeGuardSession::new((*guard).clone()).map(Some)
+                PolicyChooser::PublicLearnedTradeGuard { .. }
+                | PolicyChooser::CurrentMixedTradeGuard { .. } => {
+                    TradeGuardSession::from_provenance(&handle.description.provenance).map(Some)
                 }
                 _ => Ok(None),
             })
@@ -1227,6 +1269,7 @@ fn play_arm_captured(
                 let result = if matches!(
                     &handle.chooser,
                     PolicyChooser::PublicLearnedTradeGuard { .. }
+                        | PolicyChooser::CurrentMixedTradeGuard { .. }
                 ) {
                     let summary = trade_guard.as_mut().expect("guarded roster")[observation.actor]
                         .as_mut()

@@ -71,7 +71,9 @@ impl<'a> FrozenMixedRoster<'a> {
         if seats.iter().flatten().any(|p| {
             matches!(
                 p,
-                BorrowedArenaPolicy::Mixed(_) | BorrowedArenaPolicy::ContinuedMixed(_)
+                BorrowedArenaPolicy::Mixed(_)
+                    | BorrowedArenaPolicy::ContinuedMixed(_)
+                    | BorrowedArenaPolicy::CurrentMixedTradeGuard(..)
             )
         }) {
             return Err(
@@ -96,6 +98,9 @@ impl<'a> FrozenMixedRoster<'a> {
                     if crate::public_policy_mixed_continued::CurrentMixedPolicyHandle::from_continued(owner)?.identity()!=parent =>
                 {
                     return Err("Continued mixed opponent is not the actual learner parent".into());
+                }
+                BorrowedArenaPolicy::CurrentMixedTradeGuard(..) => {
+                    return Err("Guarded current mixed dispatch has no native source codec".into());
                 }
                 BorrowedArenaPolicy::Count1(_) | BorrowedArenaPolicy::Paired(_) => {
                     return Err("Current mixed roster cannot substitute an imported parent".into());
@@ -182,6 +187,7 @@ pub(crate) fn legacy_opponent_identity_allowed(policy: &crate::replay::SeatPolic
         policy,
         crate::replay::SeatPolicy::PublicRlMixed { .. }
             | crate::replay::SeatPolicy::PublicRlContinuedMixed { .. }
+            | crate::replay::SeatPolicy::PublicRlCurrentMixedTradeGuard { .. }
     )
 }
 fn learner_slot<T>(seats: &[Option<T>]) -> Result<usize, String> {
