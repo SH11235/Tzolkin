@@ -30,6 +30,7 @@ const MAX_CANDIDATE_EVALUATIONS: usize = 10_000_000;
 const MAX_SOURCE_MOVE: usize = 100_000;
 const MAX_MODE_BYTES: usize = 128;
 const CAPTURE_SCHEMA: &str = "tzolkin-bga-public-initial-selection-observation-v1";
+const DOM_CAPTURE_SCHEMA: &str = "tzolkin-bga-dom-witness-v1";
 const SELECTION_PROMPT: &str = "あなたは初期財産タイルを2個選んでください";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -535,11 +536,7 @@ fn retained_panel<'a>(
 }
 fn own_panel<'a>(capture: &'a Value, actor: &str) -> Result<&'a str, String> {
     let wanted = format!("player_wealthtiles_{actor}");
-    let retained = retained_panel(
-        text(capture, "gameAreaHtml")?,
-        &wanted,
-        Some("player_wealthtiles"),
-    )?;
+    let retained = retained_panel(choice_area(capture)?, &wanted, Some("player_wealthtiles"))?;
     if let Some(panels) = capture["selectedPlayerTiles"].as_array() {
         let matching: Vec<_> = panels
             .iter()
@@ -556,6 +553,21 @@ fn own_panel<'a>(capture: &'a Value, actor: &str) -> Result<&'a str, String> {
     Ok(retained)
 }
 fn move_number(capture: &Value) -> Result<usize, String> {
+    if capture["schema"].as_str() == Some(DOM_CAPTURE_SCHEMA) {
+        let id = archive_url(text(capture, "url")?)?;
+        let lines: Vec<_> = text(capture, "tableInfos")?.lines().collect();
+        if lines.len() != 3
+            || lines[0] != format!("Table #{}", id.table)
+            || lines[2] != "Progression 0%"
+        {
+            return Err("Initial DOM table/move metadata mismatch".into());
+        }
+        return lines[1]
+            .strip_prefix("Move #")
+            .ok_or("Missing replay move")?
+            .parse()
+            .map_err(|_| "Invalid replay move".into());
+    }
     text(capture, "move")?
         .strip_prefix("Move #")
         .ok_or("Missing replay move")?
@@ -587,28 +599,232 @@ fn capture_time(capture: &Value) -> Result<&str, String> {
 }
 
 type Atlas = BTreeMap<(String, [i64; 2]), String>;
+fn choice_area(capture: &Value) -> Result<&str, String> {
+    text(
+        capture,
+        if capture["schema"].as_str() == Some(DOM_CAPTURE_SCHEMA) {
+            "interfaceHtml"
+        } else {
+            "gameAreaHtml"
+        },
+    )
+}
+fn dom_roster(capture: &Value) -> Result<BTreeSet<String>, String> {
+    let html = text(capture, "playerBoardsHtml")?;
+    if retained_panel(html, "player_boards", None)? != html {
+        return Err("Detached initial DOM player boards".into());
+    }
+    let mut names = BTreeSet::new();
+    let mut boards = BTreeSet::new();
+    let mut overall = BTreeSet::new();
+    for tag in HtmlTags::new(html) {
+        let tag = tag?;
+        if tag.closing {
+            continue;
+        }
+        let Some(id) = optional_attribute(tag.opening, "id")? else {
+            continue;
+        };
+        if let Some(suffix) = id.strip_prefix("player_board_inner_") {
+            if tag.name != "div"
+                || suffix.is_empty()
+                || !suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+            {
+                return Err("Invalid initial DOM sidebar wrapper".into());
+            }
+            continue;
+        }
+        for (prefix, ids) in [
+            ("player_name_", &mut names),
+            ("player_board_", &mut boards),
+            ("overall_player_board_", &mut overall),
+        ] {
+            if let Some(actor) = id.strip_prefix(prefix)
+                && (tag.name != "div" || !ids.insert(decimal(actor)?))
+            {
+                return Err("Duplicate/invalid initial DOM player identity".into());
+            }
+        }
+    }
+    if !(3..=4).contains(&names.len()) || names != boards || names != overall {
+        return Err("Incomplete initial DOM player roster".into());
+    }
+    for actor in &names {
+        let panel = retained_panel(html, &format!("overall_player_board_{actor}"), None)?;
+        retained_panel(panel, &format!("player_name_{actor}"), None)?;
+        retained_panel(panel, &format!("player_board_{actor}"), None)?;
+    }
+    Ok(names)
+}
+
+// This schema retained DOM and computed tile metadata, not a visibility flag.
+// Validate those original witnesses directly; never manufacture an observed flag.
+fn validate_dom_capture(capture: &Value, roster: &BTreeSet<String>) -> Result<String, String> {
+    let fields = [
+        "schema",
+        "capturedAt",
+        "url",
+        "title",
+        "prompt",
+        "day",
+        "tableInfos",
+        "boardHtml",
+        "interfaceHtml",
+        "playerBoardsHtml",
+        "wealthTiles",
+        "markers",
+        "workers",
+    ];
+    if capture.as_object().is_none_or(|object| {
+        object.len() != fields.len() || fields.iter().any(|field| !object.contains_key(*field))
+    }) {
+        return Err("Missing/unknown initial DOM capture field".into());
+    }
+    let area = choice_area(capture)?;
+    if text(capture, "day")? != "1"
+        || retained_panel(area, "tzolkin-interface", None)? != area
+        || retained_panel(area, "board", None)? != text(capture, "boardHtml")?
+    {
+        return Err("Detached/noninitial DOM board".into());
+    }
+    let mut stack: Vec<Option<&str>> = Vec::new();
+    let mut tiles = BTreeMap::new();
+    let mut owners = BTreeSet::new();
+    for tag in HtmlTags::new(area) {
+        let tag = tag?;
+        if tag.name != "div" {
+            if !tag.closing
+                && (optional_attribute(tag.opening, "id")?.is_some_and(|id| {
+                    id.starts_with("wealth_tile_") || id.starts_with("player_wealthtiles_")
+                }) || optional_attribute(tag.opening, "class")?
+                    .is_some_and(|v| v.split_whitespace().any(|c| c == "wealth_tile")))
+            {
+                return Err("Initial DOM wealth node is not a retained div".into());
+            }
+            continue;
+        }
+        if tag.closing {
+            stack.pop().ok_or("Unbalanced initial DOM div")?;
+            continue;
+        }
+        let id = optional_attribute(tag.opening, "id")?;
+        if let Some(actor) = id.and_then(|id| id.strip_prefix("player_wealthtiles_"))
+            && (!roster.contains(actor)
+                || !owners.insert(actor.to_owned())
+                || stack
+                    .iter()
+                    .flatten()
+                    .any(|id| id.starts_with("player_wealthtiles_"))
+                || !attribute(tag.opening, "class")?
+                    .split_whitespace()
+                    .any(|c| c == "player_wealthtiles"))
+        {
+            return Err("Foreign/duplicate initial DOM selected-player panel".into());
+        }
+        if id.is_some_and(|id| id.starts_with("wealth_tile_"))
+            || optional_attribute(tag.opening, "class")?
+                .is_some_and(|v| v.split_whitespace().any(|c| c == "wealth_tile"))
+        {
+            let parsed = tile(tag.opening, false)?;
+            let parent = stack
+                .last()
+                .copied()
+                .flatten()
+                .ok_or("Unowned initial DOM tile")?;
+            if parent != "wealth_tiles"
+                && !parent
+                    .strip_prefix("player_wealthtiles_")
+                    .is_some_and(|actor| roster.contains(actor))
+            {
+                return Err("Foreign initial DOM tile parent".into());
+            }
+            if tiles
+                .insert(parsed.id.clone(), (parsed, parent, tag.opening))
+                .is_some()
+            {
+                return Err("Duplicate initial DOM tile".into());
+            }
+        }
+        stack.push(id);
+    }
+    let declared = array(capture, "wealthTiles")?;
+    if !stack.is_empty() || owners != *roster || declared.len() != tiles.len() {
+        return Err("Incomplete initial DOM panels/tiles".into());
+    }
+    let mut seen = BTreeSet::new();
+    let mut asset_release = None;
+    for witness in declared {
+        if witness.as_object().is_none_or(|object| {
+            object.len() != 6
+                || [
+                    "id",
+                    "parent",
+                    "class",
+                    "style",
+                    "backgroundImage",
+                    "backgroundPosition",
+                ]
+                .iter()
+                .any(|field| !object.contains_key(*field))
+        }) {
+            return Err("Missing/unknown initial DOM tile field".into());
+        }
+        let id = text(witness, "id")?;
+        let (parsed, parent, opening) = tiles.get(id).ok_or("Detached initial DOM tile witness")?;
+        let image = text(witness, "backgroundImage")?
+            .strip_prefix(
+                "url(\"https://x.boardgamearena.net/data/themereleases/current/games/tzolkin/",
+            )
+            .and_then(|s| s.strip_suffix("/img/wealth_tiles.png\")"))
+            .ok_or("Unsupported initial DOM wealth asset")?;
+        release(image)?;
+        if !seen.insert(id)
+            || text(witness, "parent")? != *parent
+            || text(witness, "class")? != attribute(opening, "class")?
+            || text(witness, "style")? != attribute(opening, "style")?
+            || sprite(&format!(
+                "background-position: {};",
+                text(witness, "backgroundPosition")?
+            ))? != parsed.sprite
+            || asset_release.is_some_and(|prior| prior != image)
+        {
+            return Err("Conflicting initial DOM tile metadata".into());
+        }
+        asset_release = Some(image);
+    }
+    asset_release
+        .map(str::to_owned)
+        .ok_or_else(|| "Missing initial DOM wealth tiles".into())
+}
+
 fn decode_choice(
     before: &Value,
     after: &Value,
     atlas: &Atlas,
 ) -> Result<(ArchiveIdentity, InitialChoiceInput, usize, usize), String> {
-    if text(before, "schema")? != CAPTURE_SCHEMA
-        || text(after, "schema")? != CAPTURE_SCHEMA
-        || text(before, "header")? != SELECTION_PROMPT
+    let dom = text(before, "schema")? == DOM_CAPTURE_SCHEMA;
+    if (!dom && text(before, "schema")? != CAPTURE_SCHEMA)
+        || text(after, "schema")? != text(before, "schema")?
+        || text(before, if dom { "prompt" } else { "header" })? != SELECTION_PROMPT
         || capture_time(before)? >= capture_time(after)?
     {
         return Err("Unsupported initial-choice capture/instruction".into());
     }
     let id = archive_url(text(before, "url")?)?;
     if archive_url(text(after, "url")?)? != id
-        || identity(&before["viewPlayerId"])? != id.player
+        || (!dom && identity(&before["viewPlayerId"])? != id.player)
         || (!after["viewPlayerId"].is_null() && identity(&after["viewPlayerId"])? != id.player)
         || (!before["tableId"].is_null() && identity(&before["tableId"])? != id.table)
         || (!after["tableId"].is_null() && identity(&after["tableId"])? != id.table)
     {
         return Err("Initial-choice actor/table/archive mismatch".into());
     }
-    let names = array(before, "playerPanels")?;
+    let dom_names = dom.then(|| dom_roster(before)).transpose()?;
+    let names = if dom {
+        &[][..]
+    } else {
+        array(before, "playerPanels")?
+    };
     let roster: BTreeSet<_> = names
         .iter()
         .map(|p| {
@@ -618,11 +834,17 @@ fn decode_choice(
                 .and_then(decimal)
         })
         .collect::<Result<_, _>>()?;
-    if !(3..=4).contains(&names.len())
-        || roster.len() != names.len()
+    let roster = dom_names.unwrap_or(roster);
+    if (!dom && (!(3..=4).contains(&names.len()) || roster.len() != names.len()))
         || !roster.contains(&id.player)
     {
         return Err("Initial-choice roster is not unique 3-4p".into());
+    }
+    if dom
+        && (dom_roster(after)? != roster
+            || validate_dom_capture(before, &roster)? != validate_dom_capture(after, &roster)?)
+    {
+        return Err("Initial DOM roster/asset release changed".into());
     }
     let before_move = move_number(before)?;
     let after_move = move_number(after)?;
@@ -633,12 +855,34 @@ fn decode_choice(
     {
         return Err("Choice was not witnessed before selection".into());
     }
-    let offers = array(before, "offers")?;
+    let area = choice_area(before)?;
+    let offer_area = if dom {
+        retained_panel(area, "wealth_tiles", None)?
+    } else {
+        text(before, "wealthTilesHtml")?
+    };
+    let mut dom_offers = Vec::new();
+    if dom {
+        for tag in HtmlTags::new(offer_area) {
+            let tag = tag?;
+            if !tag.closing
+                && optional_attribute(tag.opening, "id")?
+                    .is_some_and(|id| id.starts_with("wealth_tile_"))
+            {
+                let parsed = tile(tag.opening, true)?;
+                let html = retained_panel(offer_area, &parsed.id, None)?;
+                dom_offers.push(serde_json::json!({"id":parsed.id,"html":html}));
+            }
+        }
+    }
+    let offers: &[Value] = if dom {
+        &dom_offers
+    } else {
+        array(before, "offers")?
+    };
     if offers.len() != 4 {
         return Err("Four offered faces required".into());
     }
-    let area = text(before, "gameAreaHtml")?;
-    let offer_area = text(before, "wealthTilesHtml")?;
     if retained_panel(area, "wealth_tiles", None)? != offer_area {
         return Err("Declared offer panel differs from retained game DOM".into());
     }
@@ -653,7 +897,7 @@ fn decode_choice(
             return Err("Expected retained offered div".into());
         }
         let parsed = tile(tag.opening, true)?;
-        if offer["visible"].as_bool() != Some(true)
+        if (!dom && offer["visible"].as_bool() != Some(true))
             || text(offer, "id")? != parsed.id
             || html[tag.end..].trim() != "</div>"
             || !area.contains(html)
@@ -685,10 +929,13 @@ fn decode_choice(
             .map_err(|_| "Four catalog faces required")?,
     )?;
     let chosen_panel = own_panel(after, &id.player)?;
-    if !text(after, "gameAreaHtml")?.contains(chosen_panel) {
+    if !choice_area(after)?.contains(chosen_panel) {
         return Err("Chosen panel differs from retained game DOM".into());
     }
     let chosen = panel_tiles(chosen_panel)?;
+    if dom && chosen.iter().any(|tile| tile.active) {
+        return Err("Initial DOM selected tiles remain active offers".into());
+    }
     if chosen.len() != 2 || chosen[0].id == chosen[1].id {
         return Err("Exactly two distinct selected tiles required".into());
     }
@@ -1746,6 +1993,88 @@ mod tests {
                 assert!((f64::from(changed) - f64::from(old)).abs() <= f64::from(limit));
             }
         }
+    }
+    #[test]
+    fn dom_choice_uses_complete_retained_offers_and_own_pair_without_visibility_flags() {
+        let release = "000000-0000";
+        let asset = "000001-0000";
+        let styles = [[0, 0], [-60, 0], [-120, 0], [-180, 0]];
+        let make_tile = |index: usize, active: bool| {
+            let [x, y] = styles[index];
+            format!(
+                "<div id=\"wealth_tile_{}\" class=\"wealth_tile{}\" style=\"background-position: {x}px {y}px;\"></div>",
+                index + 1,
+                if active { " active" } else { "" }
+            )
+        };
+        let roster = ["100", "101", "102", "103"];
+        let boards = format!(
+            "<div id=\"player_boards\">{}</div>",
+            roster.iter().map(|id| format!("<div id=\"overall_player_board_{id}\"><div id=\"player_board_inner_{id}\"><div id=\"player_name_{id}\"></div><div id=\"player_board_{id}\"></div></div></div>")).collect::<String>()
+        );
+        let capture = |after: bool| {
+            let board = if after {
+                "<div id=\"board\"></div>".into()
+            } else {
+                format!(
+                    "<div id=\"board\"><div id=\"wealth_tiles\">{}</div></div>",
+                    (0..4).map(|i| make_tile(i, true)).collect::<String>()
+                )
+            };
+            let panels = roster.iter().map(|id| {
+                let tiles = if after && *id == "100" { format!("{}{}", make_tile(1, false), make_tile(3, false)) } else { String::new() };
+                format!("<div id=\"player_wealthtiles_{id}\" class=\"player_wealthtiles\">{tiles}</div>")
+            }).collect::<String>();
+            let indices = if after { vec![1, 3] } else { vec![0, 1, 2, 3] };
+            let tiles: Vec<_> = indices.into_iter().map(|i| {
+                let [x, y] = styles[i];
+                serde_json::json!({"id":format!("wealth_tile_{}",i+1),"parent":if after {"player_wealthtiles_100"} else {"wealth_tiles"},"class":if after {"wealth_tile"} else {"wealth_tile active"},"style":format!("background-position: {x}px {y}px;"),"backgroundPosition":format!("{x}px {y}px"),"backgroundImage":format!("url(\"https://x.boardgamearena.net/data/themereleases/current/games/tzolkin/{asset}/img/wealth_tiles.png\")")})
+            }).collect();
+            serde_json::json!({"schema":DOM_CAPTURE_SCHEMA,"capturedAt":if after {"2000-01-01T00:00:01.000Z"} else {"2000-01-01T00:00:00.000Z"},"url":format!("https://boardgamearena.com/archive/replay/{release}/?table=123&player=100&comments="),"title":"synthetic","prompt":if after {"next player"} else {SELECTION_PROMPT},"day":"1","tableInfos":format!("Table #123\nMove #{}\nProgression 0%",if after {5} else {3}),"boardHtml":board,"interfaceHtml":format!("<div id=\"tzolkin-interface\">{board}{panels}</div>"),"playerBoardsHtml":boards,"wealthTiles":tiles,"markers":[],"workers":[]})
+        };
+        let before = capture(false);
+        let after = capture(true);
+        let atlas: Atlas = styles
+            .into_iter()
+            .zip(["w10", "w12", "w06", "w04"])
+            .map(|(sprite, id)| ((release.into(), sprite), id.into()))
+            .collect();
+        let (_, input, chosen, count) = decode_choice(&before, &after, &atlas).unwrap();
+        assert_eq!((chosen, count, input.candidates().len()), (4, 4, 6));
+        assert_eq!(input.offers(), &["w10", "w12", "w06", "w04"]);
+        for mutation in 0..6 {
+            let mut before = before.clone();
+            let mut after = after.clone();
+            match mutation {
+                0 => {
+                    before["wealthTiles"].as_array_mut().unwrap().pop();
+                }
+                1 => before["wealthTiles"][0]["backgroundPosition"] = "-999px 0px".into(),
+                2 => {
+                    before["interfaceHtml"] = before["interfaceHtml"]
+                        .as_str()
+                        .unwrap()
+                        .replace("player_wealthtiles_103", "player_wealthtiles_999")
+                        .into()
+                }
+                3 => {
+                    after["interfaceHtml"] = after["interfaceHtml"]
+                        .as_str()
+                        .unwrap()
+                        .replace("wealth_tile_4", "wealth_tile_9")
+                        .into();
+                    after["wealthTiles"][1]["id"] = "wealth_tile_9".into();
+                }
+                4 => after["tableInfos"] = "Table #999\nMove #5\nProgression 0%".into(),
+                5 => before["offers"] = serde_json::json!([]),
+                _ => unreachable!(),
+            }
+            assert!(
+                decode_choice(&before, &after, &atlas).is_err(),
+                "mutation {mutation}"
+            );
+        }
+        assert!(decode_choice(&before, &after, &BTreeMap::new()).is_err());
     }
     #[test]
     fn source_decoder_refuses_unknown_release_sprite_subset_and_poststate_inputs() {
