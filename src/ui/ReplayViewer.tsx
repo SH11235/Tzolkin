@@ -8,8 +8,8 @@ import './ReplayViewer.css';
 
 const missingReasonLabels: Record<string, string> = {
   'record ends before the game finished': '記録が終局より前で終わっています。',
-  'observed terminal scores/ranks have not been matched':
-    '元対局の最終得点・順位を照合できていません。',
+  'exact terminal score/rank checkpoint was not provided':
+    '最終得点・順位の厳密なチェックポイントがありません。',
   'full observed initial/food-day board checkpoints are not all covered':
     '初期盤面と各食料日の盤面に、照合できていない項目があります。',
 };

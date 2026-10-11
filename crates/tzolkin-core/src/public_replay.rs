@@ -1105,7 +1105,7 @@ pub fn verify_public_replay(record: &PublicReplayRecord) -> Result<PublicReplayR
         missing_reasons.push("record ends before the game finished".into());
     }
     if !terminal_matched {
-        missing_reasons.push("observed terminal scores/ranks have not been matched".into());
+        missing_reasons.push("exact terminal score/rank checkpoint was not provided".into());
     }
     if !source_coverage.complete {
         missing_reasons
