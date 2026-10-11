@@ -605,7 +605,7 @@ pub struct CurrentMixedOwnCounts {
     pub singletons: u64,
 }
 
-/// Resolved whole-four cohorts in one local segment. Missing counts mean that
+/// Resolved whole-four cohorts. Missing counts mean that
 /// no GradientStart was saved, not that the cohort had zero learner callbacks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -628,7 +628,7 @@ impl CurrentMixedResolvedOwnCounts {
     }
 }
 
-/// Output-only local counters. Only Updated contributes to the updated bucket;
+/// Output-only resolved counters. Only Updated contributes to the updated bucket;
 /// NoChange, failed and abandoned cohorts never imply an admitted numeric step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -637,6 +637,34 @@ pub struct CurrentMixedOwnDecisionCounters {
     pub no_change: CurrentMixedResolvedOwnCounts,
     pub failed: CurrentMixedResolvedOwnCounts,
     pub abandoned: CurrentMixedResolvedOwnCounts,
+}
+impl CurrentMixedOwnDecisionCounters {
+    fn checked_add(self, other: Self) -> Result<Self, String> {
+        fn bucket(
+            a: CurrentMixedResolvedOwnCounts,
+            b: CurrentMixedResolvedOwnCounts,
+        ) -> Result<CurrentMixedResolvedOwnCounts, String> {
+            let sum = |a: u64, b: u64| {
+                a.checked_add(b)
+                    .ok_or_else(|| "Cumulative current mixed own counters overflow".to_owned())
+            };
+            Ok(CurrentMixedResolvedOwnCounts {
+                cohorts: sum(a.cohorts, b.cohorts)?,
+                cohorts_without_counts: sum(a.cohorts_without_counts, b.cohorts_without_counts)?,
+                own: CurrentMixedOwnCounts {
+                    callbacks: sum(a.own.callbacks, b.own.callbacks)?,
+                    candidate_rows: sum(a.own.candidate_rows, b.own.candidate_rows)?,
+                    singletons: sum(a.own.singletons, b.own.singletons)?,
+                },
+            })
+        }
+        Ok(Self {
+            updated: bucket(self.updated, other.updated)?,
+            no_change: bucket(self.no_change, other.no_change)?,
+            failed: bucket(self.failed, other.failed)?,
+            abandoned: bucket(self.abandoned, other.abandoned)?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1479,6 +1507,18 @@ impl<'a> CurrentMixedTrainingSession<'a> {
     }
     pub fn reserved_families(&self) -> &BTreeSet<String> {
         &self.progress.consumed
+    }
+    /// Resolved learner-own totals across this session's genuine journal chain.
+    /// Imported original training and unresolved counts are not credited. Semantic
+    /// restore rebuilds the totals from predecessor reducers; reading them performs
+    /// no I/O or policy admission and does not change local status serialization.
+    pub fn cumulative_own_decisions(&self) -> Result<CurrentMixedOwnDecisionCounters, String> {
+        self.segment
+            .as_ref()
+            .map_or(CurrentMixedOwnDecisionCounters::default(), |s| {
+                s.inherited_own
+            })
+            .checked_add(self.progress.own_decisions)
     }
     /// Latest resolved local receipt, retained while a later attempt is pending.
     /// Reading this output metadata performs no archive scan or policy admission.
@@ -2602,6 +2642,86 @@ mod tests {
         }
         r
     }
+    fn cumulative_own_fixture() -> CurrentMixedOwnDecisionCounters {
+        let bucket = |n| CurrentMixedResolvedOwnCounts {
+            cohorts: n + 1,
+            cohorts_without_counts: n,
+            own: CurrentMixedOwnCounts {
+                callbacks: n * 10,
+                candidate_rows: n * 20,
+                singletons: n * 2,
+            },
+        };
+        CurrentMixedOwnDecisionCounters {
+            updated: bucket(1),
+            no_change: bucket(2),
+            failed: bucket(3),
+            abandoned: bucket(4),
+        }
+    }
+    #[test]
+    fn current_mixed_cumulative_own_decisions_keep_all_buckets_and_missing_counts() {
+        let inherited = cumulative_own_fixture();
+        let mut local = CurrentMixedOwnDecisionCounters::default();
+        let counts = CurrentMixedOwnCounts {
+            callbacks: 7,
+            candidate_rows: 21,
+            singletons: 2,
+        };
+        local.updated.add(Some(counts));
+        local.no_change.add(None);
+        local.failed.add(Some(counts));
+        local.abandoned.add(None);
+        let total = inherited.checked_add(local).unwrap();
+        assert_eq!(total.updated.cohorts, 3);
+        assert_eq!(total.updated.cohorts_without_counts, 1);
+        assert_eq!(total.updated.own.callbacks, 17);
+        assert_eq!(total.updated.own.candidate_rows, 41);
+        assert_eq!(total.updated.own.singletons, 4);
+        assert_eq!(total.no_change.cohorts, 4);
+        assert_eq!(total.no_change.cohorts_without_counts, 3);
+        assert_eq!(total.no_change.own, inherited.no_change.own);
+        assert_eq!(total.failed.cohorts, 5);
+        assert_eq!(total.failed.cohorts_without_counts, 3);
+        assert_eq!(total.failed.own.callbacks, 37);
+        assert_eq!(total.failed.own.candidate_rows, 81);
+        assert_eq!(total.failed.own.singletons, 8);
+        assert_eq!(total.abandoned.cohorts, 6);
+        assert_eq!(total.abandoned.cohorts_without_counts, 5);
+        assert_eq!(total.abandoned.own, inherited.abandoned.own);
+        assert_eq!(local.checked_add(inherited).unwrap(), total);
+        assert_eq!(total.checked_add(Default::default()).unwrap(), total);
+    }
+    #[test]
+    fn current_mixed_cumulative_own_decisions_refuse_each_counter_overflow() {
+        for bucket_index in 0..4 {
+            for field_index in 0..5 {
+                let mut inherited = cumulative_own_fixture();
+                let bucket = [
+                    &mut inherited.updated,
+                    &mut inherited.no_change,
+                    &mut inherited.failed,
+                    &mut inherited.abandoned,
+                ]
+                .into_iter()
+                .nth(bucket_index)
+                .unwrap();
+                *[
+                    &mut bucket.cohorts,
+                    &mut bucket.cohorts_without_counts,
+                    &mut bucket.own.callbacks,
+                    &mut bucket.own.candidate_rows,
+                    &mut bucket.own.singletons,
+                ][field_index] = u64::MAX;
+                assert!(inherited.checked_add(cumulative_own_fixture()).is_err());
+                assert!(cumulative_own_fixture().checked_add(inherited).is_err());
+                assert_eq!(
+                    inherited.checked_add(Default::default()).unwrap(),
+                    inherited
+                );
+            }
+        }
+    }
     #[test]
     fn current_mixed_own_decision_counts_follow_resolve_and_restore() {
         let (_, mut spec, template) = reserved();
@@ -2772,6 +2892,29 @@ mod tests {
             assert_eq!(restored.unknown_work, progress.unknown_work);
             assert_eq!(restored.consumed, progress.consumed);
             assert_eq!(restored.next, progress.next);
+            let inherited = cumulative_own_fixture();
+            let cumulative = inherited.checked_add(progress.own_decisions).unwrap();
+            assert_eq!(
+                inherited.checked_add(restored.own_decisions).unwrap(),
+                cumulative
+            );
+            // A successor starts a new local reducer; its inherited totals are
+            // taken from the resolved predecessor, never from its pending counts.
+            let mut next = Progress::initial(
+                &continued_parent(&progress),
+                progress.prefix,
+                progress.next,
+                &progress.consumed,
+            );
+            next.base = progress.parent_count().unwrap();
+            assert_eq!(
+                next.own_decisions,
+                CurrentMixedOwnDecisionCounters::default()
+            );
+            assert_eq!(
+                cumulative.checked_add(next.own_decisions).unwrap(),
+                cumulative
+            );
             assert_eq!(
                 initial().own_decisions,
                 CurrentMixedOwnDecisionCounters::default()
