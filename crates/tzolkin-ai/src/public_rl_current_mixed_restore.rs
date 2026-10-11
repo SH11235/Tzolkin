@@ -19,6 +19,11 @@ pub enum CurrentMixedRestoreStep<'s> {
         spec: CurrentMixedSegmentSpec,
         tip: CurrentMixedRestoreTip<'s>,
     },
+    /// Explicit Ready-only extension of an established global contract.
+    BudgetAmendment {
+        spec: CurrentMixedSegmentSpec,
+        tip: CurrentMixedRestoreTip<'s>,
+    },
     GuardedPoolFork {
         spec: CurrentMixedSegmentSpec,
         old_pool: &'s CurrentMixedCollectionSpec,
@@ -51,6 +56,7 @@ pub(super) fn check_chain_tips<'s>(
     }
     let tips = std::iter::once(initial).chain(steps.iter().map(|step| match step {
         CurrentMixedRestoreStep::Segment { tip, .. }
+        | CurrentMixedRestoreStep::BudgetAmendment { tip, .. }
         | CurrentMixedRestoreStep::GuardedPoolFork { tip, .. } => tip,
     }));
     for tip in tips {
@@ -163,6 +169,9 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             session = match step {
                 CurrentMixedRestoreStep::Segment { spec, tip } => {
                     session.restore_chain_segment(spec, tip.head_raw, tip.directory)?
+                }
+                CurrentMixedRestoreStep::BudgetAmendment { spec, tip } => {
+                    session.restore_chain_budget_amendment(spec, tip.head_raw, tip.directory)?
                 }
                 CurrentMixedRestoreStep::GuardedPoolFork {
                     spec,
