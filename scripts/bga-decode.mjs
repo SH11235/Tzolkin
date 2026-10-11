@@ -883,8 +883,36 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         const gross = (context.effects[key] ?? 0) + Math.max(0, delta + knownCost);
         if (gross - (context.claims[key] ?? 0) !== amount) return false;
       }
-      // This source contains no further operation. Only an already settled trial
-      // can be compared with its own end checkpoint; unresolved tasks are excluded.
+      // A witnessed remaining Build can be the original decremented continuation.
+      // The unchanged queue excludes nested card choices whose effects are not settled.
+      // Only the actor's directly observed counters constrain this pending purchase.
+      const beforePending = state().pending;
+      const nextPending = outcome.frame.snapshot.state.pending;
+      const observedPlayers = witness.expected?.players;
+      const observedPlayer = observedPlayers?.[actor];
+      if (
+        event.kind === 'build' &&
+        task === 'build' &&
+        witness.pendingTask === 'build' &&
+        beforePending?.task?.type === 'build' &&
+        Number.isSafeInteger(beforePending.task.remaining) &&
+        beforePending.task.remaining > 1 &&
+        nextPending?.task?.type === 'build' &&
+        nextPending.task.remaining === beforePending.task.remaining - 1 &&
+        Array.isArray(beforePending.after) &&
+        Array.isArray(nextPending.after) &&
+        same(beforePending.after, nextPending.after) &&
+        Array.isArray(observedPlayers) &&
+        observedPlayers.length === state().players.length &&
+        object(observedPlayer?.resources) &&
+        Number.isSafeInteger(observedPlayer.resources.corn) &&
+        observedPlayer.resources.corn >= 0 &&
+        Number.isFinite(observedPlayer.score)
+      )
+        return (
+          matches(next.resources, observedPlayer.resources) && next.score === observedPlayer.score
+        );
+      // Other unresolved tasks cannot use an end board to infer an earlier choice.
       return (
         task !== null ||
         !witness.expected ||
