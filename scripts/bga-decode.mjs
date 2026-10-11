@@ -2693,7 +2693,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             const leaderScore = body.match(
               /^は(chaac|quetzalcoatl|kukulkan|kukulcan)の信仰が一番高い(?:うちの一人なので、半分の点を獲得した: (\d+)点|ので、(\d+)点を獲得した)$/,
             );
-            const trackScore = body.match(/^は信仰により(\d+)点を獲得した$/);
+            const trackScore = body.match(/^は信仰により(-?\d+)点を獲得した$/);
             if (body === 'は再び歯車を高速化する権利を得た') {
               if (event.iconResources.length)
                 fail('Double-advance rights caption requires icon-free evidence');
@@ -2828,7 +2828,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 context.foodScoreClaims.has(key)
               )
                 fail('Food-day score caption has no unique matching core scoring receipt');
-              automatic(event, 'score', amount);
+              if (amount < 0) {
+                const receipt = context.feeding.find((value) => value.actor === actor);
+                if (!receipt || unclaimed(event, 'score', -1) - receipt.penalty < -amount)
+                  fail('Food-day temple loss is not established separately from feeding penalties');
+              }
+              automatic(event, 'score', Math.abs(amount), amount < 0 ? -1 : 1);
               context.foodScoreClaims.add(key);
             } else if (event.rawText === '建物が第2世代になりました') {
               if (
