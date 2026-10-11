@@ -341,6 +341,184 @@ function inputs(value) {
   value.control.rawLog = pin(raw);
   return [capture, atlas, raw, bytes(value.control)];
 }
+function legacyFixture() {
+  const value = fixture(4);
+  const modern = value.capture;
+  const playerPanels = value.control.seatOrder.flatMap((id, index) => {
+    const name = element(
+      'div',
+      `player_name_${id}`,
+      `<a style="color: #008000">${'ABCD'[index]}</a>`,
+    );
+    const board = element(
+      'div',
+      `player_board_${id}`,
+      element('span', `player_score_${id}`, '0') +
+        modern.publicCounters
+          .filter((counter) => counter.id.endsWith(`_${id}`))
+          .map((counter) => counter.html)
+          .join('') +
+        element('div', `firstplayer_${id}`, index === 0 ? element('div', 'firstplayer') : ''),
+    );
+    return [
+      {
+        id: `player_board_inner_${id}`,
+        html: element('div', `player_board_inner_${id}`, name + board),
+      },
+      { id: `player_board_${id}`, html: board },
+    ];
+  });
+  value.capture = {
+    schema: 'tzolkin-bga-public-initial-selection-observation-v1',
+    url: modern.url,
+    move: modern.move,
+    header: modern.header,
+    roundsText: modern.roundsText,
+    gameAreaHtml: modern.gameAreaHtml,
+    selectedPlayerTiles: modern.selectedPlayerTiles.map(({ id, html }) => ({ id, html })),
+    playerPanels,
+    wealthTilesHtml: null,
+    trainingReady: false,
+  };
+  return value;
+}
+
+test('legacy nested initial panels project only consistent retained state with unknown options', () => {
+  const value = legacyFixture();
+  const projected = projectCapturedInitial(...inputs(value));
+  assert.deepEqual(projected.record, projectCapturedInitial(...inputs(fixture(4))).record);
+  assert.equal(
+    projected.provenance.captureAdapter.schema,
+    'tzolkin-bga-legacy-initial-capture-adapter-v1',
+  );
+  assert.equal(projected.provenance.captureAdapter.visibilityVerified, false);
+  assert.equal(projected.provenance.captureAdapter.geometryVerified, false);
+  assert.deepEqual(projected.provenance.sourceOptions, {
+    tribes: null,
+    prophecies: null,
+    additionalBuildings: null,
+    quickActions: null,
+    marketLimit: null,
+  });
+  for (const field of [
+    'sourceAuthenticated',
+    'coreInitialVerified',
+    'fullGameReplayed',
+    'strictHumanQualification',
+    'policyTrainingReady',
+    'valueTrainingReady',
+  ])
+    assert.equal(projected.provenance[field], false);
+});
+
+test('legacy panels refuse conflicting duplicates, missing state and foreign identities', () => {
+  for (const [label, mutate, pattern] of [
+    [
+      'duplicate conflict',
+      (v) => {
+        v.capture.playerPanels[1].html = v.capture.playerPanels[1].html.replace('>8<', '>9<');
+      },
+      /Conflicting duplicate/,
+    ],
+    [
+      'missing name',
+      (v) => {
+        v.capture.playerPanels = v.capture.playerPanels.filter(
+          (p) => p.id.startsWith('player_board_') && !p.id.startsWith('player_board_inner_'),
+        );
+      },
+      /Missing legacy player name/,
+    ],
+    [
+      'missing counter',
+      (v) => {
+        for (const p of v.capture.playerPanels)
+          p.html = p.html.replace(element('span', 'corn_number_player_100', '8'), '');
+      },
+      /Incomplete player setup fields/,
+    ],
+    [
+      'foreign counter',
+      (v) => {
+        v.capture.playerPanels[0].html = v.capture.playerPanels[0].html.replace(
+          'corn_number_player_100',
+          'corn_number_player_999',
+        );
+      },
+      /crosses player identity/,
+    ],
+    [
+      'discarded first-player token',
+      (v) => {
+        v.capture.playerPanels[2].html = v.capture.playerPanels[2].html.replace(
+          '<div id="player_board_200">',
+          `${element('div', 'firstplayer')}<div id="player_board_200">`,
+        );
+      },
+      /setup node outside retained board\/name/,
+    ],
+    [
+      'missing selection',
+      (v) => {
+        v.capture.selectedPlayerTiles.pop();
+      },
+      /Incomplete legacy selected/,
+    ],
+    [
+      'detached selection',
+      (v) => {
+        v.capture.selectedPlayerTiles[0].html += ' ';
+      },
+      /detached legacy selected/,
+    ],
+    [
+      'foreign view',
+      (v) => {
+        v.capture.url = v.capture.url.replace('player=100', 'player=999');
+      },
+      /roster\/view mismatch/,
+    ],
+    [
+      'foreign table',
+      (v) => {
+        v.capture.url = v.capture.url.replace('table=123', 'table=124');
+      },
+      /boundary mismatch/,
+    ],
+    [
+      'foreign release',
+      (v) => {
+        v.capture.url = v.capture.url.replace('/fixture/', '/other/');
+      },
+      /release\/catalog mismatch/,
+    ],
+    [
+      'duplicate view',
+      (v) => {
+        v.capture.url += '&player=100';
+      },
+      /archive identity/,
+    ],
+    [
+      'unobserved geometry',
+      (v) => {
+        v.capture.gameAreaHtml += element('div', 'worker_999', '', ' class="worker worker_dummy"');
+      },
+      /lacks retained worker geometry/,
+    ],
+    [
+      'readiness claim',
+      (v) => {
+        v.capture.trainingReady = true;
+      },
+      /readiness mismatch/,
+    ],
+  ]) {
+    const value = legacyFixture();
+    mutate(value);
+    assert.throws(() => projectCapturedInitial(...inputs(value)), pattern, label);
+  }
+});
 function currentUi(value) {
   value.raw = {
     ...value.raw,

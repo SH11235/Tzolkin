@@ -12,6 +12,8 @@ export const PROJECTION_SCHEMA = 'tzolkin-bga-playing-projection-v1';
 export const CONTROL_SCHEMA = 'tzolkin-bga-playing-projection-control-v1';
 export const ATLAS_SCHEMA = 'tzolkin-bga-playing-atlas-v1';
 export const LATER_WITNESS_SCHEMA = 'tzolkin-bga-playing-later-witnesses-v1';
+const LEGACY_CAPTURE_SCHEMA = 'tzolkin-bga-public-initial-selection-observation-v1';
+const LEGACY_CAPTURE_ADAPTER = 'tzolkin-bga-legacy-initial-capture-adapter-v1';
 const CAPTURE_SCHEMAS = new Set([
   'tzolkin-bga-public-playing-initial-board-witness-v1',
   'tzolkin-bga-public-setup-complete-playing-board-v1',
@@ -309,6 +311,145 @@ function profile(value) {
   )
     fail('Unsupported mechanical profile');
   return structuredClone(value);
+}
+
+// This older capture retained nested sidebar panels rather than one board and
+// explicit node lists. Extract only the same captured markup; no rectangles,
+// option values or artwork identities are reconstructed.
+function legacyInitialCapture(capture) {
+  closed(
+    capture,
+    [
+      'schema',
+      'url',
+      'move',
+      'header',
+      'roundsText',
+      'gameAreaHtml',
+      'playerPanels',
+      'selectedPlayerTiles',
+    ],
+    'legacy capture',
+    ['capturedAt', 'title', 'wealthTilesHtml', 'normalNextClicksSinceRestart', 'trainingReady'],
+  );
+  const url = urlIdentity(capture.url);
+  if (
+    !/^\/archive\/replay\/[A-Za-z0-9_-]{1,64}\/$/.test(url.pathname) ||
+    url.searchParams.getAll('player').length !== 1 ||
+    !/^\d+$/.test(url.searchParams.get('player') ?? '') ||
+    (capture.trainingReady !== undefined && capture.trainingReady !== false)
+  )
+    fail('Legacy capture archive identity/readiness mismatch');
+  const panels = new Map();
+  for (const item of list(capture.playerPanels, 8, 'legacy player panels')) {
+    closed(item, ['id', 'html'], 'legacy player panel');
+    const tree = htmlTree(item.html, 'legacy player panel');
+    const root = byId(tree, item.id);
+    if (outer(tree, root) !== item.html) fail('Detached legacy player panel');
+    const board = one(
+      tree.nodes,
+      (node) => /^player_board_\d+$/.test(node.attrs.id ?? ''),
+      'legacy board',
+    );
+    const id = board.attrs.id.slice('player_board_'.length);
+    if (item.id !== board.attrs.id && !/^player_board_inner_[A-Za-z0-9]+$/.test(item.id))
+      fail('Unsupported legacy player panel ID');
+    const name = tree.ids.get(`player_name_${id}`);
+    for (const node of tree.nodes) {
+      const owner =
+        /^(?:(?:worker|corn|wood|stone|gold|skull)_number_player_|player_(?:name|score)_|firstplayer_|overall_player_board_)(\d+)$/.exec(
+          node.attrs.id ?? '',
+        )?.[1];
+      if (owner !== undefined && owner !== id) fail('Legacy player panel crosses player identity');
+      if (
+        (owner !== undefined || node.attrs.id === 'firstplayer') &&
+        ![board, name].some(
+          (range) => range !== undefined && node.start >= range.start && node.end <= range.end,
+        )
+      )
+        fail('Legacy setup node outside retained board/name');
+    }
+    const boardHtml = outer(tree, board);
+    const nameHtml = name === undefined ? null : outer(tree, name);
+    const prior = panels.get(id);
+    if (
+      prior &&
+      (prior.board !== boardHtml ||
+        (prior.name !== null && nameHtml !== null && prior.name !== nameHtml))
+    )
+      fail('Conflicting duplicate legacy player panel');
+    panels.set(id, { board: boardHtml, name: nameHtml ?? prior?.name ?? null });
+  }
+  if (![3, 4].includes(panels.size) || !panels.has(url.searchParams.get('player')))
+    fail('Legacy capture roster/view mismatch');
+  const tree = htmlTree(capture.gameAreaHtml, 'legacy game area');
+  const selected = list(capture.selectedPlayerTiles, 4, 'legacy selected panels');
+  const selectedIds = new Set();
+  for (const item of selected) {
+    closed(item, ['id', 'html'], 'legacy selected panel');
+    const id = /^player_wealthtiles_(\d+)$/.exec(item.id)?.[1];
+    if (!panels.has(id) || selectedIds.has(id) || item.html !== outer(tree, byId(tree, item.id)))
+      fail('Missing/conflicting/detached legacy selected panel');
+    selectedIds.add(id);
+  }
+  if (selectedIds.size !== panels.size) fail('Incomplete legacy selected panels');
+  for (const node of tree.nodes) {
+    const id = /^(?:marker_(\d+)_(?:temple|technology)_|player_wealthtiles_(\d+)$)/.exec(
+      node.attrs.id ?? '',
+    );
+    if (id && !panels.has(id[1] ?? id[2])) fail('Legacy board crosses player identity');
+  }
+  if (tree.nodes.some((node) => token(node, 'worker')))
+    fail('Legacy capture lacks retained worker geometry');
+  if (
+    capture.wealthTilesHtml != null &&
+    capture.wealthTilesHtml !== outer(tree, byId(tree, 'wealth_tiles'))
+  )
+    fail('Detached legacy starting offers');
+  // Generated list markers mean parsed retained elements, not observed CSS
+  // visibility. Conditional provenance below records that distinction.
+  const nodes = (predicate) =>
+    tree.nodes
+      .filter(predicate)
+      .map((node) => ({ id: node.attrs.id, html: outer(tree, node), visible: true }));
+  const playerBoardsHtml = [...panels]
+    .map(([id, panel]) => {
+      if (panel.name === null) fail('Missing legacy player name');
+      const boardTree = htmlTree(panel.board, 'legacy board');
+      return `<div id="overall_player_board_${id}">${boardTree.ids.has(`player_name_${id}`) ? '' : panel.name}${panel.board}</div>`;
+    })
+    .join('');
+  const boards = htmlTree(playerBoardsHtml, 'legacy player boards');
+  return {
+    ...capture,
+    tableId: url.searchParams.get('table'),
+    viewPlayerId: url.searchParams.get('player'),
+    playerBoardsHtml,
+    offerNodesRemaining: tree.nodes.filter(
+      (node) =>
+        token(node, 'wealth_tile') &&
+        !selected.some((item) => {
+          const panel = byId(tree, item.id);
+          return node.start > panel.start && node.end < panel.end;
+        }),
+    ).length,
+    publicCounters: boards.nodes
+      .filter((node) =>
+        /^(worker|corn|wood|stone|gold|skull)_number_player_\d+$/.test(node.attrs.id ?? ''),
+      )
+      .map((node) => ({ id: node.attrs.id, html: outer(boards, node), visible: true })),
+    selectedPlayerTiles: selected.map((item) => ({ ...item, visible: true })),
+    templeMarkers: nodes((node) => /^marker_\d+_temple_/.test(node.attrs.id ?? '')),
+    technologyMarkers: nodes((node) => /^marker_\d+_technology_/.test(node.attrs.id ?? '')),
+    gears: nodes((node) =>
+      /^gear_(central|palenque|yaxchilan|tikal|uxmal|chichenItza)$/.test(node.attrs.id ?? ''),
+    ),
+    gearWorkerNodes: [],
+    skullSpaces: nodes((node) => /^skullplace_\d+$/.test(node.attrs.id ?? '')),
+    skullRemainingHtml: outer(tree, byId(tree, 'skull_left_wrap')),
+    buildingsHtml: outer(tree, byId(tree, 'buildings')),
+    monumentsHtml: outer(tree, byId(tree, 'monuments')),
+  };
 }
 
 // An independently pinned collection supplies the ordinary decoder's later
@@ -616,13 +757,15 @@ export function projectCapturedInitial(
     pin(laterWitnessBytes, control.laterWitnesses, MAX_BYTES, 'later witnesses');
   else if (control.laterWitnesses !== undefined && control.laterWitnesses !== null)
     fail('Missing declared later witnesses');
-  const capture = uniqueJson(captureBytes, MAX_BYTES, 'capture');
+  let capture = uniqueJson(captureBytes, MAX_BYTES, 'capture');
   const calibration = uniqueJson(calibrationBytes, MAX_ATLAS_BYTES, 'calibration');
   const raw = uniqueJson(rawLogBytes, MAX_BYTES, 'raw log');
   const table = tableBytes === null ? null : uniqueJson(tableBytes, MAX_BYTES, 'table evidence');
   observedBasicUnlimitedOptions(raw, table);
   const mechanicalProfile = profile(control.mechanicalProfile);
-  if (!CAPTURE_SCHEMAS.has(capture.schema)) fail('Unsupported Playing capture schema');
+  const legacy = capture.schema === LEGACY_CAPTURE_SCHEMA;
+  if (legacy) capture = legacyInitialCapture(capture);
+  else if (!CAPTURE_SCHEMAS.has(capture.schema)) fail('Unsupported Playing capture schema');
   const url = urlIdentity(capture.url);
   const release = /^\/archive\/replay\/([A-Za-z0-9_-]{1,64})\/$/.exec(url.pathname)?.[1];
   if (
@@ -965,6 +1108,16 @@ export function projectCapturedInitial(
     witness,
     provenance: {
       captureSha256: sha(captureBytes),
+      ...(legacy
+        ? {
+            captureAdapter: {
+              schema: LEGACY_CAPTURE_ADAPTER,
+              sourceSchema: LEGACY_CAPTURE_SCHEMA,
+              visibilityVerified: false,
+              geometryVerified: false,
+            },
+          }
+        : {}),
       calibrationSha256: sha(calibrationBytes),
       rawLogSha256: sha(rawLogBytes),
       tableEvidenceSha256: tableBytes === null ? null : sha(tableBytes),
