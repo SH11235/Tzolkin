@@ -39,6 +39,7 @@ mod restore;
 mod segment;
 pub use segment::{
     CurrentMixedSegmentSpec, GLOBAL_CONTRACT_SCHEMA, SEGMENT_JOURNAL_SCHEMA, SEGMENT_SPEC_SCHEMA,
+    StoppedCurrentMixedForkSource,
 };
 
 pub const SPEC_SCHEMA: &str = "tzolkin-current-mixed-durable-spec-v2";
@@ -619,6 +620,24 @@ impl Progress {
         {
             return Err("Current mixed continuation requires a resolved Ready session".into());
         }
+        Ok(())
+    }
+    fn require_stopped_pool_fork(&self, blocked: bool, has_head: bool) -> Result<(), String> {
+        if !self.started
+            || !has_head
+            || !blocked
+            || self.phase != Phase::Stopped
+            || self.attempts == 0
+            || self.unknown_work
+            || self.outcome.as_deref() != Some("failed")
+            || self
+                .active
+                .as_ref()
+                .is_none_or(|r| r.attempt.checked_add(1) != Some(self.attempts))
+        {
+            return Err("Pool fork requires the final known Failed stopped tip".into());
+        }
+        self.parent_count()?;
         Ok(())
     }
     fn initial(
