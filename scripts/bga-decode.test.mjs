@@ -2378,6 +2378,342 @@ test('settles a queued purchase only through the next actual technology source, 
   );
 });
 
+test('holds queued corn until the observed capped Theology choice and named skull bonus', async () => {
+  // Catalog identity is generic; all transitions below are injected JS frames.
+  const catalog = JSON.parse(
+    await readFile(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+  );
+  const card = catalog.BUILDINGS.find(
+    (item) =>
+      JSON.stringify(item.effects) ===
+      JSON.stringify([
+        { type: 'technology', technology: 'any', steps: 1 },
+        { type: 'resources', resources: { corn: item.effects[1]?.resources?.corn } },
+      ]),
+  );
+  assert.ok(card);
+  const resources = ['corn', 'wood', 'stone', 'gold', 'skull'];
+  const amount = card.effects[1].resources.corn;
+  const cost = resources.map((resource) => card.cost[resource] ?? 0);
+  const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
+  const technology = { raw_text: 'Aは神学を1レベル進めた' };
+  const bonus = { raw_text: '神学技術ボーナス: Aは追加で水晶ドクロ1個を得た' };
+  const fixture = (change = () => {}, alter = () => {}, level = 3) => {
+    const initial = clone(saved.core.initialFrame);
+    const before = clone(initial);
+    const own = before.snapshot.state.players[0];
+    Object.assign(own.resources, { corn: 10, wood: 8, stone: 4, gold: 2, skull: 0 });
+    own.score = -2;
+    own.technologies.theology = level;
+    own.technologies.architecture = 2;
+    before.snapshot.state.skullSupply = 4;
+    before.snapshot.state.buildings = [card.id];
+    before.observation.pendingTask = {
+      type: 'build',
+      remaining: 2,
+      allowMonument: true,
+      cornPayment: false,
+    };
+    before.snapshot.state.pending = {
+      title: 'Two buildings',
+      task: clone(before.observation.pendingTask),
+      after: [],
+    };
+    before.observation.legalActions = [false, true].map((architecture) => ({
+      action: {
+        type: 'build',
+        id: card.id,
+        cost,
+        architecture,
+        discountResource: null,
+        renovation: null,
+      },
+      move: { type: 'choose', choiceId: architecture ? 'purchase:bonus' : 'purchase:plain' },
+    }));
+    const apply = (request) => {
+      if (request.move.type === 'place') return clone(before);
+      const next = clone(before);
+      next.snapshot.state = clone(request.state);
+      const player = next.snapshot.state.players[0];
+      if (request.move.choiceId.startsWith('purchase:')) {
+        const architecture = request.move.choiceId === 'purchase:bonus';
+        resources.forEach((resource, index) => {
+          player.resources[resource] -= cost[index];
+        });
+        player.resources.corn += Number(architecture);
+        player.score += 2 * Number(architecture);
+        player.buildings.push(card.id);
+        next.snapshot.state.buildings = [];
+        next.observation.pendingTask = { type: 'technology', remaining: 1, free: true };
+        next.snapshot.state.pending = {
+          title: 'Technology',
+          task: clone(next.observation.pendingTask),
+          after: [
+            { type: 'effects', effects: [clone(card.effects[1])] },
+            {
+              type: 'build',
+              remaining: 1,
+              allowMonument: false,
+              cornPayment: false,
+              architectureAvailable: !architecture,
+            },
+          ],
+        };
+        next.observation.legalActions = [
+          {
+            action: { type: 'technology', technology: 'theology' },
+            move: { type: 'choose', choiceId: 'tech:theology' },
+          },
+        ];
+        alter(next, 'purchase');
+      } else {
+        assert.equal(request.move.choiceId, 'tech:theology');
+        player.resources.corn += amount;
+        player.resources.skull++;
+        next.snapshot.state.skullSupply--;
+        next.observation.pendingTask = clone(request.state.pending.after[1]);
+        next.snapshot.state.pending = {
+          title: 'Remaining building',
+          task: clone(next.observation.pendingTask),
+          after: [],
+        };
+        next.observation.legalActions = [];
+        alter(next, 'technology');
+      }
+      return next;
+    };
+    const value = input();
+    const purchase = resources.flatMap((resource, index) =>
+      cost[index]
+        ? [
+            {
+              raw_text: `Aは${cost[index]}\nを支払った`,
+              icons: [{ classes: `tz_icon resource_${resource}` }],
+            },
+          ]
+        : [],
+    );
+    purchase.push(
+      { raw_text: 'Aは建物を建てた' },
+      { raw_text: `Aは${amount}\nを獲得した`, icons: [{ classes: 'tz_icon resource_corn' }] },
+    );
+    replaceEvents(value, [
+      [6, [placement]],
+      [7, purchase],
+      [8, [technology, bonus]],
+    ]);
+    const counters = Object.fromEntries(
+      resources.map((resource, index) => [resource, own.resources[resource] - cost[index]]),
+    );
+    const held = clone(counters);
+    delete held.corn;
+    value.witness.witnesses = [
+      { actionId: 6, pendingTask: 'build', expected: { players: [clone(own), {}, {}, {}] } },
+      {
+        actionId: 7,
+        buildings: [card.id],
+        expected: { players: [{ resources: held, score: own.score }, {}, {}, {}] },
+      },
+      {
+        actionId: 8,
+        pendingTask: 'build',
+        expected: {
+          skullSupply: 3,
+          players: [
+            {
+              resources: { ...counters, corn: counters.corn + amount, skull: 1 },
+              score: own.score,
+            },
+            {},
+            {},
+            {},
+          ],
+        },
+      },
+    ];
+    change(value);
+    for (const row of value.raw.dom_entries) {
+      value.raw.entries.find((entry) => entry.action_id === row.action_id).raw_text = row.messages
+        .map((message) => message.raw_text)
+        .join('\n');
+      for (const message of row.messages) message.html = message.raw_text;
+    }
+    return { value, dispatch: dispatcher(initial, apply) };
+  };
+  const success = fixture();
+  const originals = clone(success.value.witness.witnesses);
+  const result = decode(success.value, success.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.deepEqual(
+    result.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8]],
+  );
+  for (const [index, step] of result.record.steps.entries())
+    assert.deepEqual(step.checkpoint.expected, originals[index].expected);
+  assert.deepEqual(success.value.witness.witnesses, originals);
+  const receipt = result.manifest.audit.find((row) => row.queuedPurchaseSourceActionId);
+  assert.equal(receipt.amount, amount);
+  assert.equal(receipt.cappedTheologySkull, 1);
+  assert.equal(receipt.actualDelivered, true);
+  assert.equal(receipt.humanPlayingBcReady, false);
+  const mutateMessage = (index, text) => (v) => {
+    v.raw.dom_entries.at(-1).messages[index].raw_text = text;
+  };
+  const alter = (stage, mutate) => (f, actual) => {
+    if (actual === stage) mutate(f);
+  };
+  const cases = [
+    [
+      'EOF',
+      (v) => {
+        v.raw.entries.pop();
+        v.raw.dom_entries.pop();
+        v.raw.entry_count--;
+        v.witness.witnesses.pop();
+      },
+    ],
+    [
+      'present future corn',
+      (v) => {
+        v.witness.witnesses[1].expected.players[0].resources.corn = 10 + amount;
+      },
+    ],
+    [
+      'missing bonus',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages.pop();
+      },
+    ],
+    [
+      'duplicate bonus',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages.push(clone(v.raw.dom_entries.at(-1).messages[1]));
+      },
+    ],
+    ['wrong bonus actor', mutateMessage(1, '神学技術ボーナス: Bは追加で水晶ドクロ1個を得た')],
+    ['wrong bonus amount', mutateMessage(1, '神学技術ボーナス: Aは追加で水晶ドクロ2個を得た')],
+    ['wrong choice actor', mutateMessage(0, 'Bは神学を1レベル進めた')],
+    ['wrong track', mutateMessage(0, 'Aは農業を1レベル進めた')],
+    ['two advances', mutateMessage(0, 'Aは神学を2レベル進めた')],
+    ['cancellation', mutateMessage(0, 'Aは行動をキャンセルした')],
+    [
+      'late checkpoint',
+      (v) => {
+        v.witness.witnesses[2].expected.players[0].score++;
+      },
+    ],
+    [
+      'unused refill',
+      (v) => {
+        v.witness.witnesses[2].refills = { currentAge: ['b04'] };
+      },
+    ],
+    [
+      'wrong card',
+      (v) => {
+        v.witness.witnesses[1].buildings = ['b04'];
+      },
+    ],
+    [
+      'wrong payment',
+      (v) => {
+        v.raw.dom_entries.find((entry) => entry.action_id === 7).messages[0].raw_text =
+          'Aは1\nを支払った';
+      },
+    ],
+    ['unsaturated Theology', () => {}, () => {}, 2],
+    [
+      'wrong queued amount',
+      () => {},
+      alter('purchase', (f) => {
+        f.snapshot.state.pending.after[0].effects[0].resources.corn++;
+      }),
+    ],
+    [
+      'extra queued effect',
+      () => {},
+      alter('purchase', (f) => {
+        f.snapshot.state.pending.after[0].effects.push({ type: 'points', amount: 1 });
+      }),
+    ],
+    [
+      'immediate corn',
+      () => {},
+      alter('purchase', (f) => {
+        f.snapshot.state.players[0].resources.corn++;
+      }),
+    ],
+    [
+      'immediate score',
+      () => {},
+      alter('purchase', (f) => {
+        f.snapshot.state.players[0].score++;
+      }),
+    ],
+    [
+      'wrong continuation',
+      () => {},
+      alter('technology', (f) => {
+        f.snapshot.state.pending.task.remaining = 2;
+      }),
+    ],
+    [
+      'missing skull',
+      () => {},
+      alter('technology', (f) => {
+        f.snapshot.state.players[0].resources.skull--;
+      }),
+    ],
+    [
+      'wrong supply',
+      () => {},
+      alter('technology', (f) => {
+        f.snapshot.state.skullSupply++;
+      }),
+    ],
+    [
+      'missing corn',
+      () => {},
+      alter('technology', (f) => {
+        f.snapshot.state.players[0].resources.corn--;
+      }),
+    ],
+    [
+      'extra technology',
+      () => {},
+      alter('technology', (f) => {
+        f.snapshot.state.players[0].technologies.theology++;
+      }),
+    ],
+    [
+      'other player',
+      () => {},
+      alter('technology', (f) => {
+        f.snapshot.state.players[1].resources.corn++;
+      }),
+    ],
+  ];
+  for (const [name, change, mutate, level] of cases) {
+    const f = fixture(change, mutate, level);
+    const original = clone(f.value.witness.witnesses);
+    const rejected = decode(f.value, f.dispatch);
+    assert.ok(rejected.manifest.blocked, name);
+    assert.equal(rejected.manifest.blocked.actionId, 7, name);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.deepEqual(rejected.record.steps[0].checkpoint.expected, original[0].expected, name);
+    assert.equal(
+      rejected.manifest.audit.some((row) => row.actionId > 6),
+      false,
+      name,
+    );
+    assert.deepEqual(f.value.witness.witnesses, original, name);
+  }
+});
+
 test('draw identities are supplied only to the operation that actually requires them', () => {
   const value = input();
   replaceEvents(value, [[6, [{ raw_text: '歯車が進んだ' }]]]);
