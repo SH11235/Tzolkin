@@ -258,6 +258,15 @@
 .nn-session-panel span {
   color: var(--muted);
 }
+.nn-latency-panel {
+  flex-basis: 100%;
+  display: grid;
+  gap: 4px;
+}
+.nn-latency-panel small {
+  color: var(--muted);
+  line-height: 1.6;
+}
 .start-button {
   width: 100%;
 }

@@ -31,6 +31,7 @@ import {
 } from './game/storage';
 import { ResetDialog } from './ui/ResetDialog';
 import { ReplayViewer } from './ui/ReplayViewer';
+import { NnLatency } from './ui/NnLatency';
 import { saveGameFile } from './game/files';
 import './App.css';
 
@@ -60,6 +61,7 @@ function App() {
   const cpuGameRef = useRef<CpuGameMetadata | null>(null);
   const [guardMetadata, setGuardMetadata] = useState<CpuGameMetadata>();
   const [preparingCpuModel, setPreparingCpuModel] = useState(false);
+  const [, refreshLatency] = useState(0);
   const [saving, setSaving] = useState(false);
   const [names, setNames] = useState(['翡翠の民', '黄金の民', '珊瑚の民', '藍の民', '紫水晶の民']);
   const [controllers, setControllers] = useState<Controller[]>([
@@ -377,12 +379,16 @@ function App() {
               if (cpuGameRef.current) discardGuard(cpuGameRef.current);
               throw new Error('この局面からNN CPUを明示的に再開してください。');
             }
-            timing = new NnDecisionTiming(cpuGameRef.current, (failure) => {
-              controller.abort();
-              if (issuedGame) discardGuard(issuedGame);
-              if (activeRef.current === expected && !replayOpenRef.current)
-                setError(failure.message);
-            });
+            timing = new NnDecisionTiming(
+              cpuGameRef.current,
+              (failure) => {
+                controller.abort();
+                if (issuedGame) discardGuard(issuedGame);
+                if (activeRef.current === expected && !replayOpenRef.current)
+                  setError(failure.message);
+              },
+              () => refreshLatency((revision) => revision + 1),
+            );
           }
           issuedGame = requiresNnCpuGuard(expected.session)
             ? (cpuGameRef.current ?? undefined)
@@ -418,10 +424,10 @@ function App() {
           );
           if (!legal) throw new Error('CPUが合法でない操作を返しました。');
           timing?.legal();
+          timing?.applicationStarted();
           const snapshot = await applyMove(expected.session.state, decision.move);
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
-          complete = true;
           if (selection.mode === 'nn' && (decision as GuardedCpuDecision).trade?.overridden)
             setNotice('Tradeの反復を避けて終了しました。');
           updateSession(
@@ -432,7 +438,10 @@ function App() {
             },
             snapshot,
           );
+          complete = true;
+          timing?.applicationApplied();
         } catch (failure) {
+          timing?.applicationFailed();
           timing?.failed(failure);
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
@@ -441,6 +450,7 @@ function App() {
             failure instanceof Error ? failure.message : 'CPUの操作を実行できませんでした。',
           );
         } finally {
+          if (!complete) timing?.applicationDiscarded();
           timing?.failed(
             controller.signal.aborted ? new DOMException('Cancelled', 'AbortError') : undefined,
           );
@@ -451,6 +461,7 @@ function App() {
     }, 20);
     return () => {
       clearTimeout(timer);
+      if (!complete) timing?.applicationDiscarded();
       timing?.failed(new DOMException('Cancelled', 'AbortError'));
       controller.abort();
       if (!complete && issuedGame) discardGuard(issuedGame);
@@ -935,6 +946,7 @@ function App() {
               この局面からCPUを再開
             </button>
           )}
+          <NnLatency modelChecksum={session.cpuPolicy!.modelChecksum} />
         </section>
       )}
       <div className="day-track" aria-label="27日間の暦">
