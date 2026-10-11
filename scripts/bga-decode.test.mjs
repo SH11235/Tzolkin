@@ -4055,6 +4055,39 @@ test('draw identities are supplied only to the operation that actually requires 
   );
   assert.match(ordinaryHandoff.manifest.blocked.reason, /no completed or pending core rotation/);
   assert.equal(ordinaryHandoff.record.steps.length, 0);
+  const tradingBoundary = input();
+  replaceEvents(tradingBoundary, [[6, [{ raw_text: '歯車が進んだ' }]]]);
+  const trading = clone(initial);
+  trading.snapshot.state.pending = { task: { type: 'trade' }, after: [] };
+  trading.observation.pendingTask = { type: 'trade' };
+  trading.observation.legalActions = [
+    { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
+  ];
+  const tradeEnded = clone(initial);
+  tradeEnded.snapshot.state.pending = null;
+  const tradedRotation = decode(
+    tradingBoundary,
+    dispatcher(trading, (request) => {
+      if (request.move.type === 'choose') {
+        assert.deepEqual(request.move, { type: 'choose', choiceId: 'skip' });
+        return clone(tradeEnded);
+      }
+      assert.equal(request.move.type, 'endTurn');
+      return clone(after);
+    }),
+  );
+  assert.equal(tradedRotation.manifest.blocked, null);
+  assert.deepEqual(
+    tradedRotation.record.steps.map((step) => step.move.type),
+    ['choose', 'endTurn'],
+  );
+  assert.equal(tradedRotation.manifest.audit[0].derivedFromVisibleBoundary, true);
+  const hiddenTradeRotation = decode(
+    tradingBoundary,
+    dispatcher(trading, () => clone(after)),
+  );
+  assert.match(hiddenTradeRotation.manifest.blocked.reason, /Derived actor boundary requires/);
+  assert.equal(hiddenTradeRotation.record.steps.length, 0);
   const fedInitial = clone(initial);
   Object.assign(fedInitial.snapshot.state.players[0], {
     workers: 3,
