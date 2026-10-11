@@ -121,6 +121,46 @@ fn start(b: &SegmentBinding) -> Event {
 }
 
 #[test]
+fn restore_chain_checks_every_external_tip_and_bounds_the_whole_request() {
+    let raw = b"{}";
+    let digest = sha(raw);
+    let tip = || restore::CurrentMixedRestoreTip {
+        head_raw: raw,
+        expected_sha256: &digest,
+        directory: Path::new("synthetic-archive"),
+    };
+    let step = || restore::CurrentMixedRestoreStep::Segment {
+        spec: CurrentMixedSegmentSpec {
+            schema: SEGMENT_SPEC_SCHEMA.into(),
+            run_spec: run_spec(),
+            global_contract: contract(&run_spec(), inherited()),
+        },
+        tip: tip(),
+    };
+    // Pin screening is not journal admission; valid journals are required by
+    // the subsequent semantic restore, even when their raw digest is correct.
+    restore::check_chain_tips(&tip(), &[]).unwrap();
+    let mut steps = (1..MAX_SEGMENTS).map(|_| step()).collect::<Vec<_>>();
+    restore::check_chain_tips(&tip(), &steps).unwrap();
+    steps.push(step());
+    assert!(restore::check_chain_tips(&tip(), &steps).is_err());
+    steps.pop();
+    let wrong = "f".repeat(64);
+    if let restore::CurrentMixedRestoreStep::Segment { tip, .. } = &mut steps[1] {
+        tip.expected_sha256 = &wrong;
+    }
+    assert!(restore::check_chain_tips(&tip(), &steps).is_err());
+    let mut initial = tip();
+    initial.head_raw = b"changed";
+    assert!(restore::check_chain_tips(&initial, &[]).is_err());
+    let oversized = vec![0; HEAD_CAP + 1];
+    initial.head_raw = &oversized;
+    let oversized_digest = sha(&oversized);
+    initial.expected_sha256 = &oversized_digest;
+    assert!(restore::check_chain_tips(&initial, &[]).is_err());
+}
+
+#[test]
 fn segment_envelope_checks_every_work_and_storage_dimension_in_both_modes() {
     let mut compressed = serde_json::to_value(run_spec()).unwrap();
     compressed["schema"] = COMPRESSED_SPEC_SCHEMA.into();

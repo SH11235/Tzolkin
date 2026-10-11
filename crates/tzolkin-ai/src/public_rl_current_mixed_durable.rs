@@ -35,6 +35,7 @@ use std::{
 
 #[path = "public_rl_current_mixed_restore.rs"]
 mod restore;
+pub use restore::{CurrentMixedRestoreStep, CurrentMixedRestoreTip};
 #[path = "public_rl_current_mixed_segment.rs"]
 mod segment;
 pub use segment::{
@@ -2640,6 +2641,20 @@ mod tests {
             fs::write(directory.join("orphan.tmp"), b"orphan").unwrap();
             assert!(restore::require_archive_files(&view).is_err());
             fs::remove_file(directory.join("orphan.tmp")).unwrap();
+            let mut changed: Entry = closed(&raw, HEAD_CAP).unwrap();
+            if let Event::Start { next, .. } = &mut changed.event {
+                *next += 1;
+            }
+            // A syntactically valid replacement still refuses the final raw
+            // barrier; semantic state from an earlier read cannot repin it.
+            fs::write(
+                directory.join(&head.name),
+                bytes(&changed, HEAD_CAP).unwrap(),
+            )
+            .unwrap();
+            assert!(restore::require_archive_files(&view).is_err());
+            fs::write(directory.join(&head.name), &raw).unwrap();
+            restore::require_archive_files(&view).unwrap();
             fs::write(directory.join(&head.name), b"changed").unwrap();
             assert!(restore::require_archive_files(&view).is_err());
             fs::remove_dir_all(directory).unwrap();

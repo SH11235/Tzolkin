@@ -4,6 +4,61 @@ use super::*;
 use crate::public_policy_episode::{applied_mixed_plan, canonical_record_checksum};
 use serde_json::{Value, json};
 
+/// An externally pinned saved tip. This untrusted request cannot construct an
+/// owner; restoration still validates the complete journal and its ancestry.
+pub struct CurrentMixedRestoreTip<'s> {
+    pub head_raw: &'s [u8],
+    pub expected_sha256: &'s str,
+    pub directory: &'s Path,
+}
+
+/// One saved successor in a consuming restore chain. Pool replacement uses the
+/// same closed guarded-BC replacement rule as independent pool-fork restoration.
+pub enum CurrentMixedRestoreStep<'s> {
+    Segment {
+        spec: CurrentMixedSegmentSpec,
+        tip: CurrentMixedRestoreTip<'s>,
+    },
+    GuardedPoolFork {
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &'s CurrentMixedCollectionSpec,
+        new_pool: &'s CurrentMixedCollectionSpec,
+        tip: CurrentMixedRestoreTip<'s>,
+    },
+}
+
+// Never stored on a session or exposed to callers. Deferred checks are confined
+// to one consuming restore call, which returns only after a full chain barrier.
+pub(super) enum ArchiveValidation {
+    Immediate,
+    AtChainClose,
+}
+impl ArchiveValidation {
+    pub(super) fn require(&self, session: &CurrentMixedTrainingSession<'_>) -> Result<(), String> {
+        match self {
+            Self::Immediate => session.require_full_archives(),
+            Self::AtChainClose => session.require_live(),
+        }
+    }
+}
+
+pub(super) fn check_chain_tips<'s>(
+    initial: &CurrentMixedRestoreTip<'s>,
+    steps: &[CurrentMixedRestoreStep<'s>],
+) -> Result<(), String> {
+    if steps.len() >= segment::MAX_SEGMENTS {
+        return Err("Current mixed restore chain segment cap".into());
+    }
+    let tips = std::iter::once(initial).chain(steps.iter().map(|step| match step {
+        CurrentMixedRestoreStep::Segment { tip, .. }
+        | CurrentMixedRestoreStep::GuardedPoolFork { tip, .. } => tip,
+    }));
+    for tip in tips {
+        CurrentMixedTrainingSession::check_latest_head(tip.head_raw, tip.expected_sha256)?;
+    }
+    Ok(())
+}
+
 struct MemberSummary {
     checksum: String,
     counts: [usize; 3],
@@ -88,6 +143,46 @@ fn cohort_receipt(
     )
 }
 impl<'a> CurrentMixedTrainingSession<'a> {
+    /// Restores a bounded saved chain from one genuine admission. Each journal
+    /// is semantically restored against its actual predecessor owner; full raw
+    /// archive, membership and byte checks run once over the complete chain
+    /// before any session is returned. No files are written or learning work repeated.
+    /// Ready and known-Failed predecessor rules are unchanged. A stopped final
+    /// tip remains stopped and cannot infer, resume collection or retry learning.
+    pub fn restore_chain<'s>(
+        root: AdmittedCurrentMixedRoot<'a>,
+        spec: CurrentMixedRunSpec,
+        pool: &CurrentMixedCollectionSpec,
+        initial: CurrentMixedRestoreTip<'s>,
+        steps: Vec<CurrentMixedRestoreStep<'s>>,
+    ) -> Result<Self, String> {
+        check_chain_tips(&initial, &steps)?;
+        let mut session = Self::initial(root, spec, pool, local(initial.directory, false)?)?
+            .restore_entries_in_chain(initial.head_raw)?;
+        for step in steps {
+            session = match step {
+                CurrentMixedRestoreStep::Segment { spec, tip } => {
+                    session.restore_chain_segment(spec, tip.head_raw, tip.directory)?
+                }
+                CurrentMixedRestoreStep::GuardedPoolFork {
+                    spec,
+                    old_pool,
+                    new_pool,
+                    tip,
+                } => session.restore_chain_pool_fork(
+                    spec,
+                    old_pool,
+                    new_pool,
+                    tip.head_raw,
+                    tip.directory,
+                )?,
+            };
+        }
+        session.require_full_archives()?;
+        session.handle()?;
+        Ok(session)
+    }
+
     /// Requires an externally pinned exact latest head. No collection, replay,
     /// forward, optimizer or wire-to-sealed-cohort conversion occurs here.
     /// Extra orphan/temp outputs refuse restore and require external handling.
@@ -112,7 +207,17 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         }
         Ok(())
     }
-    pub(super) fn restore_entries(mut self, head_raw: &[u8]) -> Result<Self, String> {
+    pub(super) fn restore_entries(self, head_raw: &[u8]) -> Result<Self, String> {
+        self.restore_entries_with_validation(head_raw, ArchiveValidation::Immediate)
+    }
+    pub(super) fn restore_entries_in_chain(self, head_raw: &[u8]) -> Result<Self, String> {
+        self.restore_entries_with_validation(head_raw, ArchiveValidation::AtChainClose)
+    }
+    fn restore_entries_with_validation(
+        mut self,
+        head_raw: &[u8],
+        validation: ArchiveValidation,
+    ) -> Result<Self, String> {
         let tip: Entry = closed(head_raw, HEAD_CAP)?;
         let s = &mut self;
         if tip.sequence == 0 || tip.sequence > s.spec.max_journal_entries {
@@ -338,7 +443,9 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         s.require_layout()?;
         s.require_live()?;
         s.handle()?;
-        if let Some(segment) = &s.segment {
+        if matches!(validation, ArchiveValidation::Immediate)
+            && let Some(segment) = &s.segment
+        {
             segment.require_archives()?;
         }
         s.blocked = s.progress.phase != Phase::Ready;
