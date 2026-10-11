@@ -1504,6 +1504,9 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                                 OpponentSpec::PreparedBc => {
                                     BorrowedArenaPolicy::PublicBc(self.prepared)
                                 }
+                                OpponentSpec::PreparedBcTradeGuard { guard } => {
+                                    BorrowedArenaPolicy::PublicBcTradeGuard(self.prepared, guard)
+                                }
                                 OpponentSpec::Search => BorrowedArenaPolicy::Search(&self.search),
                                 OpponentSpec::ParentArgmax => match &self.continued {
                                     Some(o) => BorrowedArenaPolicy::ContinuedMixed(o),

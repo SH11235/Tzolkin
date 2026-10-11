@@ -609,7 +609,37 @@ fn run_loop<P: Serialize + PartialEq>(
     schema: &str,
     header: Header<P>,
     expected: Option<&Record<P>>,
+    apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
+) -> Result<Record<P>, String> {
+    run_loop_with_start(
+        config,
+        policy,
+        actors,
+        schema,
+        header,
+        expected,
+        apply,
+        || {
+            create_game_with_options(
+                (0..config.players)
+                    .map(|p| format!("Stochastic P{p}"))
+                    .collect(),
+                config.environment_seed,
+                GameOptions::default(),
+            )
+        },
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn run_loop_with_start<P: Serialize + PartialEq>(
+    config: &NativeStochasticConfig,
+    policy: NativePolicy<'_, '_>,
+    actors: SamplingActors<'_, '_>,
+    schema: &str,
+    header: Header<P>,
+    expected: Option<&Record<P>>,
     mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
+    start: impl FnOnce() -> Result<GameState, String>,
 ) -> Result<Record<P>, String> {
     if matches!(policy, NativePolicy::CurrentMixed(_))
         != matches!(actors, SamplingActors::CurrentFrozen(_))
@@ -655,6 +685,19 @@ fn run_loop<P: Serialize + PartialEq>(
         return Err("Header and final diagnostic reservation exceed source cap".into());
     }
     let mut session = policy.session(config.sampling_identity)?;
+    let mut opponent_guards = match actors {
+        SamplingActors::Frozen(roster) | SamplingActors::CurrentFrozen(roster) => (0..config
+            .players)
+            .map(|actor| {
+                if actor == roster.learner_seat() {
+                    Ok(None)
+                } else {
+                    roster.opponent(actor)?.trade_guard_session()
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+        _ => Vec::new(),
+    };
     // This fixed opponent snapshot is used only by the closed mixed route.
     // Its action-row work is bounded by callbacks * the full-legal cap.
     config
@@ -663,13 +706,7 @@ fn run_loop<P: Serialize + PartialEq>(
         .checked_mul(4096)
         .ok_or("Opponent action-row work bound overflow")?;
     let opponent_weights = crate::policy::HeuristicWeights::default();
-    let start = create_game_with_options(
-        (0..config.players)
-            .map(|p| format!("Stochastic P{p}"))
-            .collect(),
-        config.environment_seed,
-        GameOptions::default(),
-    );
+    let start = start();
     let mut state = match start {
         Ok(state) => state,
         Err(error) => {
@@ -803,6 +840,23 @@ fn run_loop<P: Serialize + PartialEq>(
             check_callback(expected, &record, index)?;
             break;
         }
+        // Guard histories receive every actual callback, including other seats.
+        // This leaves the learner's sampling distribution and RNG untouched.
+        let notification = opponent_guards
+            .iter_mut()
+            .flatten()
+            .try_for_each(|guard| guard.on_callback(index, &observation));
+        if let Err(error) = notification {
+            fail(
+                &mut record,
+                FailureReason::ModelOrSamplingError,
+                AttemptStage::BeforeSample,
+                Some(index),
+                &error,
+            );
+            check_callback(expected, &record, index)?;
+            break;
+        }
         let decision = if sampling {
             let Some(trace_reservation) = checked_add_with_cap(
                 record.trace_payload_reserved_bytes,
@@ -881,7 +935,11 @@ fn run_loop<P: Serialize + PartialEq>(
                 .map(|p| p.policy_version())
                 .unwrap_or(crate::POLICY_VERSION);
             let choice = match opponent {
-                Some(p) => p.choose(&observation),
+                Some(p) => p.choose_indexed(
+                    index,
+                    &observation,
+                    opponent_guards[observation.actor].as_mut(),
+                ),
                 None => crate::choose_move_with_weights(&observation, &opponent_weights),
             };
             let decision = match choice {
@@ -1104,6 +1162,140 @@ mod tests {
             limits,
         )
         .unwrap()
+    }
+    #[test]
+    fn guarded_bc_opponent_cycle_matches_fresh_audit_and_arena_selection() {
+        use crate::public_rl_mixed_native::FrozenMixedRoster;
+        use crate::public_trade_guard::TradeGuardConfig;
+        use tzolkin_core::{Pending, Resource, Task};
+
+        // A synthetic three-callback market, not a complete/admitted RL episode.
+        let mut start = create_game_with_options(
+            vec!["A".into(), "B".into(), "C".into()],
+            17,
+            GameOptions::default(),
+        )
+        .unwrap();
+        while start.phase == Phase::Setup {
+            let o = observe(&start, start.current_player).unwrap();
+            start = apply_move(&start, crate::choose_move(&o).unwrap().r#move).unwrap();
+        }
+        let actor = start.current_player;
+        assert_eq!(actor, 0);
+        for resource in [
+            Resource::Corn,
+            Resource::Wood,
+            Resource::Stone,
+            Resource::Gold,
+            Resource::Skull,
+        ] {
+            start.players[actor].resources.insert(resource, 0);
+        }
+        start.players[actor].resources.insert(Resource::Corn, 2);
+        start.pending = Some(Pending {
+            title: "Synthetic market".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        validate_state(&start).unwrap();
+
+        let mut model = integration_fixture::model(false);
+        model.model.parameters.fill(0.0);
+        model.model.parameters[384 + 21] = 2.0; // Trade
+        model.model.parameters[435] = 1.0; // wood
+        model.model.parameters[440] = 1.0; // buy when affordable
+        model.model.parameters[crate::public_model::WP] = 1.0;
+        model.reseal().unwrap();
+        let policy = integration_fixture::handle(&model);
+        let weights = crate::policy::HeuristicWeights::default();
+        let guard = TradeGuardConfig::default();
+        let guarded = FrozenMixedRoster::synthetic_bc(&model, Some(&guard), &weights);
+        let pure = FrozenMixedRoster::synthetic_bc(&model, None, &weights);
+        let bounded_guard = TradeGuardConfig {
+            max_trades_per_episode: 1,
+            ..TradeGuardConfig::default()
+        };
+        let bounded = FrozenMixedRoster::synthetic_bc(&model, Some(&bounded_guard), &weights);
+        assert_ne!(pure.checksum(), guarded.checksum());
+        assert_ne!(guarded.checksum(), bounded.checksum());
+        assert!(matches!(
+            pure.opponent(actor).unwrap().description().provenance,
+            crate::replay::SeatPolicy::PublicLearned { .. }
+        ));
+        assert!(matches!(
+            guarded.opponent(actor).unwrap().description().provenance,
+            crate::replay::SeatPolicy::PublicLearnedTradeGuard { .. }
+        ));
+        let config = config(
+            3,
+            CollectionLimits {
+                callbacks: 3,
+                ..Default::default()
+            },
+        );
+        let run = |roster, expected| {
+            run_loop_with_start(
+                &config,
+                NativePolicy::Bc(&policy),
+                SamplingActors::Frozen(roster),
+                crate::public_rl_mixed_native::RECORD_SCHEMA,
+                header(&config, &policy).unwrap(),
+                expected,
+                apply_move,
+                || Ok(start.clone()),
+            )
+            .unwrap()
+        };
+        let collected = run(&guarded, None);
+        assert_eq!(collected.callbacks.len(), 3);
+        assert_eq!(collected.counts.accepted_samples, 0);
+        assert!(collected.terminal.is_none());
+        assert_eq!(
+            collected.failure.as_ref().unwrap().reason,
+            FailureReason::CallbackLimit
+        );
+        let ids = |r: &Record| {
+            r.callbacks
+                .iter()
+                .map(|c| c.opponent_choice.as_ref().unwrap().chosen.r#move.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&collected),
+            ["buy:wood", "sell:wood", "skip"].map(|id| GameMove::Choose {
+                choice_id: id.into()
+            })
+        );
+        assert_eq!(
+            collected.callbacks[0].observation.as_ref().unwrap().players[actor].resources,
+            collected.callbacks[2].observation.as_ref().unwrap().players[actor].resources
+        );
+        assert_ne!(
+            collected.callbacks[2].state_before,
+            collected.callbacks[2].state_after.clone().unwrap()
+        );
+        assert_eq!(collected, run(&guarded, Some(&collected)));
+        assert_eq!(
+            ids(&run(&pure, None))[2],
+            GameMove::Choose {
+                choice_id: "buy:wood".into()
+            }
+        );
+
+        // Borrowed Arena and native collection use the same indexed chooser.
+        let opponent = guarded.opponent(actor).unwrap();
+        let mut arena_guard = opponent.trade_guard_session().unwrap().unwrap();
+        for c in &collected.callbacks {
+            let o = c.observation.as_ref().unwrap();
+            let legal_before = o.legal_actions.clone();
+            arena_guard.on_callback(c.global_callback_index, o).unwrap();
+            let d = opponent
+                .choose_indexed(c.global_callback_index, o, Some(&mut arena_guard))
+                .unwrap();
+            assert_eq!(d.r#move, c.opponent_choice.as_ref().unwrap().chosen.r#move);
+            assert_eq!(d.policy_version, crate::public_trade_guard::POLICY_VERSION);
+            assert_eq!(o.legal_actions, legal_before);
+        }
     }
     #[test]
     fn complete_three_four_player_games_roundtrip_and_sessions_restart() {

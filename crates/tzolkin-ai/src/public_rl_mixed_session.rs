@@ -168,6 +168,9 @@ pub(crate) enum OpponentSpec {
     CornFirstSetup,
     CornFirstUxmalOpening,
     PreparedBc,
+    PreparedBcTradeGuard {
+        guard: crate::public_trade_guard::TradeGuardConfig,
+    },
     ParentArgmax,
     Search,
 }
@@ -206,7 +209,13 @@ impl MixedRlCollectionSpec {
                         seats.iter().all(|seat| {
                             seat.is_null()
                                 || seat.as_object().is_some_and(|fields| {
-                                    fields.len() == 1
+                                    (fields.len() == 1
+                                        || (fields.len() == 2
+                                            && fields
+                                                .get("kind")
+                                                .and_then(serde_json::Value::as_str)
+                                                == Some("preparedBcTradeGuard")
+                                            && fields.contains_key("guard")))
                                         && fields
                                             .get("kind")
                                             .is_some_and(serde_json::Value::is_string)
@@ -216,13 +225,20 @@ impl MixedRlCollectionSpec {
                 })
             })
         {
-            return Err("Mixed roster opponent requires exactly its closed kind field".into());
+            return Err(
+                "Mixed roster opponent requires its closed kind/configuration fields".into(),
+            );
         }
         let s = Self {
             wire: serde_json::from_value(value).map_err(|e| e.to_string())?,
         };
         s.wire.weights.validate()?;
         s.wire.search.validate()?;
+        for opponent in s.wire.rosters.iter().flatten().flatten() {
+            if let OpponentSpec::PreparedBcTradeGuard { guard } = opponent {
+                guard.validate()?;
+            }
+        }
         if s.wire.schema != schema
             || s.wire.catalog_hash != crate::replay::catalog_hash()
             || !(4 * MAX_RECORD_BYTES as u64 + METADATA_RESERVE..=512 * 1024 * 1024)
@@ -309,6 +325,9 @@ impl<'a> MixedRlCollectionSession<'a> {
                                 }
                                 OpponentSpec::PreparedBc => {
                                     BorrowedArenaPolicy::PublicBc(self.prepared)
+                                }
+                                OpponentSpec::PreparedBcTradeGuard { guard } => {
+                                    BorrowedArenaPolicy::PublicBcTradeGuard(self.prepared, guard)
                                 }
                                 OpponentSpec::ParentArgmax => match self.parent {
                                     PairedRlParent::Count1(p) => BorrowedArenaPolicy::Count1(p),
