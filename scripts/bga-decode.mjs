@@ -955,6 +955,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     if (state().currentPlayer !== target) fail('Actor switch did not resolve');
   }
   function calendar(days = null) {
+    // A visible calendar boundary also witnesses the end of optional trading.
+    if (pending() === 'trade') finishOptional('visible calendar boundary');
     if (legal().some((row) => row.action.type === 'endTurn'))
       choose(
         (action) => action.type === 'endTurn' && action.doubleAdvance === null,
