@@ -686,6 +686,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     visibleCalendar = false,
     outcomeFilter = null,
     validateSingleOutcome = false,
+    allowOptionalSkip = true,
   ) {
     if (record.steps.length >= MAX_STEPS) fail('Move limit reached');
     let candidates = legal().filter((row) => predicate(row.action));
@@ -693,7 +694,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     // continuation even when the same player remains the turn actor.
     for (
       let count = 0;
-      !candidates.length && count < 8 && legal().some((row) => row.action.type === 'skip');
+      !candidates.length &&
+      allowOptionalSkip &&
+      deferredScore?.kind !== 'action' &&
+      count < 8 &&
+      legal().some((row) => row.action.type === 'skip');
       count++
     ) {
       choose((action) => action.type === 'skip', `optional continuation before ${reason}`, true);
@@ -1013,6 +1018,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   }
   function deferredScoreTransition(nextFrame, action) {
     const receipt = deferredScore;
+    if (receipt.kind === 'action') return deferredActionScoreTransition(nextFrame, action);
     const before = state();
     const next = nextFrame.snapshot.state;
     const exit = action.type === 'skip' && context.deferredScoreExit === true;
@@ -1076,6 +1082,189 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       humanPlayingBcReady: false,
     });
     deferredScore = null;
+  }
+  function actionScorePair(id) {
+    const effects = buildings.get(id)?.effects;
+    return Array.isArray(effects) &&
+      effects.length === 2 &&
+      same(effects[0], { type: 'action' }) &&
+      same(effects[1], { type: 'points', amount: effects[1].amount }) &&
+      Number.isSafeInteger(effects[1].amount) &&
+      effects[1].amount > 0 &&
+      effects[1].amount <= 1000
+      ? effects
+      : null;
+  }
+  // This receipt retains the printed points through one actual Anywhere action
+  // and monument. It never moves the original purchase checkpoint forward.
+  function deferredActionScoreShape(outcome, event, events, witness, previous = state()) {
+    const action = outcome.row.action;
+    const effects = actionScorePair(action.id);
+    const actor = actorId(event.actor);
+    const before = previous.pending;
+    const next = outcome.frame.snapshot.state;
+    const scores = events.filter((item) => fixedScoreCaption(item) !== null);
+    const gains = events.filter((item) => item.kind === 'resourceGain');
+    const observed = witness.expected?.players?.[actor];
+    if (
+      !effects ||
+      actor < 0 ||
+      witnesses.catalogHash !== catalogHash ||
+      event.kind !== 'build' ||
+      action.type !== 'build' ||
+      action.architecture !== true ||
+      action.renovation !== null ||
+      previous.players[actor].technologies.architecture < 2 ||
+      !same(witness.buildings, [action.id]) ||
+      !Number.isFinite(observed?.score) ||
+      !RESOURCES.every((resource) => Number.isSafeInteger(observed?.resources?.[resource])) ||
+      !matches(next, witness.expected) ||
+      !same(typedResourceCost(action), paymentOf(events)) ||
+      events.some((item) => item.actor !== event.actor) ||
+      events.filter((item) => item.kind === 'build').length !== 1 ||
+      scores.length !== 2 ||
+      fixedScoreCaption(scores[0]) !== 2 ||
+      fixedScoreCaption(scores[1]) !== effects[1].amount ||
+      events.at(-2) !== scores[0] ||
+      events.at(-1) !== scores[1] ||
+      gains.length !== 1 ||
+      !same(resourceAmounts(gains[0]), [1, 0, 0, 0, 0]) ||
+      events.indexOf(gains[0]) !== events.indexOf(event) + 1 ||
+      events.some(
+        (item) =>
+          item !== event &&
+          !scores.includes(item) &&
+          item !== gains[0] &&
+          ((!emptyPurchasePayment(item) && item.kind !== 'resourcePayment') ||
+            events.indexOf(item) > events.indexOf(event)),
+      ) ||
+      before?.task?.type !== 'build' ||
+      before.task.remaining !== 1 ||
+      !same(before.after, []) ||
+      !same(next.pending?.task, { type: 'anyAction', excludeSkulls: true, cost: 1 }) ||
+      !same(outcome.frame.observation?.pendingTask, next.pending.task) ||
+      !same(next.pending.after, [
+        { type: 'effects', effects: [effects[1]] },
+        {
+          type: 'build',
+          remaining: 0,
+          allowMonument: false,
+          cornPayment: before.task.cornPayment,
+          architectureAvailable: false,
+          ...(before.task.mandatory ? { mandatory: true } : {}),
+        },
+      ]) ||
+      next.currentPlayer !== actor ||
+      previous.currentPlayer !== actor ||
+      next.round !== previous.round ||
+      next.phase !== previous.phase ||
+      !same(next.players[actor].buildings, [...previous.players[actor].buildings, action.id]) ||
+      !same(
+        next.buildings,
+        previous.buildings.filter((id) => id !== action.id),
+      ) ||
+      !same(
+        { ...mechanical(next), players: null, pending: null, buildings: null },
+        { ...mechanical(previous), players: null, pending: null, buildings: null },
+      ) ||
+      next.players.some((player, id) =>
+        id === actor
+          ? player.score - previous.players[id].score !== 2 ||
+            RESOURCES.some(
+              (resource, index) =>
+                player.resources[resource] !==
+                previous.players[id].resources[resource] - action.cost[index] + Number(index === 0),
+            ) ||
+            !same(
+              { ...player, resources: null, score: null, buildings: null },
+              { ...previous.players[id], resources: null, score: null, buildings: null },
+            )
+          : !same(player, previous.players[id]),
+      )
+    )
+      return null;
+    return {
+      kind: 'action',
+      stage: 'anyAction',
+      actor,
+      amount: effects[1].amount,
+      scoreEvent: scores[1],
+      captionObserved: false,
+      pending: copy(next.pending),
+      round: next.round,
+      phase: next.phase,
+    };
+  }
+  function deferredActionScoreTransition(nextFrame, action) {
+    const receipt = deferredScore;
+    const before = state();
+    const next = nextFrame.snapshot.state;
+    const anywhere = receipt.stage === 'anyAction';
+    const validAction = anywhere
+      ? action.type === 'useAction' &&
+        action.source === 'anywhere' &&
+        action.gear === 'tikal' &&
+        action.position === 4 &&
+        action.cornCost === 1
+      : receipt.stage === 'monument' &&
+        action.type === 'monument' &&
+        action.renovation === null &&
+        same(typedResourceCost(action), paymentOf(context.events));
+    if (
+      !receipt.captionObserved ||
+      !validAction ||
+      !same(before.pending, receipt.pending) ||
+      before.currentPlayer !== receipt.actor ||
+      before.round !== receipt.round ||
+      before.phase !== receipt.phase ||
+      next.currentPlayer !== receipt.actor ||
+      next.round !== receipt.round ||
+      next.phase !== receipt.phase ||
+      (anywhere
+        ? !same(next.pending?.task, {
+            type: 'build',
+            remaining: 2,
+            allowMonument: true,
+            cornPayment: false,
+          }) ||
+          !same(nextFrame.observation?.pendingTask, next.pending.task) ||
+          !same(next.pending.after, before.pending.after)
+        : next.pending !== null || nextFrame.observation?.pendingTask !== null) ||
+      !same(
+        { ...mechanical(next), players: null, pending: null, monuments: null },
+        { ...mechanical(before), players: null, pending: null, monuments: null },
+      ) ||
+      !same(
+        next.monuments,
+        anywhere ? before.monuments : before.monuments.filter((id) => id !== action.id),
+      ) ||
+      next.players.some((player, id) =>
+        id === receipt.actor
+          ? player.score - before.players[id].score !== (anywhere ? 0 : receipt.amount) ||
+            !same(
+              player.monuments,
+              anywhere
+                ? before.players[id].monuments
+                : [...before.players[id].monuments, action.id],
+            ) ||
+            RESOURCES.some(
+              (resource, index) =>
+                player.resources[resource] !==
+                before.players[id].resources[resource] - typedResourceCost(action)[index],
+            ) ||
+            !same(
+              { ...player, resources: null, score: null, monuments: null },
+              { ...before.players[id], resources: null, score: null, monuments: null },
+            )
+          : !same(player, before.players[id]),
+      )
+    )
+      fail('Deferred purchase requires its exact observed Anywhere action and monument completion');
+    deferredScore = {
+      ...receipt,
+      stage: anywhere ? 'monument' : 'complete',
+      pending: copy(next.pending),
+    };
   }
   // A source can caption a fixed card resource before its required technology
   // choice. Keep that purchase tentative until the next actual choice delivers
@@ -1248,6 +1437,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       fail('Observed purchase gain is out of bounds');
     return (outcome) => {
       const task = outcome.frame.observation?.pendingTask?.type ?? null;
+      if (task === 'anyAction' && actionScorePair(outcome.row.action.id))
+        return deferredActionScoreShape(outcome, event, events, witness) !== null;
       const envelope = events.some(
         (item) => emptyPurchasePayment(item) || architectureScoreCaption(item),
       );
@@ -1377,6 +1568,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     };
     context = {
       id,
+      events,
       before: copy(state()),
       pools: {
         currentAge: [...(witness.refills?.currentAge ?? [])],
@@ -1401,8 +1593,25 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           (witness.refills?.currentAge?.length ?? 0) !== 0 ||
           (witness.refills?.age2?.length ?? 0) !== 0
         )
-          fail('Deferred purchase requires the same actor and unchanged Trade continuation');
-        if (!events.every((event) => event.kind === 'trade')) {
+          fail('Deferred purchase requires the same actor and unchanged continuation');
+        if (deferredScore.kind === 'action') {
+          const operation = events.find((event) => event.kind !== 'resourcePayment');
+          if (
+            deferredScore.stage === 'anyAction'
+              ? events.length !== 1 ||
+                operation?.kind !== 'gearAction' ||
+                operation.detail.source !== 'selectedAction' ||
+                operation.detail.gear !== 'tikal' ||
+                operation.detail.actionPosition !== 4 ||
+                operation.detail.cornCost !== 1
+              : deferredScore.stage !== 'monument' ||
+                operation?.kind !== 'monument' ||
+                events.at(-1) !== operation ||
+                events.some((event) => event !== operation && event.kind !== 'resourcePayment') ||
+                witness.monuments?.length !== 1
+          )
+            fail('Deferred purchase requires the next observed Anywhere action, then monument');
+        } else if (!events.every((event) => event.kind === 'trade')) {
           if (
             events.filter((event) => event.kind === 'build').length !== 1 ||
             events.some((event) => ['trade', 'cancellation', 'monument'].includes(event.kind)) ||
@@ -1733,8 +1942,10 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               false,
               () => purchaseOutcome(event, events, witness),
               events.some((item) => emptyPurchasePayment(item) || architectureScoreCaption(item)) ||
+                actionScorePair(ids[0]) !== null ||
                 (buildings.get(ids[0])?.effects[0]?.type === 'trade' &&
                   events.some((item) => fixedScoreCaption(item) !== null)),
+              actionScorePair(ids[0]) === null,
             );
             context.purchase = {
               actor: actorId(event.actor),
@@ -1783,6 +1994,30 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 sourceId: id,
                 kinds: events.map((item) => item.kind),
                 saved,
+              };
+              history.at(-1).unsettledPurchase = true;
+            }
+            const actionScoreReceipt = deferredActionScoreShape(
+              { frame, row: { action } },
+              event,
+              events,
+              witness,
+              beforePurchase,
+            );
+            if (actionScorePair(action.id) && !actionScoreReceipt)
+              fail('Action plus Points purchase requires its exact deferred receipt');
+            if (actionScoreReceipt) {
+              if (deferredScore || queuedPurchase || saved.deferredScore?.kind === 'action')
+                fail('A deferred purchase cannot nest another unresolved receipt');
+              // Closing Trade at this source does not commit its tentative chain.
+              // Keep its earlier anchor until this observed continuation settles.
+              deferredScore = {
+                ...actionScoreReceipt,
+                sourceId: id,
+                kinds: events.map((item) => item.kind),
+                saved: saved.deferredScore?.saved ?? saved,
+                rollbackSourceId: saved.deferredScore?.sourceId ?? id,
+                rollbackKinds: saved.deferredScore?.kinds ?? events.map((item) => item.kind),
               };
               history.at(-1).unsettledPurchase = true;
             }
@@ -2015,13 +2250,27 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         finishQueuedPurchase(events[0]);
         queuedPurchase = null;
       }
+      if (deferredScore?.kind === 'action' && deferredScore.stage === 'complete') {
+        automatic(deferredScore.scoreEvent, 'score', deferredScore.amount);
+        audit.push({
+          actionId: id,
+          deferredScoreSourceActionId: deferredScore.sourceId,
+          actor: deferredScore.actor,
+          amount: deferredScore.amount,
+          actualDelivered: true,
+          continuation: 'anyActionMonument',
+          humanPlayingBcReady: false,
+        });
+        deferredScore = null;
+        history.at(-1).unsettledPurchase = false;
+      }
     } catch (error) {
       const receipt =
         saved.deferredScore ?? deferredScore ?? queuedPurchase ?? saved.queuedPurchase;
       rollback(receipt?.saved ?? saved);
       blocked = {
-        actionId: receipt?.sourceId ?? id,
-        kinds: receipt?.kinds ?? events.map((event) => event.kind),
+        actionId: receipt?.rollbackSourceId ?? receipt?.sourceId ?? id,
+        kinds: receipt?.rollbackKinds ?? receipt?.kinds ?? events.map((event) => event.kind),
         reason: receipt ? `Unsettled purchase at source ${id}: ${error.message}` : error.message,
       };
       break;
@@ -2031,10 +2280,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const receipt = deferredScore;
     rollback(receipt.saved);
     blocked = {
-      actionId: receipt.sourceId,
-      kinds: receipt.kinds,
+      actionId: receipt.rollbackSourceId ?? receipt.sourceId,
+      kinds: receipt.rollbackKinds ?? receipt.kinds,
       reason:
-        'Deferred purchase has no observed Trade exit; entire tentative chain was rolled back',
+        receipt.kind === 'action'
+          ? 'Deferred purchase has no observed action and monument completion; entire tentative chain was rolled back'
+          : 'Deferred purchase has no observed Trade exit; entire tentative chain was rolled back',
     };
   }
   if (!blocked && state().phase === 'finished' && game.resultsDisplay.length === names.length)
