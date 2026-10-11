@@ -649,6 +649,11 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
     start.snapshot.state.players[0].resources.wood = 4;
     start.snapshot.state.players[0].buildings = ['b04', 'b05'];
     start.observation.pendingTask = { type: 'build', remaining: 2 };
+    start.snapshot.state.pending = {
+      title: 'Build two buildings',
+      task: clone(start.observation.pendingTask),
+      after: [],
+    };
     const purchaseRows = (unique ? ['bonus'] : ['bonus', 'reserve']).map((mode) => ({
       action: {
         type: monument ? 'monument' : 'build',
@@ -704,6 +709,10 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
         }
       }
       next.observation.pendingTask = task === null ? null : { type: task, remaining: 1 };
+      next.snapshot.state.pending =
+        task === null
+          ? null
+          : { title: 'Continue', task: clone(next.observation.pendingTask), after: [] };
       next.observation.legalActions = [];
       frames.push(next);
       return next;
@@ -740,6 +749,65 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
   assert.deepEqual(architecture.choices.slice(0, 2), ['purchase:bonus', 'purchase:reserve']);
   assert.equal(architecture.frames.at(-1).snapshot.state.players[0].resources.corn, 17);
   assert.equal(architecture.frames.at(-1).snapshot.state.players[0].resources.wood, 3);
+  // Same-source counters discriminate the immediate bonus even while one Build remains.
+  for (const [mode, corn, score] of [
+    ['reserve', 16, 0],
+    ['bonus', 17, 2],
+  ]) {
+    const fixture = purchaseFixture();
+    const value = fixture.make([[6, [...purchasePayment, build]]], {
+      players: [{ resources: { corn }, score }, {}, {}, {}],
+    });
+    value.witness.witnesses[0].pendingTask = 'build';
+    const result = decode(value, fixture.dispatch);
+    assert.equal(result.manifest.blocked, null);
+    assert.equal(result.record.steps[0].move.choiceId, `purchase:${mode}`);
+  }
+  // Missing/mismatched own-source prompts and future counters cannot choose a candidate.
+  for (const pendingTask of [undefined, 'temple']) {
+    const fixture = purchaseFixture();
+    const value = fixture.make(
+      [
+        [6, [...purchasePayment, build]],
+        [7, []],
+      ],
+      {
+        players: [{ resources: { corn: 16 }, score: 0 }, {}, {}, {}],
+      },
+    );
+    if (pendingTask !== undefined) value.witness.witnesses[0].pendingTask = pendingTask;
+    value.witness.witnesses.push({
+      actionId: 7,
+      pendingTask: 'build',
+      expected: { players: [{ resources: { corn: 16 }, score: 0 }, {}, {}, {}] },
+    });
+    const result = decode(value, fixture.dispatch);
+    assert.equal(result.record.steps.length, 0);
+    assert.match(result.manifest.blocked.reason, /Ambiguous legal operation/);
+  }
+  // A nested or nondecremented Build is not a settled original continuation.
+  for (const nested of [false, true]) {
+    const fixture = purchaseFixture();
+    const value = fixture.make([[6, [...purchasePayment, build]]], {
+      players: [{ resources: { corn: 16 }, score: 0 }, {}, {}, {}],
+    });
+    value.witness.witnesses[0].pendingTask = 'build';
+    const guardedDispatch = (request) => {
+      const response = fixture.dispatch(request);
+      const frames = request.operation === 'publicReplay' ? response.frames.slice(1) : [response];
+      for (const frame of frames) {
+        if (nested) frame.snapshot.state.pending.after = [{ type: 'build', remaining: 1 }];
+        else {
+          frame.observation.pendingTask.remaining = 2;
+          frame.snapshot.state.pending.task.remaining = 2;
+        }
+      }
+      return response;
+    };
+    const result = decode(value, guardedDispatch);
+    assert.equal(result.record.steps.length, 0);
+    assert.match(result.manifest.blocked.reason, /Ambiguous legal operation/);
+  }
   for (const unique of [false, true]) {
     const fixture = purchaseFixture({ resourceFirst: true, unique });
     const result = decode(
