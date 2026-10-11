@@ -2288,7 +2288,7 @@ test('rolls an Action plus Points chain back to its earliest purchase on every l
     }
 });
 
-test('settles a queued purchase only through the next actual technology source, or rolls back both macros', () => {
+test('settles a queued purchase through observed technology and material choices, or rolls back the chain', () => {
   // Injected frames exercise receipt admission/settlement, not game-rule scoring.
   const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
   const gold = { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_gold' }] };
@@ -2299,13 +2299,22 @@ test('settles a queued purchase only through the next actual technology source, 
     { raw_text: 'Aは建物を建てた' },
     gold,
   ];
-  const fixture = (mode = 'none', change = () => {}, alterFrame = () => {}) => {
+  const fixture = (mode = 'none', change = () => {}, alterFrame = () => {}, extraction = false) => {
+    const track = extraction ? 'extraction' : 'architecture';
+    const cardId = extraction ? 'b26' : 'b06';
+    const fixedResource = extraction ? 'skull' : 'gold';
     const initial = clone(saved.core.initialFrame);
     const before = clone(initial);
     const player = before.snapshot.state.players[0];
     Object.assign(player.resources, { corn: 20, wood: 4, gold: 2 });
     player.score = -3;
     player.technologies.architecture = 2;
+    if (extraction) {
+      player.technologies.extraction = 3;
+      player.resources.stone = 4;
+      player.resources.skull = 0;
+      before.snapshot.state.skullSupply = 4;
+    }
     before.observation.pendingTask = {
       type: 'build',
       remaining: 2,
@@ -2320,8 +2329,8 @@ test('settles a queued purchase only through the next actual technology source, 
     before.observation.legalActions = ['bonus', 'none'].map((option) => ({
       action: {
         type: 'build',
-        id: 'b06',
-        cost: [4, 1, 0, 0, 0],
+        id: cardId,
+        cost: extraction ? [0, 2, 2, 0, 0] : [4, 1, 0, 0, 0],
         architecture: option === 'bonus',
         discountResource: null,
         renovation: null,
@@ -2336,16 +2345,20 @@ test('settles a queued purchase only through the next actual technology source, 
       const own = next.snapshot.state.players[0];
       if (request.move.choiceId.startsWith('purchase:')) {
         const bonus = request.move.choiceId === 'purchase:bonus';
-        own.resources.corn -= 4 - Number(bonus);
-        own.resources.wood--;
+        own.resources.corn -= (extraction ? 0 : 4) - Number(bonus);
+        own.resources.wood -= extraction ? 2 : 1;
+        if (extraction) own.resources.stone -= 2;
         own.score += 2 * Number(bonus);
-        own.buildings.push('b06');
+        own.buildings.push(cardId);
         next.observation.pendingTask = { type: 'technology', remaining: 1, free: true };
         next.snapshot.state.pending = {
           title: 'Choose technology',
           task: clone(next.observation.pendingTask),
           after: [
-            { type: 'effects', effects: [{ type: 'resources', resources: { gold: 1 } }] },
+            {
+              type: 'effects',
+              effects: [{ type: 'resources', resources: { [fixedResource]: 1 } }],
+            },
             {
               type: 'build',
               remaining: 1,
@@ -2357,14 +2370,52 @@ test('settles a queued purchase only through the next actual technology source, 
         };
         next.observation.legalActions = [
           {
-            action: { type: 'technology', technology: 'architecture' },
-            move: { type: 'choose', choiceId: 'tech:architecture' },
+            action: { type: 'technology', technology: track },
+            move: { type: 'choose', choiceId: `tech:${track}` },
           },
         ];
         alterFrame(next, 'purchase');
         if ((bonus ? 'bonus' : 'none') === mode) Object.assign(pending, clone(next));
+      } else if (extraction && request.move.choiceId === 'tech:extraction') {
+        next.observation.pendingTask = { type: 'resource', remaining: 2 };
+        next.snapshot.state.pending = {
+          title: 'Materials',
+          task: clone(next.observation.pendingTask),
+          after: [{ ...request.state.pending.task, remaining: 0 }, ...request.state.pending.after],
+        };
+        next.observation.legalActions = ['wood', 'stone', 'gold'].map((resource) => ({
+          action: { type: 'resource', resource },
+          move: { type: 'choose', choiceId: `resource:${resource}` },
+        }));
+        alterFrame(next, 'technology');
+      } else if (extraction && request.move.choiceId.startsWith('resource:')) {
+        const resource = request.move.choiceId.split(':')[1];
+        const remaining = request.state.pending.task.remaining - 1;
+        own.resources[resource]++;
+        if (remaining) {
+          next.observation.pendingTask = { type: 'resource', remaining };
+          next.snapshot.state.pending = {
+            ...clone(request.state.pending),
+            task: clone(next.observation.pendingTask),
+          };
+          next.observation.legalActions = ['wood', 'stone', 'gold'].map((material) => ({
+            action: { type: 'resource', resource: material },
+            move: { type: 'choose', choiceId: `resource:${material}` },
+          }));
+        } else {
+          own.resources[fixedResource]++;
+          if (fixedResource === 'skull') next.snapshot.state.skullSupply--;
+          next.observation.pendingTask = clone(request.state.pending.after.at(-1));
+          next.snapshot.state.pending = {
+            title: 'Remaining building',
+            task: clone(next.observation.pendingTask),
+            after: [],
+          };
+          next.observation.legalActions = [];
+        }
+        alterFrame(next, remaining ? 'firstMaterial' : 'lastMaterial');
       } else {
-        assert.equal(request.move.choiceId, 'tech:architecture');
+        assert.equal(request.move.choiceId, `tech:${track}`);
         own.technologies.architecture++;
         own.resources.gold++;
         next.observation.pendingTask = clone(request.state.pending.after[1]);
@@ -2379,18 +2430,35 @@ test('settles a queued purchase only through the next actual technology source, 
       return next;
     };
     const value = input();
-    replaceEvents(value, [
+    const rows = [
       [6, [placement]],
       [7, purchase],
       [8, [technology]],
-    ]);
+    ];
+    if (extraction) {
+      rows[1][1] = [
+        { raw_text: 'Aは2\nを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+        { raw_text: 'Aは2\nを支払った', icons: [{ classes: 'tz_icon resource_stone' }] },
+        { raw_text: 'Aは建物を建てた' },
+        { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_skull' }] },
+      ];
+      rows[2][1] = [
+        { raw_text: 'Aは収集を1レベル進めた' },
+        { raw_text: '収集技術ボーナス: Aは好きな資源2個を得た' },
+      ];
+      rows.push(
+        [9, [{ raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_stone' }] }]],
+        [10, [gold]],
+      );
+    }
+    replaceEvents(value, rows);
     const counters = {
-      resources: { corn: mode === 'bonus' ? 17 : 16 },
+      resources: { corn: (extraction ? 20 : 16) + Number(mode === 'bonus') },
       score: mode === 'bonus' ? -1 : -3,
     };
     value.witness.witnesses = [
       { actionId: 6, pendingTask: 'build', expected: { players: [clone(player), {}, {}, {}] } },
-      { actionId: 7, buildings: ['b06'], expected: { players: [clone(counters), {}, {}, {}] } },
+      { actionId: 7, buildings: [cardId], expected: { players: [clone(counters), {}, {}, {}] } },
       {
         actionId: 8,
         pendingTask: 'build',
@@ -2404,6 +2472,31 @@ test('settles a queued purchase only through the next actual technology source, 
         },
       },
     ];
+    if (extraction) {
+      value.witness.witnesses[2].pendingTask = 'resource';
+      value.witness.witnesses[2].expected.players[0] = clone(counters);
+      const materials = { ...counters.resources, stone: player.resources.stone - 1 };
+      value.witness.witnesses.push(
+        {
+          actionId: 9,
+          pendingTask: 'resource',
+          expected: { players: [{ resources: clone(materials), score: player.score }, {}, {}, {}] },
+        },
+        {
+          actionId: 10,
+          pendingTask: 'build',
+          expected: {
+            skullSupply: 3,
+            players: [
+              { resources: { ...materials, gold: 3, skull: 1 }, score: player.score },
+              {},
+              {},
+              {},
+            ],
+          },
+        },
+      );
+    }
     change(value);
     for (const row of value.raw.dom_entries) {
       const entry = value.raw.entries.find((item) => item.action_id === row.action_id);
@@ -2432,6 +2525,107 @@ test('settles a queued purchase only through the next actual technology source, 
     assert.equal(receipt.actualDelivered, true);
     assert.equal(result.manifest.trainingReady, false);
     assert.equal(result.manifest.sourceCoverage.complete, false);
+  }
+  const capped = fixture('none', undefined, undefined, true);
+  const settled = decode(capped.value, capped.dispatch);
+  assert.equal(settled.manifest.blocked, null);
+  assert.deepEqual(
+    settled.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8], [9], [10]],
+  );
+  const delivered = settled.manifest.audit.find((row) => row.queuedPurchaseSourceActionId);
+  assert.equal(delivered.continuation, 'cappedExtraction');
+  assert.deepEqual(delivered.resourceChoiceSourceActionIds, [9, 10]);
+  assert.equal(settled.manifest.extractionRewardReceipt.remaining, 0);
+  for (const step of settled.record.steps)
+    assert.deepEqual(
+      step.checkpoint.expected,
+      capped.value.witness.witnesses.find((w) => w.actionId === step.sourceActionIds[0]).expected,
+    );
+  for (const [name, change, alter] of [
+    [
+      'missing last choice',
+      (v) => {
+        v.raw.entries.pop();
+        v.raw.dom_entries.pop();
+        v.raw.entry_count--;
+        v.witness.witnesses.pop();
+      },
+    ],
+    [
+      'missing bonus',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 8).messages.pop();
+      },
+    ],
+    [
+      'wrong choice actor',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 9).messages[0].raw_text =
+          'Bは\nを獲得した';
+      },
+    ],
+    [
+      'duplicate fixed claim',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages.push(clone(gold));
+      },
+    ],
+    [
+      'early visible fixed reward',
+      (v) => {
+        v.witness.witnesses[2].expected.players[0].resources.skull = 1;
+      },
+    ],
+    [
+      'changed original checkpoint',
+      (v) => {
+        v.witness.witnesses[3].expected.players[0].score++;
+      },
+    ],
+    [
+      'changed retained queue',
+      undefined,
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.pending.after[1].effects[0].resources.skull++;
+      },
+    ],
+    [
+      'early fixed delivery',
+      undefined,
+      (f, stage) => {
+        if (stage === 'firstMaterial') f.snapshot.state.players[0].resources.gold++;
+      },
+    ],
+    [
+      'wrong final continuation',
+      undefined,
+      (f, stage) => {
+        if (stage === 'lastMaterial') f.snapshot.state.pending.task.remaining++;
+      },
+    ],
+    [
+      'wrong final skull supply',
+      undefined,
+      (f, stage) => {
+        if (stage === 'lastMaterial') f.snapshot.state.skullSupply++;
+      },
+    ],
+  ]) {
+    const f = fixture('none', change, alter, true);
+    const refused = decode(f.value, f.dispatch);
+    assert.equal(refused.manifest.blocked.actionId, 7, name);
+    assert.deepEqual(
+      refused.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.equal(refused.manifest.extractionRewardReceipt, null, name);
+    assert.equal(
+      refused.manifest.audit.some((row) => row.queuedPurchaseSourceActionId),
+      false,
+      name,
+    );
   }
   const cases = [
     [
