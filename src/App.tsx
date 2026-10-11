@@ -168,6 +168,8 @@ function App() {
   function closeReplay() {
     replayOpenRef.current = false;
     setReplayOpen(false);
+    if (cpuGameRef.current && getActiveCpuGame() !== cpuGameRef.current)
+      discardGuard(cpuGameRef.current);
     const guardRequired = modelRef.current && session && supportsNnCpu(session.state);
     if (
       !pausedBeforeReplayRef.current &&
