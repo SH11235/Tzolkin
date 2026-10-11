@@ -5,3 +5,4 @@ pub mod deployment;
 pub mod features;
 pub mod kernel;
 pub mod policy;
+pub mod trade_guard;

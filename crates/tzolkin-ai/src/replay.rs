@@ -55,6 +55,14 @@ pub enum ReplaySource {
     deny_unknown_fields
 )]
 pub enum SeatPolicy {
+    /// Guarded current joint evaluation only; this DTO admits no owner or Train source.
+    PublicRlCurrentMixedTradeGuard {
+        policy_version: String,
+        identity: Box<crate::public_rl_current_mixed_source::CurrentMixedParentIdentity>,
+        selection_version: String,
+        guard: TradeGuardConfig,
+        configuration_key: String,
+    },
     /// Count-neutral continued mixed evaluation metadata, never owner admission.
     PublicRlContinuedMixed {
         identity: Box<crate::public_rl_current_mixed_source::ContinuedMixedIdentity>,
@@ -160,6 +168,7 @@ impl SeatPolicy {
             Self::PublicRl { policy_version, .. } | Self::PublicRlPaired { policy_version, .. } => {
                 Some(policy_version)
             }
+            Self::PublicRlCurrentMixedTradeGuard { policy_version, .. } => Some(policy_version),
             Self::PublicRlMixed { identity, .. } => Some(identity.policy_version()),
             Self::PublicRlContinuedMixed { identity, .. } => Some(identity.policy_version()),
             _ => None,
@@ -167,6 +176,21 @@ impl SeatPolicy {
     }
     pub fn validate(&self) -> Result<(), String> {
         match self {
+            Self::PublicRlCurrentMixedTradeGuard {
+                policy_version,
+                identity,
+                selection_version,
+                guard,
+                configuration_key,
+            } => {
+                if policy_version != crate::public_trade_guard::CURRENT_MIXED_POLICY_VERSION
+                    || selection_version != RL_ARGMAX_SELECTION_VERSION
+                    || *configuration_key != guard.configuration_key()?
+                {
+                    return Err("Unsupported guarded current mixed provenance".into());
+                }
+                identity.validate()
+            }
             Self::PublicRlContinuedMixed {
                 identity,
                 selection_version,
@@ -611,8 +635,9 @@ impl GuardReplay {
             ReplaySource::PolicySelfPlay { policies } => policies
                 .iter()
                 .map(|policy| match policy {
-                    SeatPolicy::PublicLearnedTradeGuard { guard, .. } => {
-                        TradeGuardSession::new(guard.clone()).map(Some)
+                    SeatPolicy::PublicLearnedTradeGuard { .. }
+                    | SeatPolicy::PublicRlCurrentMixedTradeGuard { .. } => {
+                        TradeGuardSession::from_provenance(policy).map(Some)
                     }
                     _ => Ok(None),
                 })
@@ -635,8 +660,7 @@ impl GuardReplay {
         let session = self.sessions.get_mut(o.actor).and_then(Option::as_mut);
         if let Some(session) = session {
             if decision.is_some_and(|d| {
-                d.policy_version != crate::public_trade_guard::POLICY_VERSION
-                    || !d.score.is_finite()
+                d.policy_version != session.policy_version() || !d.score.is_finite()
             }) {
                 return Err("Guarded decision policy version/finite score mismatch".into());
             }

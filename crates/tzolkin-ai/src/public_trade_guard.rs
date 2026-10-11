@@ -17,9 +17,15 @@ use crate::replay::SeatPolicy;
 
 pub const GUARD_VERSION: &str = "public-trade-cycle-guard-v1";
 pub const POLICY_VERSION: &str = "learned-public-policy-trade-guard-v1";
+/// Explicit execution composition; the underlying joint identity/counts stay intact.
+pub const CURRENT_MIXED_POLICY_VERSION: &str = "current-mixed-public-trade-guard-v1";
 pub const PROJECTION_VERSION: &str = "public-trading-state-v1";
 pub const MAX_PUBLIC_STATE_BYTES: usize = 131_072;
 pub const MAX_TRADES: usize = 64;
+const _: () = assert!(
+    MAX_TRADES == tzolkin_inference::trade_guard::MAX_TRADES
+        && MAX_PUBLIC_STATE_BYTES == tzolkin_inference::trade_guard::MAX_STATE_BYTES
+);
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 pub const MAX_GAME_EXAMPLES: usize = 64;
 pub const MAX_ARENA_EXAMPLES: usize = 4096;
@@ -384,7 +390,11 @@ impl TradeGuardCapture {
 impl TradeGuardSummary {
     pub(crate) fn new(provenance: &SeatPolicy) -> Result<Self, String> {
         provenance.validate()?;
-        if !matches!(provenance, SeatPolicy::PublicLearnedTradeGuard { .. }) {
+        if !matches!(
+            provenance,
+            SeatPolicy::PublicLearnedTradeGuard { .. }
+                | SeatPolicy::PublicRlCurrentMixedTradeGuard { .. }
+        ) {
             return Err("Trade guard summary requires composite provenance".into());
         }
         Ok(Self {
@@ -437,11 +447,14 @@ impl TradeGuardSummary {
         let Some(t) = trace else {
             return Ok(());
         };
-        let SeatPolicy::PublicLearnedTradeGuard {
-            configuration_key, ..
-        } = &self.provenance
-        else {
-            unreachable!()
+        let configuration_key = match &self.provenance {
+            SeatPolicy::PublicLearnedTradeGuard {
+                configuration_key, ..
+            }
+            | SeatPolicy::PublicRlCurrentMixedTradeGuard {
+                configuration_key, ..
+            } => configuration_key,
+            _ => unreachable!(),
         };
         if t.configuration_key != *configuration_key {
             return Err("Trade summary configuration mismatch".into());
@@ -694,11 +707,6 @@ fn skip_index(o: &Observation) -> Result<usize, String> {
     }
     skip.ok_or_else(|| "Missing unique legal public Trade exit".into())
 }
-struct SeenState {
-    bytes: Vec<u8>,
-    first_index: usize,
-}
-
 /// Fresh per game/arm. No Clone, Deserialize, state/deck access or shared mutable handle.
 /// Notify *every* seat's callback once, then choose at most once for that callback.
 /// A callback/choice error invalidates this session; construct a fresh one to restart.
@@ -716,10 +724,9 @@ struct SeenState {
 /// ```compile_fail
 /// # use tzolkin_ai::public_trade_guard::TradeGuardSession;
 /// let session = TradeGuardSession::new(Default::default()).unwrap();
-/// session.seen;
+/// session.history;
 /// ```
 pub struct TradeGuardSession {
-    config: TradeGuardConfig,
     configuration_key: String,
     next_callback: usize,
     notified: Option<(usize, usize, bool)>,
@@ -728,14 +735,15 @@ pub struct TradeGuardSession {
     actor: Option<usize>,
     next_episode: usize,
     episode: usize,
-    trades: usize,
-    seen: Vec<SeenState>,
+    history: tzolkin_inference::trade_guard::TradeHistory,
+    policy_version: String,
+    raw_policy_version: String,
+    current_identity: Option<crate::public_rl_current_mixed_source::CurrentMixedParentIdentity>,
 }
 impl TradeGuardSession {
     pub fn new(config: TradeGuardConfig) -> Result<Self, String> {
         let configuration_key = config.configuration_key()?;
         Ok(Self {
-            config,
             configuration_key,
             next_callback: 0,
             notified: None,
@@ -744,14 +752,18 @@ impl TradeGuardSession {
             actor: None,
             next_episode: 0,
             episode: 0,
-            trades: 0,
-            seen: Vec::new(),
+            history: tzolkin_inference::trade_guard::TradeHistory::new(
+                config.max_trades_per_episode,
+                config.max_public_state_bytes,
+            )?,
+            policy_version: POLICY_VERSION.into(),
+            raw_policy_version: crate::public_model::POLICY_VERSION.into(),
+            current_identity: None,
         })
     }
     fn reset_episode(&mut self) {
         self.actor = None;
-        self.trades = 0;
-        self.seen.clear();
+        self.history.reset();
     }
     fn invalidate(&mut self) {
         self.reset_episode();
@@ -789,6 +801,9 @@ impl TradeGuardSession {
     ) -> Result<(Decision, Option<TradeGuardTrace>), String> {
         let result = (|| {
             self.check_callback(index, o)?;
+            if self.current_identity.is_some() {
+                return Err("BC distribution cannot substitute a current mixed handle".into());
+            }
             let output = distribution()?;
             if output.policy_version != crate::public_model::POLICY_VERSION
                 || output.feature_schema != crate::features::PUBLIC_FEATURE_SCHEMA
@@ -800,34 +815,92 @@ impl TradeGuardSession {
             {
                 return Err("Invalid base NN distribution for public Trade guard".into());
             }
-            let raw = (1..output.logits.len()).fold(0, |best, i| {
-                if output.logits[i] > output.logits[best] {
-                    i
-                } else {
-                    best
-                }
-            });
-            if !is_trade(o) {
-                self.chosen = true;
-                return Ok((decision(o, raw, output.logits[raw]), None));
-            }
-            let skip = skip_index(o)?;
-            let trace = self.transition(index, o, raw, output.logits[raw], output.logits[skip])?;
-            Ok((
-                decision(o, trace.effective.legal_index, trace.effective.logit),
-                Some(trace),
-            ))
+            self.choose_logits(index, o, &output.logits)
         })();
         if result.is_err() {
             self.invalidate();
         }
         result
     }
+    pub(crate) fn from_provenance(provenance: &SeatPolicy) -> Result<Self, String> {
+        provenance.validate()?;
+        match provenance {
+            SeatPolicy::PublicLearnedTradeGuard { guard, .. } => Self::new(guard.clone()),
+            SeatPolicy::PublicRlCurrentMixedTradeGuard {
+                identity,
+                guard,
+                policy_version,
+                ..
+            } => {
+                let mut session = Self::new(guard.clone())?;
+                session.policy_version = policy_version.clone();
+                session.raw_policy_version = identity.policy_version().into();
+                session.current_identity = Some((**identity).clone());
+                Ok(session)
+            }
+            _ => Err("Trade guard requires explicit composite provenance".into()),
+        }
+    }
+    pub(crate) fn choose_current(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'_>,
+    ) -> Result<(Decision, Option<TradeGuardTrace>), String> {
+        let result = (|| {
+            self.check_callback(index, o)?;
+            if self.current_identity.as_ref() != Some(policy.identity()) {
+                return Err("Trade guard differs from genuine current mixed handle".into());
+            }
+            // Exactly one existing Scalar actor distribution; no critic forward.
+            let output = policy.distribution(o)?;
+            self.choose_logits(index, o, output.logits())
+        })();
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+    fn choose_logits(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        logits: &[f32],
+    ) -> Result<(Decision, Option<TradeGuardTrace>), String> {
+        self.check_callback(index, o)?;
+        if logits.len() != o.legal_actions.len()
+            || logits.is_empty()
+            || logits.len() > crate::model::MAX_CANDIDATES
+            || logits.iter().any(|x| !x.is_finite())
+        {
+            return Err("Invalid logits for public Trade guard".into());
+        }
+        let raw =
+            (1..logits.len()).fold(0, |best, i| if logits[i] > logits[best] { i } else { best });
+        if !is_trade(o) {
+            self.chosen = true;
+            return Ok((decision(o, raw, logits[raw], &self.policy_version), None));
+        }
+        let skip = skip_index(o)?;
+        let trace = self.transition(index, o, raw, logits[raw], logits[skip])?;
+        Ok((
+            decision(
+                o,
+                trace.effective.legal_index,
+                trace.effective.logit,
+                &self.policy_version,
+            ),
+            Some(trace),
+        ))
+    }
     fn check_callback(&self, index: usize, o: &Observation) -> Result<(), String> {
         if self.failed || self.chosen || self.notified != Some((index, o.actor, is_trade(o))) {
             return Err("Public Trade choice requires its single current callback".into());
         }
         Ok(())
+    }
+    pub(crate) fn policy_version(&self) -> &str {
+        &self.policy_version
     }
     fn transition(
         &mut self,
@@ -848,24 +921,18 @@ impl TradeGuardSession {
             return Err("Invalid reported Trade proposal/logits".into());
         }
         let bytes = public_bytes(o)?;
-        let first_seen = self
-            .seen
-            .iter()
-            .find(|s| s.bytes == bytes)
-            .map(|s| s.first_index);
-        let repeat_seen = first_seen.is_some();
-        let budget_reached = self.trades >= self.config.max_trades_per_episode;
-        let force_exit = raw != skip && (repeat_seen || budget_reached);
+        let public_state_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let reduced = self.history.transition(index, bytes, raw == skip)?;
+        let first_seen = reduced.first_seen_index;
+        let repeat_seen = reduced.repeat_seen;
+        let budget_reached = reduced.budget_reached;
+        let force_exit = reduced.force_exit;
         let effective = if force_exit { skip } else { raw };
         let episode = if self.actor.is_none() {
             self.next_episode
         } else {
             self.episode
         };
-        let count_after = self.trades + usize::from(effective != skip);
-        if effective != skip && self.seen.len() >= MAX_TRADES {
-            return Err("Public Trade cache budget exceeded".into());
-        }
         let candidate = |legal_index, logit| GuardCandidate {
             legal_index,
             legal: o.legal_actions[legal_index].clone(),
@@ -873,17 +940,17 @@ impl TradeGuardSession {
         };
         let trace = TradeGuardTrace {
             schema: 1,
-            policy_version: POLICY_VERSION.into(),
-            raw_policy_version: crate::public_model::POLICY_VERSION.into(),
+            policy_version: self.policy_version.clone(),
+            raw_policy_version: self.raw_policy_version.clone(),
             guard_version: GUARD_VERSION.into(),
             projection_version: PROJECTION_VERSION.into(),
             configuration_key: self.configuration_key.clone(),
             callback_index: index,
             actor: o.actor,
-            public_state_sha256: format!("{:x}", Sha256::digest(&bytes)),
+            public_state_sha256,
             episode_ordinal: episode,
-            trade_count_before: self.trades,
-            trade_count_after: count_after,
+            trade_count_before: reduced.count_before,
+            trade_count_after: reduced.count_after,
             first_seen_callback_index: first_seen,
             repeat_seen,
             budget_reached,
@@ -910,7 +977,8 @@ impl TradeGuardSession {
                 },
             ),
         };
-        // Commit only after every projection/legal/logit/trace operation succeeds.
+        // The reducer commits after all fallible projection/legal/logit checks.
+        // Trace construction above only copies the validated transition.
         if self.actor.is_none() {
             self.episode = episode;
             self.next_episode += 1;
@@ -919,12 +987,6 @@ impl TradeGuardSession {
         self.chosen = true;
         if effective == skip {
             self.reset_episode();
-        } else {
-            self.seen.push(SeenState {
-                bytes,
-                first_index: index,
-            });
-            self.trades = count_after;
         }
         Ok(trace)
     }
@@ -957,11 +1019,11 @@ impl TradeGuardSession {
         result
     }
 }
-fn decision(o: &Observation, index: usize, logit: f32) -> Decision {
+fn decision(o: &Observation, index: usize, logit: f32, policy_version: &str) -> Decision {
     Decision {
         actor: o.actor,
         observation_key: o.observation_key.clone(),
-        policy_version: POLICY_VERSION.into(),
+        policy_version: policy_version.into(),
         r#move: o.legal_actions[index].r#move.clone(),
         score: f64::from(logit),
     }
@@ -1137,5 +1199,129 @@ mod tests {
         let mut session = TradeGuardSession::new(Default::default()).unwrap();
         session.on_callback(0, &earlier_skip).unwrap();
         assert!(session.transition(0, &earlier_skip, 1, 1.0, 0.0).is_ok());
+    }
+
+    #[test]
+    fn current_composition_preserves_legacy_history_and_closed_identity() {
+        use super::*;
+        use crate::public_rl_current_mixed_source as source;
+        use crate::public_rl_mixed_handle as mixed;
+        // Content-only fixtures never construct a numeric owner or a handle.
+        let mut identity = serde_json::json!({
+            "schema": mixed::IDENTITY_SCHEMA,
+            "policyVersion": mixed::POLICY_VERSION,
+            "samplingVersion": mixed::SAMPLING_VERSION,
+            "task": crate::public_policy_mixed::TASK,
+            "artifactChecksum": "a".repeat(64),
+            "importedUpdateCount": 1, "mixedUpdateCount": 1,
+            "actorModelVersion": crate::public_model::MODEL_VERSION,
+            "criticModelVersion": crate::public_state_critic::MODEL_VERSION,
+            "actorParametersChecksum": "b".repeat(64),
+            "residualParametersChecksum": "c".repeat(64),
+            "featureSchema": crate::features::PUBLIC_FEATURE_SCHEMA,
+            "inputContract": crate::public_model::INPUT_CONTRACT,
+            "contextSchema": crate::public_state_critic::CONTEXT_SCHEMA,
+            "contextContract": crate::public_state_critic::CONTEXT_CONTRACT,
+            "backend": "scalar",
+            "numericalTarget": crate::public_stochastic_native::numerical_target(),
+        });
+        let guard = TradeGuardConfig::default();
+        let mut state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            state = apply_move(&state, crate::choose_move(&o).unwrap().r#move).unwrap();
+        }
+        state.players[state.current_player]
+            .resources
+            .insert(Resource::Corn, 3);
+        state.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        let o = observe(&state, state.current_player).unwrap();
+        let skip = skip_index(&o).unwrap();
+        let mut logits = vec![0.0; o.legal_actions.len()];
+        logits[skip] = -1.0;
+        // For both identity generations the composition changes only execution
+        // metadata; exact old projection/history/ordered-mask outcomes survive.
+        for continued in [false, true] {
+            if continued {
+                identity["schema"] = source::CONTINUED_IDENTITY_SCHEMA.into();
+                identity["policyVersion"] = source::CONTINUED_POLICY_VERSION.into();
+                identity["samplingVersion"] = source::CONTINUED_SAMPLING_VERSION.into();
+                identity["task"] = source::CONTINUED_TASK.into();
+                identity["mixedUpdateCount"] = 49.into();
+                identity["firstMixedChecksum"] = "d".repeat(64).into();
+                identity["parentArtifactChecksum"] = "e".repeat(64).into();
+            }
+            let parent = serde_json::from_value(serde_json::json!({
+                "kind": if continued { "continuedMixedV2" } else { "initialMixedV1" },
+                "policy": identity,
+            }))
+            .unwrap();
+            let provenance = SeatPolicy::PublicRlCurrentMixedTradeGuard {
+                policy_version: CURRENT_MIXED_POLICY_VERSION.into(),
+                identity: Box::new(parent),
+                selection_version: crate::replay::RL_ARGMAX_SELECTION_VERSION.into(),
+                guard: guard.clone(),
+                configuration_key: guard.configuration_key().unwrap(),
+            };
+            provenance.validate().unwrap();
+            assert!(provenance.is_rl_evaluation());
+            assert!(!crate::public_rl_mixed_native::legacy_opponent_identity_allowed(&provenance));
+            let wire = serde_json::to_value(&provenance).unwrap();
+            assert_eq!(
+                serde_json::from_value::<SeatPolicy>(wire.clone()).unwrap(),
+                provenance
+            );
+            let mut invalid = wire.clone();
+            invalid["configurationKey"] = "f".repeat(64).into();
+            assert!(
+                serde_json::from_value::<SeatPolicy>(invalid)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            let mut extra = wire;
+            extra["admitOwner"] = true.into();
+            assert!(serde_json::from_value::<SeatPolicy>(extra).is_err());
+            let mut old = TradeGuardSession::new(guard.clone()).unwrap();
+            let mut new = TradeGuardSession::from_provenance(&provenance).unwrap();
+            let mut replay = TradeGuardSession::from_provenance(&provenance).unwrap();
+            for index in 0..3 {
+                old.on_callback(index, &o).unwrap();
+                new.on_callback(index, &o).unwrap();
+                replay.on_callback(index, &o).unwrap();
+                let (old_decision, old_trace) = old.choose_logits(index, &o, &logits).unwrap();
+                let (new_decision, new_trace) = new.choose_logits(index, &o, &logits).unwrap();
+                let old_trace = old_trace.unwrap();
+                let new_trace = new_trace.unwrap();
+                assert_eq!(new_decision.r#move, old_decision.r#move);
+                assert_eq!(new_decision.score, old_decision.score);
+                assert_eq!(new_decision.policy_version, CURRENT_MIXED_POLICY_VERSION);
+                let mut normalized = serde_json::to_value(&new_trace).unwrap();
+                normalized["policyVersion"] = POLICY_VERSION.into();
+                normalized["rawPolicyVersion"] = crate::public_model::POLICY_VERSION.into();
+                assert_eq!(normalized, serde_json::to_value(&old_trace).unwrap());
+                // First visit trades, second exits, third starts a fresh episode.
+                assert_eq!(new_trace.overridden, index == 1);
+                replay
+                    .verify_trace(index, &o, &new_trace.effective.legal, &new_trace)
+                    .unwrap();
+            }
+            assert!(new.choose_logits(2, &o, &logits).is_err());
+            let mut bad = TradeGuardSession::from_provenance(&provenance).unwrap();
+            bad.on_callback(0, &o).unwrap();
+            let mut malformed = o.clone();
+            malformed
+                .legal_actions
+                .push(malformed.legal_actions[skip].clone());
+            assert!(
+                bad.choose_logits(0, &malformed, &vec![0.0; malformed.legal_actions.len()])
+                    .is_err()
+            );
+        }
     }
 }
