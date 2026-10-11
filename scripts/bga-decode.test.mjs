@@ -534,6 +534,47 @@ test('binds localized food-day score captions and age-two announcements to core 
     assert.equal(result.record.steps.length, 1);
     assert.equal(result.manifest.trainingReady, false);
   }
+  const terminalCaptions = [
+    { raw_text: '最終スコア' },
+    { raw_text: '記念碑: Aは技術の合計3レベルから9点を獲得した' },
+    { raw_text: '残り資源: Aは2点を獲得した' },
+    { raw_text: 'ゲーム終了' },
+  ];
+  const terminal = fixture(27);
+  const terminalValue = terminal.make([
+    ...terminal.feeding,
+    ...terminal.scores,
+    ...terminalCaptions,
+    { raw_text: '歯車が進んだ' },
+  ]);
+  const terminalExpected = clone(terminal.after.snapshot.state);
+  terminalValue.witness.witnesses = [{ actionId: 6, expected: terminalExpected }];
+  const finished = decode(
+    terminalValue,
+    dispatcher(terminal.initial, (request) => {
+      assert.equal(request.move.type, 'endTurn');
+      return clone(terminal.after);
+    }),
+  );
+  assert.equal(finished.manifest.blocked, null);
+  assert.equal(finished.record.steps.length, 1);
+  assert.deepEqual(finished.record.steps[0].checkpoint.expected, terminalExpected);
+  assert.equal(finished.manifest.mechanicallyFinished, true);
+  assert.equal(finished.manifest.trainingReady, false);
+  const playing = fixture(14);
+  for (const caption of terminalCaptions.slice(1, 3)) {
+    const refused = run(playing, [
+      ...playing.feeding,
+      ...playing.scores,
+      caption,
+      { raw_text: '歯車が進んだ' },
+    ]);
+    assert.match(
+      refused.manifest.blocked.reason,
+      /Automatic effect has no known actor|Unsupported source message/,
+    );
+    assert.equal(refused.record.steps.length, 0);
+  }
   const f = fixture();
   const era = { raw_text: '建物が第2世代になりました' };
   const advance = { raw_text: '歯車が進んだ' };

@@ -2683,6 +2683,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               )
                 fail('Age-two announcement has no unique matching core food-day transition');
               context.ageAnnouncement = true;
+            } else if (
+              state().phase === 'finished' &&
+              /^(最終スコア|記念碑: |残り資源: )/.test(event.rawText)
+            ) {
+              // Source display annotations do not change the official core score.
             } else if (/は\d+点を獲得した$/.test(event.rawText)) {
               if (deferredScore?.sourceId === id && deferredScore.scoreEvent === event) {
                 if (deferredScore.captionObserved)
@@ -2721,11 +2726,6 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 fail('Accumulated corn has no matching actor/amount core EndTurn receipt');
               calendarEvidence = { ...calendarEvidence, corn: { ...receipt, consumed: true } };
               syncHistory();
-            } else if (
-              state().phase === 'finished' &&
-              /^(最終スコア|記念碑: |残り資源: )/.test(event.rawText)
-            ) {
-              // Source display annotations do not change the official core score.
             } else fail(`Unsupported source message: ${event.rawText.slice(0, 120)}`);
           } else fail(`Unsupported source effect ${event.kind}`);
         }
