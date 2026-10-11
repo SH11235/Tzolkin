@@ -997,7 +997,8 @@ fn borrowed_work_bounds(
                     | PolicyChooser::PublicRlPaired(_)
                     | PolicyChooser::PublicRlMixed(_)
                     | PolicyChooser::PublicRlContinuedMixed(_)
-                    | PolicyChooser::PublicLearned(_) => public_policy = true,
+                    | PolicyChooser::PublicLearned(_)
+                    | PolicyChooser::PublicLearnedTradeGuard { .. } => public_policy = true,
                     PolicyChooser::Search(policy) => {
                         search_cap = search_cap.max(
                             u64::try_from(policy.config().max_total_steps)
@@ -1760,7 +1761,7 @@ mod tests {
         .unwrap();
         let (focal, _) = PolicyHandle::borrowed(h, &config.seeds).unwrap();
         let (reference, _) = PolicyHandle::borrowed(h, &config.seeds).unwrap();
-        let pool = [
+        let mut pool = [
             BorrowedArenaPolicy::CornFirstSetup(&weights),
             BorrowedArenaPolicy::Search(&search),
             BorrowedArenaPolicy::CornFirstUxmalOpening(&weights),
@@ -1776,6 +1777,22 @@ mod tests {
         assert_eq!(
             bounds.max_search_atomic_steps,
             4 * replay::MAX_DECISIONS as u64
+        );
+
+        // A guarded BC is still the sole public NN in four of these six arms.
+        let model = crate::public_native::integration_fixture::model(false);
+        let guard = TradeGuardConfig::default();
+        pool[0] = FrozenReactiveOpponent::synthetic_bc(&model, None).handle;
+        let pure_bounds = borrowed_work_bounds(&config, &focal, &reference, &pool).unwrap();
+        assert_eq!(
+            pure_bounds.max_public_policy_candidate_rows,
+            4 * replay::MAX_DECISIONS as u64 * tzolkin_inference::policy::MAX_CANDIDATES as u64
+        );
+        pool[0] = FrozenReactiveOpponent::synthetic_bc(&model, Some(&guard)).handle;
+        let guarded_bounds = borrowed_work_bounds(&config, &focal, &reference, &pool).unwrap();
+        assert_eq!(
+            serde_json::to_value(&guarded_bounds).unwrap(),
+            serde_json::to_value(&pure_bounds).unwrap()
         );
     }
 
