@@ -1509,7 +1509,34 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       )
     );
   }
-  function queuedCornPurchase(outcome, witness, events, previous, actor, amount) {
+  function queuedCornTechnology(previous, actor) {
+    // Bind the choice to the next source group, never to a later board result.
+    const [sourceId, events] = context.nextSource ?? [];
+    const first = events?.[0];
+    if (
+      first?.kind !== 'technology' ||
+      first.detail.steps !== 1 ||
+      actorId(first.actor) !== actor ||
+      !TECHNOLOGIES.includes(first.detail.technology)
+    )
+      return null;
+    const technology = first.detail.technology;
+    const level = previous.players[actor].technologies[technology];
+    if (!Number.isSafeInteger(level) || level < 0 || level > 3) return null;
+    if (
+      level < 3
+        ? events.length !== 1
+        : technology !== 'extraction' ||
+          events.length !== 2 ||
+          events[1].kind !== 'unparsed' ||
+          events[1].actor !== null ||
+          events[1].iconResources.length !== 0 ||
+          events[1].rawText !== `収集技術ボーナス: ${first.actor}は好きな資源2個を得た`
+    )
+      return null;
+    return { kind: 'cornTechnology', technology, technologySourceId: sourceId };
+  }
+  function queuedCornPurchase(outcome, witness, events, previous, actor, amount, continuation) {
     const action = outcome.row.action;
     const next = outcome.frame.snapshot.state;
     const cost = RESOURCES.map((resource) => buildings.get(action.id)?.cost[resource] ?? 0);
@@ -1525,7 +1552,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       object(own?.resources) &&
       !Object.hasOwn(own.resources, 'corn') &&
       previous.currentPlayer === actor &&
-      previous.players[actor].technologies.theology === 3 &&
+      (continuation !== null || previous.players[actor].technologies.theology === 3) &&
       same(next.pending.after, [
         { type: 'effects', effects: [{ type: 'resources', resources: { corn: amount } }] },
         {
@@ -1631,14 +1658,19 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       )
     )
       return null;
-    if (corn && !queuedCornPurchase(outcome, witness, events, previous, actor, amount)) return null;
+    const continuation = corn ? queuedCornTechnology(previous, actor) : null;
+    if (
+      corn &&
+      !queuedCornPurchase(outcome, witness, events, previous, actor, amount, continuation)
+    )
+      return null;
     return {
       actor,
       resource,
       amount,
       pending: copy(next.pending),
       gainEvent: gainEvents[0],
-      ...(corn ? { kind: 'cornTheology', bonusClaimed: false } : {}),
+      ...(corn ? (continuation ?? { kind: 'cornTheology', bonusClaimed: false }) : {}),
     };
   }
   function finishQueuedPurchase(event) {
@@ -1680,6 +1712,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       };
       return false;
     }
+    const uncapped = receipt.kind === 'cornTechnology' ? mechanical(before) : null;
+    if (uncapped) {
+      uncapped.players[actor].technologies[technology]++;
+      uncapped.players[actor].resources.corn += receipt.amount;
+      uncapped.pending = copy(next.pending);
+    }
     if (
       record.steps.length !== receipt.stepCount + 1 ||
       next.currentPlayer !== actor ||
@@ -1705,6 +1743,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         ),
       ) ||
       next.players[actor].score !== before.players[actor].score ||
+      (uncapped !== null && !same(mechanical(next), uncapped)) ||
       (corn &&
         (!receipt.bonusClaimed ||
           technology !== 'theology' ||
@@ -1731,6 +1770,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       amount: receipt.amount,
       actualDelivered: true,
       ...(corn ? { cappedTheologySkull: 1, humanPlayingBcReady: false } : {}),
+      ...(uncapped
+        ? {
+            technologySourceActionId: receipt.technologySourceId,
+            continuation: 'uncappedTechnology',
+            humanPlayingBcReady: false,
+          }
+        : {}),
     });
     return true;
   }
@@ -1812,6 +1858,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         first.detail.technology === 'theology' &&
         state().players[queuedPurchase.actor].technologies.theology === 3
       );
+    if (
+      queuedPurchase.kind === 'cornTechnology' &&
+      (context.id !== queuedPurchase.technologySourceId ||
+        first.detail.technology !== queuedPurchase.technology)
+    )
+      return false;
     const level = state().players[queuedPurchase.actor].technologies[first.detail.technology];
     if (level < 3) return events.length === 1;
     return (
@@ -1902,8 +1954,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (envelope && (event.kind !== 'build' || !settledBuild(outcome))) return false;
       if (task === 'technology' && cornTechnologyPair(outcome.row.action.id) !== null)
         return (
-          queuedPurchaseShape(outcome, event, events, witness)?.kind === 'cornTheology' &&
-          matches(outcome.frame.snapshot.state, witness.expected)
+          ['cornTheology', 'cornTechnology'].includes(
+            queuedPurchaseShape(outcome, event, events, witness)?.kind,
+          ) && matches(outcome.frame.snapshot.state, witness.expected)
         );
       if (task === 'technology' && queuedPurchaseShape(outcome, event, events, witness))
         return matches(outcome.frame.snapshot.state, witness.expected);
@@ -2031,6 +2084,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     context = {
       id,
       events,
+      nextSource: groups[groupIndex + 1],
       before: copy(state()),
       pools: {
         currentAge: [...(witness.refills?.currentAge ?? [])],
@@ -2469,8 +2523,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               witness,
               beforePurchase,
             );
-            if (cornTechnologyPair(action.id) !== null && receipt?.kind !== 'cornTheology')
-              fail('Corn plus technology purchase requires its exact capped-theology receipt');
+            if (
+              cornTechnologyPair(action.id) !== null &&
+              !['cornTheology', 'cornTechnology'].includes(receipt?.kind)
+            )
+              fail(
+                'Corn plus technology purchase requires its exact observed continuation receipt',
+              );
             if (receipt) {
               if (saved.deferredScore)
                 fail('A deferred purchase cannot nest another unresolved receipt');
