@@ -38,7 +38,7 @@ impl CpuDeployment {
     }
 
     pub fn metadata(&self) -> Result<String, JsError> {
-        serde_json::to_string(&serde_json::json!({
+        let mut metadata = serde_json::json!({
             "checksum": self.policy.checksum(),
             "sourceRole": self.policy.source_role(),
             "sourceChecksum": self.policy.source_checksum(),
@@ -46,8 +46,12 @@ impl CpuDeployment {
             "updateCount": self.policy.update_count(),
             "policyVersion": self.policy.policy_version(),
             "backend": self.policy.backend(),
-        }))
-        .map_err(|error| JsError::new(&error.to_string()))
+        });
+        if let Some(identity) = self.policy.current_mixed_identity() {
+            metadata["currentMixedIdentity"] =
+                serde_json::to_value(identity).map_err(|error| JsError::new(&error.to_string()))?;
+        }
+        serde_json::to_string(&metadata).map_err(|error| JsError::new(&error.to_string()))
     }
 
     /// Only an observation enters inference. The expected deployment identity

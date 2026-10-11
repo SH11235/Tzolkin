@@ -13,15 +13,54 @@ export interface CpuDecision {
   policyVersion: string;
   score?: number;
 }
+interface MixedIdentityPolicy {
+  readonly artifactChecksum: string;
+  readonly importedUpdateCount: number;
+  readonly mixedUpdateCount: number;
+  readonly actorModelVersion: 'tiny-public-policy-mlp-v1';
+  readonly criticModelVersion: 'tiny-public-state-critic-mlp-v1';
+  readonly actorParametersChecksum: string;
+  /** Retained source claim; residual weights are absent from deployment. */
+  readonly residualParametersChecksum: string;
+  readonly featureSchema: 2;
+  readonly inputContract: 'base-3-4p-native-setup-public-playing-v2';
+  readonly contextSchema: 1;
+  readonly contextContract: 'public-v2-state-prefix384-v1';
+  readonly backend: 'scalar';
+  readonly numericalTarget: string;
+}
+export type CurrentMixedIdentity =
+  | {
+      readonly kind: 'initialMixedV1';
+      readonly policy: MixedIdentityPolicy & {
+        readonly schema: 'tzolkin-public-rl-mixed-joint-inference-identity-v1';
+        readonly policyVersion: 'learned-public-rl-mixed-joint-argmax-v1';
+        readonly samplingVersion: 'public-stochastic-rl-mixed-joint-uniform-tick53-v1';
+        readonly task: 'mixedLearnerOwnSumQuarterJointOneBatchV1';
+        readonly mixedUpdateCount: 1;
+      };
+    }
+  | {
+      readonly kind: 'continuedMixedV2';
+      readonly policy: MixedIdentityPolicy & {
+        readonly schema: 'tzolkin-public-rl-continued-mixed-inference-identity-v2';
+        readonly policyVersion: 'learned-public-rl-continued-mixed-joint-argmax-v2';
+        readonly samplingVersion: 'public-stochastic-rl-continued-mixed-joint-uniform-tick53-v2';
+        readonly task: 'currentMixedLearnerOwnSumQuarterJointV2';
+        readonly firstMixedChecksum: string;
+        readonly parentArtifactChecksum: string;
+      };
+    };
 /** Numeric content identity only; these fields do not establish training qualification. */
 export interface CpuModelMetadata {
   readonly checksum: string;
-  readonly sourceRole: 'bcPrepared' | 'rlCount1' | 'rlRepeated';
+  readonly sourceRole: 'bcPrepared' | 'rlCount1' | 'rlRepeated' | 'rlCurrentMixed';
   readonly sourceChecksum: string;
   readonly sourceNumericalTarget: string;
   readonly updateCount: number | null;
   readonly policyVersion: string;
   readonly backend: 'scalar';
+  readonly currentMixedIdentity?: CurrentMixedIdentity;
 }
 export type CpuSelection = { mode: 'heuristic' } | { mode: 'nn'; modelChecksum: string };
 type Bindings = {
@@ -71,7 +110,8 @@ function modelMetadata(value: unknown): CpuModelMetadata {
       metadata.updateCount !== null &&
       metadata.updateCount >= 2 &&
       metadata.updateCount <= 10 &&
-      metadata.policyVersion === 'learned-public-rl-repeat-v1');
+      metadata.policyVersion === 'learned-public-rl-repeat-v1') ||
+    (metadata.sourceRole === 'rlCurrentMixed' && currentMixedMetadataMatches(metadata));
   if (
     typeof metadata.checksum !== 'string' ||
     !SHA256.test(metadata.checksum) ||
@@ -84,7 +124,100 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     !roleMatches
   )
     throw new Error('NNモデル情報が不正です。');
+  if (metadata.sourceRole === 'rlCurrentMixed') {
+    const identity = metadata.currentMixedIdentity!;
+    return Object.freeze({
+      ...metadata,
+      currentMixedIdentity: Object.freeze({
+        ...identity,
+        policy: Object.freeze({ ...identity.policy }),
+      }) as CurrentMixedIdentity,
+    });
+  }
   return Object.freeze({ ...metadata });
+}
+
+function currentMixedMetadataMatches(metadata: CpuModelMetadata): boolean {
+  const identity = metadata.currentMixedIdentity;
+  if (
+    !identity ||
+    typeof identity !== 'object' ||
+    Object.keys(identity).length !== 2 ||
+    !Object.hasOwn(identity, 'kind') ||
+    !Object.hasOwn(identity, 'policy')
+  )
+    return false;
+  const policy = identity.policy;
+  if (!policy || typeof policy !== 'object') return false;
+  const keys = [
+    'schema',
+    'policyVersion',
+    'samplingVersion',
+    'task',
+    'artifactChecksum',
+    'importedUpdateCount',
+    'mixedUpdateCount',
+    'actorModelVersion',
+    'criticModelVersion',
+    'actorParametersChecksum',
+    'residualParametersChecksum',
+    'featureSchema',
+    'inputContract',
+    'contextSchema',
+    'contextContract',
+    'backend',
+    'numericalTarget',
+  ];
+  if (identity.kind === 'continuedMixedV2')
+    keys.push('firstMixedChecksum', 'parentArtifactChecksum');
+  if (
+    Object.keys(policy).length !== keys.length ||
+    !keys.every((key) => Object.hasOwn(policy, key)) ||
+    policy.actorModelVersion !== 'tiny-public-policy-mlp-v1' ||
+    policy.criticModelVersion !== 'tiny-public-state-critic-mlp-v1' ||
+    policy.featureSchema !== 2 ||
+    policy.inputContract !== 'base-3-4p-native-setup-public-playing-v2' ||
+    policy.contextSchema !== 1 ||
+    policy.contextContract !== 'public-v2-state-prefix384-v1' ||
+    policy.backend !== 'scalar' ||
+    typeof policy.numericalTarget !== 'string' ||
+    !/^scalar-f32-f64-tick53-v1:[a-z0-9_]{1,32}:[a-z0-9_]{1,32}:(32|64)$/.test(
+      policy.numericalTarget,
+    ) ||
+    !Number.isSafeInteger(policy.importedUpdateCount) ||
+    policy.importedUpdateCount < 1 ||
+    policy.importedUpdateCount > 1_000_000 ||
+    !Number.isSafeInteger(policy.mixedUpdateCount) ||
+    ![
+      policy.artifactChecksum,
+      policy.actorParametersChecksum,
+      policy.residualParametersChecksum,
+    ].every((checksum) => typeof checksum === 'string' && SHA256.test(checksum)) ||
+    policy.artifactChecksum !== metadata.sourceChecksum ||
+    policy.policyVersion !== metadata.policyVersion ||
+    policy.numericalTarget !== metadata.sourceNumericalTarget ||
+    policy.mixedUpdateCount !== metadata.updateCount
+  )
+    return false;
+  return (
+    (identity.kind === 'initialMixedV1' &&
+      policy.schema === 'tzolkin-public-rl-mixed-joint-inference-identity-v1' &&
+      policy.policyVersion === 'learned-public-rl-mixed-joint-argmax-v1' &&
+      policy.samplingVersion === 'public-stochastic-rl-mixed-joint-uniform-tick53-v1' &&
+      policy.task === 'mixedLearnerOwnSumQuarterJointOneBatchV1' &&
+      policy.mixedUpdateCount === 1) ||
+    (identity.kind === 'continuedMixedV2' &&
+      identity.policy.schema === 'tzolkin-public-rl-continued-mixed-inference-identity-v2' &&
+      identity.policy.policyVersion === 'learned-public-rl-continued-mixed-joint-argmax-v2' &&
+      identity.policy.samplingVersion ===
+        'public-stochastic-rl-continued-mixed-joint-uniform-tick53-v2' &&
+      identity.policy.task === 'currentMixedLearnerOwnSumQuarterJointV2' &&
+      identity.policy.mixedUpdateCount >= 2 &&
+      identity.policy.mixedUpdateCount <= 1_000_000 &&
+      [identity.policy.firstMixedChecksum, identity.policy.parentArtifactChecksum].every(
+        (checksum) => typeof checksum === 'string' && SHA256.test(checksum),
+      ))
+  );
 }
 
 function exchange<T>(
