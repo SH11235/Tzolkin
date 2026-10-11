@@ -1088,6 +1088,349 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
   assert.match(future.manifest.blocked.reason, /reveal pool was not consumed/);
 });
 
+test('settles a queued purchase only through the next actual technology source, or rolls back both macros', () => {
+  // Injected frames exercise receipt admission/settlement, not game-rule scoring.
+  const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
+  const gold = { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_gold' }] };
+  const technology = { raw_text: 'Aは建築を1レベル進めた' };
+  const purchase = [
+    { raw_text: 'Aは4\nを支払った', icons: [{ classes: 'tz_icon resource_corn' }] },
+    { raw_text: 'Aは\nを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+    { raw_text: 'Aは建物を建てた' },
+    gold,
+  ];
+  const fixture = (mode = 'none', change = () => {}, alterFrame = () => {}) => {
+    const initial = clone(saved.core.initialFrame);
+    const before = clone(initial);
+    const player = before.snapshot.state.players[0];
+    Object.assign(player.resources, { corn: 20, wood: 4, gold: 2 });
+    player.score = -3;
+    player.technologies.architecture = 2;
+    before.observation.pendingTask = {
+      type: 'build',
+      remaining: 2,
+      allowMonument: true,
+      cornPayment: false,
+    };
+    before.snapshot.state.pending = {
+      title: 'Two buildings',
+      task: clone(before.observation.pendingTask),
+      after: [],
+    };
+    before.observation.legalActions = ['bonus', 'none'].map((option) => ({
+      action: {
+        type: 'build',
+        id: 'b06',
+        cost: [4, 1, 0, 0, 0],
+        architecture: option === 'bonus',
+        discountResource: null,
+        renovation: null,
+      },
+      move: { type: 'choose', choiceId: `purchase:${option}` },
+    }));
+    const pending = clone(before);
+    const apply = (request) => {
+      if (request.move.type === 'place') return clone(before);
+      const next = clone(before);
+      next.snapshot.state = clone(request.state);
+      const own = next.snapshot.state.players[0];
+      if (request.move.choiceId.startsWith('purchase:')) {
+        const bonus = request.move.choiceId === 'purchase:bonus';
+        own.resources.corn -= 4 - Number(bonus);
+        own.resources.wood--;
+        own.score += 2 * Number(bonus);
+        own.buildings.push('b06');
+        next.observation.pendingTask = { type: 'technology', remaining: 1, free: true };
+        next.snapshot.state.pending = {
+          title: 'Choose technology',
+          task: clone(next.observation.pendingTask),
+          after: [
+            { type: 'effects', effects: [{ type: 'resources', resources: { gold: 1 } }] },
+            {
+              type: 'build',
+              remaining: 1,
+              allowMonument: false,
+              cornPayment: false,
+              architectureAvailable: !bonus,
+            },
+          ],
+        };
+        next.observation.legalActions = [
+          {
+            action: { type: 'technology', technology: 'architecture' },
+            move: { type: 'choose', choiceId: 'tech:architecture' },
+          },
+        ];
+        alterFrame(next, 'purchase');
+        if ((bonus ? 'bonus' : 'none') === mode) Object.assign(pending, clone(next));
+      } else {
+        assert.equal(request.move.choiceId, 'tech:architecture');
+        own.technologies.architecture++;
+        own.resources.gold++;
+        next.observation.pendingTask = clone(request.state.pending.after[1]);
+        next.snapshot.state.pending = {
+          title: 'Remaining building',
+          task: clone(next.observation.pendingTask),
+          after: [],
+        };
+        next.observation.legalActions = [];
+        alterFrame(next, 'technology');
+      }
+      return next;
+    };
+    const value = input();
+    replaceEvents(value, [
+      [6, [placement]],
+      [7, purchase],
+      [8, [technology]],
+    ]);
+    const counters = {
+      resources: { corn: mode === 'bonus' ? 17 : 16 },
+      score: mode === 'bonus' ? -1 : -3,
+    };
+    value.witness.witnesses = [
+      { actionId: 6, pendingTask: 'build', expected: { players: [clone(player), {}, {}, {}] } },
+      { actionId: 7, buildings: ['b06'], expected: { players: [clone(counters), {}, {}, {}] } },
+      {
+        actionId: 8,
+        pendingTask: 'build',
+        expected: {
+          players: [
+            { ...clone(counters), resources: { ...counters.resources, gold: 3 } },
+            {},
+            {},
+            {},
+          ],
+        },
+      },
+    ];
+    change(value);
+    for (const row of value.raw.dom_entries) {
+      const entry = value.raw.entries.find((item) => item.action_id === row.action_id);
+      if (entry) entry.raw_text = row.messages.map((message) => message.raw_text).join('\n');
+      for (const message of row.messages) message.html = message.raw_text;
+    }
+    return { value, before, pending, dispatch: dispatcher(initial, apply) };
+  };
+  for (const mode of ['none', 'bonus']) {
+    const f = fixture(mode);
+    const result = decode(f.value, f.dispatch);
+    assert.equal(result.manifest.blocked, null);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.sourceActionIds),
+      [[6], [7], [8]],
+    );
+    assert.equal(result.record.steps[1].move.choiceId, `purchase:${mode}`);
+    for (const step of result.record.steps)
+      assert.deepEqual(
+        step.checkpoint.expected,
+        f.value.witness.witnesses.find((w) => w.actionId === step.sourceActionIds[0]).expected,
+      );
+    const receipt = result.manifest.audit.find((row) => row.queuedPurchaseSourceActionId);
+    assert.equal(receipt.queuedPurchaseSourceActionId, 7);
+    assert.equal(receipt.actionId, 8);
+    assert.equal(receipt.actualDelivered, true);
+    assert.equal(result.manifest.trainingReady, false);
+    assert.equal(result.manifest.sourceCoverage.complete, false);
+  }
+  const cases = [
+    [
+      'missing next source',
+      (v) => {
+        v.raw.entries.pop();
+        v.raw.dom_entries.pop();
+        v.raw.entry_count--;
+        v.witness.witnesses.pop();
+      },
+    ],
+    [
+      'no own score',
+      (v) => {
+        delete v.witness.witnesses[1].expected.players[0].score;
+      },
+    ],
+    [
+      'future-only counters',
+      (v) => {
+        delete v.witness.witnesses[1].expected;
+      },
+    ],
+    [
+      'other actor',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages[0].raw_text = 'Bは建築を1レベル進めた';
+      },
+    ],
+    [
+      'two advances',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages[0].raw_text = 'Aは建築を2レベル進めた';
+      },
+    ],
+    [
+      'wrong choice',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages[0].raw_text = 'Aは農業を1レベル進めた';
+      },
+    ],
+    [
+      'duplicate caption',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages.push(clone(v.raw.dom_entries.at(-1).messages[0]));
+      },
+    ],
+    [
+      'duplicate resource claim',
+      (v) => {
+        v.raw.dom_entries.find((entry) => entry.action_id === 7).messages.push(clone(gold));
+      },
+    ],
+    [
+      'intervening cancellation',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages[0].raw_text = 'Aは行動をキャンセルした';
+      },
+    ],
+    [
+      'next checkpoint mismatch',
+      (v) => {
+        v.witness.witnesses[2].expected.players[0].resources.gold = 4;
+      },
+    ],
+    [
+      'next unused reveal',
+      (v) => {
+        v.witness.witnesses[2].refills = { currentAge: ['b07'] };
+      },
+    ],
+    [
+      'wrong queued amount',
+      () => {},
+      (f, stage) => {
+        if (stage === 'purchase') f.snapshot.state.pending.after[0].effects[0].resources.gold = 2;
+      },
+    ],
+    [
+      'paid technology',
+      () => {},
+      (f, stage) => {
+        if (stage === 'purchase') {
+          f.snapshot.state.pending.task.free = false;
+          f.observation.pendingTask.free = false;
+        }
+      },
+    ],
+    [
+      'saturated technology',
+      () => {},
+      (f, stage) => {
+        if (stage === 'purchase') f.snapshot.state.players[0].technologies.architecture = 3;
+      },
+    ],
+    [
+      'extra queued effect',
+      () => {},
+      (f, stage) => {
+        if (stage === 'purchase')
+          f.snapshot.state.pending.after[0].effects.push({
+            type: 'resources',
+            resources: { wood: 1 },
+          });
+      },
+    ],
+    [
+      'changed day',
+      () => {},
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.round++;
+      },
+    ],
+    [
+      'unrelated gain',
+      () => {},
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.players[1].resources.gold++;
+      },
+    ],
+    [
+      'undelivered resource',
+      () => {},
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.players[0].resources.gold--;
+      },
+    ],
+    [
+      'extra technology advance',
+      () => {},
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.players[0].technologies.architecture++;
+      },
+    ],
+    [
+      'wrong continuation',
+      () => {},
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.pending.task.remaining = 2;
+      },
+    ],
+  ];
+  for (const [name, change, alter] of cases) {
+    const f = fixture('none', change, alter);
+    const result = decode(f.value, f.dispatch);
+    assert.equal(result.manifest.blocked.actionId, 7, name);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.deepEqual(
+      result.record.steps[0].checkpoint.expected,
+      f.value.witness.witnesses[0].expected,
+      name,
+    );
+    assert.equal(
+      result.manifest.audit.some((row) => row.queuedPurchaseSourceActionId),
+      false,
+      name,
+    );
+  }
+  // Even after settlement, a cancellation cannot adopt the receipt-open frame.
+  const cancelled = fixture();
+  const cancelledMessages = [
+    { raw_text: 'Aは行動をキャンセルした', html: 'Aは行動をキャンセルした', icons: [] },
+  ];
+  cancelled.value.raw.entries.push({
+    action_id: 9,
+    timestamp_display: '12:00:00',
+    raw_text: cancelledMessages[0].raw_text,
+  });
+  cancelled.value.raw.dom_entries.push({
+    action_id: 9,
+    timestamp_display: '12:00:00',
+    messages: cancelledMessages,
+  });
+  cancelled.value.raw.entry_count++;
+  // The dispatcher constructs this exact intermediate state while trying the purchase.
+  const first = decode(cancelled.value, cancelled.dispatch);
+  const open = cancelled.pending.snapshot.state;
+  cancelled.value.witness.witnesses.push({
+    actionId: 9,
+    pendingTask: 'technology',
+    expected: {
+      round: open.round,
+      gears: clone(open.gears),
+      players: open.players.map((p) => ({ resources: clone(p.resources), workers: p.workers })),
+    },
+  });
+  const rejected = decode(cancelled.value, cancelled.dispatch);
+  assert.equal(first.manifest.blocked.actionId, 9);
+  assert.match(rejected.manifest.blocked.reason, /Cancellation rollback is unknown\/ambiguous/);
+  assert.deepEqual(
+    rejected.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8]],
+  );
+});
+
 test('draw identities are supplied only to the operation that actually requires them', () => {
   const value = input();
   replaceEvents(value, [[6, [{ raw_text: '歯車が進んだ' }]]]);

@@ -287,6 +287,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   let rotationCredit = 0;
   let declaredRotation = null;
   let extractionReward = null;
+  let queuedPurchase = null;
   let calendarEvidence = {
     corn: null,
     rotation: null,
@@ -821,6 +822,120 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const key = `${id}:${field}:${direction}`;
     return (context.effects[key] ?? 0) - (context.claims[key] ?? 0);
   }
+  // A source can caption a fixed card resource before its required technology
+  // choice. Keep that purchase tentative until the next actual choice delivers
+  // the resource. This normalizes log order, not Human BC decision features.
+  function queuedPurchaseShape(outcome, event, events, witness, previous = state()) {
+    const actor = actorId(event.actor);
+    const before = previous.pending;
+    const next = outcome.frame.snapshot.state;
+    const task = next.pending?.task;
+    const after = next.pending?.after;
+    const observed = witness.expected?.players;
+    const own = observed?.[actor];
+    const gainEvents = events.filter((item) => item.kind === 'resourceGain');
+    const action = outcome.row.action;
+    if (
+      actor < 0 ||
+      event.kind !== 'build' ||
+      action.type !== 'build' ||
+      typeof action.architecture !== 'boolean' ||
+      action.renovation !== null ||
+      action.discountResource !== null ||
+      events.some((item) => item.actor !== event.actor) ||
+      events.filter((item) => item.kind === 'build').length !== 1 ||
+      events.some((item) => !['resourcePayment', 'build', 'resourceGain'].includes(item.kind)) ||
+      gainEvents.length !== 1 ||
+      events.at(-1) !== gainEvents[0] ||
+      before?.task?.type !== 'build' ||
+      before.task.remaining !== 2 ||
+      !Array.isArray(before.after) ||
+      before.after.length !== 0 ||
+      task?.type !== 'technology' ||
+      task.remaining !== 1 ||
+      task.free !== true ||
+      task.mandatory === true ||
+      !same(task, outcome.frame.observation?.pendingTask) ||
+      !Array.isArray(after) ||
+      after.length !== 2 ||
+      after[0]?.type !== 'effects' ||
+      !Array.isArray(after[0].effects) ||
+      after[0].effects.length !== 1 ||
+      after[0].effects[0].type !== 'resources' ||
+      !object(after[0].effects[0].resources) ||
+      after[1]?.type !== 'build' ||
+      after[1].remaining !== 1 ||
+      after[1].allowMonument !== false ||
+      after[1].cornPayment !== before.task.cornPayment ||
+      after[1].architectureAvailable !==
+        (before.task.architectureAvailable !== false && !action.architecture) ||
+      Boolean(after[1].mandatory) !== Boolean(before.task.mandatory) ||
+      next.currentPlayer !== actor ||
+      next.round !== previous.round ||
+      next.phase !== previous.phase ||
+      (witness.pendingTask !== undefined && witness.pendingTask !== 'technology') ||
+      !Array.isArray(observed) ||
+      observed.length !== previous.players.length ||
+      !Number.isSafeInteger(own?.resources?.corn) ||
+      own.resources.corn < 0 ||
+      !Number.isFinite(own.score)
+    )
+      return null;
+    const resources = Object.entries(after[0].effects[0].resources);
+    if (resources.length !== 1) return null;
+    const [resource, amount] = resources[0];
+    if (
+      !RESOURCES.slice(1).includes(resource) ||
+      !Number.isSafeInteger(amount) ||
+      amount < 1 ||
+      amount > 1000 ||
+      !same(
+        resourceAmounts(gainEvents[0]),
+        RESOURCES.map((r) => (r === resource ? amount : 0)),
+      )
+    )
+      return null;
+    return { actor, resource, amount, pending: copy(next.pending), gainEvent: gainEvents[0] };
+  }
+  function finishQueuedPurchase(event) {
+    const receipt = queuedPurchase;
+    const next = state();
+    const before = context.before;
+    const actor = receipt.actor;
+    const technology = event.detail.technology;
+    const expected = receipt.pending.after[1];
+    if (
+      record.steps.length !== receipt.stepCount + 1 ||
+      next.currentPlayer !== actor ||
+      next.round !== receipt.round ||
+      next.phase !== before.phase ||
+      !same(next.pending?.task, expected) ||
+      !same(frame.observation.pendingTask, expected) ||
+      !same(next.pending?.after, []) ||
+      next.players[actor].technologies[technology] !==
+        before.players[actor].technologies[technology] + 1 ||
+      next.players.some((player, id) =>
+        RESOURCES.some(
+          (resource) =>
+            player.resources[resource] !==
+            before.players[id].resources[resource] +
+              (id === actor && resource === receipt.resource ? receipt.amount : 0),
+        ),
+      ) ||
+      next.players[actor].score !== before.players[actor].score ||
+      unclaimed(receipt.gainEvent, `resource:${receipt.resource}`) !== receipt.amount
+    )
+      fail('Queued purchase resource did not settle through the observed technology choice');
+    automatic(receipt.gainEvent, `resource:${receipt.resource}`, receipt.amount);
+    audit.push({
+      actionId: context.id,
+      queuedPurchaseSourceActionId: receipt.sourceId,
+      actor,
+      resource: receipt.resource,
+      amount: receipt.amount,
+      actualDelivered: true,
+    });
+  }
   function purchaseOutcome(event, events, witness) {
     const actor = actorId(event.actor);
     const remaining = events.slice(events.indexOf(event) + 1);
@@ -873,6 +988,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       fail('Observed purchase gain is out of bounds');
     return (outcome) => {
       const task = outcome.frame.observation?.pendingTask?.type ?? null;
+      if (task === 'technology' && queuedPurchaseShape(outcome, event, events, witness))
+        return matches(outcome.frame.snapshot.state, witness.expected);
       // Later resource/temple/technology choices can change the observed fields.
       // Leave these candidates ambiguous instead of filtering with a future end board.
       if (task !== null && task !== 'build') return true;
@@ -933,12 +1050,26 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     };
   }
 
+  function rollback(saved) {
+    frame = saved.frame;
+    record.steps = saved.steps;
+    record.steps.length = saved.stepCount;
+    history = saved.history;
+    history.length = saved.historyCount;
+    history.at(-1).rotationCredit = saved.historyLastCredit;
+    history.at(-1).declaredRotation = saved.historyLastDeclaration;
+    history.at(-1).calendarEvidence = saved.historyLastEvidence;
+    history.at(-1).extractionReward = saved.historyLastReward;
+    audit.length = saved.audit;
+    rotationCredit = saved.rotationCredit;
+    declaredRotation = saved.declaredRotation;
+    calendarEvidence = saved.calendarEvidence;
+    extractionReward = saved.extractionReward;
+    queuedPurchase = saved.queuedPurchase;
+  }
   let blocked = null;
-  for (const [id, events] of sourceGroups(
-    normalizedEvents,
-    witnesses.initialActionId,
-    knownActionIds,
-  )) {
+  const groups = sourceGroups(normalizedEvents, witnesses.initialActionId, knownActionIds);
+  for (const [groupIndex, [id, events]] of groups.entries()) {
     const witness = observed.get(id) ?? {};
     const saved = {
       frame: copy(frame),
@@ -955,6 +1086,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       declaredRotation,
       calendarEvidence,
       extractionReward,
+      queuedPurchase,
     };
     context = {
       id,
@@ -974,6 +1106,24 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     };
     try {
       if (!events.length) fail('Raw source action has no observed messages');
+      if (
+        queuedPurchase &&
+        (id !== queuedPurchase.nextSourceId ||
+          events.length !== 1 ||
+          events[0].kind !== 'technology' ||
+          actorId(events[0].actor) !== queuedPurchase.actor ||
+          events[0].detail.steps !== 1 ||
+          !TECHNOLOGIES.includes(events[0].detail.technology) ||
+          state().players[queuedPurchase.actor].technologies[events[0].detail.technology] >= 3 ||
+          state().round !== queuedPurchase.round ||
+          state().currentPlayer !== queuedPurchase.actor ||
+          !same(state().pending, queuedPurchase.pending) ||
+          (witness.refills?.currentAge?.length ?? 0) !== 0 ||
+          (witness.refills?.age2?.length ?? 0) !== 0 ||
+          (witness.buildings?.length ?? 0) !== 0 ||
+          (witness.monuments?.length ?? 0) !== 0)
+      )
+        fail('Queued purchase requires the next same-actor one-step technology source');
       for (const [field, kind] of [
         ['buildings', 'build'],
         ['monuments', 'monument'],
@@ -993,6 +1143,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           fail('Cancellation requires an observed settled day/worker/resource board');
         const alternatives = history.filter(
           (entry) =>
+            !entry.unsettledPurchase &&
             entry.frame.snapshot.state.currentPlayer === actorId(events[0].actor) &&
             matches(entry.frame.snapshot.state, witness.expected) &&
             (witness.pendingTask === undefined ||
@@ -1241,7 +1392,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             alignActor(event.actor);
             const ids = witness[event.kind === 'build' ? 'buildings' : 'monuments'];
             if (ids?.length !== 1) fail('Observed purchased card identity is required');
-            choose(
+            const beforePurchase = copy(state());
+            const action = choose(
               (action) =>
                 action.type === event.kind &&
                 action.id === ids[0] &&
@@ -1251,8 +1403,30 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               false,
               () => purchaseOutcome(event, events, witness),
             );
+            const receipt = queuedPurchaseShape(
+              { frame, row: { action } },
+              event,
+              events,
+              witness,
+              beforePurchase,
+            );
+            if (receipt) {
+              const nextSourceId = groups[groupIndex + 1]?.[0];
+              if (nextSourceId === undefined) fail('Queued purchase has no next observed source');
+              queuedPurchase = {
+                ...receipt,
+                sourceId: id,
+                kinds: events.map((item) => item.kind),
+                nextSourceId,
+                round: state().round,
+                stepCount: record.steps.length,
+                saved,
+              };
+              history.at(-1).unsettledPurchase = true;
+            }
           } else if (event.kind === 'workerGain') automatic(event, 'workers', 1);
           else if (event.kind === 'resourceGain') {
+            if (queuedPurchase?.sourceId === id && queuedPurchase.gainEvent === event) continue;
             const values = resourceAmounts(event);
             if (pending() === 'resource') {
               alignActor(event.actor);
@@ -1451,22 +1625,18 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           source: { reference: source.reference, actionIds: [id] },
           expected: copy(witness.expected),
         };
+      if (saved.queuedPurchase) {
+        finishQueuedPurchase(events[0]);
+        queuedPurchase = null;
+      }
     } catch (error) {
-      frame = saved.frame;
-      record.steps = saved.steps;
-      record.steps.length = saved.stepCount;
-      history = saved.history;
-      history.length = saved.historyCount;
-      history.at(-1).rotationCredit = saved.historyLastCredit;
-      history.at(-1).declaredRotation = saved.historyLastDeclaration;
-      history.at(-1).calendarEvidence = saved.historyLastEvidence;
-      history.at(-1).extractionReward = saved.historyLastReward;
-      audit.length = saved.audit;
-      rotationCredit = saved.rotationCredit;
-      declaredRotation = saved.declaredRotation;
-      calendarEvidence = saved.calendarEvidence;
-      extractionReward = saved.extractionReward;
-      blocked = { actionId: id, kinds: events.map((event) => event.kind), reason: error.message };
+      const receipt = queuedPurchase ?? saved.queuedPurchase;
+      rollback(receipt?.saved ?? saved);
+      blocked = {
+        actionId: receipt?.sourceId ?? id,
+        kinds: receipt?.kinds ?? events.map((event) => event.kind),
+        reason: receipt ? `Unsettled purchase at source ${id}: ${error.message}` : error.message,
+      };
       break;
     }
   }
