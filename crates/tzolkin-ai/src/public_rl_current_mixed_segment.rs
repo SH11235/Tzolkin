@@ -6,12 +6,14 @@ use crate::public_rl_mixed_session::require_output_outside_directory;
 pub const SEGMENT_SPEC_SCHEMA: &str = "tzolkin-current-mixed-segment-spec-v1";
 pub const SEGMENT_JOURNAL_SCHEMA: &str = "tzolkin-current-mixed-segment-journal-v1";
 pub const GLOBAL_CONTRACT_SCHEMA: &str = "tzolkin-current-mixed-global-contract-v1";
+const BUDGET_AMENDMENT_SCHEMA: &str = "tzolkin-current-mixed-ready-budget-amendment-v1";
 pub(super) const MAX_SEGMENTS: usize = 64;
 const MAX_PROTECTED_DIRECTORIES: usize = 16;
 
-/// A finite local run and immutable global limits. This is metadata, never a
-/// constructor for a policy owner. All amounts include the predecessor's spent
-/// ledger of the first durable run and its successors. Borrowed original input
+/// A finite local run and global limits. Ordinary successors keep those limits
+/// immutable; an explicit Ready budget amendment may only increase them.
+/// This is metadata, never a constructor for a policy owner. All amounts include
+/// the predecessor's spent ledger of the first durable run and its successors. Borrowed original input
 /// files remain external. Unused local capacity is not carried forward.
 /// `maxSegments` includes the first durable run. Optional `protectedDirectories`
 /// fixes at most sixteen existing absolute source/cache directories for this
@@ -66,6 +68,52 @@ struct GlobalContract {
     protected_directories: Vec<PathBuf>,
 }
 impl GlobalContract {
+    fn require_monotonic_extension(&self, next: &Self) -> Result<(), String> {
+        self.validate()?;
+        next.validate()?;
+        let old = [
+            self.max_attempts,
+            self.max_successful_updates,
+            self.max_callbacks,
+            self.max_candidate_rows,
+            self.max_search_steps,
+            self.max_declared_work_bytes,
+            self.max_logical_record_bytes,
+            self.max_stored_record_bytes,
+            self.max_metadata_bytes,
+            self.max_temporary_bytes,
+            self.max_disk_bytes,
+        ];
+        let new = [
+            next.max_attempts,
+            next.max_successful_updates,
+            next.max_callbacks,
+            next.max_candidate_rows,
+            next.max_search_steps,
+            next.max_declared_work_bytes,
+            next.max_logical_record_bytes,
+            next.max_stored_record_bytes,
+            next.max_metadata_bytes,
+            next.max_temporary_bytes,
+            next.max_disk_bytes,
+        ];
+        if self.schema != next.schema
+            || !self
+                .protected_directories
+                .iter()
+                .map(|p| p.as_os_str())
+                .eq(next.protected_directories.iter().map(|p| p.as_os_str()))
+            || self.max_segments > next.max_segments
+            || self.max_families > next.max_families
+            || old.into_iter().zip(new).any(|(a, b)| a > b)
+            || self == next
+        {
+            return Err(
+                "Current mixed budget amendment must strictly extend unchanged restrictions".into(),
+            );
+        }
+        Ok(())
+    }
     fn validate(&self) -> Result<(), String> {
         if self.protected_directories.len() > MAX_PROTECTED_DIRECTORIES
             || self.protected_directories.iter().any(|p| {
@@ -298,6 +346,15 @@ pub(super) struct SegmentBinding {
     contract_checksum: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pool_fork: Option<PoolForkBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    budget_amendment: Option<BudgetAmendmentBinding>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BudgetAmendmentBinding {
+    schema: String,
+    predecessor_contract_checksum: String,
+    ordinal: u64,
 }
 impl SegmentBinding {
     fn checksum(&self) -> Result<String, String> {
@@ -309,6 +366,7 @@ pub(super) struct SegmentContext {
     binding: SegmentBinding,
     archives: Vec<ClosedArchive>,
     pub(super) inherited_own: CurrentMixedOwnDecisionCounters,
+    amendment_ordinal: u64,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,6 +416,19 @@ impl ClosedArchive {
     }
 }
 impl SegmentContext {
+    fn next_budget_amendment(
+        &self,
+        contract: &GlobalContract,
+    ) -> Result<BudgetAmendmentBinding, String> {
+        self.binding
+            .contract
+            .require_monotonic_extension(contract)?;
+        Ok(BudgetAmendmentBinding {
+            schema: BUDGET_AMENDMENT_SCHEMA.into(),
+            predecessor_contract_checksum: self.binding.contract.checksum()?,
+            ordinal: sum(self.amendment_ordinal, 1)?,
+        })
+    }
     pub(super) fn require_archives(&self) -> Result<(), String> {
         for archive in &self.archives {
             restore::require_archive_files(&archive.view())?;
@@ -367,6 +438,26 @@ impl SegmentContext {
 }
 
 impl ReadyCurrentMixedContinuation<'_> {
+    /// Read-only preflight for an explicit monotonic contract amendment. The
+    /// established contract, actual Ready owner and all spent work are required.
+    /// Predictable refusal leaves this token owned by the caller.
+    pub fn preflight_budget_amendment(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        output: &Path,
+    ) -> Result<(), String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed successor output must be new".into());
+        }
+        self.session.segment_binding_with_validation(
+            spec,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+            true,
+        )?;
+        Ok(())
+    }
     /// Read-only checks before ownership is consumed. No directory is created,
     /// no work is reserved, and the token remains usable if a check fails.
     pub fn preflight_segment(
@@ -409,18 +500,31 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         spec: &CurrentMixedSegmentSpec,
         directory: &Path,
     ) -> Result<SegmentBinding, String> {
-        self.segment_binding_with_validation(spec, directory, restore::ArchiveValidation::Immediate)
+        self.segment_binding_with_validation(
+            spec,
+            directory,
+            restore::ArchiveValidation::Immediate,
+            false,
+        )
     }
     fn segment_binding_with_validation(
         &self,
         spec: &CurrentMixedSegmentSpec,
         directory: &Path,
         validation: restore::ArchiveValidation,
+        amend_budget: bool,
     ) -> Result<SegmentBinding, String> {
         self.progress
             .require_ready_continuation(self.blocked, self.head.is_some())?;
         self.current_policy()?;
-        self.successor_binding(spec, directory, self.pool.clone(), None, validation)
+        self.successor_binding(
+            spec,
+            directory,
+            self.pool.clone(),
+            None,
+            validation,
+            amend_budget,
+        )
     }
     fn require_stopped_fork_source(&self) -> Result<(), String> {
         self.progress
@@ -475,7 +579,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 .attempt,
             predecessor_own_counters: own_snapshot(self.progress.own_decisions),
         };
-        self.successor_binding(spec, directory, pool, Some(fork), validation)
+        self.successor_binding(spec, directory, pool, Some(fork), validation, false)
     }
     fn successor_binding(
         &self,
@@ -484,6 +588,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         pool: String,
         pool_fork: Option<PoolForkBinding>,
         validation: restore::ArchiveValidation,
+        amend_budget: bool,
     ) -> Result<SegmentBinding, String> {
         spec.validate()?;
         self.handle()?;
@@ -491,11 +596,15 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         self.root.require_output(directory)?;
         spec.global_contract.require_output(directory)?;
         require_output_outside_directory(&self.directory, directory)?;
-        let (chain_root, index, inherited) = match &self.segment {
+        let (chain_root, index, inherited, budget_amendment) = match &self.segment {
             Some(c) => {
-                if c.binding.contract != spec.global_contract {
+                let amendment = if amend_budget {
+                    Some(c.next_budget_amendment(&spec.global_contract)?)
+                } else if c.binding.contract != spec.global_contract {
                     return Err("Current mixed global contract is immutable".into());
-                }
+                } else {
+                    None
+                };
                 for archive in &c.archives {
                     require_output_outside_directory(&archive.directory, directory)?;
                 }
@@ -503,9 +612,18 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     c.binding.chain_root.clone(),
                     c.binding.index + 1,
                     c.binding.inherited,
+                    amendment,
                 )
             }
-            None => (self.root_checksum.clone(), 1, Spent::default()),
+            None => {
+                if amend_budget {
+                    return Err(
+                        "Current mixed budget amendment requires an established global contract"
+                            .into(),
+                    );
+                }
+                (self.root_checksum.clone(), 1, Spent::default(), None)
+            }
         };
         let inherited = inherited.with_session(self)?;
         if index >= spec.global_contract.max_segments
@@ -548,6 +666,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             contract: spec.global_contract.clone(),
             contract_checksum: spec.global_contract.checksum()?,
             pool_fork,
+            budget_amendment,
         };
         let raw = bytes(&spec.run_spec, SPEC_CAP)?;
         let event = Event::SegmentStart {
@@ -572,8 +691,14 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         predecessor: ReadyCurrentMixedContinuation<'a>,
         spec: CurrentMixedSegmentSpec,
         directory: PathBuf,
+        amend_budget: bool,
     ) -> Result<Self, String> {
-        let binding = predecessor.session.segment_binding(&spec, &directory)?;
+        let binding = predecessor.session.segment_binding_with_validation(
+            &spec,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+            amend_budget,
+        )?;
         Self::from_predecessor(predecessor.session, spec, binding, directory)
     }
     fn from_predecessor(
@@ -584,6 +709,10 @@ impl<'a> CurrentMixedTrainingSession<'a> {
     ) -> Result<Self, String> {
         let root_checksum = binding.checksum()?;
         let inherited_own = s.cumulative_own_decisions()?;
+        let amendment_ordinal = binding.budget_amendment.as_ref().map_or_else(
+            || s.segment.as_ref().map_or(0, |c| c.amendment_ordinal),
+            |amendment| amendment.ordinal,
+        );
         let mut progress = Progress::initial(
             &binding.parent,
             binding.prefix,
@@ -635,6 +764,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 binding,
                 archives,
                 inherited_own,
+                amendment_ordinal,
             }),
         })
     }
@@ -649,6 +779,22 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             &spec,
             &directory,
             restore::ArchiveValidation::AtChainClose,
+            false,
+        )?;
+        Self::from_predecessor(self, spec, binding, directory)?.restore_entries_in_chain(head_raw)
+    }
+    pub(super) fn restore_chain_budget_amendment(
+        self,
+        spec: CurrentMixedSegmentSpec,
+        head_raw: &[u8],
+        directory: &Path,
+    ) -> Result<Self, String> {
+        let directory = local(directory, false)?;
+        let binding = self.segment_binding_with_validation(
+            &spec,
+            &directory,
+            restore::ArchiveValidation::AtChainClose,
+            true,
         )?;
         Self::from_predecessor(self, spec, binding, directory)?.restore_entries_in_chain(head_raw)
     }
@@ -682,7 +828,21 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         if directory.exists() {
             return Err("Current mixed successor output must be new".into());
         }
-        Self::publish_successor(Self::initial_segment(predecessor, spec, directory)?)
+        Self::publish_successor(Self::initial_segment(predecessor, spec, directory, false)?)
+    }
+    /// Consumes an actual Ready continuation to start a finite successor under
+    /// strictly extended global limits. Pool/configuration, prior spend, families
+    /// and owner lineage remain unchanged. Preflight first; I/O can consume the token.
+    pub fn new_segment_with_budget_amendment(
+        predecessor: ReadyCurrentMixedContinuation<'a>,
+        spec: CurrentMixedSegmentSpec,
+        output: &Path,
+    ) -> Result<Self, String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed successor output must be new".into());
+        }
+        Self::publish_successor(Self::initial_segment(predecessor, spec, directory, true)?)
     }
     fn initial_pool_fork(
         predecessor: StoppedCurrentMixedForkSource<'a>,
@@ -764,8 +924,21 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         directory: &Path,
     ) -> Result<Self, String> {
         Self::check_latest_head(head_raw, expected_sha256)?;
-        let s = Self::initial_segment(predecessor, spec, local(directory, false)?)?;
+        let s = Self::initial_segment(predecessor, spec, local(directory, false)?, false)?;
         s.restore_entries(head_raw)
+    }
+    /// Regenerates amendment metadata from the same freshly genuine Ready
+    /// predecessor. Saved contract/checksum/ordinal DTOs cannot admit an owner.
+    pub fn restore_segment_with_budget_amendment(
+        predecessor: ReadyCurrentMixedContinuation<'a>,
+        spec: CurrentMixedSegmentSpec,
+        head_raw: &[u8],
+        expected_sha256: &str,
+        directory: &Path,
+    ) -> Result<Self, String> {
+        Self::check_latest_head(head_raw, expected_sha256)?;
+        Self::initial_segment(predecessor, spec, local(directory, false)?, true)?
+            .restore_entries(head_raw)
     }
 }
 

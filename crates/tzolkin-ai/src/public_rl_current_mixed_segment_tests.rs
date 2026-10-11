@@ -100,6 +100,7 @@ fn binding() -> SegmentBinding {
         contract_checksum: contract.checksum().unwrap(),
         contract,
         pool_fork: None,
+        budget_amendment: None,
     }
 }
 fn progress(b: &SegmentBinding) -> Progress {
@@ -141,11 +142,26 @@ fn restore_chain_checks_every_external_tip_and_bounds_the_whole_request() {
     // the subsequent semantic restore, even when their raw digest is correct.
     restore::check_chain_tips(&tip(), &[]).unwrap();
     let mut steps = (1..MAX_SEGMENTS).map(|_| step()).collect::<Vec<_>>();
+    steps[0] = restore::CurrentMixedRestoreStep::BudgetAmendment {
+        spec: CurrentMixedSegmentSpec {
+            schema: SEGMENT_SPEC_SCHEMA.into(),
+            run_spec: run_spec(),
+            global_contract: contract(&run_spec(), inherited()),
+        },
+        tip: tip(),
+    };
     restore::check_chain_tips(&tip(), &steps).unwrap();
     steps.push(step());
     assert!(restore::check_chain_tips(&tip(), &steps).is_err());
     steps.pop();
     let wrong = "f".repeat(64);
+    if let restore::CurrentMixedRestoreStep::BudgetAmendment { tip, .. } = &mut steps[0] {
+        tip.expected_sha256 = &wrong;
+    }
+    assert!(restore::check_chain_tips(&tip(), &steps).is_err());
+    if let restore::CurrentMixedRestoreStep::BudgetAmendment { tip, .. } = &mut steps[0] {
+        tip.expected_sha256 = &digest;
+    }
     if let restore::CurrentMixedRestoreStep::Segment { tip, .. } = &mut steps[1] {
         tip.expected_sha256 = &wrong;
     }
@@ -158,6 +174,190 @@ fn restore_chain_checks_every_external_tip_and_bounds_the_whole_request() {
     let oversized_digest = sha(&oversized);
     initial.expected_sha256 = &oversized_digest;
     assert!(restore::check_chain_tips(&initial, &[]).is_err());
+}
+
+#[test]
+fn budget_amendment_requires_all_caps_monotonic_and_keeps_restrictions() {
+    let mut old = contract(&run_spec(), inherited());
+    old.max_families -= 1;
+    old.protected_directories = vec![std::env::current_dir().unwrap()];
+    let original = serde_json::to_value(&old).unwrap();
+    let dimensions = [
+        "maxSegments",
+        "maxAttempts",
+        "maxSuccessfulUpdates",
+        "maxFamilies",
+        "maxCallbacks",
+        "maxCandidateRows",
+        "maxSearchSteps",
+        "maxDeclaredWorkBytes",
+        "maxLogicalRecordBytes",
+        "maxStoredRecordBytes",
+        "maxMetadataBytes",
+        "maxTemporaryBytes",
+        "maxDiskBytes",
+    ];
+    let mut increased = original.clone();
+    for field in dimensions {
+        increased[field] = (original[field].as_u64().unwrap() + 1).into();
+    }
+    let extended: GlobalContract = serde_json::from_value(increased.clone()).unwrap();
+    old.require_monotonic_extension(&extended).unwrap();
+    assert!(old.require_monotonic_extension(&old).is_err());
+    let mut changed_path = extended.clone();
+    changed_path.protected_directories[0].push(".");
+    assert!(old.require_monotonic_extension(&changed_path).is_err());
+    for field in dimensions {
+        let mut reduced = increased.clone();
+        reduced[field] = (original[field].as_u64().unwrap() - 1).into();
+        let reduced: GlobalContract = serde_json::from_value(reduced).unwrap();
+        assert!(
+            old.require_monotonic_extension(&reduced).is_err(),
+            "{field}"
+        );
+    }
+    for (field, value) in [
+        ("schema", json!("unknown")),
+        ("protectedDirectories", json!([])),
+        ("maxSegments", json!(MAX_SEGMENTS + 1)),
+        ("maxFamilies", json!(MAX_FAMILIES + 1)),
+        ("maxTemporaryBytes", json!(512 * 1024 * 1024u64 + 1)),
+        ("maxDiskBytes", json!(MAX_STORAGE + 1)),
+    ] {
+        let mut changed = increased.clone();
+        changed[field] = value;
+        let changed: GlobalContract = serde_json::from_value(changed).unwrap();
+        assert!(
+            old.require_monotonic_extension(&changed).is_err(),
+            "{field}"
+        );
+    }
+    let s = run_spec();
+    let spent = inherited();
+    let mut admitted = contract(&s, spent);
+    let prior = admitted.clone();
+    admitted.max_attempts += 1;
+    prior.require_monotonic_extension(&admitted).unwrap();
+    admitted.envelope(spent, &s).unwrap();
+    assert!(
+        admitted
+            .envelope(
+                Spent {
+                    attempts: spent.attempts + 2,
+                    ..spent
+                },
+                &s
+            )
+            .is_err()
+    );
+    assert!(
+        admitted
+            .envelope(
+                Spent {
+                    reserved_work: Work {
+                        bytes: u64::MAX,
+                        ..spent.reserved_work
+                    },
+                    ..spent
+                },
+                &s
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn budget_amendment_derives_prior_checksum_and_checked_ordinal() {
+    let mut context = SegmentContext {
+        binding: binding(),
+        archives: vec![],
+        inherited_own: CurrentMixedOwnDecisionCounters::default(),
+        amendment_ordinal: 0,
+    };
+    let mut next = context.binding.contract.clone();
+    next.max_attempts += 1;
+    let original_checksum = context.binding.contract.checksum().unwrap();
+    context.binding.contract_checksum = "0".repeat(64);
+    let first = context.next_budget_amendment(&next).unwrap();
+    assert_eq!(first.schema, BUDGET_AMENDMENT_SCHEMA);
+    assert_eq!(first.predecessor_contract_checksum, original_checksum);
+    assert_eq!(first.ordinal, 1);
+    // An ordinary successor carries the in-memory ordinal even though its own
+    // binding has no amendment. Subsequent amendments use that carried value.
+    context.amendment_ordinal = 7;
+    assert!(context.binding.budget_amendment.is_none());
+    assert_eq!(context.next_budget_amendment(&next).unwrap().ordinal, 8);
+    context.amendment_ordinal = u64::MAX;
+    assert!(context.next_budget_amendment(&next).is_err());
+}
+
+#[test]
+fn budget_amendment_start_binds_version_checksum_ordinal_and_ready_phase() {
+    let original = binding();
+    let mut amended = original.clone();
+    amended.contract.max_attempts += 1;
+    amended.contract_checksum = amended.contract.checksum().unwrap();
+    amended.budget_amendment = Some(BudgetAmendmentBinding {
+        schema: BUDGET_AMENDMENT_SCHEMA.into(),
+        predecessor_contract_checksum: original.contract.checksum().unwrap(),
+        ordinal: 1,
+    });
+    assert_ne!(amended.checksum().unwrap(), original.checksum().unwrap());
+    let expected = progress(&amended);
+    expected.check(&start(&amended), &run_spec()).unwrap();
+    assert!(
+        progress(&original)
+            .check(&start(&amended), &run_spec())
+            .is_err()
+    );
+    for (field, value) in [
+        ("schema", json!("unknown")),
+        ("predecessorContractChecksum", json!("0".repeat(64))),
+        ("ordinal", json!(2)),
+    ] {
+        let mut changed = serde_json::to_value(&amended).unwrap();
+        changed["budgetAmendment"][field] = value;
+        let changed: SegmentBinding = serde_json::from_value(changed).unwrap();
+        assert!(
+            expected.check(&start(&changed), &run_spec()).is_err(),
+            "{field}"
+        );
+    }
+    let mut p = progress(&amended);
+    p.apply(&start(&amended), &run_spec()).unwrap();
+    assert!(p.require_ready_continuation(false, true).is_err());
+    let (_, _, template) = super::super::tests::reserved();
+    let r = super::super::tests::later_reservation(&p, &template);
+    p.apply(
+        &Event::ReserveWhole4 {
+            reservation: Box::new(r),
+        },
+        &run_spec(),
+    )
+    .unwrap();
+    super::super::tests::gradient(&mut p, &run_spec());
+    p.apply(
+        &Event::Resolve {
+            resolution: Resolution::NoChange {
+                report: file_pin("report.json", b"report"),
+                report_checksum: "b".repeat(64),
+            },
+        },
+        &run_spec(),
+    )
+    .unwrap();
+    p.require_ready_continuation(false, true).unwrap();
+    assert!(p.require_ready_continuation(true, true).is_err());
+    assert!(p.require_ready_continuation(false, false).is_err());
+    let r = super::super::tests::later_reservation(&p, &template);
+    p.apply(
+        &Event::ReserveWhole4 {
+            reservation: Box::new(r),
+        },
+        &run_spec(),
+    )
+    .unwrap();
+    assert!(p.require_ready_continuation(false, true).is_err());
 }
 
 #[test]
@@ -576,6 +776,11 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
         !String::from_utf8(original.clone())
             .unwrap()
             .contains("poolFork")
+    );
+    assert!(
+        !String::from_utf8(original.clone())
+            .unwrap()
+            .contains("budgetAmendment")
     );
     let old: SegmentBinding = closed(&original, HEAD_CAP).unwrap();
     assert_eq!(old, b);
