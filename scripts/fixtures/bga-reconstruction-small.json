@@ -5244,7 +5244,7 @@
       "trainingReady": false,
       "missingReasons": [
         "record ends before the game finished",
-        "observed terminal scores/ranks have not been matched",
+        "exact terminal score/rank checkpoint was not provided",
         "full observed initial/food-day board checkpoints are not all covered"
       ],
       "frames": [
