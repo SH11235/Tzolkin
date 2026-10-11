@@ -3598,14 +3598,105 @@ test('holds queued corn until observed technology completion and preserves cappe
     assert.equal(actual.actualDelivered, true);
     assert.equal(actual.humanPlayingBcReady, false);
     if (level === 3) assert.deepEqual(actual.resourceChoiceSourceActionIds, [9, 10]);
+
+    const unknown = fixture(
+      (v) => {
+        delete v.witness.witnesses[1].expected;
+      },
+      () => {},
+      level,
+      'extraction',
+    );
+    const unknownOriginals = clone(unknown.value.witness.witnesses);
+    const withoutCounters = decode(unknown.value, unknown.dispatch);
+    assert.equal(withoutCounters.manifest.blocked, null);
+    assert.deepEqual(
+      withoutCounters.record.steps.map((step) => step.sourceActionIds),
+      completed.record.steps.map((step) => step.sourceActionIds),
+    );
+    assert.equal(withoutCounters.record.steps[1].checkpoint, null);
+    for (let index = 2; index < withoutCounters.record.steps.length; index++)
+      assert.deepEqual(
+        withoutCounters.record.steps[index].checkpoint.expected,
+        unknownOriginals[index].expected,
+      );
+    assert.deepEqual(unknown.value.witness.witnesses, unknownOriginals);
+    const unknownReceipt = withoutCounters.manifest.audit.find(
+      (row) => row.queuedPurchaseSourceActionId,
+    );
+    assert.deepEqual(unknownReceipt.purchaseCounterEvidence, {
+      score: 'unknown',
+      resourceFields: [],
+      coreState: 'derivedFromVerifiedPrefix',
+    });
+    assert.equal(unknownReceipt.humanPlayingBcReady, false);
   }
+  const withoutPurchaseCounters = (change) => (v) => {
+    delete v.witness.witnesses[1].expected;
+    change(v);
+  };
   const genericCases = [
     [
-      'missing purchase score',
+      'wrong purchase score',
       3,
       (v) => {
-        delete v.witness.witnesses[1].expected.players[0].score;
+        v.witness.witnesses[1].expected.players[0].score++;
       },
+    ],
+    [
+      'wrong purchase resource',
+      3,
+      (v) => {
+        v.witness.witnesses[1].expected.players[0].resources.gold++;
+      },
+    ],
+    [
+      'unknown counters with wrong payment',
+      3,
+      withoutPurchaseCounters((v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 7).messages[0].raw_text =
+          'Aは1\nを支払った';
+      }),
+    ],
+    [
+      'unknown counters with wrong card',
+      3,
+      withoutPurchaseCounters((v) => {
+        v.witness.witnesses[1].buildings = ['b04'];
+      }),
+    ],
+    [
+      'unknown counters with foreign purchase actor',
+      3,
+      withoutPurchaseCounters((v) => {
+        v.raw.dom_entries
+          .find((row) => row.action_id === 7)
+          .messages.find((message) => /建物/.test(message.raw_text)).raw_text = 'Bは建物を建てた';
+      }),
+    ],
+    [
+      'unknown counters with different technology choice',
+      2,
+      withoutPurchaseCounters((v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 8).messages[0].raw_text =
+          'Aは神学を1レベル進めた';
+      }),
+    ],
+    [
+      'unknown counters with extra choice event',
+      2,
+      withoutPurchaseCounters((v) => {
+        v.raw.dom_entries
+          .find((row) => row.action_id === 8)
+          .messages.push({ raw_text: 'Aは1点を得た', icons: [] });
+      }),
+    ],
+    [
+      'unknown counters with later checkpoint mismatch',
+      3,
+      withoutPurchaseCounters((v) => {
+        v.witness.witnesses.at(-1).expected.players[0].score++;
+      }),
     ],
     [
       'wrong Extraction bonus',
@@ -3669,6 +3760,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     const f = fixture(change, alter, level, 'extraction');
     const originals = clone(f.value.witness.witnesses);
     const rejected = decode(f.value, f.dispatch);
+    assert.notEqual(rejected.manifest.blocked, null, name);
     assert.equal(rejected.manifest.blocked.actionId, 7, name);
     assert.deepEqual(
       rejected.record.steps.map((step) => step.sourceActionIds),
@@ -3689,6 +3781,18 @@ test('holds queued corn until observed technology completion and preserves cappe
     if (actual === stage) mutate(f);
   };
   const cases = [
+    [
+      'legacy Theology still requires purchase score',
+      (v) => {
+        delete v.witness.witnesses[1].expected.players[0].score;
+      },
+    ],
+    [
+      'legacy Theology still requires purchase resources',
+      (v) => {
+        delete v.witness.witnesses[1].expected.players[0].resources;
+      },
+    ],
     [
       'EOF',
       (v) => {
