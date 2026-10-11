@@ -514,6 +514,19 @@ struct Progress {
     outcome: Option<String>,
 }
 impl Progress {
+    fn require_ready_continuation(&self, blocked: bool, has_head: bool) -> Result<(), String> {
+        if !self.started
+            || !has_head
+            || self.attempts == 0
+            || blocked
+            || self.phase != Phase::Ready
+            || self.unknown_work
+            || !matches!(self.outcome.as_deref(), Some("updated" | "noChange"))
+        {
+            return Err("Current mixed continuation requires a resolved Ready session".into());
+        }
+        Ok(())
+    }
     fn initial(
         parent: &CurrentMixedParentIdentity,
         prefix: [u64; 2],
@@ -849,6 +862,33 @@ pub struct CurrentMixedTrainingSession<'a> {
     stored_record_bytes: u64,
     blocked: bool,
 }
+
+/// Consumes a fully closed Ready session without changing its actual owner,
+/// reservations, cursor, specifications or spent budgets. No constructor from
+/// wire metadata, training successor or new work capacity is provided.
+pub struct ReadyCurrentMixedContinuation<'a> {
+    session: CurrentMixedTrainingSession<'a>,
+}
+impl ReadyCurrentMixedContinuation<'_> {
+    pub fn current_policy(&self) -> Result<CurrentMixedPolicyHandle<'_>, String> {
+        self.session.current_policy()
+    }
+    pub fn status(&self) -> Result<CurrentMixedSessionStatus, String> {
+        self.current_policy()?;
+        Ok(self.session.status())
+    }
+    /// All consumed reservations, including NoChange, remain unavailable.
+    pub fn reserved_families(&self) -> &BTreeSet<String> {
+        self.session.reserved_families()
+    }
+    pub fn current_policy_for_arena(&self) -> Result<BorrowedArenaPolicy<'_>, String> {
+        self.session.current_policy_for_arena()
+    }
+    pub fn original_policy_for_arena(&self) -> Result<BorrowedArenaPolicy<'_>, String> {
+        self.session.original_policy_for_arena()
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CurrentMixedSessionStatus {
@@ -1915,6 +1955,163 @@ mod tests {
             s,
         )
         .unwrap();
+    }
+    #[test]
+    fn current_mixed_ready_continuation_preserves_updated_and_no_change_reservations() {
+        for updated in [false, true] {
+            let (mut p, s, r) = reserved();
+            p.apply(
+                &Event::ReserveWhole4 {
+                    reservation: Box::new(r),
+                },
+                &s,
+            )
+            .unwrap();
+            gradient(&mut p, &s);
+            let resolution = if updated {
+                Resolution::Updated {
+                    report: file_pin("report.json", b"report"),
+                    artifact: file_pin("artifact.json", b"artifact"),
+                    report_checksum: "b".repeat(64),
+                    artifact_checksum: "c".repeat(64),
+                }
+            } else {
+                Resolution::NoChange {
+                    report: file_pin("report.json", b"report"),
+                    report_checksum: "b".repeat(64),
+                }
+            };
+            p.apply(&Event::Resolve { resolution }, &s).unwrap();
+            assert_eq!(
+                (p.phase, p.attempts, p.successful, p.imported, p.next),
+                (Phase::Ready, 1, u64::from(updated), 1, 13)
+            );
+            assert_eq!(p.consumed.len(), 4);
+            assert!(p.active.is_some());
+            assert_eq!(
+                p.current_checksum,
+                if updated { "c" } else { "a" }.repeat(64)
+            );
+            let reserved_before = p.consumed.clone();
+            let active_before = bytes(&p.active, HEAD_CAP).unwrap();
+            let work_before = p.work;
+            p.require_ready_continuation(false, true).unwrap();
+            assert_eq!(p.consumed, reserved_before);
+            assert_eq!(bytes(&p.active, HEAD_CAP).unwrap(), active_before);
+            assert_eq!(p.work, work_before);
+            assert!(p.require_ready_continuation(true, true).is_err());
+            assert!(p.require_ready_continuation(false, false).is_err());
+            p.unknown_work = true;
+            assert!(p.require_ready_continuation(false, true).is_err());
+        }
+    }
+    #[test]
+    fn current_mixed_ready_continuation_refuses_empty_pending_and_stopped_states() {
+        let (mut p, s, r) = reserved();
+        assert!(p.require_ready_continuation(false, true).is_err());
+        p.apply(
+            &Event::ReserveWhole4 {
+                reservation: Box::new(r),
+            },
+            &s,
+        )
+        .unwrap();
+        assert!(p.require_ready_continuation(false, true).is_err());
+        for member in 0..4 {
+            p.apply(&Event::CollectStart { member }, &s).unwrap();
+            assert!(p.require_ready_continuation(false, true).is_err());
+            p.apply(
+                &Event::CollectReturn {
+                    member,
+                    record: Some(RecordPin::Raw(file_pin(
+                        &format!("record-{member}.json"),
+                        b"record",
+                    ))),
+                    complete: true,
+                    error: None,
+                },
+                &s,
+            )
+            .unwrap();
+            assert!(p.require_ready_continuation(false, true).is_err());
+        }
+        for member in 0..4 {
+            p.apply(&Event::AuditStart { member }, &s).unwrap();
+            assert!(p.require_ready_continuation(false, true).is_err());
+            p.apply(
+                &Event::AuditReturn {
+                    member,
+                    passed: true,
+                    episode_checksum: Some(format!("{member:064x}")),
+                    error: None,
+                },
+                &s,
+            )
+            .unwrap();
+            assert!(p.require_ready_continuation(false, true).is_err());
+        }
+        p.apply(
+            &Event::GradientStart {
+                cohort: file_pin("cohort.json", b"cohort"),
+                cohort_checksum: "a".repeat(64),
+                episode_checksums: std::array::from_fn(|i| format!("{i:064x}")),
+                counts: [4, 4, 4],
+            },
+            &s,
+        )
+        .unwrap();
+        assert!(p.require_ready_continuation(false, true).is_err());
+        p.apply(
+            &Event::Resolve {
+                resolution: Resolution::Abandoned {
+                    reason: "explicit stop".into(),
+                },
+            },
+            &s,
+        )
+        .unwrap();
+        assert!(p.unknown_work);
+        assert!(p.require_ready_continuation(false, true).is_err());
+        let (mut failed, s, r) = reserved();
+        failed
+            .apply(
+                &Event::ReserveWhole4 {
+                    reservation: Box::new(r),
+                },
+                &s,
+            )
+            .unwrap();
+        failed
+            .apply(&Event::CollectStart { member: 0 }, &s)
+            .unwrap();
+        failed
+            .apply(
+                &Event::CollectReturn {
+                    member: 0,
+                    record: None,
+                    complete: false,
+                    error: Some("returned failure".into()),
+                },
+                &s,
+            )
+            .unwrap();
+        assert!(failed.require_ready_continuation(false, true).is_err());
+        failed
+            .apply(
+                &Event::Resolve {
+                    resolution: Resolution::Failed {
+                        error: "returned failure".into(),
+                    },
+                },
+                &s,
+            )
+            .unwrap();
+        assert!(!failed.unknown_work);
+        assert!(failed.require_ready_continuation(false, true).is_err());
+        assert_eq!(
+            (failed.next, failed.consumed.len(), failed.attempts),
+            (13, 4, 1)
+        );
     }
     #[test]
     fn current_mixed_durable_reservation_refuses_reuse_and_retains_known_failure() {
