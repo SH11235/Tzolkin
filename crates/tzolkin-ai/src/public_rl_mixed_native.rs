@@ -33,6 +33,39 @@ pub struct FrozenMixedRoster<'a> {
     checksum: String,
 }
 impl<'a> FrozenMixedRoster<'a> {
+    #[cfg(test)]
+    pub(crate) fn synthetic_bc(
+        model: &'a crate::public_model::PublicPolicyArtifact,
+        guard: Option<&'a crate::public_trade_guard::TradeGuardConfig>,
+        weights: &'a crate::policy::HeuristicWeights,
+    ) -> Self {
+        let opponents = vec![
+            Some(FrozenReactiveOpponent::synthetic_bc(model, guard)),
+            None,
+            Some(FrozenReactiveOpponent::new(BorrowedArenaPolicy::Heuristic(weights)).unwrap()),
+        ];
+        let descriptions = opponents
+            .iter()
+            .map(|p| {
+                p.as_ref().map(|p| FrozenOpponentIdentity {
+                    provenance: p.description().provenance.clone(),
+                    dataset_fingerprint: p.description().dataset_fingerprint.clone(),
+                    model_version: p.description().model_version.map(str::to_owned),
+                })
+            })
+            .collect::<Vec<_>>();
+        let checksum = hash(
+            b"tzolkin-frozen-mixed-roster-v1\0",
+            &(ROSTER_CONTRACT, 1_usize, &descriptions),
+        )
+        .unwrap();
+        Self {
+            learner_seat: 1,
+            opponents,
+            descriptions,
+            checksum,
+        }
+    }
     pub fn new(seats: Vec<Option<BorrowedArenaPolicy<'a>>>) -> Result<Self, String> {
         learner_slot(&seats)?;
         if seats.iter().flatten().any(|p| {

@@ -176,6 +176,7 @@ pub enum BorrowedArenaPolicy<'a> {
     Mixed(&'a MixedJointOwner),
     ContinuedMixed(&'a crate::public_policy_mixed_continued::ContinuedMixedOwner),
     PublicBc(&'a PreparedPublicPolicy),
+    PublicBcTradeGuard(&'a PreparedPublicPolicy, &'a TradeGuardConfig),
     Heuristic(&'a HeuristicWeights),
     CornFirstSetup(&'a HeuristicWeights),
     CornFirstUxmalOpening(&'a HeuristicWeights),
@@ -442,6 +443,36 @@ enum FrozenFamilies<'a> {
     Continued(&'a std::collections::BTreeSet<String>),
 }
 impl<'a> FrozenReactiveOpponent<'a> {
+    #[cfg(test)]
+    pub(crate) fn synthetic_bc(
+        model: &'a crate::public_model::PublicPolicyArtifact,
+        guard: Option<&'a TradeGuardConfig>,
+    ) -> Self {
+        let handle = crate::public_native::integration_fixture::handle(model);
+        let provenance = guard.map_or_else(
+            || handle.provenance().clone(),
+            |guard| handle.guarded_provenance(guard).unwrap(),
+        );
+        let chooser = match guard {
+            Some(guard) => PolicyChooser::PublicLearnedTradeGuard {
+                policy: Box::new(handle),
+                guard,
+            },
+            None => PolicyChooser::PublicLearned(Box::new(handle)),
+        };
+        Self {
+            handle: PolicyHandle {
+                chooser,
+                description: PolicyDescription {
+                    provenance,
+                    dataset_fingerprint: Some("c".repeat(64)),
+                    model_version: None,
+                },
+            },
+            families: FrozenFamilies::Owned(Vec::new()),
+            max_search_steps: 0,
+        }
+    }
     pub(crate) fn new(policy: BorrowedArenaPolicy<'a>) -> Result<Self, String> {
         let (handle, _) = PolicyHandle::borrowed(policy, &[])?;
         let families = match policy {
@@ -453,7 +484,8 @@ impl<'a> FrozenReactiveOpponent<'a> {
                 BorrowedArenaPolicy::Paired(p) => p.family_set().iter().cloned().collect(),
                 BorrowedArenaPolicy::Mixed(p) => p.family_closure().cloned().collect(),
                 BorrowedArenaPolicy::ContinuedMixed(_) => unreachable!("handled borrowed closure"),
-                BorrowedArenaPolicy::PublicBc(p) => {
+                BorrowedArenaPolicy::PublicBc(p)
+                | BorrowedArenaPolicy::PublicBcTradeGuard(p, _) => {
                     p.initialization_families().1.iter().cloned().collect()
                 }
                 BorrowedArenaPolicy::Search(_)
@@ -486,6 +518,30 @@ impl<'a> FrozenReactiveOpponent<'a> {
     }
     pub(crate) fn choose(&self, observation: &Observation) -> Result<Decision, String> {
         Ok(self.handle.choose_with_diagnostics(observation)?.0)
+    }
+    pub(crate) fn trade_guard_session(&self) -> Result<Option<TradeGuardSession>, String> {
+        match &self.handle.chooser {
+            PolicyChooser::PublicLearnedTradeGuard { guard, .. } => {
+                TradeGuardSession::new((*guard).clone()).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+    pub(crate) fn choose_indexed(
+        &self,
+        index: usize,
+        observation: &Observation,
+        guard: Option<&mut TradeGuardSession>,
+    ) -> Result<Decision, String> {
+        match (&self.handle.chooser, guard) {
+            (PolicyChooser::PublicLearnedTradeGuard { .. }, Some(guard)) => {
+                Ok(self.handle.choose_guarded(index, observation, guard)?.0)
+            }
+            (PolicyChooser::PublicLearnedTradeGuard { .. }, None) | (_, Some(_)) => {
+                Err("Frozen opponent guard/session binding mismatch".into())
+            }
+            (_, None) => self.choose(observation),
+        }
     }
     pub(crate) fn policy_version(&self) -> &str {
         match &self.handle.description.provenance {
@@ -596,10 +652,10 @@ impl<'a> PolicyHandle<'a> {
         })
     }
     fn borrowed(
-        policy: BorrowedArenaPolicy<'a>,
+        policy_role: BorrowedArenaPolicy<'a>,
         seeds: &[u32],
     ) -> Result<(Self, Vec<String>), String> {
-        let (chooser, provenance, dataset_fingerprint, overlap) = match policy {
+        let (chooser, provenance, dataset_fingerprint, overlap) = match policy_role {
             BorrowedArenaPolicy::Count1(owner) => {
                 let handle = UpdatedPublicRlHandle::new(owner)?;
                 let overlap = validation_overlap(handle.family_closure(), seeds)?;
@@ -689,7 +745,8 @@ impl<'a> PolicyHandle<'a> {
                     overlap,
                 )
             }
-            BorrowedArenaPolicy::PublicBc(policy) => {
+            BorrowedArenaPolicy::PublicBc(policy)
+            | BorrowedArenaPolicy::PublicBcTradeGuard(policy, _) => {
                 // This also explicitly excludes the immutable audited Train set.
                 policy.require_validation_families(seeds)?;
                 if policy.backend() != "scalar" {
@@ -698,21 +755,33 @@ impl<'a> PolicyHandle<'a> {
                 let (_, closure) = policy.initialization_families();
                 let overlap = validation_overlap(closure, seeds)?;
                 let handle = policy.handle()?;
-                let provenance = handle.provenance().clone();
-                let SeatPolicy::PublicLearned {
-                    dataset_fingerprint,
-                    ..
-                } = &provenance
-                else {
-                    return Err("Prepared public policy provenance mismatch".into());
+                let (chooser, provenance) = match policy_role {
+                    BorrowedArenaPolicy::PublicBcTradeGuard(_, guard) => {
+                        let provenance = handle.guarded_provenance(guard)?;
+                        (
+                            PolicyChooser::PublicLearnedTradeGuard {
+                                policy: Box::new(handle),
+                                guard,
+                            },
+                            provenance,
+                        )
+                    }
+                    _ => {
+                        let provenance = handle.provenance().clone();
+                        (PolicyChooser::PublicLearned(Box::new(handle)), provenance)
+                    }
                 };
-                let fingerprint = dataset_fingerprint.clone();
-                (
-                    PolicyChooser::PublicLearned(Box::new(handle)),
-                    provenance,
-                    Some(fingerprint),
-                    overlap,
-                )
+                let fingerprint = match &provenance {
+                    SeatPolicy::PublicLearned {
+                        dataset_fingerprint,
+                        ..
+                    } => dataset_fingerprint.clone(),
+                    SeatPolicy::PublicLearnedTradeGuard { base, .. } => {
+                        base.dataset_fingerprint.clone()
+                    }
+                    _ => return Err("Prepared public policy provenance mismatch".into()),
+                };
+                (chooser, provenance, Some(fingerprint), overlap)
             }
             BorrowedArenaPolicy::Heuristic(weights) => {
                 weights.validate()?;
@@ -765,7 +834,7 @@ impl<'a> PolicyHandle<'a> {
                     provenance,
                     dataset_fingerprint,
                     model_version: matches!(
-                        policy,
+                        policy_role,
                         BorrowedArenaPolicy::Long(_)
                             | BorrowedArenaPolicy::Paired(_)
                             | BorrowedArenaPolicy::Mixed(_)
@@ -808,6 +877,17 @@ impl<'a> PolicyHandle<'a> {
             )),
             PolicyChooser::Learned(policy) => Ok((policy.choose_move(observation)?, None)),
         }
+    }
+    fn choose_guarded(
+        &self,
+        index: usize,
+        observation: &Observation,
+        session: &mut TradeGuardSession,
+    ) -> Result<(Decision, Option<public_trade_guard::TradeGuardTrace>), String> {
+        let PolicyChooser::PublicLearnedTradeGuard { policy, .. } = &self.chooser else {
+            return Err("Trade guard requires declared guarded policy".into());
+        };
+        session.choose_with_distribution(index, observation, || policy.distribution(observation))
     }
     #[cfg(test)]
     fn choose(&self, observation: &Observation) -> Result<Decision, String> {
@@ -1143,19 +1223,18 @@ fn play_arm_captured(
                     start_of_play = Some(InitialConditions::from_observation(observation));
                 }
                 let handle = roster[observation.actor];
-                let result = if let PolicyChooser::PublicLearnedTradeGuard { policy, .. } =
-                    &handle.chooser
-                {
+                let result = if matches!(
+                    &handle.chooser,
+                    PolicyChooser::PublicLearnedTradeGuard { .. }
+                ) {
                     let summary = trade_guard.as_mut().expect("guarded roster")[observation.actor]
                         .as_mut()
                         .expect("guarded seat");
                     summary.choice_started();
-                    let result = sessions[observation.actor]
+                    let session = sessions[observation.actor]
                         .as_mut()
-                        .expect("guarded session")
-                        .choose_with_distribution(index, observation, || {
-                            policy.distribution(observation)
-                        });
+                        .expect("guarded session");
+                    let result = handle.choose_guarded(index, observation, session);
                     match result {
                         Ok((decision, trace)) => {
                             summary.returned(trace.as_ref(), &mut capture, run_capture)?;

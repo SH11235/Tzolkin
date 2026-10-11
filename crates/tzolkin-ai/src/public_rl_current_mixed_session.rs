@@ -281,6 +281,9 @@ impl<'a> CurrentMixedDataSession<'a> {
                                     )
                                 }
                                 OpponentSpec::PreparedBc => BorrowedArenaPolicy::PublicBc(prepared),
+                                OpponentSpec::PreparedBcTradeGuard { guard } => {
+                                    BorrowedArenaPolicy::PublicBcTradeGuard(prepared, guard)
+                                }
                                 OpponentSpec::ParentArgmax => BorrowedArenaPolicy::Mixed(owner),
                                 OpponentSpec::Search => BorrowedArenaPolicy::Search(&self.search),
                             })
@@ -763,6 +766,27 @@ mod tests {
         let changed =
             CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap()).unwrap();
         assert_ne!(changed.pool_checksum().unwrap(), checksum);
+        let pure_checksum = changed.pool_checksum().unwrap();
+        spec["rosters"][0][1] = json!({"kind":"preparedBcTradeGuard",
+            "guard":crate::public_trade_guard::TradeGuardConfig::default()});
+        let guarded =
+            CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap()).unwrap();
+        assert_ne!(guarded.pool_checksum().unwrap(), pure_checksum);
+        spec["rosters"][0][1]["guard"]["maxTradesPerEpisode"] = json!(1);
+        let bounded =
+            CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap()).unwrap();
+        assert_ne!(
+            bounded.pool_checksum().unwrap(),
+            guarded.pool_checksum().unwrap()
+        );
+        spec["rosters"][0][1]["guard"]["maxTradesPerEpisode"] = json!(0);
+        assert!(
+            CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap()).is_err()
+        );
+        spec["rosters"][0][1] = json!({"kind":"preparedBc","guard":crate::public_trade_guard::TradeGuardConfig::default()});
+        assert!(
+            CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&spec).unwrap()).is_err()
+        );
     }
 
     #[test]
