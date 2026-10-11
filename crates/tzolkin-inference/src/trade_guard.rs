@@ -1,6 +1,12 @@
 //! Bounded byte-history reducer for an explicit Trade exit composition.
-//! Callers own observation projection, legal exits, policy identity and callbacks.
+//! Callers provide observations and own policy identity and callbacks.
 //! This state grants no model, game, replay or learning authority.
+
+mod observation;
+pub use observation::{is_trade, public_bytes, skip_index};
+
+/// Version of the canonical redacted public Trade-state byte projection.
+pub const PROJECTION_VERSION: &str = "public-trading-state-v1";
 
 pub const MAX_TRADES: usize = 64;
 pub const MAX_STATE_BYTES: usize = 131_072;
