@@ -151,6 +151,9 @@ pub enum SeatPolicy {
         policy_version: String,
         weights: HeuristicWeights,
     },
+    ResourceCycle {
+        configuration: crate::arena::resource_cycle::ResourceCycleConfig,
+    },
     Learned {
         policy_version: String,
         model_checksum: String,
@@ -365,6 +368,7 @@ impl SeatPolicy {
             } if policy_version == crate::setup_policy::UXMAL_OPENING_POLICY_VERSION => {
                 weights.validate()
             }
+            Self::ResourceCycle { configuration } => configuration.validate(),
             Self::Learned {
                 policy_version,
                 model_checksum,
@@ -789,6 +793,13 @@ fn play_game_internal(
         {
             return Err("Guarded public learned provenance requires base 3..4p".into());
         }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::ResourceCycle { .. }))
+            && (!(3..=4).contains(&players) || options != GameOptions::default())
+        {
+            return Err("ResourceCycle provenance requires base 3..4p".into());
+        }
     }
     if players == 5 {
         options.quick_actions = true;
@@ -949,6 +960,13 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
             && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
         {
             return Err("Guarded public learned provenance requires base 3..4p".into());
+        }
+        if policies
+            .iter()
+            .any(|policy| matches!(policy, SeatPolicy::ResourceCycle { .. }))
+            && (!(3..=4).contains(&h.names.len()) || h.options != GameOptions::default())
+        {
+            return Err("ResourceCycle provenance requires base 3..4p".into());
         }
     }
     let mut state = create_game_with_options(h.names.clone(), h.seed, h.options.clone())?;

@@ -280,6 +280,9 @@ impl<'a> CurrentMixedDataSession<'a> {
                                         &spec.inner.wire.weights,
                                     )
                                 }
+                                OpponentSpec::ResourceCycle { configuration } => {
+                                    BorrowedArenaPolicy::ResourceCycle(configuration)
+                                }
                                 OpponentSpec::PreparedBc => BorrowedArenaPolicy::PublicBc(prepared),
                                 OpponentSpec::PreparedBcTradeGuard { guard } => {
                                     BorrowedArenaPolicy::PublicBcTradeGuard(prepared, guard)
