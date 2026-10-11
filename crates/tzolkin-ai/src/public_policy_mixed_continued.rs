@@ -8,10 +8,10 @@ use crate::kernel::{Kernel, ResolvedKernel};
 use crate::public_model::{self, PublicPolicyModel, ValueValidity};
 use crate::public_policy_baseline::ResidualFitConfig;
 use crate::public_policy_mixed::{
-    MixedJointOwner, MixedNumericMember, prepare_numeric, rounded_delta,
+    MixedJointOwner, MixedNumericMember, prepare_numeric_timed, rounded_delta,
 };
 use crate::public_policy_update::{
-    self, Deltas, NumericReport, OneStepConfig, checkpoint_digest, hash,
+    self, Deltas, NumericReport, OneStepConfig, PhaseTimer, Untimed, checkpoint_digest, hash,
 };
 use crate::public_rl_current_mixed_source::{
     self as source, CurrentMixedParentIdentity, ValidatedCurrentMixedCohort,
@@ -626,6 +626,16 @@ pub fn prepare_current(
     actor_config: &OneStepConfig,
     critic_config: &ResidualFitConfig,
 ) -> Result<ContinuedMixedProposal, String> {
+    prepare_current_timed(parent, cohort, actor_config, critic_config, &mut Untimed)
+}
+
+pub(crate) fn prepare_current_timed<T: PhaseTimer>(
+    parent: &CurrentMixedPolicyHandle<'_>,
+    cohort: &ValidatedCurrentMixedCohort,
+    actor_config: &OneStepConfig,
+    critic_config: &ResidualFitConfig,
+    timer: &mut T,
+) -> Result<ContinuedMixedProposal, String> {
     let proposed_count = next_count(parent.identity())?;
     if cohort.plan().parent_identity() != parent.identity() {
         return Err(
@@ -667,13 +677,14 @@ pub fn prepare_current(
         .collect::<Result<Vec<_>, String>>()?
         .try_into()
         .map_err(|_| "Continued mixed numeric whole-four shape")?;
-    let (deltas, actor, critic) = prepare_numeric(
+    let (deltas, actor, critic) = prepare_numeric_timed(
         parent.actor_model(),
         parent.residual_parameters(),
         &members,
         counts,
         actor_config,
         critic_config,
+        timer,
     )?;
     let mut report = ContinuedMixedReport {
         contract: contract(),

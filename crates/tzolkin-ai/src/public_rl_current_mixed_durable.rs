@@ -8,7 +8,9 @@ use crate::public_policy_baseline::ResidualFitConfig;
 use crate::public_policy_mixed_continued::{
     self as mixed, ContinuedMixedOwner, CurrentMixedPolicyHandle,
 };
-use crate::public_policy_update::{OneStepConfig, checkpoint_digest, hash};
+use crate::public_policy_update::{
+    OneStepConfig, PhaseTimer, TimedPhase, Untimed, checkpoint_digest, hash, timed,
+};
 use crate::public_rl_current_mixed_session::{
     AdmittedCurrentMixedRoot, CurrentMixedCollectionSpec, OriginalLivePins,
 };
@@ -31,6 +33,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 #[path = "public_rl_current_mixed_restore.rs"]
@@ -1087,6 +1090,104 @@ impl ReadyCurrentMixedContinuation<'_> {
     }
 }
 
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StageTiming {
+    entered: u64,
+    returned: u64,
+    returned_errors: u64,
+    wall_seconds: f64,
+}
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AttemptStages {
+    whole_call_inclusive: StageTiming,
+    preflight: StageTiming,
+    reservation_publication: StageTiming,
+    collection_native: [StageTiming; 4],
+    record_publication: [StageTiming; 4],
+    audit_native: [StageTiming; 4],
+    cohort_publication: StageTiming,
+    gradient_start: StageTiming,
+    numeric_preparation_inclusive: StageTiming,
+    actor_encode: StageTiming,
+    actor_scalar_forward: StageTiming,
+    actor_trace_and_cotangent: StageTiming,
+    actor_frozen_baseline: StageTiming,
+    actor_backward: StageTiming,
+    actor_aggregation: StageTiming,
+    actor_rounded_proposal: StageTiming,
+    critic_fit: StageTiming,
+    proposal_publication_readback: StageTiming,
+    resolve_and_admit: StageTiming,
+    final_guards: StageTiming,
+}
+
+/// Current-process diagnostic output only. It is never journaled or restored.
+/// Whole-call and numerical preparation spans include their named inner spans;
+/// collection/audit include their own inference and replay work. Do not sum them.
+/// Zero entered calls mean unobserved work, not a measured zero-duration stage.
+/// Returned-error counts describe `Result::Err`; a returned stopped status is
+/// recorded separately in the resolution and stopped fields. The whole-call
+/// span covers the update body, excluding the profile's before/after snapshots.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentMixedAttemptTimings {
+    call_observed: bool,
+    attempts_before: u64,
+    attempts_after: u64,
+    head_sha256_before: String,
+    head_sha256_after: String,
+    reservation_charged: bool,
+    new_resolution: Option<CurrentMixedOwnResolution>,
+    phase_after: Option<Phase>,
+    stopped_after: bool,
+    unknown_work_after: bool,
+    returned_error: bool,
+    stages: AttemptStages,
+}
+impl CurrentMixedAttemptTimings {
+    fn stage(&mut self, phase: TimedPhase) -> &mut StageTiming {
+        match phase {
+            TimedPhase::WholeCall => &mut self.stages.whole_call_inclusive,
+            TimedPhase::Preflight => &mut self.stages.preflight,
+            TimedPhase::ReservationPublication => &mut self.stages.reservation_publication,
+            TimedPhase::Collection(i) => &mut self.stages.collection_native[i],
+            TimedPhase::RecordPublication(i) => &mut self.stages.record_publication[i],
+            TimedPhase::Audit(i) => &mut self.stages.audit_native[i],
+            TimedPhase::CohortPublication => &mut self.stages.cohort_publication,
+            TimedPhase::GradientStart => &mut self.stages.gradient_start,
+            TimedPhase::NumericPreparation => &mut self.stages.numeric_preparation_inclusive,
+            TimedPhase::ActorEncode => &mut self.stages.actor_encode,
+            TimedPhase::ActorForward => &mut self.stages.actor_scalar_forward,
+            TimedPhase::ActorTrace => &mut self.stages.actor_trace_and_cotangent,
+            TimedPhase::ActorBaseline => &mut self.stages.actor_frozen_baseline,
+            TimedPhase::ActorBackward => &mut self.stages.actor_backward,
+            TimedPhase::ActorAggregate => &mut self.stages.actor_aggregation,
+            TimedPhase::ActorProposal => &mut self.stages.actor_rounded_proposal,
+            TimedPhase::CriticFit => &mut self.stages.critic_fit,
+            TimedPhase::ProposalReadback => &mut self.stages.proposal_publication_readback,
+            TimedPhase::Resolve => &mut self.stages.resolve_and_admit,
+            TimedPhase::FinalGuards => &mut self.stages.final_guards,
+        }
+    }
+}
+impl PhaseTimer for CurrentMixedAttemptTimings {
+    type Span = (TimedPhase, Instant);
+    fn enter(&mut self, phase: TimedPhase) -> Self::Span {
+        self.stage(phase).entered += 1;
+        (phase, Instant::now())
+    }
+    fn returned(&mut self, (phase, started): Self::Span, error: bool) {
+        let seconds = started.elapsed().as_secs_f64();
+        let stage = self.stage(phase);
+        stage.returned += 1;
+        stage.returned_errors += u64::from(error);
+        stage.wall_seconds += seconds;
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CurrentMixedSessionStatus {
@@ -1671,18 +1772,66 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         &mut self,
         collection: CurrentMixedCollectionSpec,
     ) -> Result<CurrentMixedSessionStatus, String> {
-        let batch = self.preflight(&collection)?;
+        self.update_whole_four_timed(collection, &mut Untimed)
+    }
+    /// Opt-in, output-only timings for exactly this call, including partial errors.
+    /// The caller owns the profile and may save it after the charged outcome;
+    /// diagnostic serialization never participates in journal or owner admission.
+    pub fn update_whole_four_profiled(
+        &mut self,
+        collection: CurrentMixedCollectionSpec,
+        profile: &mut CurrentMixedAttemptTimings,
+    ) -> Result<CurrentMixedSessionStatus, String> {
+        *profile = CurrentMixedAttemptTimings::default();
+        profile.call_observed = true;
+        profile.attempts_before = self.progress.attempts;
+        profile.head_sha256_before = self
+            .head
+            .as_ref()
+            .map(|p| p.sha256.clone())
+            .unwrap_or_default();
+        let result = timed(profile, TimedPhase::WholeCall, |timer| {
+            self.update_whole_four_timed(collection, timer)
+        });
+        profile.attempts_after = self.progress.attempts;
+        profile.head_sha256_after = self
+            .head
+            .as_ref()
+            .map(|p| p.sha256.clone())
+            .unwrap_or_default();
+        profile.reservation_charged = self.progress.attempts > profile.attempts_before;
+        profile.new_resolution = self
+            .progress
+            .last_resolved_own
+            .as_ref()
+            .filter(|r| profile.reservation_charged && r.attempt == profile.attempts_before)
+            .map(|r| r.outcome);
+        profile.phase_after = Some(self.progress.phase);
+        profile.stopped_after = self.blocked || self.progress.phase == Phase::Stopped;
+        profile.unknown_work_after = self.progress.unknown_work;
+        profile.returned_error = result.is_err();
+        result
+    }
+    fn update_whole_four_timed<T: PhaseTimer>(
+        &mut self,
+        collection: CurrentMixedCollectionSpec,
+        timer: &mut T,
+    ) -> Result<CurrentMixedSessionStatus, String> {
+        let batch = timed(timer, TimedPhase::Preflight, |_| {
+            self.preflight(&collection)
+        })?;
         self.blocked = true;
-        let result = self.run_whole_four(collection, batch);
+        let result = self.run_whole_four(collection, batch, timer);
         if result.is_err() {
             self.blocked = true;
         }
         result
     }
-    fn run_whole_four(
+    fn run_whole_four<T: PhaseTimer>(
         &mut self,
         collection: CurrentMixedCollectionSpec,
         batch: BatchPlan,
+        timer: &mut T,
     ) -> Result<CurrentMixedSessionStatus, String> {
         let BatchPlan {
             plan,
@@ -1692,17 +1841,21 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         } = batch;
         let attempt = reservation.attempt;
         let dir = self.batch(attempt);
-        local(&dir, true)?;
-        fs::create_dir(&dir).map_err(|e| e.to_string())?;
-        if self.publish_batch(attempt, "collection-spec.json", &collection_raw, SPEC_CAP)?
-            != reservation.collection_spec
-            || self.publish_batch(attempt, "plan.json", &plan_raw, HEAD_CAP)? != reservation.plan
-        {
-            return Err("Current mixed original planned pins differ".into());
-        }
-        let plan_value = plan.receipt();
-        self.save(Event::ReserveWhole4 {
-            reservation: Box::new(reservation),
+        let plan_value = timed(timer, TimedPhase::ReservationPublication, |_| {
+            local(&dir, true)?;
+            fs::create_dir(&dir).map_err(|e| e.to_string())?;
+            if self.publish_batch(attempt, "collection-spec.json", &collection_raw, SPEC_CAP)?
+                != reservation.collection_spec
+                || self.publish_batch(attempt, "plan.json", &plan_raw, HEAD_CAP)?
+                    != reservation.plan
+            {
+                return Err("Current mixed original planned pins differ".into());
+            }
+            let plan_value = plan.receipt();
+            self.save(Event::ReserveWhole4 {
+                reservation: Box::new(reservation),
+            })?;
+            Ok(plan_value)
         })?;
         for member in 0..4 {
             self.save(Event::CollectStart { member })?;
@@ -1710,20 +1863,24 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             let returned = {
                 let handle = self.handle()?;
                 let rosters = self.rosters(&collection)?;
-                source::collect(
-                    &plan.configurations()[member],
-                    &handle,
-                    &rosters[member],
-                    plan.headers[member].clone(),
-                )
+                timed(timer, TimedPhase::Collection(member), |_| {
+                    source::collect(
+                        &plan.configurations()[member],
+                        &handle,
+                        &rosters[member],
+                        plan.headers[member].clone(),
+                    )
+                })
             };
             self.require_live()?;
             let (record, complete, error) = match returned {
                 Ok(game) => {
                     let complete = game.terminal.is_some() && game.failure.is_none();
-                    let raw = source::encode(&game)?;
-                    source::check_record(&raw, &plan.headers[member])?;
-                    let p = self.publish_record(attempt, member, &raw)?;
+                    let p = timed(timer, TimedPhase::RecordPublication(member), |_| {
+                        let raw = source::encode(&game)?;
+                        source::check_record(&raw, &plan.headers[member])?;
+                        self.publish_record(attempt, member, &raw)
+                    })?;
                     let error = (!complete).then(|| {
                         bounded_error(
                             &game
@@ -1746,7 +1903,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 error: error.clone(),
             })?;
             if let Some(e) = error {
-                return self.stopped_error(e);
+                return timed(timer, TimedPhase::Resolve, |_| self.stopped_error(e));
             }
         }
         let mut episodes = Vec::new();
@@ -1761,12 +1918,14 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             let returned = {
                 let handle = self.handle()?;
                 let rosters = self.rosters(&collection)?;
-                source::audit(
-                    &raw,
-                    &handle,
-                    &rosters[member],
-                    plan.headers[member].clone(),
-                )
+                timed(timer, TimedPhase::Audit(member), |_| {
+                    source::audit(
+                        &raw,
+                        &handle,
+                        &rosters[member],
+                        plan.headers[member].clone(),
+                    )
+                })
             };
             self.require_live()?;
             self.save(Event::AuditReturn {
@@ -1780,116 +1939,135 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             })?;
             match returned {
                 Ok(e) => episodes.push(Ok(e)),
-                Err(e) => return self.stopped_error(e),
+                Err(e) => return timed(timer, TimedPhase::Resolve, |_| self.stopped_error(e)),
             }
         }
-        let cohort = match plan.finish(
-            episodes
-                .try_into()
-                .map_err(|_| "Current mixed sealed whole-four shape")?,
-        ) {
+        let episodes = episodes
+            .try_into()
+            .map_err(|_| "Current mixed sealed whole-four shape")?;
+        let cohort = match timed(timer, TimedPhase::CohortPublication, |_| {
+            plan.finish(episodes)
+        }) {
             Ok(c) => c,
-            Err(e) => return self.stopped_error(e),
+            Err(e) => return timed(timer, TimedPhase::Resolve, |_| self.stopped_error(e)),
         };
         let cohort_value = cohort.receipt();
-        let cohort_pin = self.publish_batch(
-            attempt,
-            "cohort.json",
-            &bytes(&cohort_value, HEAD_CAP)?,
-            HEAD_CAP,
-        )?;
-        self.save(Event::GradientStart {
-            cohort: cohort_pin,
-            cohort_checksum: cohort.receipt_checksum().into(),
-            episode_checksums: cohort
-                .episodes()
-                .each_ref()
-                .map(|e| e.canonical_record_checksum().into()),
-            counts: [
-                cohort.total_learner_callbacks(),
-                cohort.total_learner_candidate_rows(),
-                cohort.total_learner_singletons(),
-            ],
+        let cohort_pin = timed(timer, TimedPhase::CohortPublication, |_| {
+            self.publish_batch(
+                attempt,
+                "cohort.json",
+                &bytes(&cohort_value, HEAD_CAP)?,
+                HEAD_CAP,
+            )
+        })?;
+        timed(timer, TimedPhase::GradientStart, |_| {
+            self.save(Event::GradientStart {
+                cohort: cohort_pin,
+                cohort_checksum: cohort.receipt_checksum().into(),
+                episode_checksums: cohort
+                    .episodes()
+                    .each_ref()
+                    .map(|e| e.canonical_record_checksum().into()),
+                counts: [
+                    cohort.total_learner_callbacks(),
+                    cohort.total_learner_candidate_rows(),
+                    cohort.total_learner_singletons(),
+                ],
+            })
         })?;
         self.require_live()?;
-        let result = mixed::prepare_current(
-            &self.handle()?,
-            &cohort,
-            &self.spec.actor()?,
-            &self.spec.critic()?,
-        );
+        let handle = self.handle()?;
+        let actor_config = self.spec.actor()?;
+        let critic_config = self.spec.critic()?;
+        let result = timed(timer, TimedPhase::NumericPreparation, |timer| {
+            mixed::prepare_current_timed(&handle, &cohort, &actor_config, &critic_config, timer)
+        });
         self.require_live()?;
         let proposal = match result {
             Ok(p) => p,
-            Err(e) => return self.stopped_error(e),
+            Err(e) => return timed(timer, TimedPhase::Resolve, |_| self.stopped_error(e)),
         };
-        proposal.require_parent(&self.handle()?)?;
-        proposal.report().require_saved_cohort(
-            &plan_value,
-            &cohort_value,
-            &self.spec.actor()?,
-            &self.spec.critic()?,
-        )?;
-        let report = self.publish_batch(
-            attempt,
-            "report.json",
-            &bytes(proposal.report(), HEAD_CAP)?,
-            HEAD_CAP,
-        )?;
-        let saved_report: mixed::ContinuedMixedReport =
-            closed(&read_pin(&dir, &report, HEAD_CAP)?, HEAD_CAP)?;
-        saved_report.require_saved_cohort(
-            &plan_value,
-            &cohort_value,
-            &self.spec.actor()?,
-            &self.spec.critic()?,
-        )?;
-        if saved_report.checksum() != proposal.report().checksum() {
-            return Err("Current mixed report readback differs".into());
-        }
-        if proposal.artifact_for_publication().is_some() {
-            self.require_reserved_report(proposal.report())?;
-            let promotion = proposal.stage(&self.handle()?)?;
-            let a = promotion.artifact();
-            let artifact = self.publish_batch(
-                attempt,
-                "artifact.json",
-                &bytes(a, ARTIFACT_CAP)?,
-                ARTIFACT_CAP,
+        let (report, saved_report) = timed(timer, TimedPhase::ProposalReadback, |_| {
+            proposal.require_parent(&self.handle()?)?;
+            proposal.report().require_saved_cohort(
+                &plan_value,
+                &cohort_value,
+                &self.spec.actor()?,
+                &self.spec.critic()?,
             )?;
-            let saved: mixed::ContinuedMixedArtifact =
-                closed(&read_pin(&dir, &artifact, ARTIFACT_CAP)?, ARTIFACT_CAP)?;
-            if saved.checksum() != a.checksum()
-                || bytes(saved.report(), HEAD_CAP)? != bytes(&saved_report, HEAD_CAP)?
-            {
-                return Err("Current mixed joint artifact/report readback differs".into());
+            let report = self.publish_batch(
+                attempt,
+                "report.json",
+                &bytes(proposal.report(), HEAD_CAP)?,
+                HEAD_CAP,
+            )?;
+            let saved_report: mixed::ContinuedMixedReport =
+                closed(&read_pin(&dir, &report, HEAD_CAP)?, HEAD_CAP)?;
+            saved_report.require_saved_cohort(
+                &plan_value,
+                &cohort_value,
+                &self.spec.actor()?,
+                &self.spec.critic()?,
+            )?;
+            if saved_report.checksum() != proposal.report().checksum() {
+                return Err("Current mixed report readback differs".into());
             }
-            mixed::ContinuedMixedProposal::restored(saved, &self.handle()?)?;
-            self.require_batch_inventory(attempt)?;
-            self.save(Event::Resolve {
-                resolution: Resolution::Updated {
-                    report: report.clone(),
-                    artifact: artifact.clone(),
-                    report_checksum: a.report().checksum().into(),
-                    artifact_checksum: a.checksum().into(),
-                },
+            Ok((report, saved_report))
+        })?;
+        if proposal.artifact_for_publication().is_some() {
+            let (promotion, artifact) = timed(timer, TimedPhase::ProposalReadback, |_| {
+                self.require_reserved_report(proposal.report())?;
+                let promotion = proposal.stage(&self.handle()?)?;
+                let a = promotion.artifact();
+                let artifact = self.publish_batch(
+                    attempt,
+                    "artifact.json",
+                    &bytes(a, ARTIFACT_CAP)?,
+                    ARTIFACT_CAP,
+                )?;
+                let saved: mixed::ContinuedMixedArtifact =
+                    closed(&read_pin(&dir, &artifact, ARTIFACT_CAP)?, ARTIFACT_CAP)?;
+                if saved.checksum() != a.checksum()
+                    || bytes(saved.report(), HEAD_CAP)? != bytes(&saved_report, HEAD_CAP)?
+                {
+                    return Err("Current mixed joint artifact/report readback differs".into());
+                }
+                mixed::ContinuedMixedProposal::restored(saved, &self.handle()?)?;
+                self.require_batch_inventory(attempt)?;
+                Ok((promotion, artifact))
             })?;
-            // Publication/readback completed; no prior owner is taken on failure.
-            mixed::admit_resolved(DurableMixedResolve { promotion }, &mut self.continued);
-            self.owner_pins = Some((dir, report, artifact));
+            timed(timer, TimedPhase::Resolve, |_| {
+                let a = promotion.artifact();
+                self.save(Event::Resolve {
+                    resolution: Resolution::Updated {
+                        report: report.clone(),
+                        artifact: artifact.clone(),
+                        report_checksum: a.report().checksum().into(),
+                        artifact_checksum: a.checksum().into(),
+                    },
+                })?;
+                // Publication/readback completed; no prior owner is taken on failure.
+                mixed::admit_resolved(DurableMixedResolve { promotion }, &mut self.continued);
+                self.owner_pins = Some((dir, report, artifact));
+                Ok(())
+            })?;
         } else {
-            self.require_batch_inventory(attempt)?;
-            self.save(Event::Resolve {
-                resolution: Resolution::NoChange {
-                    report,
-                    report_checksum: proposal.report().checksum().into(),
-                },
+            timed(timer, TimedPhase::Resolve, |_| {
+                self.require_batch_inventory(attempt)?;
+                self.save(Event::Resolve {
+                    resolution: Resolution::NoChange {
+                        report,
+                        report_checksum: proposal.report().checksum().into(),
+                    },
+                })
             })?;
         }
-        self.require_live()?;
-        self.handle()?;
-        self.blocked = false;
-        Ok(self.status())
+        timed(timer, TimedPhase::FinalGuards, |_| {
+            self.require_live()?;
+            self.handle()?;
+            self.blocked = false;
+            Ok(self.status())
+        })
     }
     fn require_reserved_report(&self, report: &mixed::ContinuedMixedReport) -> Result<(), String> {
         let r = self
@@ -2426,6 +2604,66 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn output_only_timings_preserve_numeric_result_and_retain_failed_spans() {
+        use crate::public_policy_update::propose_parameters;
+        let mut old = vec![0.0; crate::public_model::PARAMETER_COUNT];
+        old[0] = -0.0;
+        old[1] = 1.0;
+        let mut gradient = vec![0.0; old.len()];
+        gradient[1] = 2.0;
+        gradient[2] = -3.0;
+        let config = OneStepConfig::default();
+        let mut profile = CurrentMixedAttemptTimings::default();
+        let calculate = |timer: &mut CurrentMixedAttemptTimings, gradient: &[f64]| {
+            timed(timer, TimedPhase::WholeCall, |timer| {
+                timed(timer, TimedPhase::ActorProposal, |_| {
+                    propose_parameters(&old, gradient, &config)
+                })
+            })
+        };
+        let plain = timed(&mut Untimed, TimedPhase::ActorProposal, |_| {
+            propose_parameters(&old, &gradient, &config)
+        })
+        .unwrap();
+        let observed = calculate(&mut profile, &gradient).unwrap();
+        assert_eq!(
+            plain
+                .parameters
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            observed
+                .parameters
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            serde_json::to_value(plain.numeric).unwrap(),
+            serde_json::to_value(observed.numeric).unwrap()
+        );
+        gradient[1] = f64::NAN;
+        let plain_error = propose_parameters(&old, &gradient, &config).err().unwrap();
+        assert_eq!(
+            calculate(&mut profile, &gradient).err().unwrap(),
+            plain_error
+        );
+        for stage in [
+            &profile.stages.whole_call_inclusive,
+            &profile.stages.actor_rounded_proposal,
+        ] {
+            assert_eq!(
+                (stage.entered, stage.returned, stage.returned_errors),
+                (2, 2, 1)
+            );
+        }
+        assert_eq!(profile.stages.collection_native[0].entered, 0);
+        assert!(!profile.reservation_charged);
+        assert!(profile.new_resolution.is_none());
+        serde_json::to_value(profile).unwrap();
+    }
+
     #[test]
     fn current_mixed_private_base_preserves_no_change_consumption() {
         let (mut p, mut s, template) = reserved();
