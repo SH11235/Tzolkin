@@ -498,6 +498,7 @@ struct BatchPlan {
 struct Progress {
     started: bool,
     phase: Phase,
+    base: u64,
     prefix: [u64; 2],
     next: u64,
     consumed: BTreeSet<String>,
@@ -514,6 +515,21 @@ struct Progress {
     outcome: Option<String>,
 }
 impl Progress {
+    fn parent_count(&self) -> Result<u64, String> {
+        if !(1..=source::MAX_MIXED_UPDATES).contains(&self.base) {
+            return Err("Current mixed base count is outside the owner ceiling".into());
+        }
+        self.base
+            .checked_add(self.successful)
+            .filter(|&n| n <= source::MAX_MIXED_UPDATES)
+            .ok_or_else(|| "Current mixed parent count overflow or owner ceiling".into())
+    }
+    fn next_parent_count(&self) -> Result<u64, String> {
+        self.parent_count()?
+            .checked_add(1)
+            .filter(|&n| n <= source::MAX_MIXED_UPDATES)
+            .ok_or_else(|| "Current mixed successful-update ceiling".into())
+    }
     fn require_ready_continuation(&self, blocked: bool, has_head: bool) -> Result<(), String> {
         if !self.started
             || !has_head
@@ -536,6 +552,7 @@ impl Progress {
         Self {
             started: false,
             phase: Phase::Ready,
+            base: 1,
             prefix,
             next,
             consumed: consumed.clone(),
@@ -553,6 +570,7 @@ impl Progress {
         }
     }
     fn check(&self, e: &Event, s: &CurrentMixedRunSpec) -> Result<(), String> {
+        let parent_count = self.parent_count()?;
         let fail = || Err("Invalid current mixed journal transition".into());
         match e {
             Event::Start {
@@ -567,7 +585,8 @@ impl Progress {
                 if self.started
                     || self.attempts != 0
                     || self.phase != Phase::Ready
-                    || parent.mixed_update_count() != 1
+                    || parent_count != 1 // Legacy Start remains genuine Count1 only.
+                    || parent.mixed_update_count() != parent_count
                     || parent.imported_update_count() != self.imported
                     || parent.artifact_checksum() != self.current_checksum
                     || *prefix != self.prefix
@@ -579,6 +598,7 @@ impl Progress {
                 }
             }
             Event::ReserveWhole4 { reservation: r } => {
+                self.next_parent_count()?;
                 r.parent.validate()?;
                 leaf(&r.collection_spec, "collection-spec.json", SPEC_CAP)?;
                 leaf(&r.plan, "plan.json", HEAD_CAP)?;
@@ -588,7 +608,7 @@ impl Progress {
                     || self.successful >= s.max_successful_updates
                     || r.attempt != self.attempts
                     || r.parent.artifact_checksum() != self.current_checksum
-                    || r.parent.mixed_update_count() != 1 + self.successful
+                    || r.parent.mixed_update_count() != parent_count
                     || r.parent.imported_update_count() != self.imported
                     || !checkpoint_digest(&r.plan_checksum)
                     || self
@@ -697,6 +717,7 @@ impl Progress {
                     report_checksum,
                     artifact_checksum,
                 } if self.phase == Phase::Updating => {
+                    self.next_parent_count()?;
                     leaf(report, "report.json", HEAD_CAP)?;
                     leaf(artifact, "artifact.json", ARTIFACT_CAP)?;
                     if !checkpoint_digest(report_checksum)
@@ -854,13 +875,35 @@ pub struct CurrentMixedTrainingSession<'a> {
     sequence: u64,
     head: Option<FilePin>,
     spec_pin: Option<FilePin>,
-    owner_pins: Option<(u64, FilePin, FilePin)>,
+    owner_pins: Option<(PathBuf, FilePin, FilePin)>,
     references: BTreeMap<u64, Vec<FilePin>>,
     output_bytes: u64,
     metadata_bytes: u64,
     raw_record_bytes: u64,
     stored_record_bytes: u64,
     blocked: bool,
+}
+
+/// Borrows only archival state; it cannot admit or expose a policy owner.
+struct ArchiveView<'s> {
+    directory: &'s Path,
+    spec: &'s CurrentMixedRunSpec,
+    journal_schema: &'static str,
+    root_checksum: &'s str,
+    pool: &'s str,
+    sequence: u64,
+    head: Option<&'s FilePin>,
+    spec_pin: Option<&'s FilePin>,
+    references: &'s BTreeMap<u64, Vec<FilePin>>,
+    output_bytes: u64,
+    metadata_bytes: u64,
+    raw_record_bytes: u64,
+    stored_record_bytes: u64,
+}
+impl ArchiveView<'_> {
+    fn batch(&self, attempt: u64) -> PathBuf {
+        self.directory.join(format!("batch-{attempt:016x}"))
+    }
 }
 
 /// Consumes a fully closed Ready session without changing its actual owner,
@@ -937,6 +980,26 @@ impl CurrentMixedSessionStatus {
     }
 }
 impl<'a> CurrentMixedTrainingSession<'a> {
+    fn journal_schema(&self) -> &'static str {
+        self.spec.journal_schema()
+    }
+    fn archive_view(&self) -> ArchiveView<'_> {
+        ArchiveView {
+            directory: &self.directory,
+            spec: &self.spec,
+            journal_schema: self.journal_schema(),
+            root_checksum: &self.root_checksum,
+            pool: &self.pool,
+            sequence: self.sequence,
+            head: self.head.as_ref(),
+            spec_pin: self.spec_pin.as_ref(),
+            references: &self.references,
+            output_bytes: self.output_bytes,
+            metadata_bytes: self.metadata_bytes,
+            raw_record_bytes: self.raw_record_bytes,
+            stored_record_bytes: self.stored_record_bytes,
+        }
+    }
     fn initial(
         root: AdmittedCurrentMixedRoot<'a>,
         spec: CurrentMixedRunSpec,
@@ -1021,7 +1084,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             None => CurrentMixedPolicyHandle::from_initial(self.root.initial_owner()?)?,
         };
         if h.identity().artifact_checksum() != self.progress.current_checksum
-            || h.identity().mixed_update_count() != self.progress.successful + 1
+            || h.identity().mixed_update_count() != self.progress.parent_count()?
             || h.identity().imported_update_count() != self.progress.imported
         {
             return Err("Current mixed owner is not the actual reduced journal parent".into());
@@ -1060,7 +1123,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
     }
     pub fn status(&self) -> CurrentMixedSessionStatus {
         CurrentMixedSessionStatus {
-            schema: self.spec.journal_schema(),
+            schema: self.journal_schema(),
             head_file: self
                 .head
                 .as_ref()
@@ -1072,7 +1135,10 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 .map(|p| p.sha256.clone())
                 .unwrap_or_default(),
             imported_update_count: self.progress.imported,
-            mixed_update_count: 1 + self.progress.successful,
+            mixed_update_count: self
+                .progress
+                .parent_count()
+                .expect("validated private current mixed count"),
             attempts: self.progress.attempts,
             next_episode_ordinal: self.progress.next,
             reserved_family_count: self.progress.consumed.len(),
@@ -1106,9 +1172,8 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         if let Some(p) = &self.head {
             read_pin(&self.directory, p, HEAD_CAP)?;
         }
-        if let Some((attempt, report, artifact)) = &self.owner_pins {
-            read_pin(&self.batch(*attempt), report, HEAD_CAP)?;
-            read_pin(&self.batch(*attempt), artifact, ARTIFACT_CAP)?;
+        if let Some(pins) = &self.owner_pins {
+            require_owner_pins(pins)?;
         }
         if let Some(r) = &self.progress.active {
             for p in self.references.get(&r.attempt).into_iter().flatten() {
@@ -1220,7 +1285,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             .filter(|n| *n <= self.spec.max_journal_entries)
             .ok_or("Current mixed journal exhausted")?;
         let entry = Entry {
-            schema: self.spec.journal_schema().into(),
+            schema: self.journal_schema().into(),
             sequence,
             previous: self
                 .head
@@ -1623,7 +1688,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             })?;
             // Publication/readback completed; no prior owner is taken on failure.
             mixed::admit_resolved(DurableMixedResolve { promotion }, &mut self.continued);
-            self.owner_pins = Some((attempt, report, artifact));
+            self.owner_pins = Some((dir, report, artifact));
         } else {
             self.require_batch_inventory(attempt)?;
             self.save(Event::Resolve {
@@ -1647,7 +1712,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         if report.parent_identity() != &r.parent
             || report.plan_checksum() != r.plan_checksum
             || report.families() != &r.families
-            || report.proposed_mixed_update_count() != 2 + self.progress.successful
+            || report.proposed_mixed_update_count() != self.progress.next_parent_count()?
         {
             return Err("Current mixed Resolve candidate differs from reserved four".into());
         }
@@ -1696,6 +1761,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         }
         Ok(())
     }
+}
+fn require_owner_pins(pins: &(PathBuf, FilePin, FilePin)) -> Result<(), String> {
+    read_pin(&pins.0, &pins.1, HEAD_CAP)?;
+    read_pin(&pins.0, &pins.2, ARTIFACT_CAP)?;
+    Ok(())
 }
 fn names(directory: &Path, cap: usize) -> Result<Vec<String>, String> {
     local(directory, false)?;
@@ -1955,6 +2025,267 @@ mod tests {
             s,
         )
         .unwrap();
+    }
+    // Content-only reducer fixtures: no sealed owner or continuation admission.
+    fn continued_parent(p: &Progress) -> CurrentMixedParentIdentity {
+        let mut wire = serde_json::to_value(source::tests::initial()).unwrap();
+        for (key, value) in [
+            ("schema", source::CONTINUED_IDENTITY_SCHEMA),
+            ("policyVersion", source::CONTINUED_POLICY_VERSION),
+            ("samplingVersion", source::CONTINUED_SAMPLING_VERSION),
+            ("task", source::CONTINUED_TASK),
+        ] {
+            wire[key] = value.into();
+        }
+        wire["firstMixedChecksum"] = "d".repeat(64).into();
+        wire["parentArtifactChecksum"] = "e".repeat(64).into();
+        wire["artifactChecksum"] = p.current_checksum.clone().into();
+        wire["mixedUpdateCount"] = p.parent_count().unwrap().into();
+        let parent = CurrentMixedParentIdentity::ContinuedMixedV2 {
+            policy: serde_json::from_value(wire).unwrap(),
+        };
+        parent.validate().unwrap();
+        parent
+    }
+    fn later_reservation(p: &Progress, template: &Reservation) -> Reservation {
+        let mut r = template.clone();
+        r.attempt = p.attempts;
+        r.parent = continued_parent(p);
+        let seeds = (0..100)
+            .filter(|&seed| {
+                let family = seed_family_id(seed);
+                split_for_family(&family).unwrap() == DatasetSplit::Train
+                    && !p.consumed.contains(&family)
+            })
+            .take(4)
+            .collect::<Vec<_>>();
+        assert_eq!(seeds.len(), 4);
+        for (i, seed) in seeds.into_iter().enumerate() {
+            r.configurations[i].environment_seed = seed;
+            r.configurations[i].episode_ordinal = format!("{:016x}", p.next + i as u64);
+            r.families[i] = seed_family_id(seed);
+        }
+        r
+    }
+    #[test]
+    fn current_mixed_private_base_preserves_no_change_consumption() {
+        let (mut p, mut s, template) = reserved();
+        p.base = 49; // Private synthetic state, never a legacy Start or real owner.
+        s.max_attempts = 3;
+        s.max_successful_updates = 3;
+        s.max_journal_entries = 64;
+        s.validate().unwrap();
+        assert_eq!(p.parent_count().unwrap(), 49);
+        for (attempt, updated) in [true, false, true].into_iter().enumerate() {
+            let r = later_reservation(&p, &template);
+            p.apply(
+                &Event::ReserveWhole4 {
+                    reservation: Box::new(r),
+                },
+                &s,
+            )
+            .unwrap();
+            gradient(&mut p, &s);
+            let resolution = if updated {
+                Resolution::Updated {
+                    report: file_pin("report.json", b"report"),
+                    artifact: file_pin("artifact.json", b"artifact"),
+                    report_checksum: "b".repeat(64),
+                    artifact_checksum: if attempt == 0 { "c" } else { "d" }.repeat(64),
+                }
+            } else {
+                Resolution::NoChange {
+                    report: file_pin("report.json", b"report"),
+                    report_checksum: "b".repeat(64),
+                }
+            };
+            p.apply(&Event::Resolve { resolution }, &s).unwrap();
+            assert_eq!(p.parent_count().unwrap(), [50, 50, 51][attempt]);
+            let attempts = attempt as u64 + 1;
+            assert_eq!(
+                (p.phase, p.attempts, p.imported),
+                (Phase::Ready, attempts, 1)
+            );
+            assert_eq!(p.next, 9 + 4 * attempts);
+            assert_eq!(p.consumed.len(), 4 * attempts as usize);
+            assert_eq!(
+                p.work,
+                Work {
+                    callbacks: 4 * attempts,
+                    rows: 4 * attempts,
+                    search: 0,
+                    bytes: 64 * attempts,
+                }
+            );
+            assert_eq!(
+                p.current_checksum,
+                if attempt < 2 { "c" } else { "d" }.repeat(64)
+            );
+        }
+        assert_eq!(p.successful, 2);
+    }
+    #[test]
+    fn current_mixed_legacy_start_refuses_later_private_base() {
+        let (mut p, s, _) = reserved();
+        p.started = false;
+        p.base = 49;
+        let parent = continued_parent(&p);
+        let start = Event::Start {
+            run_spec: file_pin("run-spec.json", b"spec"),
+            parent: Box::new(parent),
+            prefix: p.prefix,
+            next: p.next,
+            consumed: vec![],
+        };
+        for (base, successful) in [(1, 0), (49, 0), (1, 48)] {
+            p.base = base;
+            p.successful = successful;
+            assert!(p.apply(&start, &s).is_err());
+            assert!(!p.started);
+        }
+    }
+    #[test]
+    fn current_mixed_private_counts_refuse_overflow_and_ceiling_before_reserve() {
+        let (mut p, s, template) = reserved();
+        p.successful = u64::MAX;
+        assert!(p.parent_count().is_err());
+        p.successful = 0;
+        for base in [0, source::MAX_MIXED_UPDATES + 1] {
+            p.base = base;
+            assert!(p.parent_count().is_err());
+        }
+        p.base = source::MAX_MIXED_UPDATES - 1;
+        let r = later_reservation(&p, &template);
+        p.apply(
+            &Event::ReserveWhole4 {
+                reservation: Box::new(r),
+            },
+            &s,
+        )
+        .unwrap();
+        gradient(&mut p, &s);
+        p.apply(
+            &Event::Resolve {
+                resolution: Resolution::Updated {
+                    report: file_pin("report.json", b"report"),
+                    artifact: file_pin("artifact.json", b"artifact"),
+                    report_checksum: "b".repeat(64),
+                    artifact_checksum: "c".repeat(64),
+                },
+            },
+            &s,
+        )
+        .unwrap();
+        assert_eq!(p.parent_count().unwrap(), source::MAX_MIXED_UPDATES);
+        assert!(p.next_parent_count().is_err());
+        let r = later_reservation(&p, &template);
+        let before = (p.attempts, p.next, p.consumed.clone(), p.work);
+        assert!(
+            p.apply(
+                &Event::ReserveWhole4 {
+                    reservation: Box::new(r)
+                },
+                &s
+            )
+            .is_err()
+        );
+        assert_eq!((p.attempts, p.next, p.consumed.clone(), p.work), before);
+    }
+    fn test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "tzolkin-mixed-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        directory
+    }
+    #[test]
+    fn current_mixed_owner_pins_keep_their_absolute_batch_directory() {
+        let directory = test_directory("owner-pins");
+        let ancestor = directory.join("ancestor");
+        let active = directory.join("active");
+        fs::create_dir(&ancestor).unwrap();
+        fs::create_dir(&active).unwrap();
+        fs::write(ancestor.join("report.json"), b"old report").unwrap();
+        fs::write(ancestor.join("artifact.json"), b"old artifact").unwrap();
+        fs::write(active.join("report.json"), b"new report").unwrap();
+        fs::write(active.join("artifact.json"), b"new artifact").unwrap();
+        let mut pins = (
+            ancestor,
+            file_pin("report.json", b"old report"),
+            file_pin("artifact.json", b"old artifact"),
+        );
+        assert!(pins.0.is_absolute());
+        require_owner_pins(&pins).unwrap();
+        pins.0 = active;
+        assert!(require_owner_pins(&pins).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn current_mixed_archive_view_checks_layout_chain_and_byte_counters() {
+        for s in [spec(), compressed_spec()] {
+            let directory = test_directory("archive-view");
+            let raw_spec = bytes(&s, SPEC_CAP).unwrap();
+            let spec_pin = file_pin("run-spec.json", &raw_spec);
+            let raw = bytes(
+                &Entry {
+                    schema: s.journal_schema().into(),
+                    sequence: 1,
+                    previous: String::new(),
+                    root: "root".into(),
+                    spec: s.checksum().unwrap(),
+                    pool: "pool".into(),
+                    event: Event::Start {
+                        run_spec: spec_pin.clone(),
+                        parent: Box::new(CurrentMixedParentIdentity::InitialMixedV1 {
+                            policy: source::tests::initial(),
+                        }),
+                        prefix: [7, 11],
+                        next: 9,
+                        consumed: vec![],
+                    },
+                },
+                HEAD_CAP,
+            )
+            .unwrap();
+            let head = file_pin("head-0000000000000001.json", &raw);
+            fs::write(directory.join(&spec_pin.name), &raw_spec).unwrap();
+            fs::write(directory.join(&head.name), &raw).unwrap();
+            let references = BTreeMap::new();
+            let metadata = (raw_spec.len() + raw.len()) as u64;
+            let mut view = ArchiveView {
+                directory: &directory,
+                spec: &s,
+                journal_schema: s.journal_schema(),
+                root_checksum: "root",
+                pool: "pool",
+                sequence: 1,
+                head: Some(&head),
+                spec_pin: Some(&spec_pin),
+                references: &references,
+                output_bytes: metadata,
+                metadata_bytes: metadata,
+                raw_record_bytes: 0,
+                stored_record_bytes: 0,
+            };
+            restore::require_archive_files(&view).unwrap();
+            view.metadata_bytes += 1;
+            assert!(restore::require_archive_files(&view).is_err());
+            view.metadata_bytes = metadata;
+            view.raw_record_bytes = 1;
+            assert!(restore::require_archive_files(&view).is_err());
+            view.raw_record_bytes = 0;
+            fs::write(directory.join("orphan.tmp"), b"orphan").unwrap();
+            assert!(restore::require_archive_files(&view).is_err());
+            fs::remove_file(directory.join("orphan.tmp")).unwrap();
+            fs::write(directory.join(&head.name), b"changed").unwrap();
+            assert!(restore::require_archive_files(&view).is_err());
+            fs::remove_dir_all(directory).unwrap();
+        }
     }
     #[test]
     fn current_mixed_ready_continuation_preserves_updated_and_no_change_reservations() {

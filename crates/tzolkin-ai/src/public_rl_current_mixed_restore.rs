@@ -285,7 +285,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     );
                     s.add_reference(attempt, report)?;
                     s.add_reference(attempt, artifact)?;
-                    owner_pins = Some((attempt, report.clone(), artifact.clone()));
+                    owner_pins = Some((s.batch(attempt), report.clone(), artifact.clone()));
                 }
                 Event::Resolve {
                     resolution:
@@ -385,100 +385,14 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         self.account(pin, !pin.name.starts_with("record-"))
     }
     fn require_entry(&self, entry: &Entry, sequence: u64, previous: &str) -> Result<(), String> {
-        if entry.schema != self.spec.journal_schema()
-            || entry.sequence != sequence
-            || entry.previous != previous
-            || entry.root != self.root_checksum
-            || entry.spec != self.spec.checksum()?
-            || entry.pool != self.pool
-        {
-            return Err("Current mixed journal original chain/spec/root/pool differs".into());
-        }
-        Ok(())
+        require_archive_entry(&self.archive_view(), entry, sequence, previous)
     }
     pub(super) fn require_layout(&self) -> Result<(), String> {
-        let mut expected = vec!["run-spec.json".into()];
-        expected.extend((1..=self.sequence).map(|n| format!("head-{n:016x}.json")));
-        expected.extend(self.references.keys().map(|n| format!("batch-{n:016x}")));
-        expected.sort();
-        if names(
-            &self.directory,
-            1 + self.spec.max_journal_entries as usize + self.spec.max_attempts as usize,
-        )? != expected
-        {
-            return Err("Current mixed stale head or extra/missing root outputs".into());
-        }
-        for (&attempt, refs) in &self.references {
-            let mut expected = refs.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
-            expected.sort();
-            if names(&self.batch(attempt), 9)? != expected {
-                return Err(
-                    "Current mixed unreferenced/temp batch outputs refuse restore/close".into(),
-                );
-            }
-        }
-        Ok(())
+        require_archive_layout(&self.archive_view())
     }
     fn require_full_archives(&self) -> Result<(), String> {
         self.root.require_current()?;
-        self.require_layout()?;
-        let spec = self
-            .spec_pin
-            .as_ref()
-            .ok_or("Current mixed original run pin missing")?;
-        read_pin(&self.directory, spec, SPEC_CAP)?;
-        let mut previous = String::new();
-        let mut output = spec.bytes as u64;
-        let mut metadata = output;
-        let mut logical = 0u64;
-        let mut stored = 0u64;
-        for n in 1..=self.sequence {
-            let name = format!("head-{n:016x}.json");
-            let raw = read_bounded(&self.directory.join(name), HEAD_CAP)?;
-            let entry: Entry = closed(&raw, HEAD_CAP)?;
-            self.require_entry(&entry, n, &previous)?;
-            if let Event::CollectReturn {
-                member,
-                record: Some(pin),
-                ..
-            } = &entry.event
-            {
-                pin.validate(*member, &self.spec)?;
-                logical = logical
-                    .checked_add(pin.raw_bytes() as u64)
-                    .ok_or("Current mixed archive logical byte overflow")?;
-                stored = stored
-                    .checked_add(pin.file().bytes as u64)
-                    .ok_or("Current mixed archive stored byte overflow")?;
-            }
-            previous = sha(&raw);
-            output += raw.len() as u64;
-            metadata += raw.len() as u64;
-        }
-        if self.head.as_ref().is_none_or(|p| p.sha256 != previous) {
-            return Err("Current mixed original latest head changed".into());
-        }
-        for (&attempt, refs) in &self.references {
-            for p in refs {
-                read_physical_pin(&self.batch(attempt), p, &self.spec)?;
-                output += p.bytes as u64;
-                if !p.name.starts_with("record-") {
-                    metadata += p.bytes as u64;
-                }
-            }
-        }
-        self.spec.check_storage(logical, stored, metadata)?;
-        if output != self.output_bytes
-            || metadata != self.metadata_bytes
-            || logical != self.raw_record_bytes
-            || stored != self.stored_record_bytes
-            || output
-                != stored
-                    .checked_add(metadata)
-                    .ok_or("Current mixed archive retained overflow")?
-        {
-            return Err("Current mixed original archive byte accounting differs".into());
-        }
+        require_archive_files(&self.archive_view())?;
         self.require_live()
     }
     /// Consume the session only after full archival checks, returning unchanged
@@ -499,4 +413,107 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         self.current_policy()?;
         Ok(ReadyCurrentMixedContinuation { session: self })
     }
+}
+
+fn require_archive_entry(
+    archive: &ArchiveView<'_>,
+    entry: &Entry,
+    sequence: u64,
+    previous: &str,
+) -> Result<(), String> {
+    if entry.schema != archive.journal_schema
+        || entry.sequence != sequence
+        || entry.previous != previous
+        || entry.root != archive.root_checksum
+        || entry.spec != archive.spec.checksum()?
+        || entry.pool != archive.pool
+    {
+        return Err("Current mixed journal original chain/spec/root/pool differs".into());
+    }
+    Ok(())
+}
+
+fn require_archive_layout(archive: &ArchiveView<'_>) -> Result<(), String> {
+    let mut expected = vec!["run-spec.json".into()];
+    expected.extend((1..=archive.sequence).map(|n| format!("head-{n:016x}.json")));
+    expected.extend(archive.references.keys().map(|n| format!("batch-{n:016x}")));
+    expected.sort();
+    if names(
+        archive.directory,
+        1 + archive.spec.max_journal_entries as usize + archive.spec.max_attempts as usize,
+    )? != expected
+    {
+        return Err("Current mixed stale head or extra/missing root outputs".into());
+    }
+    for (&attempt, refs) in archive.references {
+        let mut expected = refs.iter().map(|p| p.name.clone()).collect::<Vec<_>>();
+        expected.sort();
+        if names(&archive.batch(attempt), 9)? != expected {
+            return Err(
+                "Current mixed unreferenced/temp batch outputs refuse restore/close".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn require_archive_files(archive: &ArchiveView<'_>) -> Result<(), String> {
+    require_archive_layout(archive)?;
+    let spec = archive
+        .spec_pin
+        .ok_or("Current mixed original run pin missing")?;
+    read_pin(archive.directory, spec, SPEC_CAP)?;
+    let mut previous = String::new();
+    let mut output = spec.bytes as u64;
+    let mut metadata = output;
+    let mut logical = 0u64;
+    let mut stored = 0u64;
+    for n in 1..=archive.sequence {
+        let name = format!("head-{n:016x}.json");
+        let raw = read_bounded(&archive.directory.join(name), HEAD_CAP)?;
+        let entry: Entry = closed(&raw, HEAD_CAP)?;
+        require_archive_entry(archive, &entry, n, &previous)?;
+        if let Event::CollectReturn {
+            member,
+            record: Some(pin),
+            ..
+        } = &entry.event
+        {
+            pin.validate(*member, archive.spec)?;
+            logical = logical
+                .checked_add(pin.raw_bytes() as u64)
+                .ok_or("Current mixed archive logical byte overflow")?;
+            stored = stored
+                .checked_add(pin.file().bytes as u64)
+                .ok_or("Current mixed archive stored byte overflow")?;
+        }
+        previous = sha(&raw);
+        output += raw.len() as u64;
+        metadata += raw.len() as u64;
+    }
+    if archive.head.is_none_or(|p| p.sha256 != previous) {
+        return Err("Current mixed original latest head changed".into());
+    }
+    for (&attempt, refs) in archive.references {
+        for p in refs {
+            read_physical_pin(&archive.batch(attempt), p, archive.spec)?;
+            output += p.bytes as u64;
+            if !p.name.starts_with("record-") {
+                metadata += p.bytes as u64;
+            }
+        }
+    }
+    archive.spec.check_storage(logical, stored, metadata)?;
+    if output != archive.output_bytes
+        || metadata != archive.metadata_bytes
+        || logical != archive.raw_record_bytes
+        || stored != archive.stored_record_bytes
+        || output
+            != stored
+                .checked_add(metadata)
+                .ok_or("Current mixed archive retained overflow")?
+    {
+        return Err("Current mixed original archive byte accounting differs".into());
+    }
+    Ok(())
 }
