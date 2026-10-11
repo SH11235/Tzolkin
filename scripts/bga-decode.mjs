@@ -1549,8 +1549,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       same(witness.buildings, [action.id]) &&
       same(typedResourceCost(action), cost) &&
       same(paymentOf(events), cost) &&
-      object(own?.resources) &&
-      !Object.hasOwn(own.resources, 'corn') &&
+      (continuation !== null ||
+        (object(own?.resources) && !Object.hasOwn(own.resources, 'corn'))) &&
       previous.currentPlayer === actor &&
       (continuation !== null || previous.players[actor].technologies.theology === 3) &&
       same(next.pending.after, [
@@ -1637,11 +1637,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       next.currentPlayer !== actor ||
       next.round !== previous.round ||
       next.phase !== previous.phase ||
-      (witness.pendingTask !== undefined && witness.pendingTask !== 'technology') ||
-      !Array.isArray(observed) ||
-      observed.length !== previous.players.length ||
-      (!corn && (!Number.isSafeInteger(own?.resources?.corn) || own.resources.corn < 0)) ||
-      !Number.isFinite(own?.score)
+      (witness.pendingTask !== undefined && witness.pendingTask !== 'technology')
     )
       return null;
     const resources = Object.entries(after[0].effects[0].resources);
@@ -1659,6 +1655,17 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     )
       return null;
     const continuation = corn ? queuedCornTechnology(previous, actor) : null;
+    // A source-bound cornTechnology choice has an exact whole-state transition.
+    // Omitted counters remain unknown; supplied checkpoints are still compared.
+    // Keep the older material and capped Theology observation requirements.
+    if (
+      continuation === null &&
+      (!Array.isArray(observed) ||
+        observed.length !== previous.players.length ||
+        (!corn && (!Number.isSafeInteger(own?.resources?.corn) || own.resources.corn < 0)) ||
+        !Number.isFinite(own?.score))
+    )
+      return null;
     if (
       corn &&
       !queuedCornPurchase(outcome, witness, events, previous, actor, amount, continuation)
@@ -1671,6 +1678,15 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       pending: copy(next.pending),
       gainEvent: gainEvents[0],
       ...(corn ? (continuation ?? { kind: 'cornTheology', bonusClaimed: false }) : {}),
+      ...(continuation
+        ? {
+            purchaseCounterEvidence: {
+              score: Object.hasOwn(own ?? {}, 'score') ? 'sourceCheckpoint' : 'unknown',
+              resourceFields: object(own?.resources) ? Object.keys(own.resources) : [],
+              coreState: 'derivedFromVerifiedPrefix',
+            },
+          }
+        : {}),
     };
   }
   function finishQueuedPurchase(event) {
@@ -1777,6 +1793,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             humanPlayingBcReady: false,
           }
         : {}),
+      ...(receipt.purchaseCounterEvidence
+        ? { purchaseCounterEvidence: copy(receipt.purchaseCounterEvidence) }
+        : {}),
     });
     return true;
   }
@@ -1830,6 +1849,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       actualDelivered: true,
       continuation: 'cappedExtraction',
       humanPlayingBcReady: false,
+      ...(receipt.purchaseCounterEvidence
+        ? { purchaseCounterEvidence: copy(receipt.purchaseCounterEvidence) }
+        : {}),
     });
     return true;
   }
@@ -1952,12 +1974,14 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           emptyPurchasePayment(item) || architectureScoreCaption(item) || cappedWorkerCaption(item),
       );
       if (envelope && (event.kind !== 'build' || !settledBuild(outcome))) return false;
-      if (task === 'technology' && cornTechnologyPair(outcome.row.action.id) !== null)
+      if (task === 'technology' && cornTechnologyPair(outcome.row.action.id) !== null) {
+        const receipt = queuedPurchaseShape(outcome, event, events, witness);
         return (
-          ['cornTheology', 'cornTechnology'].includes(
-            queuedPurchaseShape(outcome, event, events, witness)?.kind,
-          ) && matches(outcome.frame.snapshot.state, witness.expected)
+          ['cornTheology', 'cornTechnology'].includes(receipt?.kind) &&
+          ((receipt.kind === 'cornTechnology' && witness.expected === undefined) ||
+            matches(outcome.frame.snapshot.state, witness.expected))
         );
+      }
       if (task === 'technology' && queuedPurchaseShape(outcome, event, events, witness))
         return matches(outcome.frame.snapshot.state, witness.expected);
       if (
