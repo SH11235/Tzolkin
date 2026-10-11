@@ -344,7 +344,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     return Number.isSafeInteger(amount) && amount > 0 ? { actor, amount } : null;
   }
   function purchaseActor(event) {
-    return architectureScoreCaption(event)?.actor ?? event.actor;
+    return architectureScoreCaption(event)?.actor ?? theologySkullCaption(event) ?? event.actor;
   }
   function settledBuild(outcome, previous = state()) {
     const after = outcome.frame.snapshot.state;
@@ -1289,6 +1289,118 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     );
     return actors.length === 1 ? actors[0] : null;
   }
+  function cappedTheologyPurchase(outcome, event, events, witness, previous = state()) {
+    const action = outcome.row.action;
+    const actor = actorId(event.actor);
+    const next = outcome.frame.snapshot.state;
+    const before = previous.players[actor];
+    const effects = buildings.get(action.id)?.effects;
+    const temples = effects?.slice(1);
+    if (
+      witnesses.catalogHash !== catalogHash ||
+      actor < 0 ||
+      action.type !== 'build' ||
+      typeof action.architecture !== 'boolean' ||
+      action.renovation != null ||
+      !same(witness.buildings, [action.id]) ||
+      !same(effects?.[0], { type: 'technology', technology: 'theology', steps: 1 }) ||
+      !Array.isArray(temples) ||
+      temples.length > 3 ||
+      temples.some(
+        (effect) =>
+          !Object.values(TEMPLES).includes(effect.temple) ||
+          !same(effect, { type: 'temple', temple: effect.temple, steps: 1 }),
+      ) ||
+      new Set(temples.map((effect) => effect.temple)).size !== temples.length ||
+      before.technologies.theology !== 3 ||
+      previous.currentPlayer !== actor ||
+      previous.pending?.task?.type !== 'build' ||
+      previous.pending.task.remaining !== 1 ||
+      previous.pending.task.cornPayment !== false ||
+      !same(previous.pending.after, []) ||
+      next.pending !== null ||
+      outcome.frame.observation.pendingTask !== null ||
+      previous.skullSupply < 1 ||
+      next.skullSupply !== previous.skullSupply - 1 ||
+      events.filter((item) => theologySkullCaption(item) === event.actor).length !== 1 ||
+      events.filter(
+        (item) =>
+          item.kind === 'technology' &&
+          item.actor === event.actor &&
+          item.detail.technology === 'theology' &&
+          item.detail.steps === 1,
+      ).length !== 1
+    )
+      return false;
+    const cost = RESOURCES.map((resource) => buildings.get(action.id).cost[resource] ?? 0);
+    if (cost.some((amount) => !Number.isSafeInteger(amount) || amount < 0)) return false;
+    if (action.architecture) {
+      const index = RESOURCES.indexOf(action.discountResource);
+      if (before.technologies.architecture !== 3 || index < 1 || index > 3 || cost[index] < 1)
+        return false;
+      cost[index]--;
+    } else if (action.discountResource != null) return false;
+    const own = witness.expected?.players?.[actor];
+    return (
+      same(typedResourceCost(action), cost) &&
+      same(paymentOf(events), cost) &&
+      same(
+        next.buildings,
+        previous.buildings.filter((id) => id !== action.id),
+      ) &&
+      same(
+        { ...mechanical(next), players: null, pending: null, buildings: null, skullSupply: null },
+        {
+          ...mechanical(previous),
+          players: null,
+          pending: null,
+          buildings: null,
+          skullSupply: null,
+        },
+      ) &&
+      next.players.every((player, id) =>
+        id === actor
+          ? same(player.buildings, [...before.buildings, action.id]) &&
+            same(player.technologies, before.technologies) &&
+            Object.values(TEMPLES).every(
+              (temple) =>
+                player.temples[temple] ===
+                before.temples[temple] + Number(temples.some((effect) => effect.temple === temple)),
+            ) &&
+            player.score === before.score + (action.architecture ? 2 : 0) &&
+            RESOURCES.every(
+              (resource, index) =>
+                player.resources[resource] ===
+                  before.resources[resource] -
+                    cost[index] +
+                    (resource === 'skull'
+                      ? 1
+                      : resource === 'corn'
+                        ? Number(action.architecture)
+                        : 0) && own?.resources?.[resource] === player.resources[resource],
+            ) &&
+            same(
+              {
+                ...player,
+                resources: null,
+                technologies: null,
+                temples: null,
+                score: null,
+                buildings: null,
+              },
+              {
+                ...before,
+                resources: null,
+                technologies: null,
+                temples: null,
+                score: null,
+                buildings: null,
+              },
+            )
+          : same(player, previous.players[id]),
+      )
+    );
+  }
   function queuedCornPurchase(outcome, witness, events, previous, actor, amount) {
     const action = outcome.row.action;
     const next = outcome.frame.snapshot.state;
@@ -1509,6 +1621,10 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         const field = `technology:${item.detail.technology}`;
         gains[field] = (gains[field] ?? 0) + 1;
       } else {
+        if (theologySkullCaption(item)) {
+          gains['resource:skull'] = (gains['resource:skull'] ?? 0) + 1;
+          continue;
+        }
         const bonus = architectureScoreCaption(item);
         if (bonus) {
           gains.score = (gains.score ?? 0) + bonus.amount;
@@ -1539,6 +1655,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       fail('Observed purchase gain is out of bounds');
     return (outcome) => {
       const task = outcome.frame.observation?.pendingTask?.type ?? null;
+      if (remaining.some((item) => theologySkullCaption(item)))
+        return (
+          cappedTheologyPurchase(outcome, event, events, witness) &&
+          matches(outcome.frame.snapshot.state, witness.expected)
+        );
       if (task === 'anyAction' && actionScorePair(outcome.row.action.id))
         return deferredActionScoreShape(outcome, event, events, witness) !== null;
       const envelope = events.some(
@@ -2002,9 +2123,10 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               fail('Multiple technology advances need separate observed choices');
             const field = `technology:${detail.technology}`;
             const capped =
-              detail.technology === 'architecture' &&
+              (detail.technology === 'architecture'
+                ? context.purchase?.capped
+                : detail.technology === 'theology' && context.purchase?.theologyCapped) &&
               context.purchase?.actor === actorId(event.actor) &&
-              context.purchase.capped &&
               !context.purchase.advanceClaimed;
             if (capped) context.purchase.advanceClaimed = true;
             else if (unclaimed(event, field) < 1) {
@@ -2066,6 +2188,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 action.architecture === true &&
                 beforePurchase.players[actorId(event.actor)].technologies.architecture >= 2,
               capped: cappedPurchaseAdvance({ frame, row: { action } }, beforePurchase),
+              theologyCapped: cappedTheologyPurchase(
+                { frame, row: { action } },
+                event,
+                events,
+                witness,
+                beforePurchase,
+              ),
               advanceClaimed: false,
               bonusClaimed: false,
             };
@@ -2195,6 +2324,17 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 fail('Theology bonus has no matching unconsumed queued purchase');
               automatic({ ...event, actor: theologyBonus }, 'resource:skull', 1);
               queuedPurchase.bonusClaimed = true;
+            } else if (theologyBonus) {
+              const receipt = context.purchase;
+              if (
+                !receipt?.theologyCapped ||
+                receipt.actor !== actorId(theologyBonus) ||
+                !receipt.advanceClaimed ||
+                receipt.bonusClaimed
+              )
+                fail('Theology bonus has no matching unconsumed fixed purchase receipt');
+              automatic({ ...event, actor: theologyBonus }, 'resource:skull', 1);
+              receipt.bonusClaimed = true;
             } else if (architectureBonus) {
               const receipt = context.purchase;
               if (
@@ -2356,6 +2496,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           } else fail(`Unsupported source effect ${event.kind}`);
         }
         pay(payments);
+        if (
+          context.purchase?.theologyCapped &&
+          (!context.purchase.advanceClaimed || !context.purchase.bonusClaimed)
+        )
+          fail('Fixed Theology purchase did not consume its advance and skull captions');
         for (const event of events.filter((item) => item.kind === 'resourcePayment'))
           for (const [index, amount] of resourceAmounts(event).entries())
             if (amount) automatic(event, `resource:${RESOURCES[index]}`, amount, -1);
