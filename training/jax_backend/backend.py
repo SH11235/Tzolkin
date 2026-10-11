@@ -5,6 +5,7 @@ sampling contract, dataset admission, or deployable policy provenance.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -19,10 +20,13 @@ PARAMETERS = FEATURES * HIDDEN + HIDDEN + HIDDEN + 1
 VERSION = "jax-public-mlp-f32-v1"
 
 
-def load_batch(path: Path) -> dict:
-    if path.stat().st_size > 128 * 1024 * 1024:
+def load_batch(path: Path) -> tuple[dict, str]:
+    # Parse and hash exactly one bounded snapshot, even if the path changes later.
+    with path.open("rb") as file:
+        raw = file.read(128 * 1024 * 1024 + 1)
+    if len(raw) > 128 * 1024 * 1024:
         raise ValueError("Batch exceeds 128 MiB")
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(raw)
     expected = ("tzolkin-jax-numeric-batch-v1", 2, FEATURES, HIDDEN, PARAMETERS)
     actual = tuple(data.get(key) for key in (
         "schema", "featureSchema", "featureCount", "hiddenCount", "parameterCount"
@@ -67,7 +71,7 @@ def load_batch(path: Path) -> dict:
         rows += count
     if rows > 32768:
         raise ValueError("Batch exceeds row capacity")
-    return data
+    return data, hashlib.sha256(raw).hexdigest()
 
 
 def pack(samples: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

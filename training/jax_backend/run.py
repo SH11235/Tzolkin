@@ -10,7 +10,6 @@ import time
 
 # Set before importing JAX; leave room for the desktop and other sessions.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
 
 import jax
 import numpy as np
@@ -51,8 +50,10 @@ def verify(data, device):
     initial_loss = float(bc_loss(p, x, m, c))
     updated, _ = bc_step(p, x, m, c, np.float32(0.001))
     new_loss = float(bc_loss(updated, x, m, c))
-    if not np.isfinite(new_loss) or new_loss >= initial_loss:
-        raise RuntimeError("BC step did not decrease loss")
+    loss_tolerance = 5e-7 * max(1.0, abs(initial_loss))
+    if (not np.isfinite(new_loss) or not np.isfinite(np.asarray(updated)).all()
+            or new_loss > initial_loss + loss_tolerance):
+        raise RuntimeError("BC step produced nonfinite values or increased loss")
     return {"device": str(device), "samples": len(samples), "logitMaxAbsError": error,
             "gradientMaxAbsError": float(np.max(np.abs(gradient - reference_gradient))),
             "bcLossBefore": initial_loss, "bcLossAfter": new_loss,
@@ -137,13 +138,12 @@ def main():
         parser.error("learning-rate must be in (0, 0.01]")
     if args.output.exists():
         parser.error("Output already exists")
-    data = load_batch(args.input)
+    data, digest = load_batch(args.input)
     device = device_for(args.device)
     # Benchmark cold compilation before verification warms the same JIT functions.
     # Every command must pass reference verification before publishing a result.
     performance = benchmark(data, device, args.repeats, args.batch_copies) if args.command == "benchmark" else None
     parity = verify(data, device)
-    digest = hashlib.sha256(args.input.read_bytes()).hexdigest()
     if args.command == "verify":
         result = {"backendVersion": VERSION, "jaxVersion": jax.__version__,
                   "sourceSha256": digest, "verification": parity}

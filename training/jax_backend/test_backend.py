@@ -2,11 +2,17 @@
 import os
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
 import jax
 import numpy as np
 import pytest
 
-from backend import PARAMETERS, bc_loss, bc_step, log_probabilities, logits, pack, pullback
+from backend import PARAMETERS, bc_loss, bc_step, load_batch, log_probabilities, logits, pack, pullback
 
 
 def test_padding_is_excluded_and_singleton_has_zero_gradient():
@@ -56,3 +62,42 @@ def test_padding_cannot_change_loss_or_gradient():
 def test_pack_rejects_unbounded_padding():
     with pytest.raises(ValueError, match="capacity"):
         pack([{"features": [None] * 4096, "chosen": 0}] * 17)
+
+
+def singleton_batch():
+    return {
+        "schema": "tzolkin-jax-numeric-batch-v1", "featureSchema": 2,
+        "featureCount": 512, "hiddenCount": 32, "parameterCount": PARAMETERS,
+        "sourceKind": "coreNumericFixture", "datasetFingerprint": None,
+        "parameters": [0.0] * PARAMETERS,
+        "samples": [{"id": "singleton", "split": "train", "phase": "Playing",
+                     "chosen": 0, "features": [[0.0] * 512], "logits": [0.0],
+                     "dlogits": [0.0], "gradient": [0.0] * PARAMETERS}],
+    }
+
+
+def test_cpu_only_cli_accepts_stationary_singleton(tmp_path):
+    source, output = tmp_path / "batch.json", tmp_path / "verify.json"
+    raw = json.dumps(singleton_batch()).encode()
+    source.write_bytes(raw)
+    env = os.environ.copy()
+    env.pop("JAX_PLATFORMS", None)
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    command = [sys.executable, str(Path(__file__).with_name("run.py")), "verify",
+               "--device", "cpu", "--input", str(source), "--output", str(output)]
+    result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(output.read_text())
+    assert report["verification"]["bcLossBefore"] == 0
+    assert report["verification"]["bcLossAfter"] == 0
+    assert report["sourceSha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_input_hash_binds_loaded_snapshot(tmp_path):
+    path = tmp_path / "batch.json"
+    raw = json.dumps(singleton_batch()).encode()
+    path.write_bytes(raw)
+    data, digest = load_batch(path)
+    path.write_bytes(b"changed after loading")
+    assert data["samples"][0]["id"] == "singleton"
+    assert digest == hashlib.sha256(raw).hexdigest()

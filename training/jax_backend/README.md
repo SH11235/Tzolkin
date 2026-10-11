@@ -73,6 +73,11 @@ The resulting JSON binds the dataset fingerprint and sample IDs. The Python
 runner records the input file SHA-256. These bindings are not producer
 authentication or a Python-side reconstruction of Rust's admission checks.
 
+Selection also respects the runner's 65,536 padded-row limit across both
+partitions, skipping candidates that would exceed it. Exported JSON is limited
+to 128 MiB before publication. The runner hashes the same bounded byte snapshot
+it parses, so a later path change cannot change the recorded source hash.
+
 This first export initializes weights with the existing Rust model's seed 7;
 it does not import a trained RL owner. Training is full-batch SGD on the bounded
 selected examples, not the existing Scalar Adam trainer or the current Mixed
@@ -90,7 +95,8 @@ rather than allocating 4,096 candidates for every observation. Larger datasets
 need candidate-count buckets/streaming before sustained training.
 
 Every CLI command checks logits and caller-supplied pullbacks against Rust's
-Scalar reference, and checks that a small BC update reduces loss. GPU/f32
+Scalar reference, and checks that a small BC update does not increase loss
+beyond f32 tolerance. Singleton/stationary batches are valid. GPU/f32
 reductions differ from Rust's ordered f32 forward and f64 gradient accumulation;
 tolerance checks replace bit equality **for this experimental backend only**.
 Existing audit contracts and sampler/RNG semantics are unchanged. Passing the
@@ -108,6 +114,8 @@ and use new output names. This repeats the same examples in memory, not new
 independent training data. Reports state the unique sample count, copy count,
 and padded batch shape; the same capacity guard still applies. Small batches
 can be faster on CPU because GPU launch/synchronization overhead dominates.
+For a CPU-only machine, install CPU JAX and run with `JAX_PLATFORMS=cpu`.
+The CLI itself does not force CUDA initialization for `--device cpu`.
 
 Before connecting a long-run collector, qualify the current actor/critic and
 actual objective against held-out recorded batches, measure full-pipeline

@@ -14,6 +14,8 @@ use tzolkin_ai::public_policy_pullback::ScalarPolicyPullback;
 use tzolkin_core::observation::observe;
 
 const MAX_ROWS: usize = 32_768;
+const MAX_PADDED_ROWS: usize = 65_536;
+const MAX_BATCH_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -136,7 +138,18 @@ fn run() -> Result<(), String> {
                 let mut split_rows = 0usize;
                 for item in dataset.iter_split(split) {
                     let item = item?;
-                    if selected < 64 && split_rows + item.candidates().len() <= MAX_ROWS / 2 {
+                    let proposed_width = export
+                        .samples
+                        .iter()
+                        .map(|s| s.features.len())
+                        .chain(std::iter::once(item.candidates().len()))
+                        .max()
+                        .ok_or("No candidate rows")?
+                        .next_power_of_two();
+                    if selected < 64
+                        && split_rows + item.candidates().len() <= MAX_ROWS / 2
+                        && (export.samples.len() + 1) * proposed_width <= MAX_PADDED_ROWS
+                    {
                         split_rows += item.candidates().len();
                         selected += 1;
                         export.samples.push(sample(
@@ -161,7 +174,20 @@ fn run() -> Result<(), String> {
     if count > MAX_ROWS {
         return Err("Fixture exceeds row bound".into());
     }
+    let width = export
+        .samples
+        .iter()
+        .map(|s| s.features.len())
+        .max()
+        .ok_or("No exported samples")?
+        .next_power_of_two();
+    if export.samples.len() * width > MAX_PADDED_ROWS {
+        return Err("Export exceeds padded batch capacity".into());
+    }
     let bytes = serde_json::to_vec(&export).map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_BATCH_BYTES {
+        return Err("Export exceeds 128 MiB".into());
+    }
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
