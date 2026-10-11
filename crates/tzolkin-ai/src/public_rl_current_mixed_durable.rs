@@ -1218,11 +1218,17 @@ struct AttemptStages {
     whole_call_inclusive: StageTiming,
     preflight: StageTiming,
     reservation_publication: StageTiming,
+    collection_journal_inclusive: [StageTiming; 4],
+    collection_guards_and_preparation: [StageTiming; 4],
     collection_native: [StageTiming; 4],
     record_publication: [StageTiming; 4],
+    audit_record_read_and_check: [StageTiming; 4],
+    audit_journal_inclusive: [StageTiming; 4],
+    audit_guards_and_preparation: [StageTiming; 4],
     audit_native: [StageTiming; 4],
     cohort_publication: StageTiming,
     gradient_start: StageTiming,
+    numeric_guards_and_preparation: StageTiming,
     numeric_preparation_inclusive: StageTiming,
     actor_encode: StageTiming,
     actor_scalar_forward: StageTiming,
@@ -1240,6 +1246,11 @@ struct AttemptStages {
 /// Current-process diagnostic output only. It is never journaled or restored.
 /// Whole-call and numerical preparation spans include their named inner spans;
 /// collection/audit include their own inference and replay work. Do not sum them.
+/// The collection/audit journal, preparation and record-read groups cover
+/// separate surrounding calls, outside the existing native/publication spans.
+/// Journal groups include live verification and metadata serialization/readback;
+/// preparation groups include live verification and handle/roster/config work.
+/// These are inclusive operation groups, not pure disk or hash measurements.
 /// Zero entered calls mean unobserved work, not a measured zero-duration stage.
 /// Returned-error counts describe `Result::Err`; a returned stopped status is
 /// recorded separately in the resolution and stopped fields. The whole-call
@@ -1266,11 +1277,21 @@ impl CurrentMixedAttemptTimings {
             TimedPhase::WholeCall => &mut self.stages.whole_call_inclusive,
             TimedPhase::Preflight => &mut self.stages.preflight,
             TimedPhase::ReservationPublication => &mut self.stages.reservation_publication,
+            TimedPhase::CollectionJournal(i) => &mut self.stages.collection_journal_inclusive[i],
+            TimedPhase::CollectionPreparation(i) => {
+                &mut self.stages.collection_guards_and_preparation[i]
+            }
             TimedPhase::Collection(i) => &mut self.stages.collection_native[i],
             TimedPhase::RecordPublication(i) => &mut self.stages.record_publication[i],
+            TimedPhase::AuditRecordRead(i) => &mut self.stages.audit_record_read_and_check[i],
+            TimedPhase::AuditJournal(i) => &mut self.stages.audit_journal_inclusive[i],
+            TimedPhase::AuditPreparation(i) => &mut self.stages.audit_guards_and_preparation[i],
             TimedPhase::Audit(i) => &mut self.stages.audit_native[i],
             TimedPhase::CohortPublication => &mut self.stages.cohort_publication,
             TimedPhase::GradientStart => &mut self.stages.gradient_start,
+            TimedPhase::NumericPreparationControl => {
+                &mut self.stages.numeric_guards_and_preparation
+            }
             TimedPhase::NumericPreparation => &mut self.stages.numeric_preparation_inclusive,
             TimedPhase::ActorEncode => &mut self.stages.actor_encode,
             TimedPhase::ActorForward => &mut self.stages.actor_scalar_forward,
@@ -1990,11 +2011,17 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             Ok(plan_value)
         })?;
         for member in 0..4 {
-            self.save(Event::CollectStart { member })?;
-            self.require_live()?;
+            timed(timer, TimedPhase::CollectionJournal(member), |_| {
+                self.save(Event::CollectStart { member })
+            })?;
+            timed(timer, TimedPhase::CollectionPreparation(member), |_| {
+                self.require_live()
+            })?;
             let returned = {
-                let handle = self.handle()?;
-                let rosters = self.rosters(&collection)?;
+                let (handle, rosters) =
+                    timed(timer, TimedPhase::CollectionPreparation(member), |_| {
+                        Ok((self.handle()?, self.rosters(&collection)?))
+                    })?;
                 timed(timer, TimedPhase::Collection(member), |_| {
                     source::collect(
                         &plan.configurations()[member],
@@ -2004,7 +2031,9 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     )
                 })
             };
-            self.require_live()?;
+            timed(timer, TimedPhase::CollectionPreparation(member), |_| {
+                self.require_live()
+            })?;
             let (record, complete, error) = match returned {
                 Ok(game) => {
                     let complete = game.terminal.is_some() && game.failure.is_none();
@@ -2028,11 +2057,13 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 }
                 Err(e) => (None, false, Some(bounded_error(&e))),
             };
-            self.save(Event::CollectReturn {
-                member,
-                record,
-                complete,
-                error: error.clone(),
+            timed(timer, TimedPhase::CollectionJournal(member), |_| {
+                self.save(Event::CollectReturn {
+                    member,
+                    record,
+                    complete,
+                    error: error.clone(),
+                })
             })?;
             if let Some(e) = error {
                 return timed(timer, TimedPhase::Resolve, |_| self.stopped_error(e));
@@ -2043,13 +2074,21 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             let record = self.progress.collect[member]
                 .as_ref()
                 .ok_or("Missing returned current mixed record")?;
-            let raw = read_record(&dir, record, member, &self.spec)?;
-            source::check_record(&raw, &plan.headers[member])?;
-            self.save(Event::AuditStart { member })?;
-            self.require_live()?;
+            let raw = timed(timer, TimedPhase::AuditRecordRead(member), |_| {
+                let raw = read_record(&dir, record, member, &self.spec)?;
+                source::check_record(&raw, &plan.headers[member])?;
+                Ok(raw)
+            })?;
+            timed(timer, TimedPhase::AuditJournal(member), |_| {
+                self.save(Event::AuditStart { member })
+            })?;
+            timed(timer, TimedPhase::AuditPreparation(member), |_| {
+                self.require_live()
+            })?;
             let returned = {
-                let handle = self.handle()?;
-                let rosters = self.rosters(&collection)?;
+                let (handle, rosters) = timed(timer, TimedPhase::AuditPreparation(member), |_| {
+                    Ok((self.handle()?, self.rosters(&collection)?))
+                })?;
                 timed(timer, TimedPhase::Audit(member), |_| {
                     source::audit(
                         &raw,
@@ -2059,15 +2098,19 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     )
                 })
             };
-            self.require_live()?;
-            self.save(Event::AuditReturn {
-                member,
-                passed: returned.is_ok(),
-                episode_checksum: returned
-                    .as_ref()
-                    .ok()
-                    .map(|e| e.canonical_record_checksum().into()),
-                error: returned.as_ref().err().map(|e| bounded_error(e)),
+            timed(timer, TimedPhase::AuditPreparation(member), |_| {
+                self.require_live()
+            })?;
+            timed(timer, TimedPhase::AuditJournal(member), |_| {
+                self.save(Event::AuditReturn {
+                    member,
+                    passed: returned.is_ok(),
+                    episode_checksum: returned
+                        .as_ref()
+                        .ok()
+                        .map(|e| e.canonical_record_checksum().into()),
+                    error: returned.as_ref().err().map(|e| bounded_error(e)),
+                })
             })?;
             match returned {
                 Ok(e) => episodes.push(Ok(e)),
@@ -2107,14 +2150,17 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 ],
             })
         })?;
-        self.require_live()?;
-        let handle = self.handle()?;
-        let actor_config = self.spec.actor()?;
-        let critic_config = self.spec.critic()?;
+        let (handle, actor_config, critic_config) =
+            timed(timer, TimedPhase::NumericPreparationControl, |_| {
+                self.require_live()?;
+                Ok((self.handle()?, self.spec.actor()?, self.spec.critic()?))
+            })?;
         let result = timed(timer, TimedPhase::NumericPreparation, |timer| {
             mixed::prepare_current_timed(&handle, &cohort, &actor_config, &critic_config, timer)
         });
-        self.require_live()?;
+        timed(timer, TimedPhase::NumericPreparationControl, |_| {
+            self.require_live()
+        })?;
         let proposal = match result {
             Ok(p) => p,
             Err(e) => return timed(timer, TimedPhase::Resolve, |_| self.stopped_error(e)),
@@ -2924,6 +2970,23 @@ mod tests {
     #[test]
     fn output_only_timings_preserve_numeric_result_and_retain_failed_spans() {
         use crate::public_policy_update::propose_parameters;
+        let mut empty = CurrentMixedAttemptTimings::default();
+        let surrounding = [
+            TimedPhase::CollectionJournal(2),
+            TimedPhase::CollectionPreparation(2),
+            TimedPhase::AuditRecordRead(2),
+            TimedPhase::AuditJournal(2),
+            TimedPhase::AuditPreparation(2),
+            TimedPhase::NumericPreparationControl,
+        ];
+        for phase in surrounding {
+            let stage = empty.stage(phase);
+            assert_eq!(
+                (stage.entered, stage.returned, stage.returned_errors),
+                (0, 0, 0)
+            );
+            assert_eq!(stage.wall_seconds, 0.0);
+        }
         let mut old = vec![0.0; crate::public_model::PARAMETER_COUNT];
         old[0] = -0.0;
         old[1] = 1.0;
@@ -2978,6 +3041,20 @@ mod tests {
         assert_eq!(profile.stages.collection_native[0].entered, 0);
         assert!(!profile.reservation_charged);
         assert!(profile.new_resolution.is_none());
+        for phase in surrounding {
+            let plain = timed(&mut Untimed, phase, |_| Ok(7_u64)).unwrap();
+            let observed = timed(&mut profile, phase, |_| Ok(7_u64)).unwrap();
+            assert_eq!(observed, plain);
+            let failed = timed(&mut profile, phase, |_| {
+                Err::<(), _>("synthetic surrounding-stage error".into())
+            });
+            assert_eq!(failed.unwrap_err(), "synthetic surrounding-stage error");
+            let stage = profile.stage(phase);
+            assert_eq!(
+                (stage.entered, stage.returned, stage.returned_errors),
+                (2, 2, 1)
+            );
+        }
         serde_json::to_value(profile).unwrap();
     }
 
