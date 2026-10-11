@@ -1238,10 +1238,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             receipt.round !== state().round ||
             claimed === null ||
             receipt.actor !== claimed ||
-            receipt.actor !== future ||
             future === state().firstPlayer ||
             actorId(payouts[0].actor) !== receipt.actor ||
-            actorId(announcements[0].actor) !== receipt.actor ||
+            // The current first player keeps their payout; claiming again passes
+            // the next round's first-player marker to their successor.
+            actorId(announcements[0].actor) !== future ||
             accumulatedCornPayout(payouts[0]) !== receipt.amount ||
             !same(payouts[0].iconResources, ['corn']) ||
             announcements[0].iconResources.length ||

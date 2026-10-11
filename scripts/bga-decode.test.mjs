@@ -1802,6 +1802,138 @@ test('draw identities are supplied only to the operation that actually requires 
   assert.equal(duplicateConfirmed.record.steps.length, 1);
 });
 
+test('matches first-player payouts to the claimer and announcements to the next marker', () => {
+  for (const [firstPlayer, claimer, successor] of [
+    [0, 1, 1],
+    [1, 1, 2],
+    [3, 3, 0],
+  ]) {
+    const initial = clone(saved.core.initialFrame);
+    const names = initial.snapshot.state.players.map((player) => player.name);
+    const last = (firstPlayer + names.length - 1) % names.length;
+    Object.assign(initial.snapshot.state, {
+      round: 3,
+      firstPlayer,
+      firstPlayerClaimed: claimer,
+      currentPlayer: claimer,
+      accumulatedCorn: 2,
+    });
+    initial.observation.legalActions = [
+      { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
+    ];
+    const paid = clone(initial);
+    paid.snapshot.state.accumulatedCorn = 0;
+    paid.snapshot.state.players[claimer].resources.corn += 2;
+    paid.snapshot.state.currentPlayer = last;
+    paid.observation.legalActions = [
+      {
+        action: { type: 'place', gear: 'palenque', cornCost: 0, discount: false },
+        move: { type: 'place', gear: 'palenque' },
+      },
+    ];
+    const placed = clone(paid);
+    placed.snapshot.state.gears.palenque[0] = { playerId: last, dummy: false };
+    placed.observation.legalActions = clone(initial.observation.legalActions);
+    const rotating = clone(placed);
+    rotating.snapshot.state.currentPlayer = claimer;
+    rotating.observation.pendingTask = { type: 'rotation' };
+    rotating.observation.legalActions = [
+      { action: { type: 'rotate', days: 1 }, move: { type: 'choose', choiceId: 'rotate:1' } },
+    ];
+    const advanced = clone(rotating);
+    Object.assign(advanced.snapshot.state, {
+      round: 4,
+      firstPlayer: successor,
+      firstPlayerClaimed: null,
+      currentPlayer: successor,
+    });
+    advanced.observation.pendingTask = null;
+    advanced.observation.legalActions = [];
+    const payout = {
+      raw_text: `${names[claimer]}は2\nを歯車から獲得した`,
+      icons: [{ classes: 'tz_icon resource_corn' }],
+    };
+    const announcement = { raw_text: `${names[successor]}がこのラウンドのスタートプレイヤーです` };
+    const fixture = (messages, repeated = false) => {
+      const value = input();
+      value.witness.initial = clone(initial.snapshot.state);
+      replaceEvents(value, [
+        [6, [{ raw_text: `${names[last]}はPalenqueの歯車に0\nを支払ってワーカーを置いた` }]],
+        [7, messages],
+        ...(repeated
+          ? [[8, messages]]
+          : [
+              [
+                8,
+                [
+                  { raw_text: '歯車が進んだ' },
+                  {
+                    raw_text: `スタートプレイヤースペースに置かれているワーカーは${names[claimer]}の手元に戻った`,
+                  },
+                ],
+              ],
+            ]),
+      ]);
+      value.witness.witnesses = [
+        { actionId: 7, expected: { round: 3, players: clone(paid.snapshot.state.players) } },
+      ];
+      return value;
+    };
+    const dispatch = dispatcher(initial, (request) => {
+      if (request.move.type === 'endTurn')
+        return clone(request.state.currentPlayer === claimer ? paid : rotating);
+      if (request.move.type === 'place') return clone(placed);
+      assert.deepEqual(request.move, { type: 'choose', choiceId: 'rotate:1' });
+      return clone(advanced);
+    });
+    const result = decode(fixture([payout, announcement]), dispatch);
+    assert.equal(result.manifest.blocked, null);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.sourceActionIds),
+      [[6], [6], [7], [8]],
+    );
+    assert.equal(result.manifest.pendingCalendarAnnouncement, null);
+    assert.equal(
+      result.record.steps[2].checkpoint.expected.players[claimer].resources.corn,
+      paid.snapshot.state.players[claimer].resources.corn,
+    );
+    assert.equal(result.manifest.trainingReady, false);
+    for (const messages of [
+      [
+        {
+          ...payout,
+          raw_text: `${names[successor === claimer ? firstPlayer : successor]}は2\nを歯車から獲得した`,
+        },
+        announcement,
+      ],
+      [
+        payout,
+        {
+          raw_text: `${names[(successor + 1) % names.length]}がこのラウンドのスタートプレイヤーです`,
+        },
+      ],
+      [{ ...payout, raw_text: `${names[claimer]}は3\nを歯車から獲得した` }, announcement],
+      [{ ...payout, icons: [{ classes: 'tz_icon resource_wood' }] }, announcement],
+      [payout, payout, announcement],
+      [payout, announcement, announcement],
+    ]) {
+      const refused = decode(fixture(messages), dispatch);
+      assert.equal(refused.manifest.blocked.actionId, 7);
+      assert.equal(refused.record.steps.length, 2);
+    }
+    const mismatchedCheckpoint = fixture([payout, announcement]);
+    mismatchedCheckpoint.witness.witnesses[0].expected.players[claimer].resources.corn++;
+    const rolledBack = decode(mismatchedCheckpoint, dispatch);
+    assert.equal(rolledBack.manifest.blocked.actionId, 7);
+    assert.match(rolledBack.manifest.blocked.reason, /checkpoint mismatch/);
+    assert.equal(rolledBack.record.steps.length, 2);
+    assert.ok(rolledBack.manifest.audit.every((row) => row.actionId !== 7));
+    const reused = decode(fixture([payout, announcement], true), dispatch);
+    assert.equal(reused.manifest.blocked.actionId, 8);
+    assert.equal(reused.record.steps.length, 3);
+  }
+});
+
 test('keeps automatic payments distinct from typed theology offerings and temple spellings', () => {
   for (const templeName of ['Kukulcan', 'Kukulkan']) {
     const value = input();
