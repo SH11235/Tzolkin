@@ -533,6 +533,18 @@ test('binds localized food-day score captions and age-two announcements to core 
     assert.equal(result.manifest.blocked, null);
     assert.equal(result.record.steps.length, 1);
     assert.equal(result.manifest.trainingReady, false);
+    f.after.snapshot.state.players[3].score -= 2;
+    f.scores.at(-1).raw_text = 'Dは信仰により-2点を獲得した';
+    assert.equal(
+      run(f, [...f.feeding, ...f.scores, { raw_text: '歯車が進んだ' }]).manifest.blocked,
+      null,
+    );
+    for (const amount of [2, -3]) {
+      f.scores.at(-1).raw_text = `Dは信仰により${amount}点を獲得した`;
+      const rejected = run(f, [...f.feeding, ...f.scores, { raw_text: '歯車が進んだ' }]);
+      assert.match(rejected.manifest.blocked.reason, /score=.*is not established/);
+      assert.equal(rejected.record.steps.length, 0);
+    }
   }
   const terminalCaptions = [
     { raw_text: '最終スコア' },
