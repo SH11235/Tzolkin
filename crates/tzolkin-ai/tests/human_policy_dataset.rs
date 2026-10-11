@@ -239,3 +239,37 @@ fn inferred_equivalent_and_cancelled_labels_are_not_samples() {
         .push(json!({"raw_text":"P0は行動をキャンセルした"}));
     assert!(fixture.load().unwrap().samples().is_empty());
 }
+
+#[test]
+fn conditional_training_keeps_validation_reserved_and_rechecks_source_bytes() {
+    use tzolkin_ai::human_policy_training::train_conditional_datasets;
+    use tzolkin_ai::policy_training::PolicyBcConfig;
+    let fixture = Fixture::new();
+    let dataset = fixture.load().unwrap();
+    assert!(
+        train_conditional_datasets(
+            std::slice::from_ref(&dataset),
+            &PolicyBcConfig::default(),
+            None
+        )
+        .unwrap_err()
+        .contains("isolated conditional")
+    );
+    let fingerprint = dataset.fingerprint().unwrap();
+    assert_eq!(fingerprint.len(), 64);
+    // Same-length current source changes cannot be hidden behind the sealed handle.
+    let path = fixture.root.join("raw.json");
+    let mut bytes = fs::read(&path).unwrap();
+    let index = bytes.iter().position(|b| *b == b'P').unwrap();
+    bytes[index] = b'Q';
+    fs::write(&path, &bytes).unwrap();
+    assert!(
+        train_conditional_datasets(
+            std::slice::from_ref(&dataset),
+            &PolicyBcConfig::default(),
+            None
+        )
+        .unwrap_err()
+        .contains("content mismatch")
+    );
+}
