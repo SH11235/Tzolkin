@@ -308,6 +308,7 @@ impl SegmentBinding {
 pub(super) struct SegmentContext {
     binding: SegmentBinding,
     archives: Vec<ClosedArchive>,
+    pub(super) inherited_own: CurrentMixedOwnDecisionCounters,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -582,6 +583,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         directory: PathBuf,
     ) -> Result<Self, String> {
         let root_checksum = binding.checksum()?;
+        let inherited_own = s.cumulative_own_decisions()?;
         let mut progress = Progress::initial(
             &binding.parent,
             binding.prefix,
@@ -629,7 +631,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             raw_record_bytes: 0,
             stored_record_bytes: 0,
             blocked: false,
-            segment: Some(SegmentContext { binding, archives }),
+            segment: Some(SegmentContext {
+                binding,
+                archives,
+                inherited_own,
+            }),
         })
     }
     pub(super) fn restore_chain_segment(
