@@ -431,6 +431,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       nextTask?.type === 'resource' &&
       nextTask.remaining === 2;
     if (extractionReward?.remaining > 0) {
+      // Only the last actual material choice may also deliver this purchase's
+      // already witnessed fixed effect. Settlement below checks the full state.
+      const queuedGain =
+        queuedPurchase?.stage === 'extraction' && extractionReward.remaining === 1
+          ? queuedPurchase
+          : null;
       if (
         opens ||
         action.type !== 'resource' ||
@@ -444,7 +450,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         RESOURCES.some(
           (resource) =>
             after.players[actor].resources[resource] - before.players[actor].resources[resource] !==
-            Number(resource === action.resource),
+            Number(resource === action.resource) +
+              (queuedGain?.resource === resource ? queuedGain.amount : 0),
         ) ||
         (extractionReward.remaining > 1 &&
           (nextTask?.type !== 'resource' || nextTask.remaining !== extractionReward.remaining - 1))
@@ -1538,9 +1545,40 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const next = state();
     const before = context.before;
     const actor = receipt.actor;
+    if (receipt.stage === 'extraction') return finishQueuedExtraction(event);
     const technology = event.detail.technology;
     const expected = receipt.pending.after[1];
     const corn = receipt.kind === 'cornTheology';
+    if (
+      !corn &&
+      technology === 'extraction' &&
+      before.players[actor].technologies.extraction === 3
+    ) {
+      const after = [{ ...receipt.pending.task, remaining: 0 }, ...receipt.pending.after];
+      const unchanged = mechanical(before);
+      unchanged.pending = copy(next.pending);
+      if (
+        record.steps.length !== receipt.stepCount + 1 ||
+        next.pending?.task?.type !== 'resource' ||
+        next.pending.task.remaining !== 2 ||
+        !same(next.pending.task, frame.observation.pendingTask) ||
+        !same(next.pending.after, after) ||
+        !same(mechanical(next), unchanged) ||
+        extractionReward?.actor !== actor ||
+        extractionReward.originActionId !== context.id ||
+        extractionReward.captionActionId !== context.id ||
+        extractionReward.remaining !== 2 ||
+        extractionReward.materials.length !== 0
+      )
+        fail('Queued purchase has no exact capped Extraction reward and retained effect queue');
+      queuedPurchase = {
+        ...receipt,
+        stage: 'extraction',
+        technologySourceId: context.id,
+        resourceSourceIds: [],
+      };
+      return false;
+    }
     if (
       record.steps.length !== receipt.stepCount + 1 ||
       next.currentPlayer !== actor ||
@@ -1593,6 +1631,96 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       actualDelivered: true,
       ...(corn ? { cappedTheologySkull: 1, humanPlayingBcReady: false } : {}),
     });
+    return true;
+  }
+  function finishQueuedExtraction(event) {
+    const receipt = queuedPurchase;
+    const before = context.before;
+    const next = state();
+    const remaining = receipt.pending.task.remaining - 1;
+    const values = resourceAmounts(event);
+    const resource = RESOURCES[values.findIndex((amount) => amount === 1)];
+    const expected = mechanical(before);
+    expected.players[receipt.actor].resources[resource]++;
+    if (remaining === 0) {
+      expected.players[receipt.actor].resources[receipt.resource] += receipt.amount;
+      if (receipt.resource === 'skull') expected.skullSupply -= receipt.amount;
+    }
+    expected.pending = copy(next.pending);
+    if (
+      record.steps.length !== receipt.stepCount + 1 ||
+      !same(mechanical(next), expected) ||
+      !same(next.pending?.task, frame.observation.pendingTask) ||
+      !same(
+        next.pending?.task,
+        remaining ? { type: 'resource', remaining } : receipt.pending.after.at(-1),
+      ) ||
+      !same(next.pending?.after, remaining ? receipt.pending.after : []) ||
+      extractionReward?.originActionId !== receipt.technologySourceId ||
+      extractionReward.captionActionId !== receipt.technologySourceId ||
+      extractionReward.remaining !== remaining ||
+      extractionReward.materials.length !== 2 - remaining
+    )
+      fail('Queued Extraction choice did not preserve or deliver the exact purchase continuation');
+    if (remaining) {
+      queuedPurchase = {
+        ...receipt,
+        resourceSourceIds: [...receipt.resourceSourceIds, context.id],
+      };
+      return false;
+    }
+    if (unclaimed(receipt.gainEvent, `resource:${receipt.resource}`) !== receipt.amount)
+      fail('Queued purchase resource was not delivered exactly once');
+    automatic(receipt.gainEvent, `resource:${receipt.resource}`, receipt.amount);
+    audit.push({
+      actionId: context.id,
+      queuedPurchaseSourceActionId: receipt.sourceId,
+      technologySourceActionId: receipt.technologySourceId,
+      resourceChoiceSourceActionIds: [...receipt.resourceSourceIds, context.id],
+      actor: receipt.actor,
+      resource: receipt.resource,
+      amount: receipt.amount,
+      actualDelivered: true,
+      continuation: 'cappedExtraction',
+      humanPlayingBcReady: false,
+    });
+    return true;
+  }
+  function queuedPurchaseEvents(events) {
+    const first = events[0];
+    if (queuedPurchase.stage === 'extraction') {
+      if (events.length !== 1 || first?.kind !== 'resourceGain') return false;
+      const amounts = resourceAmounts(first);
+      return (
+        amounts.reduce((sum, amount) => sum + amount, 0) === 1 &&
+        amounts.some(
+          (amount, index) => amount === 1 && ['wood', 'stone', 'gold'].includes(RESOURCES[index]),
+        )
+      );
+    }
+    if (
+      first?.kind !== 'technology' ||
+      first.detail.steps !== 1 ||
+      !TECHNOLOGIES.includes(first.detail.technology)
+    )
+      return false;
+    if (queuedPurchase.kind === 'cornTheology')
+      return (
+        events.length === 2 &&
+        theologySkullCaption(events[1]) === first.actor &&
+        first.detail.technology === 'theology' &&
+        state().players[queuedPurchase.actor].technologies.theology === 3
+      );
+    const level = state().players[queuedPurchase.actor].technologies[first.detail.technology];
+    if (level < 3) return events.length === 1;
+    return (
+      first.detail.technology === 'extraction' &&
+      events.length === 2 &&
+      events[1].kind === 'unparsed' &&
+      events[1].actor === null &&
+      events[1].iconResources.length === 0 &&
+      events[1].rawText === `収集技術ボーナス: ${first.actor}は好きな資源2個を得た`
+    );
   }
   function purchaseOutcome(event, events, witness) {
     const actor = actorId(event.actor);
@@ -1852,18 +1980,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (
         queuedPurchase &&
         (id !== queuedPurchase.nextSourceId ||
-          (queuedPurchase.kind === 'cornTheology'
-            ? events.length !== 2 ||
-              theologySkullCaption(events[1]) !== events[0].actor ||
-              events[0].detail.technology !== 'theology' ||
-              state().players[queuedPurchase.actor].technologies.theology !== 3
-            : events.length !== 1 ||
-              state().players[queuedPurchase.actor].technologies[events[0]?.detail.technology] >=
-                3) ||
-          events[0].kind !== 'technology' ||
+          !queuedPurchaseEvents(events) ||
           actorId(events[0].actor) !== queuedPurchase.actor ||
-          events[0].detail.steps !== 1 ||
-          !TECHNOLOGIES.includes(events[0].detail.technology) ||
           state().round !== queuedPurchase.round ||
           state().currentPlayer !== queuedPurchase.actor ||
           !same(state().pending, queuedPurchase.pending) ||
@@ -1872,7 +1990,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           (witness.buildings?.length ?? 0) !== 0 ||
           (witness.monuments?.length ?? 0) !== 0)
       )
-        fail('Queued purchase requires the next same-actor one-step technology source');
+        fail('Queued purchase requires the next same-actor technology or exact material choice');
       for (const [field, kind] of [
         ['buildings', 'build'],
         ['monuments', 'monument'],
@@ -2537,8 +2655,19 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           expected: copy(witness.expected),
         };
       if (saved.queuedPurchase) {
-        finishQueuedPurchase(events[0]);
-        queuedPurchase = null;
+        if (finishQueuedPurchase(events[0])) queuedPurchase = null;
+        else {
+          const nextSourceId = groups[groupIndex + 1]?.[0];
+          if (nextSourceId === undefined)
+            fail('Queued purchase has no next observed material choice');
+          queuedPurchase = {
+            ...queuedPurchase,
+            nextSourceId,
+            stepCount: record.steps.length,
+            pending: copy(state().pending),
+          };
+          history.at(-1).unsettledPurchase = true;
+        }
       }
       if (deferredScore?.kind === 'action' && deferredScore.stage === 'complete') {
         automatic(deferredScore.scoreEvent, 'score', deferredScore.amount);
