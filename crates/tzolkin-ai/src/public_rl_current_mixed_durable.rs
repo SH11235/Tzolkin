@@ -17,12 +17,17 @@ use crate::public_rl_current_mixed_source::{
 };
 use crate::public_rl_mixed_native::FrozenMixedRoster;
 use crate::public_rl_mixed_session::{FilePin, OpponentSpec, read_pin};
-use crate::public_rl_paired_session::{local, publish_mixed_metadata, read_bounded};
+use crate::public_rl_paired_session::{
+    local, publish_mixed_metadata, publish_mixed_stored_record, read_bounded,
+    read_mixed_stored_record,
+};
+use crate::public_rl_record_storage::{self as record_storage, MAX_STORED_RECORD_BYTES};
 use crate::public_stochastic_record::{Config, MAX_RECORD_BYTES, unique_json};
 use crate::search::PreparedSearch;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
@@ -33,12 +38,17 @@ mod restore;
 
 pub const SPEC_SCHEMA: &str = "tzolkin-current-mixed-durable-spec-v2";
 pub const JOURNAL_SCHEMA: &str = "tzolkin-current-mixed-durable-journal-v2";
+pub const COMPRESSED_SPEC_SCHEMA: &str = "tzolkin-current-mixed-durable-spec-v3";
+pub const COMPRESSED_JOURNAL_SCHEMA: &str = "tzolkin-current-mixed-durable-journal-v3";
 const SPEC_CAP: usize = 64 * 1024;
 const HEAD_CAP: usize = 512 * 1024;
 const ARTIFACT_CAP: usize = 16 * 1024 * 1024;
 const EVENTS_PER_ATTEMPT: u64 = 21;
 const MAX_ATTEMPTS: u64 = 64;
 const MAX_FAMILIES: usize = 4096;
+const METADATA_HEADROOM: u64 =
+    EVENTS_PER_ATTEMPT * HEAD_CAP as u64 + ARTIFACT_CAP as u64 + 2 * HEAD_CAP as u64;
+const MAX_STORAGE: u64 = 64 * 1024 * 1024 * 1024;
 fn sha(raw: &[u8]) -> String {
     format!("{:x}", Sha256::digest(raw))
 }
@@ -68,6 +78,168 @@ fn leaf(pin: &FilePin, name: &str, cap: usize) -> Result<(), String> {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RecordStorageSpec {
+    schema: String,
+    max_stored_bytes: u64,
+    max_temporary_bytes: u64,
+    max_disk_bytes: u64,
+}
+impl RecordStorageSpec {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != record_storage::STORAGE_SCHEMA
+            || !(4 * MAX_STORED_RECORD_BYTES as u64..=MAX_STORAGE).contains(&self.max_stored_bytes)
+            || !(MAX_STORED_RECORD_BYTES as u64..=512 * 1024 * 1024)
+                .contains(&self.max_temporary_bytes)
+            || !(4 * MAX_STORED_RECORD_BYTES as u64 + METADATA_HEADROOM + self.max_temporary_bytes
+                ..=MAX_STORAGE)
+                .contains(&self.max_disk_bytes)
+        {
+            return Err("Current mixed explicit compressed storage limits".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompressedRecordPin {
+    schema: String,
+    stored: FilePin,
+    raw_bytes: usize,
+    raw_sha256: String,
+}
+// The raw alternative retains the exact original v2 FilePin wire shape.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum RecordPin {
+    Raw(FilePin),
+    Compressed(CompressedRecordPin),
+}
+impl RecordPin {
+    fn file(&self) -> &FilePin {
+        match self {
+            Self::Raw(pin) => pin,
+            Self::Compressed(pin) => &pin.stored,
+        }
+    }
+    fn raw_bytes(&self) -> usize {
+        match self {
+            Self::Raw(pin) => pin.bytes,
+            Self::Compressed(pin) => pin.raw_bytes,
+        }
+    }
+    fn validate(&self, member: usize, spec: &CurrentMixedRunSpec) -> Result<(), String> {
+        match (self, &spec.record_storage) {
+            (Self::Raw(pin), None) => leaf(pin, &record_name(member, spec), MAX_RECORD_BYTES),
+            (Self::Compressed(pin), Some(_))
+                if pin.schema == record_storage::PIN_SCHEMA
+                    && checkpoint_digest(&pin.raw_sha256) =>
+            {
+                leaf(
+                    &pin.stored,
+                    &record_name(member, spec),
+                    record_storage::maximum_stored_bytes(pin.raw_bytes)?,
+                )
+            }
+            _ => Err("Current mixed record pin/storage mode differs".into()),
+        }
+    }
+}
+fn record_name(member: usize, spec: &CurrentMixedRunSpec) -> String {
+    let suffix = if spec.record_storage.is_some() {
+        ".gz"
+    } else {
+        ""
+    };
+    format!("record-{member}.json{suffix}")
+}
+fn encode_record<'r>(
+    raw: &'r [u8],
+    member: usize,
+    spec: &CurrentMixedRunSpec,
+) -> Result<(Cow<'r, [u8]>, RecordPin), String> {
+    if member >= 4 || raw.is_empty() || raw.len() > MAX_RECORD_BYTES {
+        return Err("Current mixed raw record member/byte cap".into());
+    }
+    let name = record_name(member, spec);
+    match spec.record_storage {
+        None => Ok((Cow::Borrowed(raw), RecordPin::Raw(file_pin(&name, raw)))),
+        Some(_) => {
+            let stored = record_storage::encode(raw)?;
+            let pin = RecordPin::Compressed(CompressedRecordPin {
+                schema: record_storage::PIN_SCHEMA.into(),
+                stored: file_pin(&name, &stored),
+                raw_bytes: raw.len(),
+                raw_sha256: sha(raw),
+            });
+            Ok((Cow::Owned(stored), pin))
+        }
+    }
+}
+fn publish_record_file(
+    directory: &Path,
+    stored: &[u8],
+    raw: &[u8],
+    pin: &RecordPin,
+    member: usize,
+    spec: &CurrentMixedRunSpec,
+) -> Result<(), String> {
+    pin.validate(member, spec)?;
+    if stored.len() != pin.file().bytes || sha(stored) != pin.file().sha256 {
+        return Err("Current mixed publication differs from stored record pin".into());
+    }
+    if spec.record_storage.is_some() {
+        publish_mixed_stored_record(directory, &pin.file().name, stored)?;
+    } else {
+        publish_mixed_metadata(directory, &pin.file().name, stored)?;
+    }
+    if read_record(directory, pin, member, spec)? != raw {
+        return Err("Current mixed record readback differs from original raw bytes".into());
+    }
+    Ok(())
+}
+fn read_record(
+    directory: &Path,
+    pin: &RecordPin,
+    member: usize,
+    spec: &CurrentMixedRunSpec,
+) -> Result<Vec<u8>, String> {
+    pin.validate(member, spec)?;
+    match pin {
+        RecordPin::Raw(pin) => read_pin(directory, pin, MAX_RECORD_BYTES),
+        RecordPin::Compressed(pin) => {
+            let stored = read_physical_pin(directory, &pin.stored, spec)?;
+            record_storage::decode(&stored, pin.raw_bytes, &pin.raw_sha256)
+        }
+    }
+}
+fn read_physical_pin(
+    directory: &Path,
+    pin: &FilePin,
+    spec: &CurrentMixedRunSpec,
+) -> Result<Vec<u8>, String> {
+    if pin.name.starts_with("record-")
+        && !(0..4).any(|member| pin.name == record_name(member, spec))
+    {
+        return Err("Current mixed record filename/storage mode differs".into());
+    }
+    if pin.name.starts_with("record-") && spec.record_storage.is_some() {
+        if !pin.name.ends_with(".json.gz") {
+            return Err("Current mixed compressed record filename differs".into());
+        }
+        leaf(pin, &pin.name, MAX_STORED_RECORD_BYTES)?;
+        let raw = read_mixed_stored_record(&directory.join(&pin.name), pin.bytes)?;
+        if raw.len() != pin.bytes || sha(&raw) != pin.sha256 {
+            return Err("Current mixed stored bytes/SHA differ".into());
+        }
+        Ok(raw)
+    } else {
+        read_pin(directory, pin, pin.bytes)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CurrentMixedRunSpec {
     schema: String,
     actor: serde_json::Value,
@@ -81,10 +253,19 @@ pub struct CurrentMixedRunSpec {
     max_callbacks: u64,
     max_candidate_rows: u64,
     max_search_steps: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_storage: Option<RecordStorageSpec>,
 }
 impl CurrentMixedRunSpec {
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
-        let s: Self = closed(raw, SPEC_CAP)?;
+        let value = unique_json(raw, SPEC_CAP)?;
+        if value
+            .get("recordStorage")
+            .is_some_and(serde_json::Value::is_null)
+        {
+            return Err("Current mixed explicit null storage mode".into());
+        }
+        let s: Self = serde_json::from_value(value).map_err(|e| e.to_string())?;
         s.validate()?;
         Ok(s)
     }
@@ -95,13 +276,68 @@ impl CurrentMixedRunSpec {
         ResidualFitConfig::from_checkpoint(self.critic.clone())
     }
     fn checksum(&self) -> Result<String, String> {
-        hash(b"tzolkin-current-mixed-durable-spec-v2\0", self)
+        hash(
+            if self.record_storage.is_some() {
+                b"tzolkin-current-mixed-durable-spec-v3\0"
+            } else {
+                b"tzolkin-current-mixed-durable-spec-v2\0"
+            },
+            self,
+        )
+    }
+    fn journal_schema(&self) -> &'static str {
+        if self.record_storage.is_some() {
+            COMPRESSED_JOURNAL_SCHEMA
+        } else {
+            JOURNAL_SCHEMA
+        }
+    }
+    fn check_storage(&self, raw: u64, stored: u64, metadata: u64) -> Result<(), String> {
+        if raw
+            .checked_add(metadata)
+            .is_none_or(|n| n > self.max_output_bytes)
+            || metadata > self.max_metadata_bytes
+        {
+            return Err("Current mixed logical/metadata storage budget consumed".into());
+        }
+        if let Some(storage) = &self.record_storage {
+            if stored > storage.max_stored_bytes
+                || stored
+                    .checked_add(metadata)
+                    .and_then(|n| n.checked_add(storage.max_temporary_bytes))
+                    .is_none_or(|n| n > storage.max_disk_bytes)
+            {
+                return Err("Current mixed stored/temporary/disk storage budget consumed".into());
+            }
+        } else if raw != stored {
+            return Err("Current mixed raw storage counters differ".into());
+        }
+        Ok(())
+    }
+    fn check_whole_four_storage(&self, raw: u64, stored: u64, metadata: u64) -> Result<(), String> {
+        if self.record_storage.is_some() {
+            self.check_storage(
+                raw.checked_add(4 * MAX_RECORD_BYTES as u64)
+                    .ok_or("Current mixed logical reserve overflow")?,
+                stored
+                    .checked_add(4 * MAX_STORED_RECORD_BYTES as u64)
+                    .ok_or("Current mixed stored reserve overflow")?,
+                metadata
+                    .checked_add(METADATA_HEADROOM)
+                    .ok_or("Current mixed metadata reserve overflow")?,
+            )?;
+        }
+        Ok(())
     }
     fn validate(&self) -> Result<(), String> {
         self.actor()?;
         self.critic()?;
-        if self.schema != SPEC_SCHEMA
-            || !(1..=MAX_ATTEMPTS).contains(&self.max_attempts)
+        match (&self.record_storage, self.schema.as_str()) {
+            (None, SPEC_SCHEMA) => {}
+            (Some(storage), COMPRESSED_SPEC_SCHEMA) => storage.validate()?,
+            _ => return Err("Current mixed run schema/storage mode differs".into()),
+        }
+        if !(1..=MAX_ATTEMPTS).contains(&self.max_attempts)
             || !(1..=self.max_attempts).contains(&self.max_successful_updates)
             || !(4..=MAX_FAMILIES).contains(&self.max_families)
             || self.max_journal_entries < 1 + EVENTS_PER_ATTEMPT * self.max_attempts
@@ -219,7 +455,7 @@ enum Event {
     },
     CollectReturn {
         member: usize,
-        record: Option<FilePin>,
+        record: Option<RecordPin>,
         complete: bool,
         error: Option<String>,
     },
@@ -271,7 +507,7 @@ struct Progress {
     current_checksum: String,
     work: Work,
     active: Option<Reservation>,
-    collect: [Option<FilePin>; 4],
+    collect: [Option<RecordPin>; 4],
     audited: [Option<String>; 4],
     cohort: Option<FilePin>,
     unknown_work: bool,
@@ -386,7 +622,7 @@ impl Progress {
                 error,
             } if self.phase == Phase::Collecting(*i) => {
                 if let Some(p) = record {
-                    leaf(p, &format!("record-{i}.json"), MAX_RECORD_BYTES)?;
+                    p.validate(*i, s)?;
                 }
                 if *complete != error.is_none()
                     || *complete && record.is_none()
@@ -609,6 +845,8 @@ pub struct CurrentMixedTrainingSession<'a> {
     references: BTreeMap<u64, Vec<FilePin>>,
     output_bytes: u64,
     metadata_bytes: u64,
+    raw_record_bytes: u64,
+    stored_record_bytes: u64,
     blocked: bool,
 }
 #[derive(Debug, Serialize)]
@@ -626,6 +864,17 @@ pub struct CurrentMixedSessionStatus {
     stopped: bool,
     unknown_work_possible: bool,
     outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_usage: Option<StorageUsage>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageUsage {
+    logical_raw_record_bytes: u64,
+    stored_record_bytes: u64,
+    metadata_bytes: u64,
+    retained_bytes: u64,
+    temporary_reserve_bytes: u64,
 }
 impl CurrentMixedSessionStatus {
     pub fn head_file(&self) -> &str {
@@ -696,6 +945,8 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             references: BTreeMap::new(),
             output_bytes: 0,
             metadata_bytes: 0,
+            raw_record_bytes: 0,
+            stored_record_bytes: 0,
             blocked: false,
         })
     }
@@ -769,7 +1020,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
     }
     pub fn status(&self) -> CurrentMixedSessionStatus {
         CurrentMixedSessionStatus {
-            schema: JOURNAL_SCHEMA,
+            schema: self.spec.journal_schema(),
             head_file: self
                 .head
                 .as_ref()
@@ -789,6 +1040,17 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             stopped: self.blocked || self.progress.phase == Phase::Stopped,
             unknown_work_possible: self.progress.unknown_work,
             outcome: self.progress.outcome.clone(),
+            storage_usage: self
+                .spec
+                .record_storage
+                .as_ref()
+                .map(|storage| StorageUsage {
+                    logical_raw_record_bytes: self.raw_record_bytes,
+                    stored_record_bytes: self.stored_record_bytes,
+                    metadata_bytes: self.metadata_bytes,
+                    retained_bytes: self.output_bytes,
+                    temporary_reserve_bytes: storage.max_temporary_bytes,
+                }),
         }
     }
     fn batch(&self, attempt: u64) -> PathBuf {
@@ -810,7 +1072,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         }
         if let Some(r) = &self.progress.active {
             for p in self.references.get(&r.attempt).into_iter().flatten() {
-                read_pin(&self.batch(r.attempt), p, p.bytes)?;
+                read_physical_pin(&self.batch(r.attempt), p, &self.spec)?;
             }
         }
         Ok(())
@@ -827,9 +1089,8 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             .metadata_bytes
             .checked_add(raw.len() as u64)
             .ok_or("Current mixed metadata overflow")?;
-        if output > self.spec.max_output_bytes || metadata > self.spec.max_metadata_bytes {
-            return Err("Current mixed storage budget consumed".into());
-        }
+        self.spec
+            .check_storage(self.raw_record_bytes, self.stored_record_bytes, metadata)?;
         publish_mixed_metadata(&self.directory, name, raw)?;
         let p = file_pin(name, raw);
         read_pin(&self.directory, &p, cap)?;
@@ -851,17 +1112,14 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             .ok_or("Current mixed storage overflow")?;
         let metadata = self
             .metadata_bytes
-            .checked_add(if name.starts_with("record-") {
-                0
-            } else {
-                raw.len() as u64
-            })
+            .checked_add(raw.len() as u64)
             .ok_or("Current mixed metadata overflow")?;
+        self.spec
+            .check_storage(self.raw_record_bytes, self.stored_record_bytes, metadata)?;
         let refs = self.references.entry(attempt).or_default();
         if raw.is_empty()
             || raw.len() > cap
-            || output > self.spec.max_output_bytes
-            || metadata > self.spec.max_metadata_bytes
+            || name.starts_with("record-")
             || refs.len() >= 9
             || refs.iter().any(|p| p.name == name)
         {
@@ -877,6 +1135,42 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         self.require_live()?;
         Ok(p)
     }
+    fn publish_record(
+        &mut self,
+        attempt: u64,
+        member: usize,
+        raw: &[u8],
+    ) -> Result<RecordPin, String> {
+        self.require_live()?;
+        let (stored, pin) = encode_record(raw, member, &self.spec)?;
+        let logical = self
+            .raw_record_bytes
+            .checked_add(raw.len() as u64)
+            .ok_or("Current mixed logical storage overflow")?;
+        let physical = self
+            .stored_record_bytes
+            .checked_add(stored.len() as u64)
+            .ok_or("Current mixed stored storage overflow")?;
+        self.spec
+            .check_storage(logical, physical, self.metadata_bytes)?;
+        let refs = self.references.entry(attempt).or_default();
+        if refs.len() >= 9 || refs.iter().any(|p| p.name == pin.file().name) {
+            return Err("Current mixed repeated record output".into());
+        }
+        let directory = self.batch(attempt);
+        publish_record_file(&directory, &stored, raw, &pin, member, &self.spec)?;
+        self.references
+            .entry(attempt)
+            .or_default()
+            .push(pin.file().clone());
+        self.output_bytes = physical
+            .checked_add(self.metadata_bytes)
+            .ok_or("Current mixed retained storage overflow")?;
+        self.raw_record_bytes = logical;
+        self.stored_record_bytes = physical;
+        self.require_live()?;
+        Ok(pin)
+    }
     fn save(&mut self, event: Event) -> Result<(), String> {
         self.progress.check(&event, &self.spec)?;
         self.require_live()?;
@@ -886,7 +1180,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             .filter(|n| *n <= self.spec.max_journal_entries)
             .ok_or("Current mixed journal exhausted")?;
         let entry = Entry {
-            schema: JOURNAL_SCHEMA.into(),
+            schema: self.spec.journal_schema().into(),
             sequence,
             previous: self
                 .head
@@ -981,11 +1275,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 .inner
                 .wire
                 .max_output_bytes
-                .checked_add(
-                    EVENTS_PER_ATTEMPT * HEAD_CAP as u64
-                        + ARTIFACT_CAP as u64
-                        + 2 * HEAD_CAP as u64,
-                )
+                .checked_add(METADATA_HEADROOM)
                 .ok_or("Current mixed allocation overflow")?,
             ..Work::default()
         };
@@ -1031,15 +1321,16 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             .is_none_or(|n| n > self.spec.max_journal_entries)
             || self
                 .metadata_bytes
-                .checked_add(
-                    EVENTS_PER_ATTEMPT * HEAD_CAP as u64
-                        + ARTIFACT_CAP as u64
-                        + 2 * HEAD_CAP as u64,
-                )
+                .checked_add(METADATA_HEADROOM)
                 .is_none_or(|n| n > self.spec.max_metadata_bytes)
         {
             return Err("Current mixed terminal/failure publication headroom".into());
         }
+        self.spec.check_whole_four_storage(
+            self.raw_record_bytes,
+            self.stored_record_bytes,
+            self.metadata_bytes,
+        )?;
         let plan = self.plan(collection)?;
         let collection_raw = collection.inner.to_json()?;
         let plan_raw = bytes(&plan.receipt(), HEAD_CAP)?;
@@ -1139,12 +1430,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     let complete = game.terminal.is_some() && game.failure.is_none();
                     let raw = source::encode(&game)?;
                     source::check_record(&raw, &plan.headers[member])?;
-                    let p = self.publish_batch(
-                        attempt,
-                        &format!("record-{member}.json"),
-                        &raw,
-                        MAX_RECORD_BYTES,
-                    )?;
+                    let p = self.publish_record(attempt, member, &raw)?;
                     let error = (!complete).then(|| {
                         bounded_error(
                             &game
@@ -1175,7 +1461,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             let record = self.progress.collect[member]
                 .as_ref()
                 .ok_or("Missing returned current mixed record")?;
-            let raw = read_pin(&dir, record, MAX_RECORD_BYTES)?;
+            let raw = read_record(&dir, record, member, &self.spec)?;
             source::check_record(&raw, &plan.headers[member])?;
             self.save(Event::AuditStart { member })?;
             self.require_live()?;
@@ -1366,7 +1652,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             return Err("Current mixed extra/missing batch outputs".into());
         }
         for p in pins {
-            read_pin(&dir, p, p.bytes)?;
+            read_physical_pin(&dir, p, &self.spec)?;
         }
         Ok(())
     }
@@ -1415,6 +1701,146 @@ mod tests {
             "maxMetadataBytes":33554432,"maxOutputBytes":1073741824,"maxCallbacks":1000,
             "maxCandidateRows":10000000,"maxSearchSteps":0})).unwrap()).unwrap()
     }
+    fn compressed_spec() -> CurrentMixedRunSpec {
+        let mut value = serde_json::to_value(spec()).unwrap();
+        value["schema"] = COMPRESSED_SPEC_SCHEMA.into();
+        value["recordStorage"] = json!({"schema":record_storage::STORAGE_SCHEMA,
+            "maxStoredBytes":1073741824u64,"maxTemporaryBytes":MAX_STORED_RECORD_BYTES,
+            "maxDiskBytes":2147483648u64});
+        CurrentMixedRunSpec::from_json(&serde_json::to_vec(&value).unwrap()).unwrap()
+    }
+    #[test]
+    fn current_mixed_storage_preserves_raw_wire_and_rejects_mode_mixing() {
+        let raw = spec();
+        let expected = br#"{"schema":"tzolkin-current-mixed-durable-spec-v2","actor":{"learningRate":0.0001,"maxAbsActualDelta":0.01,"maxCandidateRows":4000000},"critic":{"learningRate":0.0001,"maxAbsActualDelta":0.01,"maxCallbacks":100},"maxAttempts":2,"maxSuccessfulUpdates":2,"maxFamilies":32,"maxJournalEntries":43,"maxMetadataBytes":33554432,"maxOutputBytes":1073741824,"maxCallbacks":1000,"maxCandidateRows":10000000,"maxSearchSteps":0}"#;
+        assert_eq!(bytes(&raw, SPEC_CAP).unwrap(), expected);
+        assert_eq!(
+            raw.checksum().unwrap(),
+            "3d25e45ea5068d04866cbb18d17b689699ff930cc6b8c3c1a02a23b325e10205"
+        );
+        assert_eq!(raw.journal_schema(), JOURNAL_SCHEMA);
+        let pin = file_pin("record-0.json", b"record");
+        assert_eq!(
+            bytes(&RecordPin::Raw(pin.clone()), HEAD_CAP).unwrap(),
+            bytes(&pin, HEAD_CAP).unwrap()
+        );
+        let compressed = compressed_spec();
+        assert_eq!(compressed.journal_schema(), COMPRESSED_JOURNAL_SCHEMA);
+        assert_ne!(raw.checksum().unwrap(), compressed.checksum().unwrap());
+        let mut value = serde_json::to_value(&raw).unwrap();
+        value["recordStorage"] = serde_json::Value::Null;
+        assert!(CurrentMixedRunSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["schema"] = COMPRESSED_SPEC_SCHEMA.into();
+        value.as_object_mut().unwrap().remove("recordStorage");
+        assert!(CurrentMixedRunSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value = serde_json::to_value(&compressed).unwrap();
+        value["schema"] = SPEC_SCHEMA.into();
+        assert!(CurrentMixedRunSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        value["schema"] = COMPRESSED_SPEC_SCHEMA.into();
+        value["recordStorage"]["schema"] = "unknown".into();
+        assert!(CurrentMixedRunSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        let (_, gzip) = encode_record(b"record", 0, &compressed).unwrap();
+        assert!(gzip.validate(0, &raw).is_err());
+        assert!(RecordPin::Raw(pin).validate(0, &compressed).is_err());
+        assert!(gzip.validate(1, &compressed).is_err());
+        let (mut progress, _, reservation) = reserved();
+        progress
+            .apply(
+                &Event::ReserveWhole4 {
+                    reservation: Box::new(reservation),
+                },
+                &compressed,
+            )
+            .unwrap();
+        progress
+            .apply(&Event::CollectStart { member: 0 }, &compressed)
+            .unwrap();
+        let event = Event::CollectReturn {
+            member: 0,
+            record: Some(gzip),
+            complete: true,
+            error: None,
+        };
+        let wire = bytes(&event, HEAD_CAP).unwrap();
+        let restored: Event = closed(&wire, HEAD_CAP).unwrap();
+        progress.apply(&restored, &compressed).unwrap();
+        assert_eq!(progress.phase, Phase::Collected(0));
+        assert_eq!(progress.collect[0].as_ref().unwrap().raw_bytes(), 6);
+    }
+    #[test]
+    fn current_mixed_storage_io_binds_stored_and_original_bytes_without_overwrite() {
+        let raw_spec = spec();
+        let spec = compressed_spec();
+        let raw = b" {\n\"literal\":\"\\u0041\",\"numbers\":[1.0,1e0]}\n";
+        let (stored, pin) = encode_record(raw, 0, &spec).unwrap();
+        assert_eq!(encode_record(raw, 0, &spec).unwrap().0, stored);
+        let directory = std::env::temp_dir().join(format!(
+            "tzolkin-mixed-storage-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        publish_record_file(&directory, &stored, raw, &pin, 0, &spec).unwrap();
+        assert_eq!(read_record(&directory, &pin, 0, &spec).unwrap(), raw);
+        assert!(publish_record_file(&directory, &stored, raw, &pin, 0, &spec).is_err());
+        assert_eq!(names(&directory, 9).unwrap(), vec!["record-0.json.gz"]);
+        assert!(read_record(&directory, &pin, 0, &raw_spec).is_err());
+        let mut wrong = pin.clone();
+        if let RecordPin::Compressed(p) = &mut wrong {
+            p.stored.sha256 = "f".repeat(64);
+        }
+        assert!(read_record(&directory, &wrong, 0, &spec).is_err());
+        let mut wrong = pin.clone();
+        if let RecordPin::Compressed(p) = &mut wrong {
+            p.raw_sha256 = "f".repeat(64);
+        }
+        assert!(read_record(&directory, &wrong, 0, &spec).is_err());
+        assert!(
+            read_mixed_stored_record(
+                &directory.join("record-0.json.gz"),
+                MAX_STORED_RECORD_BYTES + 1
+            )
+            .is_err()
+        );
+        fs::write(directory.join("record-1.json.gz"), b"corrupt").unwrap();
+        let corrupt = RecordPin::Compressed(CompressedRecordPin {
+            schema: record_storage::PIN_SCHEMA.into(),
+            stored: file_pin("record-1.json.gz", b"corrupt"),
+            raw_bytes: raw.len(),
+            raw_sha256: sha(raw),
+        });
+        assert!(read_record(&directory, &corrupt, 1, &spec).is_err());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn current_mixed_storage_reserves_logical_physical_and_temporary_headroom() {
+        let raw = spec();
+        assert!(raw.check_storage(10, 11, 0).is_err());
+        assert!(raw.check_storage(10, 10, raw.max_output_bytes).is_err());
+        assert!(raw.check_whole_four_storage(0, 0, 0).is_ok());
+        let mut gzip = compressed_spec();
+        assert!(gzip.check_storage(10, 12, 100).is_ok());
+        assert!(gzip.check_whole_four_storage(0, 0, 0).is_ok());
+        assert!(gzip.check_storage(u64::MAX, 0, 1).is_err());
+        assert!(gzip.check_storage(0, u64::MAX, 1).is_err());
+        assert!(gzip.check_whole_four_storage(u64::MAX, 0, 0).is_err());
+        assert!(
+            gzip.check_storage(0, 0, gzip.max_metadata_bytes + 1)
+                .is_err()
+        );
+        let storage = gzip.record_storage.as_mut().unwrap();
+        storage.max_stored_bytes = 4 * MAX_STORED_RECORD_BYTES as u64;
+        storage.max_disk_bytes =
+            storage.max_stored_bytes + METADATA_HEADROOM + storage.max_temporary_bytes;
+        assert!(gzip.check_whole_four_storage(0, 0, 0).is_ok());
+        assert!(gzip.check_whole_four_storage(0, 1, 0).is_err());
+        assert!(gzip.check_whole_four_storage(0, 0, 1).is_err());
+        assert_eq!(MAX_STORED_RECORD_BYTES, 108 * 1024 * 1024 + 1024);
+        assert_eq!(METADATA_HEADROOM, 55 * 1024 * 1024 / 2);
+    }
     fn reserved() -> (Progress, CurrentMixedRunSpec, Reservation) {
         let s = spec();
         let plan = source::tests::plan();
@@ -1455,7 +1881,10 @@ mod tests {
             p.apply(
                 &Event::CollectReturn {
                     member,
-                    record: Some(file_pin(&format!("record-{member}.json"), b"record")),
+                    record: Some(RecordPin::Raw(file_pin(
+                        &format!("record-{member}.json"),
+                        b"record",
+                    ))),
                     complete: true,
                     error: None,
                 },

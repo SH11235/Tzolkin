@@ -175,7 +175,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                         .active
                         .as_ref()
                         .ok_or("Saved current mixed active reservation missing")?;
-                    let raw = read_pin(&s.batch(r.attempt), pin, MAX_RECORD_BYTES)?;
+                    let raw = read_record(&s.batch(r.attempt), pin, *member, &s.spec)?;
                     let p = plan.as_ref().ok_or("Saved current mixed plan missing")?;
                     let record = source::check_record(&raw, &p.headers[*member])?;
                     crate::public_stochastic_native::require_payload_reservations(
@@ -202,7 +202,15 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                         return Err("Saved failed collection error differs".into());
                     }
                     let attempt = r.attempt;
-                    s.add_reference(attempt, pin)?;
+                    s.raw_record_bytes = s
+                        .raw_record_bytes
+                        .checked_add(pin.raw_bytes() as u64)
+                        .ok_or("Current mixed restored logical record overflow")?;
+                    s.stored_record_bytes = s
+                        .stored_record_bytes
+                        .checked_add(pin.file().bytes as u64)
+                        .ok_or("Current mixed restored stored record overflow")?;
+                    s.add_reference(attempt, pin.file())?;
                 }
                 Event::AuditReturn {
                     member,
@@ -353,10 +361,18 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             .metadata_bytes
             .checked_add(if metadata { pin.bytes as u64 } else { 0 })
             .ok_or("Current mixed restore metadata overflow")?;
-        if self.output_bytes > self.spec.max_output_bytes
-            || self.metadata_bytes > self.spec.max_metadata_bytes
+        self.spec.check_storage(
+            self.raw_record_bytes,
+            self.stored_record_bytes,
+            self.metadata_bytes,
+        )?;
+        if self.output_bytes
+            != self
+                .stored_record_bytes
+                .checked_add(self.metadata_bytes)
+                .ok_or("Current mixed restored retained byte overflow")?
         {
-            return Err("Current mixed restored storage ceiling".into());
+            return Err("Current mixed restored retained byte counters differ".into());
         }
         Ok(())
     }
@@ -369,7 +385,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         self.account(pin, !pin.name.starts_with("record-"))
     }
     fn require_entry(&self, entry: &Entry, sequence: u64, previous: &str) -> Result<(), String> {
-        if entry.schema != JOURNAL_SCHEMA
+        if entry.schema != self.spec.journal_schema()
             || entry.sequence != sequence
             || entry.previous != previous
             || entry.root != self.root_checksum
@@ -414,10 +430,27 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         let mut previous = String::new();
         let mut output = spec.bytes as u64;
         let mut metadata = output;
+        let mut logical = 0u64;
+        let mut stored = 0u64;
         for n in 1..=self.sequence {
             let name = format!("head-{n:016x}.json");
             let raw = read_bounded(&self.directory.join(name), HEAD_CAP)?;
-            self.require_entry(&closed(&raw, HEAD_CAP)?, n, &previous)?;
+            let entry: Entry = closed(&raw, HEAD_CAP)?;
+            self.require_entry(&entry, n, &previous)?;
+            if let Event::CollectReturn {
+                member,
+                record: Some(pin),
+                ..
+            } = &entry.event
+            {
+                pin.validate(*member, &self.spec)?;
+                logical = logical
+                    .checked_add(pin.raw_bytes() as u64)
+                    .ok_or("Current mixed archive logical byte overflow")?;
+                stored = stored
+                    .checked_add(pin.file().bytes as u64)
+                    .ok_or("Current mixed archive stored byte overflow")?;
+            }
             previous = sha(&raw);
             output += raw.len() as u64;
             metadata += raw.len() as u64;
@@ -427,14 +460,23 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         }
         for (&attempt, refs) in &self.references {
             for p in refs {
-                read_pin(&self.batch(attempt), p, p.bytes)?;
+                read_physical_pin(&self.batch(attempt), p, &self.spec)?;
                 output += p.bytes as u64;
                 if !p.name.starts_with("record-") {
                     metadata += p.bytes as u64;
                 }
             }
         }
-        if output != self.output_bytes || metadata != self.metadata_bytes {
+        self.spec.check_storage(logical, stored, metadata)?;
+        if output != self.output_bytes
+            || metadata != self.metadata_bytes
+            || logical != self.raw_record_bytes
+            || stored != self.stored_record_bytes
+            || output
+                != stored
+                    .checked_add(metadata)
+                    .ok_or("Current mixed archive retained overflow")?
+        {
             return Err("Current mixed original archive byte accounting differs".into());
         }
         self.require_live()
