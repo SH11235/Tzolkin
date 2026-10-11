@@ -189,6 +189,95 @@ impl Spent {
     }
 }
 
+/// Bound only by a genuine final stopped session; this metadata cannot admit an owner.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PoolForkBinding {
+    schema: String,
+    predecessor_pool: String,
+    predecessor_outcome: String,
+    failed_attempt: u64,
+    // Fixed snapshot of [cohorts, missing counts, callbacks, rows, singletons]
+    // for Updated, NoChange, Failed and Abandoned, including known missingness.
+    predecessor_own_counters: [[u64; 5]; 4],
+    predecessor_pending_own: Option<[u64; 3]>,
+}
+fn own_snapshot(c: CurrentMixedOwnDecisionCounters) -> [[u64; 5]; 4] {
+    [c.updated, c.no_change, c.failed, c.abandoned].map(|v| {
+        [
+            v.cohorts,
+            v.cohorts_without_counts,
+            v.own.callbacks,
+            v.own.candidate_rows,
+            v.own.singletons,
+        ]
+    })
+}
+fn require_guarded_pool_replacement(
+    old: &CurrentMixedCollectionSpec,
+    new: &CurrentMixedCollectionSpec,
+    old_checksum: &str,
+) -> Result<String, String> {
+    if old.pool_checksum()? != old_checksum
+        || bytes(&old.inner.wire.weights, SPEC_CAP)? != bytes(&new.inner.wire.weights, SPEC_CAP)?
+        || bytes(&old.inner.wire.search, SPEC_CAP)? != bytes(&new.inner.wire.search, SPEC_CAP)?
+    {
+        return Err("Pool fork cannot replace weights, Search or the actual old pool".into());
+    }
+    let mut changed = 0usize;
+    for (before, after) in old.inner.wire.rosters.iter().zip(&new.inner.wire.rosters) {
+        if before.len() != after.len() {
+            return Err("Pool fork absolute roster lengths changed".into());
+        }
+        for (before, after) in before.iter().zip(after) {
+            match (before, after) {
+                (
+                    Some(OpponentSpec::PreparedBc),
+                    Some(OpponentSpec::PreparedBcTradeGuard { guard }),
+                ) => {
+                    guard.validate()?;
+                    changed += 1;
+                }
+                (Some(OpponentSpec::PreparedBc), _) => {
+                    return Err("Pool fork must guard every declared PreparedBC seat".into());
+                }
+                _ if bytes(before, SPEC_CAP)? == bytes(after, SPEC_CAP)? => (),
+                _ => return Err("Pool fork permits only PreparedBC to guarded PreparedBC".into()),
+            }
+        }
+    }
+    let checksum = new.pool_checksum()?;
+    if changed == 0 || checksum == old_checksum {
+        return Err("Pool fork requires an explicit different guarded pool".into());
+    }
+    Ok(checksum)
+}
+
+/// Owns the complete known-failed tip and its last genuinely resolved joint owner.
+/// It cannot be built from an artifact, metadata, an older checkpoint or a Ready token.
+/// The predecessor remains stopped in its immutable saved archive.
+pub struct StoppedCurrentMixedForkSource<'a> {
+    session: CurrentMixedTrainingSession<'a>,
+}
+impl StoppedCurrentMixedForkSource<'_> {
+    /// Read-only checks leave this token owned by the caller on predictable errors.
+    pub fn preflight_pool_fork(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        output: &Path,
+    ) -> Result<(), String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed pool fork output must be new".into());
+        }
+        self.session
+            .pool_fork_binding(spec, old_pool, new_pool, &directory)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct SegmentBinding {
@@ -208,6 +297,8 @@ pub(super) struct SegmentBinding {
     inherited: Spent,
     contract: GlobalContract,
     contract_checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pool_fork: Option<PoolForkBinding>,
 }
 impl SegmentBinding {
     fn checksum(&self) -> Result<String, String> {
@@ -318,10 +409,63 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         spec: &CurrentMixedSegmentSpec,
         directory: &Path,
     ) -> Result<SegmentBinding, String> {
-        spec.validate()?;
         self.progress
             .require_ready_continuation(self.blocked, self.head.is_some())?;
         self.current_policy()?;
+        self.successor_binding(spec, directory, self.pool.clone(), None)
+    }
+    fn require_stopped_fork_source(&self) -> Result<(), String> {
+        self.progress
+            .require_stopped_pool_fork(self.blocked, self.head.is_some())?;
+        if self.continued.is_none() {
+            return Err("Pool fork requires a genuinely resolved continued joint owner".into());
+        }
+        self.handle()?;
+        Ok(())
+    }
+    /// Consumes only the final known Failed tip, never reviving its old training authority.
+    pub fn into_stopped_pool_fork(self) -> Result<StoppedCurrentMixedForkSource<'a>, String> {
+        self.require_stopped_fork_source()?;
+        self.require_full_archives()?;
+        self.require_stopped_fork_source()?;
+        Ok(StoppedCurrentMixedForkSource { session: self })
+    }
+    fn pool_fork_binding(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        directory: &Path,
+    ) -> Result<SegmentBinding, String> {
+        self.require_stopped_fork_source()?;
+        let pool = require_guarded_pool_replacement(old_pool, new_pool, &self.pool)?;
+        let fork = PoolForkBinding {
+            schema: "tzolkin-current-mixed-stopped-pool-fork-v1".into(),
+            predecessor_pool: self.pool.clone(),
+            predecessor_outcome: "failed".into(),
+            failed_attempt: self
+                .progress
+                .active
+                .as_ref()
+                .expect("checked failure")
+                .attempt,
+            predecessor_own_counters: own_snapshot(self.progress.own_decisions),
+            predecessor_pending_own: self
+                .progress
+                .active_own
+                .map(|c| [c.callbacks, c.candidate_rows, c.singletons]),
+        };
+        self.successor_binding(spec, directory, pool, Some(fork))
+    }
+    fn successor_binding(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        directory: &Path,
+        pool: String,
+        pool_fork: Option<PoolForkBinding>,
+    ) -> Result<SegmentBinding, String> {
+        spec.validate()?;
+        self.handle()?;
         self.require_full_archives()?;
         self.root.require_output(directory)?;
         spec.global_contract.require_output(directory)?;
@@ -374,7 +518,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 .sha256
                 .clone(),
             predecessor_sequence: self.sequence,
-            pool: self.pool.clone(),
+            pool: pool.clone(),
             parent: self.handle()?.identity().clone(),
             prefix: self.progress.prefix,
             next: self.progress.next,
@@ -382,6 +526,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             inherited,
             contract: spec.global_contract.clone(),
             contract_checksum: spec.global_contract.checksum()?,
+            pool_fork,
         };
         let raw = bytes(&spec.run_spec, SPEC_CAP)?;
         let event = Event::SegmentStart {
@@ -395,7 +540,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 previous: String::new(),
                 root: binding.checksum()?,
                 spec: spec.run_spec.checksum()?,
-                pool: self.pool.clone(),
+                pool,
                 event,
             },
             HEAD_CAP,
@@ -408,6 +553,14 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         directory: PathBuf,
     ) -> Result<Self, String> {
         let binding = predecessor.session.segment_binding(&spec, &directory)?;
+        Self::from_predecessor(predecessor.session, spec, binding, directory)
+    }
+    fn from_predecessor(
+        s: CurrentMixedTrainingSession<'a>,
+        spec: CurrentMixedSegmentSpec,
+        binding: SegmentBinding,
+        directory: PathBuf,
+    ) -> Result<Self, String> {
         let root_checksum = binding.checksum()?;
         let mut progress = Progress::initial(
             &binding.parent,
@@ -417,7 +570,6 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         );
         progress.base = binding.parent.mixed_update_count();
         progress.segment_start = Some(binding.clone());
-        let s = predecessor.session;
         let journal_schema = s.journal_schema();
         let mut archives = s.segment.map(|c| c.archives).unwrap_or_default();
         archives.push(ClosedArchive {
@@ -440,7 +592,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             original: s.original,
             prepared: s.prepared,
             search: s.search,
-            pool: s.pool,
+            pool: binding.pool.clone(),
             spec: spec.run_spec,
             root_checksum,
             progress,
@@ -471,7 +623,61 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         if directory.exists() {
             return Err("Current mixed successor output must be new".into());
         }
-        let mut s = Self::initial_segment(predecessor, spec, directory)?;
+        Self::publish_successor(Self::initial_segment(predecessor, spec, directory)?)
+    }
+    fn initial_pool_fork(
+        predecessor: StoppedCurrentMixedForkSource<'a>,
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        directory: PathBuf,
+    ) -> Result<Self, String> {
+        let binding = predecessor
+            .session
+            .pool_fork_binding(&spec, old_pool, new_pool, &directory)?;
+        Self::from_predecessor(predecessor.session, spec, binding, directory)
+    }
+    /// Starts a distinct guarded-pool successor from the full final failed archive.
+    /// Preflight first; predictable errors preserve the token, I/O errors can consume it.
+    pub fn new_pool_fork(
+        predecessor: StoppedCurrentMixedForkSource<'a>,
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        output: &Path,
+    ) -> Result<Self, String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed pool fork output must be new".into());
+        }
+        Self::publish_successor(Self::initial_pool_fork(
+            predecessor,
+            spec,
+            old_pool,
+            new_pool,
+            directory,
+        )?)
+    }
+    /// Requires a freshly genuine complete failed predecessor, not a saved artifact DTO.
+    pub fn restore_pool_fork(
+        predecessor: StoppedCurrentMixedForkSource<'a>,
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        head: (&[u8], &str),
+        directory: &Path,
+    ) -> Result<Self, String> {
+        Self::check_latest_head(head.0, head.1)?;
+        Self::initial_pool_fork(
+            predecessor,
+            spec,
+            old_pool,
+            new_pool,
+            local(directory, false)?,
+        )?
+        .restore_entries(head.0)
+    }
+    fn publish_successor(mut s: Self) -> Result<Self, String> {
         let raw = bytes(&s.spec, SPEC_CAP)?;
         let initial = Event::SegmentStart {
             run_spec: file_pin("run-spec.json", &raw),

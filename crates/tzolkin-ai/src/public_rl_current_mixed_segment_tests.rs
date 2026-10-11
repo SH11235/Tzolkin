@@ -99,6 +99,7 @@ fn binding() -> SegmentBinding {
         inherited: inherited(),
         contract_checksum: contract.checksum().unwrap(),
         contract,
+        pool_fork: None,
     }
 }
 fn progress(b: &SegmentBinding) -> Progress {
@@ -340,4 +341,180 @@ fn segment_output_restrictions_are_bounded_and_refuse_overlap_before_creation() 
     c.protected_directories = vec![protected; MAX_PROTECTED_DIRECTORIES + 1];
     assert!(c.validate().is_err());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stopped_pool_fork_requires_known_final_failure_and_keeps_all_charges() {
+    let b = binding();
+    let s = run_spec();
+    let mut p = progress(&b);
+    p.apply(&start(&b), &s).unwrap();
+    let (_, _, template) = super::super::tests::reserved();
+    for updated in [true, false] {
+        let r = super::super::tests::later_reservation(&p, &template);
+        p.apply(
+            &Event::ReserveWhole4 {
+                reservation: Box::new(r),
+            },
+            &s,
+        )
+        .unwrap();
+        super::super::tests::gradient(&mut p, &s);
+        let resolution = if updated {
+            Resolution::Updated {
+                report: file_pin("report.json", b"report"),
+                artifact: file_pin("artifact.json", b"artifact"),
+                report_checksum: "b".repeat(64),
+                artifact_checksum: "c".repeat(64),
+            }
+        } else {
+            Resolution::NoChange {
+                report: file_pin("report.json", b"report"),
+                report_checksum: "b".repeat(64),
+            }
+        };
+        p.apply(&Event::Resolve { resolution }, &s).unwrap();
+    }
+    assert!(p.require_stopped_pool_fork(false, true).is_err());
+    let r = super::super::tests::later_reservation(&p, &template);
+    p.apply(
+        &Event::ReserveWhole4 {
+            reservation: Box::new(r),
+        },
+        &s,
+    )
+    .unwrap();
+    p.apply(&Event::CollectStart { member: 0 }, &s).unwrap();
+    assert!(p.require_stopped_pool_fork(true, true).is_err());
+    p.apply(
+        &Event::CollectReturn {
+            member: 0,
+            record: None,
+            complete: false,
+            error: Some("known cap".into()),
+        },
+        &s,
+    )
+    .unwrap();
+    p.apply(
+        &Event::Resolve {
+            resolution: Resolution::Failed {
+                error: "known cap".into(),
+            },
+        },
+        &s,
+    )
+    .unwrap();
+    p.require_stopped_pool_fork(true, true).unwrap();
+    assert!(p.require_ready_continuation(true, true).is_err());
+    let spent = inherited().with_progress(&p, 1024, 512, 256).unwrap();
+    assert_eq!((spent.attempts, spent.successful_updates), (51, 49));
+    assert_eq!(spent.reserved_work.callbacks, 492);
+    assert_eq!(
+        spent.reserved_work.bytes,
+        inherited().reserved_work.bytes + 192
+    );
+    assert_eq!(
+        (p.parent_count().unwrap(), p.next, p.consumed.len()),
+        (50, 280, 280)
+    );
+    assert_eq!(
+        own_snapshot(p.own_decisions),
+        [[1, 0, 4, 4, 4], [1, 0, 4, 4, 4], [1, 1, 0, 0, 0], [0; 5]]
+    );
+    assert!(p.require_stopped_pool_fork(false, true).is_err());
+    assert!(p.require_stopped_pool_fork(true, false).is_err());
+    p.unknown_work = true;
+    assert!(p.require_stopped_pool_fork(true, true).is_err());
+    p.unknown_work = false;
+    p.outcome = Some("abandoned".into());
+    assert!(p.require_stopped_pool_fork(true, true).is_err());
+    p.outcome = Some("failed".into());
+    p.started = false;
+    assert!(p.require_stopped_pool_fork(true, true).is_err());
+    p.started = true;
+    p.active.as_mut().unwrap().attempt = u64::MAX;
+    assert!(p.require_stopped_pool_fork(true, true).is_err());
+}
+
+#[test]
+fn stopped_pool_fork_allows_only_explicit_guarded_bc_replacement() {
+    let plan = source::tests::plan();
+    let h = json!({"kind":"heuristic"});
+    let bc = json!({"kind":"preparedBc"});
+    let wire = json!({"schema":crate::public_rl_current_mixed_session::SPEC_SCHEMA,
+        "catalogHash":crate::replay::catalog_hash(),
+        "configurations":plan.headers.each_ref().map(|v|&v.config),
+        "rosters":[[null,bc,h],[h,null,bc],[null,h,h,bc],[h,h,bc,null]],
+        "weights":crate::policy::HeuristicWeights::default(),
+        "search":crate::search::SearchConfig::default(),
+        "maxOutputBytes":4*MAX_RECORD_BYTES+2*1024*1024});
+    let parse =
+        |v: &Value| CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(v).unwrap()).unwrap();
+    let old = parse(&wire);
+    let checksum = old.pool_checksum().unwrap();
+    let mut replacement = wire.clone();
+    for roster in replacement["rosters"].as_array_mut().unwrap() {
+        for seat in roster.as_array_mut().unwrap() {
+            if seat["kind"] == "preparedBc" {
+                *seat = json!({"kind":"preparedBcTradeGuard","guard":crate::public_trade_guard::TradeGuardConfig::default()});
+            }
+        }
+    }
+    let new = parse(&replacement);
+    assert_eq!(
+        require_guarded_pool_replacement(&old, &new, &checksum).unwrap(),
+        new.pool_checksum().unwrap()
+    );
+    assert!(require_guarded_pool_replacement(&old, &old, &checksum).is_err());
+    assert!(require_guarded_pool_replacement(&old, &new, &"0".repeat(64)).is_err());
+    for (section, key, value) in [
+        ("weights", "cornBase", json!(999.0)),
+        ("search", "samplingSalt", json!(999)),
+    ] {
+        let mut wrong = replacement.clone();
+        wrong[section][key] = value;
+        assert!(require_guarded_pool_replacement(&old, &parse(&wrong), &checksum).is_err());
+    }
+    let mut wrong = replacement.clone();
+    wrong["rosters"][0][1] = bc;
+    assert!(require_guarded_pool_replacement(&old, &parse(&wrong), &checksum).is_err());
+    let mut wrong = replacement;
+    wrong["rosters"][0][2] = json!({"kind":"parentArgmax"});
+    assert!(require_guarded_pool_replacement(&old, &parse(&wrong), &checksum).is_err());
+}
+
+#[test]
+fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
+    let b = binding();
+    let original = bytes(&b, HEAD_CAP).unwrap();
+    assert!(
+        !String::from_utf8(original.clone())
+            .unwrap()
+            .contains("poolFork")
+    );
+    let old: SegmentBinding = closed(&original, HEAD_CAP).unwrap();
+    assert_eq!(old, b);
+    assert_eq!(bytes(&old, HEAD_CAP).unwrap(), original);
+    let mut fork = b.clone();
+    fork.pool = "1".repeat(64);
+    fork.pool_fork = Some(PoolForkBinding {
+        schema: "tzolkin-current-mixed-stopped-pool-fork-v1".into(),
+        predecessor_pool: b.pool.clone(),
+        predecessor_outcome: "failed".into(),
+        failed_attempt: 2,
+        predecessor_own_counters: [[1, 0, 4, 4, 4], [1, 0, 4, 4, 4], [1, 1, 0, 0, 0], [0; 5]],
+        predecessor_pending_own: None,
+    });
+    assert_ne!(fork.checksum().unwrap(), b.checksum().unwrap());
+    progress(&fork).check(&start(&fork), &run_spec()).unwrap();
+    assert!(progress(&fork).check(&start(&b), &run_spec()).is_err());
+    let mut changed = fork.clone();
+    changed.pool_fork.as_mut().unwrap().predecessor_own_counters[2][1] = 0;
+    assert!(
+        progress(&fork)
+            .check(&start(&changed), &run_spec())
+            .is_err()
+    );
+    assert_ne!(fork.checksum().unwrap(), changed.checksum().unwrap());
 }
