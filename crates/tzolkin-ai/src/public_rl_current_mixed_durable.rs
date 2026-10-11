@@ -35,6 +35,11 @@ use std::{
 
 #[path = "public_rl_current_mixed_restore.rs"]
 mod restore;
+#[path = "public_rl_current_mixed_segment.rs"]
+mod segment;
+pub use segment::{
+    CurrentMixedSegmentSpec, GLOBAL_CONTRACT_SCHEMA, SEGMENT_JOURNAL_SCHEMA, SEGMENT_SPEC_SCHEMA,
+};
 
 pub const SPEC_SCHEMA: &str = "tzolkin-current-mixed-durable-spec-v2";
 pub const JOURNAL_SCHEMA: &str = "tzolkin-current-mixed-durable-journal-v2";
@@ -447,6 +452,10 @@ enum Event {
         next: u64,
         consumed: Vec<String>,
     },
+    SegmentStart {
+        run_spec: FilePin,
+        binding: Box<segment::SegmentBinding>,
+    },
     ReserveWhole4 {
         reservation: Box<Reservation>,
     },
@@ -499,6 +508,7 @@ struct Progress {
     started: bool,
     phase: Phase,
     base: u64,
+    segment_start: Option<segment::SegmentBinding>,
     prefix: [u64; 2],
     next: u64,
     consumed: BTreeSet<String>,
@@ -553,6 +563,7 @@ impl Progress {
             started: false,
             phase: Phase::Ready,
             base: 1,
+            segment_start: None,
             prefix,
             next,
             consumed: consumed.clone(),
@@ -583,6 +594,7 @@ impl Progress {
                 leaf(run_spec, "run-spec.json", SPEC_CAP)?;
                 parent.validate()?;
                 if self.started
+                    || self.segment_start.is_some()
                     || self.attempts != 0
                     || self.phase != Phase::Ready
                     || parent_count != 1 // Legacy Start remains genuine Count1 only.
@@ -593,6 +605,22 @@ impl Progress {
                     || *next != self.next
                     || consumed.windows(2).any(|v| v[0] >= v[1])
                     || consumed.iter().cloned().collect::<BTreeSet<_>>() != self.consumed
+                {
+                    return fail();
+                }
+            }
+            Event::SegmentStart { run_spec, binding } => {
+                leaf(run_spec, "run-spec.json", SPEC_CAP)?;
+                if self.started
+                    || self.attempts != 0
+                    || self.phase != Phase::Ready
+                    || self.segment_start.as_ref() != Some(binding.as_ref())
+                    || binding.parent.mixed_update_count() != parent_count
+                    || binding.parent.imported_update_count() != self.imported
+                    || binding.parent.artifact_checksum() != self.current_checksum
+                    || binding.prefix != self.prefix
+                    || binding.next != self.next
+                    || binding.consumed.iter().cloned().collect::<BTreeSet<_>>() != self.consumed
                 {
                     return fail();
                 }
@@ -762,7 +790,7 @@ impl Progress {
     fn apply(&mut self, e: &Event, s: &CurrentMixedRunSpec) -> Result<(), String> {
         self.check(e, s)?;
         match e {
-            Event::Start { .. } => {
+            Event::Start { .. } | Event::SegmentStart { .. } => {
                 self.started = true;
             }
             Event::ReserveWhole4 { reservation: r } => {
@@ -882,6 +910,7 @@ pub struct CurrentMixedTrainingSession<'a> {
     raw_record_bytes: u64,
     stored_record_bytes: u64,
     blocked: bool,
+    segment: Option<segment::SegmentContext>,
 }
 
 /// Borrows only archival state; it cannot admit or expose a policy owner.
@@ -908,7 +937,7 @@ impl ArchiveView<'_> {
 
 /// Consumes a fully closed Ready session without changing its actual owner,
 /// reservations, cursor, specifications or spent budgets. No constructor from
-/// wire metadata, training successor or new work capacity is provided.
+/// wire metadata is provided. A successor consumes this token after preflight.
 pub struct ReadyCurrentMixedContinuation<'a> {
     session: CurrentMixedTrainingSession<'a>,
 }
@@ -949,6 +978,8 @@ pub struct CurrentMixedSessionStatus {
     outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     storage_usage: Option<StorageUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    segment_usage: Option<segment::SegmentUsage>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -981,7 +1012,11 @@ impl CurrentMixedSessionStatus {
 }
 impl<'a> CurrentMixedTrainingSession<'a> {
     fn journal_schema(&self) -> &'static str {
-        self.spec.journal_schema()
+        if self.segment.is_some() {
+            SEGMENT_JOURNAL_SCHEMA
+        } else {
+            self.spec.journal_schema()
+        }
     }
     fn archive_view(&self) -> ArchiveView<'_> {
         ArchiveView {
@@ -1051,6 +1086,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             raw_record_bytes: 0,
             stored_record_bytes: 0,
             blocked: false,
+            segment: None,
         })
     }
     pub fn new(
@@ -1157,6 +1193,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     retained_bytes: self.output_bytes,
                     temporary_reserve_bytes: storage.max_temporary_bytes,
                 }),
+            segment_usage: self.segment_usage(),
         }
     }
     fn batch(&self, attempt: u64) -> PathBuf {
@@ -1951,7 +1988,7 @@ mod tests {
         assert_eq!(MAX_STORED_RECORD_BYTES, 108 * 1024 * 1024 + 1024);
         assert_eq!(METADATA_HEADROOM, 55 * 1024 * 1024 / 2);
     }
-    fn reserved() -> (Progress, CurrentMixedRunSpec, Reservation) {
+    pub(super) fn reserved() -> (Progress, CurrentMixedRunSpec, Reservation) {
         let s = spec();
         let plan = source::tests::plan();
         let parent = plan.parent_identity().clone();
@@ -1985,7 +2022,7 @@ mod tests {
         };
         (progress, s, r)
     }
-    fn gradient(p: &mut Progress, s: &CurrentMixedRunSpec) {
+    pub(super) fn gradient(p: &mut Progress, s: &CurrentMixedRunSpec) {
         for member in 0..4 {
             p.apply(&Event::CollectStart { member }, s).unwrap();
             p.apply(
@@ -2047,7 +2084,7 @@ mod tests {
         parent.validate().unwrap();
         parent
     }
-    fn later_reservation(p: &Progress, template: &Reservation) -> Reservation {
+    pub(super) fn later_reservation(p: &Progress, template: &Reservation) -> Reservation {
         let mut r = template.clone();
         r.attempt = p.attempts;
         r.parent = continued_parent(p);
