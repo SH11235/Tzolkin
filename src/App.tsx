@@ -13,6 +13,7 @@ import {
   type GuardedCpuDecision,
   type Observation,
 } from './game/cpu';
+import { NnDecisionTiming } from './game/cpuTiming';
 import type { GameMove, GameState } from './game/types';
 import { CalendarArt, Icon } from './ui/Icons';
 import { PlayersSidebar } from './ui/PlayersSidebar';
@@ -223,9 +224,13 @@ function App() {
     cpuGameRef.current = next;
     setGuardMetadata(next);
   }
-  async function notifyGuard(observation: Observation, signal: AbortSignal) {
+  async function notifyGuard(
+    observation: Observation,
+    signal: AbortSignal,
+    timing?: NnDecisionTiming,
+  ) {
     const current = cpuGameRef.current;
-    if (current) return notifyCpuCallback(observation, signal, current);
+    if (current) return notifyCpuCallback(observation, signal, current, timing);
     return undefined;
   }
   function toggleCpu() {
@@ -353,6 +358,7 @@ function App() {
     cpuAbortRef.current = controller;
     const expected = active;
     let issuedGame: CpuGameMetadata | undefined;
+    let timing: NnDecisionTiming | undefined;
     let complete = false;
     // Keep each decision on its own task so pause, undo and reset stay responsive.
     const timer = setTimeout(() => {
@@ -367,11 +373,19 @@ function App() {
               if (cpuGameRef.current) discardGuard(cpuGameRef.current);
               throw new Error('この局面からNN CPUを明示的に再開してください。');
             }
+            timing = new NnDecisionTiming(cpuGameRef.current, (failure) => {
+              controller.abort();
+              if (issuedGame) discardGuard(issuedGame);
+              if (activeRef.current === expected && !replayOpenRef.current)
+                setError(failure.message);
+            });
           }
+          issuedGame = cpuGameRef.current ?? undefined;
           const observation = await observeGame(
             expected.session.state,
             expected.session.state.currentPlayer,
           );
+          timing?.inputReady();
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
           if (
@@ -382,8 +396,7 @@ function App() {
             if (cpuGameRef.current) discardGuard(cpuGameRef.current);
             throw new Error('この局面からNN CPUの履歴を明示的に再開してください。');
           }
-          issuedGame = cpuGameRef.current ?? undefined;
-          const callback = await notifyGuard(observation, controller.signal);
+          const callback = await notifyGuard(observation, controller.signal, timing);
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
           const decision = await chooseCpu(observation, controller.signal, selection, callback);
@@ -394,6 +407,7 @@ function App() {
               !choice.disabled && JSON.stringify(choice.move) === JSON.stringify(decision.move),
           );
           if (!legal) throw new Error('CPUが合法でない操作を返しました。');
+          timing?.legal();
           const snapshot = await applyMove(expected.session.state, decision.move);
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
@@ -409,6 +423,7 @@ function App() {
             snapshot,
           );
         } catch (failure) {
+          timing?.failed(failure);
           if (controller.signal.aborted || replayOpenRef.current || activeRef.current !== expected)
             return;
           setCpuPaused(true);
@@ -416,6 +431,9 @@ function App() {
             failure instanceof Error ? failure.message : 'CPUの操作を実行できませんでした。',
           );
         } finally {
+          timing?.failed(
+            controller.signal.aborted ? new DOMException('Cancelled', 'AbortError') : undefined,
+          );
           if (!complete && issuedGame) discardGuard(issuedGame);
           if (cpuAbortRef.current === controller) setPreparingCpuModel(false);
         }
@@ -423,6 +441,7 @@ function App() {
     }, 20);
     return () => {
       clearTimeout(timer);
+      timing?.failed(new DOMException('Cancelled', 'AbortError'));
       controller.abort();
       if (!complete && issuedGame) discardGuard(issuedGame);
       if (cpuAbortRef.current === controller) {
@@ -960,6 +979,7 @@ function App() {
           onCancel={() => setConfirmReset(false)}
           onConfirm={() => {
             cpuAbortRef.current?.abort();
+            if (cpuGameRef.current) discardGuard(cpuGameRef.current);
             activeRef.current = null;
             setActive(null);
             setSaved(null);

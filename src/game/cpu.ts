@@ -1,4 +1,5 @@
 import type { GameMove } from './types';
+import { NnDecisionDeadlineError, type NnDecisionTiming } from './cpuTiming';
 
 /** The authority constructs this allowlist in Rust; the Worker never receives a saved game. */
 export interface Observation {
@@ -79,6 +80,7 @@ export interface CpuCallback {
   readonly game: CpuGameMetadata;
   readonly index: number;
   readonly observationJson: string;
+  readonly timing?: NnDecisionTiming;
 }
 export interface GuardedCpuDecision extends CpuDecision {
   rawPolicyVersion: string;
@@ -135,7 +137,7 @@ let nextGameId = 0;
 let game: CpuGameMetadata | undefined;
 let nextCallback = 0;
 let notified: CpuCallback | undefined;
-let pendingAbort: (() => void) | undefined;
+let pendingAbort: { gameId: string | null; abort: () => void } | undefined;
 
 export function getActiveCpuGame(): CpuGameMetadata | undefined {
   return game;
@@ -146,8 +148,11 @@ export function getActiveCpuGame(): CpuGameMetadata | undefined {
 export function discardCpuGame(expected?: CpuGameMetadata): void {
   if (expected && game !== expected) return;
   if (!game) return;
-  if (pendingAbort) pendingAbort();
-  else {
+  if (pendingAbort) {
+    // A delayed old-game cleanup cannot cancel a replacement epoch/model load.
+    if (expected && pendingAbort.gameId !== expected.gameId) return;
+    pendingAbort.abort();
+  } else {
     worker?.terminate();
     worker = undefined;
     loaded = undefined;
@@ -291,6 +296,7 @@ function exchange<T>(
   signal: AbortSignal,
   deadline: number,
   accept: (reply: Reply) => T,
+  timing?: NnDecisionTiming,
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -299,6 +305,14 @@ function exchange<T>(
     }
     if (pending) {
       reject(new Error('CPUはすでに考えています。'));
+      return;
+    }
+    let remaining = deadline;
+    try {
+      if (timing) remaining = Math.min(remaining, timing.remainingMs());
+    } catch (failure) {
+      discardCpuGame();
+      reject(failure);
       return;
     }
     if (!Number.isSafeInteger(nextRequestId + 1)) {
@@ -319,7 +333,7 @@ function exchange<T>(
     const current = worker;
     const requestId = ++nextRequestId;
     let settled = false;
-    const timeout = setTimeout(expired, deadline);
+    const timeout = setTimeout(expired, Math.ceil(remaining));
     function release() {
       if (settled) return false;
       settled = true;
@@ -333,6 +347,7 @@ function exchange<T>(
     }
     function terminate(error: Error) {
       if (!release()) return;
+      timing?.failed(error);
       current.terminate();
       if (worker === current) {
         worker = undefined;
@@ -350,13 +365,14 @@ function exchange<T>(
     }
     function expired() {
       terminate(
-        new Error(
-          request.operation === 'load'
-            ? 'NNモデルの準備が期限を超えました。再試行してください。'
-            : request.mode === 'nn'
-              ? 'NNの判断が期限を超えました。再試行してください。'
-              : 'CPUを起動できませんでした。再試行してください。',
-        ),
+        timing?.expire() ??
+          new Error(
+            request.operation === 'load'
+              ? 'NNモデルの準備が期限を超えました。再試行してください。'
+              : request.mode === 'nn'
+                ? 'NNの判断が期限を超えました。再試行してください。'
+                : 'CPUを起動できませんでした。再試行してください。',
+          ),
       );
     }
     function receive(event: MessageEvent<Reply>) {
@@ -373,6 +389,12 @@ function exchange<T>(
         reply.callbackIndex !== request.callbackIndex
       )
         return;
+      try {
+        timing?.remainingMs();
+      } catch (failure) {
+        terminate(failure as Error);
+        return;
+      }
       if (reply.error !== undefined) {
         if (
           typeof reply.error !== 'string' ||
@@ -390,13 +412,18 @@ function exchange<T>(
       }
       try {
         const result = accept(reply);
+        timing?.remainingMs();
         if (release()) resolve(result);
-      } catch {
-        terminate(new Error('CPUが不正な結果を返しました。'));
+      } catch (failure) {
+        terminate(
+          failure instanceof NnDecisionDeadlineError
+            ? failure
+            : new Error('CPUが不正な結果を返しました。'),
+        );
       }
     }
     pending = true;
-    pendingAbort = cancel;
+    pendingAbort = { gameId: request.gameId, abort: cancel };
     signal.addEventListener('abort', cancel, { once: true });
     current.addEventListener('message', receive);
     current.addEventListener('error', failed);
@@ -405,9 +432,11 @@ function exchange<T>(
       return;
     }
     try {
+      timing?.remainingMs();
       current.postMessage({ ...request, requestId });
-    } catch {
-      failed();
+    } catch (failure) {
+      if (failure instanceof NnDecisionDeadlineError) terminate(failure);
+      else failed();
     }
   });
 }
@@ -497,6 +526,7 @@ export function notifyCpuCallback(
   observation: Observation,
   signal: AbortSignal,
   expected: CpuGameMetadata,
+  timing?: NnDecisionTiming,
 ): Promise<CpuCallback> {
   if (
     game !== expected ||
@@ -536,10 +566,12 @@ export function notifyCpuCallback(
         game !== expected
       )
         throw new Error('Invalid callback acknowledgement');
+      timing?.notified();
       nextCallback++;
-      notified = Object.freeze({ game: expected, index, observationJson });
+      notified = Object.freeze({ game: expected, index, observationJson, timing });
       return notified;
     },
+    timing,
   );
 }
 
@@ -669,8 +701,10 @@ export function chooseCpu(
           : decision.policyVersion !== 'heuristic-v1')
       )
         throw new Error('Invalid decision binding');
+      callback?.timing?.chosen();
       if (callback) notified = undefined;
       return decision;
     },
+    callback?.timing,
   );
 }

@@ -102,10 +102,169 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe('CPU Worker request lifecycle', () => {
+  it('cannot cancel an in-flight replacement epoch through delayed old-game cleanup', async () => {
+    const api = await import('../../src/game/cpu');
+    const signal = new AbortController().signal;
+    const loading = api.loadCpuModel(bytes, signal);
+    const worker = FakeWorker.instances[0]!;
+    worker.respond({ metadata: model });
+    await loading;
+    const old = await start(api, worker, signal);
+    const replacement = api.startCpuGame(signal, model.checksum);
+    api.discardCpuGame(old);
+    expect(worker.terminated).toBe(false);
+    worker.respond({ gameMetadata: { ...gameMetadata, gameId: worker.request!.gameId } });
+    const current = await replacement;
+    expect(current.gameId).not.toBe(old.gameId);
+    expect(api.getActiveCpuGame()).toBe(current);
+    api.discardCpuGame(old);
+    expect(worker.terminated).toBe(false);
+  });
+
+  it('shares one remaining budget and refuses a late bound reply before its timer is processed', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const api = await import('../../src/game/cpu');
+    const metrics = await import('../../src/game/cpuTiming');
+    const signal = new AbortController().signal;
+    const loading = api.loadCpuModel(bytes, signal);
+    const worker = FakeWorker.instances[0]!;
+    worker.respond({ metadata: model });
+    await loading;
+    const game = await start(api, worker, signal);
+    const timing = new metrics.NnDecisionTiming(game);
+    now = 120;
+    timing.inputReady();
+    const notification = api.notifyCpuCallback(observation, signal, game, timing);
+    now = 700;
+    worker.respond({ notified: true });
+    const callback = await notification;
+    expect(timing.remainingMs()).toBe(300);
+    const choosing = api.chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: model.checksum },
+      callback,
+    );
+    const rejected = expect(choosing).rejects.toBeInstanceOf(metrics.NnDecisionDeadlineError);
+    now = 1000; // Do not advance timer events: acceptance must check the absolute clock.
+    worker.reply(nnDecision);
+    await rejected;
+    expect(worker.terminated).toBe(true);
+    expect(api.getActiveCpuGame()).toBeUndefined();
+    const summary = metrics.getNnDecisionLatency(model.checksum);
+    expect(summary).toMatchObject({
+      completedAttempts: 1,
+      legalDecisions: 0,
+      legalP95Ms: null,
+      deadlines: 1,
+    });
+    expect(summary.samples[0]).toMatchObject({
+      inputMs: 120,
+      notifyMs: 580,
+      chooseMs: null,
+      legalityMs: null,
+      elapsedMs: 1000,
+    });
+  });
+
+  it('expires asynchronous input and refuses legality that exceeds the final budget', async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const metrics = await import('../../src/game/cpuTiming');
+    const onDeadline = vi.fn();
+    const input = new metrics.NnDecisionTiming(
+      { gameId: 'input', modelChecksum: model.checksum },
+      onDeadline,
+    );
+    now = 1000;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onDeadline).toHaveBeenCalledOnce();
+    expect(() => input.inputReady()).toThrow(metrics.NnDecisionDeadlineError);
+    now = 2000;
+    const legal = new metrics.NnDecisionTiming({
+      gameId: 'legality',
+      modelChecksum: model.checksum,
+    });
+    now = 2100;
+    legal.inputReady();
+    now = 2200;
+    legal.notified();
+    now = 2900;
+    legal.chosen();
+    now = 3000;
+    expect(() => legal.legal()).toThrow(metrics.NnDecisionDeadlineError);
+    expect(metrics.getNnDecisionLatency(model.checksum)).toMatchObject({
+      completedAttempts: 2,
+      deadlines: 2,
+      legalDecisions: 0,
+    });
+  });
+
+  it('reports bounded measured quantiles with separate failure denominators and stage totals', async () => {
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const metrics = await import('../../src/game/cpuTiming');
+    expect(metrics.getNnDecisionLatency(model.checksum).legalP95Ms).toBeNull();
+    for (let duration = 1; duration <= 20; duration++) {
+      now = duration * 2000;
+      const timing = new metrics.NnDecisionTiming({
+        gameId: 'measured',
+        modelChecksum: model.checksum,
+      });
+      timing.inputReady();
+      timing.notified();
+      timing.chosen();
+      now += duration;
+      timing.legal();
+    }
+    const cancelled = new metrics.NnDecisionTiming({
+      gameId: 'cancelled',
+      modelChecksum: model.checksum,
+    });
+    now += 500;
+    cancelled.failed(new DOMException('Cancelled', 'AbortError'));
+    cancelled.failed(new Error('Later failure does not change the first outcome'));
+    const failed = new metrics.NnDecisionTiming({
+      gameId: 'failed',
+      modelChecksum: model.checksum,
+    });
+    now += 10;
+    failed.failed(new Error('Invalid input'));
+    const summary = metrics.getNnDecisionLatency(model.checksum);
+    expect(summary).toMatchObject({
+      completedAttempts: 22,
+      legalDecisions: 20,
+      cancellations: 1,
+      errors: 1,
+      legalP95Ms: 19,
+    });
+    expect(summary.samples[19]).toMatchObject({
+      elapsedMs: 20,
+      inputMs: 0,
+      notifyMs: 0,
+      chooseMs: 0,
+      legalityMs: 20,
+    });
+    summary.samples[0]!.elapsedMs = 9999;
+    expect(metrics.getNnDecisionLatency(model.checksum).legalP95Ms).toBe(19);
+    for (let i = 0; i < 128; i++) {
+      new metrics.NnDecisionTiming({
+        gameId: 'other-model',
+        modelChecksum: 'd'.repeat(64),
+      }).failed();
+    }
+    expect(metrics.getNnDecisionLatency('d'.repeat(64)).completedAttempts).toBe(128);
+    expect(metrics.getNnDecisionLatency(model.checksum).completedAttempts).toBe(0);
+  });
+
   it('ignores stale requests and checks the actor and observation key', async () => {
     const { chooseCpu } = await import('../../src/game/cpu');
     const pending = chooseCpu(observation, new AbortController().signal);
