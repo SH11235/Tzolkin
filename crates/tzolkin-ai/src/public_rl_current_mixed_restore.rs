@@ -99,6 +99,10 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         expected_sha256: &str,
         directory: &Path,
     ) -> Result<Self, String> {
+        Self::check_latest_head(head_raw, expected_sha256)?;
+        Self::initial(root, spec, pool, local(directory, false)?)?.restore_entries(head_raw)
+    }
+    pub(super) fn check_latest_head(head_raw: &[u8], expected_sha256: &str) -> Result<(), String> {
         if !checkpoint_digest(expected_sha256)
             || head_raw.is_empty()
             || head_raw.len() > HEAD_CAP
@@ -106,8 +110,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         {
             return Err("Current mixed externally pinned latest head differs".into());
         }
+        Ok(())
+    }
+    pub(super) fn restore_entries(mut self, head_raw: &[u8]) -> Result<Self, String> {
         let tip: Entry = closed(head_raw, HEAD_CAP)?;
-        let mut s = Self::initial(root, spec, pool, local(directory, false)?)?;
+        let s = &mut self;
         if tip.sequence == 0 || tip.sequence > s.spec.max_journal_entries {
             return Err("Current mixed bounded restore sequence".into());
         }
@@ -127,10 +134,14 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             let mut promotion = None;
             let mut owner_pins = None;
             match &entry.event {
-                Event::Start {
-                    run_spec, parent, ..
-                } => {
-                    parent.require_current(&s.handle()?)?;
+                Event::Start { run_spec, .. } | Event::SegmentStart { run_spec, .. } => {
+                    match &entry.event {
+                        Event::Start { parent, .. } => parent.require_current(&s.handle()?)?,
+                        Event::SegmentStart { binding, .. } => {
+                            binding.parent.require_current(&s.handle()?)?
+                        }
+                        _ => unreachable!("matched start event"),
+                    }
                     let raw = read_pin(&s.directory, run_spec, SPEC_CAP)?;
                     let stored = CurrentMixedRunSpec::from_json(&raw)?;
                     if stored.checksum()? != s.spec.checksum()? {
@@ -327,8 +338,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         s.require_layout()?;
         s.require_live()?;
         s.handle()?;
+        if let Some(segment) = &s.segment {
+            segment.require_archives()?;
+        }
         s.blocked = s.progress.phase != Phase::Ready;
-        Ok(s)
+        Ok(self)
     }
     fn saved_report(
         &self,
@@ -390,8 +404,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
     pub(super) fn require_layout(&self) -> Result<(), String> {
         require_archive_layout(&self.archive_view())
     }
-    fn require_full_archives(&self) -> Result<(), String> {
+    pub(super) fn require_full_archives(&self) -> Result<(), String> {
         self.root.require_current()?;
+        if let Some(segment) = &self.segment {
+            segment.require_archives()?;
+        }
         require_archive_files(&self.archive_view())?;
         self.require_live()
     }
@@ -404,7 +421,7 @@ impl<'a> CurrentMixedTrainingSession<'a> {
 
     /// Consumes only a resolved Ready session, retaining the actual joint owner,
     /// original admission and every reservation/work/storage counter. The token
-    /// borrows policies; it cannot start another training segment.
+    /// borrows policies and can be consumed by bounded successor admission.
     pub fn into_ready_continuation(self) -> Result<ReadyCurrentMixedContinuation<'a>, String> {
         self.progress
             .require_ready_continuation(self.blocked, self.head.is_some())?;
