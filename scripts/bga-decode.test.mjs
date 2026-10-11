@@ -1244,6 +1244,152 @@ test('binds empty payment and architecture captions to one settled purchase rece
   assert.equal(chosen.record.steps.length, 1);
 });
 
+function workerPurchaseFixture(remaining = 1) {
+  const initial = clone(saved.core.initialFrame);
+  const own = initial.snapshot.state.players[0];
+  own.resources = { corn: 8, wood: 2, stone: 1, gold: 2, skull: 0 };
+  own.workers = 6;
+  own.score = 7;
+  own.technologies.architecture = 3;
+  initial.observation.pendingTask = { type: 'build', remaining };
+  initial.snapshot.state.pending = { task: clone(initial.observation.pendingTask), after: [] };
+  initial.observation.legalActions = [
+    {
+      action: {
+        type: 'build',
+        id: 'b19',
+        cost: [0, 1, 0, 1, 0],
+        architecture: true,
+        discountResource: 'stone',
+      },
+      move: { type: 'choose', choiceId: 'build:worker' },
+    },
+  ];
+  const messages = [
+    { raw_text: 'Aはを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+    { raw_text: 'Aはを支払った' },
+    { raw_text: 'Aはを支払った', icons: [{ classes: 'tz_icon resource_gold' }] },
+    { raw_text: 'Aは建物を建てた' },
+    { raw_text: 'Aはを獲得した', icons: [{ classes: 'tz_icon resource_corn' }] },
+    { raw_text: 'Aは2点を獲得した' },
+    { raw_text: 'Aは既にワーカー6個を持っています' },
+    { raw_text: 'Aは6点を獲得した' },
+  ];
+  const value = input();
+  const frames = [];
+  // Injected completed outcomes check receipt admission; no world or model is run.
+  const apply = (request) => {
+    assert.equal(request.move.choiceId, 'build:worker');
+    const next = clone(initial);
+    next.snapshot.state = clone(request.state);
+    const player = next.snapshot.state.players[0];
+    player.resources.wood--;
+    player.resources.gold--;
+    player.resources.corn++;
+    player.workers = Math.min(6, player.workers + 1);
+    player.score += 6 + 2; // Fixed catalog Points plus architecture; Worker only saturates.
+    player.buildings.push(initial.observation.legalActions[0].action.id);
+    next.snapshot.state.pending =
+      remaining === 1 ? null : { task: { type: 'build', remaining: remaining - 1 }, after: [] };
+    next.observation.pendingTask = next.snapshot.state.pending?.task ?? null;
+    next.observation.legalActions = [];
+    frames.push(next);
+    return next;
+  };
+  const prepare = () => {
+    replaceEvents(value, [[6, messages]]);
+    value.witness.initial = clone(initial.snapshot.state);
+    value.witness.witnesses = [
+      {
+        actionId: 6,
+        buildings: [initial.observation.legalActions[0].action.id],
+        pendingTask: remaining === 1 ? null : 'build',
+        expected: {
+          players: [
+            { resources: { corn: 9, wood: 1, stone: 1, gold: 1, skull: 0 }, workers: 6, score: 15 },
+            {},
+            {},
+            {},
+          ],
+        },
+      },
+    ];
+  };
+  return { initial, messages, value, frames, apply, prepare };
+}
+
+test('capped worker purchase keeps its fixed score and original Build continuation', () => {
+  for (const remaining of [1, 2]) {
+    const f = workerPurchaseFixture(remaining);
+    f.prepare();
+    const result = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(result.manifest.blocked, null);
+    assert.equal(result.record.steps.length, 1);
+    assert.deepEqual(
+      result.record.steps[0].checkpoint.expected,
+      f.value.witness.witnesses[0].expected,
+    );
+    const own = f.frames.at(-1).snapshot.state.players[0];
+    assert.equal(own.workers, 6);
+    assert.equal(own.score, 15);
+    assert.equal(result.manifest.trainingReady, false);
+  }
+});
+
+test('capped worker purchase refuses a notice without the same saturated catalog effect', () => {
+  for (const mutate of [
+    (f) => {
+      f.initial.snapshot.state.players[0].workers = 5;
+    },
+    (f) => {
+      f.initial.observation.legalActions[0].action.id = 'b28';
+    },
+    (f) => {
+      f.messages[6].raw_text = 'Bは既にワーカー6個を持っています';
+    },
+    (f) => {
+      f.messages.push(clone(f.messages[6]));
+    },
+  ]) {
+    const f = workerPurchaseFixture();
+    mutate(f);
+    f.prepare();
+    const result = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(result.manifest.blocked.actionId, 6);
+    assert.equal(result.record.steps.length, 0);
+    assert.equal(result.manifest.audit.filter((row) => row.action?.type === 'build').length, 0);
+  }
+});
+
+test('capped worker purchase rolls back missing, duplicate and mismatched score receipts', () => {
+  for (const mutate of [
+    (f) => {
+      f.messages.pop();
+    },
+    (f) => {
+      f.messages.push(clone(f.messages[7]));
+    },
+    (f) => {
+      f.messages[5].raw_text = 'Aは3点を獲得した';
+    },
+  ]) {
+    const f = workerPurchaseFixture();
+    mutate(f);
+    f.prepare();
+    const result = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(result.manifest.blocked.actionId, 6);
+    assert.equal(result.record.steps.length, 0);
+    assert.equal(result.manifest.frameCount, 1);
+  }
+  const mismatched = workerPurchaseFixture();
+  mismatched.prepare();
+  mismatched.value.witness.witnesses[0].expected.players[0].score++;
+  const refused = decode(mismatched.value, dispatcher(mismatched.initial, mismatched.apply));
+  assert.equal(refused.manifest.blocked.actionId, 6);
+  assert.equal(refused.record.steps.length, 0);
+  assert.equal(refused.manifest.frameCount, 1);
+});
+
 test('binds a settled fixed Theology purchase to one capped advance and named skull receipt', () => {
   const fixture = (actor = 0) => {
     // Injected outcomes exercise decoder admission and rollback, not core execution.

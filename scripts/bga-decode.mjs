@@ -346,6 +346,27 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   function purchaseActor(event) {
     return architectureScoreCaption(event)?.actor ?? theologySkullCaption(event) ?? event.actor;
   }
+  function cappedWorkerCaption(event) {
+    return (
+      event.kind === 'unparsed' &&
+      event.actor !== null &&
+      event.iconResources.length === 0 &&
+      event.rawText === `${event.actor}は既にワーカー6個を持っています`
+    );
+  }
+  function cappedPurchaseWorker(outcome, previous = state()) {
+    const action = outcome.row.action;
+    const next = outcome.frame.snapshot.state;
+    const actor = previous.currentPlayer;
+    return (
+      action.type === 'build' &&
+      buildings.get(action.id)?.effects.filter((effect) => effect.type === 'worker').length === 1 &&
+      previous.players[actor].workers === 6 &&
+      next.players[actor].workers === 6 &&
+      next.currentPlayer === actor &&
+      settledBuild(outcome, previous)
+    );
+  }
   function settledBuild(outcome, previous = state()) {
     const after = outcome.frame.snapshot.state;
     const before = previous.pending;
@@ -1725,17 +1746,20 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   function purchaseOutcome(event, events, witness) {
     const actor = actorId(event.actor);
     const remaining = events.slice(events.indexOf(event) + 1);
+    const workerCaps = remaining.filter(cappedWorkerCaption);
     const gains = {};
     if (
       actor < 0 ||
       events.filter((item) => ['build', 'monument'].includes(item.kind)).length !== 1 ||
-      remaining.some((item) => purchaseActor(item) !== event.actor)
+      remaining.some((item) => purchaseActor(item) !== event.actor) ||
+      workerCaps.length > 1
     )
       fail('Purchase source requires one purchased card and one actor');
     // Earlier operations and claims have already been validated. Only the
     // unconsumed suffix can constrain this purchase's trial outcome.
     for (const item of remaining) {
       if (['resourcePayment', 'build', 'monument'].includes(item.kind)) continue;
+      if (cappedWorkerCaption(item)) continue; // No worker delta or score conversion is claimed.
       if (item.kind === 'resourceGain') {
         for (const [index, amount] of resourceAmounts(item).entries())
           if (amount) {
@@ -1783,6 +1807,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       fail('Observed purchase gain is out of bounds');
     return (outcome) => {
       const task = outcome.frame.observation?.pendingTask?.type ?? null;
+      if (workerCaps.length && !cappedPurchaseWorker(outcome)) return false;
       if (remaining.some((item) => theologySkullCaption(item)))
         return (
           cappedTheologyPurchase(outcome, event, events, witness) &&
@@ -1791,7 +1816,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (task === 'anyAction' && actionScorePair(outcome.row.action.id))
         return deferredActionScoreShape(outcome, event, events, witness) !== null;
       const envelope = events.some(
-        (item) => emptyPurchasePayment(item) || architectureScoreCaption(item),
+        (item) =>
+          emptyPurchasePayment(item) || architectureScoreCaption(item) || cappedWorkerCaption(item),
       );
       if (envelope && (event.kind !== 'build' || !settledBuild(outcome))) return false;
       if (task === 'technology' && cornTechnologyPair(outcome.row.action.id) !== null)
@@ -2294,7 +2320,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               false,
               false,
               () => purchaseOutcome(event, events, witness),
-              events.some((item) => emptyPurchasePayment(item) || architectureScoreCaption(item)) ||
+              events.some(
+                (item) =>
+                  emptyPurchasePayment(item) ||
+                  architectureScoreCaption(item) ||
+                  cappedWorkerCaption(item),
+              ) ||
                 actionScorePair(ids[0]) !== null ||
                 (buildings.get(ids[0])?.effects[0]?.type === 'trade' &&
                   events.some((item) => fixedScoreCaption(item) !== null)),
@@ -2315,6 +2346,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               ),
               advanceClaimed: false,
               bonusClaimed: false,
+              workerCapped: cappedPurchaseWorker({ frame, row: { action } }, beforePurchase),
+              workerCapClaimed: false,
             };
             const receipt = queuedPurchaseShape(
               { frame, row: { action } },
@@ -2439,6 +2472,16 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             const theologyBonus = theologySkullCaption(event);
             const body =
               event.actor === null ? event.rawText : event.rawText.slice(event.actor.length);
+            if (cappedWorkerCaption(event)) {
+              if (
+                context.purchase?.actor !== actorId(event.actor) ||
+                !context.purchase.workerCapped ||
+                context.purchase.workerCapClaimed
+              )
+                fail('Worker cap caption has no unique matching settled purchase');
+              context.purchase.workerCapClaimed = true;
+              continue;
+            }
             const first = body.match(
               /^はスタートプレイヤースペースに(\d+)\s*を支払ってワーカーを置いた$/,
             );
