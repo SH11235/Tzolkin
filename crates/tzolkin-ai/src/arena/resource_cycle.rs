@@ -7,7 +7,7 @@ use tzolkin_core::observation::{
 };
 use tzolkin_core::{GearId, Phase, Resource, Task, TechnologyId};
 
-pub const POLICY_VERSION: &str = "resource-cycle-arena-v1";
+pub const POLICY_VERSION: &str = "resource-cycle-arena-v2";
 
 /// Changing any field requires a separately versioned hypothesis. The complete
 /// configuration is included in Numeric Arena's absolute-seat pool identity.
@@ -36,19 +36,23 @@ impl Default for ResourceCycleConfig {
 impl ResourceCycleConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self != &Self::default() {
-            return Err("Resource-cycle Arena requires its frozen v1 configuration".into());
+            return Err("Resource-cycle Arena requires its frozen v2 configuration".into());
         }
         Ok(())
     }
 }
 
-fn corn_target(o: &Observation, p: &PublicPlayer) -> f64 {
+fn feeding_need(p: &PublicPlayer) -> i64 {
     // Base feeding discounts apply to each non-fed worker, not once per player.
-    let food = if p.feed_all {
+    if p.feed_all {
         0
     } else {
         (p.workers - p.feed_workers).max(0) * (2 - p.feed_discount).max(0)
-    } as f64;
+    }
+}
+
+fn corn_target(o: &Observation, p: &PublicPlayer) -> f64 {
+    let food = feeding_need(p) as f64;
     let next = [8, 14, 21, 27]
         .into_iter()
         .find(|day| *day >= o.round && !o.food_days.contains(day));
@@ -196,7 +200,15 @@ pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Deci
     } else {
         None
     };
-    let reserve = investment.as_ref().map_or([0; 3], |i| i.reserve);
+    let urgent_food = [8, 14, 21, 27]
+        .into_iter()
+        .find(|day| *day >= o.round && !o.food_days.contains(day))
+        .is_some_and(|day| day - o.round <= 2 && p.resources[0] < feeding_need(p));
+    let reserve = if urgent_food {
+        [0; 3]
+    } else {
+        investment.as_ref().map_or([0; 3], |i| i.reserve)
+    };
     let market = market_value(p, target, &reserve, &config.weights);
     let mut best = None;
     for legal in &o.legal_actions {
@@ -522,6 +534,22 @@ mod tests {
         ]
         .into_iter()
         .collect();
+        let o = observe(&state, 1).unwrap();
+        let decision = choose_move(&o, &config).unwrap();
+        assert_eq!(
+            o.legal_actions
+                .iter()
+                .find(|row| row.r#move == decision.r#move)
+                .unwrap()
+                .action,
+            TypedAction::Trade {
+                resource: Resource::Wood,
+                buy: false,
+            }
+        );
+        state = apply_move(&state, decision.r#move).unwrap();
+        assert_eq!(state.players[1].resources[&Resource::Corn], 4);
+        assert_eq!(state.players[1].resources[&Resource::Wood], 0);
         let o = observe(&state, 1).unwrap();
         let decision = choose_move(&o, &config).unwrap();
         assert_eq!(
