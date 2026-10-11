@@ -498,6 +498,12 @@ mod tests {
         changed.players[o.actor].resources[0] += 1;
         assert!(altered.choose_move(0, &changed).is_err());
         assert!(altered.choose_move(0, &o).is_err());
+        // A fresh explicit game moves the same immutable model and no history.
+        let checksum = altered.policy().checksum().to_owned();
+        let mut fresh = GuardedDeployment::new(altered.into_policy(), Default::default()).unwrap();
+        assert_eq!(fresh.policy().checksum(), checksum);
+        fresh.on_callback(0, &o).unwrap();
+        assert!(!fresh.choose_move(0, &o).unwrap().trade.unwrap().overridden);
     }
     #[test]
     fn preserves_bits_and_distinct_source_roles() {
