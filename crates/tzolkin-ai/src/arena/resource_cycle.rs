@@ -7,7 +7,7 @@ use tzolkin_core::observation::{
 };
 use tzolkin_core::{GearId, Phase, Resource, Task, TechnologyId};
 
-pub const POLICY_VERSION: &str = "resource-cycle-arena-v2";
+pub const POLICY_VERSION: &str = "resource-cycle-arena-v3";
 
 /// Changing any field requires a separately versioned hypothesis. The complete
 /// configuration is included in Numeric Arena's absolute-seat pool identity.
@@ -36,7 +36,7 @@ impl Default for ResourceCycleConfig {
 impl ResourceCycleConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self != &Self::default() {
-            return Err("Resource-cycle Arena requires its frozen v2 configuration".into());
+            return Err("Resource-cycle Arena requires its frozen v3 configuration".into());
         }
         Ok(())
     }
@@ -51,13 +51,16 @@ fn feeding_need(p: &PublicPlayer) -> i64 {
     }
 }
 
+fn next_unprocessed_food_day(o: &Observation) -> Option<i64> {
+    [8, 14, 21, 27]
+        .into_iter()
+        .find(|day| !o.food_days.contains(day))
+}
+
 fn corn_target(o: &Observation, p: &PublicPlayer) -> f64 {
     let food = feeding_need(p) as f64;
-    let next = [8, 14, 21, 27]
-        .into_iter()
-        .find(|day| *day >= o.round && !o.food_days.contains(day));
-    let reserve = match next.map(|day| day - o.round) {
-        Some(0..=2) => food,
+    let reserve = match next_unprocessed_food_day(o).map(|day| day - o.round) {
+        Some(..=2) => food,
         Some(3..=5) => food * 0.6,
         _ => 2.0,
     };
@@ -200,9 +203,7 @@ pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Deci
     } else {
         None
     };
-    let urgent_food = [8, 14, 21, 27]
-        .into_iter()
-        .find(|day| *day >= o.round && !o.food_days.contains(day))
+    let urgent_food = next_unprocessed_food_day(o)
         .is_some_and(|day| day - o.round <= 2 && p.resources[0] < feeding_need(p));
     let reserve = if urgent_food {
         [0; 3]
@@ -560,6 +561,50 @@ mod tests {
                 .action,
             TypedAction::Skip
         );
+        // Double rotation can pass day 8 before its feeding is processed.
+        state.food_days.clear();
+        state.players[1].workers = 5;
+        state.players[1].resources.insert(Resource::Wood, 1);
+        for (round, corn, expected) in [
+            (
+                9,
+                9,
+                TypedAction::Trade {
+                    resource: Resource::Wood,
+                    buy: false,
+                },
+            ),
+            (9, 10, TypedAction::Skip),
+            (5, 6, TypedAction::Skip),
+        ] {
+            state.round = round;
+            state.players[1].resources.insert(Resource::Corn, corn);
+            let o = observe(&state, 1).unwrap();
+            assert_eq!(next_unprocessed_food_day(&o), Some(8));
+            assert_eq!(
+                corn_target(&o, &o.players[1]),
+                if round == 9 { 13.0 } else { 9.0 }
+            );
+            let decision = choose_move(&o, &config).unwrap();
+            assert_eq!(
+                o.legal_actions
+                    .iter()
+                    .find(|row| row.r#move == decision.r#move)
+                    .unwrap()
+                    .action,
+                expected
+            );
+            let after = apply_move(&state, decision.r#move).unwrap();
+            if expected != TypedAction::Skip {
+                assert_eq!(after.players[1].resources[&Resource::Corn], 11);
+                assert_eq!(after.players[1].resources[&Resource::Wood], 0);
+            } else {
+                assert_eq!(after.players[1].resources[&Resource::Corn], corn);
+                assert_eq!(after.players[1].resources[&Resource::Wood], 1);
+            }
+        }
+        state.round = 7;
+        state.players[1].workers = 3;
         state.players[1].feed_discount = 1;
         let o = observe(&state, 1).unwrap();
         assert_eq!(corn_target(&o, &o.players[1]), 6.0);
