@@ -698,7 +698,7 @@ export function chooseCpu(
         decision.observationKey !== observationKey ||
         (mode === 'nn'
           ? !guardedDecisionMatches(decision, callback!)
-          : decision.policyVersion !== 'heuristic-v1')
+          : decision.policyVersion !== 'heuristic-v2')
       )
         throw new Error('Invalid decision binding');
       callback?.timing?.chosen();

@@ -5,8 +5,8 @@ use tzolkin_core::catalog::wealth;
 use tzolkin_core::observation::{LegalAction, Observation, TypedAction};
 use tzolkin_core::{Effect, GameMove, GearId, Phase, Resource, StartingWealth, TurnMode};
 
-pub const POLICY_VERSION: &str = "corn-first-setup-v1";
-pub const UXMAL_OPENING_POLICY_VERSION: &str = "corn-first-uxmal-opening-v1";
+pub const POLICY_VERSION: &str = "corn-first-setup-v2";
+pub const UXMAL_OPENING_POLICY_VERSION: &str = "corn-first-uxmal-opening-v2";
 
 fn direct_corn(tile: &StartingWealth) -> i64 {
     tile.resources.get(&Resource::Corn).copied().unwrap_or(0)

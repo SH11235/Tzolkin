@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tzolkin_core::GameMove;
 use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, observation_key};
 
-pub const POLICY_VERSION: &str = "heuristic-v1";
+pub const POLICY_VERSION: &str = "heuristic-v2";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {

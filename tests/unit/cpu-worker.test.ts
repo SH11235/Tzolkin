@@ -41,7 +41,7 @@ const observation: Observation = {
 const decision: CpuDecision = {
   actor: 1,
   observationKey: 'expected',
-  policyVersion: 'heuristic-v1',
+  policyVersion: 'heuristic-v2',
   move: { type: 'endTurn' },
 };
 const model: CpuModelMetadata = {
