@@ -1088,6 +1088,162 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
   assert.match(future.manifest.blocked.reason, /reveal pool was not consumed/);
 });
 
+test('binds empty payment and architecture captions to one settled purchase receipt', () => {
+  const fixture = () => {
+    const initial = clone(saved.core.initialFrame);
+    const player = initial.snapshot.state.players[0];
+    player.resources = { corn: 8, wood: 2, stone: 1, gold: 2, skull: 0 };
+    player.score = 7;
+    player.technologies.architecture = 3;
+    initial.observation.pendingTask = { type: 'build', remaining: 1 };
+    initial.snapshot.state.pending = { task: clone(initial.observation.pendingTask), after: [] };
+    initial.observation.legalActions = [false, true].map((architecture) => ({
+      action: { type: 'build', id: 'b28', cost: [0, 0, 1, 0, 0], architecture },
+      move: { type: 'choose', choiceId: `build:${architecture}` },
+    }));
+    const frames = [];
+    // Injected core outcomes test receipt admission, not the catalog's rule implementation.
+    const apply = (request) => {
+      const next = clone(initial);
+      next.snapshot.state = clone(request.state);
+      const actor = next.snapshot.state.players[0];
+      const bonus = request.move.choiceId === 'build:true';
+      actor.resources.stone--;
+      actor.resources.corn += bonus ? 1 : 0;
+      actor.score += 6 + (bonus ? 2 : 0);
+      actor.buildings.push('b28');
+      next.snapshot.state.pending = null;
+      next.observation.pendingTask = null;
+      next.observation.legalActions = [];
+      frames.push(next);
+      return next;
+    };
+    const messages = [
+      { raw_text: 'Aはを支払った', icons: [{ classes: 'tz_icon resource_stone' }] },
+      { raw_text: 'Aはを支払った' },
+      { raw_text: 'Aは建物を建てた' },
+      { raw_text: 'Aはを獲得した', icons: [{ classes: 'tz_icon resource_corn' }] },
+      { raw_text: 'Aは2点を獲得した' },
+      { raw_text: 'Aは建築を1レベル進めた' },
+      { raw_text: '建築技術ボーナス: Aは3点を獲得した' },
+      { raw_text: 'Aは3点を獲得した' },
+    ];
+    const value = input();
+    replaceEvents(value, [[6, messages]]);
+    value.witness.initial = clone(initial.snapshot.state);
+    value.witness.witnesses = [
+      {
+        actionId: 6,
+        buildings: ['b28'],
+        pendingTask: null,
+        expected: { players: [{ resources: { corn: 9, stone: 0 } }, {}, {}, {}] },
+      },
+    ];
+    return { initial, apply, messages, value, frames };
+  };
+  const f = fixture();
+  const accepted = decode(f.value, dispatcher(f.initial, f.apply));
+  assert.equal(accepted.manifest.blocked, null);
+  assert.equal(accepted.record.steps.length, 1);
+  assert.equal(accepted.record.steps[0].move.choiceId, 'build:true');
+  const final = f.frames.at(-1).snapshot.state.players[0];
+  assert.equal(final.technologies.architecture, 3);
+  assert.equal(final.score, 15);
+  assert.equal(accepted.manifest.trainingReady, false);
+  // The prefixed ordinary construction bonus claims the same actual score ledger.
+  const ordinary = fixture();
+  ordinary.messages[4].raw_text = '建築技術ボーナス: Aは2点を獲得した';
+  ordinary.messages[6].raw_text = 'Aは3点を獲得した';
+  replaceEvents(ordinary.value, [[6, ordinary.messages]]);
+  ordinary.value.witness.witnesses = [{ actionId: 6, buildings: ['b28'] }];
+  assert.equal(
+    decode(ordinary.value, dispatcher(ordinary.initial, ordinary.apply)).manifest.blocked,
+    null,
+  );
+  for (const mutate of [
+    (f) => {
+      f.messages[6].raw_text = '建築技術ボーナス: Bは3点を獲得した';
+    },
+    (f) => {
+      f.messages.push(clone(f.messages[6]));
+    },
+    (f) => {
+      f.messages.push(clone(f.messages[5]));
+    },
+    (f) => {
+      f.messages[1].raw_text = 'Aは1を支払った';
+    },
+    (f) => {
+      f.messages[6].raw_text = '建築技術ボーナス: Aは4点を獲得した';
+    },
+    (f) => {
+      f.messages[7].raw_text = 'Aは2点を獲得した';
+    },
+    (f) => {
+      f.initial.observation.legalActions = f.initial.observation.legalActions.filter(
+        (row) => row.action.architecture,
+      );
+      f.messages[7].raw_text = 'Aは2点を獲得した';
+    },
+    (f) => {
+      f.messages.splice(2, 1);
+    },
+    (f) => {
+      f.initial.observation.pendingTask.type = 'resource';
+      f.initial.snapshot.state.pending.task.type = 'resource';
+    },
+    (f) => {
+      f.value.witness.catalogHash = '0000000000000000';
+    },
+    (f) => {
+      f.initial.observation.legalActions.forEach((row) => {
+        row.action.id = 'b06';
+      });
+    },
+  ]) {
+    const f = fixture();
+    mutate(f);
+    replaceEvents(f.value, [[6, f.messages]]);
+    f.value.witness.initial = clone(f.initial.snapshot.state);
+    f.value.witness.witnesses = [
+      { actionId: 6, buildings: [f.initial.observation.legalActions[0].action.id] },
+    ];
+    const rejected = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.notEqual(rejected.manifest.blocked, null);
+    assert.equal(rejected.record.steps.length, 0);
+    assert.equal(rejected.manifest.audit.filter((row) => row.action?.type === 'build').length, 0);
+  }
+  // A real selected advance at the cap keeps its existing legal-choice path.
+  const choice = fixture();
+  choice.initial.observation.pendingTask = { type: 'technology', remaining: 1, free: true };
+  choice.initial.snapshot.state.pending.task = clone(choice.initial.observation.pendingTask);
+  choice.initial.observation.legalActions = [
+    {
+      action: { type: 'technology', technology: 'architecture' },
+      move: { type: 'choose', choiceId: 'technology:architecture' },
+    },
+  ];
+  replaceEvents(choice.value, [
+    [6, [{ raw_text: 'Aは建築を1レベル進めた' }, { raw_text: 'Aは3点を獲得した' }]],
+  ]);
+  choice.value.witness.initial = clone(choice.initial.snapshot.state);
+  const chosen = decode(
+    choice.value,
+    dispatcher(choice.initial, (request) => {
+      assert.equal(request.move.choiceId, 'technology:architecture');
+      const next = clone(choice.initial);
+      next.snapshot.state = clone(request.state);
+      next.snapshot.state.players[0].score += 3;
+      next.snapshot.state.pending = null;
+      next.observation.pendingTask = null;
+      next.observation.legalActions = [];
+      return next;
+    }),
+  );
+  assert.equal(chosen.manifest.blocked, null);
+  assert.equal(chosen.record.steps.length, 1);
+});
+
 test('settles a queued purchase only through the next actual technology source, or rolls back both macros', () => {
   // Injected frames exercise receipt admission/settlement, not game-rule scoring.
   const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
