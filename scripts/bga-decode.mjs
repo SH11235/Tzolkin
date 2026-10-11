@@ -16,6 +16,7 @@ const MAX_BYTES = 16 * 1024 * 1024;
 const MAX_STEPS = 4000;
 const MAX_CALLS = 12000;
 const RESOURCES = ['corn', 'wood', 'stone', 'gold', 'skull'];
+const TECHNOLOGIES = ['agriculture', 'extraction', 'architecture', 'theology'];
 const TEMPLES = {
   Chaac: 'chaac',
   Quetzalcoatl: 'quetzalcoatl',
@@ -668,12 +669,15 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         'score',
         ...RESOURCES.map((resource) => `resource:${resource}`),
         ...['chaac', 'quetzalcoatl', 'kukulkan'].map((temple) => `temple:${temple}`),
+        ...TECHNOLOGIES.map((technology) => `technology:${technology}`),
       ]) {
         const delta = field.startsWith('resource:')
           ? next.resources[field.slice(9)] - player.resources[field.slice(9)]
           : field.startsWith('temple:')
             ? next.temples[field.slice(7)] - player.temples[field.slice(7)]
-            : next[field] - player[field];
+            : field.startsWith('technology:')
+              ? next.technologies[field.slice(11)] - player.technologies[field.slice(11)]
+              : next[field] - player[field];
         const cost = field.startsWith('resource:')
           ? (player.id === previous.currentPlayer
               ? resourceCost[RESOURCES.indexOf(field.slice(9))]
@@ -838,7 +842,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             gains[field] = (gains[field] ?? 0) + amount;
           }
       } else if (item.kind === 'workerGain') gains.workers = (gains.workers ?? 0) + 1;
-      else {
+      else if (item.kind === 'technology') {
+        if (item.detail.steps !== 1 || !TECHNOLOGIES.includes(item.detail.technology))
+          fail('Purchase source has an unsupported technology advance');
+        const field = `technology:${item.detail.technology}`;
+        gains[field] = (gains[field] ?? 0) + 1;
+      } else {
         const temple =
           item.kind === 'unparsed'
             ? item.rawText
@@ -873,11 +882,14 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       for (const [field, amount] of Object.entries(gains)) {
         const resource = field.startsWith('resource:') ? field.slice(9) : null;
         const temple = field.startsWith('temple:') ? field.slice(7) : null;
+        const technology = field.startsWith('technology:') ? field.slice(11) : null;
         const delta = resource
           ? next.resources[resource] - previous.resources[resource]
           : temple
             ? next.temples[temple] - previous.temples[temple]
-            : next[field] - previous[field];
+            : technology
+              ? next.technologies[technology] - previous.technologies[technology]
+              : next[field] - previous[field];
         const knownCost = resource ? cost[RESOURCES.indexOf(resource)] : 0;
         const key = `${actor}:${field}:1`;
         const gross = (context.effects[key] ?? 0) + Math.max(0, delta + knownCost);
@@ -1189,11 +1201,17 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             alignActor(event.actor);
             if (detail.steps !== 1)
               fail('Multiple technology advances need separate observed choices');
-            choose(
-              (action) => action.type === 'technology' && action.technology === detail.technology,
-              'technology advance',
-            );
-            pay(payments);
+            const field = `technology:${detail.technology}`;
+            if (unclaimed(event, field) < 1) {
+              choose(
+                (action) => action.type === 'technology' && action.technology === detail.technology,
+                'technology advance',
+              );
+              pay(payments);
+            }
+            // A fixed effect may already have advanced this track. Claim its
+            // same-macro delta once; a genuine choice at level three has no level delta.
+            if (unclaimed(event, field) > 0) automatic(event, field, 1);
           } else if (event.kind === 'trade') {
             alignActor(event.actor);
             const buy = detail.from?.resource === 'corn';
