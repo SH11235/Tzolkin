@@ -4,7 +4,9 @@ use crate::public_model::{self, PublicPolicyModel};
 use crate::public_policy_baseline::{self, InitializedResidualBaseline, ResidualFitConfig};
 use crate::public_policy_episode::AppliedActorStep;
 use crate::public_policy_paired_long::PairedRlParent;
-use crate::public_policy_update::{self, Deltas, NumericReport, OneStepConfig, hash};
+use crate::public_policy_update::{
+    self, Deltas, NumericReport, OneStepConfig, PhaseTimer, TimedPhase, Untimed, hash, timed,
+};
 use crate::public_rl_artifact::InitializedPublicRlPolicy;
 use crate::public_rl_mixed_cohort::{COHORT_CONTRACT, ValidatedMixedRlCohort};
 use crate::public_rl_mixed_episode::EPISODE_CONTRACT;
@@ -537,6 +539,33 @@ pub(crate) fn prepare_numeric(
     ),
     String,
 > {
+    prepare_numeric_timed(
+        model,
+        residual,
+        members,
+        counts,
+        actor_config,
+        critic_config,
+        &mut Untimed,
+    )
+}
+
+pub(crate) fn prepare_numeric_timed<T: PhaseTimer>(
+    model: &PublicPolicyModel,
+    residual: &[f32],
+    members: &[MixedNumericMember<'_>; 4],
+    counts: [usize; 3],
+    actor_config: &OneStepConfig,
+    critic_config: &ResidualFitConfig,
+    timer: &mut T,
+) -> Result<
+    (
+        Deltas,
+        public_policy_update::Proposal,
+        public_policy_baseline::NumericResidualFit,
+    ),
+    String,
+> {
     actor_config.validate()?;
     critic_config.check_callbacks(counts[0])?;
     model.validate()?;
@@ -555,7 +584,7 @@ pub(crate) fn prepare_numeric(
             if step.actor() != e.learner || step.observation().players.len() != e.players {
                 return Err("Mixed update opponent/absolute learner actor mismatch".into());
             }
-            public_policy_update::accumulate_step_with_baseline(
+            public_policy_update::accumulate_step_with_baseline_timed(
                 model,
                 step,
                 actor_config,
@@ -568,30 +597,36 @@ pub(crate) fn prepare_numeric(
                         &PublicStateContext::from_observation(o)?,
                     )
                 },
+                timer,
             )?;
         }
-        add_learner_actor(
-            &mut gradient,
-            &own,
-            e.learner,
-            e.players,
-            e.learner,
-            e.coefficient,
-        )?;
+        timed(timer, TimedPhase::ActorAggregate, |_| {
+            add_learner_actor(
+                &mut gradient,
+                &own,
+                e.learner,
+                e.players,
+                e.learner,
+                e.coefficient,
+            )
+        })?;
     }
     if observed != counts {
         return Err("Mixed update sealed learner count mismatch".into());
     }
-    let actor =
-        public_policy_update::propose_parameters(model.parameters(), &gradient, actor_config)?;
-    let critic = public_policy_baseline::fit_applied(
-        residual,
-        members
-            .iter()
-            .flat_map(|e| e.steps.iter().map(AppliedActorStep::reborrow)),
-        counts[0],
-        critic_config,
-    )?;
+    let actor = timed(timer, TimedPhase::ActorProposal, |_| {
+        public_policy_update::propose_parameters(model.parameters(), &gradient, actor_config)
+    })?;
+    let critic = timed(timer, TimedPhase::CriticFit, |_| {
+        public_policy_baseline::fit_applied(
+            residual,
+            members
+                .iter()
+                .flat_map(|e| e.steps.iter().map(AppliedActorStep::reborrow)),
+            counts[0],
+            critic_config,
+        )
+    })?;
     Ok((deltas, actor, critic))
 }
 fn add_learner_actor(

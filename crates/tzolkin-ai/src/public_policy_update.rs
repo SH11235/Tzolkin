@@ -33,6 +33,57 @@ pub const MAX_ALL_LOG_DELTA: f64 = 0.01;
 pub const MAX_CANDIDATE_ROWS: usize = 4 * MAX_RESERVED_CANDIDATE_ROWS;
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+pub(crate) enum TimedPhase {
+    WholeCall,
+    Preflight,
+    ReservationPublication,
+    Collection(usize),
+    RecordPublication(usize),
+    Audit(usize),
+    CohortPublication,
+    GradientStart,
+    NumericPreparation,
+    ActorEncode,
+    ActorForward,
+    ActorTrace,
+    ActorBaseline,
+    ActorBackward,
+    ActorAggregate,
+    ActorProposal,
+    CriticFit,
+    ProposalReadback,
+    Resolve,
+    FinalGuards,
+}
+
+pub(crate) trait PhaseTimer {
+    type Span;
+    fn enter(&mut self, phase: TimedPhase) -> Self::Span;
+    fn returned(&mut self, span: Self::Span, error: bool);
+}
+
+pub(crate) struct Untimed;
+impl PhaseTimer for Untimed {
+    type Span = ();
+    #[inline]
+    fn enter(&mut self, _: TimedPhase) {}
+    #[inline]
+    fn returned(&mut self, _: (), _: bool) {}
+}
+
+#[inline]
+pub(crate) fn timed<T: PhaseTimer, R>(
+    timer: &mut T,
+    phase: TimedPhase,
+    operation: impl FnOnce(&mut T) -> Result<R, String>,
+) -> Result<R, String> {
+    let span = timer.enter(phase);
+    let result = operation(timer);
+    timer.returned(span, result.is_err());
+    result
+}
+
 /// Bounds only this API's reconstructed forward rows; caller qualification and
 /// collection/audit work are separate. No raw/Deserialize configuration route.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -602,6 +653,29 @@ pub(crate) fn accumulate_step_with_baseline(
     deltas: &mut Deltas,
     baseline: impl FnOnce(&tzolkin_core::observation::Observation) -> Result<f64, String>,
 ) -> Result<(), String> {
+    accumulate_step_with_baseline_timed(
+        model,
+        step,
+        config,
+        own,
+        counts,
+        deltas,
+        baseline,
+        &mut Untimed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accumulate_step_with_baseline_timed<T: PhaseTimer>(
+    model: &PublicPolicyModel,
+    step: AppliedActorStep<'_>,
+    config: &OneStepConfig,
+    own: &mut [f64],
+    counts: &mut [usize; 3],
+    deltas: &mut Deltas,
+    baseline: impl FnOnce(&tzolkin_core::observation::Observation) -> Result<f64, String>,
+    timer: &mut T,
+) -> Result<(), String> {
     let observation = step.observation();
     let count = observation.legal_actions.len();
     if !(1..=MAX_CANDIDATES).contains(&count)
@@ -618,35 +692,49 @@ pub(crate) fn accumulate_step_with_baseline(
     if counts[1] > config.max_candidate_rows {
         return Err("One-step row budget exceeded before forward".into());
     }
-    public_model::validate_contract(observation)?;
-    let encoder = FeatureEncoder::new_public(observation)?;
-    let rows = (0..count)
-        .map(|index| encoder.encode_legal_tagged(index))
-        .collect::<Result<Vec<_>, _>>()?;
-    let cache = ScalarPolicyPullback::new(model, &rows)?;
-    let likelihood = BehaviorLikelihood::from_logits(cache.logits(), step.chosen_index())?;
-    if full_logits_digest(cache.logits()) != step.logits_digest()
-        || likelihood.distribution_digest() != step.distribution_digest()
-        || likelihood.mass_ticks()[step.chosen_index()] != step.behavior_mass_ticks()
-        || likelihood.smooth().probabilities()[step.chosen_index()].to_bits()
-            != step.nominal_probability().to_bits()
-        || likelihood.behavior_probability().to_bits() != step.behavior_probability().to_bits()
-        || likelihood.behavior_log_probability().to_bits() != step.behavior_logp().to_bits()
-    {
-        return Err("Old Scalar logits/nominal/tick trace mismatch".into());
-    }
-    deltas.observe(&likelihood)?;
+    let rows = timed(timer, TimedPhase::ActorEncode, |_| {
+        public_model::validate_contract(observation)?;
+        let encoder = FeatureEncoder::new_public(observation)?;
+        (0..count)
+            .map(|index| encoder.encode_legal_tagged(index))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    let cache = timed(timer, TimedPhase::ActorForward, |_| {
+        ScalarPolicyPullback::new(model, &rows)
+    })?;
+    let likelihood = timed(timer, TimedPhase::ActorTrace, |_| {
+        let likelihood = BehaviorLikelihood::from_logits(cache.logits(), step.chosen_index())?;
+        if full_logits_digest(cache.logits()) != step.logits_digest()
+            || likelihood.distribution_digest() != step.distribution_digest()
+            || likelihood.mass_ticks()[step.chosen_index()] != step.behavior_mass_ticks()
+            || likelihood.smooth().probabilities()[step.chosen_index()].to_bits()
+                != step.nominal_probability().to_bits()
+            || likelihood.behavior_probability().to_bits() != step.behavior_probability().to_bits()
+            || likelihood.behavior_log_probability().to_bits() != step.behavior_logp().to_bits()
+        {
+            return Err("Old Scalar logits/nominal/tick trace mismatch".into());
+        }
+        deltas.observe(&likelihood)?;
+        Ok(likelihood)
+    })?;
     let target = step.return_target();
     if !target.is_finite() || !(0.0..=1.0).contains(&target) {
         return Err("Invalid terminal winner-share return".into());
     }
-    let baseline = baseline(observation)?;
-    if !baseline.is_finite() || !(0.0..=1.0).contains(&baseline) {
-        return Err("Invalid frozen state baseline".into());
-    }
+    let baseline = timed(timer, TimedPhase::ActorBaseline, |_| {
+        let value = baseline(observation)?;
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err("Invalid frozen state baseline".into());
+        }
+        Ok(value)
+    })?;
     let mut dlogits = vec![0.0; count];
-    likelihood.weighted_logit_gradient(likelihood.smooth(), target - baseline, &mut dlogits)?;
-    cache.accumulate_parameter_gradient(&dlogits, own)
+    timed(timer, TimedPhase::ActorTrace, |_| {
+        likelihood.weighted_logit_gradient(likelihood.smooth(), target - baseline, &mut dlogits)
+    })?;
+    timed(timer, TimedPhase::ActorBackward, |_| {
+        cache.accumulate_parameter_gradient(&dlogits, own)
+    })
 }
 fn closure(
     initial: &InitializedPublicRlPolicy,
