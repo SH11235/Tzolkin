@@ -14,6 +14,11 @@ use crate::policy::{self, BorrowedPolicy, HIDDEN, NumericPolicyDistribution, PAR
 
 mod current_mixed;
 pub use current_mixed::CurrentMixedIdentity;
+mod guarded;
+pub use guarded::{
+    GUARDED_DEPLOYMENT_VERSION, GuardedDeployment, GuardedDeploymentDecision, GuardedTradeTrace,
+    MAX_GAME_CALLBACKS,
+};
 
 pub const DEPLOYMENT_SCHEMA: &str = "tzolkin-numeric-policy-deployment-v1";
 pub const MAX_DEPLOYMENT_BYTES: usize = 1024 * 1024;
@@ -415,6 +420,84 @@ mod tests {
     fn encoded(mut wire: Wire) -> Vec<u8> {
         wire.checksum = wire.expected_checksum().unwrap();
         serde_json::to_vec(&wire).unwrap()
+    }
+    #[test]
+    fn guarded_deployment_exits_repeated_trade_and_binds_all_callbacks() {
+        use tzolkin_core::observation::observe;
+        use tzolkin_core::{Pending, Phase, Resource, Task, apply_move};
+        let mut state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            state = apply_move(&state, o.legal_actions[0].r#move.clone()).unwrap();
+        }
+        state.players[state.current_player]
+            .resources
+            .insert(Resource::Corn, 3);
+        state.players[state.current_player]
+            .resources
+            .insert(Resource::Wood, 3);
+        state.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        let o = observe(&state, state.current_player).unwrap();
+        let loaded = LoadedDeployment::load(&encoded(wire())).unwrap();
+        let raw = loaded.choose_move(&o).unwrap();
+        let mut session = GuardedDeployment::new(loaded, Default::default()).unwrap();
+        session.on_callback(0, &o).unwrap();
+        let first = session.choose_move(0, &o).unwrap();
+        assert_eq!(first.decision.r#move, raw.r#move);
+        assert!(!first.trade.unwrap().overridden);
+        session.on_callback(1, &o).unwrap();
+        let repeated = session.choose_move(1, &o).unwrap();
+        let skip = crate::trade_guard::skip_index(&o).unwrap();
+        assert_eq!(repeated.decision.r#move, o.legal_actions[skip].r#move);
+        assert!(repeated.trade.unwrap().repeat_seen);
+        assert_ne!(repeated.raw_legal_index, repeated.effective_legal_index);
+        session.on_callback(2, &o).unwrap();
+        assert!(
+            !session
+                .choose_move(2, &o)
+                .unwrap()
+                .trade
+                .unwrap()
+                .overridden
+        );
+        // Every seat notification breaks an interrupted actor's episode even
+        // when this model did not choose that other seat's action.
+        state.current_player = (state.current_player + 1) % 3;
+        let other = observe(&state, state.current_player).unwrap();
+        session.on_callback(3, &other).unwrap();
+        session.on_callback(4, &o).unwrap();
+        assert!(
+            !session
+                .choose_move(4, &o)
+                .unwrap()
+                .trade
+                .unwrap()
+                .overridden
+        );
+        assert!(session.choose_move(4, &o).is_err());
+        assert!(session.on_callback(5, &o).is_err());
+        let mut stale = GuardedDeployment::new(
+            LoadedDeployment::load(&encoded(wire())).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(stale.on_callback(1, &o).is_err());
+        assert!(stale.on_callback(0, &o).is_err());
+        let mut altered = GuardedDeployment::new(
+            LoadedDeployment::load(&encoded(wire())).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        altered.on_callback(0, &o).unwrap();
+        let mut changed = o.clone();
+        changed.players[o.actor].resources[0] += 1;
+        assert!(altered.choose_move(0, &changed).is_err());
+        assert!(altered.choose_move(0, &o).is_err());
     }
     #[test]
     fn preserves_bits_and_distinct_source_roles() {
