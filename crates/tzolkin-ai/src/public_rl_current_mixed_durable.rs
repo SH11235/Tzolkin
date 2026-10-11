@@ -504,6 +504,71 @@ struct BatchPlan {
     plan_raw: Vec<u8>,
     reservation: Reservation,
 }
+
+/// Sealed learner-only counts from one validated GradientStart. Candidate rows
+/// and singletons are separate diagnostics; neither is an extra callback. These
+/// counts do not measure audit work, all-seat decisions or native forward calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentMixedOwnCounts {
+    pub callbacks: u64,
+    pub candidate_rows: u64,
+    pub singletons: u64,
+}
+
+/// Resolved whole-four cohorts in one local segment. Missing counts mean that
+/// no GradientStart was saved, not that the cohort had zero learner callbacks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentMixedResolvedOwnCounts {
+    pub cohorts: u64,
+    pub cohorts_without_counts: u64,
+    pub own: CurrentMixedOwnCounts,
+}
+impl CurrentMixedResolvedOwnCounts {
+    fn add(&mut self, counts: Option<CurrentMixedOwnCounts>) {
+        // At most 64 local attempts, each bounded by the actor/critic configs.
+        self.cohorts += 1;
+        if let Some(counts) = counts {
+            self.own.callbacks += counts.callbacks;
+            self.own.candidate_rows += counts.candidate_rows;
+            self.own.singletons += counts.singletons;
+        } else {
+            self.cohorts_without_counts += 1;
+        }
+    }
+}
+
+/// Output-only local counters. Only Updated contributes to the updated bucket;
+/// NoChange, failed and abandoned cohorts never imply an admitted numeric step.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentMixedOwnDecisionCounters {
+    pub updated: CurrentMixedResolvedOwnCounts,
+    pub no_change: CurrentMixedResolvedOwnCounts,
+    pub failed: CurrentMixedResolvedOwnCounts,
+    pub abandoned: CurrentMixedResolvedOwnCounts,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CurrentMixedOwnResolution {
+    Updated,
+    NoChange,
+    Failed,
+    Abandoned,
+}
+
+/// Borrows no policy authority. Counts remain known for an abandoned in-flight
+/// gradient, but do not establish whether its numeric work returned or applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CurrentMixedResolvedOwnReceipt {
+    pub attempt: u64,
+    pub outcome: CurrentMixedOwnResolution,
+    pub own: Option<CurrentMixedOwnCounts>,
+}
+
 struct Progress {
     started: bool,
     phase: Phase,
@@ -523,6 +588,9 @@ struct Progress {
     cohort: Option<FilePin>,
     unknown_work: bool,
     outcome: Option<String>,
+    own_decisions: CurrentMixedOwnDecisionCounters,
+    active_own: Option<CurrentMixedOwnCounts>,
+    last_resolved_own: Option<CurrentMixedResolvedOwnReceipt>,
 }
 impl Progress {
     fn parent_count(&self) -> Result<u64, String> {
@@ -578,6 +646,9 @@ impl Progress {
             cohort: None,
             unknown_work: false,
             outcome: None,
+            own_decisions: CurrentMixedOwnDecisionCounters::default(),
+            active_own: None,
+            last_resolved_own: None,
         }
     }
     fn check(&self, e: &Event, s: &CurrentMixedRunSpec) -> Result<(), String> {
@@ -789,6 +860,32 @@ impl Progress {
     }
     fn apply(&mut self, e: &Event, s: &CurrentMixedRunSpec) -> Result<(), String> {
         self.check(e, s)?;
+        if let Event::Resolve { resolution } = e {
+            let (outcome, bucket) = match resolution {
+                Resolution::Updated { .. } => (
+                    CurrentMixedOwnResolution::Updated,
+                    &mut self.own_decisions.updated,
+                ),
+                Resolution::NoChange { .. } => (
+                    CurrentMixedOwnResolution::NoChange,
+                    &mut self.own_decisions.no_change,
+                ),
+                Resolution::Failed { .. } => (
+                    CurrentMixedOwnResolution::Failed,
+                    &mut self.own_decisions.failed,
+                ),
+                Resolution::Abandoned { .. } => (
+                    CurrentMixedOwnResolution::Abandoned,
+                    &mut self.own_decisions.abandoned,
+                ),
+            };
+            bucket.add(self.active_own);
+            self.last_resolved_own = Some(CurrentMixedResolvedOwnReceipt {
+                attempt: self.attempts - 1,
+                outcome,
+                own: self.active_own,
+            });
+        }
         match e {
             Event::Start { .. } | Event::SegmentStart { .. } => {
                 self.started = true;
@@ -804,6 +901,7 @@ impl Progress {
                 self.audited = std::array::from_fn(|_| None);
                 self.cohort = None;
                 self.outcome = None;
+                self.active_own = None;
             }
             Event::CollectStart { member } => {
                 self.phase = Phase::Collecting(*member);
@@ -841,8 +939,13 @@ impl Progress {
                     Phase::FailedReturned
                 };
             }
-            Event::GradientStart { cohort, .. } => {
+            Event::GradientStart { cohort, counts, .. } => {
                 self.cohort = Some(cohort.clone());
+                self.active_own = Some(CurrentMixedOwnCounts {
+                    callbacks: counts[0] as u64,
+                    candidate_rows: counts[1] as u64,
+                    singletons: counts[2] as u64,
+                });
                 self.phase = Phase::Updating;
                 self.unknown_work = true;
             }
@@ -953,6 +1056,9 @@ impl ReadyCurrentMixedContinuation<'_> {
     pub fn reserved_families(&self) -> &BTreeSet<String> {
         self.session.reserved_families()
     }
+    pub fn last_resolved_own_receipt(&self) -> Option<&CurrentMixedResolvedOwnReceipt> {
+        self.session.last_resolved_own_receipt()
+    }
     pub fn current_policy_for_arena(&self) -> Result<BorrowedArenaPolicy<'_>, String> {
         self.session.current_policy_for_arena()
     }
@@ -976,6 +1082,8 @@ pub struct CurrentMixedSessionStatus {
     stopped: bool,
     unknown_work_possible: bool,
     outcome: Option<String>,
+    own_decisions: CurrentMixedOwnDecisionCounters,
+    pending_own: Option<CurrentMixedOwnCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     storage_usage: Option<StorageUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1008,6 +1116,14 @@ impl CurrentMixedSessionStatus {
     }
     pub fn attempts(&self) -> u64 {
         self.attempts
+    }
+    /// Local-segment totals rebuilt by the same validated live/restore reducer.
+    pub fn own_decisions(&self) -> &CurrentMixedOwnDecisionCounters {
+        &self.own_decisions
+    }
+    /// Known sealed counts for the unresolved attempt; not credited to totals.
+    pub fn pending_own(&self) -> Option<&CurrentMixedOwnCounts> {
+        self.pending_own.as_ref()
     }
 }
 impl<'a> CurrentMixedTrainingSession<'a> {
@@ -1157,6 +1273,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
     pub fn reserved_families(&self) -> &BTreeSet<String> {
         &self.progress.consumed
     }
+    /// Latest resolved local receipt, retained while a later attempt is pending.
+    /// Reading this output metadata performs no archive scan or policy admission.
+    pub fn last_resolved_own_receipt(&self) -> Option<&CurrentMixedResolvedOwnReceipt> {
+        self.progress.last_resolved_own.as_ref()
+    }
     pub fn status(&self) -> CurrentMixedSessionStatus {
         CurrentMixedSessionStatus {
             schema: self.journal_schema(),
@@ -1182,6 +1303,13 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             stopped: self.blocked || self.progress.phase == Phase::Stopped,
             unknown_work_possible: self.progress.unknown_work,
             outcome: self.progress.outcome.clone(),
+            own_decisions: self.progress.own_decisions,
+            pending_own: self
+                .progress
+                .outcome
+                .is_none()
+                .then_some(self.progress.active_own)
+                .flatten(),
             storage_usage: self
                 .spec
                 .record_storage
@@ -2022,46 +2150,41 @@ mod tests {
         };
         (progress, s, r)
     }
+    fn gradient_events(counts: [usize; 3]) -> Vec<Event> {
+        let mut events = Vec::new();
+        for member in 0..4 {
+            events.push(Event::CollectStart { member });
+            events.push(Event::CollectReturn {
+                member,
+                record: Some(RecordPin::Raw(file_pin(
+                    &format!("record-{member}.json"),
+                    b"record",
+                ))),
+                complete: true,
+                error: None,
+            });
+        }
+        for member in 0..4 {
+            events.push(Event::AuditStart { member });
+            events.push(Event::AuditReturn {
+                member,
+                passed: true,
+                episode_checksum: Some(format!("{member:064x}")),
+                error: None,
+            });
+        }
+        events.push(Event::GradientStart {
+            cohort: file_pin("cohort.json", b"cohort"),
+            cohort_checksum: "a".repeat(64),
+            episode_checksums: std::array::from_fn(|i| format!("{i:064x}")),
+            counts,
+        });
+        events
+    }
     pub(super) fn gradient(p: &mut Progress, s: &CurrentMixedRunSpec) {
-        for member in 0..4 {
-            p.apply(&Event::CollectStart { member }, s).unwrap();
-            p.apply(
-                &Event::CollectReturn {
-                    member,
-                    record: Some(RecordPin::Raw(file_pin(
-                        &format!("record-{member}.json"),
-                        b"record",
-                    ))),
-                    complete: true,
-                    error: None,
-                },
-                s,
-            )
-            .unwrap();
+        for event in gradient_events([4, 4, 4]) {
+            p.apply(&event, s).unwrap();
         }
-        for member in 0..4 {
-            p.apply(&Event::AuditStart { member }, s).unwrap();
-            p.apply(
-                &Event::AuditReturn {
-                    member,
-                    passed: true,
-                    episode_checksum: Some(format!("{member:064x}")),
-                    error: None,
-                },
-                s,
-            )
-            .unwrap();
-        }
-        p.apply(
-            &Event::GradientStart {
-                cohort: file_pin("cohort.json", b"cohort"),
-                cohort_checksum: "a".repeat(64),
-                episode_checksums: std::array::from_fn(|i| format!("{i:064x}")),
-                counts: [4, 4, 4],
-            },
-            s,
-        )
-        .unwrap();
     }
     // Content-only reducer fixtures: no sealed owner or continuation admission.
     fn continued_parent(p: &Progress) -> CurrentMixedParentIdentity {
@@ -2103,6 +2226,182 @@ mod tests {
             r.families[i] = seed_family_id(seed);
         }
         r
+    }
+    #[test]
+    fn current_mixed_own_decision_counts_follow_resolve_and_restore() {
+        let (_, mut spec, template) = reserved();
+        spec.max_attempts = 3;
+        spec.max_successful_updates = 3;
+        spec.max_journal_entries = 64;
+        spec.validate().unwrap();
+        let initial = || Progress::initial(&template.parent, [7, 11], 9, &BTreeSet::new());
+        let own = |callbacks, candidate_rows, singletons| CurrentMixedOwnCounts {
+            callbacks,
+            candidate_rows,
+            singletons,
+        };
+        // The third attempt may stop before counts exist, or after a sealed
+        // cohort. Both kinds of pending work must leave resolved totals alone.
+        for (kind, has_counts, resolved) in [
+            (CurrentMixedOwnResolution::Failed, false, false),
+            (CurrentMixedOwnResolution::Failed, true, false),
+            (CurrentMixedOwnResolution::Failed, false, true),
+            (CurrentMixedOwnResolution::Failed, true, true),
+            (CurrentMixedOwnResolution::Abandoned, false, true),
+            (CurrentMixedOwnResolution::Abandoned, true, true),
+        ] {
+            let mut progress = initial();
+            let mut events = Vec::new();
+            let apply = |p: &mut Progress, events: &mut Vec<Event>, event: Event| {
+                p.apply(&event, &spec).unwrap();
+                events.push(event);
+            };
+            apply(
+                &mut progress,
+                &mut events,
+                Event::Start {
+                    run_spec: file_pin("run-spec.json", b"spec"),
+                    parent: Box::new(template.parent.clone()),
+                    prefix: [7, 11],
+                    next: 9,
+                    consumed: vec![],
+                },
+            );
+            for (attempt, counts) in [[4, 8, 1], [7, 14, 3]].into_iter().enumerate() {
+                let reservation = if attempt == 0 {
+                    template.clone()
+                } else {
+                    later_reservation(&progress, &template)
+                };
+                apply(
+                    &mut progress,
+                    &mut events,
+                    Event::ReserveWhole4 {
+                        reservation: Box::new(reservation),
+                    },
+                );
+                for event in gradient_events(counts) {
+                    apply(&mut progress, &mut events, event);
+                }
+                assert_eq!(progress.own_decisions.no_change.cohorts, 0);
+                let resolution = if attempt == 0 {
+                    Resolution::Updated {
+                        report: file_pin("report.json", b"report"),
+                        artifact: file_pin("artifact.json", b"artifact"),
+                        report_checksum: "b".repeat(64),
+                        artifact_checksum: "c".repeat(64),
+                    }
+                } else {
+                    Resolution::NoChange {
+                        report: file_pin("report.json", b"no change report"),
+                        report_checksum: "d".repeat(64),
+                    }
+                };
+                apply(&mut progress, &mut events, Event::Resolve { resolution });
+            }
+            let expected = CurrentMixedOwnDecisionCounters {
+                updated: CurrentMixedResolvedOwnCounts {
+                    cohorts: 1,
+                    own: own(4, 8, 1),
+                    ..Default::default()
+                },
+                no_change: CurrentMixedResolvedOwnCounts {
+                    cohorts: 1,
+                    own: own(7, 14, 3),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            assert_eq!(progress.own_decisions, expected);
+            assert_eq!(progress.last_resolved_own.unwrap().own, Some(own(7, 14, 3)));
+            let reservation = later_reservation(&progress, &template);
+            apply(
+                &mut progress,
+                &mut events,
+                Event::ReserveWhole4 {
+                    reservation: Box::new(reservation),
+                },
+            );
+            assert_eq!(progress.active_own, None); // Never the prior owner's report.
+            for event in if has_counts {
+                gradient_events([5, 20, 2])
+            } else {
+                vec![Event::CollectStart { member: 0 }]
+            } {
+                apply(&mut progress, &mut events, event);
+            }
+            assert_eq!(progress.own_decisions, expected);
+            assert_eq!(progress.active_own, has_counts.then_some(own(5, 20, 2)));
+            if resolved {
+                let resolution = if kind == CurrentMixedOwnResolution::Failed {
+                    if !has_counts {
+                        apply(
+                            &mut progress,
+                            &mut events,
+                            Event::CollectReturn {
+                                member: 0,
+                                record: None,
+                                complete: false,
+                                error: Some("returned failure".into()),
+                            },
+                        );
+                    }
+                    Resolution::Failed {
+                        error: "returned failure".into(),
+                    }
+                } else {
+                    Resolution::Abandoned {
+                        reason: "explicit stop".into(),
+                    }
+                };
+                apply(&mut progress, &mut events, Event::Resolve { resolution });
+                let bucket = if kind == CurrentMixedOwnResolution::Failed {
+                    progress.own_decisions.failed
+                } else {
+                    progress.own_decisions.abandoned
+                };
+                assert_eq!(bucket.cohorts, 1);
+                assert_eq!(bucket.cohorts_without_counts, u64::from(!has_counts));
+                assert_eq!(
+                    bucket.own,
+                    if has_counts {
+                        own(5, 20, 2)
+                    } else {
+                        own(0, 0, 0)
+                    }
+                );
+                assert_eq!(progress.last_resolved_own.unwrap().attempt, 2);
+                assert_eq!(progress.last_resolved_own.unwrap().outcome, kind);
+            } else {
+                assert_eq!(progress.own_decisions, expected);
+                assert_eq!(progress.last_resolved_own.unwrap().attempt, 1);
+            }
+            assert_eq!(progress.own_decisions.updated, expected.updated);
+            assert_eq!(progress.own_decisions.no_change, expected.no_change);
+            assert_eq!(progress.successful, 1);
+            assert_eq!(
+                progress.unknown_work,
+                !resolved || kind == CurrentMixedOwnResolution::Abandoned
+            );
+            // Restore consumes the unchanged serialized events through apply,
+            // just as the production restore does after validating each body.
+            let mut restored = initial();
+            for event in events {
+                let decoded: Event = closed(&bytes(&event, HEAD_CAP).unwrap(), HEAD_CAP).unwrap();
+                restored.apply(&decoded, &spec).unwrap();
+            }
+            assert_eq!(restored.own_decisions, progress.own_decisions);
+            assert_eq!(restored.active_own, progress.active_own);
+            assert_eq!(restored.last_resolved_own, progress.last_resolved_own);
+            assert_eq!(restored.phase, progress.phase);
+            assert_eq!(restored.unknown_work, progress.unknown_work);
+            assert_eq!(restored.consumed, progress.consumed);
+            assert_eq!(restored.next, progress.next);
+            assert_eq!(
+                initial().own_decisions,
+                CurrentMixedOwnDecisionCounters::default()
+            );
+        }
     }
     #[test]
     fn current_mixed_private_base_preserves_no_change_consumption() {
