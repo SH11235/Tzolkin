@@ -355,6 +355,11 @@ fn export_sources<'a>(
                             "Guarded public learned source admission is not implemented".into()
                         );
                     }
+                    if matches!(policy, replay::SeatPolicy::ResourceCycle { .. }) {
+                        return Err(
+                            "ResourceCycle source training admission is not implemented".into()
+                        );
+                    }
                     policy.validate()?;
                 }
                 // The complete replay keeps explicit per-seat model SHA, heuristic,

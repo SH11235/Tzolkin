@@ -1738,6 +1738,12 @@ fn run_handles(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod resource_cycle_test_temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
+        ));
+    }
 
     #[test]
     fn borrowed_resource_cycle_binds_untrained_configuration() {
@@ -1789,6 +1795,76 @@ mod tests {
                 .unwrap_err()
                 .contains("sealed RL")
         );
+        // Frozen opponent provenance is not an admission of BC labels.
+        let mut record = replay::GameReplay {
+            header: replay::ReplayHeader {
+                replay_schema: replay::REPLAY_SCHEMA,
+                rules_version: replay::RULES_VERSION,
+                rules_baseline: replay::RULES_BASELINE.into(),
+                catalog_hash: replay::catalog_hash(),
+                move_schema: tzolkin_core::observation::MOVE_SCHEMA,
+                observation_schema: tzolkin_core::observation::OBSERVATION_SCHEMA,
+                source: ReplaySource::PolicySelfPlay {
+                    policies: vec![provenance; 3],
+                },
+                names: vec!["A".into(), "B".into(), "C".into()],
+                seed: 17,
+                options: GameOptions::default(),
+            },
+            steps: Vec::new(),
+            final_scores: Vec::new(),
+            final_state: String::new(),
+            verified_complete: true,
+        };
+        let root =
+            resource_cycle_test_temp_root::create("tzolkin-resource-cycle-admission").unwrap();
+        let source = root.join("source.json");
+        std::fs::write(&source, serde_json::to_vec(&record).unwrap()).unwrap();
+        let output = root.join("legacy");
+        assert!(
+            crate::dataset::export_dataset(std::slice::from_ref(&record), &output)
+                .unwrap_err()
+                .contains("ResourceCycle source training admission")
+        );
+        assert!(!output.exists());
+        let output = root.join("public");
+        assert!(
+            crate::policy_dataset::export_native_files(std::slice::from_ref(&source), &output)
+                .unwrap_err()
+                .contains("ResourceCycle source training admission")
+        );
+        assert!(!output.exists());
+        for (players, options) in [(2, 0), (5, 0), (3, 1), (3, 2), (3, 4), (3, 8)] {
+            record.header.names = (0..players).map(|seat| format!("P{seat}")).collect();
+            record.header.source = ReplaySource::PolicySelfPlay {
+                policies: vec![decoded.clone(); players],
+            };
+            record.header.options = replay::options_from_mask(options);
+            assert!(
+                replay::verify_replay(&record)
+                    .unwrap_err()
+                    .contains("ResourceCycle provenance requires base 3..4p")
+            );
+            let mut called = false;
+            let result = replay::play_game_using_fast(
+                players,
+                17,
+                record.header.options.clone(),
+                false,
+                record.header.source.clone(),
+                |_| {
+                    called = true;
+                    Err("unexpected chooser call".into())
+                },
+            );
+            assert!(
+                result
+                    .unwrap_err()
+                    .contains("ResourceCycle provenance requires base 3..4p")
+            );
+            assert!(!called);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

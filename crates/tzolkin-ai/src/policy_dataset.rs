@@ -397,6 +397,9 @@ fn source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
                 if matches!(policy, replay::SeatPolicy::PublicLearnedTradeGuard { .. }) {
                     return Err("Guarded public learned source admission is not implemented".into());
                 }
+                if matches!(policy, replay::SeatPolicy::ResourceCycle { .. }) {
+                    return Err("ResourceCycle source training admission is not implemented".into());
+                }
                 policy.validate()?;
             }
         }

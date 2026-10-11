@@ -1235,7 +1235,7 @@ mod tests {
             resource_cycle::POLICY_VERSION
         );
         assert_eq!(collected, run(Some(&collected)).unwrap());
-        let mut changed = collected;
+        let mut changed = collected.clone();
         changed.callbacks[0]
             .opponent_choice
             .as_mut()
