@@ -303,6 +303,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   let declaredRotation = null;
   let extractionReward = null;
   let queuedPurchase = null;
+  let deferredScore = null;
   let calendarEvidence = {
     corn: null,
     rotation: null,
@@ -729,6 +730,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       fail(`Ambiguous legal operation for ${reason}`);
     const chosen = outcomes[0];
     const previous = state();
+    if (deferredScore) deferredScoreTransition(chosen.frame, chosen.row.action);
     if (
       derived &&
       !visibleCalendar &&
@@ -808,6 +810,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       declaredRotation,
       calendarEvidence,
       extractionReward,
+      unsettledPurchase: deferredScore !== null,
     });
     audit.push({
       actionId: context.id,
@@ -911,6 +914,168 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     if (id < 0) fail('Automatic effect has no known actor');
     const key = `${id}:${field}:${direction}`;
     return (context.effects[key] ?? 0) - (context.claims[key] ?? 0);
+  }
+  function fixedScoreCaption(event) {
+    const match =
+      event.kind === 'unparsed' &&
+      event.actor !== null &&
+      event.iconResources.length === 0 &&
+      event.rawText.slice(event.actor.length).match(/^は(\d+)点を獲得した$/);
+    const amount = match ? Number(match[1]) : null;
+    return Number.isSafeInteger(amount) && amount > 0 && amount <= 1000 ? amount : null;
+  }
+  // Only this selected catalog pair can caption points before the actual Trade
+  // exit. Every source checkpoint remains at its original macro boundary.
+  function deferredScoreShape(outcome, event, events, witness, previous = state()) {
+    const actor = actorId(event.actor);
+    const action = outcome.row.action;
+    const effects = buildings.get(action.id)?.effects;
+    const next = outcome.frame.snapshot.state;
+    const before = previous.pending;
+    const after = next.pending?.after;
+    const scoreEvents = events.filter((item) => fixedScoreCaption(item) !== null);
+    if (
+      actor < 0 ||
+      witnesses.catalogHash !== catalogHash ||
+      event.kind !== 'build' ||
+      action.type !== 'build' ||
+      typeof action.architecture !== 'boolean' ||
+      action.renovation !== null ||
+      !same(witness.buildings, [action.id]) ||
+      !same(typedResourceCost(action), paymentOf(events)) ||
+      events.some((item) => item.actor !== event.actor) ||
+      events.filter((item) => item.kind === 'build').length !== 1 ||
+      scoreEvents.length !== 1 ||
+      events.at(-1) !== scoreEvents[0] ||
+      events.some(
+        (item) => item !== event && item !== scoreEvents[0] && item.kind !== 'resourcePayment',
+      ) ||
+      events.slice(events.indexOf(event) + 1).some((item) => item !== scoreEvents[0]) ||
+      !same(effects, [
+        { type: 'trade' },
+        { type: 'points', amount: fixedScoreCaption(scoreEvents[0]) },
+      ]) ||
+      before?.task?.type !== 'build' ||
+      before.task.remaining !== 2 ||
+      !same(before.after, []) ||
+      !same(next.pending?.task, { type: 'trade' }) ||
+      !same(outcome.frame.observation?.pendingTask, next.pending.task) ||
+      !Array.isArray(after) ||
+      after.length !== 2 ||
+      !same(after[0], { type: 'effects', effects: [effects[1]] }) ||
+      !same(after[1], {
+        type: 'build',
+        remaining: 1,
+        allowMonument: false,
+        cornPayment: before.task.cornPayment,
+        architectureAvailable: before.task.architectureAvailable !== false && !action.architecture,
+        ...(before.task.mandatory ? { mandatory: true } : {}),
+      }) ||
+      next.currentPlayer !== actor ||
+      previous.currentPlayer !== actor ||
+      next.round !== previous.round ||
+      next.phase !== previous.phase ||
+      !same(next.players[actor].buildings, [...previous.players[actor].buildings, action.id]) ||
+      !same(
+        next.buildings,
+        previous.buildings.filter((id) => id !== action.id),
+      ) ||
+      !same(
+        { ...mechanical(next), players: null, pending: null, buildings: null },
+        { ...mechanical(previous), players: null, pending: null, buildings: null },
+      ) ||
+      next.players.some((player, id) =>
+        id === actor
+          ? player.score !== previous.players[id].score ||
+            RESOURCES.some(
+              (resource, index) =>
+                player.resources[resource] !==
+                previous.players[id].resources[resource] - action.cost[index],
+            ) ||
+            !same(
+              { ...player, resources: null, buildings: null },
+              { ...previous.players[id], resources: null, buildings: null },
+            )
+          : !same(player, previous.players[id]),
+      )
+    )
+      return null;
+    return {
+      actor,
+      amount: effects[1].amount,
+      scoreEvent: scoreEvents[0],
+      pending: copy(next.pending),
+      round: next.round,
+      phase: next.phase,
+      trades: 0,
+      captionObserved: false,
+    };
+  }
+  function deferredScoreTransition(nextFrame, action) {
+    const receipt = deferredScore;
+    const before = state();
+    const next = nextFrame.snapshot.state;
+    const exit = action.type === 'skip' && context.deferredScoreExit === true;
+    if (
+      (!exit && action.type !== 'trade') ||
+      !same(before.pending, receipt.pending) ||
+      before.currentPlayer !== receipt.actor ||
+      before.round !== receipt.round ||
+      before.phase !== receipt.phase ||
+      next.currentPlayer !== receipt.actor ||
+      next.round !== receipt.round ||
+      next.phase !== receipt.phase ||
+      !same(
+        { ...mechanical(next), players: null, pending: null },
+        { ...mechanical(before), players: null, pending: null },
+      ) ||
+      (exit
+        ? !same(next.pending?.task, receipt.pending.after[1]) ||
+          !same(nextFrame.observation.pendingTask, receipt.pending.after[1]) ||
+          !same(next.pending?.after, [])
+        : !same(next.pending, receipt.pending) ||
+          !same(nextFrame.observation.pendingTask, receipt.pending.task)) ||
+      next.players.some((player, id) =>
+        id === receipt.actor
+          ? player.score - before.players[id].score !== (exit ? receipt.amount : 0) ||
+            !same(
+              { ...player, resources: null, score: null },
+              { ...before.players[id], resources: null, score: null },
+            ) ||
+            (exit
+              ? !same(player.resources, before.players[id].resources)
+              : RESOURCES.some(
+                  (resource) =>
+                    resource !== 'corn' &&
+                    player.resources[resource] - before.players[id].resources[resource] !==
+                      (resource === action.resource ? (action.buy ? 1 : -1) : 0),
+                ))
+          : !same(player, before.players[id]),
+      )
+    )
+      fail('Deferred purchase score requires the exact Trade queue and isolated legal exit');
+    if (!exit) deferredScore = { ...receipt, trades: receipt.trades + 1 };
+  }
+  function finishDeferredScore() {
+    const receipt = deferredScore;
+    if (!receipt.captionObserved || receipt.trades < 1)
+      fail('Deferred purchase requires its one score caption and an actual observed Trade');
+    context.deferredScoreExit = true;
+    try {
+      choose((action) => action.type === 'skip', 'observed Trade exit before next Build', true);
+    } finally {
+      context.deferredScoreExit = false;
+    }
+    automatic(receipt.scoreEvent, 'score', receipt.amount);
+    audit.push({
+      actionId: context.id,
+      deferredScoreSourceActionId: receipt.sourceId,
+      actor: receipt.actor,
+      amount: receipt.amount,
+      actualDelivered: true,
+      humanPlayingBcReady: false,
+    });
+    deferredScore = null;
   }
   // A source can caption a fixed card resource before its required technology
   // choice. Keep that purchase tentative until the next actual choice delivers
@@ -1089,6 +1254,18 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (envelope && (event.kind !== 'build' || !settledBuild(outcome))) return false;
       if (task === 'technology' && queuedPurchaseShape(outcome, event, events, witness))
         return matches(outcome.frame.snapshot.state, witness.expected);
+      if (
+        task === 'trade' &&
+        (gains.score ?? 0) > 0 &&
+        same(buildings.get(outcome.row.action.id)?.effects, [
+          { type: 'trade' },
+          { type: 'points', amount: gains.score },
+        ])
+      )
+        return (
+          deferredScoreShape(outcome, event, events, witness) !== null &&
+          (!witness.expected || matches(outcome.frame.snapshot.state, witness.expected))
+        );
       // Later resource/temple/technology choices can change the observed fields.
       // Leave these candidates ambiguous instead of filtering with a future end board.
       if (task !== null && task !== 'build') return true;
@@ -1174,6 +1351,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     calendarEvidence = saved.calendarEvidence;
     extractionReward = saved.extractionReward;
     queuedPurchase = saved.queuedPurchase;
+    deferredScore = saved.deferredScore;
   }
   let blocked = null;
   const groups = sourceGroups(normalizedEvents, witnesses.initialActionId, knownActionIds);
@@ -1195,6 +1373,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       calendarEvidence,
       extractionReward,
       queuedPurchase,
+      deferredScore,
     };
     context = {
       id,
@@ -1215,6 +1394,24 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     };
     try {
       if (!events.length) fail('Raw source action has no observed messages');
+      if (deferredScore) {
+        if (
+          events.some((event) => actorId(event.actor) !== deferredScore.actor) ||
+          !same(state().pending, deferredScore.pending) ||
+          (witness.refills?.currentAge?.length ?? 0) !== 0 ||
+          (witness.refills?.age2?.length ?? 0) !== 0
+        )
+          fail('Deferred purchase requires the same actor and unchanged Trade continuation');
+        if (!events.every((event) => event.kind === 'trade')) {
+          if (
+            events.filter((event) => event.kind === 'build').length !== 1 ||
+            events.some((event) => ['trade', 'cancellation', 'monument'].includes(event.kind)) ||
+            witness.buildings?.length !== 1
+          )
+            fail('Deferred purchase requires observed Trades followed by the next actual Build');
+          finishDeferredScore();
+        }
+      }
       if (
         queuedPurchase &&
         (id !== queuedPurchase.nextSourceId ||
@@ -1535,7 +1732,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               false,
               false,
               () => purchaseOutcome(event, events, witness),
-              events.some((item) => emptyPurchasePayment(item) || architectureScoreCaption(item)),
+              events.some((item) => emptyPurchasePayment(item) || architectureScoreCaption(item)) ||
+                (buildings.get(ids[0])?.effects[0]?.type === 'trade' &&
+                  events.some((item) => fixedScoreCaption(item) !== null)),
             );
             context.purchase = {
               actor: actorId(event.actor),
@@ -1554,6 +1753,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               beforePurchase,
             );
             if (receipt) {
+              if (saved.deferredScore)
+                fail('A deferred purchase cannot nest another unresolved receipt');
               const nextSourceId = groups[groupIndex + 1]?.[0];
               if (nextSourceId === undefined) fail('Queued purchase has no next observed source');
               queuedPurchase = {
@@ -1563,6 +1764,24 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 nextSourceId,
                 round: state().round,
                 stepCount: record.steps.length,
+                saved,
+              };
+              history.at(-1).unsettledPurchase = true;
+            }
+            const scoreReceipt = deferredScoreShape(
+              { frame, row: { action } },
+              event,
+              events,
+              witness,
+              beforePurchase,
+            );
+            if (scoreReceipt) {
+              if (saved.deferredScore || queuedPurchase)
+                fail('A deferred purchase cannot nest another unresolved receipt');
+              deferredScore = {
+                ...scoreReceipt,
+                sourceId: id,
+                kinds: events.map((item) => item.kind),
                 saved,
               };
               history.at(-1).unsettledPurchase = true;
@@ -1730,9 +1949,14 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               )
                 fail('Age-two announcement has no unique matching core food-day transition');
               context.ageAnnouncement = true;
-            } else if (/は\d+点を獲得した$/.test(event.rawText))
-              automatic(event, 'score', Number(event.rawText.match(/(\d+)点を獲得した$/)[1]));
-            else if (
+            } else if (/は\d+点を獲得した$/.test(event.rawText)) {
+              if (deferredScore?.sourceId === id && deferredScore.scoreEvent === event) {
+                if (deferredScore.captionObserved)
+                  fail('Deferred purchase score was already observed');
+                deferredScore = { ...deferredScore, captionObserved: true };
+              } else
+                automatic(event, 'score', Number(event.rawText.match(/(\d+)点を獲得した$/)[1]));
+            } else if (
               /スタートプレイヤースペースに置かれているワーカーは.+の手元に戻った$/.test(
                 event.rawText,
               )
@@ -1792,7 +2016,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         queuedPurchase = null;
       }
     } catch (error) {
-      const receipt = queuedPurchase ?? saved.queuedPurchase;
+      const receipt =
+        saved.deferredScore ?? deferredScore ?? queuedPurchase ?? saved.queuedPurchase;
       rollback(receipt?.saved ?? saved);
       blocked = {
         actionId: receipt?.sourceId ?? id,
@@ -1801,6 +2026,16 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       };
       break;
     }
+  }
+  if (!blocked && deferredScore) {
+    const receipt = deferredScore;
+    rollback(receipt.saved);
+    blocked = {
+      actionId: receipt.sourceId,
+      kinds: receipt.kinds,
+      reason:
+        'Deferred purchase has no observed Trade exit; entire tentative chain was rolled back',
+    };
   }
   if (!blocked && state().phase === 'finished' && game.resultsDisplay.length === names.length)
     record.terminalDisplayCheckpoint = {

@@ -1244,6 +1244,388 @@ test('binds empty payment and architecture captions to one settled purchase rece
   assert.equal(chosen.record.steps.length, 1);
 });
 
+function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
+  // Injected frames test atomic decoding and original checkpoints, not core rules.
+  const initial = clone(saved.core.initialFrame);
+  const before = clone(initial);
+  const own = before.snapshot.state.players[0];
+  Object.assign(own.resources, { corn: 10, wood: 4, stone: 5, gold: 4 });
+  own.score = 5;
+  own.technologies.architecture = 3;
+  before.snapshot.state.buildings = ['b18', 'b01'];
+  before.observation.pendingTask = {
+    type: 'build',
+    remaining: 2,
+    allowMonument: true,
+    cornPayment: false,
+  };
+  before.snapshot.state.pending = {
+    title: 'Two buildings',
+    task: clone(before.observation.pendingTask),
+    after: [],
+  };
+  before.observation.legalActions = [false, true].map((architecture) => ({
+    action: {
+      type: 'build',
+      id: 'b18',
+      cost: [0, 0, architecture ? 2 : 3, 0, 0],
+      architecture,
+      discountResource: architecture ? 'stone' : null,
+      renovation: null,
+    },
+    move: { type: 'choose', choiceId: `purchase:${architecture}` },
+  }));
+  const continuation = {
+    type: 'build',
+    remaining: 1,
+    allowMonument: false,
+    cornPayment: false,
+    architectureAvailable: true,
+  };
+  const tradeActions = [
+    {
+      action: { type: 'trade', resource: 'gold', buy: false },
+      move: { type: 'choose', choiceId: 'sell:gold' },
+    },
+    {
+      action: { type: 'trade', resource: 'wood', buy: true },
+      move: { type: 'choose', choiceId: 'buy:wood' },
+    },
+    { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
+  ];
+  const apply = (request) => {
+    if (request.move.type === 'place') return clone(before);
+    const next = clone(before);
+    next.snapshot.state = clone(request.state);
+    const player = next.snapshot.state.players[0];
+    const choice = request.move.choiceId;
+    let stage;
+    if (choice.startsWith('purchase:')) {
+      const bonus = choice === 'purchase:true';
+      player.resources.stone -= bonus ? 2 : 3;
+      player.resources.corn += Number(bonus);
+      player.score += 2 * Number(bonus);
+      player.buildings.push('b18');
+      next.snapshot.state.buildings = ['b01'];
+      next.snapshot.state.pending = {
+        title: 'Trade',
+        task: { type: 'trade' },
+        after: [
+          { type: 'effects', effects: [{ type: 'points', amount: 6 }] },
+          { ...continuation, architectureAvailable: !bonus },
+        ],
+      };
+      next.observation.legalActions = clone(tradeActions);
+      stage = 'purchase';
+    } else if (choice === 'sell:gold' || choice === 'buy:wood') {
+      if (choice === 'sell:gold') {
+        player.resources.gold--;
+        player.resources.corn += 4;
+      } else {
+        player.resources.wood++;
+        player.resources.corn -= 2;
+      }
+      next.observation.legalActions = clone(tradeActions);
+      stage = 'trade';
+    } else if (choice === 'skip') {
+      player.score += 6;
+      next.snapshot.state.pending = {
+        title: 'Remaining building',
+        task: clone(continuation),
+        after: [],
+      };
+      next.observation.legalActions = [
+        {
+          action: {
+            type: 'build',
+            id: 'b01',
+            cost: [0, 1, 0, 0, 0],
+            architecture: false,
+            discountResource: null,
+            renovation: null,
+          },
+          move: { type: 'choose', choiceId: 'second-building' },
+        },
+      ];
+      stage = 'exit';
+    } else {
+      assert.equal(choice, 'second-building');
+      player.resources.wood--;
+      player.buildings.push('b01');
+      next.snapshot.state.buildings = [];
+      next.snapshot.state.pending = null;
+      next.observation.legalActions = [];
+      stage = 'build';
+    }
+    next.observation.pendingTask = clone(next.snapshot.state.pending?.task ?? null);
+    alterFrame(next, stage);
+    return next;
+  };
+  const value = input();
+  replaceEvents(value, [
+    [6, [{ raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' }]],
+    [
+      7,
+      [
+        { raw_text: 'Aは3\nを支払った', icons: [{ classes: 'tz_icon resource_stone' }] },
+        { raw_text: 'Aは建物を建てた' },
+        { raw_text: 'Aは6点を獲得した' },
+      ],
+    ],
+    [
+      8,
+      [
+        {
+          raw_text: 'Aは2\nを8\nに交換した',
+          icons: [{ classes: 'tz_icon resource_gold' }, { classes: 'tz_icon resource_corn' }],
+        },
+        {
+          raw_text: 'Aは2\nを1\nに交換した',
+          icons: [{ classes: 'tz_icon resource_corn' }, { classes: 'tz_icon resource_wood' }],
+        },
+      ],
+    ],
+    [
+      9,
+      [
+        { raw_text: 'Aは\nを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+        { raw_text: 'Aは建物を建てた' },
+      ],
+    ],
+  ]);
+  value.witness.witnesses = [
+    { actionId: 6, pendingTask: 'build', expected: { players: [clone(own), {}, {}, {}] } },
+    {
+      actionId: 7,
+      buildings: ['b18'],
+      pendingTask: 'trade',
+      expected: { players: [{ score: 5, resources: { stone: 2 } }, {}, {}, {}] },
+    },
+    {
+      actionId: 8,
+      pendingTask: 'trade',
+      expected: { players: [{ score: 5, resources: { corn: 16, gold: 2, wood: 5 } }, {}, {}, {}] },
+    },
+    {
+      actionId: 9,
+      buildings: ['b01'],
+      pendingTask: null,
+      expected: { players: [{ score: 11, resources: { corn: 16, gold: 2, wood: 4 } }, {}, {}, {}] },
+    },
+  ];
+  change(value);
+  for (const row of value.raw.dom_entries) {
+    const entry = value.raw.entries.find((item) => item.action_id === row.action_id);
+    entry.raw_text = row.messages.map((message) => message.raw_text).join('\n');
+    for (const message of row.messages) {
+      message.html = message.raw_text;
+      message.icons ??= [];
+    }
+  }
+  return { value, initial, dispatch: dispatcher(initial, apply) };
+}
+
+test('defers a fixed purchase score through observed Trades and isolates the legal Build exit', () => {
+  const f = deferredTradeFixture();
+  const result = decode(f.value, f.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.deepEqual(
+    result.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8], [8], [8], [9], [9]],
+  );
+  assert.deepEqual(result.record.steps.map((step) => step.move.choiceId).slice(1), [
+    'purchase:false',
+    'sell:gold',
+    'sell:gold',
+    'buy:wood',
+    'skip',
+    'second-building',
+  ]);
+  assert.deepEqual(
+    result.record.steps.filter((step) => step.checkpoint).map((step) => step.checkpoint.expected),
+    f.value.witness.witnesses.map((w) => w.expected),
+  );
+  const receipt = result.manifest.audit.find((row) => row.deferredScoreSourceActionId);
+  assert.deepEqual(receipt, {
+    actionId: 9,
+    deferredScoreSourceActionId: 7,
+    actor: 0,
+    amount: 6,
+    actualDelivered: true,
+    humanPlayingBcReady: false,
+  });
+  assert.equal(result.manifest.trainingReady, false);
+  assert.equal(result.manifest.sourceCoverage.complete, false);
+});
+
+test('rolls every deferred purchase and Trade back when its original boundary or exit is unsupported', () => {
+  const cases = [
+    [
+      'no Trade',
+      (v) => {
+        v.raw.entries.splice(-2, 1);
+        v.raw.dom_entries.splice(-2, 1);
+        v.raw.entry_count--;
+        v.witness.witnesses.splice(2, 1);
+      },
+    ],
+    [
+      'EOF after purchase',
+      (v) => {
+        v.raw.entries.splice(-2);
+        v.raw.dom_entries.splice(-2);
+        v.raw.entry_count -= 2;
+        v.witness.witnesses.splice(2);
+      },
+    ],
+    [
+      'EOF after Trades',
+      (v) => {
+        v.raw.entries.pop();
+        v.raw.dom_entries.pop();
+        v.raw.entry_count--;
+        v.witness.witnesses.pop();
+      },
+    ],
+    [
+      'pre-exit score mismatch',
+      (v) => {
+        v.witness.witnesses[2].expected.players[0].score = 11;
+      },
+    ],
+    [
+      'purchase score mismatch',
+      (v) => {
+        v.witness.witnesses[1].expected.players[0].score = 11;
+      },
+    ],
+    [
+      'other actor',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 8).messages[0].raw_text =
+          'Bは2\nを8\nに交換した';
+      },
+    ],
+    [
+      'cancellation',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 8).messages = [
+          { raw_text: 'Aは行動をキャンセルした' },
+        ];
+      },
+    ],
+    [
+      'duplicate score',
+      (v) => {
+        v.raw.dom_entries
+          .find((row) => row.action_id === 7)
+          .messages.push({ raw_text: 'Aは6点を獲得した' });
+      },
+    ],
+    [
+      'wrong selected card',
+      (v) => {
+        v.witness.witnesses[1].buildings = ['b01'];
+      },
+    ],
+    [
+      'different payment',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 7).messages[0].raw_text =
+          'Aは2\nを支払った';
+      },
+    ],
+    [
+      'wrong queued points',
+      () => {},
+      (frame, stage) => {
+        if (stage === 'purchase') frame.snapshot.state.pending.after[0].effects[0].amount = 7;
+      },
+    ],
+    [
+      'changed Trade queue',
+      () => {},
+      (frame, stage) => {
+        if (stage === 'trade') frame.snapshot.state.pending.after[1].remaining = 2;
+      },
+    ],
+    [
+      'unrelated Trade gain',
+      () => {},
+      (frame, stage) => {
+        if (stage === 'trade') frame.snapshot.state.players[1].resources.gold++;
+      },
+    ],
+    [
+      'extra traded material',
+      () => {},
+      (frame, stage) => {
+        if (stage === 'trade') frame.snapshot.state.players[0].resources.stone++;
+      },
+    ],
+    [
+      'wrong exit score',
+      () => {},
+      (frame, stage) => {
+        if (stage === 'exit') frame.snapshot.state.players[0].score++;
+      },
+    ],
+    [
+      'wrong Build continuation',
+      () => {},
+      (frame, stage) => {
+        if (stage === 'exit') frame.snapshot.state.pending.task.remaining = 2;
+      },
+    ],
+    [
+      'unrelated exit change',
+      () => {},
+      (frame, stage) => {
+        if (stage === 'exit') frame.snapshot.state.age++;
+      },
+    ],
+    [
+      'exit checkpoint mismatch',
+      (v) => {
+        v.witness.witnesses[3].expected.players[0].score = 12;
+      },
+    ],
+    [
+      'reused caption',
+      (v) => {
+        v.raw.dom_entries
+          .find((row) => row.action_id === 9)
+          .messages.push({ raw_text: 'Aは6点を獲得した' });
+      },
+    ],
+  ];
+  for (const [name, change, alter] of cases) {
+    const f = deferredTradeFixture(change, alter);
+    const result = decode(f.value, f.dispatch);
+    assert.equal(result.manifest.blocked.actionId, 7, name);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.deepEqual(
+      result.record.steps[0].checkpoint.expected,
+      f.value.witness.witnesses[0].expected,
+      name,
+    );
+    assert.equal(
+      result.manifest.audit.some((row) => row.deferredScoreSourceActionId),
+      false,
+      name,
+    );
+    assert.equal(
+      result.manifest.audit.some((row) => row.actionId >= 7),
+      false,
+      name,
+    );
+  }
+});
+
 test('settles a queued purchase only through the next actual technology source, or rolls back both macros', () => {
   // Injected frames exercise receipt admission/settlement, not game-rule scoring.
   const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
