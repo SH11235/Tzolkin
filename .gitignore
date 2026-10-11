@@ -36,3 +36,8 @@ test-results/
 
 # Local Codex settings
 /.codex/config.toml
+
+# Local Python research caches
+__pycache__/
+.pytest_cache/
+.venv/
