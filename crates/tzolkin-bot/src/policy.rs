@@ -78,9 +78,9 @@ fn food_requirement(o: &Observation, p: &PublicPlayer) -> f64 {
 fn corn_target(o: &Observation, p: &PublicPlayer) -> f64 {
     let food = [8, 14, 21, 27]
         .into_iter()
-        .find(|day| *day >= o.round && !o.food_days.contains(day));
+        .find(|day| !o.food_days.contains(day));
     let reserve = match food.map(|day| day - o.round) {
-        Some(0..=2) => food_requirement(o, p),
+        Some(..=2) => food_requirement(o, p),
         Some(3..=5) => food_requirement(o, p) * 0.6,
         _ => 2.0,
     };
@@ -465,5 +465,82 @@ pub fn score_action(o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f
             }
         }
         TypedAction::TribeSkipSpace => 1.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tzolkin_core::observation::observe;
+
+    #[test]
+    fn unprocessed_food_day_reserve_survives_double_advance() {
+        // A double advance from day 7 leaves day 8 due during day 9.
+        for (round, processed, target, sell) in [
+            (9, vec![], 13.0, true),
+            (8, vec![], 13.0, true),
+            (6, vec![], 13.0, true),
+            (5, vec![], 9.0, false),
+            (9, vec![8], 9.0, false),
+            (12, vec![8], 13.0, true),
+            (15, vec![8, 14], 5.0, false),
+            (27, vec![8, 14, 21, 27], 5.0, false),
+        ] {
+            let mut state =
+                create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+            state.phase = Phase::Playing;
+            state.round = round;
+            state.age = if round >= 14 { 2 } else { 1 };
+            state.food_days = processed;
+            state.pending = Some(Pending {
+                title: "Trade".into(),
+                task: Task::Trade,
+                after: vec![],
+            });
+            let player = &mut state.players[state.current_player];
+            player.workers = 5;
+            player.feed_workers = 0;
+            player.feed_all = false;
+            player.feed_discount = 0;
+            player.resources = [
+                (Resource::Corn, 9),
+                (Resource::Wood, 1),
+                (Resource::Stone, 0),
+                (Resource::Gold, 0),
+                (Resource::Skull, 0),
+            ]
+            .into_iter()
+            .collect();
+            let observation = observe(&state, state.current_player).unwrap();
+            let player = &observation.players[observation.actor];
+            assert_eq!(corn_target(&observation, player), target);
+            let weights = HeuristicWeights::default();
+            assert_eq!(
+                value(&observation, player, Resource::Corn, &weights),
+                if sell {
+                    weights.corn_when_short
+                } else {
+                    weights.corn_base
+                }
+            );
+            let decision = crate::choose_move(&observation).unwrap();
+            let selected = observation
+                .legal_actions
+                .iter()
+                .find(|row| row.r#move == decision.r#move)
+                .unwrap();
+            assert_eq!(
+                selected.action,
+                if sell {
+                    TypedAction::Trade {
+                        resource: Resource::Wood,
+                        buy: false,
+                    }
+                } else {
+                    TypedAction::Skip
+                }
+            );
+            assert_eq!(decision.policy_version, crate::POLICY_VERSION);
+        }
     }
 }

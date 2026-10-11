@@ -7,7 +7,7 @@ use tzolkin_core::observation::{
 };
 use tzolkin_core::{GearId, Phase, Resource, Task, TechnologyId};
 
-pub const POLICY_VERSION: &str = "resource-cycle-arena-v3";
+pub const POLICY_VERSION: &str = "resource-cycle-arena-v4";
 
 /// Changing any field requires a separately versioned hypothesis. The complete
 /// configuration is included in Numeric Arena's absolute-seat pool identity.
@@ -36,7 +36,7 @@ impl Default for ResourceCycleConfig {
 impl ResourceCycleConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self != &Self::default() {
-            return Err("Resource-cycle Arena requires its frozen v3 configuration".into());
+            return Err("Resource-cycle Arena requires its frozen v4 configuration".into());
         }
         Ok(())
     }
