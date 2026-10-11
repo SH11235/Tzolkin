@@ -2035,6 +2035,9 @@ fn read_pin_with_ceiling(
 pub fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, String> {
     read_bounded_with_ceiling(path, max, MAX_RECORD_BYTES)
 }
+pub(crate) fn read_mixed_stored_record(path: &Path, max: usize) -> Result<Vec<u8>, String> {
+    read_bounded_with_ceiling(path, max, MAX_STORED_RECORD_BYTES)
+}
 fn read_bounded_with_ceiling(path: &Path, max: usize, ceiling: usize) -> Result<Vec<u8>, String> {
     if max == 0 || max > ceiling || ceiling > MAX_STORED_RECORD_BYTES {
         return Err("Invalid Paired read byte limit".into());
@@ -2113,6 +2116,16 @@ pub(crate) fn publish_mixed_metadata(
     bytes: &[u8],
 ) -> Result<(), String> {
     publish(directory, name, bytes).map(|_| ())
+}
+pub(crate) fn publish_mixed_stored_record(
+    directory: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_STORED_RECORD_BYTES {
+        return Err("Invalid mixed stored record byte limit".into());
+    }
+    publish_with_ceiling(directory, name, bytes, MAX_STORED_RECORD_BYTES).map(|_| ())
 }
 fn publish_with_ceiling(
     directory: &Path,
