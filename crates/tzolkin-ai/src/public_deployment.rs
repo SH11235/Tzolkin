@@ -8,6 +8,7 @@ use tzolkin_inference::deployment::{self, LoadedDeployment};
 use crate::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
 use crate::public_model::{self, HIDDEN, PARAMETER_COUNT, PublicPolicyModel};
 use crate::public_native::PreparedPublicPolicy;
+use crate::public_policy_mixed_continued::CurrentMixedPolicyHandle;
 use crate::public_policy_repeat::RepeatedPublicRlPolicy;
 use crate::public_policy_update::UpdatedPublicRlPolicy;
 use crate::public_rl_native::{RepeatedPublicRlHandle, UpdatedPublicRlHandle};
@@ -58,6 +59,9 @@ enum Source<'a> {
         task: &'a str,
         artifact_checksum: &'a str,
         update_count: u64,
+    },
+    RlCurrentMixed {
+        identity: &'a crate::public_rl_current_mixed_source::CurrentMixedParentIdentity,
     },
 }
 #[derive(Serialize)]
@@ -163,6 +167,22 @@ pub fn export_repeated_rl(owner: &RepeatedPublicRlPolicy) -> Result<Vec<u8>, Str
             task: crate::public_policy_repeat::TASK,
             artifact_checksum: handle.artifact_checksum(),
             update_count: handle.update_count(),
+        },
+    )
+}
+
+/// Export the actual current actor and its unchanged generation/count identity
+/// from a genuine borrowed handle. No residual weights or owner admission leave
+/// this boundary; deployment loading does not qualify training or adoption.
+pub fn export_current_mixed(handle: &CurrentMixedPolicyHandle<'_>) -> Result<Vec<u8>, String> {
+    handle.identity().validate()?;
+    if handle.backend() != "scalar" {
+        return Err("Numeric deployment requires a Scalar current Mixed handle".into());
+    }
+    encode(
+        handle.actor_model(),
+        Source::RlCurrentMixed {
+            identity: handle.identity(),
         },
     )
 }

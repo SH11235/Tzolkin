@@ -12,6 +12,9 @@ use crate::features::{FEATURE_COUNT, FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::policy::{self, BorrowedPolicy, HIDDEN, NumericPolicyDistribution, PARAMETER_COUNT};
 
+mod current_mixed;
+pub use current_mixed::CurrentMixedIdentity;
+
 pub const DEPLOYMENT_SCHEMA: &str = "tzolkin-numeric-policy-deployment-v1";
 pub const MAX_DEPLOYMENT_BYTES: usize = 1024 * 1024;
 pub const MODEL_VERSION: &str = "tiny-public-policy-mlp-v1";
@@ -95,6 +98,9 @@ enum Source {
         artifact_checksum: String,
         update_count: u64,
     },
+    RlCurrentMixed {
+        identity: Box<CurrentMixedIdentity>,
+    },
 }
 fn digest(value: &str) -> bool {
     value.len() == 64
@@ -138,6 +144,7 @@ impl Source {
                     && (2..=10).contains(update_count)
                     && digest(artifact_checksum)
             }
+            Self::RlCurrentMixed { identity } => identity.valid(),
         };
         if valid {
             Ok(())
@@ -150,6 +157,7 @@ impl Source {
             Self::BcPrepared { .. } => "bcPrepared",
             Self::RlCount1 { .. } => "rlCount1",
             Self::RlRepeated { .. } => "rlRepeated",
+            Self::RlCurrentMixed { .. } => "rlCurrentMixed",
         }
     }
     fn policy_version(&self) -> &str {
@@ -157,6 +165,7 @@ impl Source {
             Self::BcPrepared { policy_version, .. }
             | Self::RlCount1 { policy_version, .. }
             | Self::RlRepeated { policy_version, .. } => policy_version,
+            Self::RlCurrentMixed { identity } => identity.policy_version(),
         }
     }
     fn source_checksum(&self) -> &str {
@@ -168,6 +177,7 @@ impl Source {
             | Self::RlRepeated {
                 artifact_checksum, ..
             } => artifact_checksum,
+            Self::RlCurrentMixed { identity } => identity.artifact_checksum(),
         }
     }
     fn update_count(&self) -> Option<u64> {
@@ -176,6 +186,7 @@ impl Source {
             Self::RlCount1 { update_count, .. } | Self::RlRepeated { update_count, .. } => {
                 Some(*update_count)
             }
+            Self::RlCurrentMixed { identity } => Some(identity.mixed_update_count()),
         }
     }
 }
@@ -233,6 +244,9 @@ impl Wire {
             })
             .collect::<Result<Vec<_>, String>>()?;
         policy::validate_parameters(&values)?;
+        if let Source::RlCurrentMixed { identity } = &self.source {
+            identity.validate_actor(&values, &self.source_numerical_target)?;
+        }
         Ok(values)
     }
     fn expected_checksum(&mut self) -> Result<String, String> {
@@ -293,6 +307,14 @@ impl LoadedDeployment {
     /// Closed claimed role, checked for consistency rather than authenticated.
     pub fn source_role(&self) -> &'static str {
         self.source.role()
+    }
+    /// Closed numeric metadata, not a joint owner. The actor fingerprint is
+    /// checked against loaded bits; the residual fingerprint remains a claim.
+    pub fn current_mixed_identity(&self) -> Option<&CurrentMixedIdentity> {
+        match &self.source {
+            Source::RlCurrentMixed { identity } => Some(identity),
+            _ => None,
+        }
     }
     /// Claimed BC model/RL artifact identity, retained without recreating it.
     pub fn source_checksum(&self) -> &str {
@@ -430,6 +452,123 @@ mod tests {
             let loaded = LoadedDeployment::load(&encoded(model)).unwrap();
             assert_eq!(loaded.update_count(), Some(count));
             assert_ne!(loaded.source_role(), "bcPrepared");
+        }
+    }
+    #[test]
+    fn current_mixed_identity_roundtrip_binds_generation_counts_and_actor_bits() {
+        // Numeric metadata fixtures establish no trained owner or admission.
+        for (initial, count, imported) in [
+            (true, 1, 1),
+            (false, 2, 1),
+            (false, 49, 7),
+            (false, 1_000_000, 1_000_000),
+        ] {
+            let mut model = wire();
+            model.parameter_bits[0] = "80000000".into();
+            model.parameter_bits[1] = "3eaaaaab".into();
+            let parameters = model.parameters().unwrap();
+            let domain: &[u8] = if initial {
+                b"tzolkin-mixed-inference-actor-v1\0"
+            } else {
+                b"tzolkin-continued-mixed-inference-actor-v2\0"
+            };
+            let mut hash = Sha256::new();
+            hash.update(domain);
+            hash.update(serde_json::to_vec(&parameters).unwrap());
+            let fingerprint = format!("{:x}", hash.finalize());
+            let mut policy = serde_json::json!({
+                "schema": if initial {"tzolkin-public-rl-mixed-joint-inference-identity-v1"}
+                    else {"tzolkin-public-rl-continued-mixed-inference-identity-v2"},
+                "policyVersion": if initial {"learned-public-rl-mixed-joint-argmax-v1"}
+                    else {"learned-public-rl-continued-mixed-joint-argmax-v2"},
+                "samplingVersion": if initial {"public-stochastic-rl-mixed-joint-uniform-tick53-v1"}
+                    else {"public-stochastic-rl-continued-mixed-joint-uniform-tick53-v2"},
+                "task": if initial {"mixedLearnerOwnSumQuarterJointOneBatchV1"}
+                    else {"currentMixedLearnerOwnSumQuarterJointV2"},
+                "artifactChecksum":"c".repeat(64), "importedUpdateCount":imported,
+                "mixedUpdateCount":count, "actorModelVersion":MODEL_VERSION,
+                "criticModelVersion":"tiny-public-state-critic-mlp-v1",
+                "actorParametersChecksum":fingerprint,
+                "residualParametersChecksum":"d".repeat(64),
+                "featureSchema":PUBLIC_FEATURE_SCHEMA,"inputContract":INPUT_CONTRACT,
+                "contextSchema":1,"contextContract":"public-v2-state-prefix384-v1",
+                "backend":"scalar","numericalTarget":model.source_numerical_target,
+            });
+            if !initial {
+                policy["firstMixedChecksum"] = "e".repeat(64).into();
+                policy["parentArtifactChecksum"] = "f".repeat(64).into();
+            }
+            let identity: CurrentMixedIdentity = serde_json::from_value(serde_json::json!({
+                "kind":if initial {"initialMixedV1"} else {"continuedMixedV2"},"policy":policy,
+            }))
+            .unwrap();
+            model.source = Source::RlCurrentMixed {
+                identity: Box::new(identity),
+            };
+            let bytes = encoded(model);
+            let loaded = LoadedDeployment::load(&bytes).unwrap();
+            let identity = loaded.current_mixed_identity().unwrap();
+            assert_eq!(loaded.source_role(), "rlCurrentMixed");
+            assert_eq!(loaded.source_checksum(), "c".repeat(64));
+            assert_eq!(loaded.update_count(), Some(count));
+            assert_eq!(identity.mixed_update_count(), count);
+            assert_eq!(identity.imported_update_count(), imported);
+            assert_eq!(loaded.parameters[0].to_bits(), (-0.0f32).to_bits());
+            assert_eq!(loaded.parameters[1].to_bits(), 0x3eaaaaab);
+            // Actor identity uses native generation domains and serde f32
+            // numbers. Recomputing the outer content checksum cannot bypass it.
+            let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            for (field, bad) in [
+                ("actorParametersChecksum", serde_json::json!("0".repeat(64))),
+                (
+                    "residualParametersChecksum",
+                    serde_json::json!("not-a-digest"),
+                ),
+                ("actorModelVersion", serde_json::json!("different")),
+                ("criticModelVersion", serde_json::json!("different")),
+                ("schema", serde_json::json!("different")),
+                ("task", serde_json::json!("different")),
+                ("samplingVersion", serde_json::json!("different")),
+                ("contextSchema", serde_json::json!(2)),
+                ("importedUpdateCount", serde_json::json!(0)),
+                (
+                    "mixedUpdateCount",
+                    serde_json::json!(if initial { 2 } else { 1 }),
+                ),
+                (
+                    "numericalTarget",
+                    serde_json::json!("scalar-f32-f64-tick53-v1:aarch64:linux:64"),
+                ),
+            ] {
+                let mut changed = original.clone();
+                changed["source"]["identity"]["policy"][field] = bad;
+                assert!(
+                    numeric_checksum(&serde_json::to_vec(&changed).unwrap()).is_err(),
+                    "{field}"
+                );
+            }
+            for field in ["mixedUpdateCount", "importedUpdateCount"] {
+                let mut changed = original.clone();
+                changed["source"]["identity"]["policy"][field] = 1_000_001.into();
+                assert!(numeric_checksum(&serde_json::to_vec(&changed).unwrap()).is_err());
+            }
+            let mut changed = original.clone();
+            changed["parameterBits"][1] = "3eaaaaaa".into();
+            assert!(numeric_checksum(&serde_json::to_vec(&changed).unwrap()).is_err());
+            let mut changed = original.clone();
+            changed["source"]["identity"]["policy"]["extra"] = true.into();
+            assert!(numeric_checksum(&serde_json::to_vec(&changed).unwrap()).is_err());
+            let mut changed = original.clone();
+            if initial {
+                changed["source"]["identity"]["policy"]["firstMixedChecksum"] =
+                    "e".repeat(64).into();
+            } else {
+                changed["source"]["identity"]["policy"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("parentArtifactChecksum");
+            }
+            assert!(numeric_checksum(&serde_json::to_vec(&changed).unwrap()).is_err());
         }
     }
     #[test]
