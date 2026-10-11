@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tzolkin_core::observation::{LegalAction, Observation, TypedAction};
 use tzolkin_core::{Phase, Resource};
+pub use tzolkin_inference::trade_guard::TradeGuardConfig;
 use tzolkin_inference::trade_guard::{is_trade, public_bytes, skip_index};
 
 use crate::Decision;
 use crate::public_model::{LoadedPublicPolicy, PublicPolicyDistribution, ValueValidity};
 use crate::replay::SeatPolicy;
 
-pub const GUARD_VERSION: &str = "public-trade-cycle-guard-v1";
+pub const GUARD_VERSION: &str = tzolkin_inference::trade_guard::GUARD_VERSION;
 pub const POLICY_VERSION: &str = "learned-public-policy-trade-guard-v1";
 /// Explicit execution composition; the underlying joint identity/counts stay intact.
 pub const CURRENT_MIXED_POLICY_VERSION: &str = "current-mixed-public-trade-guard-v1";
@@ -103,50 +104,6 @@ pub fn load_config(path: &Path) -> Result<TradeGuardConfig, String> {
     let config: TradeGuardConfig = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     config.validate()?;
     Ok(config)
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TradeGuardConfig {
-    pub schema: u32,
-    pub algorithm_version: String,
-    pub state_projection_version: String,
-    pub repeat_state_policy: String,
-    pub max_trades_per_episode: usize,
-    pub max_public_state_bytes: usize,
-}
-impl Default for TradeGuardConfig {
-    fn default() -> Self {
-        Self {
-            schema: 1,
-            algorithm_version: GUARD_VERSION.into(),
-            state_projection_version: PROJECTION_VERSION.into(),
-            repeat_state_policy: "secondVisitExit".into(),
-            max_trades_per_episode: MAX_TRADES,
-            max_public_state_bytes: MAX_PUBLIC_STATE_BYTES,
-        }
-    }
-}
-impl TradeGuardConfig {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.schema != 1
-            || self.algorithm_version != GUARD_VERSION
-            || self.state_projection_version != PROJECTION_VERSION
-            || self.repeat_state_policy != "secondVisitExit"
-            || !(1..=MAX_TRADES).contains(&self.max_trades_per_episode)
-            || self.max_public_state_bytes != MAX_PUBLIC_STATE_BYTES
-        {
-            return Err("Unsupported public Trade guard configuration".into());
-        }
-        Ok(())
-    }
-    pub fn configuration_key(&self) -> Result<String, String> {
-        self.validate()?;
-        let mut hash = Sha256::new();
-        hash.update(b"tzolkin-public-trade-guard-config-v1\0");
-        hash.update(serde_json::to_vec(self).map_err(|e| e.to_string())?);
-        Ok(format!("{:x}", hash.finalize()))
-    }
 }
 
 /// Closed base-NN metadata. Its validation reuses the unchanged pure variant.
