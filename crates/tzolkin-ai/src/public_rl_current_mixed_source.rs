@@ -307,6 +307,30 @@ pub(crate) fn check_record(
     }
     Ok(record)
 }
+
+/// A closed record checked against its full planned header. This is only an
+/// input to fresh native auditing; it is not a validated episode or owner.
+pub(crate) struct CheckedCurrentMixedRecord {
+    record: Record<CurrentMixedSource>,
+}
+impl CheckedCurrentMixedRecord {
+    fn require_header(&self, header: &Header<CurrentMixedSource>) -> Result<(), String> {
+        if self.record.header != *header {
+            return Err(
+                "Current mixed record/schema/full planned header differs before work".into(),
+            );
+        }
+        Ok(())
+    }
+}
+pub(crate) fn check_for_audit(
+    raw: &[u8],
+    header: &Header<CurrentMixedSource>,
+) -> Result<CheckedCurrentMixedRecord, String> {
+    Ok(CheckedCurrentMixedRecord {
+        record: check_record(raw, header)?,
+    })
+}
 pub(crate) fn audit(
     raw: &[u8],
     handle: &CurrentMixedPolicyHandle<'_>,
@@ -315,6 +339,24 @@ pub(crate) fn audit(
 ) -> Result<ValidatedCurrentMixedEpisode, String> {
     header.base_policy.parent.require_current(handle)?;
     let expected = check_record(raw, &header)?;
+    audit_record(expected, handle, roster, header)
+}
+pub(crate) fn audit_checked(
+    expected: CheckedCurrentMixedRecord,
+    handle: &CurrentMixedPolicyHandle<'_>,
+    roster: &FrozenMixedRoster<'_>,
+    header: Header<CurrentMixedSource>,
+) -> Result<ValidatedCurrentMixedEpisode, String> {
+    header.base_policy.parent.require_current(handle)?;
+    expected.require_header(&header)?;
+    audit_record(expected.record, handle, roster, header)
+}
+fn audit_record(
+    expected: Record<CurrentMixedSource>,
+    handle: &CurrentMixedPolicyHandle<'_>,
+    roster: &FrozenMixedRoster<'_>,
+    header: Header<CurrentMixedSource>,
+) -> Result<ValidatedCurrentMixedEpisode, String> {
     let config = header.config.checked_config()?;
     let actual = run_current_mixed_shared(&config, handle, roster, header, Some(&expected))?;
     ValidatedCurrentMixedEpisode::from_audited(actual, config)
@@ -719,6 +761,9 @@ pub(crate) mod tests {
         };
         let raw = encode(&record).unwrap();
         assert!(check_record(&raw, &header).is_ok());
+        let checked = check_for_audit(&raw, &header).unwrap();
+        checked.require_header(&header).unwrap();
+        assert_eq!(encode(&checked.record).unwrap(), raw);
         assert!(decode_typed_record::<crate::public_rl_mixed_native::MixedRlSource>(&raw).is_err());
         let mut wrong = record.clone();
         wrong.schema = crate::public_rl_mixed_native::RECORD_SCHEMA.into();
@@ -726,9 +771,26 @@ pub(crate) mod tests {
         let mut wrong_header = header.clone();
         wrong_header.base_policy.learner_seat = 0;
         assert!(check_record(&raw, &wrong_header).is_err());
+        assert!(checked.require_header(&wrong_header).is_err());
+        assert!(check_for_audit(&raw, &wrong_header).is_err());
+        let mut wrong_header = header.clone();
+        wrong_header.config.environment_seed += 1;
+        assert!(checked.require_header(&wrong_header).is_err());
+        let mut unknown = serde_json::to_value(&record).unwrap();
+        unknown["counts"]["unexpected"] = true.into();
+        assert!(check_for_audit(&serde_json::to_vec(&unknown).unwrap(), &header).is_err());
+        let duplicate = format!(
+            "{{\"schema\":\"{RECORD_SCHEMA}\",{}",
+            &String::from_utf8(raw.clone()).unwrap()[1..]
+        );
+        assert!(check_for_audit(duplicate.as_bytes(), &header).is_err());
+        let mut wrong_counts = record.clone();
+        wrong_counts.counts.observed_callbacks = 1;
+        assert!(check_for_audit(&serde_json::to_vec(&wrong_counts).unwrap(), &header).is_err());
         let mut wrong = record;
         wrong.header.base_policy.opponents[0] = None;
         let bad_header = wrong.header.clone();
         assert!(check_record(&encode(&wrong).unwrap(), &bad_header).is_err());
+        assert!(check_for_audit(&encode(&wrong).unwrap(), &bad_header).is_err());
     }
 }

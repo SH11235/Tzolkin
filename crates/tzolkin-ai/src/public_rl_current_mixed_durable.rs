@@ -2074,10 +2074,9 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             let record = self.progress.collect[member]
                 .as_ref()
                 .ok_or("Missing returned current mixed record")?;
-            let raw = timed(timer, TimedPhase::AuditRecordRead(member), |_| {
+            let checked = timed(timer, TimedPhase::AuditRecordRead(member), |_| {
                 let raw = read_record(&dir, record, member, &self.spec)?;
-                source::check_record(&raw, &plan.headers[member])?;
-                Ok(raw)
+                source::check_for_audit(&raw, &plan.headers[member])
             })?;
             timed(timer, TimedPhase::AuditJournal(member), |_| {
                 self.save(Event::AuditStart { member })
@@ -2090,8 +2089,8 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     Ok((self.handle()?, self.rosters(&collection)?))
                 })?;
                 timed(timer, TimedPhase::Audit(member), |_| {
-                    source::audit(
-                        &raw,
+                    source::audit_checked(
+                        checked,
                         &handle,
                         &rosters[member],
                         plan.headers[member].clone(),
