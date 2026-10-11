@@ -22,7 +22,12 @@ const TECHNOLOGIES = ['agriculture', 'extraction', 'architecture', 'theology'];
 const catalogBytes = readFileSync(
   new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url),
 );
-const buildings = new Map(JSON.parse(catalogBytes).BUILDINGS.map((card) => [card.id, card]));
+const catalog = JSON.parse(catalogBytes);
+const buildings = new Map(catalog.BUILDINGS.map((card) => [card.id, card]));
+const templeMaximums = Object.entries(catalog.TEMPLE_TRACKS).map(([temple, track]) => [
+  temple,
+  track.points.length - 2,
+]);
 const catalogHash = catalogFingerprint(catalogBytes);
 const TEMPLES = {
   Chaac: 'chaac',
@@ -790,6 +795,20 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     for (const player of previous.players) {
       const next = chosen.frame.snapshot.state.players[player.id];
       const food = feeding.find((receipt) => receipt.actor === player.id);
+      if (
+        player.id === previous.currentPlayer &&
+        chosen.frame.snapshot.state.currentPlayer === player.id &&
+        chosen.frame.snapshot.state.round === previous.round &&
+        player.doubleAdvanceAvailable === false &&
+        next.doubleAdvanceAvailable === true &&
+        templeMaximums.some(
+          ([temple, maximum]) =>
+            player.temples[temple] < maximum && next.temples[temple] === maximum,
+        )
+      ) {
+        const key = `${player.id}:doubleAdvanceAvailable:1`;
+        context.effects[key] = (context.effects[key] ?? 0) + 1;
+      }
       for (const field of [
         'workers',
         'score',
@@ -2496,7 +2515,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               /^は(chaac|quetzalcoatl|kukulkan|kukulcan)の信仰が一番高い(?:うちの一人なので、半分の点を獲得した: (\d+)点|ので、(\d+)点を獲得した)$/,
             );
             const trackScore = body.match(/^は信仰により(\d+)点を獲得した$/);
-            if (theologyBonus && queuedPurchase?.kind === 'cornTheology') {
+            if (body === 'は再び歯車を高速化する権利を得た') {
+              if (event.iconResources.length)
+                fail('Double-advance rights caption requires icon-free evidence');
+              automatic(event, 'doubleAdvanceAvailable', 1);
+            } else if (theologyBonus && queuedPurchase?.kind === 'cornTheology') {
               if (
                 queuedPurchase.nextSourceId !== id ||
                 queuedPurchase.actor !== actorId(theologyBonus) ||
