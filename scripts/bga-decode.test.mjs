@@ -643,6 +643,7 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
     resourceFirst = false,
     unique = false,
     templeGains = false,
+    technologyGain = false,
   } = {}) => {
     const start = clone(saved.core.initialFrame);
     start.snapshot.state.players[0].resources.corn = 20;
@@ -699,6 +700,7 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
         player.monuments.push('m01');
       } else {
         player.buildings.push('b06');
+        if (technologyGain) player.technologies.theology++;
         if (bonus) {
           player.resources.corn++;
           player.score += 2;
@@ -854,6 +856,25 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
     ).manifest.blocked.reason,
     /No legal outcome/,
   );
+  const fixedTechnology = { raw_text: 'Aは神学を1レベル進めた' };
+  const technologyPurchase = purchaseFixture({ task: null, technologyGain: true });
+  const fixedAdvance = decode(
+    technologyPurchase.make([[6, [...purchasePayment, build, refund, points, fixedTechnology]]]),
+    technologyPurchase.dispatch,
+  );
+  assert.equal(fixedAdvance.manifest.blocked, null);
+  assert.equal(fixedAdvance.record.steps.length, 1);
+  assert.equal(fixedAdvance.record.steps[0].move.choiceId, 'purchase:bonus');
+  // A single automatic delta cannot validate a duplicate caption or an unrelated track.
+  for (const extra of [fixedTechnology, { raw_text: 'Aは農業を1レベル進めた' }]) {
+    const fixture = purchaseFixture({ task: null, unique: true, technologyGain: true });
+    const rejected = decode(
+      fixture.make([[6, [...purchasePayment, build, refund, points, fixedTechnology, extra]]]),
+      fixture.dispatch,
+    );
+    assert.match(rejected.manifest.blocked.reason, /No legal operation for technology advance/);
+    assert.equal(rejected.record.steps.length, 0);
+  }
   for (const [messages, reason] of [
     [[...purchasePayment, build], /Ambiguous legal operation/],
     [[...purchasePayment, build, material('corn', 2), points], /No legal outcome/],
@@ -863,10 +884,7 @@ test('uses the full typed legal rows for a two-operation technology/payment macr
       [...purchasePayment, build, material('corn', 1, 'B'), points],
       /one purchased card and one actor/,
     ],
-    [
-      [...purchasePayment, build, technology, refund, points],
-      /unsupported or independent operation/,
-    ],
+    [[...purchasePayment, build, technology, refund, points], /No legal outcome/],
     [[...purchasePayment, build, build], /one purchased card and one actor/],
   ]) {
     const fixture = purchaseFixture();
