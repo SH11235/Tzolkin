@@ -8,6 +8,7 @@ use tzolkin_core::observation::{
 use tzolkin_core::{GearId, Phase, Resource, Task, TechnologyId};
 
 pub const POLICY_VERSION: &str = "resource-cycle-arena-v4";
+pub const V5_POLICY_VERSION: &str = "resource-cycle-arena-v5";
 
 /// Changing any field requires a separately versioned hypothesis. The complete
 /// configuration is included in Numeric Arena's absolute-seat pool identity.
@@ -34,9 +35,17 @@ impl Default for ResourceCycleConfig {
     }
 }
 impl ResourceCycleConfig {
+    /// Explicit alternative hypothesis. V4 remains the default opponent.
+    pub fn v5() -> Self {
+        Self {
+            policy_version: V5_POLICY_VERSION.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self != &Self::default() {
-            return Err("Resource-cycle Arena requires its frozen v4 configuration".into());
+        if self != &Self::default() && self != &Self::v5() {
+            return Err("Resource-cycle Arena requires a frozen v4 or v5 configuration".into());
         }
         Ok(())
     }
@@ -163,6 +172,261 @@ fn market_value(
     if useful { 2.0 + net } else { 0.0 }
 }
 
+fn own_forward_worker(o: &Observation, gear: GearId, target: i64, before: i64) -> bool {
+    o.gears.get(&gear).is_some_and(|slots| {
+        slots.iter().enumerate().any(|(position, worker)| {
+            position as i64 <= target
+                && o.round + (target - position as i64) < before
+                && worker
+                    .as_ref()
+                    .is_some_and(|w| !w.dummy && w.player_id == o.actor as i64)
+        })
+    })
+}
+
+fn forward_placement(o: &Observation, gear: GearId, target: i64, before: i64) -> bool {
+    o.gears
+        .get(&gear)
+        .and_then(|slots| slots.iter().position(Option::is_none))
+        .is_some_and(|position| {
+            position as i64 <= target && o.round + (target - position as i64).max(1) < before
+        })
+}
+
+fn material_count(p: &PublicPlayer) -> i64 {
+    p.resources[1..=3].iter().sum()
+}
+
+fn v5_investment(
+    o: &Observation,
+    p: &PublicPlayer,
+    config: &ResourceCycleConfig,
+) -> Option<Investment> {
+    let level = p.technologies[1];
+    if o.round >= config.extraction_before_day
+        || !(0..2).contains(&level)
+        || (p.resources[0] as f64) < corn_target(o, p)
+        || !own_forward_worker(o, GearId::Yaxchilan, 5, config.harvest_before_day)
+        || material_count(p) < level + 1
+    {
+        return None;
+    }
+    let mut remaining = level + 1;
+    let mut reserve = [0; 3];
+    for (i, reserved) in reserve.iter_mut().enumerate() {
+        *reserved = remaining.min(p.resources[i + 1]);
+        remaining -= *reserved;
+    }
+    // Reserve one affordable paid step. The V5 goal priority is a hypothesis,
+    // not a claim that one visible harvest repays two technology investments.
+    Some(Investment {
+        reserve,
+        profit: 0.0,
+    })
+}
+
+fn v5_yax_five_value(p: &PublicPlayer, weights: &HeuristicWeights) -> f64 {
+    // Exactly one base action: Extraction2 yields 2 stone, 1 gold, 2 corn.
+    2.0 * weights.material_values[1]
+        + (1 + i64::from(p.technologies[1] >= 3)) as f64 * weights.material_values[2]
+        + 2.0 * weights.corn_base
+}
+
+fn visible_food_corn(o: &Observation, p: &PublicPlayer, reserve: &[i64; 3]) -> i64 {
+    let Some(day) = next_unprocessed_food_day(o) else {
+        return 0;
+    };
+    let mut corn = 0;
+    for (gear, slots) in &o.gears {
+        for (position, worker) in slots.iter().enumerate() {
+            if !worker
+                .as_ref()
+                .is_some_and(|w| !w.dummy && w.player_id == o.actor as i64)
+            {
+                continue;
+            }
+            let target = match gear {
+                GearId::Palenque if position <= 1 => 1,
+                GearId::Yaxchilan if position <= 3 => 3,
+                GearId::Yaxchilan if position <= 5 => 5,
+                _ => continue,
+            };
+            let wait = (target - position as i64)
+                .max(i64::from(o.turn.mode == tzolkin_core::TurnMode::Place));
+            if o.round + wait < day {
+                corn += if *gear == GearId::Palenque {
+                    3 + i64::from(p.technologies[0] >= 2)
+                } else {
+                    2
+                };
+            }
+        }
+    }
+    // Only current stock, and only when a visible market route exists.
+    // No corn from new placements or repeated future harvests is counted.
+    if own_forward_worker(
+        o,
+        GearId::Uxmal,
+        2,
+        day - i64::from(o.turn.mode == tzolkin_core::TurnMode::Place),
+    ) {
+        corn += (0..3)
+            .map(|i| (p.resources[i + 1] - reserve[i]).max(0) * (i as i64 + 2))
+            .sum::<i64>();
+    }
+    corn
+}
+
+fn v5_worker_penalty_fraction(
+    o: &Observation,
+    p: &PublicPlayer,
+    corn_cost: i64,
+    reserve: &[i64; 3],
+) -> f64 {
+    let Some(day) = next_unprocessed_food_day(o) else {
+        return 0.0;
+    };
+    let mut enlarged = p.clone();
+    enlarged.workers += 1;
+    let current = feeding_need(p);
+    let marginal = feeding_need(&enlarged) - current;
+    if marginal <= 0 {
+        return 0.0;
+    }
+    let coverage =
+        (p.resources[0] - corn_cost + visible_food_corn(o, p, reserve) - current).max(0) as f64;
+    let short_fraction = 1.0 - (coverage / marginal as f64).min(1.0);
+    // Do not suppress the normal first-seat opening seven days before feeding.
+    // As feeding approaches, remove at most the extra-worker score component.
+    let urgency = match day - o.round {
+        ..=2 => 1.0,
+        3..=5 => 0.5,
+        _ => 0.0,
+    };
+    short_fraction * urgency
+}
+
+fn v5_adjustment(
+    o: &Observation,
+    p: &PublicPlayer,
+    action: &TypedAction,
+    config: &ResourceCycleConfig,
+    investment: Option<&Investment>,
+    reserve: &[i64; 3],
+    urgent_food: bool,
+) -> f64 {
+    // Keep V4's urgent-food and final-days liquidation scoring unchanged.
+    if urgent_food || o.round >= 25 {
+        return 0.0;
+    }
+    let level = p.technologies[1];
+    let early = o.round < config.extraction_before_day && level < 2;
+    let goal_priority = (2 - level).max(0) as f64 * config.weights.technology_step;
+    let target = corn_target(o, p);
+    match action {
+        TypedAction::Place {
+            gear, corn_cost, ..
+        } => {
+            let food_covered = (p.resources[0] - corn_cost) as f64 >= target;
+            match gear {
+                GearId::Yaxchilan
+                    if food_covered
+                        && forward_placement(o, *gear, 5, config.harvest_before_day) =>
+                {
+                    if early && !own_forward_worker(o, *gear, 5, config.harvest_before_day) {
+                        config.weights.technology_step + config.qualified_investment_bonus
+                    } else if level >= 2 {
+                        v5_yax_five_value(p, &config.weights)
+                    } else {
+                        0.0
+                    }
+                }
+                GearId::Tikal
+                    if early
+                        && food_covered
+                        && material_count(p) >= level + 1
+                        && own_forward_worker(
+                            o,
+                            GearId::Yaxchilan,
+                            5,
+                            config.harvest_before_day,
+                        )
+                        && !own_forward_worker(o, *gear, 3, config.extraction_before_day)
+                        && forward_placement(o, *gear, 3, config.extraction_before_day) =>
+                {
+                    goal_priority + config.qualified_investment_bonus
+                }
+                GearId::Uxmal => {
+                    let worker = if p.workers < 5 && o.round < 17 {
+                        -6.0 * v5_worker_penalty_fraction(o, p, *corn_cost, reserve)
+                    } else {
+                        0.0
+                    };
+                    let market = if !urgent_food
+                        && !own_forward_worker(o, *gear, 2, config.harvest_before_day)
+                        && next_unprocessed_food_day(o)
+                            .is_some_and(|day| forward_placement(o, *gear, 2, day))
+                    {
+                        market_value(p, target, reserve, &config.weights)
+                    } else {
+                        0.0
+                    };
+                    worker
+                        + if market > 0.0 {
+                            market + config.weights.technology_step
+                        } else {
+                            0.0
+                        }
+                }
+                _ => 0.0,
+            }
+        }
+        TypedAction::Technology {
+            technology: TechnologyId::Extraction,
+        } if early
+            && (p.resources[0] as f64) >= target
+            && own_forward_worker(o, GearId::Yaxchilan, 5, config.harvest_before_day)
+            && (investment.is_some()
+                || matches!(&o.pending_task, Some(Task::Technology { free: true, .. }))) =>
+        {
+            goal_priority
+        }
+        TypedAction::Remove { gear, position } | TypedAction::UseAction { gear, position, .. } => {
+            let corn_cost = match action {
+                TypedAction::UseAction { corn_cost, .. } => *corn_cost,
+                _ => 0,
+            };
+            if *gear == GearId::Uxmal && *position == 3 && p.workers < 6 {
+                return -config.weights.worker
+                    * ((27 - o.round) as f64 / 18.0).max(0.2)
+                    * v5_worker_penalty_fraction(o, p, corn_cost, reserve);
+            }
+            if early
+                && investment.is_some()
+                && *gear == GearId::Tikal
+                && [1, 3].contains(position)
+                && (p.resources[0] - corn_cost) as f64 >= target
+            {
+                return goal_priority + config.qualified_investment_bonus;
+            }
+            // Only a worker still on the gear can wait for position5. An
+            // already-pending UseAction must not forfeit its current harvest.
+            if matches!(action, TypedAction::Remove { .. })
+                && *gear == GearId::Yaxchilan
+                && (1..4).contains(position)
+                && level >= 2
+                && !urgent_food
+                && (p.resources[0] as f64) >= target
+                && o.round + (5 - position) < config.harvest_before_day
+            {
+                return -v5_yax_five_value(p, &config.weights);
+            }
+            0.0
+        }
+        _ => 0.0,
+    }
+}
+
 /// Select exactly one existing legal row. Setup and all other effects retain
 /// baseline scoring; there is no simulation, history, owner or Train interface.
 pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Decision, String> {
@@ -197,9 +461,16 @@ pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Deci
         return Err("Observation key mismatch".into());
     }
     let p = &o.players[o.actor];
+    // Preserve V4's first-seat opening scores before considering a V5
+    // resource route; the alternative still has its own replay identity.
+    let v5 = config.policy_version == V5_POLICY_VERSION && !(o.round == 1 && o.turn_index == 0);
     let target = corn_target(o, p);
     let investment = if o.phase == Phase::Playing {
-        investment(o, p, config)
+        if v5 {
+            v5_investment(o, p, config)
+        } else {
+            investment(o, p, config)
+        }
     } else {
         None
     };
@@ -249,6 +520,17 @@ pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Deci
                 }
                 _ => {}
             }
+            if v5 {
+                score += v5_adjustment(
+                    o,
+                    p,
+                    &legal.action,
+                    config,
+                    investment.as_ref(),
+                    &reserve,
+                    urgent_food,
+                );
+            }
         }
         if !score.is_finite() {
             return Err("Non-finite resource-cycle score".into());
@@ -269,7 +551,7 @@ pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Deci
     Ok(Decision {
         actor: o.actor,
         observation_key: key,
-        policy_version: POLICY_VERSION.into(),
+        policy_version: config.policy_version.clone(),
         r#move: legal.r#move.clone(),
         score,
     })
@@ -670,6 +952,11 @@ mod tests {
             let mut baseline = crate::choose_move(&o).unwrap();
             baseline.policy_version = POLICY_VERSION.into();
             assert_eq!(choose_move(&o, &config).unwrap(), baseline);
+            baseline.policy_version = V5_POLICY_VERSION.into();
+            assert_eq!(
+                choose_move(&o, &ResourceCycleConfig::v5()).unwrap(),
+                baseline
+            );
         }
         let setup = create_game(
             vec!["A".into(), "B".into(), "C".into(), "D".into()],
@@ -700,5 +987,242 @@ mod tests {
             identity["configuration"],
             serde_json::to_value(config).unwrap()
         );
+        let v5 = ResourceCycleConfig::v5();
+        assert!(v5.validate().is_ok());
+        baseline.policy_version = V5_POLICY_VERSION.into();
+        assert_eq!(choose_move(&o, &v5).unwrap(), baseline);
+        changed = v5;
+        changed.qualified_investment_bonus += 1.0;
+        assert!(changed.validate().is_err());
+    }
+
+    #[test]
+    fn resource_cycle_v5_bootstraps_funded_extraction_and_its_visible_route() {
+        let config = ResourceCycleConfig::v5();
+        let mut opening = create_game(
+            vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            17,
+            false,
+        )
+        .unwrap();
+        opening.phase = Phase::Playing;
+        opening.players[0].resources.insert(Resource::Corn, 20);
+        for _ in 0..3 {
+            let o = observe(&opening, 0).unwrap();
+            let mut v4 = choose_move(&o, &ResourceCycleConfig::default()).unwrap();
+            v4.policy_version = V5_POLICY_VERSION.into();
+            let v5 = choose_move(&o, &config).unwrap();
+            assert_eq!(v5, v4);
+            assert_eq!(
+                v5.r#move,
+                tzolkin_core::GameMove::Place {
+                    gear: GearId::Uxmal
+                }
+            );
+            opening = apply_move(&opening, v5.r#move).unwrap();
+        }
+        for level in [0, 1] {
+            let mut state = playing(Task::Technology {
+                remaining: 1,
+                free: false,
+                mandatory: false,
+            });
+            state.players[1].resources.insert(Resource::Corn, 9);
+            state.players[1].resources.insert(Resource::Wood, level + 1);
+            state.players[1].resources.insert(Resource::Stone, 0);
+            state.players[1].resources.insert(Resource::Gold, 0);
+            state.players[1]
+                .technologies
+                .insert(TechnologyId::Extraction, level);
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[0] = Some(GearWorker {
+                player_id: 1,
+                dummy: false,
+            });
+            let o = observe(&state, 1).unwrap();
+            assert!(investment(&o, &o.players[1], &ResourceCycleConfig::default()).is_none());
+            let decision = choose_move(&o, &config).unwrap();
+            let row = o
+                .legal_actions
+                .iter()
+                .find(|row| row.r#move == decision.r#move)
+                .unwrap();
+            assert_eq!(
+                row.action,
+                TypedAction::Technology {
+                    technology: TechnologyId::Extraction
+                }
+            );
+            let payment = apply_move(&state, decision.r#move).unwrap();
+            let payment_o = observe(&payment, 1).unwrap();
+            let paid =
+                apply_move(&payment, choose_move(&payment_o, &config).unwrap().r#move).unwrap();
+            assert_eq!(
+                paid.players[1].technologies[&TechnologyId::Extraction],
+                level + 1
+            );
+            assert_eq!(paid.players[1].resources[&Resource::Wood], 0);
+            assert_eq!(paid.players[1].resources[&Resource::Corn], 9);
+        }
+
+        let mut state = playing(Task::Trade);
+        state.pending = None;
+        let o = observe(&state, 1).unwrap();
+        let decision = choose_move(&o, &config).unwrap();
+        assert_eq!(
+            decision.r#move,
+            tzolkin_core::GameMove::Place {
+                gear: GearId::Yaxchilan
+            }
+        );
+        state = apply_move(&state, decision.r#move).unwrap();
+        // Placement has already committed this turn: the next funded route is
+        // a real Tikal placement rather than a hypothetical future harvest.
+        let o = observe(&state, 1).unwrap();
+        let decision = choose_move(&o, &config).unwrap();
+        assert_eq!(
+            decision.r#move,
+            tzolkin_core::GameMove::Place {
+                gear: GearId::Tikal
+            }
+        );
+        let after = apply_move(&state, decision.r#move).unwrap();
+        assert_eq!(after.turn.count, 2);
+        assert!(
+            after.gears[&GearId::Tikal]
+                .iter()
+                .any(|worker| worker.as_ref().is_some_and(|w| w.player_id == 1))
+        );
+
+        // A pending action cannot wait on the gear: take the actual level2
+        // harvest without treating two future rotations as repeated income.
+        state.pending = Some(Pending {
+            title: "Synthetic harvest".into(),
+            task: Task::Action {
+                gear: GearId::Yaxchilan,
+                position: 5,
+                free: Some(true),
+            },
+            after: vec![],
+        });
+        state.players[1]
+            .technologies
+            .insert(TechnologyId::Extraction, 2);
+        let o = observe(&state, 1).unwrap();
+        let after = apply_move(&state, choose_move(&o, &config).unwrap().r#move).unwrap();
+        assert_eq!(
+            after.players[1].resources[&Resource::Stone]
+                - state.players[1].resources[&Resource::Stone],
+            2
+        );
+        assert_eq!(
+            after.players[1].resources[&Resource::Gold]
+                - state.players[1].resources[&Resource::Gold],
+            1
+        );
+        assert_eq!(
+            after.players[1].resources[&Resource::Corn]
+                - state.players[1].resources[&Resource::Corn],
+            2
+        );
+        state.pending = None;
+        state.turn.mode = tzolkin_core::TurnMode::Remove;
+        state.turn.count = 1;
+        state.gears.get_mut(&GearId::Yaxchilan).unwrap().fill(None);
+        state.gears.get_mut(&GearId::Yaxchilan).unwrap()[3] = Some(GearWorker {
+            player_id: 1,
+            dummy: false,
+        });
+        state.round = 18;
+        state.age = 2;
+        state.food_days = vec![8, 14];
+        let o = observe(&state, 1).unwrap();
+        let decision = choose_move(&o, &config).unwrap();
+        assert!(matches!(
+            o.legal_actions
+                .iter()
+                .find(|row| row.r#move == decision.r#move)
+                .unwrap()
+                .action,
+            TypedAction::EndTurn { .. }
+        ));
+        assert!(apply_move(&state, decision.r#move).is_ok());
+        for (round, corn) in [(20, 2), (25, 20)] {
+            state.round = round;
+            state.food_days = if round == 25 {
+                vec![8, 14, 21]
+            } else {
+                vec![8, 14]
+            };
+            state.players[1].resources.insert(Resource::Corn, corn);
+            let o = observe(&state, 1).unwrap();
+            let mut v4 = choose_move(&o, &ResourceCycleConfig::default()).unwrap();
+            v4.policy_version = V5_POLICY_VERSION.into();
+            assert_eq!(choose_move(&o, &config).unwrap(), v4);
+        }
+    }
+
+    #[test]
+    fn resource_cycle_v5_marginal_feeding_uses_core_discounts_and_visible_food() {
+        let mut state = playing(Task::Action {
+            gear: GearId::Uxmal,
+            position: 3,
+            free: Some(true),
+        });
+        state.players[1].resources.insert(Resource::Corn, 6);
+        let o = observe(&state, 1).unwrap();
+        assert_eq!(
+            v5_worker_penalty_fraction(&o, &o.players[1], 0, &[0; 3]),
+            1.0
+        );
+        state.round = 1;
+        let o = observe(&state, 1).unwrap();
+        assert_eq!(
+            v5_worker_penalty_fraction(&o, &o.players[1], 0, &[0; 3]),
+            0.0
+        );
+        state.round = 7;
+        state.gears.get_mut(&GearId::Palenque).unwrap()[1] = Some(GearWorker {
+            player_id: 1,
+            dummy: false,
+        });
+        let o = observe(&state, 1).unwrap();
+        assert_eq!(
+            v5_worker_penalty_fraction(&o, &o.players[1], 0, &[0; 3]),
+            0.0
+        );
+        state.gears.get_mut(&GearId::Palenque).unwrap()[1] = None;
+
+        for (feed_workers, feed_discount, feed_all, expected_marginal) in [
+            (0, 0, false, 2),
+            (0, 1, false, 1),
+            (0, 2, false, 0),
+            (3, 0, false, 2),
+            (4, 0, false, 0),
+            (0, 0, true, 0),
+        ] {
+            let p = &mut state.players[1];
+            p.resources.insert(Resource::Corn, 30);
+            p.feed_workers = feed_workers;
+            p.feed_discount = feed_discount;
+            p.feed_all = feed_all;
+            let before = tzolkin_core::prophecies::feeding(p, false, 0).corn_cost;
+            p.workers += 1;
+            let after = tzolkin_core::prophecies::feeding(p, false, 0).corn_cost;
+            p.workers -= 1;
+            let o = observe(&state, 1).unwrap();
+            let mut enlarged = o.players[1].clone();
+            enlarged.workers += 1;
+            assert_eq!(after - before, expected_marginal);
+            assert_eq!(
+                feeding_need(&enlarged) - feeding_need(&o.players[1]),
+                after - before
+            );
+            state.players[1].resources.insert(Resource::Corn, before);
+            let o = observe(&state, 1).unwrap();
+            assert_eq!(
+                v5_worker_penalty_fraction(&o, &o.players[1], 0, &[0; 3]),
+                if expected_marginal == 0 { 0.0 } else { 1.0 }
+            );
+        }
     }
 }
