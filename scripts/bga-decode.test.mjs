@@ -323,6 +323,155 @@ function replaceEvents(value, rows) {
   value.witness.witnesses = [];
 }
 
+function rightsFixture(temple = 'kukulkan') {
+  const initial = clone(saved.core.initialFrame);
+  const before = initial.snapshot.state;
+  const maximum = temple === 'chaac' ? 5 : 6;
+  before.turn = { mode: 'remove', count: 1, begged: false };
+  before.gears.chichenItza.fill(null);
+  before.gears.chichenItza[3] = { playerId: 0, dummy: false };
+  before.players[0].temples[temple] = maximum - 1;
+  before.players[0].doubleAdvanceAvailable = false;
+  before.players[0].resources.skull = 1;
+  initial.observation.legalActions = [
+    {
+      action: { type: 'remove', gear: 'chichenItza', position: 3 },
+      move: { type: 'remove', gear: 'chichenItza', position: 3 },
+    },
+  ];
+  const removed = clone(initial);
+  removed.snapshot.state.gears.chichenItza[3] = null;
+  removed.snapshot.state.turn.count++;
+  removed.observation.legalActions = [
+    {
+      action: { type: 'useAction', gear: 'chichenItza', position: 4, cornCost: 0 },
+      move: { type: 'choose', choiceId: 'action:4' },
+    },
+  ];
+  const after = clone(removed);
+  const next = after.snapshot.state;
+  next.players[0].resources.skull--;
+  next.players[0].temples[temple] = maximum;
+  next.players[0].doubleAdvanceAvailable = true;
+  next.players[0].score += 7;
+  after.observation.legalActions = [];
+  const value = input();
+  value.witness.initial = clone(before);
+  const messages = [
+    { raw_text: 'AはChichen Itza 3のワーカーを取り除き、n°4のアクションを行った' },
+    {
+      raw_text: 'Aは\nを支払った',
+      icons: [{ classes: 'tz_icon resource_skull' }],
+    },
+    { raw_text: 'Aは再び歯車を高速化する権利を得た' },
+    { raw_text: `Aは${temple === 'chaac' ? 'Chaac' : 'Kukulcan'}の信仰を1段上げた` },
+    { raw_text: 'Aは7点を獲得した' },
+  ];
+  return { initial, removed, after, value, messages, temple, maximum };
+}
+
+function rightsDispatcher(f) {
+  return dispatcher(f.initial, (request) =>
+    clone(request.move.type === 'remove' ? f.removed : f.after),
+  );
+}
+
+test('binds double-advance rights to actual same-source top-temple transitions', () => {
+  for (const temple of ['chaac', 'kukulkan']) {
+    const f = rightsFixture(temple);
+    replaceEvents(f.value, [[6, f.messages]]);
+    f.value.witness.witnesses = [
+      {
+        actionId: 6,
+        expected: {
+          players: f.after.snapshot.state.players.map((player) => ({
+            resources: clone(player.resources),
+            temples: clone(player.temples),
+            score: player.score,
+            doubleAdvanceAvailable: player.doubleAdvanceAvailable,
+          })),
+        },
+      },
+    ];
+    const result = decode(f.value, rightsDispatcher(f));
+    assert.equal(result.manifest.blocked, null);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.move),
+      [
+        { type: 'remove', gear: 'chichenItza', position: 3 },
+        { type: 'choose', choiceId: 'action:4' },
+      ],
+    );
+    assert.equal(
+      result.record.steps[1].checkpoint.expected.players[0].doubleAdvanceAvailable,
+      true,
+    );
+    assert.equal(result.manifest.trainingReady, false);
+  }
+});
+
+test('refuses unestablished or duplicate double-advance rights atomically', () => {
+  const changes = [
+    (f) => {
+      f.initial.snapshot.state.players[0].doubleAdvanceAvailable = true;
+      f.removed.snapshot.state.players[0].doubleAdvanceAvailable = true;
+    },
+    (f) => {
+      f.after.snapshot.state.players[0].doubleAdvanceAvailable = false;
+    },
+    (f) => {
+      f.after.snapshot.state.players[0].temples[f.temple] = f.maximum - 1;
+    },
+    (f) => {
+      f.messages[2].raw_text = 'Bは再び歯車を高速化する権利を得た';
+    },
+    (f) => {
+      f.messages.splice(3, 0, clone(f.messages[2]));
+    },
+    (f) => {
+      f.messages[2].icons = [{ classes: 'tz_icon resource_gold' }];
+    },
+    (f) => {
+      f.after.snapshot.state.round++;
+    },
+  ];
+  for (const change of changes) {
+    const f = rightsFixture();
+    change(f);
+    f.value.witness.initial = clone(f.initial.snapshot.state);
+    replaceEvents(f.value, [[6, f.messages]]);
+    const result = decode(f.value, rightsDispatcher(f));
+    assert.equal(result.manifest.blocked.actionId, 6);
+    assert.match(result.manifest.blocked.reason, /doubleAdvanceAvailable|icon-free/);
+    assert.equal(result.record.steps.length, 0);
+    assert.equal(result.manifest.audit.length, 0);
+  }
+});
+
+test('keeps double-advance rights source-local and preserves original checkpoints', () => {
+  const stale = rightsFixture();
+  const caption = stale.messages.splice(2, 1)[0];
+  replaceEvents(stale.value, [
+    [6, stale.messages],
+    [7, [caption]],
+  ]);
+  const retained = decode(stale.value, rightsDispatcher(stale));
+  assert.equal(retained.manifest.blocked.actionId, 7);
+  assert.match(retained.manifest.blocked.reason, /doubleAdvanceAvailable/);
+  assert.deepEqual(
+    retained.record.steps.map((step) => step.sourceActionIds),
+    [[6], [6]],
+  );
+
+  const mismatch = rightsFixture();
+  replaceEvents(mismatch.value, [[6, mismatch.messages]]);
+  mismatch.value.witness.witnesses = [{ actionId: 6, expected: { round: 99 } }];
+  const rolledBack = decode(mismatch.value, rightsDispatcher(mismatch));
+  assert.equal(rolledBack.manifest.blocked.actionId, 6);
+  assert.match(rolledBack.manifest.blocked.reason, /checkpoint/);
+  assert.equal(rolledBack.record.steps.length, 0);
+});
+
 test('binds localized food-day score captions and age-two announcements to core effects', () => {
   const fixture = (day = 14) => {
     const initial = clone(saved.core.initialFrame);
