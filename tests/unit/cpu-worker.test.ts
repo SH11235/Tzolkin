@@ -265,6 +265,49 @@ describe('CPU Worker request lifecycle', () => {
     expect(metrics.getNnDecisionLatency(model.checksum).completedAttempts).toBe(0);
   });
 
+  it('keeps actual application failures separate from legality and publishes bounded numeric rows', async () => {
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const metrics = await import('../../src/game/cpuTiming');
+    const changed = vi.fn();
+    const timing = new metrics.NnDecisionTiming(
+      { gameId: 'private-epoch', modelChecksum: model.checksum },
+      undefined,
+      changed,
+    );
+    timing.inputReady();
+    timing.notified();
+    timing.chosen();
+    now = 25;
+    timing.legal();
+    timing.applicationStarted();
+    timing.applicationDiscarded(); // A cancellation can race the actual core rejection.
+    now = 1200;
+    timing.applicationFailed();
+    timing.failed(new Error('Core application failed after completed legality'));
+    timing.applicationApplied(); // A failed application cannot later become successful.
+    const data = metrics.getNnLatencyMeasurement(model.checksum);
+    expect(data.summary).toMatchObject({
+      completedAttempts: 1,
+      legalDecisions: 1,
+      legalP95Ms: 25,
+      errors: 0,
+      deadlines: 0,
+      applied: 0,
+      applyPending: 0,
+      applyFailures: 1,
+      applyDiscards: 0,
+    });
+    expect(data.rows).toEqual([[1, 0, 3, 25, 0, 0, 0, 25]]);
+    expect(data.rows.flat().every((value) => value === null || typeof value === 'number')).toBe(
+      true,
+    );
+    expect(JSON.stringify(data)).not.toContain('private-epoch');
+    data.rows[0]![3] = 9999;
+    expect(metrics.getNnLatencyMeasurement(model.checksum).rows[0]![3]).toBe(25);
+    expect(changed).toHaveBeenCalledTimes(4);
+  });
+
   it('ignores stale requests and checks the actor and observation key', async () => {
     const { chooseCpu } = await import('../../src/game/cpu');
     const pending = chooseCpu(observation, new AbortController().signal);
