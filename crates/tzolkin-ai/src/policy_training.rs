@@ -1,6 +1,7 @@
 //! Scalar policy-only BC on fully source-validated V2 native datasets. No value head or labels.
 use crate::dataset::DatasetSplit;
 use crate::features::{EncodedCandidate, FEATURE_COUNT, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
+use crate::kernel::Kernel;
 use crate::model::{MAX_ARTIFACT_BYTES, Random, digest, dot, policy_softmax, read_json};
 use crate::policy_dataset::{
     DATASET_SCHEMA, PolicyDatasetStratum, ValidatedPolicyDataset, ValidatedPolicySample,
@@ -472,10 +473,36 @@ pub(crate) fn policy_loss(
     scratch: &mut Scratch,
     gradient: Option<&mut [f32]>,
 ) -> Result<(f64, bool), String> {
+    policy_loss_using::<true>(model, rows, chosen, scratch, gradient)
+}
+fn prefix_bits_equal(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| a.to_bits() == b.to_bits())
+}
+fn policy_loss_using<const REUSE_PREFIX: bool>(
+    model: &PublicPolicyModel,
+    rows: &[EncodedCandidate],
+    chosen: usize,
+    scratch: &mut Scratch,
+    gradient: Option<&mut [f32]>,
+) -> Result<(f64, bool), String> {
     if rows.is_empty() || rows.len() > MAX_LEGAL_ACTIONS || chosen >= rows.len() {
         return Err("Invalid BC complete-legal candidate batch".into());
     }
     let context = &rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384];
+    // Eligibility only: bad tags or numeric-equal signed-zero differences keep
+    // the original per-row path and its guard/error order. No cache escapes
+    // this call or its current immutable parameters.
+    let reusable = REUSE_PREFIX
+        && rows.len() > 1
+        && rows.iter().all(|row| {
+            row.values_for_schema(PUBLIC_FEATURE_SCHEMA)
+                .is_ok_and(|values| prefix_bits_equal(context, &values[..384]))
+        });
+    let mut prefix = None;
     scratch.hidden.resize(rows.len() * HIDDEN, 0.0);
     scratch.logits.resize(rows.len(), 0.0);
     scratch.probabilities.resize(rows.len(), 0.0);
@@ -485,11 +512,28 @@ pub(crate) fn policy_loss(
             return Err("Invalid BC tagged/context/finite features".into());
         }
         let hidden = &mut scratch.hidden[i * HIDDEN..(i + 1) * HIDDEN];
+        let mut continued = [0.0; HIDDEN];
+        if reusable {
+            // Only initialize after this row's full feature guard. Scalar
+            // continuation retains the ordered unfinished 384-column sum;
+            // bias, finite checks and tanh still occur in original unit order.
+            let saved = prefix.get_or_insert_with(|| {
+                Kernel::Scalar
+                    .resolve()
+                    .expect("Scalar is available on every supported target")
+                    .policy_prefix_validated(&model.parameters[..B1], context)
+            });
+            saved.continue_validated(&values[384..], &mut continued);
+        }
         for (unit, value) in hidden.iter_mut().enumerate() {
-            let affine = dot(
-                &model.parameters[unit * FEATURE_COUNT..(unit + 1) * FEATURE_COUNT],
-                values,
-            ) + model.parameters[B1 + unit];
+            let affine = if reusable {
+                continued[unit]
+            } else {
+                dot(
+                    &model.parameters[unit * FEATURE_COUNT..(unit + 1) * FEATURE_COUNT],
+                    values,
+                )
+            } + model.parameters[B1 + unit];
             if !affine.is_finite() {
                 return Err("Nonfinite BC hidden affine".into());
             }
@@ -954,6 +998,80 @@ mod tests {
         })
     }
 
+    fn short_numeric_batches() -> Vec<Vec<EncodedCandidate>> {
+        let mut batches = Vec::new();
+        for players in [3, 4] {
+            let mut state = tzolkin_core::create_game(
+                (0..players).map(|i| format!("Seat {i}")).collect(),
+                17,
+                false,
+            )
+            .unwrap();
+            for phase in [tzolkin_core::Phase::Setup, tzolkin_core::Phase::Playing] {
+                for _ in 0..players {
+                    if state.phase == phase {
+                        break;
+                    }
+                    let o = observe(&state, state.current_player).unwrap();
+                    state = tzolkin_core::apply_move(&state, o.legal_actions[0].r#move.clone())
+                        .unwrap();
+                }
+                assert_eq!(state.phase, phase);
+                let o = observe(&state, state.current_player).unwrap();
+                let encoder = FeatureEncoder::new_public(&o).unwrap();
+                // The private numeric primitive's ragged fixture may repeat
+                // an encoded legal row. No raw candidate or dataset is made;
+                // production still accepts only a regenerated full legal set.
+                batches.push(
+                    (0..7)
+                        .map(|i| {
+                            encoder
+                                .encode_legal_tagged(i % o.legal_actions.len())
+                                .unwrap()
+                        })
+                        .collect(),
+                );
+            }
+        }
+        batches
+    }
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+    fn forward_gradient_parity(model: &PublicPolicyModel) -> (Vec<f32>, Vec<f32>) {
+        let mut old = Scratch::default();
+        let mut new = Scratch::default();
+        let mut old_gradient = vec![0.0; PARAMETER_COUNT];
+        let mut new_gradient = vec![0.0; PARAMETER_COUNT];
+        for batch in short_numeric_batches() {
+            for size in [1, 2, 3, 7] {
+                let old_result = policy_loss_using::<false>(
+                    model,
+                    &batch[..size],
+                    size - 1,
+                    &mut old,
+                    Some(&mut old_gradient),
+                )
+                .unwrap();
+                let new_result = policy_loss(
+                    model,
+                    &batch[..size],
+                    size - 1,
+                    &mut new,
+                    Some(&mut new_gradient),
+                )
+                .unwrap();
+                assert_eq!(old_result.0.to_bits(), new_result.0.to_bits());
+                assert_eq!(old_result.1, new_result.1);
+                assert_eq!(bits(&old.hidden), bits(&new.hidden));
+                assert_eq!(bits(&old.logits), bits(&new.logits));
+                assert_eq!(bits(&old.probabilities), bits(&new.probabilities));
+                assert_eq!(bits(&old_gradient), bits(&new_gradient));
+            }
+        }
+        (old_gradient, new_gradient)
+    }
+
     #[test]
     fn ragged_categorical_loss_forward_and_singleton_match_policy_only_inference() {
         let artifact = PublicPolicyArtifact::new(11235).unwrap();
@@ -995,6 +1113,7 @@ mod tests {
             }
             assert!(gradient[BP].abs() < 2.0e-7); // shared policy bias cancels under softmax.
         }
+        forward_gradient_parity(&artifact.model);
     }
 
     #[test]
@@ -1052,6 +1171,28 @@ mod tests {
     #[test]
     fn adam_clips_batch_mean_and_refuses_invalid_or_nonfinite_updates() {
         let mut artifact = PublicPolicyArtifact::new(7).unwrap();
+        let (mut old_gradient, mut new_gradient) = forward_gradient_parity(&artifact.model);
+        let mut old_model = artifact.model.clone();
+        let mut new_model = artifact.model.clone();
+        let mut old_optimizer = PolicyAdamState::new();
+        let mut new_optimizer = PolicyAdamState::new();
+        old_optimizer
+            .update(&mut old_model, &mut old_gradient, 16, 0.001)
+            .unwrap();
+        new_optimizer
+            .update(&mut new_model, &mut new_gradient, 16, 0.001)
+            .unwrap();
+        assert_eq!(bits(old_model.parameters()), bits(new_model.parameters()));
+        assert_eq!(
+            bits(&old_optimizer.first_moment),
+            bits(&new_optimizer.first_moment)
+        );
+        assert_eq!(
+            bits(&old_optimizer.second_moment),
+            bits(&new_optimizer.second_moment)
+        );
+        assert_eq!(old_optimizer.step, new_optimizer.step);
+        assert_eq!(bits(&old_gradient), bits(&new_gradient));
         let mut optimizer = PolicyAdamState::new();
         let mut gradient = vec![0.0; PARAMETER_COUNT];
         gradient[0] = 120.0;
@@ -1101,9 +1242,113 @@ mod tests {
             .encode_legal_tagged(0)
             .unwrap();
         assert!(policy_loss(&artifact.model, &[row], 0, &mut scratch, None).is_err());
+        let legacy = FeatureEncoder::new(&observation)
+            .unwrap()
+            .encode_legal_tagged(0)
+            .unwrap();
+        let mut bad_tag = rows()[..2].to_vec();
+        bad_tag[1] = legacy;
+        let compare_error = |model: &PublicPolicyModel, rows: &[EncodedCandidate], chosen| {
+            let mut old = Scratch::default();
+            let mut new = Scratch::default();
+            let a = policy_loss_using::<false>(model, rows, chosen, &mut old, None).unwrap_err();
+            let b = policy_loss(model, rows, chosen, &mut new, None).unwrap_err();
+            assert_eq!(a, b);
+            assert_eq!(bits(&old.hidden), bits(&new.hidden));
+            assert_eq!(bits(&old.logits), bits(&new.logits));
+        };
+        compare_error(&artifact.model, &[], 0);
+        compare_error(&artifact.model, rows(), rows().len());
+        compare_error(&artifact.model, &bad_tag, 0);
+        let positive_zero = [0.0, 1.0, f32::from_bits(1)];
+        let negative_zero = [-0.0, 1.0, f32::from_bits(1)];
+        assert_eq!(positive_zero, negative_zero);
+        assert!(!prefix_bits_equal(&positive_zero, &negative_zero));
+        assert!(prefix_bits_equal(&positive_zero, &positive_zero));
+        assert!(!prefix_bits_equal(&positive_zero, &positive_zero[..2]));
         artifact.model.parameters[..B1].fill(f32::MAX);
         assert!(artifact.model.validate().is_ok());
         assert!(policy_loss(&artifact.model, rows(), 0, &mut scratch, None).is_err());
+        // The first row's affine error must still precede a later bad tag.
+        compare_error(&artifact.model, &bad_tag, 0);
+        compare_error(&artifact.model, &rows()[..2], 0);
+    }
+
+    #[test]
+    #[ignore = "Bounded local numeric microbench; no CI timing threshold or training/strength measurement."]
+    fn scalar_prefix_forward_and_gradient_local_microbench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        const ITERATIONS: usize = 32;
+        const TRIALS: usize = 5;
+        let artifact = PublicPolicyArtifact::new(11235).unwrap();
+        let batches = short_numeric_batches();
+        let candidates = ITERATIONS * batches.len() * (2 + 7);
+        let mut scratch = Scratch::default();
+        let mut gradient = vec![0.0; PARAMETER_COUNT];
+        let mut measure = |reuse: bool, backward: bool| {
+            gradient.fill(0.0);
+            let start = Instant::now();
+            for _ in 0..ITERATIONS {
+                for batch in &batches {
+                    for size in [2, 7] {
+                        let g = backward.then_some(&mut gradient[..]);
+                        let result = if reuse {
+                            policy_loss(
+                                &artifact.model,
+                                black_box(&batch[..size]),
+                                1,
+                                &mut scratch,
+                                g,
+                            )
+                        } else {
+                            policy_loss_using::<false>(
+                                &artifact.model,
+                                black_box(&batch[..size]),
+                                1,
+                                &mut scratch,
+                                g,
+                            )
+                        }
+                        .unwrap();
+                        black_box(result);
+                    }
+                }
+            }
+            black_box(&scratch);
+            black_box(&gradient);
+            start.elapsed().as_secs_f64()
+        };
+        for backward in [false, true] {
+            measure(false, backward);
+            measure(true, backward);
+            let mut old = Vec::with_capacity(TRIALS);
+            let mut new = Vec::with_capacity(TRIALS);
+            for trial in 0..TRIALS {
+                for reuse in [trial % 2 == 1, trial % 2 == 0] {
+                    let seconds = measure(reuse, backward);
+                    if reuse {
+                        new.push(seconds);
+                    } else {
+                        old.push(seconds);
+                    }
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "schema":"scalar-policy-prefix-local-microbench-v1", "backward":backward,
+                    "backend":"scalar", "iterations":ITERATIONS, "trials":TRIALS,
+                    "candidatesPerTrial":candidates, "oldMedianSeconds":old[TRIALS / 2],
+                    "newMedianSeconds":new[TRIALS / 2], "medianRatio":old[TRIALS / 2] / new[TRIALS / 2],
+                    "oldCandidatesPerSecond":candidates as f64 / old[TRIALS / 2],
+                    "newCandidatesPerSecond":candidates as f64 / new[TRIALS / 2],
+                    "trainingMeasured":false, "strengthMeasured":false
+                })
+            );
+        }
     }
 
     #[test]
