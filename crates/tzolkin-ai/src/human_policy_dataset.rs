@@ -21,7 +21,8 @@ use tzolkin_core::public_replay::{
     public_catalog_hash, verify_public_replay,
 };
 use tzolkin_core::{
-    GameOptions, GearId, Pending, Phase, RESOURCE_IDS, Resource, Task, TechnologyId,
+    GameOptions, GearId, Pending, Phase, RESOURCE_IDS, Resource, TEMPLE_IDS, Task, TechnologyId,
+    TempleId, TempleReason,
 };
 
 pub const INPUT_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-source-v1";
@@ -37,6 +38,10 @@ pub const INPUT_SCHEMA_V4: &str = "tzolkin-conditional-basic-human-policy-source
 pub const DATASET_SCHEMA_V4: &str = "tzolkin-conditional-basic-human-policy-dataset-v4";
 pub const EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE: &str =
     "PrimitivesRemovalPaidTechnologyAndObservedMarketSellPaidAnywhereV4";
+pub const INPUT_SCHEMA_V5: &str = "tzolkin-conditional-basic-human-policy-source-v5";
+pub const DATASET_SCHEMA_V5: &str = "tzolkin-conditional-basic-human-policy-dataset-v5";
+pub const OBSERVED_CORN_BEG_LABEL_SCOPE: &str =
+    "PrimitivesRemovalPaidTechnologyMarketSellPaidAnywhereAndObservedCornBegV5";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -90,6 +95,9 @@ impl Manifest {
             }
             (INPUT_SCHEMA_V4, Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)) => {
                 Ok(Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE))
+            }
+            (INPUT_SCHEMA_V5, Some(OBSERVED_CORN_BEG_LABEL_SCOPE)) => {
+                Ok(Some(OBSERVED_CORN_BEG_LABEL_SCOPE))
             }
             _ => Err("Conditional Human manifest label scope mismatch".into()),
         }
@@ -148,6 +156,17 @@ pub struct HumanPolicySample {
     source_label_support: Option<RemovalActionSupport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     paid_technology_support: Option<PaidTechnologySupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    corn_beg_support: Option<CornBegSupport>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CornBegSupport {
+    beg_replay_step_index: usize,
+    temple_replay_step_index: usize,
+    temple: TempleId,
+    corn_gain: i64,
+    basis: &'static str,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -990,6 +1009,231 @@ fn paid_technology_evidence(
     }))
 }
 
+struct CornBegEvidence {
+    support: CornBegSupport,
+    temple_observation: tzolkin_core::observation::Observation,
+    temple_chosen: usize,
+}
+
+// One visible caption selects both the request and its negative-faith choice.
+// Admission requires both consecutive, audited core moves; neither row may be
+// inferred independently from a resource change or a later checkpoint.
+fn corn_beg_evidence(
+    index: usize,
+    sources: &Sources,
+    report: &PublicReplayReport,
+    audit: &[Value],
+) -> Result<Option<CornBegEvidence>, String> {
+    let record = &sources.record;
+    let step = &record.steps[index];
+    let Some(next) = record.steps.get(index + 1) else {
+        return Ok(None);
+    };
+    let source_id = step.source_action_ids[0];
+    if next.actor != step.actor
+        || next.source_action_ids != step.source_action_ids
+        || step.refills != Default::default()
+        || next.refills != Default::default()
+        || record
+            .steps
+            .iter()
+            .filter(|step| step.source_action_ids.contains(&source_id))
+            .count()
+            != 2
+        || audit
+            .iter()
+            .filter(|entry| entry["actionId"].as_u64() == Some(source_id))
+            .count()
+            != 2
+    {
+        return Ok(None);
+    }
+    let before = &report.frames[index].snapshot.state;
+    let middle = &report.frames[index + 1].snapshot.state;
+    let after = &report.frames[index + 2].snapshot.state;
+    if [middle, after].iter().any(|state| {
+        state.phase != before.phase
+            || state.round != before.round
+            || state.current_player != before.current_player
+    }) || middle.players != before.players
+    {
+        return Ok(None);
+    }
+    let inspection = inspect_public(middle)?;
+    let observation = inspection
+        .observation
+        .ok_or("Beg temple observation missing")?;
+    if !matches!(
+        observation.pending_task,
+        Some(Task::Temple {
+            remaining: 1,
+            distinct: None,
+            direction: Some(-1),
+            reason: Some(TempleReason::Beg)
+        })
+    ) {
+        return Ok(None);
+    }
+    let choices: Vec<_> = observation
+        .legal_actions
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.r#move == next.r#move)
+        .collect();
+    if choices.len() != 1 {
+        return Ok(None);
+    }
+    let (chosen, row) = choices[0];
+    let TypedAction::Temple {
+        temple,
+        direction: -1,
+    } = row.action
+    else {
+        return Ok(None);
+    };
+    let action = serde_json::to_value(&row.action).map_err(|e| e.to_string())?;
+    let entries: Vec<_> = audit
+        .iter()
+        .filter(|entry| {
+            entry["step"].as_u64() == Some((index + 2) as u64)
+                && entry["actionId"].as_u64() == Some(source_id)
+                && entry["actor"].as_u64() == Some(step.actor as u64)
+                && entry["action"] == action
+        })
+        .collect();
+    if entries.len() != 1 || !observed_audit(entries[0]) {
+        return Ok(None);
+    }
+    let gain = after.players[step.actor].resources[&Resource::Corn]
+        - before.players[step.actor].resources[&Resource::Corn];
+    if !(1..=3).contains(&gain)
+        || after.players[step.actor].resources[&Resource::Corn] != 3
+        || TEMPLE_IDS.iter().any(|id| {
+            after.players[step.actor].temples[id] - before.players[step.actor].temples[id]
+                != if *id == temple { -1 } else { 0 }
+        })
+    {
+        return Ok(None);
+    }
+    for (actor, player) in after.players.iter().enumerate() {
+        let mut expected = player.clone();
+        if actor == step.actor {
+            expected.resources = before.players[actor].resources.clone();
+            expected.temples = before.players[actor].temples.clone();
+        }
+        if expected != before.players[actor] {
+            return Ok(None);
+        }
+    }
+    let nodes: Vec<_> = sources.raw["dom_entries"]
+        .as_array()
+        .ok_or("Missing Beg source entries")?
+        .iter()
+        .filter(|entry| entry["action_id"].as_u64() == Some(source_id))
+        .collect();
+    if nodes.len() != 1 {
+        return Ok(None);
+    }
+    let messages = nodes[0]["messages"]
+        .as_array()
+        .ok_or("Missing Beg messages")?;
+    let temple_name = match temple {
+        TempleId::Chaac => "Chaac",
+        TempleId::Quetzalcoatl => "Quetzalcoatl",
+        TempleId::Kukulkan => "Kukulcan",
+    };
+    let caption = format!(
+        "{}は{temple_name}の信仰を1段下げることでコーン{gain}個を受け取った",
+        before.players[step.actor].name
+    );
+    if messages.len() != 1
+        || messages[0]["raw_text"] != caption
+        || messages[0]["html"] != caption
+        || !messages[0]["icons"].as_array().is_some_and(Vec::is_empty)
+    {
+        return Ok(None);
+    }
+    Ok(Some(CornBegEvidence {
+        support: CornBegSupport {
+            beg_replay_step_index: index,
+            temple_replay_step_index: index + 1,
+            temple,
+            corn_gain: gain,
+            basis: "oneObservedCornBegAndNegativeTempleChoice",
+        },
+        temple_observation: observation,
+        temple_chosen: chosen,
+    }))
+}
+
+fn corn_beg_sample(
+    observation: &tzolkin_core::observation::Observation,
+    chosen: usize,
+    support: &CornBegSupport,
+    identity: (&str, &str, DatasetSplit, &str, u64),
+    counts: &mut HumanPolicyCounts,
+    temple_choice: bool,
+) -> Result<HumanPolicySample, String> {
+    let (family, table, split, actor_id, source_id) = identity;
+    let part = if temple_choice {
+        "begTemple"
+    } else {
+        "cornBeg"
+    };
+    let id = |part| {
+        digest(format!("tzolkin-human-observed-corn-beg-factor-v5\0{family}\0{actor_id}\0{source_id}\0{part}").as_bytes())
+    };
+    let encoder = FeatureEncoder::new_public(observation)?;
+    let candidates = (0..observation.legal_actions.len())
+        .map(|i| encoder.encode_legal_tagged(i))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    for (i, candidate) in candidates.iter().enumerate() {
+        let values = candidate.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 1024.0)
+            || (i != chosen && values == selected)
+        {
+            return Err("Beg features are unbounded or aliased".into());
+        }
+    }
+    counts.candidates = counts
+        .candidates
+        .checked_add(candidates.len())
+        .filter(|n| *n <= MAX_CANDIDATES)
+        .ok_or("Human dataset candidate limit exceeded")?;
+    Ok(HumanPolicySample {
+        sample_id: id(part),
+        family_id: family.into(),
+        split,
+        table_id: table.into(),
+        source_actor_id: actor_id.into(),
+        source_action_id: source_id,
+        source_message_index: 0,
+        replay_step_index: if temple_choice {
+            support.temple_replay_step_index
+        } else {
+            support.beg_replay_step_index
+        },
+        actor: observation.actor,
+        observation_key: observation.observation_key.clone(),
+        legal_actions: observation.legal_actions.clone(),
+        candidates,
+        chosen,
+        value_target: (),
+        source_label_part: Some(part),
+        paired_sample_id: Some(id(if temple_choice {
+            "cornBeg"
+        } else {
+            "begTemple"
+        })),
+        source_label_support: None,
+        paid_technology_support: None,
+        corn_beg_support: Some(support.clone()),
+    })
+}
+
 fn paid_technology_sample(
     observation: &tzolkin_core::observation::Observation,
     chosen: usize,
@@ -1048,6 +1292,7 @@ fn paid_technology_sample(
         paired_sample_id,
         source_label_support: None,
         paid_technology_support: Some(support.clone()),
+        corn_beg_support: None,
     })
 }
 
@@ -1206,6 +1451,7 @@ impl ConditionalHumanPolicyDataset {
         let mut samples: Vec<HumanPolicySample> = Vec::new();
         let mut labels = BTreeSet::new();
         let mut paid_payment_steps = BTreeSet::new();
+        let mut beg_temple_steps = BTreeSet::new();
         for (index, step) in record.steps.iter().enumerate() {
             let frame = inspect_public(&report.frames[index].snapshot.state)?;
             let observation = frame
@@ -1247,12 +1493,72 @@ impl ConditionalHumanPolicyDataset {
                 return Err("Final applied-step audit is absent or ambiguous".into());
             }
             let entry = bound[0];
-            if paid_payment_steps.contains(&index) {
+            if paid_payment_steps.contains(&index) || beg_temple_steps.contains(&index) {
+                continue;
+            }
+            if label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE)
+                && matches!(row.action, TypedAction::Beg)
+            {
+                let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
+                {
+                    corn_beg_evidence(index, sources, &report, audit_rows)?
+                } else {
+                    None
+                };
+                let Some(evidence) = evidence else {
+                    *counts
+                        .excluded
+                        .entry("unobservedCornBeg".into())
+                        .or_default() += 1;
+                    continue;
+                };
+                if observation.legal_actions.len() < 2
+                    || evidence.temple_observation.legal_actions.len() < 2
+                {
+                    *counts
+                        .excluded
+                        .entry("forcedCornBegNoChoice".into())
+                        .or_default() += 1;
+                    continue;
+                }
+                if !labels.insert((source_id, 0, "cornBeg"))
+                    || !labels.insert((source_id, 0, "begTemple"))
+                {
+                    return Err("Corn Beg source label was consumed twice".into());
+                }
+                let identity = (
+                    family.as_str(),
+                    manifest.table_id.as_str(),
+                    split,
+                    actor_ids[step.actor].as_str(),
+                    source_id,
+                );
+                samples.push(corn_beg_sample(
+                    observation,
+                    chosen,
+                    &evidence.support,
+                    identity,
+                    &mut counts,
+                    false,
+                )?);
+                samples.push(corn_beg_sample(
+                    &evidence.temple_observation,
+                    evidence.temple_chosen,
+                    &evidence.support,
+                    identity,
+                    &mut counts,
+                    true,
+                )?);
+                beg_temple_steps.insert(index + 1);
                 continue;
             }
             if matches!(
                 label_scope,
-                Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                Some(
+                    PAID_TECHNOLOGY_LABEL_SCOPE
+                        | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                        | OBSERVED_CORN_BEG_LABEL_SCOPE
+                )
             ) && let TypedAction::Technology { technology } = row.action
             {
                 if !teachers.contains(&actor_ids[step.actor]) || !observed_audit(entry) {
@@ -1353,18 +1659,20 @@ impl ConditionalHumanPolicyDataset {
                         ..
                     }
                 );
-            let explicit = label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
-                && matches!(
-                    row.action,
-                    TypedAction::Trade {
-                        resource: Resource::Wood | Resource::Stone | Resource::Gold,
-                        buy: false
-                    } | TypedAction::UseAction {
-                        source: ActionSource::Anywhere,
-                        corn_cost: 1,
-                        ..
-                    }
-                );
+            let explicit = matches!(
+                label_scope,
+                Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE | OBSERVED_CORN_BEG_LABEL_SCOPE)
+            ) && matches!(
+                row.action,
+                TypedAction::Trade {
+                    resource: Resource::Wood | Resource::Stone | Resource::Gold,
+                    buy: false
+                } | TypedAction::UseAction {
+                    source: ActionSource::Anywhere,
+                    corn_cost: 1,
+                    ..
+                }
+            );
             let reason = if !factorized
                 && !explicit
                 && !matches!(
@@ -1631,6 +1939,7 @@ impl ConditionalHumanPolicyDataset {
                 paired_sample_id: pair.map(|(id, _, _, _)| id),
                 source_label_support: support,
                 paid_technology_support: None,
+                corn_beg_support: None,
             });
         }
         counts.samples = samples.len();
@@ -1780,6 +2089,7 @@ impl ConditionalHumanPolicyDataset {
                 paired_sample_id: None,
                 source_label_support: None,
                 paid_technology_support: None,
+                corn_beg_support: None,
             }],
         }
     }
@@ -1796,7 +2106,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
+                DATASET_SCHEMA_V5
+            } else if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
                 DATASET_SCHEMA_V4
             } else if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
                 DATASET_SCHEMA_V3
@@ -1814,7 +2126,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
+                "originalVisibleTextAndFinalAppliedStepAuditWithObservedCornBegAndNegativeTempleChoice"
+            } else if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedPaidTechnologyMarketSellAndPaidAnywhere"
             } else if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedPaidTechnologyAndMaterials"
