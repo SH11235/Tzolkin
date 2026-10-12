@@ -4,7 +4,8 @@ use crate::features::{FEATURE_COUNT, FeatureEncoder, MAX_LEGAL_ACTIONS, PUBLIC_F
 use crate::human_initial_wealth::ContentPin;
 use crate::human_initial_wealth::table_family_id;
 use crate::human_policy_dataset::{
-    ConditionalHumanPolicyDataset, FACTORIZED_LABEL_SCOPE, HumanPolicySample, TASK,
+    ConditionalHumanPolicyDataset, FACTORIZED_LABEL_SCOPE, HumanPolicySample,
+    PAID_TECHNOLOGY_LABEL_SCOPE, TASK,
 };
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::model::{Random, digest};
@@ -156,10 +157,9 @@ impl ConditionalDatasetIdentity {
     fn validate(&self) -> Result<(), String> {
         if self.task != TASK
             || self.input_contract != INPUT_CONTRACT
-            || self
-                .label_scope
-                .as_deref()
-                .is_some_and(|scope| scope != FACTORIZED_LABEL_SCOPE)
+            || self.label_scope.as_deref().is_some_and(|scope| {
+                scope != FACTORIZED_LABEL_SCOPE && scope != PAID_TECHNOLOGY_LABEL_SCOPE
+            })
             || self.feature_schema != PUBLIC_FEATURE_SCHEMA
             || self.feature_count != FEATURE_COUNT
             || self.rules_version != tzolkin_core::public_replay::PUBLIC_RULES_VERSION
