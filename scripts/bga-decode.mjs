@@ -2671,6 +2671,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             const round = state().round;
             const amount = state().accumulatedCorn;
             const corn = state().players[claimed].resources.corn;
+            const foodDays = copy(state().foodDays);
             if (
               events.length !== 2 ||
               payouts.length !== 1 ||
@@ -2705,6 +2706,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               state().currentPlayer !== claimed ||
               state().accumulatedCorn !== 0 ||
               state().players[claimed].resources.corn - corn !== amount ||
+              !same(state().foodDays, foodDays) ||
+              context.feeding.length !== 0 ||
               !receipt ||
               receipt.actor !== claimed ||
               receipt.round !== round ||

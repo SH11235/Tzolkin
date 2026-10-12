@@ -5047,6 +5047,7 @@ test('matches first-player payouts to the claimer and announcements to the next 
       turnOrder: names.map((_, offset) => (firstPlayer + offset) % names.length),
       turnIndex: names.length - 1,
     });
+    initial.snapshot.state.players[claimer].feedAll = true;
     initial.observation.pendingTask = null;
     initial.observation.legalActions = [
       { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
@@ -5138,6 +5139,10 @@ test('matches first-player payouts to the claimer and announcements to the next 
       },
       (post) => {
         post.snapshot.state.firstPlayerClaimed = null;
+      },
+      (post) => {
+        post.snapshot.state.foodDays.push(8);
+        post.snapshot.state.log.push(`食糧の日：${names[claimer]} はコーン 0 を支払い`);
       },
     ]) {
       const post = clone(paid);
