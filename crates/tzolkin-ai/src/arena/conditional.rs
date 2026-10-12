@@ -8,7 +8,7 @@ use crate::policy::HeuristicWeights;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tzolkin_core::Phase;
-use tzolkin_core::observation::{Observation, observation_key};
+use tzolkin_core::observation::{ActionSource, Observation, TypedAction, observation_key};
 use tzolkin_inference::deployment::{GuardedTradeTrace, MAX_GAME_CALLBACKS};
 use tzolkin_inference::policy::{NumericPolicyDistribution, validate_contract};
 use tzolkin_inference::trade_guard::{
@@ -84,16 +84,27 @@ impl<'a> ConditionalPolicy<'a> {
     pub fn identity(&self) -> &ConditionalIdentity {
         &self.identity
     }
-    pub(super) fn teacher_grammar_contains(&self, kind: &str) -> bool {
-        teacher_grammar_contains(self.prepared.identity().label_scope.as_deref(), kind)
+    pub(super) fn teacher_grammar_contains(&self, action: &TypedAction) -> bool {
+        teacher_grammar_contains(self.prepared.identity().label_scope.as_deref(), action)
     }
 }
 
-fn teacher_grammar_contains(label_scope: Option<&str>, kind: &str) -> bool {
+fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> bool {
     match label_scope {
-        None => matches!(kind, "place" | "remove" | "firstPlayer"),
-        Some(FACTORIZED_LABEL_SCOPE) => {
-            matches!(kind, "place" | "remove" | "firstPlayer" | "useAction")
+        None | Some(FACTORIZED_LABEL_SCOPE) => {
+            matches!(
+                action,
+                TypedAction::Place { .. }
+                    | TypedAction::Remove { .. }
+                    | TypedAction::FirstPlayer { .. }
+            ) || (label_scope.is_some()
+                && matches!(
+                    action,
+                    TypedAction::UseAction {
+                        source: ActionSource::CurrentGear,
+                        ..
+                    }
+                ))
         }
         Some(_) => false,
     }
@@ -104,10 +115,12 @@ fn teacher_grammar_contains(label_scope: Option<&str>, kind: &str) -> bool {
 pub struct ConditionalDiagnostics {
     pub setup_choices: usize,
     pub playing_choices: usize,
+    /// Counts effective choices after the guard, including guard-forced Skip.
     /// Counts categories even when the training dataset had no such labels.
     /// A grammar-supported category need not occur in the actual Train tables.
     pub selected_action_kinds: BTreeMap<String, usize>,
-    /// Uses the sealed dataset label scope: v1 primitives, v2 also UseAction.
+    /// Uses the sealed label scope: v1 primitives, v2 also CurrentGear UseAction.
+    /// Counts effective choices after the guard, so guard-forced Skip is outside.
     /// Membership does not establish positive Train coverage of that category.
     pub outside_teacher_grammar_choices: usize,
 }
@@ -301,7 +314,7 @@ impl GameSession {
 mod tests {
     use super::*;
     use tzolkin_core::observation::observe;
-    use tzolkin_core::{Pending, Resource, Task, apply_move, create_game};
+    use tzolkin_core::{GearId, Pending, Resource, Task, apply_move, create_game};
 
     fn session() -> GameSession {
         GameSession::with_config(ConditionalSetup::CornFirst, &TradeGuardConfig::default()).unwrap()
@@ -309,17 +322,61 @@ mod tests {
     #[test]
     fn conditional_callbacks_and_setup_are_explicit_and_fail_closed() {
         for scope in [None, Some(FACTORIZED_LABEL_SCOPE)] {
-            for kind in ["place", "remove", "firstPlayer"] {
-                assert!(teacher_grammar_contains(scope, kind));
+            for action in [
+                TypedAction::Place {
+                    gear: GearId::Tikal,
+                    corn_cost: 0,
+                    discount: false,
+                },
+                TypedAction::Remove {
+                    gear: GearId::Tikal,
+                    position: 1,
+                },
+                TypedAction::FirstPlayer { corn_cost: 0 },
+            ] {
+                assert!(teacher_grammar_contains(scope, &action));
             }
-            assert_eq!(
-                teacher_grammar_contains(scope, "useAction"),
-                scope.is_some()
-            );
-            assert!(!teacher_grammar_contains(scope, "trade"));
-            assert!(!teacher_grammar_contains(scope, "build"));
+            for source in [
+                ActionSource::CurrentGear,
+                ActionSource::PairedGear,
+                ActionSource::TheologyAhead,
+                ActionSource::TribeAhead,
+                ActionSource::Anywhere,
+            ] {
+                let action = TypedAction::UseAction {
+                    gear: GearId::Tikal,
+                    position: 1,
+                    source,
+                    corn_cost: 0,
+                };
+                assert_eq!(
+                    teacher_grammar_contains(scope, &action),
+                    scope.is_some() && source == ActionSource::CurrentGear
+                );
+            }
+            assert!(!teacher_grammar_contains(scope, &TypedAction::Skip));
+            assert!(!teacher_grammar_contains(
+                scope,
+                &TypedAction::Trade {
+                    resource: Resource::Wood,
+                    buy: false,
+                }
+            ));
+            assert!(!teacher_grammar_contains(
+                scope,
+                &TypedAction::Build {
+                    id: "synthetic".into(),
+                    cost: [0; 5],
+                    architecture: false,
+                    discount_resource: None,
+                    renovation: None,
+                }
+            ));
         }
-        assert!(!teacher_grammar_contains(Some("unknown"), "place"));
+        assert!(!teacher_grammar_contains(
+            Some("unknown"),
+            &TypedAction::FirstPlayer { corn_cost: 0 }
+        ));
         let legacy = serde_json::json!({
             "task": "ConditionalBasicHumanPolicy", "inputContract": "synthetic",
             "featureSchema": 1, "featureCount": 512, "rulesVersion": 1,
