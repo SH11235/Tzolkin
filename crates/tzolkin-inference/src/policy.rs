@@ -7,7 +7,10 @@ use tzolkin_core::catalog::CATALOG;
 use tzolkin_core::observation::{Observation, TypedAction};
 use tzolkin_core::{GameMove, Phase, Task};
 
-use crate::features::{EncodedCandidate, FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
+use crate::features::{
+    EncodedCandidate, FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA, SEMANTIC_SETUP_FEATURE_SCHEMA,
+    SETUP_PAIR_FEATURE_COUNT, SETUP_PAIR_FEATURE_START,
+};
 use crate::kernel::ResolvedKernel;
 
 pub const HIDDEN: usize = 32;
@@ -19,6 +22,22 @@ const WP: usize = B1 + HIDDEN;
 const BP: usize = WP + HIDDEN;
 const MAX_FEATURE_ABS: f32 = 1024.0;
 const CONTEXT_COLUMNS: usize = 384;
+
+// Only the two explicit numeric borrows below can select a profile. This is
+// numeric layout validation, never model/source ownership or qualification.
+#[derive(Clone, Copy)]
+enum FeatureProfile {
+    Public,
+    SemanticSetup,
+}
+impl FeatureProfile {
+    fn schema(self) -> u32 {
+        match self {
+            Self::Public => PUBLIC_FEATURE_SCHEMA,
+            Self::SemanticSetup => SEMANTIC_SETUP_FEATURE_SCHEMA,
+        }
+    }
+}
 
 fn prefix_bits_equal(left: &[f32], right: &[f32]) -> bool {
     left.len() == right.len()
@@ -39,7 +58,21 @@ pub fn validate_parameters(parameters: &[f32]) -> Result<(), String> {
 
 /// Validate a tagged row's numeric/input layout; tags do not prove legal-set provenance.
 pub fn validated_values(row: &EncodedCandidate) -> Result<&[f32; FEATURE_COUNT], String> {
-    let values = row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    validated_values_using(row, FeatureProfile::Public)
+}
+
+/// Schema-3 numeric validation only; no legal/source or training admission.
+pub fn validated_semantic_setup_values(
+    row: &EncodedCandidate,
+) -> Result<&[f32; FEATURE_COUNT], String> {
+    validated_values_using(row, FeatureProfile::SemanticSetup)
+}
+
+fn validated_values_using(
+    row: &EncodedCandidate,
+    profile: FeatureProfile,
+) -> Result<&[f32; FEATURE_COUNT], String> {
+    let values = row.values_for_schema(profile.schema())?;
     if values
         .iter()
         .any(|value| !value.is_finite() || value.abs() > MAX_FEATURE_ABS)
@@ -61,7 +94,23 @@ pub fn validated_values(row: &EncodedCandidate) -> Result<&[f32; FEATURE_COUNT],
     {
         return Err("Tagged features outside the base 3-4p Setup/Playing contract".into());
     }
+    if matches!(profile, FeatureProfile::SemanticSetup) {
+        validate_semantic_pair_values(values)?;
+    }
     Ok(values)
+}
+fn validate_semantic_pair_values(values: &[f32; FEATURE_COUNT]) -> Result<(), String> {
+    if values[391] != 0.0
+        && (values[391] != 1.0
+            || values[231] != 1.0
+            || values
+                [SETUP_PAIR_FEATURE_START..SETUP_PAIR_FEATURE_START + SETUP_PAIR_FEATURE_COUNT]
+                .iter()
+                .any(|value| !(0.0..=17.0).contains(value) || value.fract() != 0.0))
+    {
+        return Err("Invalid semantic Setup pair quantities/phase".into());
+    }
+    Ok(())
 }
 
 /// Numeric-only borrow. No parameters are copied, owned, mutated or deserialized.
@@ -69,7 +118,11 @@ pub fn validated_values(row: &EncodedCandidate) -> Result<&[f32; FEATURE_COUNT],
 /// constructor below checks shape only; it deliberately does not repeat the
 /// finite-parameter scan on every already-validated AI prediction.
 pub struct BorrowedPolicy<'a> {
+    numeric: NumericPolicy<'a>,
+}
+struct NumericPolicy<'a> {
     parameters: &'a [f32],
+    profile: FeatureProfile,
 }
 impl<'a> BorrowedPolicy<'a> {
     /// Safe shape-checked numeric construction from caller-validated immutable
@@ -79,7 +132,12 @@ impl<'a> BorrowedPolicy<'a> {
         if parameters.len() != PARAMETER_COUNT {
             return Err("Invalid public policy parameter shape/finite values".into());
         }
-        Ok(Self { parameters })
+        Ok(Self {
+            numeric: NumericPolicy {
+                parameters,
+                profile: FeatureProfile::Public,
+            },
+        })
     }
     /// Classify the supplied ordered batch; it is not an authenticated legal set.
     pub fn predict(
@@ -87,10 +145,44 @@ impl<'a> BorrowedPolicy<'a> {
         kernel: ResolvedKernel,
         rows: &[EncodedCandidate],
     ) -> Result<NumericPolicyDistribution, String> {
-        predict_numeric(self, kernel, rows)
+        predict_numeric(&self.numeric, kernel, rows)
     }
     pub fn logit(&self, row: &EncodedCandidate, kernel: ResolvedKernel) -> Result<f32, String> {
-        let values = validated_values(row)?;
+        self.numeric.logit(row, kernel)
+    }
+}
+
+/// Explicit schema-3 numeric borrow. It grants no artifact, teacher owner,
+/// resume, deployment or Arena admission. It cannot accept schema-1/2 rows.
+pub struct BorrowedSemanticSetupPolicy<'a> {
+    numeric: NumericPolicy<'a>,
+}
+impl<'a> BorrowedSemanticSetupPolicy<'a> {
+    pub fn from_validated_parameters(parameters: &'a [f32]) -> Result<Self, String> {
+        if parameters.len() != PARAMETER_COUNT {
+            return Err("Invalid public policy parameter shape/finite values".into());
+        }
+        Ok(Self {
+            numeric: NumericPolicy {
+                parameters,
+                profile: FeatureProfile::SemanticSetup,
+            },
+        })
+    }
+    pub fn predict(
+        &self,
+        kernel: ResolvedKernel,
+        rows: &[EncodedCandidate],
+    ) -> Result<NumericPolicyDistribution, String> {
+        predict_numeric(&self.numeric, kernel, rows)
+    }
+    pub fn logit(&self, row: &EncodedCandidate, kernel: ResolvedKernel) -> Result<f32, String> {
+        self.numeric.logit(row, kernel)
+    }
+}
+impl NumericPolicy<'_> {
+    fn logit(&self, row: &EncodedCandidate, kernel: ResolvedKernel) -> Result<f32, String> {
+        let values = validated_values_using(row, self.profile)?;
         let mut hidden = [0.0; HIDDEN];
         // The immutable loaded handle has checked parameter shape and finiteness.
         kernel.dot_rows_validated(&self.parameters[..B1], values, &mut hidden);
@@ -125,37 +217,35 @@ pub struct NumericPolicyDistribution {
 /// Both callers retain a checked immutable model. This function preserves the
 /// existing batch guard/error order and unreduced prefix continuation exactly.
 fn predict_numeric(
-    model: &BorrowedPolicy<'_>,
+    model: &NumericPolicy<'_>,
     kernel: ResolvedKernel,
     rows: &[EncodedCandidate],
 ) -> Result<NumericPolicyDistribution, String> {
     if rows.is_empty() || rows.len() > MAX_CANDIDATES {
         return Err("Invalid public policy candidate count".into());
     }
-    let context = rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    let schema = model.profile.schema();
+    let context = rows[0].values_for_schema(schema)?;
     // This is only an optimization predicate, not a new acceptance guard.
     // Numeric-equal contexts with different signed-zero bits retain the
     // old path. A bad tag also retains the old per-row error ordering.
     let reusable = rows.len() > 1
         && rows.iter().all(|row| {
-            row.values_for_schema(PUBLIC_FEATURE_SCHEMA)
-                .is_ok_and(|values| {
-                    prefix_bits_equal(&context[..CONTEXT_COLUMNS], &values[..CONTEXT_COLUMNS])
-                })
+            row.values_for_schema(schema).is_ok_and(|values| {
+                prefix_bits_equal(&context[..CONTEXT_COLUMNS], &values[..CONTEXT_COLUMNS])
+            })
         });
     let mut prefix = None;
     let mut logits = Vec::with_capacity(rows.len());
     for row in rows {
-        if row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..CONTEXT_COLUMNS]
-            != context[..CONTEXT_COLUMNS]
-        {
+        if row.values_for_schema(schema)?[..CONTEXT_COLUMNS] != context[..CONTEXT_COLUMNS] {
             return Err("Public policy candidates do not share one context".into());
         }
         let logit = if reusable {
             // Every candidate's full 512-value guard runs before its dot.
             // Initialization occurs only after the first row is validated;
             // the cache cannot escape this call or its immutable model.
-            let values = validated_values(row)?;
+            let values = validated_values_using(row, model.profile)?;
             let saved = prefix.get_or_insert_with(|| {
                 kernel.policy_prefix_validated(&model.parameters[..B1], &context[..CONTEXT_COLUMNS])
             });
@@ -290,7 +380,7 @@ pub fn policy_softmax(logits: &[f32], output: &mut [f32]) -> Result<(), String> 
 
 #[cfg(test)]
 mod prefix_tests {
-    use super::prefix_bits_equal;
+    use super::*;
 
     #[test]
     fn numeric_equal_signed_zero_is_ineligible_for_prefix_reuse() {
@@ -301,5 +391,105 @@ mod prefix_tests {
         assert!(prefix_bits_equal(&left, &left));
         assert!(!prefix_bits_equal(&left, &left[..2]));
         assert!(!prefix_bits_equal(&[1.0], &[1.0000001]));
+
+        // Raw pair bounds are guarded only for the semantic ChooseWealth row.
+        let mut values = [0.0; FEATURE_COUNT];
+        values[231] = 1.0;
+        values[391] = 1.0;
+        values[480] = 17.0;
+        assert!(validate_semantic_pair_values(&values).is_ok());
+        for bad in [-1.0, 17.5, 18.0, f32::NAN, f32::INFINITY] {
+            values[493] = bad;
+            assert!(validate_semantic_pair_values(&values).is_err());
+        }
+        values[493] = 0.0;
+        values[231] = 0.0;
+        assert!(validate_semantic_pair_values(&values).is_err());
+        values[391] = 0.0;
+        values[493] = -0.25; // other moves keep their existing interactions
+        assert!(validate_semantic_pair_values(&values).is_ok());
+
+        let parameters = (0..PARAMETER_COUNT)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 512.0)
+            .collect::<Vec<_>>();
+        validate_parameters(&parameters).unwrap();
+        let semantic = BorrowedSemanticSetupPolicy::from_validated_parameters(&parameters).unwrap();
+        let old = BorrowedPolicy::from_validated_parameters(&parameters).unwrap();
+        for players in [3, 4] {
+            let mut state = tzolkin_core::create_game(
+                (0..players).map(|i| format!("Seat {i}")).collect(),
+                17,
+                false,
+            )
+            .unwrap();
+            for phase in [Phase::Setup, Phase::Playing] {
+                while state.phase != phase {
+                    let o =
+                        tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+                    state = tzolkin_core::apply_move(&state, o.legal_actions[0].r#move.clone())
+                        .unwrap();
+                }
+                let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+                let encoder = crate::features::FeatureEncoder::new_semantic_setup(&o).unwrap();
+                let rows = (0..o.legal_actions.len())
+                    .map(|i| encoder.encode_legal_tagged(i).unwrap())
+                    .collect::<Vec<_>>();
+                let old_encoder = crate::features::FeatureEncoder::new_public(&o).unwrap();
+                let old_rows = (0..o.legal_actions.len())
+                    .map(|i| old_encoder.encode_legal_tagged(i).unwrap())
+                    .collect::<Vec<_>>();
+                assert!(
+                    old.predict(crate::kernel::Kernel::Scalar.resolve().unwrap(), &rows)
+                        .is_err()
+                );
+                assert!(
+                    semantic
+                        .predict(crate::kernel::Kernel::Scalar.resolve().unwrap(), &old_rows)
+                        .is_err()
+                );
+                for kernel in [
+                    crate::kernel::Kernel::Scalar,
+                    crate::kernel::Kernel::Auto,
+                    crate::kernel::Kernel::Avx2,
+                    crate::kernel::Kernel::Sse2,
+                    crate::kernel::Kernel::Neon,
+                    crate::kernel::Kernel::Simd128,
+                ]
+                .into_iter()
+                .filter_map(|k| k.resolve().ok())
+                {
+                    let batch = semantic.predict(kernel, &rows).unwrap();
+                    for (row, logit) in rows.iter().zip(&batch.logits) {
+                        assert_eq!(
+                            logit.to_bits(),
+                            semantic.logit(row, kernel).unwrap().to_bits()
+                        );
+                    }
+                    if phase == Phase::Playing {
+                        let previous = old.predict(kernel, &old_rows).unwrap();
+                        assert_eq!(
+                            batch.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                            previous
+                                .logits
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            batch
+                                .probabilities
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>(),
+                            previous
+                                .probabilities
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                }
+            }
+        }
     }
 }

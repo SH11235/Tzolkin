@@ -1115,6 +1115,12 @@ impl ValidatedSemanticSetupTeacherDataset {
     pub fn iter_split(&self, split: DatasetSplit) -> SemanticSetupTeacherDatasetIter<'_> {
         self.iterator(Some(split))
     }
+    // Used only by the distinct schema-3 teacher trainer's before/after cache
+    // checks. The typed handle and its original load pin remain mandatory.
+    pub(crate) fn recheck_teacher_bytes(&self) -> Result<(u64, String), String> {
+        self.recheck_bytes()?;
+        Ok(self.manifest_pin.clone())
+    }
     fn recheck_bytes(&self) -> Result<(), String> {
         if self.dataset.recheck_all_bytes()? != self.manifest_pin {
             return Err("Semantic Setup teacher manifest bytes changed after load".into());
