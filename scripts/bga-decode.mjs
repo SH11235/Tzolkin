@@ -1500,6 +1500,90 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     );
     return actors.length === 1 ? actors[0] : null;
   }
+  function selectedPaidTheology(before, event, events) {
+    const actor = actorId(event.actor);
+    const task = before.pending?.task;
+    const payments = paymentOf(events);
+    if (
+      before.version !== 1 ||
+      before.additionalBuildings !== false ||
+      before.expansion != null ||
+      actor < 0 ||
+      before.currentPlayer !== actor ||
+      before.players[actor].technologies.theology !== 3 ||
+      !same(
+        { ...task, mandatory: task?.mandatory === undefined ? false : task.mandatory },
+        { type: 'technology', remaining: 1, free: false, mandatory: false },
+      ) ||
+      !same(before.pending.after, []) ||
+      !same(mechanical(before), mechanical(context.before)) ||
+      queuedPurchase !== null ||
+      context.purchase !== null ||
+      context.paymentOperations !== 0 ||
+      !Number.isSafeInteger(before.skullSupply) ||
+      before.skullSupply < 1 ||
+      payments[0] !== 0 ||
+      payments[4] !== 0 ||
+      payments.slice(1, 4).reduce((sum, amount) => sum + amount, 0) !== 1 ||
+      events.filter((item) => item.kind === 'resourcePayment').length !== 1 ||
+      events.filter((item) => item.kind === 'technology').length !== 1 ||
+      events.filter((item) => theologySkullCaption(item) !== null).length > 1 ||
+      events.some(
+        (item) =>
+          (item.kind === 'resourcePayment' && item.actor !== event.actor) ||
+          (item.kind === 'technology' && item !== event) ||
+          (!['resourcePayment', 'technology'].includes(item.kind) &&
+            theologySkullCaption(item) === null),
+      )
+    )
+      fail('Selected capped Theology requires one source-bound paid final technology choice');
+    return { actor, payments };
+  }
+  function settlePaidTheology(before, selected) {
+    const mid = state();
+    const task = mid.pending?.task;
+    const following = mid.pending?.after;
+    if (
+      !same(
+        { ...task, optional: task?.optional === undefined ? false : task.optional },
+        { type: 'payTechnology', technology: 'theology', amount: 1, optional: false },
+      ) ||
+      !Array.isArray(following) ||
+      following.length !== 1 ||
+      !same(
+        {
+          ...following[0],
+          mandatory: following[0]?.mandatory === undefined ? false : following[0].mandatory,
+        },
+        { type: 'technology', remaining: 0, free: false, mandatory: false },
+      ) ||
+      !same({ ...mechanical(before), pending: null }, { ...mechanical(mid), pending: null }) ||
+      legal().filter((row) => same(row.action, { type: 'payment', resources: selected.payments }))
+        .length !== 1
+    )
+      fail('Selected capped Theology has no exact actual material payment continuation');
+    choose(
+      (action) => same(action, { type: 'payment', resources: selected.payments }),
+      'observed capped Theology payment',
+      false,
+      false,
+      null,
+      false,
+      false,
+    );
+    context.paymentOperations++;
+    const expected = mechanical(before);
+    const own = expected.players[selected.actor];
+    for (const [index, resource] of RESOURCES.entries())
+      own.resources[resource] -= selected.payments[index];
+    own.resources.skull++;
+    expected.skullSupply--;
+    // The sole zero-remaining Technology continuation is consumed by the core.
+    expected.pending = null;
+    if (!same(mechanical(state()), expected))
+      fail('Selected capped Theology differs from its exact payment and skull transition');
+    context.theologyAdvance = { actor: selected.actor, sourceId: context.id, claimed: false };
+  }
   function cappedTheologyPurchase(outcome, event, events, witness, previous = state()) {
     const action = outcome.row.action;
     const actor = actorId(event.actor);
@@ -2620,6 +2704,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       paymentOperations: 0,
       purchase: null,
       architectureAdvance: null,
+      theologyAdvance: null,
     };
     try {
       if (!events.length) fail('Raw source action has no observed messages');
@@ -3007,11 +3092,26 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 detail.technology === 'architecture' &&
                 before.players[actorId(event.actor)].technologies.architecture === 3 &&
                 pending() === 'technology';
+              const paidTheology =
+                detail.technology === 'theology' &&
+                before.players[actorId(event.actor)].technologies.theology === 3 &&
+                before.pending?.task?.type === 'technology' &&
+                before.pending.task.free === false &&
+                queuedPurchase === null &&
+                context.purchase === null
+                  ? selectedPaidTheology(before, event, events)
+                  : null;
               choose(
                 (action) => action.type === 'technology' && action.technology === detail.technology,
                 'technology advance',
+                false,
+                false,
+                null,
+                false,
+                paidTheology === null,
               );
-              pay(payments);
+              if (paidTheology) settlePaidTheology(before, paidTheology);
+              else pay(payments);
               if (selectedAtCap) {
                 const actor = actorId(event.actor);
                 const after = state();
@@ -3296,6 +3396,16 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 fail('Theology bonus has no matching unconsumed queued purchase');
               automatic({ ...event, actor: theologyBonus }, 'resource:skull', 1);
               queuedPurchase.bonusClaimed = true;
+            } else if (theologyBonus && context.theologyAdvance) {
+              const selected = context.theologyAdvance;
+              if (
+                selected.sourceId !== id ||
+                selected.actor !== actorId(theologyBonus) ||
+                selected.claimed
+              )
+                fail('Theology bonus has no matching unconsumed selected paid advance');
+              automatic({ ...event, actor: theologyBonus }, 'resource:skull', 1);
+              selected.claimed = true;
             } else if (theologyBonus) {
               const receipt = context.purchase;
               if (
@@ -3485,6 +3595,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           } else fail(`Unsupported source effect ${event.kind}`);
         }
         pay(payments);
+        if (context.theologyAdvance && !context.theologyAdvance.claimed)
+          fail('Selected capped Theology did not consume its same-source skull caption');
         if (
           context.purchase?.theologyCapped &&
           (!context.purchase.advanceClaimed || !context.purchase.bonusClaimed)
