@@ -6,6 +6,7 @@ use super::conditional::{
     ConditionalIdentity, ConditionalMixedArenaIdentity, ConditionalMixedArenaPolicy,
     ConditionalPolicy, GameSession,
 };
+use super::teacher::{ResourceCycleTeacherArenaIdentity, ResourceCycleTeacherArenaPolicy};
 use super::{
     ArmResult, BorrowedArenaPolicy, BorrowedArenaWorkBounds, InitialConditions, PairedStatistics,
     PolicyChooser, PolicyHandle, SeatPair, SeedBlock, block, family_id, seed_partition, summarize,
@@ -181,12 +182,16 @@ pub enum PolicyIdentity {
     ConditionalHumanCountZeroAllPhase {
         identity: Box<ConditionalCountZeroArenaIdentity>,
     },
+    ResourceCycleV5LearnedTeacher {
+        identity: Box<ResourceCycleTeacherArenaIdentity>,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
     Conditional(Box<ConditionalPolicy<'a>>),
     ConditionalMixed(Box<ConditionalMixedArenaPolicy<'a>>),
     ConditionalCountZero(Box<ConditionalCountZeroArenaPolicy<'a>>),
+    Teacher(Box<ResourceCycleTeacherArenaPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
@@ -223,6 +228,9 @@ impl<'a> Role<'a> {
                     identity: Box::new(policy.identity().clone()),
                 }
             }
+            Self::Teacher(policy) => PolicyIdentity::ResourceCycleV5LearnedTeacher {
+                identity: Box::new(policy.identity().clone()),
+            },
             Self::Reactive(policy) => PolicyIdentity::Reactive {
                 provenance: policy.description.provenance.clone(),
             },
@@ -237,6 +245,7 @@ impl<'a> Role<'a> {
             Self::Conditional(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalMixed(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalCountZero(policy) => Some(&policy.identity().configuration_key),
+            Self::Teacher(policy) => Some(&policy.identity().configuration_key),
             _ => None,
         }
     }
@@ -399,6 +408,7 @@ fn choose(
             Role::ConditionalCountZero(policy) => {
                 session.choose_count_zero(index, observation, policy)?
             }
+            Role::Teacher(policy) => session.choose_teacher(index, observation, policy)?,
             _ => return Err("Conditional Arena game session/role mismatch".into()),
         };
         d.choices_returned += 1;
@@ -408,36 +418,36 @@ fn choose(
             d.repeat_exits += usize::from(trade.overridden && trade.repeat_seen);
             d.budget_exits += usize::from(trade.overridden && trade.budget_reached);
         }
-        let conditional = d
-            .conditional
-            .as_mut()
-            .expect("conditional choice diagnostic");
-        if observation.phase == Phase::Setup {
-            conditional.setup_choices += 1;
-        } else {
-            conditional.playing_choices += 1;
-            let action = observation
-                .legal_actions
-                .iter()
-                .find(|a| a.r#move == result.decision.r#move)
-                .expect("conditional session returned a legal row");
-            let kind = serde_json::to_value(&action.action).map_err(|e| e.to_string())?;
-            let kind = kind["type"]
-                .as_str()
-                .ok_or("Conditional action kind missing")?;
-            *conditional
-                .selected_action_kinds
-                .entry(kind.into())
-                .or_default() += 1;
-            let in_origin_grammar = match role {
-                Role::Conditional(policy) => policy.teacher_grammar_contains(&action.action),
-                Role::ConditionalMixed(policy) => policy.teacher_grammar_contains(&action.action),
-                Role::ConditionalCountZero(policy) => {
-                    policy.teacher_grammar_contains(&action.action)
-                }
-                _ => unreachable!("conditional session requires a conditional role"),
-            };
-            conditional.outside_teacher_grammar_choices += usize::from(!in_origin_grammar);
+        if let Some(conditional) = d.conditional.as_mut() {
+            if observation.phase == Phase::Setup {
+                conditional.setup_choices += 1;
+            } else {
+                conditional.playing_choices += 1;
+                let action = observation
+                    .legal_actions
+                    .iter()
+                    .find(|a| a.r#move == result.decision.r#move)
+                    .expect("conditional session returned a legal row");
+                let kind = serde_json::to_value(&action.action).map_err(|e| e.to_string())?;
+                let kind = kind["type"]
+                    .as_str()
+                    .ok_or("Conditional action kind missing")?;
+                *conditional
+                    .selected_action_kinds
+                    .entry(kind.into())
+                    .or_default() += 1;
+                let in_origin_grammar = match role {
+                    Role::Conditional(policy) => policy.teacher_grammar_contains(&action.action),
+                    Role::ConditionalMixed(policy) => {
+                        policy.teacher_grammar_contains(&action.action)
+                    }
+                    Role::ConditionalCountZero(policy) => {
+                        policy.teacher_grammar_contains(&action.action)
+                    }
+                    _ => unreachable!("conditional session requires a conditional role"),
+                };
+                conditional.outside_teacher_grammar_choices += usize::from(!in_origin_grammar);
+            }
         }
         result.decision
     } else {
@@ -458,6 +468,7 @@ fn choose(
             Role::ConditionalCountZero(_) => {
                 return Err("Conditional Arena missing game session".into());
             }
+            Role::Teacher(_) => return Err("Teacher Arena missing game session".into()),
         };
         match (roster[actor].search(), trace) {
             (Some(prepared), Some(trace)) => {
@@ -548,13 +559,14 @@ fn play_arm_using<'a>(
             Role::Conditional(policy) => Some(GameSession::new(policy)),
             Role::ConditionalMixed(policy) => Some(GameSession::new_mixed(policy)),
             Role::ConditionalCountZero(policy) => Some(GameSession::new_count_zero(policy)),
+            Role::Teacher(policy) => Some(GameSession::new_teacher(policy)),
             _ => None,
         })
         .collect::<Vec<_>>();
     let mut diagnostics = roster
         .iter()
         .map(|role| match &**role {
-            Role::Numeric(_) => Some(GuardDiagnostics::default()),
+            Role::Numeric(_) | Role::Teacher(_) => Some(GuardDiagnostics::default()),
             Role::Conditional(_) | Role::ConditionalMixed(_) | Role::ConditionalCountZero(_) => {
                 Some(GuardDiagnostics {
                     conditional: Some(ConditionalDiagnostics::default()),
@@ -675,6 +687,30 @@ pub fn run_resource_cycle_validation<'a>(
         opponent_pool,
         RESOURCE_CYCLE_ARENA_SCHEMA,
     )
+}
+
+/// Audited learned V5 teacher, using the same paired all-seat callback/Trade
+/// engine. Source families from every partition are excluded locally. This is
+/// Development Validation, without native, training or fresh Test authority.
+pub fn run_resource_cycle_teacher_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: ResourceCycleTeacherArenaPolicy<'a>,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    candidate.validate_arena_config(config)?;
+    let prepared = candidate.prepared;
+    let result = run_roles(
+        config,
+        Role::Teacher(Box::new(candidate)),
+        Role::Numeric(reference),
+        opponent_pool,
+        super::teacher::ARENA_SCHEMA,
+    );
+    // Also audit after an attempted run returning an error. No report may be
+    // published with a changed retained manifest, copied replay or shard.
+    prepared.recheck_sources()?;
+    result
 }
 
 /// Conditional Human Playing with explicit Corn-first Setup, paired against a

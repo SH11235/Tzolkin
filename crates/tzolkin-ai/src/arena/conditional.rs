@@ -368,6 +368,15 @@ impl GameSession {
         )
         .expect("conditional count0 constructor validated guard configuration")
     }
+    pub(super) fn new_teacher(
+        policy: &super::teacher::ResourceCycleTeacherArenaPolicy<'_>,
+    ) -> Self {
+        Self::with_route(
+            SetupRoute::NumericAllPhase(super::teacher::POLICY_VERSION),
+            &policy.identity().guard,
+        )
+        .expect("teacher constructor validated guard configuration")
+    }
     fn with_config(setup: ConditionalSetup, guard: &TradeGuardConfig) -> Result<Self, String> {
         let route = match setup {
             ConditionalSetup::CornFirst => SetupRoute::CornFirst,
@@ -444,6 +453,14 @@ impl GameSession {
         policy: &ConditionalCountZeroArenaPolicy<'_>,
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.handle.numeric_distribution(o))
+    }
+    pub(super) fn choose_teacher(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &super::teacher::ResourceCycleTeacherArenaPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.prepared.distribution(o))
     }
     fn choose_using(
         &mut self,
@@ -724,7 +741,11 @@ mod tests {
             .unwrap();
         assert!(o.legal_actions.len() > 1);
         let target = (corn_index + 1) % o.legal_actions.len();
-        for version in [MIXED_POLICY_VERSION, COUNT_ZERO_POLICY_VERSION] {
+        for version in [
+            MIXED_POLICY_VERSION,
+            COUNT_ZERO_POLICY_VERSION,
+            super::super::teacher::POLICY_VERSION,
+        ] {
             let mut numeric = GameSession::with_route(
                 SetupRoute::NumericAllPhase(version),
                 &TradeGuardConfig::default(),
@@ -808,6 +829,7 @@ mod tests {
             SetupRoute::CornFirst,
             SetupRoute::NumericAllPhase(MIXED_POLICY_VERSION),
             SetupRoute::NumericAllPhase(COUNT_ZERO_POLICY_VERSION),
+            SetupRoute::NumericAllPhase(super::super::teacher::POLICY_VERSION),
         ] {
             state.current_player = o.actor;
             let mut game = GameSession::with_route(route, &TradeGuardConfig::default()).unwrap();

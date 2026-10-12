@@ -976,6 +976,18 @@ impl ValidatedPolicyDataset {
         }
         validate_manifest(&self.manifest, self.route)
     }
+    pub(crate) fn recheck_resource_cycle_v5_teacher_manifest(
+        &self,
+    ) -> Result<(u64, String), String> {
+        self.require_resource_cycle_v5_teacher_route()?;
+        let bytes = read_bytes(&self.directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
+        let manifest: PolicyDatasetManifest =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if manifest != self.manifest {
+            return Err("Teacher source manifest changed after load".into());
+        }
+        Ok((bytes.len() as u64, digest(&bytes)))
+    }
     pub fn iter(&self) -> PolicyDatasetIter {
         self.iterator(None)
     }

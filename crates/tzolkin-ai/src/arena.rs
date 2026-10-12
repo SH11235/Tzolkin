@@ -2,6 +2,7 @@
 pub mod conditional;
 pub mod numeric;
 pub mod resource_cycle;
+pub mod teacher;
 use crate::dataset::{DatasetSplit, load_dataset, split_for_family};
 // Keep the original arena API while all callers use the dataset's family identity.
 pub use crate::dataset::seed_family_id as family_id;
