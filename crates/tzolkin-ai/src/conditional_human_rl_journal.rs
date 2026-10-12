@@ -10,7 +10,10 @@ use crate::human_initial_wealth::ContentPin;
 use crate::human_policy_training::PreparedConditionalHumanPolicy;
 use crate::public_native::PreparedPublicPolicy;
 use crate::public_policy_baseline::ResidualFitConfig;
-use crate::public_policy_update::{OneStepConfig, checkpoint_digest, hash};
+use crate::public_policy_update::{
+    ConditionalTimedPhase, OneStepConfig, PhaseTimer, TimedGame, TimedPhase, Untimed,
+    checkpoint_digest, hash, timed, timed_conditional,
+};
 use crate::public_rl_paired_session::{
     local, publish_mixed_metadata, publish_mixed_stored_record, read_bounded,
     read_mixed_stored_record,
@@ -24,6 +27,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 pub const JOURNAL_SCHEMA: &str = "tzolkin-conditional-human-joint-journal-v1";
@@ -34,6 +38,152 @@ pub const PROCESS_CLOSE_SCHEMA: &str =
 const HEAD_BYTES: usize = 512 * 1024;
 const JOINT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FILES: usize = 1024;
+
+/// Informational timings only. Inclusive phases overlap; do not sum them.
+/// ActorForward measures update reconstruction, not inference during a game.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalPhaseTiming {
+    pub phase: &'static str,
+    pub member: Option<usize>,
+    pub calls: u64,
+    pub errors: u64,
+    pub nanoseconds: u128,
+}
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalGameCounters {
+    pub games: u64,
+    pub callbacks: u64,
+    pub own_callbacks: u64,
+    pub singletons: u64,
+    pub nonforced: u64,
+    pub candidate_rows: u64,
+    pub winning_games: u64,
+    pub winner_share_sum: f64,
+}
+impl ConditionalGameCounters {
+    fn add(&mut self, game: &TimedGame<'_>) {
+        self.games += 1;
+        self.callbacks += game.callbacks as u64;
+        self.own_callbacks += game.own as u64;
+        self.singletons += game.singletons as u64;
+        self.nonforced += (game.own - game.singletons) as u64;
+        self.candidate_rows += game.candidates as u64;
+        self.winning_games += u64::from(game.winner_share > 0.0);
+        self.winner_share_sum += game.winner_share;
+    }
+}
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalGameProfile {
+    pub players: usize,
+    pub roster_checksum: String,
+    /// Newly collected games that subsequently passed their source audit.
+    pub collected: ConditionalGameCounters,
+    /// Includes replayed games on restore; these are not new training games.
+    pub audited: ConditionalGameCounters,
+}
+/// A fresh, bounded profile for one call, kept outside all durable artifacts.
+/// Successful audits do not imply admission or credit; use the returned close
+/// and owner accounting for successful updates and credited decisions.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalRunProfile {
+    phase_timings: Vec<ConditionalPhaseTiming>,
+    games: [ConditionalGameProfile; 4],
+}
+impl Default for ConditionalRunProfile {
+    fn default() -> Self {
+        Self {
+            phase_timings: Vec::with_capacity(53),
+            games: std::array::from_fn(|_| ConditionalGameProfile::default()),
+        }
+    }
+}
+impl ConditionalRunProfile {
+    pub fn phase_timings(&self) -> &[ConditionalPhaseTiming] {
+        &self.phase_timings
+    }
+    pub fn games(&self) -> &[ConditionalGameProfile; 4] {
+        &self.games
+    }
+}
+struct RunTimer<'a>(&'a mut ConditionalRunProfile);
+impl PhaseTimer for RunTimer<'_> {
+    type Span = (&'static str, Option<usize>, Instant);
+    fn enter(&mut self, phase: TimedPhase) -> Self::Span {
+        let (label, member) = match phase {
+            TimedPhase::WholeCall => ("wholeCall", None),
+            TimedPhase::Preflight => ("preflight", None),
+            TimedPhase::ReservationPublication => ("reservationPublication", None),
+            TimedPhase::CollectionJournal(i) => ("collectionEncode", Some(i)),
+            TimedPhase::CollectionPreparation(i) => ("collectionPreparation", Some(i)),
+            TimedPhase::Collection(i) => ("collection", Some(i)),
+            TimedPhase::RecordPublication(i) => ("recordPublication", Some(i)),
+            TimedPhase::AuditRecordRead(i) => ("auditRecordDecode", Some(i)),
+            TimedPhase::AuditJournal(i) => ("auditJournal", Some(i)),
+            TimedPhase::AuditPreparation(i) => ("auditPreparation", Some(i)),
+            TimedPhase::Audit(i) => ("audit", Some(i)),
+            TimedPhase::CohortPublication => ("cohortPublication", None),
+            TimedPhase::GradientStart => ("gradientStart", None),
+            TimedPhase::NumericPreparationControl => ("numericPreparationControl", None),
+            TimedPhase::NumericPreparation => ("numericPreparation", None),
+            TimedPhase::ActorEncode => ("actorEncode", None),
+            TimedPhase::ActorForward => ("actorForward", None),
+            TimedPhase::ActorTrace => ("actorTrace", None),
+            TimedPhase::ActorBaseline => ("actorBaseline", None),
+            TimedPhase::ActorBackward => ("actorBackward", None),
+            TimedPhase::ActorAggregate => ("actorAggregate", None),
+            TimedPhase::ActorProposal => ("actorProposal", None),
+            TimedPhase::CriticFit => ("criticFit", None),
+            TimedPhase::ProposalReadback => ("proposalReadback", None),
+            TimedPhase::Resolve => ("resolve", None),
+            TimedPhase::FinalGuards => ("finalGuards", None),
+        };
+        (label, member, Instant::now())
+    }
+    fn enter_conditional(&mut self, phase: ConditionalTimedPhase) -> Self::Span {
+        let label = match phase {
+            ConditionalTimedPhase::SourceLoad => "sourceLoad",
+            ConditionalTimedPhase::ArchiveVerify => "archiveVerify",
+            ConditionalTimedPhase::RestoreReplay => "restoreReplay",
+        };
+        (label, None, Instant::now())
+    }
+    fn returned(&mut self, (label, member, start): Self::Span, error: bool) {
+        let elapsed = start.elapsed().as_nanos();
+        if let Some(bucket) = self
+            .0
+            .phase_timings
+            .iter_mut()
+            .find(|v| v.phase == label && v.member == member)
+        {
+            bucket.calls += 1;
+            bucket.errors += u64::from(error);
+            bucket.nanoseconds += elapsed;
+        } else if self.0.phase_timings.len() < 53 {
+            self.0.phase_timings.push(ConditionalPhaseTiming {
+                phase: label,
+                member,
+                calls: 1,
+                errors: u64::from(error),
+                nanoseconds: elapsed,
+            });
+        }
+    }
+    fn game(&mut self, game: TimedGame<'_>) {
+        let bucket = &mut self.0.games[game.member];
+        bucket.players = game.players;
+        if bucket.roster_checksum.is_empty() {
+            bucket.roster_checksum = game.roster_checksum.into();
+        }
+        if game.newly_collected {
+            bucket.collected.add(&game);
+        }
+        bucket.audited.add(&game);
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -775,18 +925,49 @@ impl ConditionalHumanJournal {
         seeds: [u32; 4],
         opponent: Option<&PreparedPublicPolicy>,
     ) -> Result<ConditionalReturnedClose, String> {
-        self.preflight()?;
-        if self.pool.binding(opponent)? != self.opponent_binding {
-            return Err("Frozen conditional opponents changed".into());
-        }
-        let plan = self.session.plan(
-            seeds,
-            &self.pool,
-            opponent,
-            self.spec.limits()?,
-            self.spec.actor()?,
-            self.spec.critic()?,
-        )?;
+        self.update_timed(seeds, opponent, &mut Untimed)
+    }
+    /// Replaces the caller's informational profile, including on error.
+    /// The profile grants no credit, source qualification or close authority.
+    pub fn update_whole_four_profiled(
+        &mut self,
+        seeds: [u32; 4],
+        opponent: Option<&PreparedPublicPolicy>,
+        profile: &mut ConditionalRunProfile,
+    ) -> Result<ConditionalReturnedClose, String> {
+        *profile = ConditionalRunProfile::default();
+        self.update_timed(seeds, opponent, &mut RunTimer(profile))
+    }
+    fn update_timed<T: PhaseTimer>(
+        &mut self,
+        seeds: [u32; 4],
+        opponent: Option<&PreparedPublicPolicy>,
+        timer: &mut T,
+    ) -> Result<ConditionalReturnedClose, String> {
+        timed(timer, TimedPhase::WholeCall, |timer| {
+            self.update_inner(seeds, opponent, timer)
+        })
+    }
+    fn update_inner<T: PhaseTimer>(
+        &mut self,
+        seeds: [u32; 4],
+        opponent: Option<&PreparedPublicPolicy>,
+        timer: &mut T,
+    ) -> Result<ConditionalReturnedClose, String> {
+        let plan = timed(timer, TimedPhase::Preflight, |_| {
+            self.preflight()?;
+            if self.pool.binding(opponent)? != self.opponent_binding {
+                return Err("Frozen conditional opponents changed".into());
+            }
+            self.session.plan(
+                seeds,
+                &self.pool,
+                opponent,
+                self.spec.limits()?,
+                self.spec.actor()?,
+                self.spec.critic()?,
+            )
+        })?;
         let event = Event::Reserve {
             attempt: self.session.attempts() + 1,
             first_ordinal: self.session.next_episode_ordinal(),
@@ -794,7 +975,10 @@ impl ConditionalHumanJournal {
             families: plan.families(),
             parent: plan.parent().clone(),
         };
-        match self.append(event) {
+        let span = timer.enter(TimedPhase::ReservationPublication);
+        let appended = self.append(event);
+        timer.returned(span, appended.is_err());
+        match appended {
             Ok(_) => {
                 if let Err(e) = self.session.reserve(&plan) {
                     self.stop();
@@ -810,31 +994,34 @@ impl ConditionalHumanJournal {
             }
         }
         self.phase = ConditionalJournalPhase::Reserved;
-        match self.stage(&plan, opponent, None) {
-            Ok(proposal) => self.resolve_proposal(proposal),
-            Err(error) => self.resolve_failure(error),
+        match self.stage_timed(&plan, opponent, None, timer) {
+            Ok(proposal) => self.resolve_proposal(proposal, timer),
+            Err(error) => timed(timer, TimedPhase::Resolve, |_| self.resolve_failure(error)),
         }
     }
-    fn stage(
+    fn stage_timed<T: PhaseTimer>(
         &self,
         plan: &ConditionalReservation,
         opponent: Option<&PreparedPublicPolicy>,
         saved: Option<&[Vec<u8>; 4]>,
+        timer: &mut T,
     ) -> Result<JointProposal, String> {
         #[cfg(test)]
         if let Some(outcomes) = &self.source.test_outcomes {
             let winning = *outcomes
                 .get((self.session.attempts() - 1) as usize)
                 .ok_or("Missing tiny fixture case")?;
-            return crate::conditional_human_rl_update::test_short_stage(
+            return crate::conditional_human_rl_update::test_short_stage_timed(
                 &self.session,
                 plan,
                 &self.pool,
                 winning,
                 saved,
+                timer,
             );
         }
-        self.session.stage(plan, &self.pool, opponent, saved)
+        self.session
+            .stage_timed(plan, &self.pool, opponent, saved, timer)
     }
     fn resolve_failure(&mut self, error: String) -> Result<ConditionalReturnedClose, String> {
         let error = bounded_error(&error);
@@ -864,11 +1051,12 @@ impl ConditionalHumanJournal {
         self.stop();
         Err(error)
     }
-    fn resolve_proposal(
+    fn resolve_proposal<T: PhaseTimer>(
         &mut self,
         proposal: JointProposal,
+        timer: &mut T,
     ) -> Result<ConditionalReturnedClose, String> {
-        let stage = (|| {
+        let stage = timed(timer, TimedPhase::CohortPublication, |timer| {
             let (report_raw, joint_raw) = proposal.payload()?;
             let attempt = self.session.attempts();
             let report =
@@ -879,12 +1067,14 @@ impl ConditionalHumanJournal {
                 .transpose()?;
             let mut records = Vec::new();
             for (i, raw) in proposal.records().iter().enumerate() {
-                let encoded = storage::encode(raw)?;
-                let stored = self.publish_payload(
-                    &format!("record-{attempt:04}-{i}.json.gz"),
-                    &encoded,
-                    true,
-                )?;
+                let stored = timed(timer, TimedPhase::RecordPublication(i), |_| {
+                    let encoded = storage::encode(raw)?;
+                    self.publish_payload(
+                        &format!("record-{attempt:04}-{i}.json.gz"),
+                        &encoded,
+                        true,
+                    )
+                })?;
                 records.push(StoredRecord {
                     stored,
                     raw_bytes: raw.len(),
@@ -901,7 +1091,7 @@ impl ConditionalHumanJournal {
                 ConditionalResolution::NoChange
             };
             Ok::<_, String>((report, joint, records, tip, resolution))
-        })();
+        });
         let (report, joint, records, tip, resolution) = match stage {
             Ok(v) => v,
             Err(e) => {
@@ -919,7 +1109,10 @@ impl ConditionalHumanJournal {
             credited_own: proposal.own_credit(),
             error: None,
         };
-        let resolve = match self.append(event) {
+        let span = timer.enter(TimedPhase::Resolve);
+        let appended = self.append(event);
+        timer.returned(span, appended.is_err());
+        let resolve = match appended {
             Ok(pin) => pin,
             Err(failure) => {
                 if failure.committed {
@@ -944,13 +1137,16 @@ impl ConditionalHumanJournal {
         }
         self.logical_bytes += records.iter().map(|r| r.raw_bytes as u64).sum::<u64>();
         self.phase = ConditionalJournalPhase::ResolvedAwaitingClose;
-        if let Err(error) = self
-            .source
-            .full_load()
-            .and_then(|_| self.require_head())
-            .and_then(|()| inspect_archive(&self.directory, &self.head()).map(|_| ()))
-            .and_then(|()| self.usage(&BTreeSet::new(), true).map(|_| ()))
-        {
+        if let Err(error) = timed(timer, TimedPhase::FinalGuards, |timer| {
+            timed_conditional(timer, ConditionalTimedPhase::SourceLoad, |_| {
+                self.source.full_load()
+            })?;
+            self.require_head()?;
+            timed_conditional(timer, ConditionalTimedPhase::ArchiveVerify, |_| {
+                inspect_archive(&self.directory, &self.head())
+            })?;
+            self.usage(&BTreeSet::new(), true).map(|_| ())
+        }) {
             self.stop();
             let error = bounded_error(&error);
             let _ = self.append(Event::CloseFailed {
@@ -961,13 +1157,14 @@ impl ConditionalHumanJournal {
             self.stop();
             return Err(error);
         }
-        let closed = self
-            .append(Event::Closed {
-                attempt: self.session.attempts(),
-                resolve,
-                tip_checksum: self.session.owner().identity().checksum().into(),
-            })
-            .map_err(|e| e.error)?;
+        let span = timer.enter(TimedPhase::Resolve);
+        let appended = self.append(Event::Closed {
+            attempt: self.session.attempts(),
+            resolve,
+            tip_checksum: self.session.owner().identity().checksum().into(),
+        });
+        timer.returned(span, appended.is_err());
+        let closed = appended.map_err(|e| e.error)?;
         // No fallible operation follows successful library finalization.
         self.phase = ConditionalJournalPhase::Ready;
         Ok(ConditionalReturnedClose {
@@ -1162,6 +1359,44 @@ mod tests {
         parsed.source.test_outcomes = Some(vec![true; 4]);
         ConditionalHumanJournal::restore_verified(directory, parsed, None, Some(authority))
     }
+    fn restore_test_profiled(
+        directory: &Path,
+        head: &ContentPin,
+        authority: &ContentPin,
+        profile: &mut ConditionalRunProfile,
+    ) -> Result<ConditionalHumanJournal, String> {
+        *profile = ConditionalRunProfile::default();
+        let mut timer = RunTimer(profile);
+        timed(&mut timer, TimedPhase::WholeCall, |timer| {
+            let mut parsed =
+                timed_conditional(timer, ConditionalTimedPhase::ArchiveVerify, |_| {
+                    inspect_archive(directory, head)
+                })?;
+            if !parsed.logically_closed {
+                return Err("Test archive is not closed".into());
+            }
+            require_authority(authority, &parsed.saved)?;
+            parsed.source.test_outcomes = Some(vec![true; 4]);
+            ConditionalHumanJournal::restore_verified_timed(
+                directory,
+                parsed,
+                None,
+                Some(authority),
+                timer,
+            )
+        })
+    }
+    fn assert_same_archive(left: &ConditionalHumanJournal, right: &ConditionalHumanJournal) {
+        assert_eq!(left.members, right.members);
+        for name in &left.members {
+            assert_eq!(
+                fs::read(left.directory.join(name)).unwrap(),
+                fs::read(right.directory.join(name)).unwrap(),
+                "{name}"
+            );
+        }
+        assert_eq!(left.head, right.head);
+    }
     #[test]
     fn conditional_closed_restore_keeps_joint_bits_credit_rng_and_rounded_nochange() {
         for (name, rate, expected_updates) in [("updated", 0.001, 2), ("rounded", 1e-300, 0)] {
@@ -1170,7 +1405,45 @@ mod tests {
             let mut journal = start(&files, &format!("{name}-restart"), rate);
             assert!(journal.export_numeric_inference().is_err());
             continuous.update_whole_four(seeds()[0], None).unwrap();
-            let first = journal.update_whole_four(seeds()[0], None).unwrap();
+            let mut profile = ConditionalRunProfile::default();
+            let first = journal
+                .update_whole_four_profiled(seeds()[0], None, &mut profile)
+                .unwrap();
+            assert_same_archive(&continuous, &journal);
+            let report: serde_json::Value = serde_json::from_slice(
+                &fs::read(journal.directory.join("report-0001.json")).unwrap(),
+            )
+            .unwrap();
+            let totals = profile.games().iter().fold([0u64; 3], |mut total, game| {
+                assert_eq!(game.collected.games, 1);
+                assert_eq!(game.audited.games, 1);
+                assert_eq!(game.roster_checksum.len(), 64);
+                assert_eq!(
+                    game.collected.nonforced,
+                    game.collected.own_callbacks - game.collected.singletons
+                );
+                total[0] += game.collected.own_callbacks;
+                total[1] += game.collected.candidate_rows;
+                total[2] += game.collected.singletons;
+                total
+            });
+            for (i, n) in totals.iter().enumerate() {
+                assert_eq!(report["counts"][i].as_u64(), Some(*n));
+            }
+            assert_eq!(
+                profile
+                    .games()
+                    .iter()
+                    .map(|g| g.players)
+                    .collect::<Vec<_>>(),
+                vec![3, 3, 4, 4]
+            );
+            assert!(
+                profile
+                    .phase_timings()
+                    .iter()
+                    .any(|v| v.phase == "actorForward")
+            );
             let head = journal.head();
             let directory = journal.directory.clone();
             let saved = ConditionalHumanJournal::inspect_saved_tip(&directory, &head).unwrap();
@@ -1178,10 +1451,45 @@ mod tests {
             let positive = authority(&files, "positive", &first, 0);
             let negative = authority(&files, "negative", &first, 1);
             assert!(restore_test(&directory, &head, &negative).is_err());
+            assert!(
+                ConditionalHumanJournal::restore_ready_profiled(
+                    &directory,
+                    &head,
+                    &negative,
+                    None,
+                    &mut profile
+                )
+                .is_err()
+            );
+            assert_eq!(
+                profile.games().iter().map(|g| g.audited.games).sum::<u64>(),
+                0
+            );
+            assert!(
+                profile
+                    .phase_timings()
+                    .iter()
+                    .any(|v| v.phase == "wholeCall" && v.errors == 1)
+            );
             drop(journal);
-            let mut restored = restore_test(&directory, &head, &positive).unwrap();
-            continuous.update_whole_four(seeds()[1], None).unwrap();
+            let mut restored =
+                restore_test_profiled(&directory, &head, &positive, &mut profile).unwrap();
+            assert_same_archive(&continuous, &restored);
+            for game in profile.games() {
+                assert_eq!(game.collected.games, 0);
+                assert_eq!(game.audited.games, 1);
+            }
+            assert!(
+                profile
+                    .phase_timings()
+                    .iter()
+                    .any(|v| v.phase == "restoreReplay" && v.calls == 1)
+            );
+            continuous
+                .update_whole_four_profiled(seeds()[1], None, &mut profile)
+                .unwrap();
             restored.update_whole_four(seeds()[1], None).unwrap();
+            assert_same_archive(&continuous, &restored);
             assert_eq!(
                 restored.session.owner().actor_parameters(),
                 continuous.session.owner().actor_parameters()
@@ -1907,21 +2215,70 @@ impl ConditionalHumanJournal {
         authority_pin: &ContentPin,
         opponent: Option<&PreparedPublicPolicy>,
     ) -> Result<Self, String> {
-        let parsed = inspect_archive(directory, expected_head)?;
-        if !parsed.logically_closed {
-            return Err("Conditional saved tip is not successfully closed".into());
-        }
-        require_authority(authority_pin, &parsed.saved)?;
-        Self::restore_verified(directory, parsed, opponent, Some(authority_pin))
+        Self::restore_ready_timed(
+            directory,
+            expected_head,
+            authority_pin,
+            opponent,
+            &mut Untimed,
+        )
     }
+    /// Measures one authority-bound restore without changing its saved bytes.
+    /// Replayed audits are reported separately from newly collected games.
+    pub fn restore_ready_profiled(
+        directory: &Path,
+        expected_head: &ContentPin,
+        authority_pin: &ContentPin,
+        opponent: Option<&PreparedPublicPolicy>,
+        profile: &mut ConditionalRunProfile,
+    ) -> Result<Self, String> {
+        *profile = ConditionalRunProfile::default();
+        Self::restore_ready_timed(
+            directory,
+            expected_head,
+            authority_pin,
+            opponent,
+            &mut RunTimer(profile),
+        )
+    }
+    fn restore_ready_timed<T: PhaseTimer>(
+        directory: &Path,
+        expected_head: &ContentPin,
+        authority_pin: &ContentPin,
+        opponent: Option<&PreparedPublicPolicy>,
+        timer: &mut T,
+    ) -> Result<Self, String> {
+        timed(timer, TimedPhase::WholeCall, |timer| {
+            let parsed = timed_conditional(timer, ConditionalTimedPhase::ArchiveVerify, |_| {
+                inspect_archive(directory, expected_head)
+            })?;
+            if !parsed.logically_closed {
+                return Err("Conditional saved tip is not successfully closed".into());
+            }
+            require_authority(authority_pin, &parsed.saved)?;
+            Self::restore_verified_timed(directory, parsed, opponent, Some(authority_pin), timer)
+        })
+    }
+    #[cfg(test)]
     fn restore_verified(
         directory: &Path,
         parsed: Parsed,
         opponent: Option<&PreparedPublicPolicy>,
         authority_pin: Option<&ContentPin>,
     ) -> Result<Self, String> {
+        Self::restore_verified_timed(directory, parsed, opponent, authority_pin, &mut Untimed)
+    }
+    fn restore_verified_timed<T: PhaseTimer>(
+        directory: &Path,
+        parsed: Parsed,
+        opponent: Option<&PreparedPublicPolicy>,
+        authority_pin: Option<&ContentPin>,
+        timer: &mut T,
+    ) -> Result<Self, String> {
         let directory = local(directory, false)?;
-        let mut session = parsed.source.full_load()?;
+        let mut session = timed_conditional(timer, ConditionalTimedPhase::SourceLoad, |_| {
+            parsed.source.full_load()
+        })?;
         if root_parameters(&session)? != read_pin(&directory, &parsed.root_parameters, JOINT_BYTES)?
         {
             return Err("Conditional root actor/fresh critic bits differ on restore".into());
@@ -1980,42 +2337,56 @@ impl ConditionalHumanJournal {
                     let records = records.as_ref().ok_or("Missing saved conditional cohort")?;
                     let raw: [Vec<u8>; 4] = records
                         .iter()
-                        .map(|r| {
-                            storage::decode(
-                                &read_pin(&directory, &r.stored, storage::MAX_STORED_RECORD_BYTES)?,
-                                r.raw_bytes,
-                                &r.raw_sha256,
-                            )
+                        .enumerate()
+                        .map(|(i, r)| {
+                            timed(timer, TimedPhase::AuditJournal(i), |_| {
+                                storage::decode(
+                                    &read_pin(
+                                        &directory,
+                                        &r.stored,
+                                        storage::MAX_STORED_RECORD_BYTES,
+                                    )?,
+                                    r.raw_bytes,
+                                    &r.raw_sha256,
+                                )
+                            })
                         })
                         .collect::<Result<Vec<_>, _>>()?
                         .try_into()
                         .map_err(|_| "Saved cohort shape")?;
-                    #[cfg(test)]
-                    let staged = if let Some(outcomes) = &parsed.source.test_outcomes {
-                        crate::conditional_human_rl_update::test_short_stage(
-                            &session,
-                            plan.as_ref().ok_or("Missing saved Reserve")?,
-                            &pool,
-                            *outcomes
-                                .get((session.attempts() - 1) as usize)
-                                .ok_or("Missing tiny fixture case")?,
-                            Some(&raw),
-                        )?
-                    } else {
-                        session.stage(
-                            plan.as_ref().ok_or("Missing saved Reserve")?,
-                            &pool,
-                            opponent,
-                            Some(&raw),
-                        )?
-                    };
-                    #[cfg(not(test))]
-                    let staged = session.stage(
-                        plan.as_ref().ok_or("Missing saved Reserve")?,
-                        &pool,
-                        opponent,
-                        Some(&raw),
-                    )?;
+                    let staged =
+                        timed_conditional(timer, ConditionalTimedPhase::RestoreReplay, |timer| {
+                            #[cfg(test)]
+                            let staged = if let Some(outcomes) = &parsed.source.test_outcomes {
+                                crate::conditional_human_rl_update::test_short_stage_timed(
+                                    &session,
+                                    plan.as_ref().ok_or("Missing saved Reserve")?,
+                                    &pool,
+                                    *outcomes
+                                        .get((session.attempts() - 1) as usize)
+                                        .ok_or("Missing tiny fixture case")?,
+                                    Some(&raw),
+                                    timer,
+                                )?
+                            } else {
+                                session.stage_timed(
+                                    plan.as_ref().ok_or("Missing saved Reserve")?,
+                                    &pool,
+                                    opponent,
+                                    Some(&raw),
+                                    timer,
+                                )?
+                            };
+                            #[cfg(not(test))]
+                            let staged = session.stage_timed(
+                                plan.as_ref().ok_or("Missing saved Reserve")?,
+                                &pool,
+                                opponent,
+                                Some(&raw),
+                                timer,
+                            )?;
+                            Ok(staged)
+                        })?;
                     let (actual_report, actual_joint) = staged.payload()?;
                     if actual_report
                         != read_pin(
@@ -2076,12 +2447,17 @@ impl ConditionalHumanJournal {
             #[cfg(test)]
             change_source_after_resolve: None,
         };
-        journal.usage(&BTreeSet::new(), true)?;
-        journal.source.full_load()?;
-        journal.require_head()?;
-        if let Some(pin) = authority_pin {
-            require_authority(pin, &parsed.saved)?;
-        }
+        timed(timer, TimedPhase::FinalGuards, |timer| {
+            journal.usage(&BTreeSet::new(), true)?;
+            timed_conditional(timer, ConditionalTimedPhase::SourceLoad, |_| {
+                journal.source.full_load()
+            })?;
+            journal.require_head()?;
+            if let Some(pin) = authority_pin {
+                require_authority(pin, &parsed.saved)?;
+            }
+            Ok(())
+        })?;
         Ok(journal)
     }
 }

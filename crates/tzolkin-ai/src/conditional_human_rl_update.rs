@@ -16,7 +16,8 @@ use crate::public_policy_episode::{
 };
 use crate::public_policy_mixed::{MixedNumericMember, prepare_numeric_timed, rounded_delta};
 use crate::public_policy_update::{
-    Deltas, NumericReport, OneStepConfig, Untimed, checkpoint_digest, hash,
+    Deltas, NumericReport, OneStepConfig, PhaseTimer, TimedGame, TimedPhase, Untimed,
+    checkpoint_digest, hash, timed,
 };
 use crate::public_stochastic::{
     RNG_VERSION, SamplingSeed, SamplingStreamIdentity, UNIFORM_MIXTURE,
@@ -1168,6 +1169,16 @@ impl ConditionalMixedSession {
         prepared_opponent: Option<&PreparedPublicPolicy>,
         saved: Option<&[Vec<u8>; 4]>,
     ) -> Result<JointProposal, String> {
+        self.stage_timed(plan, pool, prepared_opponent, saved, &mut Untimed)
+    }
+    pub(crate) fn stage_timed<T: PhaseTimer>(
+        &self,
+        plan: &ConditionalReservation,
+        pool: &ConditionalFrozenPool,
+        prepared_opponent: Option<&PreparedPublicPolicy>,
+        saved: Option<&[Vec<u8>; 4]>,
+        timer: &mut T,
+    ) -> Result<JointProposal, String> {
         if self.stopped
             || plan.parent != self.owner.identity
             || self.next != plan.previous_next + 4
@@ -1192,32 +1203,43 @@ impl ConditionalMixedSession {
             }
             let raw = match saved {
                 Some(records) => records[i].clone(),
-                None => encode_typed_record(&run_conditional_mixed_shared(
-                    &plan.configs[i],
-                    &handle,
-                    &rosters[i],
-                    actual_header.clone(),
-                    None,
-                )?)?,
+                None => {
+                    let record = timed(timer, TimedPhase::Collection(i), |_| {
+                        run_conditional_mixed_shared(
+                            &plan.configs[i],
+                            &handle,
+                            &rosters[i],
+                            actual_header.clone(),
+                            None,
+                        )
+                    })?;
+                    timed(timer, TimedPhase::CollectionJournal(i), |_| {
+                        encode_typed_record(&record)
+                    })?
+                }
             };
-            let expected: Record<ConditionalMixedSource> = decode_typed_record(&raw)?;
+            let expected: Record<ConditionalMixedSource> =
+                timed(timer, TimedPhase::AuditRecordRead(i), |_| {
+                    decode_typed_record(&raw)
+                })?;
             if expected.schema != RECORD_SCHEMA
                 || expected.header != actual_header
                 || expected.training_admission != "unavailable-distinct-codec-required"
             {
                 return Err("Conditional full source/header differs before audit".into());
             }
-            let audited = run_conditional_mixed_shared(
-                &plan.configs[i],
-                &handle,
-                &rosters[i],
-                actual_header,
-                Some(&expected),
-            )?;
-            episodes.push(ConditionalEpisode::from_audited(
-                audited,
-                plan.configs[i].clone(),
-            )?);
+            let audited = timed(timer, TimedPhase::Audit(i), |_| {
+                run_conditional_mixed_shared(
+                    &plan.configs[i],
+                    &handle,
+                    &rosters[i],
+                    actual_header,
+                    Some(&expected),
+                )
+            })?;
+            episodes.push(timed(timer, TimedPhase::AuditPreparation(i), |_| {
+                ConditionalEpisode::from_audited(audited, plan.configs[i].clone())
+            })?);
         }
         prepare(
             &self.owner,
@@ -1229,6 +1251,8 @@ impl ConditionalMixedSession {
             self.attempts,
             self.next,
             self.credited,
+            timer,
+            saved.is_none(),
         )
     }
     pub(crate) fn admit(
@@ -1358,6 +1382,17 @@ pub(crate) fn test_short_stage(
     winning: bool,
     saved: Option<&[Vec<u8>; 4]>,
 ) -> Result<JointProposal, String> {
+    test_short_stage_timed(session, plan, pool, winning, saved, &mut Untimed)
+}
+#[cfg(test)]
+pub(crate) fn test_short_stage_timed<T: PhaseTimer>(
+    session: &ConditionalMixedSession,
+    plan: &ConditionalReservation,
+    pool: &ConditionalFrozenPool,
+    winning: bool,
+    saved: Option<&[Vec<u8>; 4]>,
+    timer: &mut T,
+) -> Result<JointProposal, String> {
     let handle = session.owner.handle()?;
     let rosters = pool.freeze(None)?;
     let mut episodes = Vec::new();
@@ -1374,25 +1409,40 @@ pub(crate) fn test_short_stage(
             Some(raw) => Some(decode_typed_record::<ConditionalMixedSource>(&raw[i])?),
             None => None,
         };
-        let record = crate::public_stochastic_native::conditional_test_start(
-            config,
-            &handle,
-            roster,
-            plan.headers[i].clone(),
-            expected.as_ref(),
-            start.clone(),
-        )?;
-        let raw = encode_typed_record(&record)?;
-        let expected = decode_typed_record::<ConditionalMixedSource>(&raw)?;
-        let audited = crate::public_stochastic_native::conditional_test_start(
-            config,
-            &handle,
-            roster,
-            plan.headers[i].clone(),
-            Some(&expected),
-            start,
-        )?;
-        episodes.push(ConditionalEpisode::from_audited(audited, config.clone())?);
+        let phase = if saved.is_some() {
+            TimedPhase::Audit(i)
+        } else {
+            TimedPhase::Collection(i)
+        };
+        let record = timed(timer, phase, |_| {
+            crate::public_stochastic_native::conditional_test_start(
+                config,
+                &handle,
+                roster,
+                plan.headers[i].clone(),
+                expected.as_ref(),
+                start.clone(),
+            )
+        })?;
+        let raw = timed(timer, TimedPhase::CollectionJournal(i), |_| {
+            encode_typed_record(&record)
+        })?;
+        let expected = timed(timer, TimedPhase::AuditRecordRead(i), |_| {
+            decode_typed_record::<ConditionalMixedSource>(&raw)
+        })?;
+        let audited = timed(timer, TimedPhase::Audit(i), |_| {
+            crate::public_stochastic_native::conditional_test_start(
+                config,
+                &handle,
+                roster,
+                plan.headers[i].clone(),
+                Some(&expected),
+                start,
+            )
+        })?;
+        episodes.push(timed(timer, TimedPhase::AuditPreparation(i), |_| {
+            ConditionalEpisode::from_audited(audited, config.clone())
+        })?);
     }
     prepare(
         &session.owner,
@@ -1404,10 +1454,12 @@ pub(crate) fn test_short_stage(
         session.attempts,
         session.next,
         session.credited,
+        timer,
+        saved.is_none(),
     )
 }
 #[allow(clippy::too_many_arguments)]
-fn prepare(
+fn prepare<T: PhaseTimer>(
     owner: &ConditionalMixedOwner,
     episodes: &[ConditionalEpisode],
     families: [NativeSeedFamily; 4],
@@ -1417,6 +1469,8 @@ fn prepare(
     attempts: u64,
     next: u64,
     credited: u64,
+    timer: &mut T,
+    newly_collected: bool,
 ) -> Result<JointProposal, String> {
     if episodes.len() != 4
         || episodes.iter().enumerate().any(|(i, e)| {
@@ -1429,7 +1483,8 @@ fn prepare(
         return Err("Conditional sealed cohort immediate parent/config/family differs".into());
     }
     let mut counts = [0usize; 3];
-    for e in episodes {
+    for (member, e) in episodes.iter().enumerate() {
+        let mut game_counts = [0usize; 3];
         for s in e.steps() {
             for (total, n) in counts.iter_mut().zip([
                 1,
@@ -1440,7 +1495,25 @@ fn prepare(
                     .checked_add(n)
                     .ok_or("Conditional cohort count overflow")?;
             }
+            game_counts[0] += 1;
+            game_counts[1] += s.observation().legal_actions.len();
+            game_counts[2] += usize::from(s.observation().legal_actions.len() == 1);
         }
+        timer.game(TimedGame {
+            member,
+            players: e.config.players(),
+            roster_checksum: &e.record.header.base_policy.roster_checksum,
+            newly_collected,
+            callbacks: e.record.callbacks.len(),
+            own: game_counts[0],
+            singletons: game_counts[2],
+            candidates: game_counts[1],
+            winner_share: if e.rank == 1 {
+                1.0 / e.winners as f64
+            } else {
+                0.0
+            },
+        });
     }
     let members: [MixedNumericMember<'_>; 4] = episodes
         .iter()
@@ -1453,15 +1526,17 @@ fn prepare(
         .collect::<Vec<_>>()
         .try_into()
         .map_err(|_| "Conditional numeric whole-four shape")?;
-    let (deltas, actor, critic) = prepare_numeric_timed(
-        &owner.actor,
-        &owner.critic,
-        &members,
-        counts,
-        &actor_config,
-        &critic_config,
-        &mut Untimed,
-    )?;
+    let (deltas, actor, critic) = timed(timer, TimedPhase::NumericPreparation, |timer| {
+        prepare_numeric_timed(
+            &owner.actor,
+            &owner.critic,
+            &members,
+            counts,
+            &actor_config,
+            &critic_config,
+            timer,
+        )
+    })?;
     let episode_checksums: [String; 4] = episodes
         .iter()
         .map(|e| e.checksum.clone())
@@ -1833,6 +1908,8 @@ pub(crate) mod tests {
             1,
             4,
             0,
+            &mut Untimed,
+            true,
         )
         .unwrap();
         bad.updated.as_mut().unwrap().2.actor_parameters[0] = f32::NAN;
@@ -1850,6 +1927,8 @@ pub(crate) mod tests {
             1,
             4,
             0,
+            &mut Untimed,
+            true,
         )
         .unwrap();
         let outcome = session.admit(good).unwrap();

@@ -63,10 +63,31 @@ pub(crate) enum TimedPhase {
     FinalGuards,
 }
 
+pub(crate) enum ConditionalTimedPhase {
+    SourceLoad,
+    ArchiveVerify,
+    RestoreReplay,
+}
+pub(crate) struct TimedGame<'a> {
+    pub member: usize,
+    pub players: usize,
+    pub roster_checksum: &'a str,
+    pub newly_collected: bool,
+    pub callbacks: usize,
+    pub own: usize,
+    pub singletons: usize,
+    pub candidates: usize,
+    pub winner_share: f64,
+}
+
 pub(crate) trait PhaseTimer {
     type Span;
     fn enter(&mut self, phase: TimedPhase) -> Self::Span;
     fn returned(&mut self, span: Self::Span, error: bool);
+    fn game(&mut self, _: TimedGame<'_>) {}
+    fn enter_conditional(&mut self, _: ConditionalTimedPhase) -> Self::Span {
+        self.enter(TimedPhase::Preflight)
+    }
 }
 
 pub(crate) struct Untimed;
@@ -85,6 +106,18 @@ pub(crate) fn timed<T: PhaseTimer, R>(
     operation: impl FnOnce(&mut T) -> Result<R, String>,
 ) -> Result<R, String> {
     let span = timer.enter(phase);
+    let result = operation(timer);
+    timer.returned(span, result.is_err());
+    result
+}
+
+#[inline]
+pub(crate) fn timed_conditional<T: PhaseTimer, R>(
+    timer: &mut T,
+    phase: ConditionalTimedPhase,
+    operation: impl FnOnce(&mut T) -> Result<R, String>,
+) -> Result<R, String> {
+    let span = timer.enter_conditional(phase);
     let result = operation(timer);
     timer.returned(span, result.is_err());
     result
