@@ -1207,8 +1207,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       ? effects
       : null;
   }
-  // This receipt retains the printed points through one actual Anywhere action
-  // and monument. It never moves the original purchase checkpoint forward.
+  // Retain the printed points through the actual Anywhere action and its
+  // observed purchases. The original purchase remains the rollback anchor.
   function deferredActionScoreShape(outcome, event, events, witness, previous = state()) {
     const action = outcome.row.action;
     const effects = actionScorePair(action.id);
@@ -1217,7 +1217,6 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const next = outcome.frame.snapshot.state;
     const scores = events.filter((item) => fixedScoreCaption(item) !== null);
     const gains = events.filter((item) => item.kind === 'resourceGain');
-    const observed = witness.expected?.players?.[actor];
     if (
       !effects ||
       actor < 0 ||
@@ -1228,9 +1227,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       action.renovation !== null ||
       previous.players[actor].technologies.architecture < 2 ||
       !same(witness.buildings, [action.id]) ||
-      !Number.isFinite(observed?.score) ||
-      !RESOURCES.every((resource) => Number.isSafeInteger(observed?.resources?.[resource])) ||
-      !matches(next, witness.expected) ||
+      (witness.expected !== undefined && !matches(next, witness.expected)) ||
       !same(typedResourceCost(action), paymentOf(events)) ||
       events.some((item) => item.actor !== event.actor) ||
       events.filter((item) => item.kind === 'build').length !== 1 ||
@@ -1302,15 +1299,124 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       amount: effects[1].amount,
       scoreEvent: scores[1],
       captionObserved: false,
+      tail: copy(next.pending.after),
       pending: copy(next.pending),
       round: next.round,
       phase: next.phase,
     };
   }
+  function retainedActionTail(previous) {
+    const receipt = deferredScore;
+    return receipt?.kind === 'action' &&
+      receipt.captionObserved &&
+      ['build', 'nested'].includes(receipt.stage) &&
+      previous.currentPlayer === receipt.actor &&
+      previous.round === receipt.round &&
+      previous.phase === receipt.phase &&
+      same(previous.pending?.after, receipt.tail)
+      ? receipt.tail
+      : null;
+  }
+  function settledActionBuild(outcome, event, events, witness, previous = state()) {
+    const receipt = deferredScore;
+    const action = outcome.row.action;
+    const next = outcome.frame.snapshot.state;
+    const task = previous.pending?.task;
+    const index = events.indexOf(event);
+    if (
+      retainedActionTail(previous) === null ||
+      receipt.stage !== 'build' ||
+      witnesses.catalogHash !== catalogHash ||
+      previous.version !== 1 ||
+      previous.additionalBuildings !== false ||
+      previous.expansion != null ||
+      task?.type !== 'build' ||
+      task.remaining !== 1 ||
+      task.cornPayment !== false ||
+      event?.kind !== 'build' ||
+      action.type !== 'build' ||
+      typeof action.architecture !== 'boolean' ||
+      action.renovation !== null ||
+      (action.architecture && task.architectureAvailable === false) ||
+      !same(witness.buildings, [action.id]) ||
+      !previous.buildings.includes(action.id) ||
+      !same(typedResourceCost(action), paymentOf(events)) ||
+      events.some((item) => actorId(item.actor) !== receipt.actor) ||
+      events.slice(0, index).some((item) => item.kind !== 'resourcePayment') ||
+      events.slice(index + 1).some((item) => !['resourceGain', 'unparsed'].includes(item.kind)) ||
+      next.pending !== null ||
+      outcome.frame.observation?.pendingTask !== null ||
+      (witness.expected !== undefined && !matches(next, witness.expected))
+    )
+      return false;
+    // Source captions constrain all delivered counters; the known outer Points
+    // are accounted separately. The full state comparison rejects other effects.
+    const gains = purchaseGains(event, events);
+    const expected = mechanical(previous);
+    const own = expected.players[receipt.actor];
+    for (const [i, resource] of RESOURCES.entries()) own.resources[resource] -= action.cost[i];
+    for (const [field, amount] of Object.entries(gains)) {
+      if (field.startsWith('resource:')) own.resources[field.slice(9)] += amount;
+      else if (field.startsWith('temple:')) own.temples[field.slice(7)] += amount;
+      else if (field === 'score') own.score += amount;
+      else return false;
+    }
+    own.score += receipt.amount;
+    own.buildings.push(action.id);
+    expected.buildings = previous.buildings.filter((id) => id !== action.id);
+    expected.pending = null;
+    return same(mechanical(next), expected);
+  }
   function deferredActionScoreTransition(nextFrame, action) {
     const receipt = deferredScore;
     const before = state();
     const next = nextFrame.snapshot.state;
+    if (
+      !receipt.captionObserved ||
+      !same(before.pending, receipt.pending) ||
+      before.currentPlayer !== receipt.actor ||
+      before.round !== receipt.round ||
+      before.phase !== receipt.phase ||
+      next.currentPlayer !== receipt.actor ||
+      next.round !== receipt.round ||
+      next.phase !== receipt.phase
+    )
+      fail('Deferred action purchase changed its actor or continuation');
+    if (receipt.stage === 'nested') {
+      const inner = queuedPurchase;
+      if (
+        inner?.kind !== 'materialTechnology' ||
+        !same(inner.retainedTail, receipt.tail) ||
+        !same(before.pending, inner.pending) ||
+        !['technology', 'resource'].includes(action.type) ||
+        !Array.isArray(next.pending?.after) ||
+        !same(next.pending.after.slice(-receipt.tail.length), receipt.tail)
+      )
+        fail('Deferred action purchase lost its anchored outer queue');
+      // The existing inner receipt validates the whole mechanical state at this
+      // source's end, before any part of the tentative chain can be committed.
+      deferredScore = {
+        ...receipt,
+        stage: next.pending.task.type === 'build' ? 'build' : 'nested',
+        pending: copy(next.pending),
+      };
+      return;
+    }
+    if (receipt.stage === 'build' && action.type === 'build') {
+      const event = context.events.find((item) => item.kind === 'build');
+      const witness = observed.get(context.id) ?? {};
+      const outcome = { row: { action }, frame: nextFrame };
+      const inner = queuedMaterialPurchase(outcome, event, context.events, witness, before);
+      if (inner === null && !settledActionBuild(outcome, event, context.events, witness, before))
+        fail('Deferred action purchase has no exact nested or settled Build receipt');
+      deferredScore = {
+        ...receipt,
+        stage: inner ? 'nested' : 'complete',
+        continuation: 'anyActionBuild',
+        pending: copy(next.pending),
+      };
+      return;
+    }
     const anywhere = receipt.stage === 'anyAction';
     const validAction = anywhere
       ? action.type === 'useAction' &&
@@ -1318,20 +1424,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         action.gear === 'tikal' &&
         action.position === 4 &&
         action.cornCost === 1
-      : receipt.stage === 'monument' &&
+      : receipt.stage === 'build' &&
         action.type === 'monument' &&
         action.renovation === null &&
         same(typedResourceCost(action), paymentOf(context.events));
     if (
-      !receipt.captionObserved ||
       !validAction ||
-      !same(before.pending, receipt.pending) ||
-      before.currentPlayer !== receipt.actor ||
-      before.round !== receipt.round ||
-      before.phase !== receipt.phase ||
-      next.currentPlayer !== receipt.actor ||
-      next.round !== receipt.round ||
-      next.phase !== receipt.phase ||
       (anywhere
         ? !same(next.pending?.task, {
             type: 'build',
@@ -1374,7 +1472,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       fail('Deferred purchase requires its exact observed Anywhere action and monument completion');
     deferredScore = {
       ...receipt,
-      stage: anywhere ? 'monument' : 'complete',
+      stage: anywhere ? 'build' : 'complete',
+      continuation: 'anyActionMonument',
       pending: copy(next.pending),
     };
   }
@@ -1606,6 +1705,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const task = previous.pending?.task;
     const next = outcome.frame.snapshot.state;
     const continuation = actor < 0 ? null : queuedCornTechnology(previous, actor);
+    const retainedTail = same(previous.pending?.after, []) ? [] : retainedActionTail(previous);
     if (
       witnesses.catalogHash !== catalogHash ||
       actor < 0 ||
@@ -1630,7 +1730,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       task?.type !== 'build' ||
       task.remaining !== 2 ||
       task.cornPayment !== false ||
-      !same(previous.pending.after, []) ||
+      retainedTail === null ||
       continuation === null ||
       (action.architecture &&
         (task.architectureAvailable === false ||
@@ -1678,6 +1778,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           architectureAvailable: task.architectureAvailable !== false && !action.architecture,
           ...(task.mandatory ? { mandatory: true } : {}),
         },
+        ...retainedTail,
       ])
     )
       return null;
@@ -1695,6 +1796,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       actor,
       resource,
       amount,
+      retainedTail: copy(retainedTail),
       pending: copy(next.pending),
       gainEvent,
       purchaseCounterEvidence: {
@@ -1866,7 +1968,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       next.phase !== before.phase ||
       !sameReceipt(next.pending?.task, expected) ||
       !sameReceipt(frame.observation.pendingTask, expected) ||
-      !sameReceipt(next.pending?.after, []) ||
+      !sameReceipt(next.pending?.after, receipt.retainedTail ?? []) ||
       next.players[actor].technologies[technology] !==
         before.players[actor].technologies[technology] + Number(!corn) ||
       next.players.some((player, id) =>
@@ -1945,9 +2047,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       !sameReceipt(next.pending?.task, frame.observation.pendingTask) ||
       !sameReceipt(
         next.pending?.task,
-        remaining ? { type: 'resource', remaining } : receipt.pending.after.at(-1),
+        remaining ? { type: 'resource', remaining } : receipt.pending.after[2],
       ) ||
-      !sameReceipt(next.pending?.after, remaining ? receipt.pending.after : []) ||
+      !sameReceipt(
+        next.pending?.after,
+        remaining ? receipt.pending.after : (receipt.retainedTail ?? []),
+      ) ||
       extractionReward?.originActionId !== receipt.technologySourceId ||
       extractionReward.captionActionId !== receipt.technologySourceId ||
       extractionReward.remaining !== remaining ||
@@ -2216,7 +2321,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     });
     return true;
   }
-  function purchaseOutcome(event, events, witness, outcomes = []) {
+  function purchaseGains(event, events) {
     const actor = actorId(event.actor);
     const remaining = events.slice(events.indexOf(event) + 1);
     const workerCaps = remaining.filter(cappedWorkerCaption);
@@ -2278,6 +2383,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     }
     if (Object.values(gains).some((amount) => !Number.isSafeInteger(amount) || amount < 0))
       fail('Observed purchase gain is out of bounds');
+    return gains;
+  }
+  function purchaseOutcome(event, events, witness, outcomes = []) {
+    const actor = actorId(event.actor);
+    const remaining = events.slice(events.indexOf(event) + 1);
+    const workerCaps = remaining.filter(cappedWorkerCaption);
+    const gains = purchaseGains(event, events);
     // A branch is selected only when every candidate has the same bounded
     // causal shape and exactly one can pay the next observed purchase. A
     // partial proof leaves the original candidates ambiguous.
@@ -2307,6 +2419,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         );
       if (task === 'anyAction' && actionScorePair(outcome.row.action.id))
         return deferredActionScoreShape(outcome, event, events, witness) !== null;
+      if (
+        deferredScore?.kind === 'action' &&
+        deferredScore.stage === 'build' &&
+        outcome.row.action.type === 'build' &&
+        task === null
+      )
+        return settledActionBuild(outcome, event, events, witness);
       const envelope = events.some(
         (item) =>
           emptyPurchasePayment(item) || architectureScoreCaption(item) || cappedWorkerCaption(item),
@@ -2486,7 +2605,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (!events.length) fail('Raw source action has no observed messages');
       if (deferredScore) {
         if (
-          events.some((event) => actorId(event.actor) !== deferredScore.actor) ||
+          (deferredScore.kind === 'action' && deferredScore.stage === 'nested'
+            ? !queuedPurchase ||
+              !queuedPurchaseEvents(events) ||
+              actorId(events[0].actor) !== deferredScore.actor
+            : events.some((event) => actorId(event.actor) !== deferredScore.actor)) ||
           !same(state().pending, deferredScore.pending) ||
           (witness.refills?.currentAge?.length ?? 0) !== 0 ||
           (witness.refills?.age2?.length ?? 0) !== 0
@@ -2502,13 +2625,20 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 operation.detail.gear !== 'tikal' ||
                 operation.detail.actionPosition !== 4 ||
                 operation.detail.cornCost !== 1
-              : deferredScore.stage !== 'monument' ||
-                operation?.kind !== 'monument' ||
-                events.at(-1) !== operation ||
-                events.some((event) => event !== operation && event.kind !== 'resourcePayment') ||
-                witness.monuments?.length !== 1
+              : deferredScore.stage === 'nested'
+                ? !queuedPurchaseEvents(events)
+                : deferredScore.stage !== 'build' ||
+                  (operation?.kind === 'monument'
+                    ? events.at(-1) !== operation ||
+                      events.some(
+                        (event) => event !== operation && event.kind !== 'resourcePayment',
+                      ) ||
+                      witness.monuments?.length !== 1
+                    : operation?.kind !== 'build' || witness.buildings?.length !== 1)
           )
-            fail('Deferred purchase requires the next observed Anywhere action, then monument');
+            fail(
+              'Deferred purchase requires the next observed Anywhere action and purchase choices',
+            );
         } else if (!events.every((event) => event.kind === 'trade')) {
           if (
             events.filter((event) => event.kind === 'build').length !== 1 ||
@@ -2981,7 +3111,16 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 'Corn plus technology purchase requires its exact observed continuation receipt',
               );
             if (receipt) {
-              if (saved.deferredScore || saved.queuedPurchase?.kind === 'technologyBuild')
+              const anchoredMaterial =
+                receipt.kind === 'materialTechnology' &&
+                saved.deferredScore?.kind === 'action' &&
+                saved.deferredScore.stage === 'build' &&
+                deferredScore?.stage === 'nested' &&
+                same(receipt.retainedTail, saved.deferredScore.tail);
+              if (
+                (saved.deferredScore && !anchoredMaterial) ||
+                saved.queuedPurchase?.kind === 'technologyBuild'
+              )
                 fail('A deferred purchase cannot nest another unresolved receipt');
               const nextSourceId = groups[groupIndex + 1]?.[0];
               if (nextSourceId === undefined) fail('Queued purchase has no next observed source');
@@ -3374,7 +3513,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           actor: deferredScore.actor,
           amount: deferredScore.amount,
           actualDelivered: true,
-          continuation: 'anyActionMonument',
+          continuation: deferredScore.continuation,
           humanPlayingBcReady: false,
         });
         deferredScore = null;
@@ -3400,7 +3539,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       kinds: receipt.rollbackKinds ?? receipt.kinds,
       reason:
         receipt.kind === 'action'
-          ? 'Deferred purchase has no observed action and monument completion; entire tentative chain was rolled back'
+          ? 'Deferred purchase has no observed action and purchase completion; entire tentative chain was rolled back'
           : 'Deferred purchase has no observed Trade exit; entire tentative chain was rolled back',
     };
   }
