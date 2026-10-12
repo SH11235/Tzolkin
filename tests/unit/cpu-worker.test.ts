@@ -368,6 +368,89 @@ describe('CPU Worker request lifecycle', () => {
     worker.reply(decision);
     await expect(heuristic).resolves.toEqual(decision);
     expect(FakeWorker.instances).toHaveLength(1);
+    const conditional: CpuModelMetadata = {
+      ...model,
+      sourceRole: 'conditionalHumanCurrentMixed',
+      updateCount: 2,
+      policyVersion: 'conditional-human-current-mixed-scalar-v1',
+      sourceAuthenticated: false,
+      sourceQualified: false,
+      verifiedNativePolicy: false,
+      valueValidity: 'unavailablePolicyOnly',
+      conditionalCurrentIdentity: {
+        policyVersion: 'conditional-human-current-mixed-scalar-v1',
+        inputContract:
+          'conditional-human-origin-base-default-3-4p-public512-native-setup-playing-v1',
+        originChecksum: 'c'.repeat(64),
+        rootIdentityChecksum: 'd'.repeat(64),
+        parentIdentityChecksum: 'e'.repeat(64),
+        actorChecksum: 'f'.repeat(64),
+        criticChecksum: 'c'.repeat(64),
+        checksum: model.sourceChecksum,
+        mixedUpdateCount: 2,
+        samplingSeed: '18446744073709551615',
+        nextEpisodeOrdinal: '8',
+        gameOptions: {
+          additionalBuildings: false,
+          tribes: false,
+          prophecies: false,
+          quickActions: false,
+        },
+        uxmalCornLimit: false,
+        sourceQualified: false,
+        verifiedNativePolicy: false,
+      },
+    };
+    const conditionalLoad = loadCpuModel(bytes, signal);
+    worker.respond({ metadata: conditional });
+    await expect(conditionalLoad).resolves.toEqual(conditional);
+    expect(Object.isFrozen(getLoadedCpuModel()?.conditionalCurrentIdentity?.gameOptions)).toBe(
+      true,
+    );
+    const opening = api.startCpuGame(signal, conditional.checksum);
+    const conditionalGame = {
+      ...gameMetadata,
+      gameId: worker.request!.gameId,
+      policyVersion: 'numeric-conditional-human-trade-guard-v1',
+      rawPolicyVersion: conditional.policyVersion,
+    };
+    worker.respond({ gameMetadata: conditionalGame });
+    const newGame = await opening;
+    const human = await notify(api, worker, newGame, signal);
+    const cpu = await notify(api, worker, newGame, signal);
+    expect(cpu.index).toBe(human.index + 1);
+    const choice = chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: conditional.checksum },
+      cpu,
+    );
+    const conditionalDecision = {
+      ...nnDecision,
+      policyVersion: conditionalGame.policyVersion,
+      rawPolicyVersion: conditional.policyVersion,
+      callbackIndex: cpu.index,
+    };
+    worker.reply(conditionalDecision);
+    await expect(choice).resolves.toEqual(conditionalDecision);
+    for (const invalid of [
+      { ...conditional, sourceQualified: true },
+      { ...conditional, sourceRole: 'rlCurrentMixed' },
+      {
+        ...conditional,
+        conditionalCurrentIdentity: {
+          ...conditional.conditionalCurrentIdentity,
+          samplingSeed: 18446744073709551615n.toString() + '0',
+        },
+      },
+    ]) {
+      const invalidLoad = loadCpuModel(bytes, signal);
+      const currentWorker = FakeWorker.instances.at(-1)!;
+      currentWorker.respond({ metadata: invalid });
+      await expect(invalidLoad).rejects.toThrow('不正');
+      expect(currentWorker.terminated).toBe(true);
+      expect(getLoadedCpuModel()).toBeUndefined();
+    }
   });
 
   it('invalidates replacement/aborted caches and rejects busy or unloaded NN calls without fallback', async () => {

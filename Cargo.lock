@@ -3700,6 +3700,7 @@ dependencies = [
 name = "tzolkin-wasm"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "tzolkin-bot",
  "tzolkin-core",

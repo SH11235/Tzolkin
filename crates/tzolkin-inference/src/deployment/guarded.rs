@@ -20,6 +20,12 @@ pub const MAX_GAME_CALLBACKS: usize = 4000;
 /// Loading this numeric model establishes no training or playing-strength claim.
 pub struct GuardedDeployment {
     policy: LoadedDeployment,
+    game: GuardedGame,
+}
+
+/// Shared callback/Trade lifecycle; immutable model storage stays with each
+/// closed deployment type. No serialized state can restore this game history.
+pub(crate) struct GuardedGame {
     configuration_key: String,
     history: TradeHistory,
     next_callback: usize,
@@ -31,9 +37,48 @@ pub struct GuardedDeployment {
 
 impl GuardedDeployment {
     pub fn new(policy: LoadedDeployment, config: TradeGuardConfig) -> Result<Self, String> {
-        let configuration_key = config.configuration_key()?;
         Ok(Self {
             policy,
+            game: GuardedGame::new(config)?,
+        })
+    }
+
+    pub fn policy(&self) -> &LoadedDeployment {
+        &self.policy
+    }
+
+    pub fn into_policy(self) -> LoadedDeployment {
+        self.policy
+    }
+
+    pub fn configuration_key(&self) -> &str {
+        self.game.configuration_key()
+    }
+
+    pub fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
+        self.game.on_callback(index, o)
+    }
+
+    pub fn choose_move(
+        &mut self,
+        index: usize,
+        o: &Observation,
+    ) -> Result<GuardedDeploymentDecision, String> {
+        self.game.choose_move(
+            index,
+            o,
+            || self.policy.distribution(o),
+            self.policy.policy_version(),
+            self.policy.checksum(),
+            GUARDED_DEPLOYMENT_VERSION,
+        )
+    }
+}
+
+impl GuardedGame {
+    pub(crate) fn new(config: TradeGuardConfig) -> Result<Self, String> {
+        let configuration_key = config.configuration_key()?;
+        Ok(Self {
             configuration_key,
             history: TradeHistory::new(
                 config.max_trades_per_episode,
@@ -47,19 +92,7 @@ impl GuardedDeployment {
         })
     }
 
-    /// Immutable metadata and the original numeric policy remain available.
-    /// Its pure argmax is a different composition from this game session.
-    pub fn policy(&self) -> &LoadedDeployment {
-        &self.policy
-    }
-
-    /// Discard this game's callback/history state and move the same immutable
-    /// model into a fresh session. This does not copy parameters or keep history.
-    pub fn into_policy(self) -> LoadedDeployment {
-        self.policy
-    }
-
-    pub fn configuration_key(&self) -> &str {
+    pub(crate) fn configuration_key(&self) -> &str {
         &self.configuration_key
     }
 
@@ -73,7 +106,7 @@ impl GuardedDeployment {
         self.failed = true;
     }
 
-    pub fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
+    pub(crate) fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
         let result = (|| {
             if self.failed || index != self.next_callback || index >= MAX_GAME_CALLBACKS {
                 return Err("Stale/out-of-order guarded deployment callback".into());
@@ -97,10 +130,14 @@ impl GuardedDeployment {
         result
     }
 
-    pub fn choose_move(
+    pub(crate) fn choose_move(
         &mut self,
         index: usize,
         o: &Observation,
+        predict: impl FnOnce() -> Result<crate::policy::NumericPolicyDistribution, String>,
+        raw_policy_version: &str,
+        deployment_checksum: &str,
+        guarded_policy_version: &str,
     ) -> Result<GuardedDeploymentDecision, String> {
         let result = (|| {
             if self.failed
@@ -121,7 +158,7 @@ impl GuardedDeployment {
             }
             // Distribution validates the contract and recomputes the public
             // key before prediction. One Scalar actor; no critic or weight copy.
-            let prediction = self.policy.distribution(o)?;
+            let prediction = predict()?;
             let raw = (1..prediction.logits.len()).fold(0, |best, i| {
                 if prediction.logits[i] > prediction.logits[best] {
                     i
@@ -161,11 +198,11 @@ impl GuardedDeployment {
                     actor: o.actor,
                     observation_key: o.observation_key.clone(),
                     r#move: o.legal_actions[effective].r#move.clone(),
-                    policy_version: GUARDED_DEPLOYMENT_VERSION.into(),
+                    policy_version: guarded_policy_version.into(),
                     score: f64::from(prediction.logits[effective]),
                 },
-                raw_policy_version: self.policy.policy_version().into(),
-                deployment_checksum: self.policy.checksum().into(),
+                raw_policy_version: raw_policy_version.into(),
+                deployment_checksum: deployment_checksum.into(),
                 guard_version: GUARD_VERSION.into(),
                 projection_version: PROJECTION_VERSION.into(),
                 configuration_key: self.configuration_key.clone(),

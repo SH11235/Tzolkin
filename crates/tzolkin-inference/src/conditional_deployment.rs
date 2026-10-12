@@ -14,6 +14,7 @@ use crate::policy::{self, BorrowedPolicy, HIDDEN, NumericPolicyDistribution, PAR
 pub const DEPLOYMENT_SCHEMA: &str = "tzolkin-conditional-human-current-numeric-inference-v1";
 pub const MAX_DEPLOYMENT_BYTES: usize = 1024 * 1024;
 pub const POLICY_VERSION: &str = "conditional-human-current-mixed-scalar-v1";
+pub const GUARDED_POLICY_VERSION: &str = "numeric-conditional-human-trade-guard-v1";
 const INPUT_CONTRACT: &str =
     "conditional-human-origin-base-default-3-4p-public512-native-setup-playing-v1";
 const CHECKSUM_DOMAIN: &[u8] = b"tzolkin-conditional-human-current-numeric-inference-v1\0";
@@ -475,6 +476,9 @@ impl LoadedConditionalDeployment {
     pub fn backend(&self) -> &'static str {
         self.kernel.backend()
     }
+    pub fn policy_version(&self) -> &'static str {
+        POLICY_VERSION
+    }
     /// Checks the native observation/key/ordered-menu contract. Observations
     /// contain no market-option field, so callers still bind actual Basic and
     /// unlimited GameState provenance. Scalar cross-target bit equality is not
@@ -508,5 +512,50 @@ impl LoadedConditionalDeployment {
             policy_version: POLICY_VERSION.into(),
             score: f64::from(prediction.logits[best]),
         })
+    }
+}
+
+/// The same all-actor Trade lifecycle as native numeric deployments, with a
+/// distinct conditional identity. New games move the immutable actor once;
+/// neither this adapter nor its metadata grants learning ownership.
+pub struct GuardedConditionalDeployment {
+    policy: LoadedConditionalDeployment,
+    game: crate::deployment::guarded::GuardedGame,
+}
+impl GuardedConditionalDeployment {
+    pub fn new(
+        policy: LoadedConditionalDeployment,
+        config: crate::trade_guard::TradeGuardConfig,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            game: crate::deployment::guarded::GuardedGame::new(config)?,
+        })
+    }
+    pub fn policy(&self) -> &LoadedConditionalDeployment {
+        &self.policy
+    }
+    pub fn into_policy(self) -> LoadedConditionalDeployment {
+        self.policy
+    }
+    pub fn configuration_key(&self) -> &str {
+        self.game.configuration_key()
+    }
+    pub fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
+        self.game.on_callback(index, o)
+    }
+    pub fn choose_move(
+        &mut self,
+        index: usize,
+        o: &Observation,
+    ) -> Result<crate::deployment::GuardedDeploymentDecision, String> {
+        self.game.choose_move(
+            index,
+            o,
+            || self.policy.distribution(o),
+            self.policy.policy_version(),
+            self.policy.checksum(),
+            GUARDED_POLICY_VERSION,
+        )
     }
 }

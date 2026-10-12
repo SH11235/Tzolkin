@@ -15,7 +15,11 @@ export function controllersFor(session: Session): Controller[] {
 }
 /** The numeric NN input contract covers the basic three- and four-player game. */
 export function supportsNnCpu(state: GameState): boolean {
+  // Ordinary App/core games use the unlimited market. A foreign snapshot must
+  // not silently describe a different market rule that observations cannot show.
+  const marketLimit: unknown = Reflect.get(state, 'uxmalCornLimit');
   return (
+    (marketLimit === undefined || marketLimit === false) &&
     state.version === 1 &&
     !state.additionalBuildings &&
     state.expansion == null &&
