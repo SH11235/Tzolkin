@@ -2,7 +2,8 @@
 //! Numeric identities and external exclusions do not authenticate a producer,
 //! recreate an owner, or grant training, fresh Test, or strength authority.
 use super::conditional::{
-    ConditionalDiagnostics, ConditionalIdentity, ConditionalPolicy, GameSession,
+    ConditionalDiagnostics, ConditionalIdentity, ConditionalMixedArenaIdentity,
+    ConditionalMixedArenaPolicy, ConditionalPolicy, GameSession,
 };
 use super::{
     ArmResult, BorrowedArenaPolicy, BorrowedArenaWorkBounds, InitialConditions, PairedStatistics,
@@ -171,10 +172,14 @@ pub enum PolicyIdentity {
     ConditionalHumanHybrid {
         identity: Box<ConditionalIdentity>,
     },
+    ConditionalHumanMixedRl {
+        identity: Box<ConditionalMixedArenaIdentity>,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
     Conditional(Box<ConditionalPolicy<'a>>),
+    ConditionalMixed(Box<ConditionalMixedArenaPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
@@ -203,6 +208,9 @@ impl<'a> Role<'a> {
             Self::Conditional(policy) => PolicyIdentity::ConditionalHumanHybrid {
                 identity: Box::new(policy.identity().clone()),
             },
+            Self::ConditionalMixed(policy) => PolicyIdentity::ConditionalHumanMixedRl {
+                identity: Box::new(policy.identity().clone()),
+            },
             Self::Reactive(policy) => PolicyIdentity::Reactive {
                 provenance: policy.description.provenance.clone(),
             },
@@ -215,6 +223,7 @@ impl<'a> Role<'a> {
         match self {
             Self::Numeric(policy) => Some(&policy.identity.configuration_key),
             Self::Conditional(policy) => Some(&policy.identity().configuration_key),
+            Self::ConditionalMixed(policy) => Some(&policy.identity().configuration_key),
             _ => None,
         }
     }
@@ -365,16 +374,17 @@ fn choose(
             score: decision.score,
         }
     } else if let Some(session) = conditional_sessions.get_mut(actor).and_then(Option::as_mut) {
-        let Role::Conditional(policy) = &**roster
+        let role = &**roster
             .get(actor)
-            .ok_or("Conditional Arena actor outside roster")?
-        else {
-            return Err("Conditional Arena game session/role mismatch".into());
-        };
+            .ok_or("Conditional Arena actor outside roster")?;
         let d = diagnostics[actor].as_mut().expect("conditional diagnostic");
         d.choices_attempted += 1;
         d.candidate_rows_attempted += observation.legal_actions.len();
-        let result = session.choose_move(index, observation, policy)?;
+        let result = match role {
+            Role::Conditional(policy) => session.choose_move(index, observation, policy)?,
+            Role::ConditionalMixed(policy) => session.choose_mixed(index, observation, policy)?,
+            _ => return Err("Conditional Arena game session/role mismatch".into()),
+        };
         d.choices_returned += 1;
         d.candidate_rows_returned += observation.legal_actions.len();
         if let Some(trade) = result.trade {
@@ -403,8 +413,12 @@ fn choose(
                 .selected_action_kinds
                 .entry(kind.into())
                 .or_default() += 1;
-            conditional.outside_teacher_grammar_choices +=
-                usize::from(!policy.teacher_grammar_contains(&action.action));
+            let in_origin_grammar = match role {
+                Role::Conditional(policy) => policy.teacher_grammar_contains(&action.action),
+                Role::ConditionalMixed(policy) => policy.teacher_grammar_contains(&action.action),
+                _ => unreachable!("conditional session requires a conditional role"),
+            };
+            conditional.outside_teacher_grammar_choices += usize::from(!in_origin_grammar);
         }
         result.decision
     } else {
@@ -419,6 +433,9 @@ fn choose(
             ),
             Role::Numeric(_) => return Err("Numeric Arena missing game guard".into()),
             Role::Conditional(_) => return Err("Conditional Arena missing game session".into()),
+            Role::ConditionalMixed(_) => {
+                return Err("Conditional Arena missing game session".into());
+            }
         };
         match (roster[actor].search(), trace) {
             (Some(prepared), Some(trace)) => {
@@ -507,6 +524,7 @@ fn play_arm_using<'a>(
         .iter()
         .map(|role| match &**role {
             Role::Conditional(policy) => Some(GameSession::new(policy)),
+            Role::ConditionalMixed(policy) => Some(GameSession::new_mixed(policy)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -514,7 +532,7 @@ fn play_arm_using<'a>(
         .iter()
         .map(|role| match &**role {
             Role::Numeric(_) => Some(GuardDiagnostics::default()),
-            Role::Conditional(_) => Some(GuardDiagnostics {
+            Role::Conditional(_) | Role::ConditionalMixed(_) => Some(GuardDiagnostics {
                 conditional: Some(ConditionalDiagnostics::default()),
                 ..GuardDiagnostics::default()
             }),
@@ -626,6 +644,24 @@ pub fn run_conditional_validation<'a>(
         Role::Numeric(reference),
         opponent_pool,
         super::conditional::ARENA_SCHEMA,
+    )
+}
+
+/// Genuine updated conditional Human actor, predicting both native Setup and
+/// Playing, paired against an immutable numeric reference with the same guard.
+/// This grants no training/source qualification, Ready proof or fresh Test.
+pub fn run_conditional_mixed_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: ConditionalMixedArenaPolicy<'a>,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    run_roles(
+        config,
+        Role::ConditionalMixed(Box::new(candidate)),
+        Role::Numeric(reference),
+        opponent_pool,
+        super::conditional::MIXED_ARENA_SCHEMA,
     )
 }
 
@@ -901,5 +937,132 @@ mod tests {
         let stats = summarize(&[failed], 7);
         assert_eq!((stats.complete_blocks, stats.failed_games), (0, 2));
         assert!(stats.failures_preclude_adoption && !stats.strength_improvement_declared);
+
+        let zero = crate::conditional_human_rl_update::tests::owner();
+        assert!(ConditionalMixedArenaPolicy::new(&zero, TradeGuardConfig::default()).is_err());
+        let updated = crate::conditional_human_rl_update::tests::updated_owner();
+        let actor_bits = updated
+            .actor_parameters()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>();
+        let critic_bits = updated
+            .critic_parameters()
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>();
+        let policy =
+            ConditionalMixedArenaPolicy::new(&updated, TradeGuardConfig::default()).unwrap();
+        assert_eq!(policy.identity().current, *updated.identity());
+        assert_eq!(policy.identity().dataset, *updated.origin().dataset());
+        assert_eq!(
+            policy.identity().reservations,
+            *updated.origin().table_reservations()
+        );
+        assert!(!policy.identity().source_qualified && !policy.identity().verified_native_policy);
+        let mut mismatched_reference = synthetic_policy();
+        mismatched_reference.identity.guard.max_trades_per_episode = 1;
+        mismatched_reference.identity.configuration_key = mismatched_reference
+            .identity
+            .guard
+            .configuration_key()
+            .unwrap();
+        assert_eq!(
+            run_conditional_mixed_validation(
+                &config,
+                policy,
+                mismatched_reference,
+                (0..3)
+                    .map(|_| Opponent::ResourceCycle(
+                        super::super::resource_cycle::ResourceCycleConfig::v5()
+                    ))
+                    .collect(),
+            )
+            .err()
+            .unwrap(),
+            "Numeric Arena requires one fixed shared guard configuration"
+        );
+        let mut focal = Role::ConditionalMixed(Box::new(
+            ConditionalMixedArenaPolicy::new(&updated, TradeGuardConfig::default()).unwrap(),
+        ));
+        let identity = serde_json::to_value(focal.identity()).unwrap();
+        assert_eq!(identity["kind"], "conditionalHumanMixedRl");
+        assert_eq!(identity["identity"]["current"]["mixedUpdateCount"], 1);
+        for phase in [Phase::Setup, Phase::Playing, Phase::Playing] {
+            let (arm, diagnostics) =
+                play_arm_using(3, 0, &mut focal, &mut pool, |players, seed, decide| {
+                    let state = if phase == Phase::Setup {
+                        tzolkin_core::create_game(
+                            (0..players).map(|i| format!("Seat {i}")).collect(),
+                            seed,
+                            false,
+                        )?
+                    } else {
+                        crate::conditional_human_rl_update::tests::terminal_start(players, seed)
+                    };
+                    let o = observe(&state, state.current_player)?;
+                    assert_eq!(o.phase, phase);
+                    let prediction = updated.handle()?.distribution(&o)?;
+                    let expected = (1..prediction.logits().len()).fold(0, |best, i| {
+                        if prediction.logits()[i] > prediction.logits()[best] {
+                            i
+                        } else {
+                            best
+                        }
+                    });
+                    let decision = decide(0, &o)?;
+                    assert_eq!(decision.r#move, o.legal_actions[expected].r#move);
+                    assert_eq!(
+                        decision.policy_version,
+                        super::super::conditional::MIXED_POLICY_VERSION
+                    );
+                    Err("Injected conditional downstream failure".into())
+                });
+            assert_eq!(
+                arm.error.as_deref(),
+                Some("Injected conditional downstream failure")
+            );
+            assert!(arm.decisions.is_none() && arm.score.is_none() && arm.rank.is_none());
+            assert!(
+                diagnostics
+                    .iter()
+                    .flatten()
+                    .all(|d| d.notifications_attempted == 1
+                        && d.notifications_returned == 1
+                        && d.applied_choices.is_none())
+            );
+            let conditional = diagnostics[0]
+                .as_ref()
+                .unwrap()
+                .conditional
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                conditional.setup_choices,
+                usize::from(phase == Phase::Setup)
+            );
+            assert_eq!(
+                conditional.playing_choices,
+                usize::from(phase == Phase::Playing)
+            );
+            assert_eq!(serde_json::to_value(focal.identity()).unwrap(), identity);
+        }
+        assert_eq!(
+            updated
+                .actor_parameters()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            actor_bits
+        );
+        assert_eq!(
+            updated
+                .critic_parameters()
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            critic_bits
+        );
+        assert_eq!(updated.identity().mixed_update_count(), 1);
     }
 }

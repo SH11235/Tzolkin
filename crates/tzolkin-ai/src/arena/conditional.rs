@@ -1,9 +1,12 @@
 //! Conditional Human origin and explicit Setup/Playing composition for Dev only.
-pub use super::numeric::run_conditional_validation;
+pub use super::numeric::{run_conditional_mixed_validation, run_conditional_validation};
 use crate::Decision;
+use crate::conditional_human_rl_update::{
+    ConditionalMixedIdentity, ConditionalMixedOwner, ConditionalMixedPolicyHandle,
+};
 use crate::dataset::DatasetSplit;
 use crate::human_policy_dataset::{FACTORIZED_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE};
-use crate::human_policy_training::PreparedConditionalHumanPolicy;
+use crate::human_policy_training::{ConditionalDatasetIdentity, PreparedConditionalHumanPolicy};
 use crate::policy::HeuristicWeights;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -17,6 +20,8 @@ use tzolkin_inference::trade_guard::{
 
 pub const POLICY_VERSION: &str = "conditional-human-corn-setup-guarded-playing-v1";
 pub const ARENA_SCHEMA: &str = "tzolkin-conditional-human-policy-development-arena-v1";
+pub const MIXED_POLICY_VERSION: &str = "conditional-human-current-allphase-guarded-argmax-v1";
+pub const MIXED_ARENA_SCHEMA: &str = "tzolkin-conditional-human-mixed-development-arena-v1";
 
 /// The algorithm and weights are the existing frozen Corn-first Setup policy.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -89,6 +94,65 @@ impl<'a> ConditionalPolicy<'a> {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalMixedArenaIdentity {
+    pub policy_version: String,
+    pub input_contract: String,
+    pub origin_checksum: String,
+    pub dataset: ConditionalDatasetIdentity,
+    pub reservations: BTreeMap<String, DatasetSplit>,
+    pub current: ConditionalMixedIdentity,
+    pub backend: String,
+    pub selection: String,
+    pub guard: TradeGuardConfig,
+    pub configuration_key: String,
+    pub source_qualified: bool,
+    pub verified_native_policy: bool,
+    pub value_validity: crate::public_model::ValueValidity,
+}
+
+/// A genuine updated actor borrowed for all-phase inference, not a learning or
+/// close certificate. A journal caller obtains it only through a Ready owner;
+/// a restarted caller still needs the journal's positive-close restore boundary.
+pub struct ConditionalMixedArenaPolicy<'a> {
+    handle: ConditionalMixedPolicyHandle<'a>,
+    identity: ConditionalMixedArenaIdentity,
+}
+impl<'a> ConditionalMixedArenaPolicy<'a> {
+    pub fn new(owner: &'a ConditionalMixedOwner, guard: TradeGuardConfig) -> Result<Self, String> {
+        let handle = owner.handle()?;
+        if handle.identity().mixed_update_count() == 0 {
+            return Err("Conditional mixed Arena requires a positive update count".into());
+        }
+        let configuration_key = guard.configuration_key()?;
+        Ok(Self {
+            identity: ConditionalMixedArenaIdentity {
+                policy_version: MIXED_POLICY_VERSION.into(),
+                input_contract: crate::conditional_human_rl::INPUT_CONTRACT.into(),
+                origin_checksum: owner.origin().checksum().into(),
+                dataset: owner.origin().dataset().clone(),
+                reservations: owner.origin().table_reservations().clone(),
+                current: handle.identity().clone(),
+                backend: "scalar".into(),
+                selection: "orderedFirstMaxSetupPlaying".into(),
+                guard,
+                configuration_key,
+                source_qualified: false,
+                verified_native_policy: false,
+                value_validity: crate::public_model::ValueValidity::UnavailablePolicyOnly,
+            },
+            handle,
+        })
+    }
+    pub fn identity(&self) -> &ConditionalMixedArenaIdentity {
+        &self.identity
+    }
+    pub(super) fn teacher_grammar_contains(&self, action: &TypedAction) -> bool {
+        teacher_grammar_contains(self.identity.dataset.label_scope.as_deref(), action)
+    }
+}
+
 // Category membership is diagnostic only: it does not check observed captions,
 // an uncapped technology/pending payment, or positive coverage in actual Train rows.
 fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> bool {
@@ -136,6 +200,8 @@ pub struct ConditionalDiagnostics {
     /// v3 also Technology and positive material-only Payment categories.
     /// Counts effective choices after the guard, so guard-forced Skip is outside.
     /// Membership does not establish positive Train coverage of that category.
+    /// For a mixed RL actor this still refers to its original BC teacher grammar,
+    /// not the action categories it subsequently encountered during RL.
     pub outside_teacher_grammar_choices: usize,
 }
 
@@ -144,9 +210,23 @@ pub(super) struct ConditionalDecision {
     pub trade: Option<GuardedTradeTrace>,
 }
 
+// Keep the legacy public Setup composition separate from all-phase actor inference.
+#[derive(Clone, Copy)]
+enum SetupRoute {
+    CornFirst,
+    NumericAllPhase,
+}
+impl SetupRoute {
+    fn policy_version(self) -> &'static str {
+        match self {
+            Self::CornFirst => POLICY_VERSION,
+            Self::NumericAllPhase => MIXED_POLICY_VERSION,
+        }
+    }
+}
 /// Fresh callback ownership and bounded Trade history for one arm. Weights stay borrowed.
 pub(super) struct GameSession {
-    setup: ConditionalSetup,
+    setup: SetupRoute,
     history: TradeHistory,
     next_callback: usize,
     notified: Option<(usize, usize, bool, String)>,
@@ -159,7 +239,17 @@ impl GameSession {
         Self::with_config(policy.identity.setup, &policy.identity.guard)
             .expect("conditional constructor validated guard configuration")
     }
+    pub(super) fn new_mixed(policy: &ConditionalMixedArenaPolicy<'_>) -> Self {
+        Self::with_route(SetupRoute::NumericAllPhase, &policy.identity.guard)
+            .expect("conditional mixed constructor validated guard configuration")
+    }
     fn with_config(setup: ConditionalSetup, guard: &TradeGuardConfig) -> Result<Self, String> {
+        let route = match setup {
+            ConditionalSetup::CornFirst => SetupRoute::CornFirst,
+        };
+        Self::with_route(route, guard)
+    }
+    fn with_route(setup: SetupRoute, guard: &TradeGuardConfig) -> Result<Self, String> {
         guard.configuration_key()?;
         Ok(Self {
             setup,
@@ -214,6 +304,14 @@ impl GameSession {
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.prepared.distribution(o))
     }
+    pub(super) fn choose_mixed(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &ConditionalMixedArenaPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.handle.numeric_distribution(o))
+    }
     fn choose_using(
         &mut self,
         index: usize,
@@ -237,15 +335,11 @@ impl GameSession {
                 return Err("Conditional choice requires one current callback".into());
             }
             let (raw, scores) = match o.phase {
-                Phase::Setup => {
-                    let decision = match self.setup {
-                        ConditionalSetup::CornFirst => {
-                            crate::setup_policy::choose_move_with_weights(
-                                o,
-                                &HeuristicWeights::default(),
-                            )?
-                        }
-                    };
+                Phase::Setup if matches!(self.setup, SetupRoute::CornFirst) => {
+                    let decision = crate::setup_policy::choose_move_with_weights(
+                        o,
+                        &HeuristicWeights::default(),
+                    )?;
                     let index = o
                         .legal_actions
                         .iter()
@@ -253,7 +347,7 @@ impl GameSession {
                         .ok_or("Conditional Setup choice is not legal")?;
                     (index, vec![decision.score; o.legal_actions.len()])
                 }
-                Phase::Playing => {
+                Phase::Setup | Phase::Playing => {
                     let prediction = predict(o)?;
                     if prediction.logits.len() != o.legal_actions.len()
                         || prediction.probabilities.len() != o.legal_actions.len()
@@ -311,7 +405,7 @@ impl GameSession {
                     actor: o.actor,
                     observation_key: o.observation_key.clone(),
                     r#move: o.legal_actions[effective].r#move.clone(),
-                    policy_version: POLICY_VERSION.into(),
+                    policy_version: self.setup.policy_version().into(),
                     score: scores[effective],
                 },
                 trade,
@@ -460,6 +554,33 @@ mod tests {
                 .r#move
         );
         assert_eq!(selected.policy_version, POLICY_VERSION);
+        let corn_index = o
+            .legal_actions
+            .iter()
+            .position(|a| a.r#move == selected.r#move)
+            .unwrap();
+        assert!(o.legal_actions.len() > 1);
+        let target = (corn_index + 1) % o.legal_actions.len();
+        let mut numeric =
+            GameSession::with_route(SetupRoute::NumericAllPhase, &TradeGuardConfig::default())
+                .unwrap();
+        numeric.on_callback(0, &o).unwrap();
+        let mixed = numeric
+            .choose_using(0, &o, |o| {
+                let mut logits = vec![0.; o.legal_actions.len()];
+                logits[target] = 1.;
+                let mut probabilities = vec![0.; o.legal_actions.len()];
+                probabilities[target] = 1.;
+                Ok(NumericPolicyDistribution {
+                    logits,
+                    probabilities,
+                })
+            })
+            .unwrap()
+            .decision;
+        assert_eq!(mixed.r#move, o.legal_actions[target].r#move);
+        assert_eq!(mixed.policy_version, MIXED_POLICY_VERSION);
+        assert!(numeric.choose_using(0, &o, |_| unreachable!()).is_err());
         assert!(game.choose_using(0, &o, |_| unreachable!()).is_err());
         assert!(game.on_callback(1, &o).is_err());
         let mut stale = session();

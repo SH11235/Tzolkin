@@ -560,17 +560,23 @@ impl ConditionalMixedPolicyHandle<'_> {
         &self,
         observation: &Observation,
     ) -> Result<ConditionalMixedDistribution, String> {
-        validate_contract(observation)?;
-        let encoder = FeatureEncoder::new_public(observation)?;
-        let rows = (0..observation.legal_actions.len())
-            .map(|i| encoder.encode_legal_tagged(i))
-            .collect::<Result<Vec<_>, _>>()?;
-        let numeric = predict_numeric(&self.owner.actor, self.kernel, &rows)?;
+        let numeric = self.numeric_distribution(observation)?;
         Ok(ConditionalMixedDistribution {
             identity: self.owner.identity.clone(),
             logits: numeric.logits,
             probabilities: numeric.probabilities,
         })
+    }
+    pub(crate) fn numeric_distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<tzolkin_inference::policy::NumericPolicyDistribution, String> {
+        validate_contract(observation)?;
+        let encoder = FeatureEncoder::new_public(observation)?;
+        let rows = (0..observation.legal_actions.len())
+            .map(|i| encoder.encode_legal_tagged(i))
+            .collect::<Result<Vec<_>, _>>()?;
+        predict_numeric(&self.owner.actor, self.kernel, &rows)
     }
 }
 pub struct ConditionalMixedDistribution {
@@ -1516,6 +1522,26 @@ pub(crate) mod tests {
         assert!(ConditionalRlOwner::from_prepared(&prepared, 11, SamplingSeed::new(17)).is_err());
         ConditionalMixedOwner::from_count_zero(ConditionalRlOwner::synthetic(&prepared).unwrap())
             .unwrap()
+    }
+    pub(crate) fn updated_owner() -> ConditionalMixedOwner {
+        let files = Files(temp_root::create("conditional-arena-owner").unwrap());
+        let mut session = ConditionalMixedSession::new(owner(), external(&files)).unwrap();
+        let pool = ConditionalFrozenPool::from_json(&serde_json::to_vec(&pool()).unwrap()).unwrap();
+        let plan = session
+            .plan(
+                seeds(),
+                &pool,
+                None,
+                CollectionLimits::new(64, 262144, 8 * 1024 * 1024, 1024 * 1024).unwrap(),
+                OneStepConfig::default(),
+                ResidualFitConfig::new(0.001, 0.01, 16_000).unwrap(),
+            )
+            .unwrap();
+        session.reserve(&plan).unwrap();
+        let staged = test_short_stage(&session, &plan, &pool, true, None).unwrap();
+        assert!(session.admit(staged).unwrap().artifact().is_some());
+        assert_eq!(session.owner.identity().mixed_update_count(), 1);
+        session.owner
     }
     fn seeds() -> [u32; 4] {
         (0..32)
