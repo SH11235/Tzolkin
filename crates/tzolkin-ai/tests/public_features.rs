@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use tzolkin_ai::features::{
     FEATURE_COUNT, FEATURE_SCHEMA, FeatureEncoder, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA,
+    SEMANTIC_SETUP_FEATURE_SCHEMA, SETUP_PAIR_FEATURE_COUNT, SETUP_PAIR_FEATURE_START,
     encode_public_action,
 };
 use tzolkin_ai::model::ModelArtifact;
@@ -239,4 +240,123 @@ fn public_encoding_rejects_unknown_schemas_bad_keys_and_oversized_inputs() {
     let encoder = FeatureEncoder::new_public(&o).unwrap();
     assert!(encoder.encode_legal_tagged(o.legal_actions.len()).is_err());
     assert!(encode_public_action(&o, &TypedAction::Rotate { days: 99 }).is_err());
+}
+
+fn setup_offer(count: usize, pair: [&str; 2]) -> Observation {
+    let mut state = create_game((0..count).map(|i| format!("P{i}")).collect(), 42, false).unwrap();
+    state.players[state.current_player].wealth_offer =
+        [pair[0], pair[1], "w04", "w21"].map(String::from).into();
+    observe(&state, state.current_player).unwrap()
+}
+
+fn feature_bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
+}
+
+#[test]
+fn semantic_setup_pair_quantities_preserve_context_and_candidate_hash() {
+    // Resource order: corn/wood/stone/gold/skull, worker/feed, four technologies,
+    // then Chaac/Quetzalcoatl/Kukulkan. These expectations describe catalog gains.
+    let cases = [
+        (["w14", "w15"], [3, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0]),
+        (["w17", "w03"], [4, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
+        (["w01", "w03"], [3, 0, 1, 1, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0]),
+        (["w05", "w07"], [4, 2, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1]),
+        (["w09", "w11"], [5, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 1, 0, 0]),
+        (["w18", "w20"], [7, 2, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0]),
+    ];
+    for count in [3, 4] {
+        for (pair, expected) in cases {
+            for order in [pair, [pair[1], pair[0]]] {
+                let o = setup_offer(count, order);
+                let old = FeatureEncoder::new_public(&o).unwrap();
+                let new = FeatureEncoder::new_semantic_setup(&o).unwrap();
+                assert_eq!(new.feature_schema(), SEMANTIC_SETUP_FEATURE_SCHEMA);
+                for index in 0..o.legal_actions.len() {
+                    let old_row = old.encode_legal_tagged(index).unwrap();
+                    let new_row = new.encode_legal_tagged(index).unwrap();
+                    let before = old_row.values_for_schema(PUBLIC_FEATURE_SCHEMA).unwrap();
+                    let after = new_row
+                        .values_for_schema(SEMANTIC_SETUP_FEATURE_SCHEMA)
+                        .unwrap();
+                    assert_eq!(
+                        feature_bits(&before[..SETUP_PAIR_FEATURE_START]),
+                        feature_bits(&after[..SETUP_PAIR_FEATURE_START])
+                    );
+                    let end = SETUP_PAIR_FEATURE_START + SETUP_PAIR_FEATURE_COUNT;
+                    assert_eq!(feature_bits(&before[end..]), feature_bits(&after[end..]));
+                    if index == 0 {
+                        assert_eq!(
+                            feature_bits(&after[SETUP_PAIR_FEATURE_START..end]),
+                            feature_bits(&expected.map(|quantity| quantity as f32))
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_playing_keeps_schema_two_bits_and_existing_admission_closed() {
+    for count in [3, 4] {
+        let state = started(count);
+        let o = observe(&state, state.current_player).unwrap();
+        let old = FeatureEncoder::new_public(&o).unwrap();
+        let new = FeatureEncoder::new_semantic_setup(&o).unwrap();
+        for index in 0..o.legal_actions.len() {
+            let before = old.encode_legal_tagged(index).unwrap();
+            let after = new.encode_legal_tagged(index).unwrap();
+            assert_eq!(
+                feature_bits(before.values_for_schema(PUBLIC_FEATURE_SCHEMA).unwrap()),
+                feature_bits(
+                    after
+                        .values_for_schema(SEMANTIC_SETUP_FEATURE_SCHEMA)
+                        .unwrap()
+                )
+            );
+            assert!(tzolkin_inference::policy::validated_values(&after).is_err());
+            assert!(after.values_for_schema(PUBLIC_FEATURE_SCHEMA).is_err());
+        }
+        assert!(new.encode_legal(0).is_err());
+        assert!(new.public_state_prefix().is_err());
+        assert!(FeatureEncoder::new_with_schema(&o, SEMANTIC_SETUP_FEATURE_SCHEMA).is_err());
+    }
+}
+
+#[test]
+fn semantic_setup_refuses_other_contracts_and_non_pair_inputs() {
+    for count in [2, 5] {
+        let o = setup_offer(count, ["w14", "w15"]);
+        assert!(FeatureEncoder::new_public(&o).is_ok());
+        assert!(FeatureEncoder::new_semantic_setup(&o).is_err());
+    }
+    let original = setup_offer(3, ["w14", "w15"]);
+    let mut unknown_offer = original.clone();
+    unknown_offer.private.wealth_offer[0] = "unknown".into();
+    rekey(&mut unknown_offer);
+    assert!(FeatureEncoder::new_semantic_setup(&unknown_offer).is_err());
+    let mut bad_key = original.clone();
+    bad_key.observation_key = "forged".into();
+    assert!(FeatureEncoder::new_semantic_setup(&bad_key).is_err());
+    let mut expansion = original.clone();
+    expansion.additional_buildings = true;
+    rekey(&mut expansion);
+    assert!(FeatureEncoder::new_semantic_setup(&expansion).is_err());
+    for ids in [
+        vec!["w14".into()],
+        vec!["w14".into(), "w14".into()],
+        vec!["w14".into(), "w01".into()],
+        vec!["w14".into(), "unknown".into()],
+    ] {
+        let mut o = original.clone();
+        o.legal_actions[0].action = TypedAction::ChooseWealth { ids };
+        rekey(&mut o);
+        assert!(
+            FeatureEncoder::new_semantic_setup(&o)
+                .unwrap()
+                .encode_legal_tagged(0)
+                .is_err()
+        );
+    }
 }

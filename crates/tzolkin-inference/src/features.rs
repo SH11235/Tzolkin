@@ -9,8 +9,15 @@ use tzolkin_core::*;
 
 pub const FEATURE_SCHEMA: u32 = 1;
 pub const PUBLIC_FEATURE_SCHEMA: u32 = 2;
+/// Opt-in base 3-4p Setup semantics; existing dataset/model contracts remain schema 2.
+pub const SEMANTIC_SETUP_FEATURE_SCHEMA: u32 = 3;
 pub const FEATURE_COUNT: usize = 512;
 pub const MAX_LEGAL_ACTIONS: usize = 4096;
+/// Schema 3, ChooseWealth only: raw pair resources (RESOURCE_IDS order), worker,
+/// fed workers, technologies (TECHNOLOGY_IDS order), then temples (TEMPLE_IDS order).
+/// These columns retain their schema-2 meanings for every other action.
+pub const SETUP_PAIR_FEATURE_START: usize = 480;
+pub const SETUP_PAIR_FEATURE_COUNT: usize = 14;
 const STATE_HASH_START: usize = 264;
 const STATE_HASH_END: usize = 384;
 const ACTION_START: usize = 384;
@@ -158,6 +165,15 @@ impl<'a> FeatureEncoder<'a> {
     pub fn new_public(observation: &'a Observation) -> Result<Self, String> {
         Self::new_with_schema(observation, PUBLIC_FEATURE_SCHEMA)
     }
+    /// Explicit schema-3 numeric encoding, without dataset/model/source admission.
+    /// The schema-2 context and every Playing value are retained bit for bit.
+    /// The old constructors, including new_with_schema, still accept only 1/2.
+    pub fn new_semantic_setup(observation: &'a Observation) -> Result<Self, String> {
+        crate::policy::validate_contract(observation)?;
+        let mut encoder = Self::new_public(observation)?;
+        encoder.feature_schema = SEMANTIC_SETUP_FEATURE_SCHEMA;
+        Ok(encoder)
+    }
     pub fn new_with_schema(observation: &'a Observation, schema: u32) -> Result<Self, String> {
         if ![FEATURE_SCHEMA, PUBLIC_FEATURE_SCHEMA].contains(&schema) {
             return Err("Unsupported feature schema".into());
@@ -216,9 +232,72 @@ impl<'a> FeatureEncoder<'a> {
             .get(index)
             .ok_or("Invalid legal feature index")?
             .action;
-        candidate_features(self.observation, action, self.context)
+        let mut values = candidate_features(self.observation, action, self.context)?;
+        if self.feature_schema == SEMANTIC_SETUP_FEATURE_SCHEMA
+            && let TypedAction::ChooseWealth { ids } = action
+        {
+            if self.observation.phase != Phase::Setup
+                || ids.len() != 2
+                || ids[0] == ids[1]
+                || ids
+                    .iter()
+                    .any(|id| !self.observation.private.wealth_offer.contains(id))
+            {
+                return Err("Semantic Setup requires two distinct offered wealth IDs".into());
+            }
+            let tiles = [
+                tzolkin_core::catalog::wealth(&ids[0]).ok_or("Unknown Setup wealth ID")?,
+                tzolkin_core::catalog::wealth(&ids[1]).ok_or("Unknown Setup wealth ID")?,
+            ];
+            let pair = setup_pair_quantities(tiles)?;
+            values[SETUP_PAIR_FEATURE_START..SETUP_PAIR_FEATURE_START + SETUP_PAIR_FEATURE_COUNT]
+                .copy_from_slice(&pair);
+        }
+        Ok(values)
     }
 }
+
+fn setup_pair_quantities(
+    tiles: [&StartingWealth; 2],
+) -> Result<[f32; SETUP_PAIR_FEATURE_COUNT], String> {
+    let mut quantities = [0i64; SETUP_PAIR_FEATURE_COUNT];
+    for tile in tiles {
+        for (resource, amount) in &tile.resources {
+            add_setup_quantity(&mut quantities[resource_index(*resource)], *amount)?;
+        }
+        for effect in &tile.effects {
+            let (index, amount) = match effect {
+                Effect::Worker => (5, 1),
+                Effect::Feed {
+                    workers: FeedWorkers::Count(count),
+                } => (6, *count),
+                Effect::Technology {
+                    technology: Target::Specific(technology),
+                    steps,
+                } => (7 + technology_index(*technology), steps.unwrap_or(1)),
+                Effect::Temple {
+                    temple: Target::Specific(temple),
+                    steps,
+                } => (11 + temple_index(*temple), steps.unwrap_or(1)),
+                _ => return Err("Unsupported semantic Setup wealth effect".into()),
+            };
+            add_setup_quantity(&mut quantities[index], amount)?;
+        }
+    }
+    // These quantities come only from two immutable bundled catalog tiles.
+    Ok(quantities.map(|quantity| quantity as f32))
+}
+
+fn add_setup_quantity(total: &mut i64, amount: i64) -> Result<(), String> {
+    if amount < 0 {
+        return Err("Negative semantic Setup quantity".into());
+    }
+    *total = total
+        .checked_add(amount)
+        .ok_or("Semantic Setup quantity overflow")?;
+    Ok(())
+}
+
 fn observation_features(o: &Observation, schema: u32) -> Result<[f32; FEATURE_COUNT], String> {
     let n = o.players.len();
     if o.schema != OBSERVATION_SCHEMA
@@ -701,4 +780,28 @@ fn technology_index(v: TechnologyId) -> usize {
 }
 fn temple_index(v: TempleId) -> usize {
     TEMPLE_IDS.iter().position(|x| *x == v).unwrap()
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_setup_refuses_unrepresented_catalog_effects() {
+        let known = tzolkin_core::catalog::wealth("w01").unwrap();
+        let mut changed = known.clone();
+        for effect in [
+            Effect::Trade,
+            Effect::Feed {
+                workers: FeedWorkers::All(AllWorkers::All),
+            },
+            Effect::Technology {
+                technology: Target::Any(Any::Any),
+                steps: Some(1),
+            },
+        ] {
+            changed.effects = vec![effect];
+            assert!(setup_pair_quantities([known, &changed]).is_err());
+        }
+    }
 }
