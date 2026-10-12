@@ -175,34 +175,17 @@ fn complete_native_three_and_four_players_roundtrip_all_ordered_rows_and_null_ta
     let legacy_dir = temp.0.join("legacy");
     dataset::export_dataset(&[basic(3).clone()], &legacy_dir).unwrap();
     assert!(load_policy_dataset(&legacy_dir).is_err());
-    resource_cycle_v5_teacher_roundtrip_and_closed_admission();
+    resource_cycle_v5_teacher_roundtrip_and_closed_admission(&loaded);
 }
 
-fn resource_cycle_v5_teacher_roundtrip_and_closed_admission() {
+fn resource_cycle_v5_teacher_roundtrip_and_closed_admission(
+    native: &policy_dataset::ValidatedPolicyDataset,
+) {
     use tzolkin_ai::arena::resource_cycle::{self, ResourceCycleConfig};
     use tzolkin_ai::replay::SeatPolicy;
     let temp = Temp::new();
     let configuration = ResourceCycleConfig::v5();
-    let records = [3, 4].map(|players| {
-        replay::play_game_using_fast(
-            players,
-            42,
-            GameOptions::default(),
-            true,
-            ReplaySource::PolicySelfPlay {
-                policies: vec![
-                    SeatPolicy::ResourceCycle {
-                        configuration: configuration.clone(),
-                    };
-                    players
-                ],
-            },
-            |o| resource_cycle::choose_move(o, &configuration),
-        )
-        .unwrap()
-        .2
-        .unwrap()
-    });
+    let records = [3, 4].map(|players| resource_cycle_v5_record(players, 42));
     let sources = records
         .iter()
         .enumerate()
@@ -255,6 +238,20 @@ fn resource_cycle_v5_teacher_roundtrip_and_closed_admission() {
             .is_err()
     );
 
+    use tzolkin_ai::policy_training::PolicyBcConfig;
+    use tzolkin_ai::resource_cycle_teacher_training as teacher;
+    let config = PolicyBcConfig {
+        epochs: 2,
+        batch_size: 256,
+        learning_rate: 0.001,
+        seed: 7,
+    };
+    assert!(teacher::train_dataset(native, &config, None).is_err());
+    assert!(
+        teacher::train_dataset(&dataset, &config, None)
+            .unwrap_err()
+            .contains("train and validation")
+    );
     // A complete legal game cannot become v5 demonstrations by relabeling its header.
     let mut relabeled = basic(3).clone();
     relabeled.header.source = records[0].header.source.clone();
@@ -318,6 +315,149 @@ fn resource_cycle_v5_teacher_roundtrip_and_closed_admission() {
     lines[0]["candidates"][0]["values"][0] = Value::from(0.99);
     rewrite_lines(&temp.dataset(), &mut forged, &lines);
     assert!(load_resource_cycle_v5_teacher_dataset(&temp.dataset()).is_err());
+}
+
+fn resource_cycle_v5_record(players: usize, seed: u32) -> GameReplay {
+    use tzolkin_ai::arena::resource_cycle::{self, ResourceCycleConfig};
+    use tzolkin_ai::replay::SeatPolicy;
+    let configuration = ResourceCycleConfig::v5();
+    replay::play_game_using_fast(
+        players,
+        seed,
+        GameOptions::default(),
+        true,
+        ReplaySource::PolicySelfPlay {
+            policies: vec![
+                SeatPolicy::ResourceCycle {
+                    configuration: configuration.clone(),
+                };
+                players
+            ],
+        },
+        |o| resource_cycle::choose_move(o, &configuration),
+    )
+    .unwrap()
+    .2
+    .unwrap()
+}
+
+#[test]
+#[ignore = "Runs policy training and full source audits; execute locally when the teacher trainer changes."]
+fn resource_cycle_v5_teacher_training_resume_and_source_contract() {
+    use tzolkin_ai::arena::resource_cycle::ResourceCycleConfig;
+    use tzolkin_ai::policy_training::{PolicyBcConfig, PolicyTrainingCheckpoint};
+    use tzolkin_ai::resource_cycle_teacher_training::{self as teacher, TeacherTrainingCheckpoint};
+    let temp = Temp::new();
+    let records = [3, 4].map(|players| resource_cycle_v5_record(players, 42));
+    let sources = records
+        .iter()
+        .enumerate()
+        .map(|(i, record)| temp.source(&format!("teacher-{i}.json"), record))
+        .collect::<Vec<_>>();
+    let manifest = export_resource_cycle_v5_teacher_files(&sources, &temp.dataset()).unwrap();
+    let config = PolicyBcConfig {
+        epochs: 2,
+        batch_size: 256,
+        learning_rate: 0.001,
+        seed: 7,
+    };
+    assert_eq!(manifest.games[0].split, DatasetSplit::Train);
+    assert_eq!(
+        dataset::split_for_family(&dataset::seed_family_id(10005)).unwrap(),
+        DatasetSplit::Validation
+    );
+    let validation = resource_cycle_v5_record(3, 10005);
+    let mut training_sources = sources.clone();
+    training_sources.push(temp.source("teacher-validation.json", &validation));
+    let training_directory = temp.0.join("teacher-training-dataset");
+    let training_manifest =
+        export_resource_cycle_v5_teacher_files(&training_sources, &training_directory).unwrap();
+    let training = load_resource_cycle_v5_teacher_dataset(&training_directory).unwrap();
+    let continuous = teacher::train_dataset(&training, &config, None).unwrap();
+    let first = teacher::train_dataset(
+        &training,
+        &PolicyBcConfig {
+            epochs: 1,
+            ..config.clone()
+        },
+        None,
+    )
+    .unwrap();
+    let resumed = teacher::train_dataset(&training, &config, Some(&first.checkpoint)).unwrap();
+    assert_eq!(continuous, resumed);
+    assert_eq!(
+        serde_json::to_vec(&continuous).unwrap(),
+        serde_json::to_vec(&resumed).unwrap()
+    );
+    assert_eq!(
+        teacher::train_dataset(&training, &config, Some(&resumed.checkpoint)).unwrap(),
+        resumed
+    );
+    teacher::validate_checkpoint_dataset(&training, &resumed.checkpoint).unwrap();
+    assert_eq!(resumed.checkpoint.dataset.families.len(), 2);
+    assert_eq!(resumed.checkpoint.dataset.dataset.samples[2], 0);
+    assert!(!resumed.metrics.strength_measured);
+    assert_eq!(resumed.metrics.final_train.value_samples, 0);
+    assert_eq!(resumed.metrics.final_validation.value_loss, ());
+    assert_eq!(
+        teacher::evaluate_dataset(&training, &resumed.checkpoint, DatasetSplit::Validation)
+            .unwrap(),
+        resumed.metrics.final_validation
+    );
+    assert!(teacher::evaluate_dataset(&training, &resumed.checkpoint, DatasetSplit::Test).is_err());
+    assert!(tzolkin_ai::policy_training::train_dataset(&training, &config, None).is_err());
+    let bytes = serde_json::to_vec(&resumed.checkpoint).unwrap();
+    assert!(serde_json::from_slice::<PolicyTrainingCheckpoint>(&bytes).is_err());
+    assert!(serde_json::from_slice::<PublicPolicyArtifact>(&bytes).is_err());
+    let output = temp.0.join("teacher-checkpoint");
+    resumed.save_new_directory(&output).unwrap();
+    assert_eq!(
+        TeacherTrainingCheckpoint::load(&output.join("checkpoint.json")).unwrap(),
+        resumed.checkpoint
+    );
+    assert!(!output.join("model.json").exists());
+    assert!(resumed.save_new_directory(&output).is_err());
+    for field in ["teacher", "sourceKind", "family", "policyId"] {
+        let mut bad = resumed.checkpoint.clone();
+        match field {
+            "teacher" => bad.teacher = ResourceCycleConfig::default(),
+            "sourceKind" => bad.source_kind = "verifiedNativePolicy".into(),
+            "family" => bad.dataset.families.pop().map(|_| ()).unwrap(),
+            "policyId" => bad.dataset.dataset.strata[0].policy_id = "0".repeat(64),
+            _ => unreachable!(),
+        }
+        bad.checksum.clear();
+        bad.checksum = hash(&serde_json::to_vec(&bad).unwrap());
+        assert!(bad.validate().is_err());
+        assert!(teacher::train_dataset(&training, &config, Some(&bad)).is_err());
+    }
+    assert!(
+        teacher::train_dataset(
+            &training,
+            &PolicyBcConfig {
+                seed: 8,
+                ..config.clone()
+            },
+            Some(&resumed.checkpoint)
+        )
+        .is_err()
+    );
+    assert!(
+        teacher::train_dataset(
+            &training,
+            &PolicyBcConfig {
+                epochs: 1,
+                ..config
+            },
+            Some(&resumed.checkpoint)
+        )
+        .is_err()
+    );
+    let training_source = training_directory.join(&training_manifest.games[0].source_file);
+    let original_training_source = fs::read(&training_source).unwrap();
+    fs::write(&training_source, b"{}").unwrap();
+    assert!(teacher::validate_checkpoint_dataset(&training, &resumed.checkpoint).is_err());
+    fs::write(training_source, original_training_source).unwrap();
 }
 
 #[test]

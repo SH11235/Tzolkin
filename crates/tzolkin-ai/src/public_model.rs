@@ -47,6 +47,21 @@ impl PublicPolicyModel {
     }
 }
 
+/// Shared numerical initialization; carries no source or training identity.
+pub(crate) fn initialized_model(seed: u64) -> PublicPolicyModel {
+    let mut random = Random { state: seed };
+    let mut parameters = vec![0.0; PARAMETER_COUNT];
+    let input_scale = (6.0 / (FEATURE_COUNT + HIDDEN) as f32).sqrt();
+    for value in &mut parameters[..B1] {
+        *value = (random.unit() * 2.0 - 1.0) * input_scale;
+    }
+    let policy_scale = (6.0 / (HIDDEN + 1) as f32).sqrt();
+    for value in &mut parameters[WP..BP] {
+        *value = (random.unit() * 2.0 - 1.0) * policy_scale;
+    }
+    PublicPolicyModel { parameters }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PublicPolicyArtifact {
@@ -71,16 +86,6 @@ pub struct PublicPolicyArtifact {
 impl PublicPolicyArtifact {
     /// An initialized, untrained policy. This constructor does not train BC.
     pub fn new(seed: u64) -> Result<Self, String> {
-        let mut random = Random { state: seed };
-        let mut parameters = vec![0.0; PARAMETER_COUNT];
-        let input_scale = (6.0 / (FEATURE_COUNT + HIDDEN) as f32).sqrt();
-        for value in &mut parameters[..B1] {
-            *value = (random.unit() * 2.0 - 1.0) * input_scale;
-        }
-        let policy_scale = (6.0 / (HIDDEN + 1) as f32).sqrt();
-        for value in &mut parameters[WP..BP] {
-            *value = (random.unit() * 2.0 - 1.0) * policy_scale;
-        }
         let mut artifact = Self {
             schema: MODEL_SCHEMA.into(),
             model_version: MODEL_VERSION.into(),
@@ -97,7 +102,7 @@ impl PublicPolicyArtifact {
             observation_schema: OBSERVATION_SCHEMA,
             move_schema: MOVE_SCHEMA,
             catalog_hash: crate::replay::catalog_hash(),
-            model: PublicPolicyModel { parameters },
+            model: initialized_model(seed),
             checksum: String::new(),
         };
         artifact.checksum = artifact.expected_checksum()?;

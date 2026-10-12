@@ -63,6 +63,7 @@ pub mod public_stochastic_native;
 pub mod public_stochastic_record;
 pub mod public_trade_guard;
 pub mod replay;
+pub mod resource_cycle_teacher_training;
 pub mod search;
 pub mod search_native;
 pub mod selfplay_batch;
