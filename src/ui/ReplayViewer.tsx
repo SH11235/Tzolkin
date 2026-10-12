@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { loadPublicReplay, type PublicReplayReport } from '../game/publicReplay';
+import {
+  loadPublicReplay,
+  MAX_REPLAY_FILE_BYTES,
+  type PublicReplayReport,
+} from '../game/publicReplay';
 import { chooseCpu, type CpuDecision } from '../game/cpu';
 import { GameBoardView, type View } from './GameBoardView';
 import { PlayersSidebar } from './PlayersSidebar';
@@ -21,6 +25,8 @@ export function ReplayViewer({ onClose }: { onClose: () => void }) {
   const [view, setView] = useState<View>('board');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [pasteOpen, setPasteOpen] = useState(false);
+  const [replayText, setReplayText] = useState('');
   const [cpuBusy, setCpuBusy] = useState(false);
   const [cpuError, setCpuError] = useState('');
   const [cpuCandidate, setCpuCandidate] = useState<{ decision: CpuDecision; label: string } | null>(
@@ -57,7 +63,7 @@ export function ReplayViewer({ onClose }: { onClose: () => void }) {
     onClose();
   }
 
-  async function importReplay(file?: File) {
+  async function importReplay(file?: File, pasted = false) {
     if (!file) return;
     cancelCpu();
     const token = ++generation.current;
@@ -70,6 +76,10 @@ export function ReplayViewer({ onClose }: { onClose: () => void }) {
       setFilename(file.name);
       setPosition(0);
       setView('board');
+      if (pasted) {
+        setReplayText('');
+        setPasteOpen(false);
+      }
     } catch (failure) {
       if (token !== generation.current) return;
       setError(failure instanceof Error ? failure.message : 'リプレイを読み込めませんでした。');
@@ -129,6 +139,14 @@ export function ReplayViewer({ onClose }: { onClose: () => void }) {
           <button disabled={busy} onClick={() => input.current?.click()}>
             {report ? '別のリプレイを読み込む' : '公開リプレイを読み込む'}
           </button>
+          <button
+            disabled={busy}
+            aria-expanded={pasteOpen}
+            aria-controls="replay-paste"
+            onClick={() => setPasteOpen((open) => !open)}
+          >
+            JSONを貼り付ける
+          </button>
           <button onClick={close}>対局画面に戻る</button>
         </div>
       </header>
@@ -142,6 +160,31 @@ export function ReplayViewer({ onClose }: { onClose: () => void }) {
         disabled={busy}
         onChange={(event) => void importReplay(event.target.files?.[0])}
       />
+      {pasteOpen && (
+        <section id="replay-paste" className="replay-paste" aria-label="リプレイJSONの貼り付け">
+          <label htmlFor="replay-paste-text">リプレイJSON（上限10MB）</label>
+          <textarea
+            id="replay-paste-text"
+            rows={6}
+            value={replayText}
+            maxLength={MAX_REPLAY_FILE_BYTES}
+            disabled={busy}
+            spellCheck={false}
+            onChange={(event) => setReplayText(event.target.value)}
+          />
+          <button
+            disabled={busy || !replayText.trim()}
+            onClick={() =>
+              void importReplay(
+                new File([replayText], '貼り付けたリプレイ.json', { type: 'application/json' }),
+                true,
+              )
+            }
+          >
+            検証して読み込む
+          </button>
+        </section>
+      )}
       {error && (
         <p className="error-message replay-error" role="alert">
           {error}
