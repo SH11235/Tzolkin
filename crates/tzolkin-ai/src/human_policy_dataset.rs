@@ -1015,6 +1015,77 @@ struct CornBegEvidence {
     temple_chosen: usize,
 }
 
+// The decoder may attach the prior player's turn boundary to this visible
+// operation. It is context only: it must be immediately before the observed
+// pair, uniquely legal, and have exactly the supported derived audit fields.
+fn preceding_derived_beg_boundary(
+    index: usize,
+    sources: &Sources,
+    report: &PublicReplayReport,
+    audit: &[Value],
+) -> Result<bool, String> {
+    let Some(previous_index) = index.checked_sub(1) else {
+        return Ok(false);
+    };
+    let current = &sources.record.steps[index];
+    let previous = &sources.record.steps[previous_index];
+    if previous.actor == current.actor
+        || previous.source_action_ids != current.source_action_ids
+        || previous.refills != Default::default()
+        || report.frames[index].snapshot.state.current_player != current.actor
+    {
+        return Ok(false);
+    }
+    let inspection = inspect_public(&report.frames[previous_index].snapshot.state)?;
+    let Some(observation) = inspection.observation else {
+        return Ok(false);
+    };
+    let matches: Vec<_> = observation
+        .legal_actions
+        .iter()
+        .filter(|row| row.r#move == previous.r#move)
+        .collect();
+    if observation.actor != previous.actor
+        || observation.phase != Phase::Playing
+        || matches.len() != 1
+        || !matches!(
+            matches[0].action,
+            TypedAction::EndTurn {
+                double_advance: None
+            }
+        )
+    {
+        return Ok(false);
+    }
+    let action = serde_json::to_value(&matches[0].action).map_err(|e| e.to_string())?;
+    let entries: Vec<_> = audit
+        .iter()
+        .filter(|entry| {
+            entry["step"].as_u64() == Some(index as u64)
+                && entry["actionId"].as_u64() == Some(current.source_action_ids[0])
+                && entry["actor"].as_u64() == Some(previous.actor as u64)
+                && entry["action"] == action
+        })
+        .collect();
+    Ok(entries.len() == 1
+        && entries[0]["derivedFromVisibleBoundary"] == true
+        && entries[0]["equivalentChoices"].as_u64() == Some(1)
+        && entries[0].as_object().is_some_and(|object| {
+            object.len() == 6
+                && object.keys().all(|key| {
+                    matches!(
+                        key.as_str(),
+                        "step"
+                            | "actionId"
+                            | "actor"
+                            | "action"
+                            | "derivedFromVisibleBoundary"
+                            | "equivalentChoices"
+                    )
+                })
+        }))
+}
+
 // One visible caption selects both the request and its negative-faith choice.
 // Admission requires both consecutive, audited core moves; neither row may be
 // inferred independently from a resource change or a later checkpoint.
@@ -1030,21 +1101,27 @@ fn corn_beg_evidence(
         return Ok(None);
     };
     let source_id = step.source_action_ids[0];
+    let uses: Vec<_> = record
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| step.source_action_ids.contains(&source_id))
+        .map(|(index, _)| index)
+        .collect();
+    let audit_uses = audit
+        .iter()
+        .filter(|entry| entry["actionId"].as_u64() == Some(source_id))
+        .count();
+    let source_pair_only = uses == [index, index + 1] && audit_uses == 2;
+    let supported_prior_boundary = index > 0
+        && uses == [index - 1, index, index + 1]
+        && audit_uses == 3
+        && preceding_derived_beg_boundary(index, sources, report, audit)?;
     if next.actor != step.actor
         || next.source_action_ids != step.source_action_ids
         || step.refills != Default::default()
         || next.refills != Default::default()
-        || record
-            .steps
-            .iter()
-            .filter(|step| step.source_action_ids.contains(&source_id))
-            .count()
-            != 2
-        || audit
-            .iter()
-            .filter(|entry| entry["actionId"].as_u64() == Some(source_id))
-            .count()
-            != 2
+        || !(source_pair_only || supported_prior_boundary)
     {
         return Ok(None);
     }

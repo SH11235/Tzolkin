@@ -12,7 +12,8 @@ use tzolkin_ai::human_policy_dataset::{
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{
     Evidence, Market, PUBLIC_REPLAY_SCHEMA, PUBLIC_RULES_VERSION, PublicReplayRecord,
-    PublicReplayStep, PublicState, Refills, public_catalog_hash,
+    PublicReplayStep, PublicState, Refills, inspect_public, public_catalog_hash,
+    verify_public_replay,
 };
 use tzolkin_core::{GameState, GearId, Phase, apply_move, create_game, get_available_moves};
 #[path = "support/temp_root.rs"]
@@ -237,6 +238,29 @@ impl Fixture {
         );
         fixture.set_messages(vec![json!({"raw_text":caption,"html":caption,"icons":[]})]);
         fixture
+    }
+    fn bind_derived_source_step(&mut self, index: usize) {
+        let record: PublicReplayRecord = serde_json::from_value(self.record.clone()).unwrap();
+        let report = verify_public_replay(&record).unwrap();
+        let observation = inspect_public(&report.frames[index].snapshot.state)
+            .unwrap()
+            .observation
+            .unwrap();
+        let step = &record.steps[index];
+        let action = &observation
+            .legal_actions
+            .iter()
+            .find(|row| row.r#move == step.r#move)
+            .unwrap()
+            .action;
+        self.record["steps"][index]["sourceActionIds"] = json!([10]);
+        self.audit["audit"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "step":index+1,"actionId":10,"actor":step.actor,"action":action,
+                "derivedFromVisibleBoundary":true,"equivalentChoices":1
+            }),
+        );
     }
     fn paired_action(removed_position: i64, action_position: i64) -> Self {
         let mut state = playing_state();
@@ -1009,6 +1033,68 @@ fn observed_market_and_paid_anywhere_v4_require_exact_source_authority() {
             "valueSupervised",
         ] {
             assert_eq!(report[flag], false);
+        }
+    }
+    let plain = Fixture::corn_beg(1);
+    let mut boundary = Fixture::corn_beg(1);
+    let previous = boundary.record["steps"].as_array().unwrap().len() - 3;
+    boundary.bind_derived_source_step(previous);
+    // The prior actor's uniquely audited boundary adds no teacher label and
+    // does not change either observed pair's identity or features.
+    assert_eq!(
+        serde_json::to_vec(load_beg(&plain).unwrap().samples()).unwrap(),
+        serde_json::to_vec(load_beg(&boundary).unwrap().samples()).unwrap()
+    );
+    for change in [
+        "sameActor",
+        "afterPair",
+        "moreThanOne",
+        "otherAction",
+        "notDerived",
+        "ambiguousBoundary",
+        "extraAuditField",
+        "missingBoundaryAudit",
+    ] {
+        let mut f = Fixture::corn_beg(1);
+        let previous = f.record["steps"].as_array().unwrap().len() - 3;
+        if change == "afterPair" {
+            let record: PublicReplayRecord = serde_json::from_value(f.record.clone()).unwrap();
+            let report = verify_public_replay(&record).unwrap();
+            let observation = inspect_public(&report.frames.last().unwrap().snapshot.state)
+                .unwrap()
+                .observation
+                .unwrap();
+            let row = observation
+                .legal_actions
+                .iter()
+                .find(|row| matches!(row.action, TypedAction::Place { .. }))
+                .unwrap();
+            f.record["steps"].as_array_mut().unwrap().push(json!({
+                "actor":observation.actor,"move":row.r#move,"sourceActionIds":[],
+                "refills":{},"checkpoint":null
+            }));
+            f.bind_derived_source_step(previous + 3);
+        } else if change == "otherAction" {
+            f.bind_derived_source_step(previous - 1);
+        } else {
+            f.bind_derived_source_step(previous);
+            match change {
+                "sameActor" => {
+                    f.record["steps"][previous]["actor"] =
+                        f.record["steps"][previous + 1]["actor"].clone();
+                }
+                "moreThanOne" => f.bind_derived_source_step(previous - 1),
+                "notDerived" => f.audit["audit"][0]["derivedFromVisibleBoundary"] = json!(false),
+                "ambiguousBoundary" => f.audit["audit"][0]["equivalentChoices"] = json!(2),
+                "extraAuditField" => f.audit["audit"][0]["removedSteps"] = json!([]),
+                "missingBoundaryAudit" => {
+                    f.audit["audit"].as_array_mut().unwrap().remove(0);
+                }
+                _ => unreachable!(),
+            }
+        }
+        if let Ok(dataset) = load_beg(&f) {
+            assert!(dataset.samples().is_empty(), "{change}");
         }
     }
     for change in [
