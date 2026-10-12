@@ -16,8 +16,8 @@ mod current_mixed;
 pub use current_mixed::CurrentMixedIdentity;
 pub(crate) mod guarded;
 pub use guarded::{
-    GUARDED_DEPLOYMENT_VERSION, GuardedDeployment, GuardedDeploymentDecision, GuardedTradeTrace,
-    MAX_GAME_CALLBACKS,
+    BorrowedGuardedDeployment, GUARDED_DEPLOYMENT_VERSION, GuardedDeployment,
+    GuardedDeploymentDecision, GuardedTradeTrace, MAX_GAME_CALLBACKS,
 };
 
 pub const DEPLOYMENT_SCHEMA: &str = "tzolkin-numeric-policy-deployment-v1";
@@ -450,13 +450,49 @@ mod tests {
         let o = observe(&state, state.current_player).unwrap();
         let loaded = LoadedDeployment::load(&encoded(wire())).unwrap();
         let raw = loaded.choose_move(&o).unwrap();
+        let (borrowed_first, borrowed_repeat) = {
+            let mut a = BorrowedGuardedDeployment::new(&loaded, Default::default()).unwrap();
+            let mut b = BorrowedGuardedDeployment::new(&loaded, Default::default()).unwrap();
+            assert!(std::ptr::eq(a.policy(), b.policy()));
+            assert!(std::ptr::eq(a.policy(), &loaded));
+            assert_eq!(a.configuration_key(), b.configuration_key());
+            a.on_callback(0, &o).unwrap();
+            let first = serde_json::to_value(a.choose_move(0, &o).unwrap()).unwrap();
+            a.on_callback(1, &o).unwrap();
+            let repeated = serde_json::to_value(a.choose_move(1, &o).unwrap()).unwrap();
+            assert!(a.choose_move(1, &o).is_err());
+            assert!(a.on_callback(2, &o).is_err());
+            // The other view starts with no Trade history despite a's repeated
+            // trade and terminal failure, then independently sees its repeat.
+            b.on_callback(0, &o).unwrap();
+            assert_eq!(
+                serde_json::to_value(b.choose_move(0, &o).unwrap()).unwrap(),
+                first
+            );
+            b.on_callback(1, &o).unwrap();
+            assert_eq!(
+                serde_json::to_value(b.choose_move(1, &o).unwrap()).unwrap(),
+                repeated
+            );
+            b.on_callback(2, &o).unwrap();
+            let mut changed = o.clone();
+            changed.players[o.actor].resources[0] += 1;
+            assert!(b.choose_move(2, &changed).is_err());
+            assert!(b.choose_move(2, &o).is_err());
+            let mut stale = BorrowedGuardedDeployment::new(&loaded, Default::default()).unwrap();
+            assert!(stale.on_callback(1, &o).is_err());
+            assert!(stale.on_callback(0, &o).is_err());
+            (first, repeated)
+        };
         let mut session = GuardedDeployment::new(loaded, Default::default()).unwrap();
         session.on_callback(0, &o).unwrap();
         let first = session.choose_move(0, &o).unwrap();
+        assert_eq!(serde_json::to_value(&first).unwrap(), borrowed_first);
         assert_eq!(first.decision.r#move, raw.r#move);
         assert!(!first.trade.unwrap().overridden);
         session.on_callback(1, &o).unwrap();
         let repeated = session.choose_move(1, &o).unwrap();
+        assert_eq!(serde_json::to_value(&repeated).unwrap(), borrowed_repeat);
         let skip = crate::trade_guard::skip_index(&o).unwrap();
         assert_eq!(repeated.decision.r#move, o.legal_actions[skip].r#move);
         assert!(repeated.trade.unwrap().repeat_seen);
