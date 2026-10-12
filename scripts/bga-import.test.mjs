@@ -359,6 +359,34 @@ test('reads an omitted trade icon list only from its exact preserved HTML captio
       'unparsed',
     );
   }
+  for (const amount of [0, 2]) {
+    const payout = {
+      raw_text: `Aは${amount}\nを歯車から獲得した`,
+      html: `Aは${amount}<div class="tz_icon resource_corn"></div>を歯車から獲得した`,
+      icons: [],
+    };
+    const original = structuredClone(payout);
+    const parsed = parseMessage(payout, ['A']);
+    assert.equal(parsed.kind, 'unparsed');
+    assert.deepEqual(parsed.detail, {});
+    assert.deepEqual(parsed.iconResources, ['corn']);
+    assert.deepEqual(payout, original);
+    for (const html of [
+      payout.html.replace('Aは', 'Bは'),
+      payout.html.replace(`${amount}<div`, `${amount + 1}<div`),
+      payout.html.replace('resource_corn', 'resource_wood'),
+      payout.html.replace('<div class=', '<div hidden class='),
+      `<span>${payout.html}</span>`,
+      payout.html.replace('</div>', '</div><div class="tz_icon resource_corn"></div>'),
+      payout.html.replace(`${amount}<div`, `${amount} <div`),
+    ])
+      assert.deepEqual(parseMessage({ ...payout, html }, ['A']).iconResources, []);
+    assert.deepEqual(
+      parseMessage({ ...payout, icons: [{ classes: 'tz_icon resource_stone' }] }, ['A'])
+        .iconResources,
+      ['stone'],
+    );
+  }
 });
 
 test('rejects evidence mismatches, malformed identities and duplicate actions', () => {
