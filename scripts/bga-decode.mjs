@@ -1696,6 +1696,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         score: Object.hasOwn(witness.expected?.players?.[actor] ?? {}, 'score')
           ? 'sourceCheckpoint'
           : 'unknown',
+        resourceFields: object(witness.expected?.players?.[actor]?.resources)
+          ? Object.keys(witness.expected.players[actor].resources)
+          : [],
         coreState: 'derivedFromVerifiedPrefix',
       },
     };
@@ -2280,6 +2283,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       technologyBuildProofs.filter(Boolean).length === 1
         ? outcomes[technologyBuildProofs.findIndex(Boolean)]
         : null;
+    // Positive bonus captions can exclude a same-fee plain sibling. Their
+    // absence cannot establish declining an optional Architecture bonus.
+    const provedMaterialBonus = outcomes.some(
+      (outcome) =>
+        outcome.row.action.architecture === true &&
+        queuedMaterialPurchase(outcome, event, events, witness, state()) !== null,
+    );
     return (outcome) => {
       const task = outcome.frame.observation?.pendingTask?.type ?? null;
       if (workerCaps.length && !cappedPurchaseWorker(outcome)) return false;
@@ -2310,6 +2320,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             (receipt.kind === 'materialTechnology' && witness.expected === undefined) ||
             matches(outcome.frame.snapshot.state, witness.expected)
           );
+        if (provedMaterialBonus) return false;
       }
       if (
         task === 'technology' &&

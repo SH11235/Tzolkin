@@ -3578,6 +3578,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     track = 'theology',
     resource = 'corn',
     architectureBonus = false,
+    architectureLevel = architectureBonus ? 3 : 2,
   ) => {
     const card =
       resource === 'corn'
@@ -3598,7 +3599,8 @@ test('holds queued corn until observed technology completion and preserves cappe
     const cost = resources.map((r) => card.cost[r] ?? 0);
     const discount = resources.find((r, index) => index > 0 && index < 4 && cost[index] > 0);
     const chosenCost = cost.map(
-      (n, index) => n - Number(architectureBonus && resources[index] === discount),
+      (n, index) =>
+        n - Number(architectureBonus && architectureLevel === 3 && resources[index] === discount),
     );
     const initial = clone(saved.core.initialFrame);
     const before = clone(initial);
@@ -3606,7 +3608,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     Object.assign(own.resources, { corn: 10, wood: 8, stone: 4, gold: 2, skull: 0 });
     own.score = -2;
     own.technologies[track] = level;
-    own.technologies.architecture = architectureBonus ? 3 : 2;
+    own.technologies.architecture = architectureLevel;
     before.snapshot.state.skullSupply = 4;
     before.snapshot.state.buildings = [card.id];
     before.observation.pendingTask = {
@@ -3626,7 +3628,8 @@ test('holds queued corn until observed technology completion and preserves cappe
         id: card.id,
         cost: architecture && architectureBonus ? chosenCost : cost,
         architecture,
-        discountResource: architecture && architectureBonus ? discount : null,
+        discountResource:
+          architecture && architectureBonus && architectureLevel === 3 ? discount : null,
         renovation: null,
       },
       move: { type: 'choose', choiceId: architecture ? 'purchase:bonus' : 'purchase:plain' },
@@ -3919,7 +3922,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     });
     assert.equal(unknownReceipt.humanPlayingBcReady, false);
   }
-  const materialFixture = (change = () => {}, alter = () => {}) =>
+  const materialFixture = (change = () => {}, alter = () => {}, architectureLevel = 3) =>
     fixture(
       (v) => {
         v.witness.witnesses = v.witness.witnesses.slice(0, 2);
@@ -3931,6 +3934,7 @@ test('holds queued corn until observed technology completion and preserves cappe
       'extraction',
       'stone',
       true,
+      architectureLevel,
     );
   const materialSuccess = materialFixture();
   const materialWitnesses = clone(materialSuccess.value.witness.witnesses);
@@ -3949,14 +3953,35 @@ test('holds queued corn until observed technology completion and preserves cappe
   assert.deepEqual(materialReceipt.resourceChoiceSourceActionIds, [9, 10]);
   assert.equal(materialReceipt.actualDelivered, true);
   assert.equal(materialReceipt.purchaseCounterEvidence.score, 'unknown');
+  assert.deepEqual(materialReceipt.purchaseCounterEvidence.resourceFields, []);
   assert.deepEqual(materialSuccess.value.witness.witnesses, materialWitnesses);
-  for (const [name, change, alter] of [
+  const sameFee = materialFixture(
+    () => {},
+    () => {},
+    2,
+  );
+  const sameFeeOriginals = clone(sameFee.value.witness.witnesses);
+  const sameFeeCompleted = decode(sameFee.value, sameFee.dispatch);
+  assert.equal(sameFeeCompleted.manifest.blocked, null);
+  assert.deepEqual(
+    sameFeeCompleted.record.steps.map((step) => step.sourceActionIds),
+    materialCompleted.record.steps.map((step) => step.sourceActionIds),
+  );
+  assert.ok(sameFeeCompleted.record.steps.slice(1).every((step) => step.checkpoint === null));
+  assert.equal(
+    sameFeeCompleted.manifest.audit.find((row) => row.action?.type === 'build').action.architecture,
+    true,
+  );
+  assert.deepEqual(sameFee.value.witness.witnesses, sameFeeOriginals);
+  for (const [name, change, alter, reason, architectureLevel] of [
     [
       'wrong Architecture payment',
       (v) => {
         v.raw.dom_entries.find((row) => row.action_id === 7).messages[0].raw_text =
           'Aは3\nを支払った';
       },
+      undefined,
+      /Source effect resource:corn=1 is not established by this macro/,
     ],
     [
       'unrelated purchase state',
@@ -3964,6 +3989,7 @@ test('holds queued corn until observed technology completion and preserves cappe
       (f, stage) => {
         if (stage === 'purchase') f.snapshot.state.firstPlayer = 1;
       },
+      /Source effect resource:stone=1 is not established by this macro/,
     ],
     [
       'early queued material',
@@ -3971,19 +3997,34 @@ test('holds queued corn until observed technology completion and preserves cappe
       (f, stage) => {
         if (stage === 'resource:1') f.snapshot.state.players[0].resources.stone++;
       },
+      /Unsettled purchase at source 9: Extraction reward choice has no exact matching core material gain/,
     ],
     [
       'wrong actual material actor',
       (v) => {
         v.raw.dom_entries.at(-1).messages[0].raw_text = 'Bは\nを獲得した';
       },
+      undefined,
+      /Queued purchase requires the next same-actor technology or exact material choice/,
+      2,
+    ],
+    [
+      'absent Architecture bonus captions remain ambiguous',
+      (v) => {
+        const source = v.raw.dom_entries.find((row) => row.action_id === 7);
+        source.messages.splice(2, 2);
+      },
+      undefined,
+      /Ambiguous legal operation for observed build/,
+      2,
     ],
   ]) {
-    const f = materialFixture(change, alter);
+    const f = materialFixture(change, alter, architectureLevel);
     const originalWitnesses = clone(f.value.witness.witnesses);
     const rejected = decode(f.value, f.dispatch);
     assert.notEqual(rejected.manifest.blocked, null, name);
     assert.equal(rejected.manifest.blocked.actionId, 7, name);
+    assert.match(rejected.manifest.blocked.reason, reason, name);
     assert.deepEqual(
       rejected.record.steps.map((step) => step.sourceActionIds),
       [[6]],
