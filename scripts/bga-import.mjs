@@ -113,22 +113,28 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
       };
     }
   } else if (actor && (m = match(/^は(\d*)\s*を(獲得した|支払った)$/))) {
-    if (!iconResources.length && m[1] && typeof message.html === 'string') {
+    if (!iconResources.length && typeof message.html === 'string') {
       const resources = Array.from(
         message.html.matchAll(
           /<div class="tz_icon resource_(corn|wood|stone|gold|skull)"><\/div>/g,
         ),
         (match) => match[1],
       );
-      if (
+      const explicitSingle =
+        m[1] &&
         resources.length === 1 &&
         ['', ' '].some(
           (space) =>
             message.html ===
             `${actor}は${m[1]}${space}<div class="tz_icon resource_${resources[0]}"></div>を${m[2]}`,
-        )
-      )
-        iconResources.push(...resources);
+        );
+      const implicitRun =
+        !m[1] &&
+        resources.length > 0 &&
+        resources.every((resource) => resource === resources[0]) &&
+        message.html ===
+          `${actor}は${`<div class="tz_icon resource_${resources[0]}"></div>`.repeat(resources.length)}を${m[2]}`;
+      if (explicitSingle || implicitRun) iconResources.push(...resources);
     }
     if (iconResources.length > 0) {
       result.kind = m[2] === '獲得した' ? 'resourceGain' : 'resourcePayment';

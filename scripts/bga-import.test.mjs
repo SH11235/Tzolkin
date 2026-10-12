@@ -319,6 +319,45 @@ test('reads an omitted trade icon list only from its exact preserved HTML captio
         { explicitAmount: 4, iconResources: ['wood'] },
       );
     }
+    for (const count of [1, 3]) {
+      const icon = '<div class="tz_icon resource_wood"></div>';
+      const implicit = {
+        raw_text: `Aは\nを${verb}`,
+        html: `Aは${icon.repeat(count)}を${verb}`,
+        icons: [],
+      };
+      const original = structuredClone(implicit);
+      const parsed = parseMessage(implicit, ['A']);
+      assert.equal(parsed.kind, kind);
+      assert.deepEqual(parsed.detail, {
+        explicitAmount: null,
+        iconResources: Array(count).fill('wood'),
+      });
+      assert.deepEqual(implicit, original);
+      for (const html of [
+        implicit.html.replace('Aは', 'Bは'),
+        implicit.html.replace('Aは', 'Aは1'),
+        implicit.html.replace('<div class=', '<div hidden class='),
+        `<span>${implicit.html}</span>`,
+        implicit.html.replace('Aは', 'Aは '),
+        implicit.html.replace('</div>', '</div> '),
+        implicit.html.replace('を', '<div class="tz_icon resource_gold"></div>を'),
+        implicit.html.replace('resource_wood', 'resource_unknown'),
+      ])
+        assert.equal(parseMessage({ ...implicit, html }, ['A']).kind, 'unparsed');
+      assert.equal(
+        parseMessage({ ...implicit, raw_text: `Aは2\nを${verb}` }, ['A']).kind,
+        'unparsed',
+      );
+      assert.deepEqual(
+        parseMessage({ ...implicit, icons: [{ classes: 'tz_icon resource_stone' }] }, ['A']).detail,
+        { explicitAmount: null, iconResources: ['stone'] },
+      );
+    }
+    assert.equal(
+      parseMessage({ raw_text: `Aはを${verb}`, html: `Aはを${verb}`, icons: [] }, ['A']).kind,
+      'unparsed',
+    );
   }
 });
 
