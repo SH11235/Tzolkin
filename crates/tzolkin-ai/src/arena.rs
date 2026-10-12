@@ -1,4 +1,5 @@
 //! Paired, seat-rotated experiments. Policies receive only actor observations.
+pub mod conditional;
 pub mod numeric;
 pub mod resource_cycle;
 use crate::dataset::{DatasetSplit, load_dataset, split_for_family};
