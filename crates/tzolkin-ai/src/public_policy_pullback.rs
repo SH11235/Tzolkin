@@ -37,67 +37,17 @@ pub struct ScalarPolicyPullback<'a> {
 impl<'a> ScalarPolicyPullback<'a> {
     pub fn new(model: &'a PublicPolicyModel, rows: &'a [EncodedCandidate]) -> Result<Self, String> {
         model.validate()?;
-        if rows.is_empty() || rows.len() > MAX_CANDIDATES {
-            return Err("Invalid scalar pullback candidate count".into());
-        }
-        let context = &rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..PREFIX_COUNT];
-        let mut values = Vec::with_capacity(rows.len());
-        let mut hidden = Vec::with_capacity(rows.len());
-        let mut logits = Vec::with_capacity(rows.len());
-        let mut prefix: Option<[f32; HIDDEN]> = None;
-        for row in rows {
-            if &row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..PREFIX_COUNT] != context {
-                return Err("Scalar pullback candidates do not share one context".into());
-            }
-            let input = PublicPolicyModel::validated_values(row)?;
-            // Keep validation row-by-row. Numeric context equality also accepts
-            // signed-zero differences; those rows retain the original full dot.
-            let cached = if rows.len() > 1 && same_context_bits(context, &input[..PREFIX_COUNT]) {
-                Some(&*prefix.get_or_insert_with(|| {
-                    std::array::from_fn(|unit| {
-                        dot(
-                            &model.parameters
-                                [unit * FEATURE_COUNT..unit * FEATURE_COUNT + PREFIX_COUNT],
-                            context,
-                        )
-                    })
-                }))
-            } else {
-                None
-            };
-            let mut activation = [0.0; HIDDEN];
-            for (unit, value) in activation.iter_mut().enumerate() {
-                // The Scalar kernel and its context-prefix continuation use this
-                // same left-to-right f32 multiply/add order, with no mul_add.
-                let weights = &model.parameters[unit * FEATURE_COUNT..(unit + 1) * FEATURE_COUNT];
-                let sum = if let Some(prefix) = cached {
-                    continue_dot(
-                        prefix[unit],
-                        &weights[PREFIX_COUNT..],
-                        &input[PREFIX_COUNT..],
-                    )
-                } else {
-                    dot(weights, input)
-                };
-                let affine = sum + model.parameters[B1 + unit];
-                if !affine.is_finite() {
-                    return Err("Nonfinite scalar pullback hidden affine".into());
-                }
-                *value = affine.tanh();
-            }
-            let logit = dot(&model.parameters[WP..BP], &activation) + model.parameters[BP];
-            if !logit.is_finite() {
-                return Err("Nonfinite scalar pullback logit".into());
-            }
-            values.push(input);
-            hidden.push(activation);
-            logits.push(logit);
-        }
+        let cache = scalar_forward_cache(
+            &model.parameters,
+            rows,
+            PUBLIC_FEATURE_SCHEMA,
+            PublicPolicyModel::validated_values,
+        )?;
         Ok(Self {
             model,
-            values,
-            hidden,
-            logits,
+            values: cache.values,
+            hidden: cache.hidden,
+            logits: cache.logits,
         })
     }
 
@@ -117,32 +67,122 @@ impl<'a> ScalarPolicyPullback<'a> {
         dlogits: &[f64],
         gradient: &mut [f64],
     ) -> Result<(), String> {
-        if dlogits.len() != self.logits.len()
-            || gradient.len() != PARAMETER_COUNT
-            || dlogits.iter().any(|value| !value.is_finite())
-            || gradient.iter().any(|value| !value.is_finite())
-        {
-            return Err("Invalid scalar pullback gradient shape/finite values".into());
+        accumulate_scalar_parameter_gradient(
+            &self.model.parameters,
+            &self.values,
+            &self.hidden,
+            dlogits,
+            gradient,
+        )
+    }
+}
+
+// Numeric scratch shared by the two strict outer schema boundaries. Neither
+// helper admits a source, objective, optimizer or model identity.
+pub(crate) struct ScalarForwardCache<'a> {
+    pub(crate) values: Vec<&'a [f32; FEATURE_COUNT]>,
+    pub(crate) hidden: Vec<[f32; HIDDEN]>,
+    pub(crate) logits: Vec<f32>,
+}
+pub(crate) fn scalar_forward_cache<'a>(
+    parameters: &[f32],
+    rows: &'a [EncodedCandidate],
+    schema: u32,
+    validated_row: fn(&EncodedCandidate) -> Result<&[f32; FEATURE_COUNT], String>,
+) -> Result<ScalarForwardCache<'a>, String> {
+    if rows.is_empty() || rows.len() > MAX_CANDIDATES {
+        return Err("Invalid scalar pullback candidate count".into());
+    }
+    let context = &rows[0].values_for_schema(schema)?[..PREFIX_COUNT];
+    let mut values = Vec::with_capacity(rows.len());
+    let mut hidden = Vec::with_capacity(rows.len());
+    let mut logits = Vec::with_capacity(rows.len());
+    let mut prefix: Option<[f32; HIDDEN]> = None;
+    for row in rows {
+        if &row.values_for_schema(schema)?[..PREFIX_COUNT] != context {
+            return Err("Scalar pullback candidates do not share one context".into());
         }
-        for ((input, hidden), &delta) in self.values.iter().zip(&self.hidden).zip(dlogits) {
-            gradient[BP] += delta;
-            for (unit, &activation) in hidden.iter().enumerate() {
-                let activation = f64::from(activation);
-                gradient[WP + unit] += delta * activation;
-                let affine_gradient = delta
-                    * f64::from(self.model.parameters[WP + unit])
-                    * (1.0 - activation * activation);
-                gradient[B1 + unit] += affine_gradient;
-                for (feature, &value) in input.iter().enumerate() {
-                    gradient[unit * FEATURE_COUNT + feature] += affine_gradient * f64::from(value);
-                }
+        let input = validated_row(row)?;
+        // Keep validation row-by-row. Numeric context equality also accepts
+        // signed-zero differences; those rows retain the original full dot.
+        let cached = if rows.len() > 1 && same_context_bits(context, &input[..PREFIX_COUNT]) {
+            Some(&*prefix.get_or_insert_with(|| {
+                std::array::from_fn(|unit| {
+                    dot(
+                        &parameters[unit * FEATURE_COUNT..unit * FEATURE_COUNT + PREFIX_COUNT],
+                        context,
+                    )
+                })
+            }))
+        } else {
+            None
+        };
+        let mut activation = [0.0; HIDDEN];
+        for (unit, value) in activation.iter_mut().enumerate() {
+            // The Scalar kernel and its context-prefix continuation use this
+            // same left-to-right f32 multiply/add order, with no mul_add.
+            let weights = &parameters[unit * FEATURE_COUNT..(unit + 1) * FEATURE_COUNT];
+            let sum = if let Some(prefix) = cached {
+                continue_dot(
+                    prefix[unit],
+                    &weights[PREFIX_COUNT..],
+                    &input[PREFIX_COUNT..],
+                )
+            } else {
+                dot(weights, input)
+            };
+            let affine = sum + parameters[B1 + unit];
+            if !affine.is_finite() {
+                return Err("Nonfinite scalar pullback hidden affine".into());
+            }
+            *value = affine.tanh();
+        }
+        let logit = dot(&parameters[WP..BP], &activation) + parameters[BP];
+        if !logit.is_finite() {
+            return Err("Nonfinite scalar pullback logit".into());
+        }
+        values.push(input);
+        hidden.push(activation);
+        logits.push(logit);
+    }
+    Ok(ScalarForwardCache {
+        values,
+        hidden,
+        logits,
+    })
+}
+
+pub(crate) fn accumulate_scalar_parameter_gradient(
+    parameters: &[f32],
+    values: &[&[f32; FEATURE_COUNT]],
+    hidden: &[[f32; HIDDEN]],
+    dlogits: &[f64],
+    gradient: &mut [f64],
+) -> Result<(), String> {
+    if dlogits.len() != values.len()
+        || gradient.len() != PARAMETER_COUNT
+        || dlogits.iter().any(|value| !value.is_finite())
+        || gradient.iter().any(|value| !value.is_finite())
+    {
+        return Err("Invalid scalar pullback gradient shape/finite values".into());
+    }
+    for ((input, hidden), &delta) in values.iter().zip(hidden).zip(dlogits) {
+        gradient[BP] += delta;
+        for (unit, &activation) in hidden.iter().enumerate() {
+            let activation = f64::from(activation);
+            gradient[WP + unit] += delta * activation;
+            let affine_gradient =
+                delta * f64::from(parameters[WP + unit]) * (1.0 - activation * activation);
+            gradient[B1 + unit] += affine_gradient;
+            for (feature, &value) in input.iter().enumerate() {
+                gradient[unit * FEATURE_COUNT + feature] += affine_gradient * f64::from(value);
             }
         }
-        if gradient.iter().any(|value| !value.is_finite()) {
-            return Err("Nonfinite scalar policy parameter pullback".into());
-        }
-        Ok(())
     }
+    if gradient.iter().any(|value| !value.is_finite()) {
+        return Err("Nonfinite scalar policy parameter pullback".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
