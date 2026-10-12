@@ -3840,6 +3840,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     architectureBonus = false,
     architectureLevel = architectureBonus ? 3 : 2,
     renovationSibling = false,
+    buildsRemaining = 2,
   ) => {
     const card =
       resource === 'corn'
@@ -3889,8 +3890,8 @@ test('holds queued corn until observed technology completion and preserves cappe
     before.snapshot.state.buildings = [card.id];
     before.observation.pendingTask = {
       type: 'build',
-      remaining: 2,
-      allowMonument: true,
+      remaining: buildsRemaining,
+      allowMonument: buildsRemaining > 1,
       cornPayment: false,
     };
     before.snapshot.state.pending = {
@@ -3949,7 +3950,7 @@ test('holds queued corn until observed technology completion and preserves cappe
             { type: 'effects', effects: [clone(card.effects[1])] },
             {
               type: 'build',
-              remaining: 1,
+              remaining: buildsRemaining - 1,
               allowMonument: false,
               cornPayment: false,
               architectureAvailable: !architecture,
@@ -3982,16 +3983,20 @@ test('holds queued corn until observed technology completion and preserves cappe
           }));
         } else {
           player.resources[resource] += amount;
-          if (track === 'theology') {
+          if (track === 'theology' && level === 3) {
             player.resources.skull++;
             next.snapshot.state.skullSupply--;
           } else player.technologies[track]++;
-          next.observation.pendingTask = clone(request.state.pending.after[1]);
-          next.snapshot.state.pending = {
-            title: 'Remaining building',
-            task: clone(next.observation.pendingTask),
-            after: [],
-          };
+          if (resource === 'skull') next.snapshot.state.skullSupply -= amount;
+          next.observation.pendingTask =
+            buildsRemaining > 1 ? clone(request.state.pending.after[1]) : null;
+          next.snapshot.state.pending = next.observation.pendingTask
+            ? {
+                title: 'Remaining building',
+                task: clone(next.observation.pendingTask),
+                after: [],
+              }
+            : null;
           next.observation.legalActions = [];
         }
         alter(next, 'technology');
@@ -4042,7 +4047,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     });
     const continuation =
       track === 'theology'
-        ? [technology, bonus]
+        ? [technology, ...(level === 3 ? [bonus] : [])]
         : [
             { raw_text: 'Aは収集を1レベル進めた' },
             ...(level === 3 ? [{ raw_text: '収集技術ボーナス: Aは好きな資源2個を得た' }] : []),
@@ -4268,6 +4273,144 @@ test('holds queued corn until observed technology completion and preserves cappe
     uncappedCompleted.manifest.audit.find((row) => row.queuedPurchaseSourceActionId).continuation,
     'uncappedTechnology',
   );
+  const skullFixture = (change = () => {}, alter = () => {}, level = 1, remaining = 1) => {
+    const f = fixture(
+      (v) => {
+        v.witness.witnesses = v.witness.witnesses.slice(0, 2);
+        delete v.witness.witnesses[1].expected;
+        change(v);
+      },
+      alter,
+      level,
+      'theology',
+      'skull',
+      true,
+      3,
+      false,
+      remaining,
+    );
+    const dispatch = f.dispatch;
+    f.dispatch = (request) => nativeJsonShape(dispatch(request));
+    return f;
+  };
+  const skullSuccess = skullFixture();
+  const skullWitnesses = clone(skullSuccess.value.witness.witnesses);
+  const skullCompleted = decode(skullSuccess.value, skullSuccess.dispatch);
+  assert.equal(skullCompleted.manifest.blocked, null);
+  assert.deepEqual(
+    skullCompleted.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8]],
+  );
+  assert.equal(skullCompleted.record.steps[1].checkpoint, null);
+  assert.equal(skullCompleted.record.steps[2].checkpoint, null);
+  assert.deepEqual(skullSuccess.value.witness.witnesses, skullWitnesses);
+  const skullReceipt = skullCompleted.manifest.audit.find(
+    (row) => row.queuedPurchaseSourceActionId,
+  );
+  assert.equal(skullReceipt.resource, 'skull');
+  assert.equal(skullReceipt.amount, 1);
+  assert.equal(skullReceipt.actualDelivered, true);
+  assert.equal(skullReceipt.humanPlayingBcReady, false);
+  const skullCheckpoint = (v) =>
+    v.witness.witnesses.push({
+      actionId: 8,
+      pendingTask: null,
+      expected: {
+        skullSupply: 3,
+        players: [{ resources: { skull: 1 }, technologies: { theology: 2 } }, {}, {}, {}],
+      },
+    });
+  const checkedSkull = skullFixture(skullCheckpoint);
+  const checkedResult = decode(checkedSkull.value, checkedSkull.dispatch);
+  assert.equal(checkedResult.manifest.blocked, null);
+  assert.deepEqual(
+    checkedResult.record.steps[2].checkpoint.expected,
+    checkedSkull.value.witness.witnesses[2].expected,
+  );
+  for (const [name, change, alter, level, remaining] of [
+    [
+      'supply unchanged',
+      undefined,
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.skullSupply++;
+      },
+    ],
+    [
+      'supply overdrawn',
+      undefined,
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.skullSupply--;
+      },
+    ],
+    [
+      'extra skull',
+      undefined,
+      (f, stage) => {
+        if (stage === 'technology') f.snapshot.state.players[0].resources.skull++;
+      },
+    ],
+    [
+      'zero Build not consumed',
+      undefined,
+      (f, stage) => {
+        if (stage === 'technology') {
+          f.observation.pendingTask = {
+            type: 'build',
+            remaining: 0,
+            allowMonument: false,
+            cornPayment: false,
+            architectureAvailable: false,
+          };
+          f.snapshot.state.pending = {
+            title: 'Remaining building',
+            task: clone(f.observation.pendingTask),
+            after: [],
+          };
+        }
+      },
+    ],
+    [
+      'unfinished continuation',
+      (v) => {
+        v.raw.entries = v.raw.entries.filter((row) => row.action_id !== 8);
+        v.raw.dom_entries = v.raw.dom_entries.filter((row) => row.action_id !== 8);
+        v.raw.entry_count = v.raw.entries.length;
+      },
+    ],
+    [
+      'foreign continuation',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 8).messages[0].raw_text =
+          'Bは神学を1レベル進めた';
+      },
+    ],
+    [
+      'checkpoint mismatch',
+      (v) => {
+        skullCheckpoint(v);
+        v.witness.witnesses.at(-1).expected.skullSupply++;
+      },
+    ],
+    ['unsupported capped Theology', undefined, undefined, 3],
+    ['unsupported two-build Skull', undefined, undefined, 1, 2],
+  ]) {
+    const f = skullFixture(change, alter, level, remaining);
+    const originals = clone(f.value.witness.witnesses);
+    const rejected = decode(f.value, f.dispatch);
+    assert.notEqual(rejected.manifest.blocked, null, name);
+    assert.equal(rejected.manifest.blocked.actionId, 7, name);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.deepEqual(f.value.witness.witnesses, originals, name);
+    assert.equal(
+      rejected.manifest.audit.some((row) => row.resource === 'skull' && row.actualDelivered),
+      false,
+      name,
+    );
+  }
   const sameFee = materialFixture(
     () => {},
     () => {},
