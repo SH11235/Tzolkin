@@ -2,7 +2,9 @@
 use crate::dataset::DatasetSplit;
 use crate::features::{FEATURE_COUNT, FeatureEncoder, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
 use crate::human_initial_wealth::table_family_id;
-use crate::human_policy_dataset::{ConditionalHumanPolicyDataset, HumanPolicySample, TASK};
+use crate::human_policy_dataset::{
+    ConditionalHumanPolicyDataset, FACTORIZED_LABEL_SCOPE, HumanPolicySample, TASK,
+};
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::model::{Random, digest};
 use crate::policy_training::{
@@ -135,6 +137,8 @@ pub struct ConditionalDatasetIdentity {
     pub samples: [usize; 3],
     pub candidates: [usize; 3],
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_scope: Option<String>,
 }
 impl ConditionalDatasetIdentity {
     fn expected_fingerprint(&self) -> Result<String, String> {
@@ -145,6 +149,10 @@ impl ConditionalDatasetIdentity {
     fn validate(&self) -> Result<(), String> {
         if self.task != TASK
             || self.input_contract != INPUT_CONTRACT
+            || self
+                .label_scope
+                .as_deref()
+                .is_some_and(|scope| scope != FACTORIZED_LABEL_SCOPE)
             || self.feature_schema != PUBLIC_FEATURE_SCHEMA
             || self.feature_count != FEATURE_COUNT
             || self.rules_version != tzolkin_core::public_replay::PUBLIC_RULES_VERSION
@@ -202,6 +210,13 @@ fn audit(datasets: &[ConditionalHumanPolicyDataset]) -> Result<ConditionalDatase
     if datasets.is_empty() || datasets.len() > MAX_TABLES {
         return Err("Conditional collection table bound exceeded".into());
     }
+    let label_scope = datasets[0].label_scope();
+    if datasets
+        .iter()
+        .any(|dataset| dataset.label_scope() != label_scope)
+    {
+        return Err("Conditional collections cannot mix label scopes".into());
+    }
     let mut identity = ConditionalDatasetIdentity {
         task: TASK.into(),
         input_contract: INPUT_CONTRACT.into(),
@@ -216,6 +231,7 @@ fn audit(datasets: &[ConditionalHumanPolicyDataset]) -> Result<ConditionalDatase
         samples: [0; 3],
         candidates: [0; 3],
         fingerprint: String::new(),
+        label_scope: label_scope.map(str::to_owned),
     };
     let mut reservations = BTreeMap::new();
     let mut sample_ids = BTreeSet::new();
@@ -487,8 +503,10 @@ impl PreparedConditionalHumanPolicy {
     }
 
     /// Score every supplied legal row in its original order. Only the producer's
-    /// observed Playing Place/Remove/FirstPlayer labels were supervised; scoring
-    /// other legal actions does not establish observed Human labels for them.
+    /// observed Playing Place/Remove/FirstPlayer labels were supervised. Opt-in
+    /// v2 also factorizes a joint Remove/CurrentGear UseAction caption; these are
+    /// two App labels, not two independent observed Human choices. Scoring other
+    /// legal actions does not establish observed Human labels for them.
     /// The core observation/key is checked, without authenticating its source.
     pub fn distribution(
         &self,
@@ -887,6 +905,64 @@ mod tests {
             ConditionalHumanPolicyDataset::training_fixture("126", DatasetSplit::Train, 0),
         ]);
         let first = train_conditional_datasets(&datasets, &config(1), None).unwrap();
+        let legacy_bytes = bounded_json(&first.checkpoint).unwrap();
+        let legacy: ConditionalHumanPolicyCheckpoint =
+            serde_json::from_slice(&legacy_bytes).unwrap();
+        assert!(legacy.dataset.label_scope.is_none());
+        assert!(
+            serde_json::to_value(&legacy.dataset)
+                .unwrap()
+                .get("labelScope")
+                .is_none()
+        );
+        legacy.validate().unwrap();
+        assert_eq!(legacy.checksum, first.checkpoint.checksum);
+        assert_eq!(bounded_json(&legacy).unwrap(), legacy_bytes);
+        let expanded = vec![
+            ConditionalHumanPolicyDataset::factorized_training_fixture(
+                "123",
+                DatasetSplit::Train,
+                0,
+            ),
+            ConditionalHumanPolicyDataset::factorized_training_fixture(
+                "124",
+                DatasetSplit::Validation,
+                1,
+            ),
+            ConditionalHumanPolicyDataset::factorized_training_fixture(
+                "125",
+                DatasetSplit::Train,
+                1,
+            ),
+            ConditionalHumanPolicyDataset::factorized_training_fixture(
+                "126",
+                DatasetSplit::Train,
+                0,
+            ),
+        ];
+        let expanded_identity = audit(&expanded).unwrap();
+        assert_eq!(
+            expanded_identity.label_scope.as_deref(),
+            Some(FACTORIZED_LABEL_SCOPE)
+        );
+        assert_ne!(
+            expanded_identity.fingerprint,
+            first.checkpoint.dataset.fingerprint
+        );
+        assert!(
+            train_conditional_datasets(&expanded, &config(2), Some(&first.checkpoint))
+                .unwrap_err()
+                .contains("dataset/config mismatch")
+        );
+        let mixed = vec![
+            ConditionalHumanPolicyDataset::factorized_training_fixture(
+                "123",
+                DatasetSplit::Train,
+                0,
+            ),
+            ConditionalHumanPolicyDataset::training_fixture("124", DatasetSplit::Validation, 1),
+        ];
+        assert!(audit(&mixed).unwrap_err().contains("mix label scopes"));
         let continuous = train_conditional_datasets(&datasets, &config(2), None).unwrap();
         let resumed =
             train_conditional_datasets(&datasets, &config(2), Some(&first.checkpoint)).unwrap();

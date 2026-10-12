@@ -13,15 +13,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use tzolkin_core::observation::{LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, TypedAction};
+use tzolkin_core::observation::{
+    ActionSource, LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, TypedAction,
+};
 use tzolkin_core::public_replay::{
     PUBLIC_RULES_VERSION, PublicReplayRecord, inspect_public, public_catalog_hash,
     verify_public_replay,
 };
-use tzolkin_core::{GameOptions, GearId, Phase};
+use tzolkin_core::{GameOptions, GearId, Phase, Task};
 
 pub const INPUT_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-source-v1";
 pub const DATASET_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-dataset-v1";
+pub const INPUT_SCHEMA_V2: &str = "tzolkin-conditional-basic-human-policy-source-v2";
+pub const DATASET_SCHEMA_V2: &str = "tzolkin-conditional-basic-human-policy-dataset-v2";
+pub const FACTORIZED_LABEL_SCOPE: &str = "PrimitivesAndRemovalPairedCurrentGearActionsV2";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -47,6 +52,8 @@ pub struct UnknownSourceOptions {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
     schema: String,
+    #[serde(default, deserialize_with = "explicit_label_scope")]
+    label_scope: Option<String>,
     basis: InputBasis,
     table_id: String,
     observed_options: UnknownSourceOptions,
@@ -57,6 +64,20 @@ struct Manifest {
     reservations: ContentPin,
     /// Captures/calibrations used by the reconstruction, retained as declarations.
     reconstruction_evidence: Vec<ContentPin>,
+}
+fn explicit_label_scope<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+impl Manifest {
+    fn scope(&self) -> Result<Option<&'static str>, String> {
+        match (self.schema.as_str(), self.label_scope.as_deref()) {
+            (INPUT_SCHEMA, None) => Ok(None),
+            (INPUT_SCHEMA_V2, Some(FACTORIZED_LABEL_SCOPE)) => Ok(Some(FACTORIZED_LABEL_SCOPE)),
+            _ => Err("Conditional Human manifest label scope mismatch".into()),
+        }
+    }
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -103,6 +124,22 @@ pub struct HumanPolicySample {
     candidates: Vec<EncodedCandidate>,
     chosen: usize,
     value_target: (),
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_label_part: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paired_sample_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_label_support: Option<RemovalActionSupport>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovalActionSupport {
+    paired_replay_step_index: usize,
+    gear: GearId,
+    removed_position: i64,
+    action_position: i64,
+    corn_cost: i64,
+    basis: &'static str,
 }
 impl HumanPolicySample {
     pub fn sample_id(&self) -> &str {
@@ -150,6 +187,8 @@ pub struct HumanPolicyReport<'a> {
     move_schema: u32,
     observation_schema: u32,
     source_label_basis: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label_scope: Option<&'static str>,
     observed_options: &'a UnknownSourceOptions,
     reconstructed_options: GameOptions,
     reconstructed_market: &'static str,
@@ -177,6 +216,7 @@ pub struct ConditionalHumanPolicyDataset {
     synthetic: bool,
     manifest_sha256: String,
     basis: InputBasis,
+    label_scope: Option<&'static str>,
     observed_options: UnknownSourceOptions,
     pins: Vec<ContentPin>,
     counts: HumanPolicyCounts,
@@ -459,6 +499,44 @@ fn observed_label(text: &str, name: &str, action: &TypedAction) -> bool {
         _ => false,
     }
 }
+struct RemovalCaption {
+    gear: GearId,
+    removed_position: i64,
+    action_position: i64,
+    corn_cost: i64,
+}
+fn removal_action_caption(text: &str, name: &str) -> Option<RemovalCaption> {
+    let body = text.strip_prefix(name)?.strip_prefix('は')?;
+    let (head, tail) = body.split_once("のワーカーを取り除き、")?;
+    let (gear, position) = head.rsplit_once(' ')?;
+    let gear = match gear {
+        "Palenque" => GearId::Palenque,
+        "Yaxchilan" => GearId::Yaxchilan,
+        "Tikal" => GearId::Tikal,
+        "Uxmal" => GearId::Uxmal,
+        "Chichen Itza" => GearId::ChichenItza,
+        _ => return None,
+    };
+    let tail = tail.trim();
+    let (action_position, corn_cost) = if let Some(action) = tail
+        .strip_prefix("n°")
+        .and_then(|s| s.strip_suffix("のアクションを行った"))
+    {
+        (number(action)?, 0)
+    } else {
+        let (cost, action) = tail.split_once("コーンを支払ってn°")?;
+        (
+            number(action.strip_suffix("アクションを行った")?)?,
+            number(cost)?,
+        )
+    };
+    Some(RemovalCaption {
+        gear,
+        removed_position: number(position)?,
+        action_position,
+        corn_cost,
+    })
+}
 
 impl ConditionalHumanPolicyDataset {
     pub fn load(
@@ -484,8 +562,8 @@ impl ConditionalHumanPolicyDataset {
         };
         let bytes = read_pin(&manifest_pin, Path::new(""))?;
         let manifest: Manifest = parse(&bytes)?;
-        if manifest.schema != INPUT_SCHEMA
-            || manifest.nominations.sha256 != nominations_sha256
+        manifest.scope()?;
+        if manifest.nominations.sha256 != nominations_sha256
             || manifest.reservations.sha256 != reservations_sha256
             || manifest.reconstruction_evidence.len() > 32
         {
@@ -537,6 +615,7 @@ impl ConditionalHumanPolicyDataset {
         manifest_sha256: &str,
         pins: Vec<ContentPin>,
     ) -> Result<Self, String> {
+        let label_scope = manifest.scope()?;
         let Sources {
             record,
             raw,
@@ -611,7 +690,7 @@ impl ConditionalHumanPolicyDataset {
             candidates: 0,
             excluded: BTreeMap::new(),
         };
-        let mut samples = Vec::new();
+        let mut samples: Vec<HumanPolicySample> = Vec::new();
         let mut labels = BTreeSet::new();
         for (index, step) in record.steps.iter().enumerate() {
             let frame = inspect_public(&report.frames[index].snapshot.state)?;
@@ -654,12 +733,21 @@ impl ConditionalHumanPolicyDataset {
                 return Err("Final applied-step audit is absent or ambiguous".into());
             }
             let entry = bound[0];
-            let reason = if !matches!(
-                row.action,
-                TypedAction::Place { .. }
-                    | TypedAction::Remove { .. }
-                    | TypedAction::FirstPlayer { .. }
-            ) {
+            let factorized = label_scope.is_some()
+                && matches!(
+                    row.action,
+                    TypedAction::UseAction {
+                        source: ActionSource::CurrentGear,
+                        ..
+                    }
+                );
+            let reason = if !factorized
+                && !matches!(
+                    row.action,
+                    TypedAction::Place { .. }
+                        | TypedAction::Remove { .. }
+                        | TypedAction::FirstPlayer { .. }
+                ) {
                 Some("outsideExplicitPrimitiveScope")
             } else if !teachers.contains(&actor_ids[step.actor]) {
                 Some("notNominated")
@@ -679,6 +767,65 @@ impl ConditionalHumanPolicyDataset {
                 *counts.excluded.entry(reason.into()).or_default() += 1;
                 continue;
             }
+            let pair = if factorized {
+                let previous = index.checked_sub(1).and_then(|i| record.steps.get(i));
+                let sample = samples.last().filter(|sample| {
+                    sample.replay_step_index + 1 == index
+                        && sample.actor == step.actor
+                        && sample.source_action_id == source_id
+                });
+                let removal =
+                    sample.and_then(|sample| match sample.legal_actions[sample.chosen].action {
+                        TypedAction::Remove { gear, position } => Some((sample, gear, position)),
+                        _ => None,
+                    });
+                let (Some(previous), Some((sample, gear, position))) = (previous, removal) else {
+                    *counts
+                        .excluded
+                        .entry("unpairedGearAction".into())
+                        .or_default() += 1;
+                    continue;
+                };
+                if previous.actor != step.actor
+                    || previous.source_action_ids != step.source_action_ids
+                    || !matches!(observation.pending_task, Some(Task::Action { gear: g, position: p, .. }) if g == gear && p == position)
+                {
+                    *counts
+                        .excluded
+                        .entry("unpairedGearAction".into())
+                        .or_default() += 1;
+                    continue;
+                }
+                let before = &report.frames[index - 1].snapshot.state;
+                let current = &report.frames[index].snapshot.state;
+                let after = &report.frames[index + 1].snapshot.state;
+                if previous.refills != Default::default()
+                    || step.refills != Default::default()
+                    || [current, after].iter().any(|state| {
+                        state.round != before.round
+                            || state.phase != before.phase
+                            || state.current_player != before.current_player
+                    })
+                {
+                    *counts
+                        .excluded
+                        .entry("interveningTransition".into())
+                        .or_default() += 1;
+                    continue;
+                }
+                if observation.legal_actions.len() < 2 {
+                    *counts.excluded.entry("forcedNoChoice".into()).or_default() += 1;
+                    continue;
+                }
+                Some((
+                    sample.sample_id.clone(),
+                    sample.source_message_index,
+                    gear,
+                    position,
+                ))
+            } else {
+                None
+            };
             let texts = source_messages
                 .get(&source_id)
                 .ok_or("Missing original label source")?;
@@ -701,22 +848,54 @@ impl ConditionalHumanPolicyDataset {
                         .filter(|player| text.starts_with(&format!("{}は", player.name)))
                         .max_by_key(|player| player.name.len());
                     source_actor.is_some_and(|player| &player.name == name)
-                        && observed_label(text, name, &row.action)
+                        && if factorized {
+                            removal_action_caption(text, name).is_some_and(|caption| {
+                                matches!(row.action, TypedAction::UseAction { gear, position, corn_cost, .. }
+                                    if caption.gear == gear && caption.action_position == position && caption.corn_cost == corn_cost)
+                            })
+                        } else {
+                            observed_label(text, name, &row.action)
+                        }
                 })
                 .collect();
             if matches.len() != 1 {
                 return Err("Observed primitive text/actor/action is absent or ambiguous".into());
             }
             let message_index = matches[0].0;
-            if !labels.insert((source_id, message_index)) {
+            let support = if let Some((_, paired_message, gear, position)) = &pair {
+                let caption = removal_action_caption(matches[0].1, name)
+                    .ok_or("Missing paired removal caption")?;
+                if message_index != *paired_message
+                    || caption.gear != *gear
+                    || caption.removed_position != *position
+                {
+                    return Err("Factorized action does not match its observed removal".into());
+                }
+                Some(RemovalActionSupport {
+                    paired_replay_step_index: index - 1,
+                    gear: caption.gear,
+                    removed_position: caption.removed_position,
+                    action_position: caption.action_position,
+                    corn_cost: caption.corn_cost,
+                    basis: "oneObservedJointRemovalAndActionChoice",
+                })
+            } else {
+                None
+            };
+            let part = if factorized {
+                "removalAction"
+            } else {
+                "primitive"
+            };
+            if !labels.insert((source_id, message_index, part)) {
                 return Err("Source label was consumed twice".into());
             }
             let encoder = FeatureEncoder::new_public(observation)?;
-            counts.candidates = counts
+            let candidate_count = counts
                 .candidates
                 .checked_add(observation.legal_actions.len())
                 .ok_or("Candidate count overflow")?;
-            if counts.candidates > MAX_CANDIDATES {
+            if candidate_count > MAX_CANDIDATES {
                 return Err("Human dataset candidate limit exceeded".into());
             }
             let candidates = (0..observation.legal_actions.len())
@@ -731,13 +910,30 @@ impl ConditionalHumanPolicyDataset {
                     return Err("Conditional Human features exceed finite1024 bound".into());
                 }
             }
-            let sample_id = digest(
-                format!(
-                    "{family}\0{}\0{source_id}\0{message_index}",
-                    actor_ids[step.actor]
-                )
-                .as_bytes(),
+            if factorized {
+                let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+                if candidates.iter().enumerate().any(|(i, candidate)| {
+                    i != chosen
+                        && candidate
+                            .values_for_schema(PUBLIC_FEATURE_SCHEMA)
+                            .is_ok_and(|values| values == selected)
+                }) {
+                    *counts
+                        .excluded
+                        .entry("aliasedChosenFeatures".into())
+                        .or_default() += 1;
+                    continue;
+                }
+            }
+            counts.candidates = candidate_count;
+            let mut identity = format!(
+                "{family}\0{}\0{source_id}\0{message_index}",
+                actor_ids[step.actor]
             );
+            if factorized {
+                identity.push_str("\0removalAction");
+            }
+            let sample_id = digest(identity.as_bytes());
             samples.push(HumanPolicySample {
                 sample_id,
                 family_id: family.clone(),
@@ -753,6 +949,9 @@ impl ConditionalHumanPolicyDataset {
                 candidates,
                 chosen,
                 value_target: (),
+                source_label_part: factorized.then_some("removalAction"),
+                paired_sample_id: pair.map(|(id, _, _, _)| id),
+                source_label_support: support,
             });
         }
         counts.samples = samples.len();
@@ -765,6 +964,7 @@ impl ConditionalHumanPolicyDataset {
             synthetic: false,
             manifest_sha256: manifest_sha256.into(),
             basis: manifest.basis,
+            label_scope,
             observed_options: manifest.observed_options.clone(),
             pins,
             counts,
@@ -785,6 +985,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+    pub fn label_scope(&self) -> Option<&str> {
+        self.label_scope
     }
     /// Canonical sealed report, including labels, features and all declared source pins.
     pub fn fingerprint(&self) -> Result<String, String> {
@@ -850,6 +1053,7 @@ impl ConditionalHumanPolicyDataset {
             synthetic: true,
             manifest_sha256: digest(table.as_bytes()),
             basis: InputBasis::ConditionalBasicHumanPolicy,
+            label_scope: None,
             observed_options: UnknownSourceOptions {
                 tribes: (),
                 prophecies: (),
@@ -879,12 +1083,30 @@ impl ConditionalHumanPolicyDataset {
                 candidates,
                 chosen,
                 value_target: (),
+                source_label_part: None,
+                paired_sample_id: None,
+                source_label_support: None,
             }],
         }
     }
+    #[cfg(test)]
+    pub(crate) fn factorized_training_fixture(
+        table: &str,
+        split: DatasetSplit,
+        chosen: usize,
+    ) -> Self {
+        // Scope identity tests only; not a substitute for source-admitted UseAction rows.
+        let mut dataset = Self::training_fixture(table, split, chosen);
+        dataset.label_scope = Some(FACTORIZED_LABEL_SCOPE);
+        dataset
+    }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: DATASET_SCHEMA,
+            schema: if self.label_scope.is_some() {
+                DATASET_SCHEMA_V2
+            } else {
+                DATASET_SCHEMA
+            },
             task: TASK,
             source_kind: "conditionalBasicHumanPolicy",
             basis: self.basis,
@@ -894,7 +1116,12 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: "originalVisibleTextAndFinalAppliedStepAudit",
+            source_label_basis: if self.label_scope.is_some() {
+                "originalVisibleTextAndFinalAppliedStepAuditWithFactorizedRemovalCaption"
+            } else {
+                "originalVisibleTextAndFinalAppliedStepAudit"
+            },
+            label_scope: self.label_scope,
             observed_options: &self.observed_options,
             reconstructed_options: GameOptions::default(),
             reconstructed_market: "unlimited",
