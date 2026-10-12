@@ -107,6 +107,200 @@ afterEach(() => {
 });
 
 describe('CPU Worker request lifecycle', () => {
+  it('binds Own Setup composite metadata and exact seed to the existing all-seat guarded protocol', async () => {
+    // Synthetic metadata acknowledgements only; no artifact/learner or forward.
+    const composite: CpuModelMetadata = {
+      ...model,
+      sourceRole: 'ownSetupCurrentMixedComposite',
+      updateCount: 2,
+      policyVersion: 'own-setup-composite-scalar-argmax-v1',
+      sourceAuthenticated: false,
+      sourceQualified: false,
+      verifiedNativePolicy: false,
+      valueValidity: 'unavailablePolicyOnly',
+      ownSetupIdentity: {
+        schema: 'tzolkin-own-setup-trained-model-v1',
+        policyVersion: 'own-setup-trained-semantic-scalar-argmax-v1',
+        samplingVersion: 'own-setup-trained-semantic-scalar-uniform-tick53-v2',
+        task: 'ownSetupWinnerShareBaselineUniformCorrectedAdamV1',
+        initial: {
+          schema: 'tzolkin-own-setup-initialized-model-v1',
+          modelVersion: 'own-setup-quantity-512x32-tanh-v1',
+          inputContract: 'base-3-4p-setup-only-six-wealth-pairs-semantic-v3',
+          task: 'initializedOwnSetupPolicyOnly',
+          initVersion: 'splitmix64-glorot-quantity-weight-div17-f32-v1',
+          seed: '18446744073709551615',
+          completedUpdates: 0,
+          featureSchema: 3,
+          featureCount: 512,
+          hiddenCount: 32,
+          parameterCount: 16449,
+          backend: 'scalar',
+          rulesVersion: 1,
+          rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677',
+          observationSchema: 1,
+          moveSchema: 1,
+          catalogHash: '0'.repeat(16),
+          checksum: 'c'.repeat(64),
+        },
+        parentChecksum: 'd'.repeat(64),
+        updateCount: 2,
+        trainingConfigChecksum: 'c'.repeat(64),
+        playingBindingChecksum: 'd'.repeat(64),
+        numericalTarget: model.sourceNumericalTarget,
+        parameterWordsChecksum: 'e'.repeat(64),
+        sources: [{ episodeId: 'f'.repeat(64), recordChecksum: 'e'.repeat(64) }],
+        checksum: model.sourceChecksum,
+      },
+      fixedPlayingIdentity: {
+        deploymentChecksum: 'd'.repeat(64),
+        sourceRole: 'rlCurrentMixed',
+        sourceChecksum: 'e'.repeat(64),
+        updateCount: 1,
+        currentMixedIdentity: {
+          kind: 'initialMixedV1',
+          policy: {
+            schema: 'tzolkin-public-rl-mixed-joint-inference-identity-v1',
+            policyVersion: 'learned-public-rl-mixed-joint-argmax-v1',
+            samplingVersion: 'public-stochastic-rl-mixed-joint-uniform-tick53-v1',
+            task: 'mixedLearnerOwnSumQuarterJointOneBatchV1',
+            artifactChecksum: 'e'.repeat(64),
+            importedUpdateCount: 1,
+            mixedUpdateCount: 1,
+            actorModelVersion: 'tiny-public-policy-mlp-v1',
+            criticModelVersion: 'tiny-public-state-critic-mlp-v1',
+            actorParametersChecksum: 'd'.repeat(64),
+            residualParametersChecksum: 'f'.repeat(64),
+            featureSchema: 2,
+            inputContract: 'base-3-4p-native-setup-public-playing-v2',
+            contextSchema: 1,
+            contextContract: 'public-v2-state-prefix384-v1',
+            backend: 'scalar',
+            numericalTarget: model.sourceNumericalTarget,
+          },
+        },
+        sourceNumericalTarget: model.sourceNumericalTarget,
+        rawPolicyVersion: 'learned-public-rl-mixed-joint-argmax-v1',
+        backend: 'scalar',
+        guard: {
+          schema: 1,
+          algorithmVersion: 'public-trade-cycle-guard-v1',
+          stateProjectionVersion: 'public-trading-state-v1',
+          repeatStatePolicy: 'secondVisitExit',
+          maxTradesPerEpisode: 64,
+          maxPublicStateBytes: 131072,
+        },
+        configurationKey: gameMetadata.configurationKey,
+        inferenceVersion: 'numeric-public-trade-guard-v1',
+        guardVersion: 'public-trade-cycle-guard-v1',
+        projectionVersion: 'public-trading-state-v1',
+      },
+    };
+    const api = await import('../../src/game/cpu');
+    const signal = new AbortController().signal;
+    const loading = api.loadCpuModel(bytes, signal);
+    const worker = FakeWorker.instances.at(-1)!;
+    worker.respond({ metadata: composite });
+    const loaded = await loading;
+    expect(loaded.ownSetupIdentity?.initial.seed).toBe('18446744073709551615');
+    expect(Object.isFrozen(loaded.ownSetupIdentity?.initial)).toBe(true);
+    expect(Object.isFrozen(loaded.ownSetupIdentity?.sources[0])).toBe(true);
+    expect(Object.isFrozen(loaded.fixedPlayingIdentity?.currentMixedIdentity.policy)).toBe(true);
+    const opening = api.startCpuGame(signal, composite.checksum);
+    const compositeGame = {
+      ...gameMetadata,
+      gameId: worker.request!.gameId,
+      policyVersion: 'own-setup-composite-trade-guard-v1',
+      rawPolicyVersion: composite.policyVersion,
+    };
+    worker.respond({ gameMetadata: compositeGame });
+    const game = await opening;
+    const human = await notify(api, worker, game, signal);
+    const cpu = await notify(api, worker, game, signal);
+    expect(cpu.index).toBe(human.index + 1);
+    const chosen = api.chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: composite.checksum },
+      cpu,
+    );
+    expect(worker.request).not.toHaveProperty('deploymentBytes');
+    const compositeDecision = {
+      ...nnDecision,
+      policyVersion: compositeGame.policyVersion,
+      rawPolicyVersion: composite.policyVersion,
+      callbackIndex: cpu.index,
+    };
+    worker.reply(compositeDecision);
+    await expect(chosen).resolves.toEqual(compositeDecision);
+    for (const invalid of [
+      { ...composite, sourceQualified: true },
+      {
+        ...composite,
+        ownSetupIdentity: {
+          ...composite.ownSetupIdentity,
+          initial: { ...composite.ownSetupIdentity!.initial, seed: Number('18446744073709551615') },
+        },
+      },
+      {
+        ...composite,
+        ownSetupIdentity: {
+          ...composite.ownSetupIdentity,
+          initial: { ...composite.ownSetupIdentity!.initial, seed: '18446744073709551616' },
+        },
+      },
+      {
+        ...composite,
+        ownSetupIdentity: {
+          ...composite.ownSetupIdentity,
+          initial: { ...composite.ownSetupIdentity!.initial, featureSchema: 2 },
+        },
+      },
+      { ...composite, sourceRole: 'conditionalHumanCurrentMixed' },
+      {
+        ...composite,
+        sourceRole: 'bcPrepared',
+        updateCount: null,
+        policyVersion: model.policyVersion,
+      },
+      {
+        ...composite,
+        fixedPlayingIdentity: {
+          ...composite.fixedPlayingIdentity,
+          inferenceVersion: compositeGame.policyVersion,
+        },
+      },
+      {
+        ...composite,
+        fixedPlayingIdentity: {
+          ...composite.fixedPlayingIdentity,
+          guard: { ...composite.fixedPlayingIdentity!.guard, maxTradesPerEpisode: 63 },
+        },
+      },
+    ]) {
+      const refused = api.loadCpuModel(bytes, signal);
+      const nextWorker = FakeWorker.instances.at(-1)!;
+      nextWorker.respond({ metadata: invalid });
+      await expect(refused).rejects.toThrow('不正');
+      expect(nextWorker.terminated).toBe(true);
+      expect(api.getLoadedCpuModel()).toBeUndefined();
+    }
+    const reloading = api.loadCpuModel(bytes, signal);
+    const nextWorker = FakeWorker.instances.at(-1)!;
+    nextWorker.respond({ metadata: composite });
+    await reloading;
+    const wrongGuard = api.startCpuGame(signal, composite.checksum);
+    nextWorker.respond({
+      gameMetadata: {
+        ...compositeGame,
+        gameId: nextWorker.request!.gameId,
+        configurationKey: 'f'.repeat(64),
+      },
+    });
+    await expect(wrongGuard).rejects.toThrow('不正');
+    expect(nextWorker.terminated).toBe(true);
+  });
+
   it('cannot cancel an in-flight replacement epoch through delayed old-game cleanup', async () => {
     const api = await import('../../src/game/cpu');
     const signal = new AbortController().signal;

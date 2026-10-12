@@ -76,11 +76,73 @@ export interface ConditionalCurrentIdentity {
   readonly verifiedNativePolicy: false;
   readonly checksum: string;
 }
+/** Numeric metadata only. Rust stringifies the seed before the Worker boundary. */
+export interface OwnSetupIdentity {
+  readonly schema: 'tzolkin-own-setup-trained-model-v1';
+  readonly policyVersion: 'own-setup-trained-semantic-scalar-argmax-v1';
+  readonly samplingVersion: 'own-setup-trained-semantic-scalar-uniform-tick53-v2';
+  readonly task: 'ownSetupWinnerShareBaselineUniformCorrectedAdamV1';
+  readonly initial: {
+    readonly schema: 'tzolkin-own-setup-initialized-model-v1';
+    readonly modelVersion: 'own-setup-quantity-512x32-tanh-v1';
+    readonly inputContract: 'base-3-4p-setup-only-six-wealth-pairs-semantic-v3';
+    readonly task: 'initializedOwnSetupPolicyOnly';
+    readonly initVersion: 'splitmix64-glorot-quantity-weight-div17-f32-v1';
+    readonly seed: string;
+    readonly completedUpdates: 0;
+    readonly featureSchema: 3;
+    readonly featureCount: 512;
+    readonly hiddenCount: 32;
+    readonly parameterCount: 16449;
+    readonly backend: 'scalar';
+    readonly rulesVersion: 1;
+    readonly rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677';
+    readonly observationSchema: 1;
+    readonly moveSchema: 1;
+    readonly catalogHash: string;
+    readonly checksum: string;
+  };
+  readonly parentChecksum: string;
+  readonly updateCount: number;
+  readonly trainingConfigChecksum: string;
+  readonly playingBindingChecksum: string;
+  readonly numericalTarget: string;
+  readonly parameterWordsChecksum: string;
+  readonly sources: readonly { readonly episodeId: string; readonly recordChecksum: string }[];
+  readonly checksum: string;
+}
+export interface FixedPlayingIdentity {
+  readonly deploymentChecksum: string;
+  readonly sourceRole: 'rlCurrentMixed';
+  readonly sourceChecksum: string;
+  readonly updateCount: number;
+  readonly currentMixedIdentity: CurrentMixedIdentity;
+  readonly sourceNumericalTarget: string;
+  readonly rawPolicyVersion: string;
+  readonly backend: 'scalar';
+  readonly guard: {
+    readonly schema: 1;
+    readonly algorithmVersion: 'public-trade-cycle-guard-v1';
+    readonly stateProjectionVersion: 'public-trading-state-v1';
+    readonly repeatStatePolicy: 'secondVisitExit';
+    readonly maxTradesPerEpisode: 64;
+    readonly maxPublicStateBytes: 131072;
+  };
+  readonly configurationKey: string;
+  readonly inferenceVersion: 'numeric-public-trade-guard-v1';
+  readonly guardVersion: 'public-trade-cycle-guard-v1';
+  readonly projectionVersion: 'public-trading-state-v1';
+}
 /** Numeric content identity only; these fields do not establish training qualification. */
 export interface CpuModelMetadata {
   readonly checksum: string;
   readonly sourceRole:
-    'bcPrepared' | 'rlCount1' | 'rlRepeated' | 'rlCurrentMixed' | 'conditionalHumanCurrentMixed';
+    | 'bcPrepared'
+    | 'rlCount1'
+    | 'rlRepeated'
+    | 'rlCurrentMixed'
+    | 'conditionalHumanCurrentMixed'
+    | 'ownSetupCurrentMixedComposite';
   readonly sourceChecksum: string;
   readonly sourceNumericalTarget: string;
   readonly updateCount: number | null;
@@ -88,6 +150,8 @@ export interface CpuModelMetadata {
   readonly backend: 'scalar';
   readonly currentMixedIdentity?: CurrentMixedIdentity;
   readonly conditionalCurrentIdentity?: ConditionalCurrentIdentity;
+  readonly ownSetupIdentity?: OwnSetupIdentity;
+  readonly fixedPlayingIdentity?: FixedPlayingIdentity;
   readonly sourceAuthenticated?: false;
   readonly sourceQualified?: false;
   readonly verifiedNativePolicy?: false;
@@ -95,12 +159,16 @@ export interface CpuModelMetadata {
 }
 export const GUARDED_POLICY_VERSION = 'numeric-public-trade-guard-v1';
 export const GUARDED_CONDITIONAL_POLICY_VERSION = 'numeric-conditional-human-trade-guard-v1';
+export const GUARDED_OWN_SETUP_POLICY_VERSION = 'own-setup-composite-trade-guard-v1';
 const GUARD_VERSION = 'public-trade-cycle-guard-v1';
 const PROJECTION_VERSION = 'public-trading-state-v1';
 export interface CpuGameMetadata {
   readonly gameId: string;
   readonly modelChecksum: string;
-  readonly policyVersion: typeof GUARDED_POLICY_VERSION | typeof GUARDED_CONDITIONAL_POLICY_VERSION;
+  readonly policyVersion:
+    | typeof GUARDED_POLICY_VERSION
+    | typeof GUARDED_CONDITIONAL_POLICY_VERSION
+    | typeof GUARDED_OWN_SETUP_POLICY_VERSION;
   readonly rawPolicyVersion: string;
   readonly guardVersion: string;
   readonly projectionVersion: string;
@@ -200,6 +268,11 @@ export function getLoadedCpuModel(): CpuModelMetadata | undefined {
 function modelMetadata(value: unknown): CpuModelMetadata {
   if (!value || typeof value !== 'object') throw new Error('NNモデル情報が不正です。');
   const metadata = value as CpuModelMetadata;
+  if (
+    metadata.sourceRole !== 'ownSetupCurrentMixedComposite' &&
+    (Object.hasOwn(metadata, 'ownSetupIdentity') || Object.hasOwn(metadata, 'fixedPlayingIdentity'))
+  )
+    throw new Error('NNモデル情報が不正です。');
   const roleMatches =
     (metadata.sourceRole === 'bcPrepared' &&
       metadata.updateCount === null &&
@@ -215,7 +288,8 @@ function modelMetadata(value: unknown): CpuModelMetadata {
       metadata.policyVersion === 'learned-public-rl-repeat-v1') ||
     (metadata.sourceRole === 'rlCurrentMixed' && currentMixedMetadataMatches(metadata)) ||
     (metadata.sourceRole === 'conditionalHumanCurrentMixed' &&
-      conditionalMetadataMatches(metadata));
+      conditionalMetadataMatches(metadata)) ||
+    (metadata.sourceRole === 'ownSetupCurrentMixedComposite' && ownSetupMetadataMatches(metadata));
   if (
     typeof metadata.checksum !== 'string' ||
     !SHA256.test(metadata.checksum) ||
@@ -228,6 +302,26 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     !roleMatches
   )
     throw new Error('NNモデル情報が不正です。');
+  if (metadata.sourceRole === 'ownSetupCurrentMixedComposite') {
+    const identity = metadata.ownSetupIdentity!;
+    const playing = metadata.fixedPlayingIdentity!;
+    return Object.freeze({
+      ...metadata,
+      ownSetupIdentity: Object.freeze({
+        ...identity,
+        initial: Object.freeze({ ...identity.initial }),
+        sources: Object.freeze(identity.sources.map((source) => Object.freeze({ ...source }))),
+      }),
+      fixedPlayingIdentity: Object.freeze({
+        ...playing,
+        guard: Object.freeze({ ...playing.guard }),
+        currentMixedIdentity: Object.freeze({
+          ...playing.currentMixedIdentity,
+          policy: Object.freeze({ ...playing.currentMixedIdentity.policy }),
+        }) as CurrentMixedIdentity,
+      }),
+    });
+  }
   if (metadata.sourceRole === 'rlCurrentMixed') {
     const identity = metadata.currentMixedIdentity!;
     return Object.freeze({
@@ -249,6 +343,160 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     });
   }
   return Object.freeze({ ...metadata });
+}
+
+// The Wasm loader validates the raw closed wire and all numeric checksums.
+// This validates its metadata acknowledgement, never regenerates an artifact.
+function ownSetupMetadataMatches(metadata: CpuModelMetadata): boolean {
+  const identity = metadata.ownSetupIdentity;
+  const playing = metadata.fixedPlayingIdentity;
+  const keysMatch = (value: unknown, keys: string[]): boolean =>
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => Object.hasOwn(value, key));
+  const digest = (value: unknown): value is string =>
+    typeof value === 'string' && SHA256.test(value);
+  const target = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    /^scalar-f32-f64-tick53-v1:[a-z0-9_]{1,32}:[a-z0-9_]{1,32}:(32|64)$/.test(value);
+  if (
+    !identity ||
+    !playing ||
+    Object.hasOwn(metadata, 'currentMixedIdentity') ||
+    Object.hasOwn(metadata, 'conditionalCurrentIdentity') ||
+    metadata.policyVersion !== 'own-setup-composite-scalar-argmax-v1' ||
+    metadata.sourceAuthenticated !== false ||
+    metadata.sourceQualified !== false ||
+    metadata.verifiedNativePolicy !== false ||
+    metadata.valueValidity !== 'unavailablePolicyOnly' ||
+    !keysMatch(identity, [
+      'schema',
+      'policyVersion',
+      'samplingVersion',
+      'task',
+      'initial',
+      'parentChecksum',
+      'updateCount',
+      'trainingConfigChecksum',
+      'playingBindingChecksum',
+      'numericalTarget',
+      'parameterWordsChecksum',
+      'sources',
+      'checksum',
+    ]) ||
+    identity.schema !== 'tzolkin-own-setup-trained-model-v1' ||
+    identity.policyVersion !== 'own-setup-trained-semantic-scalar-argmax-v1' ||
+    identity.samplingVersion !== 'own-setup-trained-semantic-scalar-uniform-tick53-v2' ||
+    identity.task !== 'ownSetupWinnerShareBaselineUniformCorrectedAdamV1' ||
+    !Number.isSafeInteger(identity.updateCount) ||
+    identity.updateCount < 1 ||
+    identity.updateCount > 1_000_000 ||
+    metadata.updateCount !== identity.updateCount ||
+    metadata.sourceChecksum !== identity.checksum ||
+    metadata.sourceNumericalTarget !== identity.numericalTarget ||
+    !target(identity.numericalTarget) ||
+    ![
+      identity.parentChecksum,
+      identity.trainingConfigChecksum,
+      identity.playingBindingChecksum,
+      identity.parameterWordsChecksum,
+      identity.checksum,
+    ].every(digest)
+  )
+    return false;
+  const initial = identity.initial;
+  const constants = {
+    schema: 'tzolkin-own-setup-initialized-model-v1',
+    modelVersion: 'own-setup-quantity-512x32-tanh-v1',
+    inputContract: 'base-3-4p-setup-only-six-wealth-pairs-semantic-v3',
+    task: 'initializedOwnSetupPolicyOnly',
+    initVersion: 'splitmix64-glorot-quantity-weight-div17-f32-v1',
+    completedUpdates: 0,
+    featureSchema: 3,
+    featureCount: 512,
+    hiddenCount: 32,
+    parameterCount: 16449,
+    backend: 'scalar',
+    rulesVersion: 1,
+    rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677',
+    observationSchema: 1,
+    moveSchema: 1,
+  };
+  if (
+    !keysMatch(initial, [...Object.keys(constants), 'seed', 'catalogHash', 'checksum']) ||
+    !Object.entries(constants).every(([key, value]) => Reflect.get(initial, key) === value) ||
+    typeof initial.seed !== 'string' ||
+    !/^(0|[1-9][0-9]{0,19})$/.test(initial.seed) ||
+    BigInt(initial.seed) > 18446744073709551615n ||
+    typeof initial.catalogHash !== 'string' ||
+    !/^[0-9a-f]{16}$/.test(initial.catalogHash) ||
+    !digest(initial.checksum) ||
+    (identity.updateCount === 1 && identity.parentChecksum !== initial.checksum) ||
+    !Array.isArray(identity.sources) ||
+    identity.sources.length < 1 ||
+    identity.sources.length > 32 ||
+    !identity.sources.every(
+      (source) =>
+        keysMatch(source, ['episodeId', 'recordChecksum']) &&
+        digest(source.episodeId) &&
+        digest(source.recordChecksum),
+    ) ||
+    new Set(identity.sources.map((source) => source.episodeId)).size !== identity.sources.length ||
+    new Set(identity.sources.map((source) => source.recordChecksum)).size !==
+      identity.sources.length
+  )
+    return false;
+  if (
+    !keysMatch(playing, [
+      'deploymentChecksum',
+      'sourceRole',
+      'sourceChecksum',
+      'updateCount',
+      'currentMixedIdentity',
+      'sourceNumericalTarget',
+      'rawPolicyVersion',
+      'backend',
+      'guard',
+      'configurationKey',
+      'inferenceVersion',
+      'guardVersion',
+      'projectionVersion',
+    ]) ||
+    !digest(playing.deploymentChecksum) ||
+    !digest(playing.configurationKey) ||
+    playing.sourceRole !== 'rlCurrentMixed' ||
+    playing.backend !== 'scalar' ||
+    playing.inferenceVersion !== GUARDED_POLICY_VERSION ||
+    playing.guardVersion !== GUARD_VERSION ||
+    playing.projectionVersion !== PROJECTION_VERSION ||
+    !keysMatch(playing.guard, [
+      'schema',
+      'algorithmVersion',
+      'stateProjectionVersion',
+      'repeatStatePolicy',
+      'maxTradesPerEpisode',
+      'maxPublicStateBytes',
+    ]) ||
+    playing.guard.schema !== 1 ||
+    playing.guard.algorithmVersion !== GUARD_VERSION ||
+    playing.guard.stateProjectionVersion !== PROJECTION_VERSION ||
+    playing.guard.repeatStatePolicy !== 'secondVisitExit' ||
+    playing.guard.maxTradesPerEpisode !== 64 ||
+    playing.guard.maxPublicStateBytes !== 131072
+  )
+    return false;
+  return currentMixedMetadataMatches({
+    checksum: playing.deploymentChecksum,
+    sourceRole: playing.sourceRole,
+    sourceChecksum: playing.sourceChecksum,
+    sourceNumericalTarget: playing.sourceNumericalTarget,
+    updateCount: playing.updateCount,
+    policyVersion: playing.rawPolicyVersion,
+    backend: playing.backend,
+    currentMixedIdentity: playing.currentMixedIdentity,
+  });
 }
 
 function conditionalMetadataMatches(metadata: CpuModelMetadata): boolean {
@@ -621,12 +869,16 @@ export function startCpuGame(signal: AbortSignal, modelChecksum: string): Promis
         value.policyVersion !==
           (metadata.sourceRole === 'conditionalHumanCurrentMixed'
             ? GUARDED_CONDITIONAL_POLICY_VERSION
-            : GUARDED_POLICY_VERSION) ||
+            : metadata.sourceRole === 'ownSetupCurrentMixedComposite'
+              ? GUARDED_OWN_SETUP_POLICY_VERSION
+              : GUARDED_POLICY_VERSION) ||
         value.rawPolicyVersion !== metadata.policyVersion ||
         value.guardVersion !== GUARD_VERSION ||
         value.projectionVersion !== PROJECTION_VERSION ||
         typeof value.configurationKey !== 'string' ||
         !SHA256.test(value.configurationKey) ||
+        (metadata.sourceRole === 'ownSetupCurrentMixedComposite' &&
+          value.configurationKey !== metadata.fixedPlayingIdentity!.configurationKey) ||
         value.maxCallbacks !== 4000
       )
         throw new Error('Invalid guarded game acknowledgement');
