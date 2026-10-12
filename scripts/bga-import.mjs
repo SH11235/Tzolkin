@@ -112,12 +112,28 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
         to: { resource: iconResources[1], amount: Number(m[2]) },
       };
     }
-  } else if (actor && /^は\d*\s*を(獲得した|支払った)$/.test(text) && iconResources.length > 0) {
-    result.kind = text.endsWith('獲得した') ? 'resourceGain' : 'resourcePayment';
-    result.detail = {
-      explicitAmount: text.match(/^は(\d+)/)?.[1] ? Number(text.match(/^は(\d+)/)[1]) : null,
-      iconResources,
-    };
+  } else if (actor && (m = match(/^は(\d*)\s*を(獲得した|支払った)$/))) {
+    if (!iconResources.length && m[1] && typeof message.html === 'string') {
+      const resources = Array.from(
+        message.html.matchAll(
+          /<div class="tz_icon resource_(corn|wood|stone|gold|skull)"><\/div>/g,
+        ),
+        (match) => match[1],
+      );
+      if (
+        resources.length === 1 &&
+        ['', ' '].some(
+          (space) =>
+            message.html ===
+            `${actor}は${m[1]}${space}<div class="tz_icon resource_${resources[0]}"></div>を${m[2]}`,
+        )
+      )
+        iconResources.push(...resources);
+    }
+    if (iconResources.length > 0) {
+      result.kind = m[2] === '獲得した' ? 'resourceGain' : 'resourcePayment';
+      result.detail = { explicitAmount: m[1] ? Number(m[1]) : null, iconResources };
+    }
   } else if (actor && text === 'は建物を建てた') result.kind = 'build';
   else if (actor && /記念碑.*(建てた|獲得した)/.test(text)) result.kind = 'monument';
   else if (actor && text.includes('の信仰を') && /コーン[1-3]個を受け取った/.test(text))
