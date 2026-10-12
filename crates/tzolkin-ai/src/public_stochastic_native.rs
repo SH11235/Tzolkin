@@ -1200,16 +1200,42 @@ pub(crate) fn require_payload_reservations<P: Serialize>(
 ) -> Result<(), String> {
     // Verify actual serialization stays within the conservative reservations.
     // This is a late invariant, not a license to perform work before admission.
+    let trace_bytes = trace_payload_bytes(record)?;
+    let total = serialized_size(record, MAX_RECORD_BYTES)?;
+    check_payload_reservations(record, config, total, trace_bytes)
+}
+
+pub(crate) fn require_payload_reservations_and_checksum<P: Serialize>(
+    record: &Record<P>,
+    config: &NativeStochasticConfig,
+    domain: &[u8],
+) -> Result<String, String> {
+    let trace_bytes = trace_payload_bytes(record)?;
+    let (checksum, total) =
+        crate::public_policy_episode::canonical_record_checksum_with_size(record, domain)?;
+    check_payload_reservations(record, config, total, trace_bytes)?;
+    Ok(checksum)
+}
+
+fn trace_payload_bytes<P>(record: &Record<P>) -> Result<usize, String> {
     let traces = record
         .callbacks
         .iter()
         .filter_map(|c| c.sample.as_ref())
         .map(|s| serialized_size(&s.trace, TRACE_RESERVE))
         .collect::<Result<Vec<_>, _>>()?;
-    let trace_bytes = traces.into_iter().try_fold(0usize, |sum, size| {
-        sum.checked_add(size).ok_or("Trace bytes overflow")
-    })?;
-    let total = serialized_size(record, MAX_RECORD_BYTES)?;
+    traces.into_iter().try_fold(0usize, |sum, size| {
+        sum.checked_add(size)
+            .ok_or_else(|| "Trace bytes overflow".into())
+    })
+}
+
+fn check_payload_reservations<P>(
+    record: &Record<P>,
+    config: &NativeStochasticConfig,
+    total: usize,
+    trace_bytes: usize,
+) -> Result<(), String> {
     let source_bytes = total
         .checked_sub(trace_bytes)
         .ok_or("Source bytes underflow")?;
@@ -1265,6 +1291,93 @@ mod tests {
         )
         .unwrap()
     }
+
+    #[test]
+    fn payload_checksum_uses_canonical_bytes_and_preserves_reservation_refusals() {
+        use crate::public_policy_episode::{
+            TARGET_CONTRACT, canonical_record_checksum, canonical_record_checksum_with_size,
+        };
+        use sha2::{Digest, Sha256};
+
+        let model = integration_fixture::model(false);
+        let policy = integration_fixture::handle(&model);
+        let config = config(3, CollectionLimits::default());
+        // Reuse the one-callback failure fixture; no full game or episode sealing.
+        let record =
+            run_with_apply(&config, &policy, None, |_, _| Err("fixture refusal".into())).unwrap();
+        let mut opponent = record.clone();
+        let callback = &mut opponent.callbacks[0];
+        let sample = callback.sample.take().unwrap();
+        callback.opponent_choice = Some(OpponentChoice {
+            decision: sample.decision,
+            chosen: sample.chosen,
+        });
+        callback.opponent_attempted = true;
+        let mut terminal = record.clone();
+        terminal.callbacks.clear();
+        terminal.failure = None;
+        terminal.terminal = Some(Terminal {
+            final_state: hex64(0),
+            final_scores: vec![],
+        });
+        // These wire variations test payloads only, never native audit/admission.
+        let domain = b"tzolkin-applied-current-mixed-episode-v2\0";
+        for record in [&record, &opponent, &terminal] {
+            let bytes = serde_json::to_vec(record).unwrap();
+            let trace_bytes: usize = record
+                .callbacks
+                .iter()
+                .filter_map(|c| c.sample.as_ref())
+                .map(|s| serde_json::to_vec(&s.trace).unwrap().len())
+                .sum();
+            let source_bytes = bytes.len() - trace_bytes;
+            let mut hash = Sha256::new();
+            hash.update(domain);
+            hash.update(TARGET_CONTRACT.as_bytes());
+            hash.update(b"\0");
+            hash.update(&bytes);
+            let expected = format!("{:x}", hash.finalize());
+            assert_eq!(
+                canonical_record_checksum_with_size(record, domain).unwrap(),
+                (expected.clone(), bytes.len())
+            );
+            assert_eq!(canonical_record_checksum(record, domain).unwrap(), expected);
+            assert_eq!(
+                require_payload_reservations_and_checksum(record, &config, domain).unwrap(),
+                expected
+            );
+            require_payload_reservations(record, &config).unwrap();
+            assert_eq!(serde_json::to_vec(record).unwrap(), bytes);
+
+            let refuse = |record: &Record, config: &NativeStochasticConfig| {
+                assert!(require_payload_reservations(record, config).is_err());
+                assert!(require_payload_reservations_and_checksum(record, config, domain).is_err());
+            };
+            let mut source_cap = config.clone();
+            source_cap.limits.source_bytes = source_bytes - 1;
+            refuse(record, &source_cap);
+            let mut source_reserved = record.clone();
+            source_reserved.source_payload_reserved_bytes = 0;
+            refuse(&source_reserved, &config);
+            if trace_bytes != 0 {
+                let mut trace_cap = config.clone();
+                trace_cap.limits.trace_bytes = trace_bytes - 1;
+                refuse(record, &trace_cap);
+                let mut trace_reserved = record.clone();
+                trace_reserved.trace_payload_reserved_bytes = trace_bytes - 1;
+                refuse(&trace_reserved, &config);
+                let mut oversized = record.clone();
+                oversized.callbacks[0]
+                    .sample
+                    .as_mut()
+                    .unwrap()
+                    .trace
+                    .policy_binding_key = "x".repeat(TRACE_RESERVE + 1);
+                refuse(&oversized, &config);
+            }
+        }
+    }
+
     #[test]
     fn frozen_resource_cycle_prefix_matches_fresh_native_replay() {
         use crate::arena::{BorrowedArenaPolicy, resource_cycle};
