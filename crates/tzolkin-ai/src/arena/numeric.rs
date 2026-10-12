@@ -6,6 +6,9 @@ use super::conditional::{
     ConditionalIdentity, ConditionalMixedArenaIdentity, ConditionalMixedArenaPolicy,
     ConditionalPolicy, GameSession,
 };
+use super::phase_routed::{
+    PhaseRouteDiagnostics, PhaseRoutedDevelopmentIdentity, PhaseRoutedDevelopmentPolicy,
+};
 use super::teacher::{
     ResourceCycleTeacherArenaIdentity, ResourceCycleTeacherArenaPolicy,
     SemanticSetupResourceCycleTeacherArenaPolicy, SemanticSetupTeacherArenaIdentity,
@@ -150,6 +153,20 @@ impl NumericPolicy {
     pub fn identity(&self) -> &NumericIdentity {
         &self.identity
     }
+    pub(super) fn borrowed_deployment(&self) -> Result<&LoadedDeployment, String> {
+        self.loaded
+            .as_ref()
+            .ok_or_else(|| "Numeric Arena immutable storage is unavailable".into())
+    }
+    pub(super) fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<tzolkin_inference::policy::NumericPolicyDistribution, String> {
+        if observation.legal_actions.len() > MAX_ROWS_PER_CALLBACK {
+            return Err("Numeric Arena candidate-row cap exceeded before prediction".into());
+        }
+        self.borrowed_deployment()?.distribution(observation)
+    }
 }
 
 pub enum Opponent<'a> {
@@ -192,6 +209,9 @@ pub enum PolicyIdentity {
     ResourceCycleV5SemanticSetupLearnedTeacher {
         identity: Box<SemanticSetupTeacherArenaIdentity>,
     },
+    SemanticSetupTeacherNumericPlayingDevelopment {
+        identity: Box<PhaseRoutedDevelopmentIdentity>,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
@@ -200,6 +220,7 @@ enum Role<'a> {
     ConditionalCountZero(Box<ConditionalCountZeroArenaPolicy<'a>>),
     Teacher(Box<ResourceCycleTeacherArenaPolicy<'a>>),
     SemanticSetupTeacher(Box<SemanticSetupResourceCycleTeacherArenaPolicy<'a>>),
+    PhaseRouted(Box<PhaseRoutedDevelopmentPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
@@ -252,6 +273,11 @@ impl<'a> Role<'a> {
                     identity: Box::new(policy.identity().clone()),
                 }
             }
+            Self::PhaseRouted(policy) => {
+                PolicyIdentity::SemanticSetupTeacherNumericPlayingDevelopment {
+                    identity: Box::new(policy.identity().clone()),
+                }
+            }
             Self::Reactive(policy) => PolicyIdentity::Reactive {
                 provenance: policy.description.provenance.clone(),
             },
@@ -270,6 +296,7 @@ impl<'a> Role<'a> {
             Self::SemanticSetupTeacher(policy) => {
                 Some(&policy.identity().teacher.configuration_key)
             }
+            Self::PhaseRouted(policy) => Some(&policy.identity().configuration_key),
             _ => None,
         }
     }
@@ -301,6 +328,8 @@ pub struct GuardDiagnostics {
     pub applied_choices: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conditional: Option<ConditionalDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_routes: Option<PhaseRouteDiagnostics>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -426,6 +455,13 @@ fn choose(
         let d = diagnostics[actor].as_mut().expect("conditional diagnostic");
         d.choices_attempted += 1;
         d.candidate_rows_attempted += observation.legal_actions.len();
+        if let Some(routes) = d.phase_routes.as_mut() {
+            match observation.phase {
+                Phase::Setup => routes.setup_choices_attempted += 1,
+                Phase::Playing => routes.playing_choices_attempted += 1,
+                _ => {}
+            }
+        }
         let result = match role {
             Role::Conditional(policy) => session.choose_move(index, observation, policy)?,
             Role::ConditionalMixed(policy) => session.choose_mixed(index, observation, policy)?,
@@ -436,10 +472,18 @@ fn choose(
             Role::SemanticSetupTeacher(policy) => {
                 session.choose_semantic_setup_teacher(index, observation, policy)?
             }
+            Role::PhaseRouted(policy) => session.choose_phase_routed(index, observation, policy)?,
             _ => return Err("Conditional Arena game session/role mismatch".into()),
         };
         d.choices_returned += 1;
         d.candidate_rows_returned += observation.legal_actions.len();
+        if let Some(routes) = d.phase_routes.as_mut() {
+            match observation.phase {
+                Phase::Setup => routes.setup_choices_returned += 1,
+                Phase::Playing => routes.playing_choices_returned += 1,
+                _ => unreachable!("phase-routed session returned an unsupported phase"),
+            }
+        }
         if let Some(trade) = result.trade {
             d.forced_exits += usize::from(trade.overridden);
             d.repeat_exits += usize::from(trade.overridden && trade.repeat_seen);
@@ -498,6 +542,9 @@ fn choose(
             Role::Teacher(_) => return Err("Teacher Arena missing game session".into()),
             Role::SemanticSetupTeacher(_) => {
                 return Err("Semantic Setup teacher Arena missing game session".into());
+            }
+            Role::PhaseRouted(_) => {
+                return Err("Phase-routed Arena missing game session".into());
             }
         };
         match (roster[actor].search(), trace) {
@@ -593,6 +640,7 @@ fn play_arm_using<'a>(
             Role::SemanticSetupTeacher(policy) => {
                 Some(GameSession::new_semantic_setup_teacher(policy))
             }
+            Role::PhaseRouted(policy) => Some(GameSession::new_phase_routed(policy)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -608,6 +656,10 @@ fn play_arm_using<'a>(
                     ..GuardDiagnostics::default()
                 })
             }
+            Role::PhaseRouted(_) => Some(GuardDiagnostics {
+                phase_routes: Some(PhaseRouteDiagnostics::default()),
+                ..GuardDiagnostics::default()
+            }),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -766,6 +818,29 @@ pub fn run_semantic_setup_resource_cycle_teacher_validation<'a>(
         reference,
         opponent_pool,
         super::teacher::SEMANTIC_SETUP_ARENA_SCHEMA,
+    );
+    prepared.recheck_sources()?;
+    result
+}
+
+/// Setup-only semantic teacher followed by the unchanged numeric reference's
+/// Playing predictor. The outer identity is a distinct Development experiment;
+/// it cannot enter either all-phase teacher or numeric deployment entry point.
+pub fn run_phase_routed_development_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: PhaseRoutedDevelopmentPolicy<'a>,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    candidate.validate_arena_config(config)?;
+    candidate.validate_reference(&reference)?;
+    let prepared = candidate.setup.prepared;
+    let result = run_roles(
+        config,
+        Role::PhaseRouted(Box::new(candidate)),
+        Role::Numeric(reference),
+        opponent_pool,
+        super::phase_routed::ARENA_SCHEMA,
     );
     prepared.recheck_sources()?;
     result
@@ -930,12 +1005,12 @@ fn shared_guard(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
     use tzolkin_inference::{deployment as d, features, policy};
 
-    fn synthetic_policy() -> NumericPolicy {
+    pub(crate) fn synthetic_policy() -> NumericPolicy {
         let mut wire = json!({
             "schema": d::DEPLOYMENT_SCHEMA,
             "contract": {
@@ -964,6 +1039,42 @@ mod tests {
             TradeGuardConfig::default(),
         )
         .unwrap()
+    }
+
+    pub(crate) fn synthetic_guard() -> GuardedDeployment {
+        let mut policy = synthetic_policy();
+        GuardedDeployment::new(policy.loaded.take().unwrap(), TradeGuardConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn phase_routed_numeric_pair_and_borrow_reject_mismatches() {
+        use super::super::phase_routed::validate_numeric_pair;
+        let playing = synthetic_policy();
+        let mut reference = synthetic_policy();
+        validate_numeric_pair(&playing, &reference).unwrap();
+        for field in ["checksum", "backend", "update", "guard"] {
+            let mut wrong = synthetic_policy();
+            match field {
+                "checksum" => wrong.identity.deployment_checksum = "c".repeat(64),
+                "backend" => wrong.identity.backend = "avx2".into(),
+                "update" => wrong.identity.claimed_update_count = Some(1),
+                "guard" => wrong.identity.guard.max_trades_per_episode = 1,
+                _ => unreachable!(),
+            }
+            assert!(validate_numeric_pair(&playing, &wrong).is_err());
+        }
+        reference.loaded = None;
+        assert!(validate_numeric_pair(&playing, &reference).is_err());
+        let state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        let mut o = observe(&state, state.current_player).unwrap();
+        o.legal_actions = vec![o.legal_actions[0].clone(); MAX_ROWS_PER_CALLBACK + 1];
+        assert_eq!(
+            playing.distribution(&o).err().unwrap(),
+            "Numeric Arena candidate-row cap exceeded before prediction"
+        );
+        let legacy = serde_json::to_value(GuardDiagnostics::default()).unwrap();
+        assert!(legacy.get("phaseRoutes").is_none());
     }
 
     #[test]
