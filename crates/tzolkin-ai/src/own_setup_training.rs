@@ -16,6 +16,9 @@ use crate::own_setup_native::{
 };
 use crate::own_setup_pullback::OwnSetupScalarPullback;
 use crate::own_setup_record::{self, FixedPlayingIdentity, OwnSetupCounts, SetupSample};
+use crate::own_setup_roster::{
+    DeclaredOwnSetupRosterPlan, OwnSetupRosterBinding, RosteredTrainedOwnSetupCollector,
+};
 use crate::own_setup_trained_model::{
     self as trained, BorrowedTrainedOwnSetup, SetupUpdateSource, TrainedOwnSetupArtifact,
     TrainedOwnSetupIdentity,
@@ -225,6 +228,7 @@ pub struct OwnSetupTrainingOwner {
     credited_ids: BTreeSet<String>,
     credited_records: BTreeSet<String>,
     ledger: Vec<OwnSetupAttemptReport>,
+    roster_plan: Option<DeclaredOwnSetupRosterPlan>,
 }
 impl OwnSetupTrainingOwner {
     pub fn new(
@@ -273,6 +277,7 @@ impl OwnSetupTrainingOwner {
             credited_ids: BTreeSet::new(),
             credited_records: BTreeSet::new(),
             ledger: Vec::new(),
+            roster_plan: None,
         })
     }
     pub fn update_count(&self) -> u64 {
@@ -300,6 +305,9 @@ impl OwnSetupTrainingOwner {
     }
     pub fn ledger(&self) -> &[OwnSetupAttemptReport] {
         &self.ledger
+    }
+    pub fn roster_plan(&self) -> Option<&DeclaredOwnSetupRosterPlan> {
+        self.roster_plan.as_ref()
     }
 
     pub(crate) fn config_checksum(&self) -> &str {
@@ -367,6 +375,34 @@ impl OwnSetupTrainingOwner {
         self.run_config = run.clone();
         self.exclusions = exclusions;
         self.config_checksum = checksum;
+        self.roster_plan = None;
+        Ok(run)
+    }
+
+    pub(crate) fn continue_rostered_budget(
+        &mut self,
+        plan: &DeclaredOwnSetupRosterPlan,
+        exclusions: DeclaredOwnSetupExclusions,
+    ) -> Result<OwnSetupRunConfig, String> {
+        let first = self
+            .next_episode
+            .ok_or("Own Setup roster cursor exhausted")?;
+        plan.validate_install(
+            &self.playing_binding,
+            &exclusions,
+            first,
+            self.run_config.sampling_seed,
+            self.run_config.replicate_ordinal,
+        )?;
+        // A bounded metadata copy only; this declaration has no parameters,
+        // optimizer, history, credit or ownership constructor.
+        let owned_plan = serde_json::from_slice(&json(plan)?).map_err(|e| e.to_string())?;
+        let run = self.continue_budget(plan.configurations().len() as u64, exclusions)?;
+        self.config_checksum = hash(
+            b"tzolkin-own-setup-rostered-continuation-training-config-v1\0",
+            &(&self.config_checksum, plan.checksum()),
+        )?;
+        self.roster_plan = Some(owned_plan);
         Ok(run)
     }
 
@@ -398,6 +434,9 @@ impl OwnSetupTrainingOwner {
         let last = first
             .checked_add(configs.len() as u64 - 1)
             .ok_or("Own Setup batch exceeds remaining u64 cursor")?;
+        if let Some(plan) = &self.roster_plan {
+            plan.validate_batch(configs, first)?;
+        }
         let families: Vec<_> = configs
             .iter()
             .map(|c| seed_family_id(c.native().environment_seed()))
@@ -541,7 +580,14 @@ impl OwnSetupTrainingOwner {
         receipts: &mut Vec<OwnSetupEpisodeReceipt>,
         mode: BatchRecords<'_>,
     ) -> Result<OwnSetupAttemptOutcome, String> {
-        let episodes = collect_batch(&self.setup, &mut self.playing, configs, receipts, mode)?;
+        let episodes = collect_batch(
+            &self.setup,
+            &mut self.playing,
+            self.roster_plan.as_ref(),
+            configs,
+            receipts,
+            mode,
+        )?;
         let model = self.setup.model();
         let mut gradient = vec![0.0; PARAMETER_COUNT];
         let identity = self.setup.identity_bytes()?;
@@ -550,6 +596,11 @@ impl OwnSetupTrainingOwner {
         let mut sources = Vec::new();
         for (episode, config) in episodes.iter().zip(configs) {
             let e = episode.view()?;
+            let roster = self
+                .roster_plan
+                .as_ref()
+                .map(|plan| plan.binding(config))
+                .transpose()?;
             if e.identity != identity
                 || json(e.playing)? != json(&self.playing_binding)?
                 || json(&e.config)?
@@ -558,6 +609,7 @@ impl OwnSetupTrainingOwner {
                     ))?
                 || e.learner_seat != config.learner_seat()
                 || e.family != seed_family_id(config.native().environment_seed())
+                || e.roster != roster.as_ref()
                 || self.credited_ids.contains(e.id)
                 || self.credited_records.contains(e.checksum)
                 || !ids.insert(e.id.to_owned())
@@ -810,6 +862,7 @@ fn json<T: Serialize>(v: &T) -> Result<Vec<u8>, String> {
 enum SealedEpisode {
     Initialized(Box<ValidatedOwnSetupEpisode>),
     Trained(Box<ValidatedTrainedOwnSetupEpisode>),
+    Rostered(Box<ValidatedTrainedOwnSetupEpisode>),
 }
 struct EpisodeView<'a> {
     id: &'a str,
@@ -822,6 +875,7 @@ struct EpisodeView<'a> {
     observation: &'a Observation,
     sample: &'a SetupSample,
     winner_share: f64,
+    roster: Option<&'a OwnSetupRosterBinding>,
 }
 impl SealedEpisode {
     fn view(&self) -> Result<EpisodeView<'_>, String> {
@@ -841,12 +895,14 @@ impl SealedEpisode {
                     observation: e.setup_observation(),
                     sample: e.sample(),
                     winner_share: e.winner_share(),
+                    roster: e.roster_binding(),
                 })
             }};
         }
         match self {
             Self::Initialized(e) => view!(e),
             Self::Trained(e) => view!(e),
+            Self::Rostered(e) => view!(e),
         }
     }
 }
@@ -937,9 +993,16 @@ batch_source!(
     decode_trained,
     Trained
 );
+batch_source!(
+    RosteredTrainedOwnSetupCollector,
+    encode_rostered_record,
+    decode_rostered,
+    Rostered
+);
 fn collect_batch(
     setup: &SetupState,
     playing: &mut Option<LoadedDeployment>,
+    roster: Option<&DeclaredOwnSetupRosterPlan>,
     configs: &[OwnSetupNativeConfig],
     receipts: &mut Vec<OwnSetupEpisodeReceipt>,
     mode: BatchRecords<'_>,
@@ -982,6 +1045,16 @@ fn collect_batch(
             *playing = Some(collector.into_playing()?);
             result
         }};
+    }
+    if let Some(plan) = roster {
+        let SetupState::Trained(setup) = setup else {
+            return Err("Own Setup roster requires a source-produced trained continuation".into());
+        };
+        let loaded = playing
+            .as_ref()
+            .ok_or("Own Setup Playing storage unavailable")?;
+        let mut collector = RosteredTrainedOwnSetupCollector::new(setup, loaded, plan)?;
+        return collect(&mut collector, configs, receipts, mode);
     }
     match setup {
         SetupState::Initialized(a) => {

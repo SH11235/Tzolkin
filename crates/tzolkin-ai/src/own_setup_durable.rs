@@ -13,6 +13,7 @@ use crate::model::digest;
 use crate::own_setup_model::{InitializedOwnSetupArtifact, InitializedOwnSetupIdentity};
 use crate::own_setup_native::{OwnSetupNativeConfig, fixed_playing_identity};
 use crate::own_setup_record::FixedPlayingIdentity;
+use crate::own_setup_roster::DeclaredOwnSetupRosterPlan;
 use crate::own_setup_training::{
     BatchRecords, DeclaredOwnSetupExclusions, OwnSetupAdamConfig, OwnSetupAttemptReport,
     OwnSetupCheckpointState, OwnSetupRunConfig, OwnSetupTrainingOwner, ReservedOwnSetupAttempt,
@@ -30,6 +31,7 @@ use crate::public_stochastic_record::{MAX_RECORD_BYTES, unique_json};
 
 const ROOT_SCHEMA: &str = "tzolkin-own-setup-durable-root-v1";
 const CONTINUATION_SCHEMA: &str = "tzolkin-own-setup-durable-continuation-root-v1";
+const ROSTER_CONTINUATION_SCHEMA: &str = "tzolkin-own-setup-durable-rostered-continuation-root-v1";
 const HEAD_SCHEMA: &str = "tzolkin-own-setup-durable-head-v1";
 const MAX_ATTEMPTS: u64 = 64;
 const MAX_SEGMENTS: usize = 16;
@@ -148,6 +150,8 @@ struct ContinuationRoot {
     offsets: Offsets,
     additional_episodes: u64,
     checksum: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    roster_plan: Option<DeclaredOwnSetupRosterPlan>,
 }
 
 #[derive(Debug)]
@@ -325,11 +329,40 @@ impl DurableOwnSetupOwner {
     /// original archive is never edited; the child has its own bounded local
     /// Pending/Closed sequence and retains the owner's cumulative ledger.
     pub fn continue_in(
+        self,
+        directory: &Path,
+        additional_episodes: u64,
+        exclusions: DeclaredOwnSetupExclusions,
+        limits: OwnSetupArchiveLimits,
+    ) -> Result<Self, String> {
+        self.continue_with_plan(directory, additional_episodes, exclusions, limits, None)
+    }
+
+    /// Installs the entire closed prospective roster only after genuine cold
+    /// source reconstruction of a completed successful trained lineage. Old
+    /// archives and trained genesis identity remain unchanged.
+    pub fn continue_rostered_in(
+        self,
+        directory: &Path,
+        plan: DeclaredOwnSetupRosterPlan,
+        exclusions: DeclaredOwnSetupExclusions,
+        limits: OwnSetupArchiveLimits,
+    ) -> Result<Self, String> {
+        self.continue_with_plan(
+            directory,
+            plan.configurations().len() as u64,
+            exclusions,
+            limits,
+            Some(plan),
+        )
+    }
+    fn continue_with_plan(
         mut self,
         directory: &Path,
         additional_episodes: u64,
         exclusions: DeclaredOwnSetupExclusions,
         limits: OwnSetupArchiveLimits,
+        roster_plan: Option<DeclaredOwnSetupRosterPlan>,
     ) -> Result<Self, String> {
         limits.validate()?;
         let (parent, offsets) = self.continuation_parent()?;
@@ -344,15 +377,26 @@ impl DurableOwnSetupOwner {
         {
             return Err("Own Setup continuation exceeds finite local/cumulative bounds".into());
         }
-        let config = self.apply_continuation(additional_episodes, exclusions, limits)?;
+        let config = self.apply_continuation(
+            additional_episodes,
+            exclusions,
+            limits,
+            roster_plan.as_ref(),
+        )?;
         let checkpoint_bytes = bounded_json(&self.owner.checkpoint()?, CHECKPOINT_CAP)?;
         let mut root = ContinuationRoot {
-            schema: CONTINUATION_SCHEMA.into(),
+            schema: if roster_plan.is_some() {
+                ROSTER_CONTINUATION_SCHEMA
+            } else {
+                CONTINUATION_SCHEMA
+            }
+            .into(),
             config,
             parent,
             offsets,
             additional_episodes,
             checksum: String::new(),
+            roster_plan,
         };
         root.checksum = continuation_checksum(&root)?;
         let root_bytes = bounded_json(&root, ROOT_CAP)?;
@@ -394,6 +438,7 @@ impl DurableOwnSetupOwner {
         additional_episodes: u64,
         exclusions: DeclaredOwnSetupExclusions,
         limits: OwnSetupArchiveLimits,
+        roster_plan: Option<&DeclaredOwnSetupRosterPlan>,
     ) -> Result<Root, String> {
         limits.validate()?;
         if !(1..=256).contains(&additional_episodes)
@@ -406,9 +451,22 @@ impl DurableOwnSetupOwner {
         {
             return Err("Own Setup successor episode bounds differ".into());
         }
-        let run = self
-            .owner
-            .continue_budget(additional_episodes, exclusions)?;
+        let run = match roster_plan {
+            Some(plan) => {
+                if plan.configurations().len() as u64 != additional_episodes {
+                    return Err("Own Setup roster whole plan/budget differs".into());
+                }
+                if plan.batch_sizes().len() as u64 > limits.max_attempts {
+                    return Err(
+                        "Own Setup roster whole batch plan exceeds local attempt cap".into(),
+                    );
+                }
+                self.owner.continue_rostered_budget(plan, exclusions)?
+            }
+            None => self
+                .owner
+                .continue_budget(additional_episodes, exclusions)?,
+        };
         let mut config = Root {
             schema: ROOT_SCHEMA.into(),
             initial: self.root.initial.clone(),
@@ -458,8 +516,10 @@ impl DurableOwnSetupOwner {
             let inventory = inventory(&directory)?;
             let root_bytes = read_bounded(&directory.join("root.json"), ROOT_CAP)?;
             let root: ContinuationRoot = decode(&root_bytes, ROOT_CAP)?;
-            if root.schema != CONTINUATION_SCHEMA
-                || root.checksum != continuation_checksum(&root)?
+            if !matches!(
+                root.schema.as_str(),
+                CONTINUATION_SCHEMA | ROSTER_CONTINUATION_SCHEMA
+            ) || root.checksum != continuation_checksum(&root)?
                 || root.parent != parent
                 || root.offsets != offsets
                 || inventory.keys().filter_map(|n| head_sequence(n)).max()
@@ -471,6 +531,7 @@ impl DurableOwnSetupOwner {
                 root.additional_episodes,
                 source.exclusions,
                 root.config.limits.clone(),
+                root.roster_plan.as_ref(),
             )?;
             if json(&expected_config)? != json(&root.config)? {
                 return Err("Own Setup successor exact config/baseline differs".into());
@@ -1147,6 +1208,27 @@ fn root_checksum(root: &Root) -> Result<String, String> {
     )
 }
 fn continuation_checksum(root: &ContinuationRoot) -> Result<String, String> {
+    if root.schema == ROSTER_CONTINUATION_SCHEMA {
+        let plan = root
+            .roster_plan
+            .as_ref()
+            .ok_or("Own Setup roster continuation lacks original plan")?;
+        plan.validate()?;
+        return hash(
+            b"tzolkin-own-setup-durable-rostered-continuation-root-v1\0",
+            &(
+                &root.schema,
+                &root.config,
+                &root.parent,
+                &root.offsets,
+                root.additional_episodes,
+                plan,
+            ),
+        );
+    }
+    if root.schema != CONTINUATION_SCHEMA || root.roster_plan.is_some() {
+        return Err("Legacy Own Setup continuation cannot contain a roster plan".into());
+    }
     hash(
         b"tzolkin-own-setup-durable-continuation-root-v1\0",
         &(

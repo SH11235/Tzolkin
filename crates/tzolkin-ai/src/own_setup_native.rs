@@ -5,7 +5,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tzolkin_core::observation::{LegalAction, Observation, observe};
 use tzolkin_core::{GameOptions, GameState, Phase, apply_move, create_game_with_options};
-use tzolkin_inference::deployment::{GuardedDeployment, LoadedDeployment};
+use tzolkin_inference::deployment::{
+    BorrowedGuardedDeployment, GuardedDeployment, GuardedDeploymentDecision, LoadedDeployment,
+};
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 use crate::arena::resource_cycle::{self, ResourceCycleConfig};
@@ -14,9 +16,10 @@ use crate::own_setup_model::{
     BorrowedInitializedOwnSetup, InitializedOwnSetupArtifact, SetupCandidates,
 };
 use crate::own_setup_record::{
-    self, Callback, CallbackRole, Choice, FixedPlayingIdentity, GuardedWire, Header,
-    OwnSetupCounts, Record, SeatRole, SetupSample,
+    self, Callback, CallbackRole, Choice, FixedPlayingIdentity, GuardNotification, GuardedWire,
+    Header, OwnSetupCounts, Record, SeatRole, SetupSample,
 };
+use crate::own_setup_roster::{OwnSetupRosterBinding, OwnSetupSeat};
 use crate::own_setup_trained_model::{
     BorrowedTrainedOwnSetup, TrainedOwnSetupArtifact, TrainedOwnSetupIdentity,
 };
@@ -239,10 +242,39 @@ fn seal<S: Serialize>(record: Record<S>) -> Result<SuccessfulEpisode<S>, String>
         || c.setup_reserved_rows != 6
         || c.apply_successes != c.observed_callbacks
         || c.validated_transitions != c.observed_callbacks
-        || c.guard_notifications != c.observed_callbacks
+        || c.guard_notifications
+            != c.observed_callbacks
+                * r.header
+                    .roster
+                    .as_ref()
+                    .map_or(1, |b| b.guarded_seats().len())
         || c.setup_accepted + c.playing_choices + c.opponent_choices != c.observed_callbacks
     {
         return Err("Own Setup episode requires a complete fresh audited single sample".into());
+    }
+    if let Some(binding) = &r.header.roster {
+        let seats = binding.guarded_seats();
+        if r.schema != own_setup_record::ROSTERED_RECORD_SCHEMA
+            || c.guard_notification_attempts != c.guard_notifications
+            || r.callbacks.iter().any(|cb| {
+                !cb.guard_notification_attempted
+                    || !cb.guard_notified
+                    || cb.guards.as_ref().is_none_or(|guards| {
+                        guards.len() != seats.len()
+                            || guards
+                                .iter()
+                                .zip(&seats)
+                                .any(|(g, seat)| g.seat != *seat || !g.attempted || !g.returned)
+                    })
+            })
+        {
+            return Err(
+                "Own Setup roster seal requires every actor callback in every independent guard"
+                    .into(),
+            );
+        }
+    } else if r.schema == own_setup_record::ROSTERED_RECORD_SCHEMA {
+        return Err("Own Setup roster seal lacks the original plan binding".into());
     }
     let setup_index = r
         .callbacks
@@ -256,6 +288,9 @@ fn seal<S: Serialize>(record: Record<S>) -> Result<SuccessfulEpisode<S>, String>
         own_setup_record::RECORD_SCHEMA => b"tzolkin-own-setup-audited-episode-v1\0".as_slice(),
         own_setup_record::TRAINED_RECORD_SCHEMA => {
             b"tzolkin-own-setup-trained-audited-episode-v2\0".as_slice()
+        }
+        own_setup_record::ROSTERED_RECORD_SCHEMA => {
+            b"tzolkin-own-setup-rostered-trained-audited-episode-v1\0".as_slice()
         }
         _ => return Err("Unknown Own Setup episode source".into()),
     });
@@ -301,6 +336,9 @@ macro_rules! episode_getters {
             }
             pub(crate) fn playing_binding(&self) -> &FixedPlayingIdentity {
                 &self.record.header.playing
+            }
+            pub fn roster_binding(&self) -> Option<&OwnSetupRosterBinding> {
+                self.record.header.roster.as_ref()
             }
             pub fn counts(&self) -> &OwnSetupCounts {
                 &self.record.counts
@@ -483,6 +521,168 @@ pub struct ValidatedTrainedOwnSetupEpisode {
     winner_share: f64,
     episode_id: String,
 }
+pub(crate) fn seal_rostered(
+    record: Record<TrainedOwnSetupIdentity>,
+) -> Result<ValidatedTrainedOwnSetupEpisode, String> {
+    if record.schema != own_setup_record::ROSTERED_RECORD_SCHEMA {
+        return Err("Expected actual rostered audit source".into());
+    }
+    let e = seal(record)?;
+    Ok(ValidatedTrainedOwnSetupEpisode {
+        record: e.record,
+        setup_index: e.setup_index,
+        winner_share: e.winner_share,
+        episode_id: e.episode_id,
+    })
+}
+
+// One executor serves legacy collection and the closed roster. The legacy
+// owning guard still receives exactly one callback and keeps its wire bytes.
+trait NativeGuard {
+    fn policy(&self) -> &LoadedDeployment;
+    fn roster(&self) -> Option<&OwnSetupRosterBinding> {
+        None
+    }
+    fn notify(
+        &mut self,
+        index: usize,
+        observation: &Observation,
+        callback: &mut Callback,
+        counts: &mut OwnSetupCounts,
+    ) -> Result<(), String>;
+    fn choose(
+        &mut self,
+        index: usize,
+        observation: &Observation,
+    ) -> Result<GuardedDeploymentDecision, String>;
+}
+impl NativeGuard for GuardedDeployment {
+    fn policy(&self) -> &LoadedDeployment {
+        self.policy()
+    }
+    fn notify(
+        &mut self,
+        index: usize,
+        observation: &Observation,
+        callback: &mut Callback,
+        counts: &mut OwnSetupCounts,
+    ) -> Result<(), String> {
+        callback.guard_notification_attempted = true;
+        counts.guard_notification_attempts += 1;
+        self.on_callback(index, observation)?;
+        callback.guard_notified = true;
+        counts.guard_notifications += 1;
+        Ok(())
+    }
+    fn choose(
+        &mut self,
+        index: usize,
+        observation: &Observation,
+    ) -> Result<GuardedDeploymentDecision, String> {
+        self.choose_move(index, observation)
+    }
+}
+struct RosterGuards<'a> {
+    playing: &'a LoadedDeployment,
+    binding: &'a OwnSetupRosterBinding,
+    guards: Vec<(usize, BorrowedGuardedDeployment<'a>)>,
+}
+impl NativeGuard for RosterGuards<'_> {
+    fn policy(&self) -> &LoadedDeployment {
+        self.playing
+    }
+    fn roster(&self) -> Option<&OwnSetupRosterBinding> {
+        Some(self.binding)
+    }
+    fn notify(
+        &mut self,
+        index: usize,
+        observation: &Observation,
+        callback: &mut Callback,
+        counts: &mut OwnSetupCounts,
+    ) -> Result<(), String> {
+        let notices = callback
+            .guards
+            .as_mut()
+            .ok_or("Missing bounded roster guard trace")?;
+        for ((seat, guard), notice) in self.guards.iter_mut().zip(notices) {
+            if *seat != notice.seat {
+                return Err("Own Setup roster guard order differs".into());
+            }
+            notice.attempted = true;
+            counts.guard_notification_attempts += 1;
+            if self.binding.absolute_seats[*seat] == OwnSetupSeat::Learner {
+                callback.guard_notification_attempted = true;
+            }
+            guard.on_callback(index, observation)?;
+            notice.returned = true;
+            counts.guard_notifications += 1;
+            if self.binding.absolute_seats[*seat] == OwnSetupSeat::Learner {
+                callback.guard_notified = true;
+            }
+        }
+        Ok(())
+    }
+    fn choose(
+        &mut self,
+        index: usize,
+        observation: &Observation,
+    ) -> Result<GuardedDeploymentDecision, String> {
+        self.guards
+            .iter_mut()
+            .find(|(seat, _)| *seat == observation.actor)
+            .ok_or("Own Setup roster actor has no independent guard")?
+            .1
+            .choose_move(index, observation)
+    }
+}
+pub(crate) fn run_rostered(
+    config: &OwnSetupNativeConfig,
+    setup: &BorrowedTrainedOwnSetup<'_>,
+    playing: &LoadedDeployment,
+    binding: &OwnSetupRosterBinding,
+    expected: Option<&Record<TrainedOwnSetupIdentity>>,
+) -> Result<Record<TrainedOwnSetupIdentity>, String> {
+    let guard_config = TradeGuardConfig::default();
+    guard_config.configuration_key()?;
+    let mut guard = RosterGuards {
+        playing,
+        binding,
+        guards: binding
+            .guarded_seats()
+            .into_iter()
+            .map(|seat| {
+                Ok((
+                    seat,
+                    BorrowedGuardedDeployment::new(playing, guard_config.clone())?,
+                ))
+            })
+            .collect::<Result<_, String>>()?,
+    };
+    let mut actual = header(config, setup, playing)?;
+    bind_roster_header(&mut actual, binding);
+    if let Some(record) = expected {
+        same_bytes(
+            &actual,
+            &record.header,
+            "Own Setup roster header/immutable identities mismatch before model work",
+        )?;
+    }
+    run(config, setup, &mut guard, expected)
+}
+fn bind_roster_header<S>(header: &mut Header<S>, binding: &OwnSetupRosterBinding) {
+    header.source_kind = own_setup_record::ROSTERED_SOURCE_KIND.into();
+    header.roles = binding
+        .absolute_seats
+        .iter()
+        .map(|seat| match seat {
+            OwnSetupSeat::Learner => SeatRole::LearnerSetupFixedPlaying,
+            OwnSetupSeat::V5 => SeatRole::V5Opponent,
+            OwnSetupSeat::FixedPlayingNn => SeatRole::FixedPlayingNnOpponent,
+        })
+        .collect();
+    header.roster = Some(binding.clone());
+}
 fn header<P: NativeOwnSetup>(
     config: &OwnSetupNativeConfig,
     setup: &P,
@@ -513,6 +713,7 @@ fn header<P: NativeOwnSetup>(
         producer_authenticated: false,
         independent_seed_origins_verified: false,
         training_admission: "unavailable-own-setup-owner-required".into(),
+        roster: None,
     })
 }
 fn same_bytes<A: Serialize, B: Serialize>(a: &A, b: &B, message: &str) -> Result<(), String> {
@@ -610,15 +811,18 @@ fn unique_action(
     Ok(actions[0].clone())
 }
 
-fn run<P: NativeOwnSetup>(
+fn run<P: NativeOwnSetup, G: NativeGuard>(
     config: &OwnSetupNativeConfig,
     setup: &P,
-    guard: &mut GuardedDeployment,
+    guard: &mut G,
     expected: Option<&Record<P::Identity>>,
 ) -> Result<Record<P::Identity>, String> {
     let native = &config.native;
     let limits = native.limits();
-    let header = header(config, setup, guard.policy())?;
+    let mut header = header(config, setup, guard.policy())?;
+    if let Some(binding) = guard.roster() {
+        bind_roster_header(&mut header, binding);
+    }
     let initial_reserved = serialized_size(&header, limits.max_source_bytes())?
         .checked_add(FINAL_RESERVE)
         .ok_or("Own Setup header reservation overflow")?;
@@ -626,7 +830,12 @@ fn run<P: NativeOwnSetup>(
         return Err("Own Setup header exceeds source cap".into());
     }
     let mut record = Record {
-        schema: P::RECORD_SCHEMA.into(),
+        schema: if guard.roster().is_some() {
+            own_setup_record::ROSTERED_RECORD_SCHEMA
+        } else {
+            P::RECORD_SCHEMA
+        }
+        .into(),
         header,
         callbacks: Vec::new(),
         terminal: None,
@@ -718,7 +927,9 @@ fn run<P: NativeOwnSetup>(
                     .and_then(|a| a.checked_mul(2))
                     .and_then(|a| {
                         Some((
-                            n.checked_add(a)?.checked_add(CALLBACK_RESERVE)?,
+                            n.checked_add(a)?
+                                .checked_add(CALLBACK_RESERVE)?
+                                .checked_add(guard_trace_reservation(guard.roster()).ok()?)?,
                             a.checked_add(TRACE_RESERVE)?,
                         ))
                     })
@@ -752,7 +963,13 @@ fn run<P: NativeOwnSetup>(
             }
         }
         let role = if observation.actor != config.learner_seat {
-            CallbackRole::V5Opponent
+            if guard.roster().is_some_and(|b| {
+                b.absolute_seats[observation.actor] == OwnSetupSeat::FixedPlayingNn
+            }) {
+                CallbackRole::FixedPlayingNnOpponent
+            } else {
+                CallbackRole::V5Opponent
+            }
         } else if observation.phase == Phase::Setup {
             CallbackRole::SetupSample
         } else {
@@ -775,6 +992,16 @@ fn run<P: NativeOwnSetup>(
             state_after: None,
             state_validated: false,
             failure: None,
+            guards: guard.roster().map(|b| {
+                b.guarded_seats()
+                    .into_iter()
+                    .map(|seat| GuardNotification {
+                        seat,
+                        attempted: false,
+                        returned: false,
+                    })
+                    .collect()
+            }),
         });
         record.counts.observed_callbacks += 1;
         let result = step(
@@ -843,11 +1070,11 @@ fn run<P: NativeOwnSetup>(
 }
 
 type StepFailure = (FailureReason, AttemptStage, String);
-fn step<P: NativeOwnSetup>(
+fn step<P: NativeOwnSetup, G: NativeGuard>(
     record: &mut Record<P::Identity>,
     config: &OwnSetupNativeConfig,
     setup: &P,
-    guard: &mut GuardedDeployment,
+    guard: &mut G,
     state: &mut GameState,
     observation: &Observation,
     reservation: Option<(usize, usize)>,
@@ -891,13 +1118,14 @@ fn step<P: NativeOwnSetup>(
     if record.callbacks[index].role == CallbackRole::SetupSample {
         record.counts.setup_reserved_rows += rows;
     }
-    record.callbacks[index].guard_notification_attempted = true;
-    record.counts.guard_notification_attempts += 1;
     guard
-        .on_callback(index, observation)
+        .notify(
+            index,
+            observation,
+            &mut record.callbacks[index],
+            &mut record.counts,
+        )
         .map_err(|e| before_choice(FailureReason::ModelOrSamplingError, e))?;
-    record.callbacks[index].guard_notified = true;
-    record.counts.guard_notifications += 1;
     record.callbacks[index].choice_attempted = true;
     let role = record.callbacks[index].role;
     let choice = match role {
@@ -930,7 +1158,7 @@ fn step<P: NativeOwnSetup>(
                 ));
             }
             let decision = guard
-                .choose_move(index, observation)
+                .choose(index, observation)
                 .map_err(|e| before_choice(FailureReason::ModelOrSamplingError, e))?;
             let chosen = unique_action(
                 observation,
@@ -973,6 +1201,27 @@ fn step<P: NativeOwnSetup>(
                     r#move: decision.r#move,
                     score_bits: hex64(decision.score.to_bits()),
                 },
+                chosen,
+            }
+        }
+        CallbackRole::FixedPlayingNnOpponent => {
+            record.counts.opponent_attempts += 1;
+            // Ordinary fixed-Playing scoring supports genuine base Setup as well as
+            // Playing. No heuristic or sampled learner path is substituted.
+            let decision = guard
+                .choose(index, observation)
+                .map_err(|e| before_choice(FailureReason::ModelOrSamplingError, e))?;
+            let chosen = unique_action(
+                observation,
+                decision.decision.actor,
+                &decision.decision.observation_key,
+                decision.decision.score,
+                &decision.decision.r#move,
+            )
+            .map_err(|e| before_choice(FailureReason::DecisionMismatch, e))?;
+            record.counts.opponent_choices += 1;
+            Choice::FixedPlayingNnOpponent {
+                guarded: GuardedWire::from_decision(decision),
                 chosen,
             }
         }
@@ -1085,8 +1334,32 @@ fn source_size<S: Serialize>(record: &Record<S>) -> Result<usize, String> {
         bytes = bytes
             .checked_add(serialized_size(&source, MAX_RECORD_BYTES)?)
             .ok_or("Own Setup source size overflow")?;
+        if let Some(guards) = &cb.guards {
+            bytes = bytes
+                .checked_add(serialized_size(guards, MAX_RECORD_BYTES)? + 32)
+                .ok_or("Own Setup roster source size overflow")?;
+        }
     }
     Ok(bytes)
+}
+fn guard_trace_reservation(binding: Option<&OwnSetupRosterBinding>) -> Result<usize, String> {
+    match binding {
+        None => Ok(0),
+        Some(binding) => {
+            let guards: Vec<_> = binding
+                .guarded_seats()
+                .into_iter()
+                .map(|seat| GuardNotification {
+                    seat,
+                    attempted: false,
+                    returned: false,
+                })
+                .collect();
+            serialized_size(&guards, MAX_RECORD_BYTES)?
+                .checked_add(32)
+                .ok_or_else(|| "Own Setup roster guard reservation overflow".into())
+        }
+    }
 }
 fn finish<S: Serialize>(
     mut record: Record<S>,
@@ -1209,6 +1482,35 @@ pub(crate) mod tests {
     fn real_setup_prefix_audit_and_guarded_playing_parity_recover_same_storage() {
         let artifact = InitializedOwnSetupArtifact::new(7).unwrap();
         let mut collector = OwnSetupCollector::new(&artifact, playing()).unwrap();
+        // Numeric fixture only, never a native update or reconstructed owner.
+        // The short roster prefixes must not acquire an episode seal.
+        let trained = TrainedOwnSetupArtifact::from_update(
+            TrainedOwnSetupIdentity {
+                schema: crate::own_setup_trained_model::ARTIFACT_SCHEMA.into(),
+                policy_version: crate::own_setup_trained_model::POLICY_VERSION.into(),
+                sampling_version: crate::own_setup_trained_model::SAMPLING_VERSION.into(),
+                task: crate::own_setup_trained_model::TASK.into(),
+                parent_checksum: artifact.identity.checksum.clone(),
+                initial: artifact.identity.clone(),
+                update_count: 1,
+                training_config_checksum: "a".repeat(64),
+                playing_binding_checksum: playing_binding_checksum(
+                    &fixed_playing_identity(collector.playing().unwrap()).unwrap(),
+                )
+                .unwrap(),
+                numerical_target: numerical_target(),
+                parameter_words_checksum: String::new(),
+                sources: vec![crate::own_setup_trained_model::SetupUpdateSource {
+                    episode_id: "b".repeat(64),
+                    record_checksum: "c".repeat(64),
+                }],
+                checksum: String::new(),
+            },
+            crate::own_setup_model::OwnSetupModel {
+                own_setup_parameters: artifact.model.parameters().to_vec(),
+            },
+        )
+        .unwrap();
         let checksum = collector.playing().unwrap().checksum().to_string();
         for (players, learner, callbacks) in [(3, 0, 4), (4, 3, 4)] {
             let config = config(players, learner, callbacks, 1024);
@@ -1248,6 +1550,15 @@ pub(crate) mod tests {
                     .collect::<Vec<_>>()
             );
             let bytes = own_setup_record::encode_record(&collected).unwrap();
+            let legacy_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(legacy_value["header"].get("roster").is_none());
+            assert!(
+                legacy_value["callbacks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|cb| cb.get("guards").is_none())
+            );
             assert!(collector.audit(&bytes).unwrap().into_episode().is_err());
             assert_eq!(collector.playing().unwrap().checksum(), checksum);
             assert_eq!(
@@ -1320,6 +1631,115 @@ pub(crate) mod tests {
             assert!(collector.audit(&resealed(tampered)).is_err());
             assert!(collector.audit(&bytes).is_ok());
             assert_eq!(collector.playing().unwrap().checksum(), checksum);
+
+            let mut seats = vec![OwnSetupSeat::V5; players];
+            seats[learner] = OwnSetupSeat::Learner;
+            let nn_seat = if learner == 0 { 1 } else { 0 };
+            seats[nn_seat] = OwnSetupSeat::FixedPlayingNn;
+            let plan = crate::own_setup_roster::DeclaredOwnSetupRosterPlan::new(
+                fixed_playing_identity(collector.playing().unwrap()).unwrap(),
+                vec![
+                    crate::own_setup_roster::OwnSetupRosterConfig::new(
+                        self::config(players, learner, callbacks, 1024),
+                        seats,
+                    )
+                    .unwrap(),
+                ],
+                vec![1],
+            )
+            .unwrap();
+            assert!(
+                plan.validate_batch(std::slice::from_ref(&config), u64::MAX - 1)
+                    .is_ok()
+            );
+            assert!(plan.validate_batch(&[], u64::MAX - 1).is_err());
+            let excluded = vec![seed_family_id(17)];
+            let exclusions = crate::own_setup_training::DeclaredOwnSetupExclusions::from_families(
+                excluded.clone(),
+                1,
+                &crate::own_setup_training::DeclaredOwnSetupExclusions::digest_for_families(
+                    &excluded,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(
+                plan.validate_install(
+                    &fixed_playing_identity(collector.playing().unwrap()).unwrap(),
+                    &exclusions,
+                    u64::MAX - 1,
+                    u64::MAX,
+                    7
+                )
+                .is_err()
+            );
+            let mut rostered = crate::own_setup_roster::RosteredTrainedOwnSetupCollector::new(
+                &trained,
+                collector.playing().unwrap(),
+                &plan,
+            )
+            .unwrap();
+            let game = rostered.collect(&config).unwrap();
+            assert!(!game.complete());
+            assert_eq!(game.counts().guard_notifications, callbacks * 2);
+            assert_eq!(game.counts().guard_notification_attempts, callbacks * 2);
+            assert_eq!(game.counts().apply_successes, callbacks);
+            assert_eq!(game.counts().actor_draws, counts.actor_draws);
+            assert_eq!(game.counts().setup_reserved_rows, 6);
+            let saved = own_setup_record::encode_rostered_record(&game).unwrap();
+            assert!(own_setup_record::decode_trained(&saved).is_err());
+            assert!(rostered.audit(&saved).unwrap().into_episode().is_err());
+            let decoded = own_setup_record::decode_rostered(&saved).unwrap();
+            let nn_callback = decoded
+                .callbacks
+                .iter()
+                .find(|cb| {
+                    cb.actor == nn_seat
+                        && cb
+                            .observation
+                            .as_ref()
+                            .is_some_and(|o| o.phase == Phase::Setup)
+                })
+                .unwrap();
+            assert!(matches!(
+                nn_callback.choice,
+                Some(Choice::FixedPlayingNnOpponent { .. })
+            ));
+            // A separate owning guard is an independent reference for the NN
+            // seat, including every global actor's actual fresh callback.
+            let mut reference =
+                GuardedDeployment::new(reference.into_policy(), TradeGuardConfig::default())
+                    .unwrap();
+            let mut state = create_game_with_options(
+                (0..players).map(|s| format!("P{s}")).collect(),
+                17,
+                GameOptions::default(),
+            )
+            .unwrap();
+            for cb in &decoded.callbacks {
+                let o = observe(&state, state.current_player).unwrap();
+                reference.on_callback(cb.index, &o).unwrap();
+                if let Some(Choice::FixedPlayingNnOpponent { guarded, .. }) = &cb.choice {
+                    let expected =
+                        GuardedWire::from_decision(reference.choose_move(cb.index, &o).unwrap());
+                    same_bytes(
+                        guarded,
+                        &expected,
+                        "roster NN ordinary Setup/Playing scoring mismatch",
+                    )
+                    .unwrap();
+                }
+                state = apply_move(&state, cb.choice.as_ref().unwrap().chosen().r#move.clone())
+                    .unwrap();
+            }
+            let mut tampered = decoded;
+            tampered.callbacks[0].guards.as_mut().unwrap()[0].returned = false;
+            tampered.checksum = own_setup_record::checksum(&tampered).unwrap();
+            assert!(
+                rostered
+                    .audit(&serde_json::to_vec(&tampered).unwrap())
+                    .is_err()
+            );
         }
     }
 
