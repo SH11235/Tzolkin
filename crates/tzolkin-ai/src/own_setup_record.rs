@@ -10,7 +10,11 @@ use tzolkin_inference::deployment::{CurrentMixedIdentity, GuardedDeploymentDecis
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 use crate::own_setup_model::InitializedOwnSetupIdentity;
-use crate::own_setup_native::{AuditedOwnSetupGame, CollectedOwnSetupGame, OwnSetupCollector};
+use crate::own_setup_native::{
+    AuditedOwnSetupGame, AuditedTrainedOwnSetupGame, CollectedOwnSetupGame,
+    CollectedTrainedOwnSetupGame, OwnSetupCollector, TrainedOwnSetupCollector,
+};
+use crate::own_setup_trained_model::TrainedOwnSetupIdentity;
 use crate::public_stochastic_record::{
     Config, DecisionWire, Failure, MAX_RECORD_BYTES, Terminal, hex64, serialized_size, unique_json,
 };
@@ -19,12 +23,15 @@ pub const RECORD_SCHEMA: &str = "tzolkin-own-setup-native-record-v1";
 pub const SOURCE_KIND: &str = "ownSetupSampleFixedGuardedPlayingV5";
 pub const SAMPLING_VERSION: &str = "own-setup-semantic-scalar-uniform-tick53-v1";
 const CHECKSUM_DOMAIN: &[u8] = b"tzolkin-own-setup-native-record-v1\0";
+pub const TRAINED_RECORD_SCHEMA: &str = "tzolkin-own-setup-trained-native-record-v2";
+pub const TRAINED_SOURCE_KIND: &str = "trainedOwnSetupSampleFixedGuardedPlayingV5";
+const TRAINED_CHECKSUM_DOMAIN: &[u8] = b"tzolkin-own-setup-trained-native-record-v2\0";
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Record {
+pub(crate) struct Record<S = InitializedOwnSetupIdentity> {
     pub schema: String,
-    pub header: Header,
+    pub header: Header<S>,
     pub callbacks: Vec<Callback>,
     pub terminal: Option<Terminal>,
     pub failure: Option<Failure>,
@@ -33,12 +40,12 @@ pub(crate) struct Record {
 }
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Header {
+pub(crate) struct Header<S = InitializedOwnSetupIdentity> {
     pub source_kind: String,
     pub config: Config,
     pub learner_seat: usize,
     pub native_family_id: String,
-    pub setup: InitializedOwnSetupIdentity,
+    pub setup: S,
     pub playing: FixedPlayingIdentity,
     pub roles: Vec<SeatRole>,
     pub opponent: crate::arena::resource_cycle::ResourceCycleConfig,
@@ -218,7 +225,7 @@ impl GuardedWire {
 
 /// Row counters are admission/work reservations, not hardware forward measurements.
 /// Source bytes count serialized source fragments; trace bytes count full choices.
-#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OwnSetupCounts {
     pub observed_callbacks: usize,
@@ -246,9 +253,9 @@ pub struct OwnSetupCounts {
 }
 
 // This serialization differs only in checksum content; it avoids cloning a game.
-struct ChecksumPayload<'a>(&'a Record);
-impl Serialize for ChecksumPayload<'_> {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+struct ChecksumPayload<'a, S>(&'a Record<S>);
+impl<S: Serialize> Serialize for ChecksumPayload<'_, S> {
+    fn serialize<T: serde::Serializer>(&self, s: T) -> Result<T::Ok, T::Error> {
         let r = self.0;
         let mut s = s.serialize_struct("Record", 7)?;
         s.serialize_field("schema", &r.schema)?;
@@ -279,27 +286,38 @@ impl Write for HashWriter {
         Ok(())
     }
 }
-pub(crate) fn checksum(record: &Record) -> Result<String, String> {
+pub(crate) fn checksum<S: Serialize>(record: &Record<S>) -> Result<String, String> {
     let mut out = HashWriter {
         hash: Sha256::new(),
         bytes: 0,
     };
-    out.hash.update(CHECKSUM_DOMAIN);
+    out.hash.update(match record.schema.as_str() {
+        RECORD_SCHEMA => CHECKSUM_DOMAIN,
+        TRAINED_RECORD_SCHEMA => TRAINED_CHECKSUM_DOMAIN,
+        _ => return Err("Unsupported Own Setup checksum domain".into()),
+    });
     serde_json::to_writer(&mut out, &ChecksumPayload(record)).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", out.hash.finalize()))
 }
-pub(crate) fn decode(bytes: &[u8]) -> Result<Record, String> {
+fn decode_kind<S: serde::de::DeserializeOwned + Serialize>(
+    bytes: &[u8],
+    schema: &str,
+) -> Result<Record<S>, String> {
     let raw = unique_json(bytes, MAX_RECORD_BYTES)?;
-    let record: Record = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if raw != serde_json::to_value(&record).map_err(|e| e.to_string())?
-        || record.schema != RECORD_SCHEMA
-    {
+    let record: Record<S> = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    if raw != serde_json::to_value(&record).map_err(|e| e.to_string())? || record.schema != schema {
         return Err("Own Setup record closed schema/field mismatch".into());
     }
     if record.checksum.len() != 64 || record.checksum != checksum(&record)? {
         return Err("Own Setup record checksum mismatch".into());
     }
     Ok(record)
+}
+pub(crate) fn decode(bytes: &[u8]) -> Result<Record, String> {
+    decode_kind(bytes, RECORD_SCHEMA)
+}
+pub(crate) fn decode_trained(bytes: &[u8]) -> Result<Record<TrainedOwnSetupIdentity>, String> {
+    decode_kind(bytes, TRAINED_RECORD_SCHEMA)
 }
 /// Encode only an actual collection result, including a closed failure prefix.
 pub fn encode_record(game: &CollectedOwnSetupGame) -> Result<Vec<u8>, String> {
@@ -312,5 +330,17 @@ pub fn decode_and_audit(
     collector: &mut OwnSetupCollector<'_>,
     bytes: &[u8],
 ) -> Result<AuditedOwnSetupGame, String> {
+    collector.audit(bytes)
+}
+/// Encode only a real trained-model collection; the initialized codec stays closed.
+pub fn encode_trained_record(game: &CollectedTrainedOwnSetupGame) -> Result<Vec<u8>, String> {
+    let record = game.record();
+    serialized_size(record, MAX_RECORD_BYTES)?;
+    serde_json::to_vec(record).map_err(|e| e.to_string())
+}
+pub fn decode_and_audit_trained(
+    collector: &mut TrainedOwnSetupCollector<'_>,
+    bytes: &[u8],
+) -> Result<AuditedTrainedOwnSetupGame, String> {
     collector.audit(bytes)
 }

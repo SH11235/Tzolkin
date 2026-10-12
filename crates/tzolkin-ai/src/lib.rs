@@ -18,6 +18,8 @@ pub mod own_setup_model;
 pub mod own_setup_native;
 pub mod own_setup_pullback;
 pub mod own_setup_record;
+pub mod own_setup_trained_model;
+pub mod own_setup_training;
 pub mod policy_dataset;
 pub mod policy_training;
 pub mod public_deployment;
