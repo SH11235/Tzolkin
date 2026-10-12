@@ -346,12 +346,14 @@ pub(super) struct ConditionalDecision {
 enum SetupRoute {
     CornFirst,
     NumericAllPhase(&'static str),
+    PhaseRoutedDevelopment,
 }
 impl SetupRoute {
     fn policy_version(self) -> &'static str {
         match self {
             Self::CornFirst => POLICY_VERSION,
             Self::NumericAllPhase(version) => version,
+            Self::PhaseRoutedDevelopment => super::phase_routed::POLICY_VERSION,
         }
     }
 }
@@ -401,6 +403,12 @@ impl GameSession {
             &policy.identity().teacher.guard,
         )
         .expect("semantic Setup teacher constructor validated guard configuration")
+    }
+    pub(super) fn new_phase_routed(
+        policy: &super::phase_routed::PhaseRoutedDevelopmentPolicy<'_>,
+    ) -> Self {
+        Self::with_route(SetupRoute::PhaseRoutedDevelopment, &policy.identity().guard)
+            .expect("phase-routed constructor validated the default guard configuration")
     }
     fn with_config(setup: ConditionalSetup, guard: &TradeGuardConfig) -> Result<Self, String> {
         let route = match setup {
@@ -494,6 +502,14 @@ impl GameSession {
         policy: &super::teacher::SemanticSetupResourceCycleTeacherArenaPolicy<'_>,
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.prepared.distribution(o))
+    }
+    pub(super) fn choose_phase_routed(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &super::phase_routed::PhaseRoutedDevelopmentPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.distribution(o))
     }
     fn choose_using(
         &mut self,
@@ -609,6 +625,140 @@ mod tests {
 
     fn session() -> GameSession {
         GameSession::with_config(ConditionalSetup::CornFirst, &TradeGuardConfig::default()).unwrap()
+    }
+    #[test]
+    fn phase_routed_experts_keep_numeric_playing_and_trade_parity() {
+        use super::super::{numeric, phase_routed, teacher};
+        let mut parameters = vec![0.0; tzolkin_inference::policy::PARAMETER_COUNT];
+        parameters[480] = 1.0;
+        parameters[512 * 32 + 32] = 1.0;
+        let model = serde_json::from_value::<
+            crate::resource_cycle_teacher_training::SemanticSetupTeacherModel,
+        >(serde_json::json!({"semanticSetupParameters": parameters}))
+        .unwrap();
+        model.validate().unwrap();
+        let scalar = crate::kernel::Kernel::Scalar.resolve().unwrap();
+        let numeric = numeric::tests::synthetic_policy();
+        let mut guarded = numeric::tests::synthetic_guard();
+        let mut game = GameSession::with_route(
+            SetupRoute::PhaseRoutedDevelopment,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        let predict = |o: &Observation| {
+            phase_routed::route_distribution(
+                o,
+                |o| teacher::semantic_setup_distribution(&model, scalar, o),
+                |o| numeric.distribution(o),
+            )
+        };
+        let mut state = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        let mut index = 0;
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            game.on_callback(index, &o).unwrap();
+            guarded.on_callback(index, &o).unwrap();
+            let selected = if o.actor == 0 {
+                let expected = teacher::semantic_setup_distribution(&model, scalar, &o).unwrap();
+                let routed = phase_routed::route_distribution(
+                    &o,
+                    |_| {
+                        Ok(NumericPolicyDistribution {
+                            logits: expected.logits.clone(),
+                            probabilities: expected.probabilities.clone(),
+                        })
+                    },
+                    |_| panic!("Setup must not invoke numeric Playing"),
+                )
+                .unwrap();
+                assert_eq!(routed.logits, expected.logits);
+                let chosen = game.choose_using(index, &o, predict).unwrap().decision;
+                assert_eq!(chosen.policy_version, phase_routed::POLICY_VERSION);
+                chosen.r#move
+            } else {
+                o.legal_actions[0].r#move.clone()
+            };
+            state = apply_move(&state, selected).unwrap();
+            index += 1;
+        }
+        state.current_player = 0;
+        for resource in [Resource::Corn, Resource::Wood] {
+            state.players[0].resources.insert(resource, 3);
+        }
+        state.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        let trade = observe(&state, 0).unwrap();
+        let actual = phase_routed::route_distribution(
+            &trade,
+            |_| panic!("Playing must not invoke semantic Setup"),
+            |o| numeric.distribution(o),
+        )
+        .unwrap();
+        assert_eq!(actual.logits, numeric.distribution(&trade).unwrap().logits);
+        // Exact repeats trigger the same exit, and another actor's callback
+        // resets both episodes without restarting the game callback index.
+        for other_actor in [false, false, true, false] {
+            if other_actor {
+                state.current_player = 1;
+                let other = observe(&state, 1).unwrap();
+                game.on_callback(index, &other).unwrap();
+                guarded.on_callback(index, &other).unwrap();
+                index += 1;
+                state.current_player = 0;
+            }
+            game.on_callback(index, &trade).unwrap();
+            guarded.on_callback(index, &trade).unwrap();
+            let routed = game.choose_using(index, &trade, predict).unwrap();
+            let reference = guarded.choose_move(index, &trade).unwrap();
+            assert_eq!(routed.decision.r#move, reference.decision.r#move);
+            assert_eq!(routed.decision.score, reference.decision.score);
+            assert_eq!(
+                serde_json::to_value(routed.trade).unwrap(),
+                serde_json::to_value(reference.trade).unwrap()
+            );
+            index += 1;
+        }
+        assert!(
+            game.choose_using(index - 1, &trade, |_| unreachable!())
+                .is_err()
+        );
+        assert!(game.on_callback(index, &trade).is_err());
+        let mut fresh = GameSession::with_route(
+            SetupRoute::PhaseRoutedDevelopment,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        fresh.on_callback(0, &trade).unwrap();
+        assert!(
+            !fresh
+                .choose_using(0, &trade, predict)
+                .unwrap()
+                .trade
+                .unwrap()
+                .repeat_seen
+        );
+        let mut too_many = trade.clone();
+        too_many.legal_actions =
+            vec![trade.legal_actions[0].clone(); numeric::MAX_ROWS_PER_CALLBACK + 1];
+        too_many.observation_key = observation_key(&too_many).unwrap();
+        assert!(
+            GameSession::with_route(
+                SetupRoute::PhaseRoutedDevelopment,
+                &TradeGuardConfig::default()
+            )
+            .unwrap()
+            .on_callback(0, &too_many)
+            .is_err()
+        );
+        let mut finished = trade.clone();
+        finished.phase = Phase::Finished;
+        assert!(
+            phase_routed::route_distribution(&finished, |_| unreachable!(), |_| unreachable!())
+                .is_err()
+        );
     }
     #[test]
     fn conditional_callbacks_and_setup_are_explicit_and_fail_closed() {
