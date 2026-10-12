@@ -387,6 +387,7 @@ pub(crate) fn allows_opponents(schema: &str) -> bool {
     schema == crate::public_mixed_native::RECORD_SCHEMA
         || schema == crate::public_rl_mixed_native::RECORD_SCHEMA
         || schema == crate::public_rl_current_mixed_source::RECORD_SCHEMA
+        || schema == crate::conditional_human_rl_update::RECORD_SCHEMA
 }
 /// Validate representation before any reconstruction/model work. Existing
 /// FNV fingerprints are sixteen hex digits; SHA digests are sixty-four.

@@ -463,6 +463,49 @@ fn validate_report_numeric(
     families: &[String],
     (source, allow_unchanged_actor): (&SeatPolicy, bool),
 ) -> Result<(), String> {
+    source.validate()?;
+    if !matches!(source, SeatPolicy::PublicLearned { inference_backend, .. } if inference_backend == "scalar")
+    {
+        return Err("Invalid checkpoint numeric/source/count metadata".into());
+    }
+    validate_numeric_metadata(
+        counts,
+        deltas,
+        numeric,
+        config,
+        identities,
+        families,
+        allow_unchanged_actor,
+    )
+}
+/// Conditional reports share numerical checks without minting native provenance.
+pub(crate) fn validate_conditional_joint_report(
+    counts: &[usize; 3],
+    deltas: &Deltas,
+    numeric: &NumericReport,
+    config: &OneStepConfig,
+    identities: ([&str; 4], &[String; 4]),
+    families: &[String; 4],
+) -> Result<(), String> {
+    let mut sorted = families.clone();
+    sorted.sort();
+    if sorted
+        .iter()
+        .any(|f| split_for_family(f) != Ok(DatasetSplit::Train))
+    {
+        return Err("Conditional numeric report requires native Train families".into());
+    }
+    validate_numeric_metadata(counts, deltas, numeric, config, identities, &sorted, true)
+}
+fn validate_numeric_metadata(
+    counts: &[usize; 3],
+    deltas: &Deltas,
+    numeric: &NumericReport,
+    config: &OneStepConfig,
+    identities: ([&str; 4], &[String; 4]),
+    families: &[String],
+    allow_unchanged_actor: bool,
+) -> Result<(), String> {
     let finite = [
         deltas.max_abs_all_log_delta,
         deltas.max_abs_chosen_log_delta,
@@ -473,7 +516,6 @@ fn validate_report_numeric(
         numeric.actual_delta_l2,
         numeric.actual_delta_max_abs,
     ];
-    source.validate()?;
     if finite.iter().any(|v| !v.is_finite() || *v < 0.0)
         || deltas.max_abs_all_log_delta > MAX_ALL_LOG_DELTA
         || numeric.actual_delta_max_abs > config.max_abs_actual_delta
@@ -492,7 +534,6 @@ fn validate_report_numeric(
             .into_iter()
             .chain(identities.1.iter().map(String::as_str))
             .any(|s| !checkpoint_digest(s))
-        || !matches!(source, SeatPolicy::PublicLearned { inference_backend, .. } if inference_backend == "scalar")
         || families.is_empty()
         || families.len() > crate::policy_dataset::MAX_FILES + 40
         || families.windows(2).any(|p| p[0] >= p[1])
