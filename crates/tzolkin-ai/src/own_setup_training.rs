@@ -69,6 +69,9 @@ impl DeclaredOwnSetupExclusions {
     pub fn digest(&self) -> &str {
         &self.digest
     }
+    pub(crate) fn families(&self) -> &BTreeSet<String> {
+        &self.families
+    }
     pub fn count(&self) -> usize {
         self.families.len()
     }
@@ -152,8 +155,9 @@ impl SetupState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(
+    deny_unknown_fields,
     tag = "kind",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
@@ -169,15 +173,15 @@ pub enum OwnSetupAttemptOutcome {
         reason: String,
     },
 }
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OwnSetupEpisodeReceipt {
     pub record_checksum: String,
     pub episode_id: Option<String>,
     pub counts: OwnSetupCounts,
 }
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OwnSetupAttemptReport {
     pub first_episode_ordinal: u64,
     pub reserved_episodes: usize,
@@ -305,6 +309,13 @@ impl OwnSetupTrainingOwner {
         &mut self,
         configs: &[OwnSetupNativeConfig],
     ) -> Result<OwnSetupAttemptReport, String> {
+        let reservation = self.reserve(configs)?;
+        self.resolve(reservation, configs, BatchRecords::Collect(None))
+    }
+    pub(crate) fn preview(
+        &self,
+        configs: &[OwnSetupNativeConfig],
+    ) -> Result<OwnSetupAttemptReport, String> {
         if !(1..=MAX_BATCH).contains(&configs.len())
             || self
                 .attempted
@@ -323,15 +334,11 @@ impl OwnSetupTrainingOwner {
             .iter()
             .map(|c| seed_family_id(c.native().environment_seed()))
             .collect();
-        let reused = families.iter().any(|f| self.spent_families.contains(f));
-        self.next_episode = last.checked_add(1);
-        self.attempted += configs.len() as u64;
-        self.spent_families.extend(families.iter().cloned());
-        let mut report = OwnSetupAttemptReport {
+        let report = OwnSetupAttemptReport {
             first_episode_ordinal: first,
             reserved_episodes: configs.len(),
-            next_episode_ordinal: self.next_episode,
-            attempted_episodes: self.attempted,
+            next_episode_ordinal: last.checked_add(1),
+            attempted_episodes: self.attempted + configs.len() as u64,
             families,
             setup_before: self.setup.checksum().into(),
             setup_after: self.setup.checksum().into(),
@@ -340,21 +347,83 @@ impl OwnSetupTrainingOwner {
                 reason: "Reserved attempt did not finish".into(),
             },
         };
-        // Record a reservation before any model work, including rejected configs.
+        Ok(report)
+    }
+    pub(crate) fn reserve(
+        &mut self,
+        configs: &[OwnSetupNativeConfig],
+    ) -> Result<ReservedOwnSetupAttempt, String> {
+        let report = self.preview(configs)?;
+        let reused = report
+            .families
+            .iter()
+            .any(|f| self.spent_families.contains(f));
+        self.next_episode = report.next_episode_ordinal;
+        self.attempted = report.attempted_episodes;
+        self.spent_families.extend(report.families.iter().cloned());
         self.ledger.push(report.clone());
+        Ok(ReservedOwnSetupAttempt {
+            report,
+            reused,
+            ledger_index: self.ledger.len() - 1,
+        })
+    }
+    pub(crate) fn resolve(
+        &mut self,
+        reservation: ReservedOwnSetupAttempt,
+        configs: &[OwnSetupNativeConfig],
+        mode: BatchRecords<'_>,
+    ) -> Result<OwnSetupAttemptReport, String> {
+        let ReservedOwnSetupAttempt {
+            mut report,
+            reused,
+            ledger_index,
+        } = reservation;
+        self.check_reservation(&report, ledger_index, configs)?;
         let result = self
-            .preflight(configs, first, reused)
-            .and_then(|()| self.execute(configs, &mut report.receipts));
+            .preflight(configs, report.first_episode_ordinal, reused)
+            .and_then(|()| self.execute(configs, &mut report.receipts, mode));
         report.outcome = match result {
             Ok(outcome) => outcome,
             Err(reason) => OwnSetupAttemptOutcome::Rejected { reason },
         };
         report.setup_after = self.setup.checksum().into();
-        *self
-            .ledger
-            .last_mut()
-            .ok_or("Missing Own Setup reserved attempt")? = report.clone();
+        self.ledger[ledger_index] = report.clone();
         Ok(report)
+    }
+    pub(crate) fn abandon(
+        &mut self,
+        reservation: ReservedOwnSetupAttempt,
+        configs: &[OwnSetupNativeConfig],
+    ) -> Result<OwnSetupAttemptReport, String> {
+        let mut report = reservation.report;
+        self.check_reservation(&report, reservation.ledger_index, configs)?;
+        report.outcome = OwnSetupAttemptOutcome::Rejected {
+            reason: "Interrupted durable reservation consumed without model work".into(),
+        };
+        self.ledger[reservation.ledger_index] = report.clone();
+        Ok(report)
+    }
+    fn check_reservation(
+        &self,
+        report: &OwnSetupAttemptReport,
+        index: usize,
+        configs: &[OwnSetupNativeConfig],
+    ) -> Result<(), String> {
+        if index + 1 != self.ledger.len()
+            || report.setup_before != self.setup.checksum()
+            || report.attempted_episodes != self.attempted
+            || report.next_episode_ordinal != self.next_episode
+            || report.reserved_episodes != configs.len()
+            || report.families
+                != configs
+                    .iter()
+                    .map(|c| seed_family_id(c.native().environment_seed()))
+                    .collect::<Vec<_>>()
+        {
+            return Err("Own Setup reservation/current owner mismatch".into());
+        }
+        Ok(())
     }
     fn preflight(
         &self,
@@ -402,8 +471,9 @@ impl OwnSetupTrainingOwner {
         &mut self,
         configs: &[OwnSetupNativeConfig],
         receipts: &mut Vec<OwnSetupEpisodeReceipt>,
+        mode: BatchRecords<'_>,
     ) -> Result<OwnSetupAttemptOutcome, String> {
-        let episodes = collect_batch(&self.setup, &mut self.playing, configs, receipts)?;
+        let episodes = collect_batch(&self.setup, &mut self.playing, configs, receipts, mode)?;
         let model = self.setup.model();
         let mut gradient = vec![0.0; PARAMETER_COUNT];
         let identity = self.setup.identity_bytes()?;
@@ -486,6 +556,185 @@ impl OwnSetupTrainingOwner {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum SetupCheckpoint {
+    Initialized {
+        identity: Box<crate::own_setup_model::InitializedOwnSetupIdentity>,
+        parameter_bits: Vec<String>,
+    },
+    Trained {
+        identity: Box<TrainedOwnSetupIdentity>,
+        parameter_bits: Vec<String>,
+    },
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct OwnSetupCheckpointState {
+    schema: String,
+    setup: SetupCheckpoint,
+    optimizer_step: u64,
+    first_moment_bits: Vec<String>,
+    second_moment_bits: Vec<String>,
+    config_checksum: String,
+    playing_binding: FixedPlayingIdentity,
+    adam_config: OwnSetupAdamConfig,
+    run_config: OwnSetupRunConfig,
+    exclusion_count: usize,
+    exclusion_digest: String,
+    next_episode_ordinal: Option<u64>,
+    attempted_episodes: u64,
+    spent_families: Vec<String>,
+    credited_episode_ids: Vec<String>,
+    credited_record_checksums: Vec<String>,
+}
+impl OwnSetupTrainingOwner {
+    pub(crate) fn checkpoint(&self) -> Result<OwnSetupCheckpointState, String> {
+        let parameter_bits = self
+            .setup
+            .model()
+            .parameters()
+            .iter()
+            .map(|v| format!("{:08x}", v.to_bits()))
+            .collect();
+        let setup = match &self.setup {
+            SetupState::Initialized(a) => SetupCheckpoint::Initialized {
+                identity: Box::new(a.identity.clone()),
+                parameter_bits,
+            },
+            SetupState::Trained(a) => SetupCheckpoint::Trained {
+                identity: Box::new(a.identity().clone()),
+                parameter_bits,
+            },
+        };
+        Ok(OwnSetupCheckpointState {
+            schema: "tzolkin-own-setup-checkpoint-state-v1".into(),
+            setup,
+            optimizer_step: self.optimizer.step,
+            first_moment_bits: self
+                .optimizer
+                .first
+                .iter()
+                .map(|v| hex64(v.to_bits()))
+                .collect(),
+            second_moment_bits: self
+                .optimizer
+                .second
+                .iter()
+                .map(|v| hex64(v.to_bits()))
+                .collect(),
+            config_checksum: self.config_checksum.clone(),
+            playing_binding: crate::own_setup_native::fixed_playing_identity(self.playing()?)?,
+            adam_config: self.adam_config.clone(),
+            run_config: self.run_config.clone(),
+            exclusion_count: self.exclusions.count(),
+            exclusion_digest: self.exclusions.digest().into(),
+            next_episode_ordinal: self.next_episode,
+            attempted_episodes: self.attempted,
+            spent_families: self.spent_families.iter().cloned().collect(),
+            credited_episode_ids: self.credited_ids.iter().cloned().collect(),
+            credited_record_checksums: self.credited_records.iter().cloned().collect(),
+        })
+    }
+}
+impl OwnSetupCheckpointState {
+    // Numeric/shape refusal only. The durable reader must rebuild the live owner
+    // through all reservations and real source audits, then compare every word.
+    pub(crate) fn validate_claim(&self) -> Result<(), String> {
+        if self.schema != "tzolkin-own-setup-checkpoint-state-v1"
+            || !checkpoint_digest(&self.config_checksum)
+            || !checkpoint_digest(&self.exclusion_digest)
+            || self.first_moment_bits.len() != PARAMETER_COUNT
+            || self.second_moment_bits.len() != PARAMETER_COUNT
+            || !(1..=MAX_ATTEMPTED_EPISODES).contains(&self.run_config.max_attempted_episodes)
+            || self.attempted_episodes > self.run_config.max_attempted_episodes
+            || self.optimizer_step > self.attempted_episodes
+            || self.next_episode_ordinal
+                != self
+                    .run_config
+                    .first_episode_ordinal
+                    .checked_add(self.attempted_episodes)
+            || self.exclusion_count > MAX_EXCLUSIONS
+            || self.spent_families.len() > self.attempted_episodes as usize
+            || self.credited_episode_ids.len() > self.attempted_episodes as usize
+            || self.credited_record_checksums.len() != self.credited_episode_ids.len()
+        {
+            return Err("Invalid closed Own Setup checkpoint shape/count/digest".into());
+        }
+        self.adam_config.validate()?;
+        for list in [
+            &self.spent_families,
+            &self.credited_episode_ids,
+            &self.credited_record_checksums,
+        ] {
+            if list.iter().any(|s| !checkpoint_digest(s)) || list.windows(2).any(|p| p[0] >= p[1]) {
+                return Err("Own Setup checkpoint set closure differs".into());
+            }
+        }
+        for (first, second) in self.first_moment_bits.iter().zip(&self.second_moment_bits) {
+            let m = f64::from_bits(crate::public_stochastic_record::parse_hex64(first)?);
+            let v = f64::from_bits(crate::public_stochastic_record::parse_hex64(second)?);
+            if !m.is_finite()
+                || !v.is_finite()
+                || v < 0.0
+                || (self.optimizer_step == 0 && (m != 0.0 || v != 0.0))
+            {
+                return Err("Nonfinite/incompatible Own Setup moment claim".into());
+            }
+        }
+        let (bits, count) = match &self.setup {
+            SetupCheckpoint::Initialized { parameter_bits, .. } => (parameter_bits, 0),
+            SetupCheckpoint::Trained {
+                identity,
+                parameter_bits,
+            } => (parameter_bits, identity.update_count),
+        };
+        if bits.len() != PARAMETER_COUNT || count != self.optimizer_step {
+            return Err("Own Setup checkpoint parameter/count shape".into());
+        }
+        let mut parameters = Vec::with_capacity(PARAMETER_COUNT);
+        for word in bits {
+            if word.len() != 8
+                || !word
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("Invalid f32 checkpoint word".into());
+            }
+            parameters.push(f32::from_bits(
+                u32::from_str_radix(word, 16).map_err(|e| e.to_string())?,
+            ));
+        }
+        let model = OwnSetupModel {
+            own_setup_parameters: parameters,
+        };
+        model.validate()?;
+        match &self.setup {
+            SetupCheckpoint::Initialized { identity, .. } => {
+                let actual = InitializedOwnSetupArtifact::new(identity.seed)?;
+                if identity.as_ref() != &actual.identity
+                    || model
+                        .parameters()
+                        .iter()
+                        .zip(actual.model.parameters())
+                        .any(|(a, b)| a.to_bits() != b.to_bits())
+                {
+                    return Err("Initialized checkpoint words/identity changed".into());
+                }
+            }
+            SetupCheckpoint::Trained { identity, .. } => {
+                trained::validate_numeric_claim(identity, &model)?
+            }
+        }
+        Ok(())
+    }
+}
+
 fn json<T: Serialize>(v: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(v).map_err(|e| e.to_string())
 }
@@ -533,65 +782,135 @@ impl SealedEpisode {
         }
     }
 }
+pub(crate) struct ReservedOwnSetupAttempt {
+    report: OwnSetupAttemptReport,
+    reused: bool,
+    ledger_index: usize,
+}
+impl ReservedOwnSetupAttempt {
+    pub(crate) fn report(&self) -> &OwnSetupAttemptReport {
+        &self.report
+    }
+}
+pub(crate) enum BatchRecords<'a> {
+    Collect(Option<&'a mut Vec<Vec<u8>>>),
+    Audit(&'a [Vec<u8>]),
+}
 trait BatchSource {
-    fn collect_sealed(
+    fn one(
         &mut self,
         config: &OwnSetupNativeConfig,
         receipts: &mut Vec<OwnSetupEpisodeReceipt>,
+        expected: Option<&[u8]>,
+        captured: Option<&mut Vec<Vec<u8>>>,
     ) -> Result<SealedEpisode, String>;
 }
 macro_rules! batch_source {
-    ($collector:ident,$encode:ident,$variant:ident) => {
+    ($collector:ident,$encode:ident,$decode:ident,$variant:ident) => {
         impl BatchSource for $collector<'_> {
-            fn collect_sealed(
+            fn one(
                 &mut self,
                 config: &OwnSetupNativeConfig,
                 receipts: &mut Vec<OwnSetupEpisodeReceipt>,
+                expected: Option<&[u8]>,
+                captured: Option<&mut Vec<Vec<u8>>>,
             ) -> Result<SealedEpisode, String> {
-                let game = self.collect(config)?;
-                receipts.push(OwnSetupEpisodeReceipt {
-                    record_checksum: game.checksum().into(),
-                    episode_id: None,
-                    counts: game.counts().clone(),
-                });
-                let bytes = own_setup_record::$encode(&game)?;
-                let episode = self.audit(&bytes)?.into_episode()?;
-                receipts
-                    .last_mut()
-                    .ok_or("Missing Own Setup collected receipt")?
-                    .episode_id = Some(episode.episode_id().into());
-                Ok(SealedEpisode::$variant(Box::new(episode)))
+                match expected {
+                    None => {
+                        let game = self.collect(config)?;
+                        receipts.push(OwnSetupEpisodeReceipt {
+                            record_checksum: game.checksum().into(),
+                            episode_id: None,
+                            counts: game.counts().clone(),
+                        });
+                        let bytes = own_setup_record::$encode(&game)?;
+                        let audited = self.audit(&bytes);
+                        if let Some(captured) = captured {
+                            captured.push(bytes);
+                        }
+                        let episode = audited?.into_episode()?;
+                        receipts
+                            .last_mut()
+                            .ok_or("Missing Own Setup receipt")?
+                            .episode_id = Some(episode.episode_id().into());
+                        Ok(SealedEpisode::$variant(Box::new(episode)))
+                    }
+                    Some(bytes) => {
+                        let record = own_setup_record::$decode(bytes)?;
+                        if json(&record.header.config)?
+                            != json(&crate::public_stochastic_record::Config::from_config(
+                                config.native(),
+                            ))?
+                            || record.header.learner_seat != config.learner_seat()
+                        {
+                            return Err("Restored Own Setup source config mismatch".into());
+                        }
+                        receipts.push(OwnSetupEpisodeReceipt {
+                            record_checksum: record.checksum.clone(),
+                            episode_id: None,
+                            counts: record.counts.clone(),
+                        });
+                        let episode = self.audit(bytes)?.into_episode()?;
+                        receipts
+                            .last_mut()
+                            .ok_or("Missing restored Own Setup receipt")?
+                            .episode_id = Some(episode.episode_id().into());
+                        Ok(SealedEpisode::$variant(Box::new(episode)))
+                    }
+                }
             }
         }
     };
 }
-batch_source!(OwnSetupCollector, encode_record, Initialized);
-batch_source!(TrainedOwnSetupCollector, encode_trained_record, Trained);
-
+batch_source!(OwnSetupCollector, encode_record, decode, Initialized);
+batch_source!(
+    TrainedOwnSetupCollector,
+    encode_trained_record,
+    decode_trained,
+    Trained
+);
 fn collect_batch(
     setup: &SetupState,
     playing: &mut Option<LoadedDeployment>,
     configs: &[OwnSetupNativeConfig],
     receipts: &mut Vec<OwnSetupEpisodeReceipt>,
+    mode: BatchRecords<'_>,
 ) -> Result<Vec<SealedEpisode>, String> {
     fn collect<C: BatchSource>(
         c: &mut C,
         configs: &[OwnSetupNativeConfig],
         receipts: &mut Vec<OwnSetupEpisodeReceipt>,
+        mode: BatchRecords<'_>,
     ) -> Result<Vec<SealedEpisode>, String> {
-        configs
-            .iter()
-            .map(|cfg| c.collect_sealed(cfg, receipts))
-            .collect()
+        let mut episodes = Vec::new();
+        match mode {
+            BatchRecords::Collect(mut captured) => {
+                for cfg in configs {
+                    episodes.push(c.one(cfg, receipts, None, captured.as_deref_mut())?);
+                }
+            }
+            BatchRecords::Audit(records) => {
+                for (i, cfg) in configs.iter().enumerate() {
+                    let bytes = records
+                        .get(i)
+                        .ok_or("Missing retained Own Setup source record")?;
+                    episodes.push(c.one(cfg, receipts, Some(bytes), None)?);
+                }
+                if records.len() != configs.len() {
+                    return Err("Extra retained Own Setup source records".into());
+                }
+            }
+        }
+        Ok(episodes)
     }
     macro_rules! batch {
         ($binding:expr,$collector:ident) => {{
-            let binding = $binding?; // Validate the borrow before transferring Playing storage.
+            let binding = $binding?;
             let loaded = playing
                 .take()
                 .ok_or("Own Setup Playing storage unavailable")?;
             let mut collector = $collector::from_parts(binding, loaded);
-            let result = collect(&mut collector, configs, receipts);
+            let result = collect(&mut collector, configs, receipts, mode);
             *playing = Some(collector.into_playing()?);
             result
         }};

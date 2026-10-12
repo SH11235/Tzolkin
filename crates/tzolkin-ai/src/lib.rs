@@ -14,6 +14,7 @@ pub mod human_policy_dataset;
 pub mod human_policy_training;
 pub mod kernel;
 pub mod model;
+pub mod own_setup_durable;
 pub mod own_setup_model;
 pub mod own_setup_native;
 pub mod own_setup_pullback;
