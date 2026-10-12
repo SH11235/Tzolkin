@@ -299,6 +299,12 @@ fn read_pin(pin: &ContentPin, base: &Path) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
+pub(crate) fn recheck_absolute_pin(pin: &ContentPin) -> Result<(), String> {
+    if !Path::new(&pin.path).is_absolute() {
+        return Err("Conditional origin requires absolute source pins".into());
+    }
+    read_pin(pin, Path::new("")).map(|_| ())
+}
 fn parse<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, String> {
     serde_json::from_value(unique_json(bytes, MAX_INPUT)?).map_err(|e| e.to_string())
 }
@@ -1017,6 +1023,20 @@ impl ConditionalHumanPolicyDataset {
     }
     pub(crate) fn reservations(&self) -> &BTreeMap<String, DatasetSplit> {
         &self.reservations
+    }
+    /// The manifest and actual leaves consumed by load, never a report's declarations.
+    pub(crate) fn loaded_source_pins(&self) -> Result<Vec<ContentPin>, String> {
+        let (manifest, base) = self
+            .source_binding
+            .as_ref()
+            .ok_or("Unbound Human dataset")?;
+        let mut pins = vec![manifest.clone()];
+        for pin in &self.pins {
+            let mut pin = pin.clone();
+            pin.path = base.join(&pin.path).to_string_lossy().into_owned();
+            pins.push(pin);
+        }
+        Ok(pins)
     }
     /// Checks current source bytes; a serialized report cannot substitute for this handle.
     pub(crate) fn recheck_sources(&self) -> Result<(), String> {

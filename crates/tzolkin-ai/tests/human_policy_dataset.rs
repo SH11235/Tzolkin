@@ -203,7 +203,7 @@ impl Fixture {
             "basis":"userNominatedHistoricalArenaTop5","playerIds":["101","102","103"]}),
         );
         let reservations = self.pin("reservations.json", &self.reservations);
-        let mut manifest = json!({"schema":schema,"basis":"ConditionalBasicHumanPolicy","tableId":"123",
+        let mut manifest = json!({"schema":schema,"basis":"ConditionalBasicHumanPolicy","tableId":self.raw["table_id"],
             "observedOptions":{"tribes":null,"prophecies":null,"additionalBuildings":null,"quickActions":null},
             "record":self.pin("record.json", &self.record),"sourceLog":raw,"decoderAudit":self.pin("audit.json", &audit),
             "nominations":nominations,"reservations":reservations,"reconstructionEvidence":[]});
@@ -224,6 +224,168 @@ impl Fixture {
             manifest["reservations"]["sha256"].as_str().unwrap(),
         )
     }
+}
+
+#[test]
+fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel() {
+    use tzolkin_ai::conditional_human_rl::{ConditionalRlOwner, SAMPLING_VERSION};
+    use tzolkin_ai::human_policy_training::{
+        COLLECTION_SCHEMA, PreparedConditionalHumanPolicy, train_conditional_datasets,
+    };
+    use tzolkin_ai::policy_training::PolicyBcConfig;
+    use tzolkin_ai::public_stochastic::{
+        ConditionalHumanStochasticSession, SamplingSeed, SamplingStreamIdentity,
+    };
+    let mut train = Fixture::new();
+    train.reservations["entries"][0]["split"] = json!("train");
+    // Retain an unloaded Test table's reservation, separate from native seed families.
+    train.reservations["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"tableId":"125","split":"test","basis":"held-out synthetic table"}));
+    let mut validation = Fixture::new();
+    validation.raw["table_id"] = json!("124");
+    validation.raw["metadata"]["table_id"] = json!("124");
+    validation.raw["source_url"] = json!("https://boardgamearena.com/gamereview?table=124");
+    validation.record["source"]["reference"] = validation.raw["source_url"].clone();
+    validation.audit["tableId"] = json!("124");
+    validation.reservations["entries"][0]["tableId"] = json!("124");
+    let datasets = vec![train.load().unwrap(), validation.load().unwrap()];
+    let config = PolicyBcConfig {
+        epochs: 1,
+        batch_size: 1,
+        learning_rate: 0.001,
+        seed: 7,
+    };
+    let outcome = train_conditional_datasets(&datasets, &config, None).unwrap();
+    let unsealed =
+        PreparedConditionalHumanPolicy::new(outcome.checkpoint.clone(), &datasets).unwrap();
+    assert!(ConditionalRlOwner::from_prepared(&unsealed, 11, SamplingSeed::new(17)).is_err());
+    let output = train.root.join("checkpoint");
+    outcome.save_new_directory(&output).unwrap();
+    let inputs = [&train, &validation]
+        .into_iter()
+        .map(|fixture| {
+            let manifest: Value =
+                serde_json::from_slice(&fs::read(fixture.root.join("manifest.json")).unwrap())
+                    .unwrap();
+            json!({"manifestPath":fixture.root.join("manifest.json").to_string_lossy(),
+            "manifestSha256":sha(&fs::read(fixture.root.join("manifest.json")).unwrap()),
+            "nominationsSha256":manifest["nominations"]["sha256"],
+            "reservationsSha256":manifest["reservations"]["sha256"]})
+        })
+        .collect::<Vec<_>>();
+    let collection_path = train.root.join("collection.json");
+    fs::write(
+        &collection_path,
+        serde_json::to_vec(&json!({
+            "schema":COLLECTION_SCHEMA,"config":config,"datasets":inputs,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let checkpoint_path = output.join("checkpoint.json");
+    let prepared =
+        PreparedConditionalHumanPolicy::load(&checkpoint_path, &collection_path).unwrap();
+    let owner = ConditionalRlOwner::from_prepared(&prepared, 11, SamplingSeed::new(17)).unwrap();
+    assert_eq!(
+        owner
+            .actor_parameters()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        prepared
+            .model()
+            .model
+            .parameters()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(owner.critic_parameters().len(), 12353);
+    assert!(
+        owner.critic_parameters()[384 * 32 + 32..]
+            .iter()
+            .all(|v| v.to_bits() == 0)
+    );
+    let other = ConditionalRlOwner::from_prepared(&prepared, 12, SamplingSeed::new(17)).unwrap();
+    assert_ne!(
+        owner.critic_parameters()[..384 * 32],
+        other.critic_parameters()[..384 * 32]
+    );
+    assert_ne!(
+        owner.identity().critic_checksum(),
+        other.identity().critic_checksum()
+    );
+    assert_eq!(owner.identity().mixed_update_count(), 0);
+    assert_eq!(
+        (
+            owner.attempts(),
+            owner.credited_own_decisions(),
+            owner.next_episode_ordinal(),
+            owner.consumed_native_families()
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        owner.origin().table_reservations()["125"],
+        DatasetSplit::Test
+    );
+    assert!(!owner.origin().dataset().source_qualified);
+    assert!(!owner.origin().dataset().verified_native_policy);
+    assert_eq!(owner.origin().source_pins().len(), 14); // 2 top-level + 2*(manifest+5 leaves)
+    let handle = owner.handle().unwrap();
+    let setup = create_game(vec!["A".into(), "B".into(), "C".into()], 42, false).unwrap();
+    let observation = observe(&setup, setup.current_player).unwrap();
+    assert!(prepared.distribution(&observation).is_err()); // Existing Playing-only handle unchanged.
+    let prediction = handle.distribution(&observation).unwrap();
+    assert_eq!(prediction.logits().len(), observation.legal_actions.len());
+    assert!(prediction.logits().iter().all(|v| v.is_finite()));
+    assert!(
+        ConditionalHumanStochasticSession::new(
+            &handle,
+            SamplingStreamIdentity::new(SamplingSeed::new(18), 0, 0, 3).unwrap()
+        )
+        .is_err()
+    );
+    let mut session = ConditionalHumanStochasticSession::new(
+        &handle,
+        SamplingStreamIdentity::new(SamplingSeed::new(17), 0, 0, 3).unwrap(),
+    )
+    .unwrap();
+    let draw = session.sample(&observation).unwrap();
+    assert!(observation.legal_actions.contains(draw.legal_action()));
+    assert_eq!(draw.decision().policy_version, SAMPLING_VERSION);
+    assert_eq!(session.counters().accepted_samples(), 1);
+    let mut wrong = observation.clone();
+    wrong.observation_key.clear();
+    assert!(session.sample(&wrong).is_err());
+    assert!(session.counters().stopped());
+    assert!(session.sample(&observation).is_err());
+    assert!(
+        handle
+            .distribution(&observe(&playing_state(), setup.current_player).unwrap())
+            .is_ok()
+    );
+
+    // Logical JSON equivalence cannot conceal a change to actual loaded bytes.
+    for path in [
+        &collection_path,
+        &checkpoint_path,
+        &train.root.join("raw.json"),
+    ] {
+        let original = fs::read(path).unwrap();
+        let mut changed = original.clone();
+        changed.push(b' ');
+        assert_eq!(
+            serde_json::from_slice::<Value>(&original).unwrap(),
+            serde_json::from_slice::<Value>(&changed).unwrap()
+        );
+        fs::write(path, changed).unwrap();
+        assert!(ConditionalRlOwner::from_prepared(&prepared, 11, SamplingSeed::new(17)).is_err());
+        fs::write(path, original).unwrap();
+    }
+    owner.origin().recheck_sources().unwrap();
 }
 
 #[test]

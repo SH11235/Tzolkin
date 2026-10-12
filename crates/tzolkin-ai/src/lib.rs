@@ -3,6 +3,7 @@
 //! The policy the application ships lives in `tzolkin-bot`; its public items are re-exported
 //! here so existing `tzolkin_ai::` paths keep working.
 pub mod arena;
+pub mod conditional_human_rl;
 pub mod dataset;
 pub mod experiment;
 pub mod features;

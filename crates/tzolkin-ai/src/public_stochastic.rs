@@ -291,6 +291,7 @@ enum SamplingPolicyKind {
     Paired,
     Mixed,
     ContinuedMixed,
+    ConditionalHuman,
 }
 impl SamplingPolicyKind {
     fn sampling_version(self) -> &'static str {
@@ -304,6 +305,7 @@ impl SamplingPolicyKind {
             Self::ContinuedMixed => {
                 crate::public_rl_current_mixed_source::CONTINUED_SAMPLING_VERSION
             }
+            Self::ConditionalHuman => crate::conditional_human_rl::SAMPLING_VERSION,
         }
     }
 }
@@ -314,10 +316,16 @@ enum SamplingPrediction {
     Rl(PublicRlPolicyDistribution),
     Mixed(Box<crate::public_rl_mixed_handle::MixedPolicyDistribution>),
     CurrentMixed(Box<crate::public_policy_mixed_continued::CurrentMixedDistribution>),
+    ConditionalHuman(Box<crate::conditional_human_rl::ConditionalRlDistribution>),
 }
 impl SamplingPrediction {
     fn compatible(&self, kind: SamplingPolicyKind) -> bool {
         match (self, kind) {
+            (Self::ConditionalHuman(p), SamplingPolicyKind::ConditionalHuman) => {
+                p.identity().input_contract() == crate::conditional_human_rl::INPUT_CONTRACT
+                    && p.identity().mixed_update_count() == 0
+                    && p.value_validity() == ValueValidity::UnavailablePolicyOnly
+            }
             (Self::Bc(p), SamplingPolicyKind::Bc) => {
                 p.policy_version == POLICY_VERSION
                     && p.feature_schema == PUBLIC_FEATURE_SCHEMA
@@ -373,6 +381,7 @@ impl SamplingPrediction {
             Self::Rl(p) => p.logits(),
             Self::Mixed(p) => p.logits(),
             Self::CurrentMixed(p) => p.logits(),
+            Self::ConditionalHuman(p) => p.logits(),
         }
     }
     fn probability_count(&self) -> usize {
@@ -381,6 +390,7 @@ impl SamplingPrediction {
             Self::Rl(p) => p.probabilities().len(),
             Self::Mixed(p) => p.probabilities().len(),
             Self::CurrentMixed(p) => p.probabilities().len(),
+            Self::ConditionalHuman(p) => p.probabilities().len(),
         }
     }
 }
@@ -1071,6 +1081,43 @@ pub struct CurrentMixedStochasticSession<'handle, 'owner> {
     policy: &'handle crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'owner>,
     policy_binding_key: String,
     state: SessionState,
+}
+/// Conditional count0 inference only; no source codec, family reservation or update.
+pub struct ConditionalHumanStochasticSession<'handle, 'owner> {
+    policy: &'handle crate::conditional_human_rl::ConditionalRlPolicyHandle<'owner>,
+    state: SessionState,
+}
+impl<'handle, 'owner> ConditionalHumanStochasticSession<'handle, 'owner> {
+    pub fn new(
+        policy: &'handle crate::conditional_human_rl::ConditionalRlPolicyHandle<'owner>,
+        identity: SamplingStreamIdentity,
+    ) -> Result<Self, String> {
+        if !policy.sampling_prefix_matches(identity) {
+            return Err("Conditional sampler differs from fresh owner RNG prefix".into());
+        }
+        Ok(Self {
+            policy,
+            state: SessionState::new(identity)?,
+        })
+    }
+    pub fn counters(&self) -> SamplingCounters {
+        self.state.counters()
+    }
+    pub fn stop(&mut self) {
+        self.state.stopped = true;
+    }
+    pub fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
+        self.state.sample_with_kind(
+            self.policy.identity().checksum(),
+            SamplingPolicyKind::ConditionalHuman,
+            observation,
+            |o| {
+                self.policy
+                    .distribution(o)
+                    .map(|p| SamplingPrediction::ConditionalHuman(Box::new(p)))
+            },
+        )
+    }
 }
 impl<'handle, 'owner> CurrentMixedStochasticSession<'handle, 'owner> {
     pub fn new(
