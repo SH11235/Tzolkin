@@ -3567,18 +3567,64 @@ test('holds queued corn until observed technology completion and preserves cappe
   assert.ok(card);
   const resources = ['corn', 'wood', 'stone', 'gold', 'skull'];
   const amount = card.effects[1].resources.corn;
-  const cost = resources.map((resource) => card.cost[resource] ?? 0);
   const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
   const technology = { raw_text: 'Aは神学を1レベル進めた' };
   const bonus = { raw_text: '神学技術ボーナス: Aは追加で水晶ドクロ1個を得た' };
-  const fixture = (change = () => {}, alter = () => {}, level = 3, track = 'theology') => {
+  const cornCard = card;
+  const fixture = (
+    change = () => {},
+    alter = () => {},
+    level = 3,
+    track = 'theology',
+    resource = 'corn',
+    architectureBonus = false,
+    architectureLevel = architectureBonus ? 3 : 2,
+    renovationSibling = false,
+  ) => {
+    const card =
+      resource === 'corn'
+        ? cornCard
+        : catalog.BUILDINGS.find(
+            (item) =>
+              JSON.stringify(item.effects) ===
+              JSON.stringify([
+                { type: 'technology', technology: 'any', steps: 1 },
+                {
+                  type: 'resources',
+                  resources: { [resource]: item.effects[1]?.resources?.[resource] },
+                },
+              ]),
+          );
+    assert.ok(card);
+    const amount = card.effects[1].resources[resource];
+    const cost = resources.map((r) => card.cost[r] ?? 0);
+    const discount = resources.find((r, index) => index > 0 && index < 4 && cost[index] > 0);
+    const chosenCost = cost.map(
+      (n, index) =>
+        n - Number(architectureBonus && architectureLevel === 3 && resources[index] === discount),
+    );
     const initial = clone(saved.core.initialFrame);
     const before = clone(initial);
     const own = before.snapshot.state.players[0];
     Object.assign(own.resources, { corn: 10, wood: 8, stone: 4, gold: 2, skull: 0 });
     own.score = -2;
     own.technologies[track] = level;
-    own.technologies.architecture = 2;
+    own.technologies.architecture = architectureLevel;
+    const renovation = renovationSibling
+      ? catalog.ALL_BUILDINGS.find(
+          (item) =>
+            item.effects.some((effect) => effect.type === 'renovation') &&
+            item.effects.every((effect) => ['renovation', 'foodReward'].includes(effect.type)) &&
+            (item.cost.gold ?? 0) > 0 &&
+            cost.every((n, i) => n === 0 || (item.cost[resources[i]] ?? 0) === 0),
+        )
+      : null;
+    if (renovationSibling) {
+      assert.ok(renovation);
+      own.buildings.push(renovation.id);
+      // Injected typed-row stress; this does not claim a reachable base-game prefix.
+      before.snapshot.state.additionalBuildings = renovationSibling === 'expanded';
+    }
     before.snapshot.state.skullSupply = 4;
     before.snapshot.state.buildings = [card.id];
     before.observation.pendingTask = {
@@ -3596,25 +3642,43 @@ test('holds queued corn until observed technology completion and preserves cappe
       action: {
         type: 'build',
         id: card.id,
-        cost,
+        cost: architecture && architectureBonus ? chosenCost : cost,
         architecture,
-        discountResource: null,
+        discountResource:
+          architecture && architectureBonus && architectureLevel === 3 ? discount : null,
         renovation: null,
       },
       move: { type: 'choose', choiceId: architecture ? 'purchase:bonus' : 'purchase:plain' },
     }));
+    if (renovation) {
+      const row = clone(before.observation.legalActions[1]);
+      row.action.renovation = renovation.id;
+      row.action.cost = row.action.cost.map((n, i) =>
+        i >= 1 && i <= 3 ? Math.max(0, n - (renovation.cost[resources[i]] ?? 0)) : n,
+      );
+      assert.deepEqual(row.action.cost, before.observation.legalActions[1].action.cost);
+      row.move.choiceId = 'purchase:bonus:renovation';
+      before.observation.legalActions.push(row);
+    }
+    const purchaseTrials = [];
     const apply = (request) => {
       if (request.move.type === 'place') return clone(before);
       const next = clone(before);
       next.snapshot.state = clone(request.state);
       const player = next.snapshot.state.players[0];
       if (request.move.choiceId.startsWith('purchase:')) {
-        const architecture = request.move.choiceId === 'purchase:bonus';
+        const action = before.observation.legalActions.find(
+          (row) => row.move.choiceId === request.move.choiceId,
+        ).action;
+        const { architecture } = action;
+        const paid = action.cost;
         resources.forEach((resource, index) => {
-          player.resources[resource] -= cost[index];
+          player.resources[resource] -= paid[index];
         });
         player.resources.corn += Number(architecture);
         player.score += 2 * Number(architecture);
+        if (action.renovation !== null)
+          player.buildings = player.buildings.filter((id) => id !== action.renovation);
         player.buildings.push(card.id);
         next.snapshot.state.buildings = [];
         next.observation.pendingTask = { type: 'technology', remaining: 1, free: true };
@@ -3639,6 +3703,7 @@ test('holds queued corn until observed technology completion and preserves cappe
           },
         ];
         alter(next, 'purchase');
+        purchaseTrials.push({ action: clone(action), state: clone(next.snapshot.state) });
       } else if (request.move.choiceId.startsWith('tech:')) {
         assert.equal(request.move.choiceId, `tech:${track}`);
         if (track === 'extraction' && level === 3) {
@@ -3656,7 +3721,7 @@ test('holds queued corn until observed technology completion and preserves cappe
             move: { type: 'choose', choiceId: `resource:${resource}` },
           }));
         } else {
-          player.resources.corn += amount;
+          player.resources[resource] += amount;
           if (track === 'theology') {
             player.resources.skull++;
             next.snapshot.state.skullSupply--;
@@ -3671,11 +3736,11 @@ test('holds queued corn until observed technology completion and preserves cappe
         }
         alter(next, 'technology');
       } else {
-        const resource = request.move.choiceId.split(':')[1];
-        assert.ok(['wood', 'stone', 'gold'].includes(resource));
-        player.resources[resource]++;
+        const selectedResource = request.move.choiceId.split(':')[1];
+        assert.ok(['wood', 'stone', 'gold'].includes(selectedResource));
+        player.resources[selectedResource]++;
         const remaining = request.state.pending.task.remaining - 1;
-        if (remaining === 0) player.resources.corn += amount;
+        if (remaining === 0) player.resources[resource] += amount;
         next.observation.pendingTask = remaining
           ? { type: 'resource', remaining }
           : clone(request.state.pending.after.at(-1));
@@ -3696,19 +3761,25 @@ test('holds queued corn until observed technology completion and preserves cappe
     };
     const value = input();
     const purchase = resources.flatMap((resource, index) =>
-      cost[index]
+      chosenCost[index]
         ? [
             {
-              raw_text: `Aは${cost[index]}\nを支払った`,
+              raw_text: `Aは${chosenCost[index]}\nを支払った`,
               icons: [{ classes: `tz_icon resource_${resource}` }],
             },
           ]
         : [],
     );
-    purchase.push(
-      { raw_text: 'Aは建物を建てた' },
-      { raw_text: `Aは${amount}\nを獲得した`, icons: [{ classes: 'tz_icon resource_corn' }] },
-    );
+    purchase.push({ raw_text: 'Aは建物を建てた' });
+    if (architectureBonus)
+      purchase.push(
+        { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_corn' }] },
+        { raw_text: 'Aは2点を獲得した' },
+      );
+    purchase.push({
+      raw_text: `Aは${amount}\nを獲得した`,
+      icons: [{ classes: `tz_icon resource_${resource}` }],
+    });
     const continuation =
       track === 'theology'
         ? [technology, bonus]
@@ -3723,7 +3794,17 @@ test('holds queued corn until observed technology completion and preserves cappe
       ...(track === 'extraction' && level === 3
         ? [
             [9, [{ raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_gold' }] }]],
-            [10, [{ raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_stone' }] }]],
+            [
+              10,
+              [
+                {
+                  raw_text: 'Aは\nを獲得した',
+                  icons: [
+                    { classes: `tz_icon resource_${resource === 'corn' ? 'stone' : 'gold'}` },
+                  ],
+                },
+              ],
+            ],
           ]
         : []),
     ]);
@@ -3801,7 +3882,7 @@ test('holds queued corn until observed technology completion and preserves cappe
         .join('\n');
       for (const message of row.messages) message.html = message.raw_text;
     }
-    return { value, dispatch: dispatcher(initial, apply) };
+    return { value, dispatch: dispatcher(initial, apply), purchaseTrials, renovation };
   };
   const success = fixture();
   const originals = clone(success.value.witness.witnesses);
@@ -3873,6 +3954,155 @@ test('holds queued corn until observed technology completion and preserves cappe
       coreState: 'derivedFromVerifiedPrefix',
     });
     assert.equal(unknownReceipt.humanPlayingBcReady, false);
+  }
+  const materialFixture = (
+    change = () => {},
+    alter = () => {},
+    architectureLevel = 3,
+    renovationSibling = false,
+  ) =>
+    fixture(
+      (v) => {
+        v.witness.witnesses = v.witness.witnesses.slice(0, 2);
+        delete v.witness.witnesses[1].expected;
+        change(v);
+      },
+      alter,
+      3,
+      'extraction',
+      'stone',
+      true,
+      architectureLevel,
+      renovationSibling,
+    );
+  const materialSuccess = materialFixture();
+  const materialWitnesses = clone(materialSuccess.value.witness.witnesses);
+  const materialCompleted = decode(materialSuccess.value, materialSuccess.dispatch);
+  assert.equal(materialCompleted.manifest.blocked, null);
+  assert.deepEqual(
+    materialCompleted.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8], [9], [10]],
+  );
+  assert.equal(materialCompleted.record.steps[1].checkpoint, null);
+  const materialReceipt = materialCompleted.manifest.audit.find(
+    (row) => row.queuedPurchaseSourceActionId,
+  );
+  assert.equal(materialReceipt.resource, 'stone');
+  assert.equal(materialReceipt.amount, 1);
+  assert.deepEqual(materialReceipt.resourceChoiceSourceActionIds, [9, 10]);
+  assert.equal(materialReceipt.actualDelivered, true);
+  assert.equal(materialReceipt.purchaseCounterEvidence.score, 'unknown');
+  assert.deepEqual(materialReceipt.purchaseCounterEvidence.resourceFields, []);
+  assert.deepEqual(materialSuccess.value.witness.witnesses, materialWitnesses);
+  const sameFee = materialFixture(
+    () => {},
+    () => {},
+    2,
+  );
+  const sameFeeOriginals = clone(sameFee.value.witness.witnesses);
+  const sameFeeCompleted = decode(sameFee.value, sameFee.dispatch);
+  assert.equal(sameFeeCompleted.manifest.blocked, null);
+  assert.deepEqual(
+    sameFeeCompleted.record.steps.map((step) => step.sourceActionIds),
+    materialCompleted.record.steps.map((step) => step.sourceActionIds),
+  );
+  assert.ok(sameFeeCompleted.record.steps.slice(1).every((step) => step.checkpoint === null));
+  assert.equal(
+    sameFeeCompleted.manifest.audit.find((row) => row.action?.type === 'build').action.architecture,
+    true,
+  );
+  assert.deepEqual(sameFee.value.witness.witnesses, sameFeeOriginals);
+  for (const rules of [true, 'expanded']) {
+    const renovation = materialFixture(
+      () => {},
+      () => {},
+      2,
+      rules,
+    );
+    const renovationOriginals = clone(renovation.value.witness.witnesses);
+    const renovationResult = decode(renovation.value, renovation.dispatch);
+    assert.equal(renovationResult.manifest.blocked.actionId, 7);
+    assert.match(
+      renovationResult.manifest.blocked.reason,
+      /Ambiguous legal operation for observed build/,
+    );
+    assert.deepEqual(
+      renovationResult.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+    );
+    assert.deepEqual(renovation.value.witness.witnesses, renovationOriginals);
+    const ordinary = renovation.purchaseTrials.find(
+      (trial) => trial.action.architecture && trial.action.renovation === null,
+    );
+    const renovated = renovation.purchaseTrials.find(
+      (trial) => trial.action.architecture && trial.action.renovation !== null,
+    );
+    assert.deepEqual(ordinary.action.cost, renovated.action.cost);
+    const discarded = clone(ordinary.state);
+    assert.ok(discarded.players[0].buildings.includes(renovation.renovation.id));
+    discarded.players[0].buildings = discarded.players[0].buildings.filter(
+      (id) => id !== renovation.renovation.id,
+    );
+    assert.deepEqual(renovated.state, discarded);
+  }
+  for (const [name, change, alter, reason, architectureLevel] of [
+    [
+      'wrong Architecture payment',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 7).messages[0].raw_text =
+          'Aは3\nを支払った';
+      },
+      undefined,
+      /Source effect resource:corn=1 is not established by this macro/,
+    ],
+    [
+      'unrelated purchase state',
+      () => {},
+      (f, stage) => {
+        if (stage === 'purchase') f.snapshot.state.firstPlayer = 1;
+      },
+      /Source effect resource:stone=1 is not established by this macro/,
+    ],
+    [
+      'early queued material',
+      () => {},
+      (f, stage) => {
+        if (stage === 'resource:1') f.snapshot.state.players[0].resources.stone++;
+      },
+      /Unsettled purchase at source 9: Extraction reward choice has no exact matching core material gain/,
+    ],
+    [
+      'wrong actual material actor',
+      (v) => {
+        v.raw.dom_entries.at(-1).messages[0].raw_text = 'Bは\nを獲得した';
+      },
+      undefined,
+      /Queued purchase requires the next same-actor technology or exact material choice/,
+      2,
+    ],
+    [
+      'absent Architecture bonus captions remain ambiguous',
+      (v) => {
+        const source = v.raw.dom_entries.find((row) => row.action_id === 7);
+        source.messages.splice(2, 2);
+      },
+      undefined,
+      /Ambiguous legal operation for observed build/,
+      2,
+    ],
+  ]) {
+    const f = materialFixture(change, alter, architectureLevel);
+    const originalWitnesses = clone(f.value.witness.witnesses);
+    const rejected = decode(f.value, f.dispatch);
+    assert.notEqual(rejected.manifest.blocked, null, name);
+    assert.equal(rejected.manifest.blocked.actionId, 7, name);
+    assert.match(rejected.manifest.blocked.reason, reason, name);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.deepEqual(f.value.witness.witnesses, originalWitnesses, name);
   }
   const withoutPurchaseCounters = (change) => (v) => {
     delete v.witness.witnesses[1].expected;
