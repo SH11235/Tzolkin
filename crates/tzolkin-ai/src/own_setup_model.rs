@@ -1,25 +1,21 @@
 //! Fresh, initialized schema-3 Setup inference. No training or deployment owner.
 //! Features retain their raw quantities; only initialization scales those weights.
 use serde::{Deserialize, Serialize};
-use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, TypedAction};
-use tzolkin_core::{GameMove, Phase};
+use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation};
 use tzolkin_inference::policy::{self, BorrowedSemanticSetupPolicy, NumericPolicyDistribution};
 
 use crate::features::{
-    EncodedCandidate, FEATURE_COUNT, FeatureEncoder, SEMANTIC_SETUP_FEATURE_SCHEMA,
-    SETUP_PAIR_FEATURE_COUNT, SETUP_PAIR_FEATURE_START,
+    FEATURE_COUNT, SEMANTIC_SETUP_FEATURE_SCHEMA, SETUP_PAIR_FEATURE_COUNT,
+    SETUP_PAIR_FEATURE_START,
 };
 use crate::kernel::{Kernel, ResolvedKernel};
-use crate::model::{Random, digest};
+use crate::model::Random;
 use crate::public_model::{B1, BP, HIDDEN, PARAMETER_COUNT, WP};
 
-pub const ARTIFACT_SCHEMA: &str = "tzolkin-own-setup-initialized-model-v1";
-pub const MODEL_VERSION: &str = "own-setup-quantity-512x32-tanh-v1";
-pub const INPUT_CONTRACT: &str = "base-3-4p-setup-only-six-wealth-pairs-semantic-v3";
-pub const TASK: &str = "initializedOwnSetupPolicyOnly";
-pub const INIT_VERSION: &str = "splitmix64-glorot-quantity-weight-div17-f32-v1";
-const PAIR_COUNT: usize = 6;
-
+pub use tzolkin_inference::own_setup_contract::{
+    ARTIFACT_SCHEMA, INIT_VERSION, INPUT_CONTRACT, InitializedOwnSetupIdentity, MODEL_VERSION,
+    SetupCandidates, TASK,
+};
 /// Numerical parameters only; deserialization grants no initialized/trained identity.
 /// The distinct serialized field cannot deserialize an old schema-2 policy model.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -68,28 +64,6 @@ pub struct InitializedOwnSetupArtifact {
     pub identity: InitializedOwnSetupIdentity,
     pub model: OwnSetupModel,
 }
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InitializedOwnSetupIdentity {
-    pub schema: String,
-    pub model_version: String,
-    pub input_contract: String,
-    pub task: String,
-    pub init_version: String,
-    pub seed: u64,
-    pub completed_updates: u64,
-    pub feature_schema: u32,
-    pub feature_count: usize,
-    pub hidden_count: usize,
-    pub parameter_count: usize,
-    pub backend: String,
-    pub rules_version: u32,
-    pub rules_baseline: String,
-    pub observation_schema: u32,
-    pub move_schema: u32,
-    pub catalog_hash: String,
-    pub checksum: String,
-}
 impl InitializedOwnSetupArtifact {
     pub fn new(seed: u64) -> Result<Self, String> {
         let mut artifact = Self {
@@ -120,41 +94,14 @@ impl InitializedOwnSetupArtifact {
         Ok(artifact)
     }
     fn expected_checksum(&self) -> Result<String, String> {
-        let mut identity = self.identity.clone();
-        identity.checksum.clear();
-        let mut bytes = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
-        // An explicit byte boundary precedes little-endian f32 words. Checksums
-        // bind actual parameter bits, including signed zero, not float formatting.
-        bytes.push(0);
-        bytes.extend(
-            self.model
-                .parameters()
-                .iter()
-                .flat_map(|value| value.to_le_bytes()),
-        );
-        Ok(digest(&bytes))
+        tzolkin_inference::own_setup_contract::initialized_checksum(
+            &self.identity,
+            self.model.parameters(),
+        )
     }
     pub fn validate(&self) -> Result<(), String> {
         let id = &self.identity;
-        if id.schema != ARTIFACT_SCHEMA
-            || id.model_version != MODEL_VERSION
-            || id.input_contract != INPUT_CONTRACT
-            || id.task != TASK
-            || id.init_version != INIT_VERSION
-            || id.completed_updates != 0
-            || id.feature_schema != SEMANTIC_SETUP_FEATURE_SCHEMA
-            || id.feature_count != FEATURE_COUNT
-            || id.hidden_count != HIDDEN
-            || id.parameter_count != PARAMETER_COUNT
-            || id.backend != "scalar"
-            || id.rules_version != crate::replay::RULES_VERSION
-            || id.rules_baseline != crate::replay::RULES_BASELINE
-            || id.observation_schema != OBSERVATION_SCHEMA
-            || id.move_schema != MOVE_SCHEMA
-            || id.catalog_hash != crate::replay::catalog_hash()
-        {
-            return Err("Incompatible initialized own Setup contract".into());
-        }
+        tzolkin_inference::own_setup_contract::validate_initialized_contract(id)?;
         self.model.validate()?;
         if self
             .model
@@ -169,60 +116,6 @@ impl InitializedOwnSetupArtifact {
             return Err("Initialized own Setup checksum mismatch".into());
         }
         Ok(())
-    }
-}
-
-/// Immutable full six-pair numeric batch from one self-consistent observation.
-/// This checks the native Setup input/order, not source audit or learning admission.
-/// No constructor accepts arbitrary rows or a caller's claimed source identity.
-pub struct SetupCandidates {
-    observation_key: String,
-    rows: Vec<EncodedCandidate>,
-}
-impl SetupCandidates {
-    pub fn from_observation(observation: &Observation) -> Result<Self, String> {
-        if observation.phase != Phase::Setup
-            || observation.pending_task.is_some()
-            || !observation.private.selected_wealth.is_empty()
-            || observation.legal_actions.len() != PAIR_COUNT
-        {
-            return Err("Own Setup requires an unselected six-pair Setup observation".into());
-        }
-        let encoder = FeatureEncoder::new_semantic_setup(observation)?;
-        let offer = &observation.private.wealth_offer;
-        let mut index = 0;
-        for a in 0..offer.len() {
-            for b in a + 1..offer.len() {
-                let legal = &observation.legal_actions[index];
-                let ids = vec![offer[a].clone(), offer[b].clone()];
-                if legal.action != (TypedAction::ChooseWealth { ids })
-                    || legal.r#move
-                        != (GameMove::Choose {
-                            choice_id: format!("wealth:{}:{}", offer[a], offer[b]),
-                        })
-                {
-                    return Err("Own Setup pair order/action/move mismatch".into());
-                }
-                index += 1;
-            }
-        }
-        let rows = (0..PAIR_COUNT)
-            .map(|index| {
-                let row = encoder.encode_legal_tagged(index)?;
-                policy::validated_semantic_setup_values(&row)?;
-                Ok(row)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Self {
-            observation_key: observation.observation_key.clone(),
-            rows,
-        })
-    }
-    pub fn observation_key(&self) -> &str {
-        &self.observation_key
-    }
-    pub fn rows(&self) -> &[EncodedCandidate] {
-        &self.rows
     }
 }
 
@@ -276,7 +169,9 @@ pub(crate) fn setup_fixture(players: usize, offer: [&str; 4]) -> Observation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::own_setup_pullback::OwnSetupScalarPullback;
+    use crate::model::digest;
+    use tzolkin_core::Phase;
+    const PAIR_COUNT: usize = 6;
     use crate::public_model::{LoadedPublicPolicy, PublicPolicyArtifact};
     use crate::public_policy_pullback::ScalarPolicyPullback;
     use tzolkin_core::observation::observation_key;
@@ -413,12 +308,7 @@ mod tests {
             let mut stale = observation.clone();
             stale.observation_key.clear();
             assert!(SetupCandidates::from_observation(&stale).is_err());
-            // Mutate only this module's private test batch to exercise tag refusal.
-            let encoder = FeatureEncoder::new_public(&observation).unwrap();
-            let mut wrong_tag = candidates;
-            wrong_tag.rows[0] = encoder.encode_legal_tagged(0).unwrap();
-            assert!(loaded.predict(&wrong_tag).is_err());
-            assert!(OwnSetupScalarPullback::new(&artifact.model, &wrong_tag).is_err());
+            // Private batch tag refusal lives with the inference-owned factory.
         }
     }
 }

@@ -31,7 +31,7 @@ pub const SCOPE: &str = "base-3-4p-setup-playing";
 pub const VALUE_VALIDITY: &str = "unavailablePolicyOnly";
 // Source export target is metadata, not a cross-target prediction guarantee.
 const MAX_SOURCE_TARGET_BYTES: usize = 128;
-fn valid_source_target(value: &str) -> bool {
+pub(crate) fn valid_source_target(value: &str) -> bool {
     if value.len() > MAX_SOURCE_TARGET_BYTES {
         return false;
     }
@@ -107,7 +107,7 @@ enum Source {
         identity: Box<CurrentMixedIdentity>,
     },
 }
-fn digest(value: &str) -> bool {
+pub(crate) fn digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
