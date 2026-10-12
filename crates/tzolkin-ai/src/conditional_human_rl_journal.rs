@@ -901,11 +901,11 @@ impl ConditionalHumanJournal {
             return Err(e);
         }
         #[cfg(test)]
-        if let Some(path) = self.change_source_after_resolve.take() {
-            if let Err(e) = fs::write(path, b"changed after verified Resolve") {
-                self.stop();
-                return Err(e.to_string());
-            }
+        if let Some(path) = self.change_source_after_resolve.take()
+            && let Err(e) = fs::write(path, b"changed after verified Resolve")
+        {
+            self.stop();
+            return Err(e.to_string());
         }
         self.logical_bytes += records.iter().map(|r| r.raw_bytes as u64).sum::<u64>();
         self.phase = ConditionalJournalPhase::ResolvedAwaitingClose;
