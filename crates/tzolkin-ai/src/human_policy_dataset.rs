@@ -581,8 +581,9 @@ fn observed_audit(entry: &Value) -> bool {
         .all(|field| entry.get(*field).is_none())
 }
 
-// Accept only literal, bounded material icons, cross-checked against the retained
-// icon classes and visible quantity. No cost/holdings-based payment inference.
+// Accept only literal, bounded material icons and visible quantity. Nonempty
+// captured icons are authoritative; an empty array requires exact complete HTML.
+// No cost/holdings-based payment inference.
 fn material_caption(message: &Value, name: &str, current_format: bool) -> Option<[i64; 5]> {
     let prefix = format!("{name}は");
     let text = message["raw_text"]
@@ -609,8 +610,42 @@ fn material_caption(message: &Value, name: &str, current_format: bool) -> Option
     }
     body = body[digits..].trim_start();
     let icons = message["icons"].as_array()?;
-    if icons.is_empty() || icons.len() > 3 || quantity.is_some_and(|n| n < 1) {
+    if icons.len() > 3 || quantity.is_some_and(|n| n < 1) {
         return None;
+    }
+    if icons.is_empty() {
+        let mut values = [0; 5];
+        let mut literal = String::new();
+        let mut count = 0;
+        while !body.is_empty() {
+            if count == 3 {
+                return None;
+            }
+            let (classes, remaining) = body
+                .strip_prefix("<div class=\"")?
+                .split_once("\"></div>")?;
+            let resource = match classes {
+                "tz_icon resource_wood" => 1,
+                "tz_icon resource_stone" => 2,
+                "tz_icon resource_gold" => 3,
+                _ => return None,
+            };
+            values[resource] += quantity.unwrap_or(1);
+            literal.push_str(&format!("<div class=\"{classes}\"></div>"));
+            count += 1;
+            body = remaining;
+        }
+        if count == 0 || (quantity.is_some() && count != 1) {
+            return None;
+        }
+        let quantity_text = quantity.map_or_else(String::new, |value| value.to_string());
+        return ["", " "]
+            .iter()
+            .any(|space| {
+                (quantity.is_some() || space.is_empty())
+                    && html == format!("{prefix}{quantity_text}{space}{literal}を支払った")
+            })
+            .then_some(values);
     }
     let mut values = [0; 5];
     for icon in icons {
@@ -779,6 +814,9 @@ fn paid_technology_evidence(
             if message
                 .get("icons")
                 .is_some_and(|icons| !icons.as_array().is_some_and(Vec::is_empty))
+                || message
+                    .get("html")
+                    .is_some_and(|html| html.as_str() != Some(caption.as_str()))
                 || technology_message_index.replace(message_index).is_some()
             {
                 return Ok(None);

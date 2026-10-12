@@ -629,20 +629,123 @@ fn observed_paid_technology_v3_requires_exact_materials_and_preserves_prior_labe
             .len(),
         2
     );
-    let mut current = Fixture::paid_technology(4, 0, [0, 0, 1]);
-    current.raw["schema_version"] = json!(1);
-    current.raw["source_type"] = json!("public_ui_dom");
-    current.raw["export_scope"] = json!("all_rendered_gamereview_log_entries");
-    current.raw["dom_entry_count"] = json!(1);
-    current.raw["metadata"] = json!({"tableUrl":"https://boardgamearena.com/table?table=123","players":[
-        {"name":"P0","id":"101"},{"name":"P1","id":"102"},{"name":"P2","id":"103"},{"name":"P3","id":"104"}]});
-    current.raw["dom_entries"][0]["messages"][0]["icons"][0]["class"] =
-        current.raw["dom_entries"][0]["messages"][0]["icons"][0]["classes"].clone();
-    current.raw["entries"][0]["raw_text"] = json!(format!(
-        "行動 10 :\n12:00\n{}",
-        current.raw["entries"][0]["raw_text"].as_str().unwrap()
-    ));
+    let as_current = |mut current: Fixture| {
+        current.raw["schema_version"] = json!(1);
+        current.raw["source_type"] = json!("public_ui_dom");
+        current.raw["export_scope"] = json!("all_rendered_gamereview_log_entries");
+        current.raw["dom_entry_count"] = json!(1);
+        current.raw["metadata"] = json!({"tableUrl":"https://boardgamearena.com/table?table=123","players":[
+            {"name":"P0","id":"101"},{"name":"P1","id":"102"},{"name":"P2","id":"103"},{"name":"P3","id":"104"}]});
+        for message in current.raw["dom_entries"][0]["messages"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if let Some(icons) = message.get_mut("icons").and_then(Value::as_array_mut) {
+                for icon in icons {
+                    icon["class"] = icon["classes"].clone();
+                }
+            }
+        }
+        current.raw["entries"][0]["raw_text"] = json!(format!(
+            "行動 10 :\n12:00\n{}",
+            current.raw["entries"][0]["raw_text"].as_str().unwrap()
+        ));
+        current
+    };
+    let current = as_current(Fixture::paid_technology(4, 0, [0, 0, 1]));
     assert_eq!(load(&current).unwrap().samples().len(), 2);
+    for (level, payment, body) in [
+        (0, [0, 0, 1], "<div class=\"tz_icon resource_gold\"></div>"),
+        (
+            1,
+            [1, 1, 0],
+            "<div class=\"tz_icon resource_wood\"></div><div class=\"tz_icon resource_stone\"></div>",
+        ),
+        (
+            1,
+            [0, 2, 0],
+            "2<div class=\"tz_icon resource_stone\"></div>",
+        ),
+        (
+            1,
+            [0, 2, 0],
+            "2 <div class=\"tz_icon resource_stone\"></div>",
+        ),
+    ] {
+        let mut fixture = Fixture::paid_technology(4, level, payment);
+        let technology = fixture.raw["dom_entries"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let quantity = if payment[1] == 2 { "2" } else { "" };
+        fixture.set_messages(vec![
+            json!({"raw_text":format!("P0は{quantity}を支払った"),
+            "html":format!("P0は{body}を支払った"),"icons":[]}),
+            technology,
+        ]);
+        assert_eq!(load(&as_current(fixture)).unwrap().samples().len(), 2);
+    }
+    for change in [
+        "unknown",
+        "corn",
+        "skull",
+        "attribute",
+        "trailingMarkup",
+        "truncated",
+        "tooManyIcons",
+        "wrongActor",
+        "rawQuantity",
+        "quantityWithTwoIcons",
+        "capturedMismatch",
+    ] {
+        let mut fixture = Fixture::paid_technology(4, 1, [1, 1, 0]);
+        let technology = fixture.raw["dom_entries"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        let wood = "<div class=\"tz_icon resource_wood\"></div>";
+        let stone = "<div class=\"tz_icon resource_stone\"></div>";
+        let mut message = json!({"raw_text":"P0はを支払った",
+            "html":format!("P0は{wood}{stone}を支払った"),"icons":[]});
+        match change {
+            "unknown" | "corn" | "skull" => {
+                message["html"] = json!(format!(
+                    "P0は<div class=\"tz_icon resource_{change}\"></div>を支払った"
+                ))
+            }
+            "attribute" => {
+                message["html"] = json!(format!(
+                    "P0は<div class=\"tz_icon resource_wood\" title=\"wood\"></div>{stone}を支払った"
+                ))
+            }
+            "trailingMarkup" => {
+                message["html"] = json!(format!("P0は{wood}{stone}<span></span>を支払った"))
+            }
+            "truncated" => {
+                message["html"] = json!("P0は<div class=\"tz_icon resource_wood\">を支払った")
+            }
+            "tooManyIcons" => {
+                message["html"] = json!(format!("P0は{}{stone}を支払った", wood.repeat(3)))
+            }
+            "wrongActor" => message["html"] = json!(format!("P1は{wood}{stone}を支払った")),
+            "rawQuantity" => message["raw_text"] = json!("P0は2を支払った"),
+            "quantityWithTwoIcons" => {
+                message["raw_text"] = json!("P0は2を支払った");
+                message["html"] = json!(format!("P0は2{wood}{stone}を支払った"));
+            }
+            "capturedMismatch" => message["icons"] = json!([{"classes":"tz_icon resource_gold"}]),
+            _ => unreachable!(),
+        }
+        fixture.set_messages(vec![message, technology]);
+        assert!(
+            load(&as_current(fixture)).unwrap().samples().is_empty(),
+            "{change}"
+        );
+    }
     assert!(
         load(&Fixture::paid_technology(3, 0, [1, 0, 0]))
             .unwrap()
@@ -653,6 +756,7 @@ fn observed_paid_technology_v3_requires_exact_materials_and_preserves_prior_labe
         "duplicate",
         "unknownIcon",
         "unknownTechnologyIcon",
+        "unknownTechnologyHtml",
         "bonus",
         "cancel",
         "wrongActor",
@@ -676,6 +780,10 @@ fn observed_paid_technology_v3_requires_exact_materials_and_preserves_prior_labe
             "unknownTechnologyIcon" => {
                 messages.last_mut().unwrap()["icons"] =
                     json!([{"classes":"tz_icon resource_unknown"}]);
+            }
+            "unknownTechnologyHtml" => {
+                messages.last_mut().unwrap()["html"] =
+                    json!("P0は収集を1レベル進めた<div class=\"tz_icon resource_unknown\"></div>");
             }
             "bonus" => {
                 messages.push(json!({"raw_text":"収集技術ボーナス: P0は好きな資源2個を得た"}))
