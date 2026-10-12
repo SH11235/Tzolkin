@@ -75,7 +75,7 @@ impl<'a> ConditionalPolicy<'a> {
                 configuration_key,
                 source_qualified: false,
                 verified_native_policy: false,
-                value_validity: serde_json::to_value(&prepared.model().value_validity)
+                value_validity: serde_json::to_value(prepared.model().value_validity)
                     .map_err(|e| e.to_string())?,
             },
         })
@@ -292,8 +292,10 @@ mod tests {
     }
     #[test]
     fn conditional_callbacks_and_setup_are_explicit_and_fail_closed() {
-        let mut invalid = TradeGuardConfig::default();
-        invalid.max_trades_per_episode = 0;
+        let invalid = TradeGuardConfig {
+            max_trades_per_episode: 0,
+            ..TradeGuardConfig::default()
+        };
         assert!(GameSession::with_config(ConditionalSetup::CornFirst, &invalid).is_err());
         let state = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
         let o = observe(&state, state.current_player).unwrap();
