@@ -1590,7 +1590,119 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       )
     );
   }
+  // The source captions the fixed material before its required free technology.
+  // Bind only immediate Architecture gains now; settle the material by actual choices.
+  function queuedMaterialPurchase(outcome, event, events, witness, previous) {
+    const actor = actorId(event.actor);
+    const action = outcome.row.action;
+    const card = buildings.get(action.id);
+    const effects = card?.effects;
+    const resources = Object.entries(effects?.[1]?.resources ?? {});
+    if (resources.length !== 1) return null;
+    const [resource, amount] = resources[0];
+    const before = previous.players[actor];
+    const task = previous.pending?.task;
+    const next = outcome.frame.snapshot.state;
+    const continuation = actor < 0 ? null : queuedCornTechnology(previous, actor);
+    if (
+      witnesses.catalogHash !== catalogHash ||
+      actor < 0 ||
+      previous.currentPlayer !== actor ||
+      event.kind !== 'build' ||
+      action.type !== 'build' ||
+      typeof action.architecture !== 'boolean' ||
+      action.renovation !== null ||
+      !same(witness.buildings, [action.id]) ||
+      !previous.buildings.includes(action.id) ||
+      !['wood', 'stone', 'gold'].includes(resource) ||
+      !Number.isSafeInteger(amount) ||
+      amount < 1 ||
+      amount > 1000 ||
+      !same(effects, [
+        { type: 'technology', technology: 'any', steps: 1 },
+        { type: 'resources', resources: { [resource]: amount } },
+      ]) ||
+      task?.type !== 'build' ||
+      task.remaining !== 2 ||
+      task.cornPayment !== false ||
+      !same(previous.pending.after, []) ||
+      continuation === null ||
+      (action.architecture &&
+        (task.architectureAvailable === false ||
+          ![2, 3].includes(before.technologies.architecture))) ||
+      next.pending?.task?.type !== 'technology' ||
+      next.pending.task.remaining !== 1 ||
+      next.pending.task.free !== true ||
+      next.pending.task.mandatory === true ||
+      !same(next.pending.task, outcome.frame.observation.pendingTask) ||
+      (witness.pendingTask !== undefined && witness.pendingTask !== 'technology')
+    )
+      return null;
+    const cost = RESOURCES.map((r) => card.cost[r] ?? 0);
+    if (action.architecture && before.technologies.architecture === 3) {
+      const index = RESOURCES.indexOf(action.discountResource);
+      if (index < 1 || index > 3 || cost[index] < 1) return null;
+      cost[index]--;
+    } else if (action.discountResource !== null) return null;
+    const gains = events.filter((item) => item.kind === 'resourceGain');
+    const gainEvent = gains.at(-1);
+    const scoreEvent = events.find((item) => fixedScoreCaption(item) === 2);
+    const index = events.indexOf(event);
+    if (
+      events.some((item) => item.actor !== event.actor) ||
+      events.slice(0, index).some((item) => item.kind !== 'resourcePayment') ||
+      !same(
+        events.slice(index),
+        action.architecture ? [event, gains[0], scoreEvent, gainEvent] : [event, gainEvent],
+      ) ||
+      gains.length !== (action.architecture ? 2 : 1) ||
+      (action.architecture && !same(resourceAmounts(gains[0]), [1, 0, 0, 0, 0])) ||
+      !same(
+        resourceAmounts(gainEvent),
+        RESOURCES.map((r) => (r === resource ? amount : 0)),
+      ) ||
+      !same(typedResourceCost(action), cost) ||
+      !same(paymentOf(events), cost) ||
+      !same(next.pending.after, [
+        { type: 'effects', effects: [effects[1]] },
+        {
+          type: 'build',
+          remaining: 1,
+          allowMonument: false,
+          cornPayment: false,
+          architectureAvailable: task.architectureAvailable !== false && !action.architecture,
+          ...(task.mandatory ? { mandatory: true } : {}),
+        },
+      ])
+    )
+      return null;
+    const expected = mechanical(previous);
+    expected.players[actor].buildings.push(action.id);
+    expected.buildings = previous.buildings.filter((id) => id !== action.id);
+    for (const [i, r] of RESOURCES.entries()) expected.players[actor].resources[r] -= cost[i];
+    expected.players[actor].resources.corn += Number(action.architecture);
+    expected.players[actor].score += 2 * Number(action.architecture);
+    expected.pending = copy(next.pending);
+    if (!same(mechanical(next), expected)) return null;
+    return {
+      ...continuation,
+      kind: 'materialTechnology',
+      actor,
+      resource,
+      amount,
+      pending: copy(next.pending),
+      gainEvent,
+      purchaseCounterEvidence: {
+        score: Object.hasOwn(witness.expected?.players?.[actor] ?? {}, 'score')
+          ? 'sourceCheckpoint'
+          : 'unknown',
+        coreState: 'derivedFromVerifiedPrefix',
+      },
+    };
+  }
   function queuedPurchaseShape(outcome, event, events, witness, previous = state()) {
+    const material = queuedMaterialPurchase(outcome, event, events, witness, previous);
+    if (material !== null) return material;
     const actor = actorId(event.actor);
     const before = previous.pending;
     const next = outcome.frame.snapshot.state;
@@ -1730,10 +1842,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       };
       return false;
     }
-    const uncapped = receipt.kind === 'cornTechnology' ? mechanical(before) : null;
+    const uncapped = ['cornTechnology', 'materialTechnology'].includes(receipt.kind)
+      ? mechanical(before)
+      : null;
     if (uncapped) {
       uncapped.players[actor].technologies[technology]++;
-      uncapped.players[actor].resources.corn += receipt.amount;
+      uncapped.players[actor].resources[receipt.resource] += receipt.amount;
       uncapped.pending = copy(next.pending);
     }
     if (
@@ -1885,7 +1999,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         state().players[queuedPurchase.actor].technologies.theology === 3
       );
     if (
-      queuedPurchase.kind === 'cornTechnology' &&
+      ['cornTechnology', 'materialTechnology'].includes(queuedPurchase.kind) &&
       (context.id !== queuedPurchase.technologySourceId ||
         first.detail.technology !== queuedPurchase.technology)
     )
@@ -2189,8 +2303,14 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             matches(outcome.frame.snapshot.state, witness.expected))
         );
       }
-      if (task === 'technology' && queuedPurchaseShape(outcome, event, events, witness))
-        return matches(outcome.frame.snapshot.state, witness.expected);
+      if (task === 'technology') {
+        const receipt = queuedPurchaseShape(outcome, event, events, witness);
+        if (receipt)
+          return (
+            (receipt.kind === 'materialTechnology' && witness.expected === undefined) ||
+            matches(outcome.frame.snapshot.state, witness.expected)
+          );
+      }
       if (
         task === 'technology' &&
         buildings.get(outcome.row.action.id)?.effects.length === 1 &&
