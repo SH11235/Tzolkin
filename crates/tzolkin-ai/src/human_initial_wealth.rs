@@ -1314,6 +1314,19 @@ fn selected_dom_crosscheck(
     let boards = text(capture, "playerBoardsHtml")?;
     require_unhidden_choice_ancestry(boards, Some(&id.player))?;
     let own = retained_panel(boards, &format!("player_board_{}", id.player), None)?;
+    for tag in HtmlTags::new(own) {
+        let tag = tag?;
+        if !tag.closing
+            && tag.start != 0
+            && optional_attribute(tag.opening, "id")?.is_some_and(|node_id| {
+                node_id.starts_with("overall_player_board_")
+                    || (node_id.starts_with("player_board_")
+                        && !node_id.starts_with("player_board_inner_"))
+            })
+        {
+            return Err("Nested retained player-board owner in own counter panel".into());
+        }
+    }
     let own_start = own.as_ptr().addr() - boards.as_ptr().addr();
     let own_end = own_start + own.len();
     let gains = Gains::pair(input.candidates()[chosen].each_ref().map(String::as_str))?;
@@ -1323,22 +1336,24 @@ fn selected_dom_crosscheck(
     {
         let wanted = format!("{kind}_number_player_{}", id.player);
         let mut found = None;
-        for tag in HtmlTags::new(boards) {
-            let tag = tag?;
-            if !tag.closing && optional_attribute(tag.opening, "id")? == Some(wanted.as_str()) {
-                if tag.name != "span" || found.is_some() {
-                    return Err("Missing/duplicate/malformed retained own counter".into());
+        for (html, in_boards) in [(boards, true), (area, false)] {
+            for tag in HtmlTags::new(html) {
+                let tag = tag?;
+                if !tag.closing && optional_attribute(tag.opening, "id")? == Some(wanted.as_str()) {
+                    if !in_boards || tag.name != "span" || found.is_some() {
+                        return Err("Missing/duplicate/malformed retained own counter".into());
+                    }
+                    let tail = &boards[tag.end..];
+                    let end = tail.find('<').ok_or("Unterminated retained own counter")?;
+                    if tail[..end].trim() != expected.to_string()
+                        || !tail[end..].starts_with("</span>")
+                        || tag.start < own_start
+                        || tag.end + end + "</span>".len() > own_end
+                    {
+                        return Err("Chosen artwork differs from retained own counter DOM".into());
+                    }
+                    found = Some(());
                 }
-                let tail = &boards[tag.end..];
-                let end = tail.find('<').ok_or("Unterminated retained own counter")?;
-                if tail[..end].trim() != expected.to_string()
-                    || !tail[end..].starts_with("</span>")
-                    || tag.start < own_start
-                    || tag.end + end + "</span>".len() > own_end
-                {
-                    return Err("Chosen artwork differs from retained own counter DOM".into());
-                }
-                found = Some(());
             }
         }
         found.ok_or("Missing retained own counter")?;
@@ -1366,13 +1381,17 @@ fn selected_dom_crosscheck(
         for (name, level) in names.iter().zip(expected) {
             let wanted = format!("marker_{}_{kind}_{name}", id.player);
             let mut live_count = 0;
-            for tag in HtmlTags::new(area) {
-                let tag = tag?;
-                if !tag.closing && optional_attribute(tag.opening, "id")? == Some(wanted.as_str()) {
-                    if tag.name != "div" {
-                        return Err("Malformed retained own marker DOM".into());
+            for (html, in_area) in [(area, true), (boards, false)] {
+                for tag in HtmlTags::new(html) {
+                    let tag = tag?;
+                    if !tag.closing
+                        && optional_attribute(tag.opening, "id")? == Some(wanted.as_str())
+                    {
+                        if !in_area || tag.name != "div" {
+                            return Err("Malformed retained own marker DOM".into());
+                        }
+                        live_count += 1;
                     }
-                    live_count += 1;
                 }
             }
             if live_count != 1 {
@@ -2575,10 +2594,70 @@ mod tests {
                 let opening = HtmlTags::new(html).next().unwrap().unwrap();
                 serde_json::json!({"id":m["id"],"style":attribute(opening.opening,"style").unwrap()})
             }).collect();
-        let panels = roster.iter().enumerate().map(|(i, actor)| format!(
-            "<div id=\"player_wealthtiles_{actor}\" class=\"player_wealthtiles\"><div id=\"wealth_tile_{}\" class=\"wealth_tile\" style=\"background-position: 0px 0px;\"></div><div id=\"wealth_tile_{}\" class=\"wealth_tile\" style=\"background-position: -60px 0px;\"></div></div>",2*i+1,2*i+2)).collect::<String>();
+        let tiles: Vec<_> = roster.iter().enumerate().flat_map(|(i, actor)| {
+            let faces = if i == 0 { [(2, -60), (4, -180)] } else { [(2*i+3, 0), (2*i+4, -60)] };
+            faces.into_iter().map(move |(tile_id, x)| serde_json::json!({"id":format!("wealth_tile_{tile_id}"),"parent":format!("player_wealthtiles_{actor}"),"class":"wealth_tile","style":format!("background-position: {x}px 0px;"),"backgroundPosition":format!("{x}px 0px"),"backgroundImage":"url(\"https://x.boardgamearena.net/data/themereleases/current/games/tzolkin/000001-0000/img/wealth_tiles.png\")"}))
+        }).collect();
+        let panels = roster
+            .iter()
+            .map(|actor| {
+                let parent = format!("player_wealthtiles_{actor}");
+                let html = tiles
+                    .iter()
+                    .filter(|tile| tile["parent"].as_str() == Some(parent.as_str()))
+                    .map(|tile| {
+                        format!(
+                            "<div id=\"{}\" class=\"wealth_tile\" style=\"{}\"></div>",
+                            tile["id"].as_str().unwrap(),
+                            tile["style"].as_str().unwrap()
+                        )
+                    })
+                    .collect::<String>();
+                format!("<div id=\"{parent}\" class=\"player_wealthtiles\">{html}</div>")
+            })
+            .collect::<String>();
         let board_html = format!("<div id=\"board\"><div id=\"workers\"></div>{marker_html}</div>");
-        let dom = serde_json::json!({"schema":DOM_CAPTURE_SCHEMA,"capturedAt":"2000-01-01T00:00:01.000Z","url":url,"day":"1","tableInfos":"Table #123\nMove #5\nProgression 0%","prompt":"Pはワーカーを置くか取り除くかしてください","boardHtml":board_html,"interfaceHtml":format!("<div id=\"tzolkin-interface\">{board_html}{panels}</div>"),"playerBoardsHtml":boards,"markers":markers});
+        let dom = serde_json::json!({"schema":DOM_CAPTURE_SCHEMA,"capturedAt":"2000-01-01T00:00:01.000Z","url":url,"title":"synthetic","day":"1","tableInfos":"Table #123\nMove #5\nProgression 0%","prompt":"Pはワーカーを置くか取り除くかしてください","boardHtml":board_html,"interfaceHtml":format!("<div id=\"tzolkin-interface\">{board_html}{panels}</div>"),"playerBoardsHtml":boards,"wealthTiles":tiles,"markers":markers,"workers":[]});
+        let styles = [[0, 0], [-60, 0], [-120, 0], [-180, 0]];
+        let offered: Vec<_> = styles.iter().enumerate().map(|(i, [x, y])| serde_json::json!({"id":format!("wealth_tile_{}",i+1),"parent":"wealth_tiles","class":"wealth_tile active","style":format!("background-position: {x}px {y}px;"),"backgroundPosition":format!("{x}px {y}px"),"backgroundImage":"url(\"https://x.boardgamearena.net/data/themereleases/current/games/tzolkin/000001-0000/img/wealth_tiles.png\")"})).collect();
+        let offers_html = offered
+            .iter()
+            .map(|tile| {
+                format!(
+                    "<div id=\"{}\" class=\"wealth_tile active\" style=\"{}\"></div>",
+                    tile["id"].as_str().unwrap(),
+                    tile["style"].as_str().unwrap()
+                )
+            })
+            .collect::<String>();
+        let before_board =
+            format!("<div id=\"board\"><div id=\"wealth_tiles\">{offers_html}</div></div>");
+        let empty_panels = roster
+            .iter()
+            .map(|actor| {
+                format!(
+                    "<div id=\"player_wealthtiles_{actor}\" class=\"player_wealthtiles\"></div>"
+                )
+            })
+            .collect::<String>();
+        let mut before_dom = dom.clone();
+        before_dom["capturedAt"] = "2000-01-01T00:00:00.000Z".into();
+        before_dom["prompt"] = SELECTION_PROMPT.into();
+        before_dom["tableInfos"] = "Table #123\nMove #1\nProgression 0%".into();
+        before_dom["boardHtml"] = before_board.clone().into();
+        before_dom["interfaceHtml"] =
+            format!("<div id=\"tzolkin-interface\">{before_board}{empty_panels}</div>").into();
+        before_dom["wealthTiles"] = offered.into();
+        let atlas: Atlas = styles
+            .into_iter()
+            .zip(["w10", "w12", "w06", "w04"])
+            .map(|(sprite, tile)| (("000000-0000".into(), sprite), tile.into()))
+            .collect();
+        let (decoded_id, decoded_input, chosen, count) =
+            decode_choice(&before_dom, &dom, &atlas).unwrap();
+        assert_eq!((chosen, count), (4, 4));
+        assert_eq!(decoded_id, id);
+        assert_eq!(decoded_input.offers(), input().offers());
         selected_crosscheck(&dom, &id, &input(), 4, &dom).unwrap();
         assert!(selected_crosscheck(&dom, &id, &input(), 0, &dom).is_err());
         for (field, needle, replacement) in [
@@ -2652,6 +2731,45 @@ mod tests {
                 .into();
             assert!(selected_crosscheck(&foreign, &id, &input(), 4, &foreign).is_err());
         }
+        let mut nested = dom.clone();
+        let foreign = retained_panel(&boards, "overall_player_board_101", None).unwrap();
+        let own = retained_panel(&boards, "player_board_100", None).unwrap();
+        let foreign = foreign.replace(
+            "<div id=\"player_board_101\"></div>",
+            &format!("<div id=\"player_board_101\">{corn}</div>"),
+        );
+        let own = own.replace(corn, "");
+        let nested_own = format!("{}{foreign}</div>", own.strip_suffix("</div>").unwrap());
+        nested["playerBoardsHtml"] = boards
+            .replace(
+                retained_panel(&boards, "overall_player_board_101", None).unwrap(),
+                "",
+            )
+            .replace(
+                retained_panel(&boards, "player_board_100", None).unwrap(),
+                &nested_own,
+            )
+            .into();
+        let mut counter_alias = dom.clone();
+        counter_alias["interfaceHtml"] = format!("<div id=\"tzolkin-interface\">{board_html}{panels}<span id=\"corn_number_player_100\">99</span></div>").into();
+        let mut marker_alias = dom.clone();
+        let mut sidebar = boards.clone();
+        sidebar.insert_str(
+            sidebar.rfind("</div>").unwrap(),
+            "<div id=\"marker_100_temple_chaac\" style=\"top: 167px; left: 17px;\"></div>",
+        );
+        marker_alias["playerBoardsHtml"] = sidebar.into();
+        for (name, wrong) in [
+            ("nested foreign owner", nested),
+            ("interface counter alias", counter_alias),
+            ("sidebar marker alias", marker_alias),
+        ] {
+            let (id, input, chosen, _) = decode_choice(&before_dom, &wrong, &atlas).unwrap();
+            assert!(
+                selected_crosscheck(&wrong, &id, &input, chosen, &wrong).is_err(),
+                "{name}"
+            );
+        }
         let mut partial = dom.clone();
         partial["interfaceHtml"] = text(&partial, "interfaceHtml")
             .unwrap()
@@ -2674,10 +2792,19 @@ mod tests {
             .into();
         three["interfaceHtml"] = text(&three, "interfaceHtml")
             .unwrap()
-            .replace("<div id=\"player_wealthtiles_103\" class=\"player_wealthtiles\"><div id=\"wealth_tile_7\" class=\"wealth_tile\" style=\"background-position: 0px 0px;\"></div><div id=\"wealth_tile_8\" class=\"wealth_tile\" style=\"background-position: -60px 0px;\"></div></div>", "")
+            .replace("<div id=\"player_wealthtiles_103\" class=\"player_wealthtiles\"><div id=\"wealth_tile_9\" class=\"wealth_tile\" style=\"background-position: 0px 0px;\"></div><div id=\"wealth_tile_10\" class=\"wealth_tile\" style=\"background-position: -60px 0px;\"></div></div>", "")
             .replace("<div id=\"workers\"></div>", &format!("<div id=\"workers\">{}</div>", (10..16).map(|i| format!("<div id=\"worker_{i}\" class=\"worker worker_dummy\"></div>")).collect::<String>()))
             .into();
+        three["boardHtml"] = retained_panel(choice_area(&three).unwrap(), "board", None)
+            .unwrap()
+            .to_owned()
+            .into();
         three["tableInfos"] = "Table #123\nMove #4\nProgression 0%".into();
+        three["wealthTiles"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|tile| tile["parent"] != "player_wealthtiles_103");
+        validate_dom_capture(&three, &dom_roster(&three).unwrap()).unwrap();
         selected_crosscheck(&three, &id, &input(), 4, &three).unwrap();
     }
     #[test]
