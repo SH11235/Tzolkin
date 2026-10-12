@@ -9,7 +9,8 @@ use crate::conditional_human_rl_update::{
 };
 use crate::dataset::DatasetSplit;
 use crate::human_policy_dataset::{
-    EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE,
+    EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE,
+    PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use crate::human_policy_training::{ConditionalDatasetIdentity, PreparedConditionalHumanPolicy};
 use crate::policy::HeuristicWeights;
@@ -255,7 +256,11 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
     match label_scope {
         None
         | Some(FACTORIZED_LABEL_SCOPE)
-        | Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) => {
+        | Some(
+            PAID_TECHNOLOGY_LABEL_SCOPE
+            | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+            | OBSERVED_CORN_BEG_LABEL_SCOPE,
+        ) => {
             matches!(
                 action,
                 TypedAction::Place { .. }
@@ -271,7 +276,11 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
                 ))
                 || (matches!(
                     label_scope,
-                    Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                    Some(
+                        PAID_TECHNOLOGY_LABEL_SCOPE
+                            | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                            | OBSERVED_CORN_BEG_LABEL_SCOPE
+                    )
                 ) && match action {
                     TypedAction::Technology { .. } => true,
                     TypedAction::Payment { resources } => {
@@ -282,19 +291,26 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
                     }
                     _ => false,
                 })
-                || (label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                || (matches!(
+                    label_scope,
+                    Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE | OBSERVED_CORN_BEG_LABEL_SCOPE)
+                ) && matches!(
+                    action,
+                    TypedAction::Trade {
+                        resource: tzolkin_core::Resource::Wood
+                            | tzolkin_core::Resource::Stone
+                            | tzolkin_core::Resource::Gold,
+                        buy: false
+                    } | TypedAction::UseAction {
+                        source: ActionSource::Anywhere,
+                        corn_cost: 1,
+                        ..
+                    }
+                ))
+                || (label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE)
                     && matches!(
                         action,
-                        TypedAction::Trade {
-                            resource: tzolkin_core::Resource::Wood
-                                | tzolkin_core::Resource::Stone
-                                | tzolkin_core::Resource::Gold,
-                            buy: false
-                        } | TypedAction::UseAction {
-                            source: ActionSource::Anywhere,
-                            corn_cost: 1,
-                            ..
-                        }
+                        TypedAction::Beg | TypedAction::Temple { direction: -1, .. }
                     ))
         }
         Some(_) => false,
@@ -584,6 +600,7 @@ mod tests {
             Some(FACTORIZED_LABEL_SCOPE),
             Some(PAID_TECHNOLOGY_LABEL_SCOPE),
             Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE),
+            Some(OBSERVED_CORN_BEG_LABEL_SCOPE),
         ] {
             for action in [
                 TypedAction::Place {
@@ -633,7 +650,11 @@ mod tests {
                     teacher_grammar_contains(scope, &action),
                     matches!(
                         scope,
-                        Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                        Some(
+                            PAID_TECHNOLOGY_LABEL_SCOPE
+                                | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                                | OBSERVED_CORN_BEG_LABEL_SCOPE
+                        )
                     )
                 );
                 assert!(!teacher_grammar_contains(Some("unknown"), &action));
@@ -654,8 +675,13 @@ mod tests {
                 for buy in [false, true] {
                     assert_eq!(
                         teacher_grammar_contains(scope, &TypedAction::Trade { resource, buy }),
-                        scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
-                            && !buy
+                        matches!(
+                            scope,
+                            Some(
+                                EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                                    | OBSERVED_CORN_BEG_LABEL_SCOPE
+                            )
+                        ) && !buy
                             && matches!(
                                 resource,
                                 Resource::Wood | Resource::Stone | Resource::Gold
@@ -674,7 +700,26 @@ mod tests {
                             corn_cost
                         }
                     ),
-                    scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) && corn_cost == 1
+                    matches!(
+                        scope,
+                        Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE | OBSERVED_CORN_BEG_LABEL_SCOPE)
+                    ) && corn_cost == 1
+                );
+            }
+            assert_eq!(
+                teacher_grammar_contains(scope, &TypedAction::Beg),
+                scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE)
+            );
+            for direction in [-1, 1] {
+                assert_eq!(
+                    teacher_grammar_contains(
+                        scope,
+                        &TypedAction::Temple {
+                            temple: tzolkin_core::TempleId::Chaac,
+                            direction
+                        }
+                    ),
+                    scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) && direction == -1
                 );
             }
             assert!(!teacher_grammar_contains(

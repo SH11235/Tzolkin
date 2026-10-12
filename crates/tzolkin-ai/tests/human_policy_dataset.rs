@@ -6,12 +6,14 @@ use tzolkin_ai::dataset::DatasetSplit;
 use tzolkin_ai::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
 use tzolkin_ai::human_policy_dataset::{
     ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
-    INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, PAID_TECHNOLOGY_LABEL_SCOPE,
+    INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5,
+    OBSERVED_CORN_BEG_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{
     Evidence, Market, PUBLIC_REPLAY_SCHEMA, PUBLIC_RULES_VERSION, PublicReplayRecord,
-    PublicReplayStep, PublicState, Refills, public_catalog_hash,
+    PublicReplayStep, PublicState, Refills, inspect_public, public_catalog_hash,
+    verify_public_replay,
 };
 use tzolkin_core::{GameState, GearId, Phase, apply_move, create_game, get_available_moves};
 #[path = "support/temp_root.rs"]
@@ -121,6 +123,144 @@ impl Fixture {
             audit,
             reservations: json!({"schema":"tzolkin-human-source-table-reservations-v1","entries":[{"tableId":"123","split":"validation","basis":"prior setup held-out family"}]}),
         }
+    }
+    fn corn_beg(corn: i64) -> Self {
+        use tzolkin_core::{Resource, TempleId};
+        fn spend_to(
+            state: &GameState,
+            corn: i64,
+            depth: usize,
+        ) -> Option<Vec<tzolkin_core::GameMove>> {
+            let gap = state.players[state.current_player].resources[&Resource::Corn] - corn;
+            if gap == 0 {
+                return Some(Vec::new());
+            }
+            if depth == 0 {
+                return None;
+            }
+            for row in observe(state, state.current_player).unwrap().legal_actions {
+                if matches!(row.action, TypedAction::Place { corn_cost, discount: false, .. } if corn_cost <= gap)
+                {
+                    let next = apply_move(state, row.r#move.clone()).unwrap();
+                    if let Some(mut tail) = spend_to(&next, corn, depth - 1) {
+                        tail.insert(0, row.r#move);
+                        return Some(tail);
+                    }
+                }
+            }
+            None
+        }
+        let mut state = playing_state();
+        let actor = state.current_player;
+        let initial = PublicState::from_game_state(&state).unwrap();
+        let mut steps = Vec::new();
+        // Spend through legal placements, then complete one turn cycle. The
+        // initial wealth/counters remain genuine and no state is injected.
+        for turn in 0..3 {
+            let placements = if turn == 0 {
+                spend_to(&state, corn, 3)
+                    .expect("three legal placements can reach the requested corn")
+            } else {
+                vec![
+                    observe(&state, state.current_player)
+                        .unwrap()
+                        .legal_actions
+                        .into_iter()
+                        .find(|row| {
+                            matches!(
+                                row.action,
+                                TypedAction::Place {
+                                    discount: false,
+                                    ..
+                                }
+                            )
+                        })
+                        .unwrap()
+                        .r#move,
+                ]
+            };
+            for placement in placements {
+                steps.push(json!({"actor":state.current_player,"move":placement,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+                state = apply_move(&state, placement).unwrap();
+            }
+            let end = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|row| {
+                    matches!(
+                        row.action,
+                        TypedAction::EndTurn {
+                            double_advance: None
+                        }
+                    )
+                })
+                .unwrap();
+            steps.push(json!({"actor":state.current_player,"move":end.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            state = apply_move(&state, end.r#move).unwrap();
+        }
+        assert_eq!(state.current_player, actor);
+        assert_eq!(state.players[actor].resources[&Resource::Corn], corn);
+        let beg_step = steps.len() + 1;
+        let beg = observe(&state, actor)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| matches!(row.action, TypedAction::Beg))
+            .unwrap();
+        state = apply_move(&state, beg.r#move.clone()).unwrap();
+        let temple = observe(&state, actor)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::Temple {
+                        temple: TempleId::Chaac,
+                        direction: -1
+                    }
+                )
+            })
+            .unwrap();
+        let mut fixture = Self::new();
+        fixture.record["initial"] = serde_json::to_value(initial).unwrap();
+        steps.push(json!({"actor":actor,"move":beg.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
+        steps.push(json!({"actor":actor,"move":temple.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
+        fixture.record["steps"] = json!(steps);
+        fixture.audit["audit"] = json!([
+            {"step":beg_step,"actionId":10,"actor":actor,"action":beg.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1},
+            {"step":beg_step+1,"actionId":10,"actor":actor,"action":temple.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}
+        ]);
+        let caption = format!(
+            "P{actor}はChaacの信仰を1段下げることでコーン{}個を受け取った",
+            3 - corn
+        );
+        fixture.set_messages(vec![json!({"raw_text":caption,"html":caption,"icons":[]})]);
+        fixture
+    }
+    fn bind_derived_source_step(&mut self, index: usize) {
+        let record: PublicReplayRecord = serde_json::from_value(self.record.clone()).unwrap();
+        let report = verify_public_replay(&record).unwrap();
+        let observation = inspect_public(&report.frames[index].snapshot.state)
+            .unwrap()
+            .observation
+            .unwrap();
+        let step = &record.steps[index];
+        let action = &observation
+            .legal_actions
+            .iter()
+            .find(|row| row.r#move == step.r#move)
+            .unwrap()
+            .action;
+        self.record["steps"][index]["sourceActionIds"] = json!([10]);
+        self.audit["audit"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "step":index+1,"actionId":10,"actor":step.actor,"action":action,
+                "derivedFromVisibleBoundary":true,"equivalentChoices":1
+            }),
+        );
     }
     fn paired_action(removed_position: i64, action_position: i64) -> Self {
         let mut state = playing_state();
@@ -859,6 +999,195 @@ fn observed_market_and_paid_anywhere_v4_require_exact_source_authority() {
     assert!(
         f.load_scope(INPUT_SCHEMA_V4, Some(json!(PAID_TECHNOLOGY_LABEL_SCOPE)))
             .is_err()
+    );
+    let load_beg =
+        |f: &Fixture| f.load_scope(INPUT_SCHEMA_V5, Some(json!(OBSERVED_CORN_BEG_LABEL_SCOPE)));
+    for corn in 0..=2 {
+        let f = Fixture::corn_beg(corn);
+        assert!(load(&f).unwrap().samples().is_empty());
+        let dataset = load_beg(&f).unwrap();
+        let report = serde_json::to_value(dataset.report()).unwrap();
+        assert_eq!(dataset.samples().len(), 2);
+        assert_eq!(
+            report["schema"],
+            "tzolkin-conditional-basic-human-policy-dataset-v5"
+        );
+        assert_eq!(report["samples"][0]["sourceLabelPart"], "cornBeg");
+        assert_eq!(report["samples"][1]["sourceLabelPart"], "begTemple");
+        for index in 0..2 {
+            assert_eq!(
+                report["samples"][index]["cornBegSupport"]["cornGain"],
+                3 - corn
+            );
+            assert_eq!(
+                report["samples"][index]["pairedSampleId"],
+                report["samples"][1 - index]["sampleId"]
+            );
+            assert_eq!(report["samples"][index]["valueTarget"], Value::Null);
+        }
+        for flag in [
+            "sourceAuthenticated",
+            "sourceQualified",
+            "verifiedNativePolicy",
+            "trainingReady",
+            "valueSupervised",
+        ] {
+            assert_eq!(report[flag], false);
+        }
+    }
+    let plain = Fixture::corn_beg(1);
+    let mut boundary = Fixture::corn_beg(1);
+    let previous = boundary.record["steps"].as_array().unwrap().len() - 3;
+    boundary.bind_derived_source_step(previous);
+    // The prior actor's uniquely audited boundary adds no teacher label and
+    // does not change either observed pair's identity or features.
+    assert_eq!(
+        serde_json::to_vec(load_beg(&plain).unwrap().samples()).unwrap(),
+        serde_json::to_vec(load_beg(&boundary).unwrap().samples()).unwrap()
+    );
+    for change in [
+        "sameActor",
+        "afterPair",
+        "moreThanOne",
+        "otherAction",
+        "notDerived",
+        "ambiguousBoundary",
+        "extraAuditField",
+        "missingBoundaryAudit",
+    ] {
+        let mut f = Fixture::corn_beg(1);
+        let previous = f.record["steps"].as_array().unwrap().len() - 3;
+        if change == "afterPair" {
+            let record: PublicReplayRecord = serde_json::from_value(f.record.clone()).unwrap();
+            let report = verify_public_replay(&record).unwrap();
+            let observation = inspect_public(&report.frames.last().unwrap().snapshot.state)
+                .unwrap()
+                .observation
+                .unwrap();
+            let row = observation
+                .legal_actions
+                .iter()
+                .find(|row| matches!(row.action, TypedAction::Place { .. }))
+                .unwrap();
+            f.record["steps"].as_array_mut().unwrap().push(json!({
+                "actor":observation.actor,"move":row.r#move,"sourceActionIds":[],
+                "refills":{},"checkpoint":null
+            }));
+            f.bind_derived_source_step(previous + 3);
+        } else if change == "otherAction" {
+            f.bind_derived_source_step(previous - 1);
+        } else {
+            f.bind_derived_source_step(previous);
+            match change {
+                "sameActor" => {
+                    f.record["steps"][previous]["actor"] =
+                        f.record["steps"][previous + 1]["actor"].clone();
+                }
+                "moreThanOne" => f.bind_derived_source_step(previous - 1),
+                "notDerived" => f.audit["audit"][0]["derivedFromVisibleBoundary"] = json!(false),
+                "ambiguousBoundary" => f.audit["audit"][0]["equivalentChoices"] = json!(2),
+                "extraAuditField" => f.audit["audit"][0]["removedSteps"] = json!([]),
+                "missingBoundaryAudit" => {
+                    f.audit["audit"].as_array_mut().unwrap().remove(0);
+                }
+                _ => unreachable!(),
+            }
+        }
+        if let Ok(dataset) = load_beg(&f) {
+            assert!(dataset.samples().is_empty(), "{change}");
+        }
+    }
+    for change in [
+        "actor",
+        "temple",
+        "amount",
+        "direction",
+        "extraHtml",
+        "icons",
+        "duplicate",
+        "extraEvent",
+        "badAudit",
+        "rollback",
+        "differentSource",
+        "missingBeg",
+    ] {
+        let mut f = Fixture::corn_beg(1);
+        let mut message = f.raw["dom_entries"][0]["messages"][0].clone();
+        match change {
+            "actor" => {
+                message["raw_text"] =
+                    json!(message["raw_text"].as_str().unwrap().replace("P0", "P1"))
+            }
+            "temple" => {
+                message["raw_text"] = json!(
+                    message["raw_text"]
+                        .as_str()
+                        .unwrap()
+                        .replace("Chaac", "Kukulcan")
+                )
+            }
+            "amount" => {
+                message["raw_text"] = json!(
+                    message["raw_text"]
+                        .as_str()
+                        .unwrap()
+                        .replace("コーン2", "コーン3")
+                )
+            }
+            "direction" => {
+                message["raw_text"] = json!(
+                    message["raw_text"]
+                        .as_str()
+                        .unwrap()
+                        .replace("下げる", "上げる")
+                )
+            }
+            "extraHtml" => {
+                message["html"] = json!(format!(
+                    "{}<span></span>",
+                    message["html"].as_str().unwrap()
+                ))
+            }
+            "icons" => message["icons"] = json!([{"classes":"tz_icon resource_corn"}]),
+            "badAudit" => f.audit["audit"][1]["equivalentChoices"] = json!(2),
+            "rollback" => f.audit["audit"][0]["removedSteps"] = json!([]),
+            "differentSource" => {
+                let last = f.record["steps"].as_array().unwrap().len() - 1;
+                f.record["steps"][last]["sourceActionIds"] = json!([11]);
+            }
+            "missingBeg" => {
+                let beg = f.record["steps"].as_array().unwrap().len() - 2;
+                f.record["steps"].as_array_mut().unwrap().remove(beg);
+            }
+            "duplicate" | "extraEvent" => {}
+            _ => unreachable!(),
+        }
+        f.set_messages(match change {
+            "duplicate" => vec![message.clone(), message],
+            "extraEvent" => vec![message, json!({"raw_text":"P0は新しいワーカーを獲得した","html":"P0は新しいワーカーを獲得した","icons":[]})],
+            _ => vec![message],
+        });
+        if let Ok(dataset) = load_beg(&f) {
+            assert!(dataset.samples().is_empty(), "{change}");
+        }
+    }
+    for f in [
+        Fixture::paired_action(2, 1),
+        Fixture::paid_technology(4, 1, [1, 1, 0]),
+        Fixture::explicit_operation(false, Resource::Gold),
+        Fixture::explicit_operation(true, Resource::Wood),
+    ] {
+        assert_eq!(
+            serde_json::to_vec(load(&f).unwrap().samples()).unwrap(),
+            serde_json::to_vec(load_beg(&f).unwrap().samples()).unwrap()
+        );
+    }
+    assert!(
+        f.load_scope(
+            INPUT_SCHEMA_V5,
+            Some(json!(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE))
+        )
+        .is_err()
     );
 }
 
