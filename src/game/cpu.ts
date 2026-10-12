@@ -52,24 +52,55 @@ export type CurrentMixedIdentity =
         readonly parentArtifactChecksum: string;
       };
     };
+export interface ConditionalCurrentIdentity {
+  readonly policyVersion: 'conditional-human-current-mixed-scalar-v1';
+  readonly inputContract: 'conditional-human-origin-base-default-3-4p-public512-native-setup-playing-v1';
+  readonly originChecksum: string;
+  readonly rootIdentityChecksum: string;
+  readonly parentIdentityChecksum: string;
+  readonly actorChecksum: string;
+  /** Bound source claim; the portable model has no critic weights. */
+  readonly criticChecksum: string;
+  readonly mixedUpdateCount: number;
+  /** Rust decimal strings preserve u64 metadata across the Worker boundary. */
+  readonly samplingSeed: string;
+  readonly nextEpisodeOrdinal: string;
+  readonly gameOptions: {
+    readonly additionalBuildings: false;
+    readonly tribes: false;
+    readonly prophecies: false;
+    readonly quickActions: false;
+  };
+  readonly uxmalCornLimit: false;
+  readonly sourceQualified: false;
+  readonly verifiedNativePolicy: false;
+  readonly checksum: string;
+}
 /** Numeric content identity only; these fields do not establish training qualification. */
 export interface CpuModelMetadata {
   readonly checksum: string;
-  readonly sourceRole: 'bcPrepared' | 'rlCount1' | 'rlRepeated' | 'rlCurrentMixed';
+  readonly sourceRole:
+    'bcPrepared' | 'rlCount1' | 'rlRepeated' | 'rlCurrentMixed' | 'conditionalHumanCurrentMixed';
   readonly sourceChecksum: string;
   readonly sourceNumericalTarget: string;
   readonly updateCount: number | null;
   readonly policyVersion: string;
   readonly backend: 'scalar';
   readonly currentMixedIdentity?: CurrentMixedIdentity;
+  readonly conditionalCurrentIdentity?: ConditionalCurrentIdentity;
+  readonly sourceAuthenticated?: false;
+  readonly sourceQualified?: false;
+  readonly verifiedNativePolicy?: false;
+  readonly valueValidity?: 'unavailablePolicyOnly';
 }
 export const GUARDED_POLICY_VERSION = 'numeric-public-trade-guard-v1';
+export const GUARDED_CONDITIONAL_POLICY_VERSION = 'numeric-conditional-human-trade-guard-v1';
 const GUARD_VERSION = 'public-trade-cycle-guard-v1';
 const PROJECTION_VERSION = 'public-trading-state-v1';
 export interface CpuGameMetadata {
   readonly gameId: string;
   readonly modelChecksum: string;
-  readonly policyVersion: typeof GUARDED_POLICY_VERSION;
+  readonly policyVersion: typeof GUARDED_POLICY_VERSION | typeof GUARDED_CONDITIONAL_POLICY_VERSION;
   readonly rawPolicyVersion: string;
   readonly guardVersion: string;
   readonly projectionVersion: string;
@@ -182,7 +213,9 @@ function modelMetadata(value: unknown): CpuModelMetadata {
       metadata.updateCount >= 2 &&
       metadata.updateCount <= 10 &&
       metadata.policyVersion === 'learned-public-rl-repeat-v1') ||
-    (metadata.sourceRole === 'rlCurrentMixed' && currentMixedMetadataMatches(metadata));
+    (metadata.sourceRole === 'rlCurrentMixed' && currentMixedMetadataMatches(metadata)) ||
+    (metadata.sourceRole === 'conditionalHumanCurrentMixed' &&
+      conditionalMetadataMatches(metadata));
   if (
     typeof metadata.checksum !== 'string' ||
     !SHA256.test(metadata.checksum) ||
@@ -205,7 +238,89 @@ function modelMetadata(value: unknown): CpuModelMetadata {
       }) as CurrentMixedIdentity,
     });
   }
+  if (metadata.sourceRole === 'conditionalHumanCurrentMixed') {
+    const identity = metadata.conditionalCurrentIdentity!;
+    return Object.freeze({
+      ...metadata,
+      conditionalCurrentIdentity: Object.freeze({
+        ...identity,
+        gameOptions: Object.freeze({ ...identity.gameOptions }),
+      }),
+    });
+  }
   return Object.freeze({ ...metadata });
+}
+
+function conditionalMetadataMatches(metadata: CpuModelMetadata): boolean {
+  const identity = metadata.conditionalCurrentIdentity;
+  if (!identity || typeof identity !== 'object' || metadata.currentMixedIdentity) return false;
+  const keys = [
+    'policyVersion',
+    'inputContract',
+    'originChecksum',
+    'rootIdentityChecksum',
+    'parentIdentityChecksum',
+    'actorChecksum',
+    'criticChecksum',
+    'mixedUpdateCount',
+    'samplingSeed',
+    'nextEpisodeOrdinal',
+    'gameOptions',
+    'uxmalCornLimit',
+    'sourceQualified',
+    'verifiedNativePolicy',
+    'checksum',
+  ];
+  if (
+    Object.keys(identity).length !== keys.length ||
+    !keys.every((key) => Object.hasOwn(identity, key)) ||
+    identity.policyVersion !== 'conditional-human-current-mixed-scalar-v1' ||
+    metadata.policyVersion !== identity.policyVersion ||
+    identity.inputContract !==
+      'conditional-human-origin-base-default-3-4p-public512-native-setup-playing-v1' ||
+    !Number.isSafeInteger(identity.mixedUpdateCount) ||
+    identity.mixedUpdateCount < 1 ||
+    identity.mixedUpdateCount > 64 ||
+    metadata.updateCount !== identity.mixedUpdateCount ||
+    metadata.sourceChecksum !== identity.checksum ||
+    ![
+      identity.originChecksum,
+      identity.rootIdentityChecksum,
+      identity.parentIdentityChecksum,
+      identity.actorChecksum,
+      identity.criticChecksum,
+      identity.checksum,
+    ].every((value) => typeof value === 'string' && SHA256.test(value)) ||
+    !/^scalar-f32-f64-tick53-v1:[a-z0-9_]{1,32}:[a-z0-9_]{1,32}:(32|64)$/.test(
+      metadata.sourceNumericalTarget,
+    ) ||
+    metadata.sourceAuthenticated !== false ||
+    metadata.sourceQualified !== false ||
+    metadata.verifiedNativePolicy !== false ||
+    metadata.valueValidity !== 'unavailablePolicyOnly' ||
+    identity.sourceQualified !== false ||
+    identity.verifiedNativePolicy !== false ||
+    identity.uxmalCornLimit !== false
+  )
+    return false;
+  const options = identity.gameOptions;
+  const optionKeys = ['additionalBuildings', 'tribes', 'prophecies', 'quickActions'] as const;
+  if (
+    !options ||
+    typeof options !== 'object' ||
+    Object.keys(options).length !== 4 ||
+    !optionKeys.every((key) => Object.hasOwn(options, key) && options[key] === false)
+  )
+    return false;
+  const u64 = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    /^(0|[1-9][0-9]{0,19})$/.test(value) &&
+    BigInt(value) <= 18446744073709551615n;
+  if (!u64(identity.samplingSeed) || !u64(identity.nextEpisodeOrdinal)) return false;
+  const ordinal = BigInt(identity.nextEpisodeOrdinal);
+  return (
+    ordinal % 4n === 0n && ordinal <= 256n && ordinal >= BigInt(identity.mixedUpdateCount) * 4n
+  );
 }
 
 function currentMixedMetadataMatches(metadata: CpuModelMetadata): boolean {
@@ -503,7 +618,10 @@ export function startCpuGame(signal: AbortSignal, modelChecksum: string): Promis
         !value ||
         value.gameId !== gameId ||
         value.modelChecksum !== modelChecksum ||
-        value.policyVersion !== GUARDED_POLICY_VERSION ||
+        value.policyVersion !==
+          (metadata.sourceRole === 'conditionalHumanCurrentMixed'
+            ? GUARDED_CONDITIONAL_POLICY_VERSION
+            : GUARDED_POLICY_VERSION) ||
         value.rawPolicyVersion !== metadata.policyVersion ||
         value.guardVersion !== GUARD_VERSION ||
         value.projectionVersion !== PROJECTION_VERSION ||

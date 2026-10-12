@@ -1,4 +1,150 @@
+use tzolkin_inference::{conditional_deployment as conditional, deployment};
 use wasm_bindgen::prelude::*;
+
+// Closed loader alternatives: neither branch is a learning-owner constructor.
+enum CpuPolicy {
+    Native(Box<deployment::LoadedDeployment>),
+    Conditional(Box<conditional::LoadedConditionalDeployment>),
+}
+enum CpuGuard {
+    Native(Box<deployment::GuardedDeployment>),
+    Conditional(Box<conditional::GuardedConditionalDeployment>),
+}
+enum CpuPolicyRef<'a> {
+    Native(&'a deployment::LoadedDeployment),
+    Conditional(&'a conditional::LoadedConditionalDeployment),
+}
+impl CpuPolicy {
+    fn as_ref(&self) -> CpuPolicyRef<'_> {
+        match self {
+            Self::Native(policy) => CpuPolicyRef::Native(policy),
+            Self::Conditional(policy) => CpuPolicyRef::Conditional(policy),
+        }
+    }
+    fn into_guard(self) -> Result<CpuGuard, String> {
+        match self {
+            Self::Native(policy) => Ok(CpuGuard::Native(Box::new(
+                deployment::GuardedDeployment::new(*policy, Default::default())?,
+            ))),
+            Self::Conditional(policy) => Ok(CpuGuard::Conditional(Box::new(
+                conditional::GuardedConditionalDeployment::new(*policy, Default::default())?,
+            ))),
+        }
+    }
+}
+impl CpuPolicyRef<'_> {
+    fn checksum(&self) -> &str {
+        match self {
+            Self::Native(policy) => policy.checksum(),
+            Self::Conditional(policy) => policy.checksum(),
+        }
+    }
+    fn policy_version(&self) -> &str {
+        match self {
+            Self::Native(policy) => policy.policy_version(),
+            Self::Conditional(policy) => policy.policy_version(),
+        }
+    }
+    fn choose_move(
+        &self,
+        observation: &tzolkin_core::observation::Observation,
+    ) -> Result<deployment::DeploymentDecision, String> {
+        match self {
+            Self::Native(policy) => policy.choose_move(observation),
+            Self::Conditional(policy) => policy.choose_move(observation),
+        }
+    }
+    fn metadata(&self) -> Result<serde_json::Value, String> {
+        match self {
+            Self::Native(policy) => {
+                let mut metadata = serde_json::json!({
+                    "checksum": policy.checksum(),
+                    "sourceRole": policy.source_role(),
+                    "sourceChecksum": policy.source_checksum(),
+                    "sourceNumericalTarget": policy.source_numerical_target(),
+                    "updateCount": policy.update_count(),
+                    "policyVersion": policy.policy_version(),
+                    "backend": policy.backend(),
+                });
+                if let Some(identity) = policy.current_mixed_identity() {
+                    metadata["currentMixedIdentity"] =
+                        serde_json::to_value(identity).map_err(|e| e.to_string())?;
+                }
+                Ok(metadata)
+            }
+            Self::Conditional(policy) => {
+                let mut identity =
+                    serde_json::to_value(policy.identity()).map_err(|e| e.to_string())?;
+                // Preserve u64 identity exactly before crossing JSON.parse in JS.
+                // These strings are metadata, never an artifact/owner round trip.
+                for field in ["samplingSeed", "nextEpisodeOrdinal"] {
+                    let value = identity[field].as_u64().ok_or("Conditional identity u64")?;
+                    identity[field] = value.to_string().into();
+                }
+                Ok(serde_json::json!({
+                    "checksum": policy.checksum(),
+                    "sourceRole": "conditionalHumanCurrentMixed",
+                    "sourceChecksum": policy.identity().checksum(),
+                    "sourceNumericalTarget": policy.source_numerical_target(),
+                    "updateCount": policy.identity().mixed_update_count(),
+                    "policyVersion": policy.policy_version(),
+                    "backend": policy.backend(),
+                    "conditionalCurrentIdentity": identity,
+                    "sourceAuthenticated": false,
+                    "sourceQualified": false,
+                    "verifiedNativePolicy": false,
+                    "valueValidity": deployment::VALUE_VALIDITY,
+                }))
+            }
+        }
+    }
+}
+impl CpuGuard {
+    fn policy(&self) -> CpuPolicyRef<'_> {
+        match self {
+            Self::Native(game) => CpuPolicyRef::Native(game.policy()),
+            Self::Conditional(game) => CpuPolicyRef::Conditional(game.policy()),
+        }
+    }
+    fn into_policy(self) -> CpuPolicy {
+        match self {
+            Self::Native(game) => CpuPolicy::Native(Box::new((*game).into_policy())),
+            Self::Conditional(game) => CpuPolicy::Conditional(Box::new((*game).into_policy())),
+        }
+    }
+    fn configuration_key(&self) -> &str {
+        match self {
+            Self::Native(game) => game.configuration_key(),
+            Self::Conditional(game) => game.configuration_key(),
+        }
+    }
+    fn policy_version(&self) -> &'static str {
+        match self {
+            Self::Native(_) => deployment::GUARDED_DEPLOYMENT_VERSION,
+            Self::Conditional(_) => conditional::GUARDED_POLICY_VERSION,
+        }
+    }
+    fn on_callback(
+        &mut self,
+        index: usize,
+        observation: &tzolkin_core::observation::Observation,
+    ) -> Result<(), String> {
+        match self {
+            Self::Native(game) => game.on_callback(index, observation),
+            Self::Conditional(game) => game.on_callback(index, observation),
+        }
+    }
+    fn choose_move(
+        &mut self,
+        index: usize,
+        observation: &tzolkin_core::observation::Observation,
+    ) -> Result<deployment::GuardedDeploymentDecision, String> {
+        match self {
+            Self::Native(game) => game.choose_move(index, observation),
+            Self::Conditional(game) => game.choose_move(index, observation),
+        }
+    }
+}
 
 /// Dispatch a validated request to the same Rust core used by the desktop app.
 #[wasm_bindgen]
@@ -16,8 +162,8 @@ pub fn dispatch_cpu(observation: &str) -> Result<String, JsError> {
 /// ownership or source authenticity; the Worker owns this instance until reset.
 #[wasm_bindgen]
 pub struct CpuDeployment {
-    policy: Option<tzolkin_inference::deployment::LoadedDeployment>,
-    guarded: Option<tzolkin_inference::deployment::GuardedDeployment>,
+    policy: Option<CpuPolicy>,
+    guarded: Option<CpuGuard>,
     game_id: Option<String>,
 }
 
@@ -27,9 +173,26 @@ impl CpuDeployment {
     /// Nonempty expected checksums must match the validated deployment content.
     #[wasm_bindgen(constructor)]
     pub fn new(bytes: &[u8], expected_checksum: &str) -> Result<CpuDeployment, JsError> {
-        let policy = tzolkin_inference::deployment::LoadedDeployment::load(bytes)
-            .map_err(|error| JsError::new(&error))?;
-        if !expected_checksum.is_empty() && expected_checksum != policy.checksum() {
+        if bytes.len() > deployment::MAX_DEPLOYMENT_BYTES {
+            return Err(JsError::new("NN deployment exceeds 1 MiB"));
+        }
+        #[derive(serde::Deserialize)]
+        struct Format {
+            schema: String,
+        }
+        let format: Format = serde_json::from_slice(bytes)
+            .map_err(|_| JsError::new("Invalid NN deployment JSON"))?;
+        let policy = match format.schema.as_str() {
+            deployment::DEPLOYMENT_SCHEMA => CpuPolicy::Native(Box::new(
+                deployment::LoadedDeployment::load(bytes).map_err(|error| JsError::new(&error))?,
+            )),
+            conditional::DEPLOYMENT_SCHEMA => CpuPolicy::Conditional(Box::new(
+                conditional::LoadedConditionalDeployment::load(bytes)
+                    .map_err(|error| JsError::new(&error))?,
+            )),
+            _ => return Err(JsError::new("Unsupported NN deployment format")),
+        };
+        if !expected_checksum.is_empty() && expected_checksum != policy.as_ref().checksum() {
             return Err(JsError::new("NN deployment checksum mismatch"));
         }
         Ok(Self {
@@ -44,20 +207,10 @@ impl CpuDeployment {
     }
 
     pub fn metadata(&self) -> Result<String, JsError> {
-        let policy = self.policy()?;
-        let mut metadata = serde_json::json!({
-            "checksum": policy.checksum(),
-            "sourceRole": policy.source_role(),
-            "sourceChecksum": policy.source_checksum(),
-            "sourceNumericalTarget": policy.source_numerical_target(),
-            "updateCount": policy.update_count(),
-            "policyVersion": policy.policy_version(),
-            "backend": policy.backend(),
-        });
-        if let Some(identity) = policy.current_mixed_identity() {
-            metadata["currentMixedIdentity"] =
-                serde_json::to_value(identity).map_err(|error| JsError::new(&error.to_string()))?;
-        }
+        let metadata = self
+            .policy()?
+            .metadata()
+            .map_err(|error| JsError::new(&error))?;
         serde_json::to_string(&metadata).map_err(|error| JsError::new(&error.to_string()))
     }
 
@@ -103,13 +256,11 @@ impl CpuDeployment {
                 .policy
                 .take()
                 .ok_or_else(|| JsError::new("NN model unavailable"))?;
-            let guarded =
-                tzolkin_inference::deployment::GuardedDeployment::new(policy, Default::default())
-                    .map_err(|error| JsError::new(&error))?;
+            let guarded = policy.into_guard().map_err(|error| JsError::new(&error))?;
             let metadata = serde_json::json!({
                 "gameId": game_id,
                 "modelChecksum": guarded.policy().checksum(),
-                "policyVersion": tzolkin_inference::deployment::GUARDED_DEPLOYMENT_VERSION,
+                "policyVersion": guarded.policy_version(),
                 "rawPolicyVersion": guarded.policy().policy_version(),
                 "guardVersion": tzolkin_inference::trade_guard::GUARD_VERSION,
                 "projectionVersion": tzolkin_inference::trade_guard::PROJECTION_VERSION,
@@ -178,9 +329,10 @@ impl CpuDeployment {
 }
 
 impl CpuDeployment {
-    fn policy(&self) -> Result<&tzolkin_inference::deployment::LoadedDeployment, JsError> {
+    fn policy(&self) -> Result<CpuPolicyRef<'_>, JsError> {
         self.policy
             .as_ref()
+            .map(CpuPolicy::as_ref)
             .or_else(|| self.guarded.as_ref().map(|game| game.policy()))
             .ok_or_else(|| JsError::new("NN model unavailable"))
     }

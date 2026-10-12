@@ -14,7 +14,7 @@ use crate::policy::{self, BorrowedPolicy, HIDDEN, NumericPolicyDistribution, PAR
 
 mod current_mixed;
 pub use current_mixed::CurrentMixedIdentity;
-mod guarded;
+pub(crate) mod guarded;
 pub use guarded::{
     GUARDED_DEPLOYMENT_VERSION, GuardedDeployment, GuardedDeploymentDecision, GuardedTradeTrace,
     MAX_GAME_CALLBACKS,

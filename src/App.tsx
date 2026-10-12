@@ -208,6 +208,8 @@ function App() {
     }
   }
   async function initializeGuard(nextSession: Session, signal: AbortSignal, fresh = true) {
+    if (nextSession.cpuPolicy?.mode === 'nn' && !supportsNnCpu(nextSession.state))
+      throw new Error('NN CPUは市場制限なしの基本3・4人対局で利用できます。');
     if (!requiresNnCpuGuard(nextSession)) {
       if (cpuGameRef.current) discardGuard(cpuGameRef.current);
       return;

@@ -103,7 +103,7 @@ describe('validated save import through the production Rust adapter', () => {
       additionalBuildings: true,
     });
     const { state: tribal } = await createGame(['a', 'b', 'c'], 17, { tribes: true });
-    for (const unsupported of [two, expanded, tribal]) {
+    for (const unsupported of [two, expanded, tribal, { ...state, uxmalCornLimit: true }]) {
       await expect(
         parseSession(JSON.stringify({ state: unsupported, history: [], cpuPolicy: policy })),
       ).rejects.toThrow('NN CPU');
