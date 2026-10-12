@@ -672,11 +672,60 @@ impl DurableOwnSetupOwner {
             work.abandoned_pending = true;
             work.closed_attempts += 1;
         } else {
-            require_inventory(&restored.directory, &inventory, &expected_names)?;
+            restored.recover_unpublished_pending(&inventory, &expected_names)?;
             restored.ready = true;
         }
         work.elapsed_seconds = start.elapsed().as_secs_f64();
         Ok((restored, work))
+    }
+    fn recover_unpublished_pending(
+        &mut self,
+        inventory: &BTreeMap<String, usize>,
+        names: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let next = head_name(self.tip.sequence + 1);
+        let mut remaining = inventory.clone();
+        let mut paths = Vec::new();
+        for (name, bytes) in inventory {
+            if temporary_base(name) == Some(next.as_str()) {
+                if paths.len() >= MAX_ORPHANS
+                    || *bytes > HEAD_CAP
+                    || self.tip.sequence / 2 >= self.root.limits.max_attempts
+                {
+                    return Err("Unpublished Own Setup pending temporary exceeds bounds".into());
+                }
+                let path = local(&self.directory.join(name), false)?;
+                let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+                if path.parent() != Some(self.directory.as_path())
+                    || !meta.is_file()
+                    || meta.len() != *bytes as u64
+                {
+                    return Err("Unpublished Own Setup pending temporary custody differs".into());
+                }
+                paths.push((path, *bytes));
+                remaining.remove(name);
+            }
+        }
+        // Validate every published/pinned file and reject foreign files before
+        // removing anything. Unlinked pre-work bytes confer no reservation.
+        require_inventory(&self.directory, &remaining, names)?;
+        if !paths.is_empty() {
+            match fs::symlink_metadata(self.directory.join(&next)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.to_string()),
+                Ok(_) => {
+                    return Err("Own Setup pending destination appeared during recovery".into());
+                }
+            }
+        }
+        for (path, bytes) in paths {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+            self.disk_bytes = self
+                .disk_bytes
+                .checked_sub(bytes as u64)
+                .ok_or("Own Setup temporary byte accounting differs")?;
+        }
+        Ok(())
     }
     fn check_checkpoint(
         &self,
@@ -1121,6 +1170,73 @@ mod tests {
         let directory = temp.0.join("pending");
         let mut live = create(&directory, u64::MAX);
         let config = config(seeds()[0], u64::MAX);
+        let genesis = live.tip().clone();
+        let initial = json(&live.owner().unwrap().checkpoint().unwrap()).unwrap();
+        let mut head = Head {
+            schema: HEAD_SCHEMA.into(),
+            sequence: 1,
+            root: live.root_pin.clone(),
+            previous: Some(genesis.pin().unwrap()),
+            event: Event::Pending {
+                configs: vec![Config::from_native(&config)],
+                reservation: live.owner.preview(std::slice::from_ref(&config)).unwrap(),
+            },
+            checksum: String::new(),
+        };
+        head.checksum = head_checksum(&head).unwrap();
+        // Reproduce the publisher's synced write-before-hard-link crash window.
+        let unpublished = directory.join(format!("{}.123-0.tmp", head_name(1)));
+        let partial = directory.join(format!("{}.123-1.tmp", head_name(1)));
+        for (path, bytes) in [(&unpublished, json(&head).unwrap()), (&partial, vec![b'{'])] {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+        live.ready = false;
+        assert!(live.owner().is_err());
+        drop(live);
+        assert_eq!(
+            DurableOwnSetupOwner::inspect_tip(&directory).unwrap(),
+            genesis
+        );
+        // A foreign next-next temporary must refuse before deleting known ones.
+        let foreign = directory.join(format!("{}.123-0.tmp", head_name(3)));
+        fs::write(&foreign, b"foreign").unwrap();
+        assert!(
+            DurableOwnSetupOwner::restore(
+                &directory,
+                &genesis,
+                crate::own_setup_native::tests::playing(),
+                exclusions(vec![])
+            )
+            .is_err()
+        );
+        assert!(unpublished.exists());
+        assert!(partial.exists());
+        fs::remove_file(foreign).unwrap();
+        let (mut live, work) = DurableOwnSetupOwner::restore(
+            &directory,
+            &genesis,
+            crate::own_setup_native::tests::playing(),
+            exclusions(vec![]),
+        )
+        .unwrap();
+        assert!(!unpublished.exists());
+        assert!(!partial.exists());
+        assert!(!work.abandoned_pending);
+        assert_eq!(work.closed_attempts, 0);
+        assert_eq!(work.audited_records, 0);
+        assert_eq!(live.owner().unwrap().attempted_episodes(), 0);
+        assert_eq!(live.owner().unwrap().next_episode_ordinal(), Some(u64::MAX));
+        assert_eq!(
+            initial,
+            json(&live.owner().unwrap().checkpoint().unwrap()).unwrap()
+        );
         let reservation = live.reserve_on_disk(std::slice::from_ref(&config)).unwrap();
         assert_eq!(reservation.report().first_episode_ordinal, u64::MAX);
         assert_eq!(reservation.report().next_episode_ordinal, None);
