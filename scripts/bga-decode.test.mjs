@@ -3579,6 +3579,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     resource = 'corn',
     architectureBonus = false,
     architectureLevel = architectureBonus ? 3 : 2,
+    renovationSibling = false,
   ) => {
     const card =
       resource === 'corn'
@@ -3609,6 +3610,21 @@ test('holds queued corn until observed technology completion and preserves cappe
     own.score = -2;
     own.technologies[track] = level;
     own.technologies.architecture = architectureLevel;
+    const renovation = renovationSibling
+      ? catalog.ALL_BUILDINGS.find(
+          (item) =>
+            item.effects.some((effect) => effect.type === 'renovation') &&
+            item.effects.every((effect) => ['renovation', 'foodReward'].includes(effect.type)) &&
+            (item.cost.gold ?? 0) > 0 &&
+            cost.every((n, i) => n === 0 || (item.cost[resources[i]] ?? 0) === 0),
+        )
+      : null;
+    if (renovationSibling) {
+      assert.ok(renovation);
+      own.buildings.push(renovation.id);
+      // Injected typed-row stress; this does not claim a reachable base-game prefix.
+      before.snapshot.state.additionalBuildings = renovationSibling === 'expanded';
+    }
     before.snapshot.state.skullSupply = 4;
     before.snapshot.state.buildings = [card.id];
     before.observation.pendingTask = {
@@ -3634,19 +3650,35 @@ test('holds queued corn until observed technology completion and preserves cappe
       },
       move: { type: 'choose', choiceId: architecture ? 'purchase:bonus' : 'purchase:plain' },
     }));
+    if (renovation) {
+      const row = clone(before.observation.legalActions[1]);
+      row.action.renovation = renovation.id;
+      row.action.cost = row.action.cost.map((n, i) =>
+        i >= 1 && i <= 3 ? Math.max(0, n - (renovation.cost[resources[i]] ?? 0)) : n,
+      );
+      assert.deepEqual(row.action.cost, before.observation.legalActions[1].action.cost);
+      row.move.choiceId = 'purchase:bonus:renovation';
+      before.observation.legalActions.push(row);
+    }
+    const purchaseTrials = [];
     const apply = (request) => {
       if (request.move.type === 'place') return clone(before);
       const next = clone(before);
       next.snapshot.state = clone(request.state);
       const player = next.snapshot.state.players[0];
       if (request.move.choiceId.startsWith('purchase:')) {
-        const architecture = request.move.choiceId === 'purchase:bonus';
-        const paid = architecture && architectureBonus ? chosenCost : cost;
+        const action = before.observation.legalActions.find(
+          (row) => row.move.choiceId === request.move.choiceId,
+        ).action;
+        const { architecture } = action;
+        const paid = action.cost;
         resources.forEach((resource, index) => {
           player.resources[resource] -= paid[index];
         });
         player.resources.corn += Number(architecture);
         player.score += 2 * Number(architecture);
+        if (action.renovation !== null)
+          player.buildings = player.buildings.filter((id) => id !== action.renovation);
         player.buildings.push(card.id);
         next.snapshot.state.buildings = [];
         next.observation.pendingTask = { type: 'technology', remaining: 1, free: true };
@@ -3671,6 +3703,7 @@ test('holds queued corn until observed technology completion and preserves cappe
           },
         ];
         alter(next, 'purchase');
+        purchaseTrials.push({ action: clone(action), state: clone(next.snapshot.state) });
       } else if (request.move.choiceId.startsWith('tech:')) {
         assert.equal(request.move.choiceId, `tech:${track}`);
         if (track === 'extraction' && level === 3) {
@@ -3849,7 +3882,7 @@ test('holds queued corn until observed technology completion and preserves cappe
         .join('\n');
       for (const message of row.messages) message.html = message.raw_text;
     }
-    return { value, dispatch: dispatcher(initial, apply) };
+    return { value, dispatch: dispatcher(initial, apply), purchaseTrials, renovation };
   };
   const success = fixture();
   const originals = clone(success.value.witness.witnesses);
@@ -3922,7 +3955,12 @@ test('holds queued corn until observed technology completion and preserves cappe
     });
     assert.equal(unknownReceipt.humanPlayingBcReady, false);
   }
-  const materialFixture = (change = () => {}, alter = () => {}, architectureLevel = 3) =>
+  const materialFixture = (
+    change = () => {},
+    alter = () => {},
+    architectureLevel = 3,
+    renovationSibling = false,
+  ) =>
     fixture(
       (v) => {
         v.witness.witnesses = v.witness.witnesses.slice(0, 2);
@@ -3935,6 +3973,7 @@ test('holds queued corn until observed technology completion and preserves cappe
       'stone',
       true,
       architectureLevel,
+      renovationSibling,
     );
   const materialSuccess = materialFixture();
   const materialWitnesses = clone(materialSuccess.value.witness.witnesses);
@@ -3973,6 +4012,39 @@ test('holds queued corn until observed technology completion and preserves cappe
     true,
   );
   assert.deepEqual(sameFee.value.witness.witnesses, sameFeeOriginals);
+  for (const rules of [true, 'expanded']) {
+    const renovation = materialFixture(
+      () => {},
+      () => {},
+      2,
+      rules,
+    );
+    const renovationOriginals = clone(renovation.value.witness.witnesses);
+    const renovationResult = decode(renovation.value, renovation.dispatch);
+    assert.equal(renovationResult.manifest.blocked.actionId, 7);
+    assert.match(
+      renovationResult.manifest.blocked.reason,
+      /Ambiguous legal operation for observed build/,
+    );
+    assert.deepEqual(
+      renovationResult.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+    );
+    assert.deepEqual(renovation.value.witness.witnesses, renovationOriginals);
+    const ordinary = renovation.purchaseTrials.find(
+      (trial) => trial.action.architecture && trial.action.renovation === null,
+    );
+    const renovated = renovation.purchaseTrials.find(
+      (trial) => trial.action.architecture && trial.action.renovation !== null,
+    );
+    assert.deepEqual(ordinary.action.cost, renovated.action.cost);
+    const discarded = clone(ordinary.state);
+    assert.ok(discarded.players[0].buildings.includes(renovation.renovation.id));
+    discarded.players[0].buildings = discarded.players[0].buildings.filter(
+      (id) => id !== renovation.renovation.id,
+    );
+    assert.deepEqual(renovated.state, discarded);
+  }
   for (const [name, change, alter, reason, architectureLevel] of [
     [
       'wrong Architecture payment',

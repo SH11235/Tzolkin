@@ -1608,6 +1608,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       witnesses.catalogHash !== catalogHash ||
       actor < 0 ||
       previous.currentPlayer !== actor ||
+      previous.version !== 1 ||
+      previous.additionalBuildings !== false ||
+      previous.expansion != null ||
       event.kind !== 'build' ||
       action.type !== 'build' ||
       typeof action.architecture !== 'boolean' ||
@@ -2320,7 +2323,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             (receipt.kind === 'materialTechnology' && witness.expected === undefined) ||
             matches(outcome.frame.snapshot.state, witness.expected)
           );
-        if (provedMaterialBonus) return false;
+        if (
+          provedMaterialBonus &&
+          outcome.row.action.architecture === false &&
+          outcome.row.action.renovation === null
+        )
+          return false;
       }
       if (
         task === 'technology' &&
