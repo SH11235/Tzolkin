@@ -258,6 +258,34 @@
 .nn-session-panel span {
   color: var(--muted);
 }
+.nn-model-paste {
+  display: grid;
+  flex-basis: 100%;
+  gap: 8px;
+  width: 100%;
+  margin-top: 10px;
+}
+.nn-model-paste label {
+  display: block;
+}
+.nn-model-paste textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: #faf8f1;
+  color: var(--ink);
+  font: 0.85rem monospace;
+  resize: vertical;
+}
+.nn-model-paste textarea:focus-visible {
+  outline: 3px solid #c39443;
+  outline-offset: 3px;
+}
+.nn-model-paste button {
+  justify-self: start;
+}
 .nn-latency-panel {
   flex-basis: 100%;
   display: grid;
