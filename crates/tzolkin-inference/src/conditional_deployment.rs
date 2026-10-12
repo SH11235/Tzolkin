@@ -102,6 +102,7 @@ impl Dataset {
                     scope,
                     "PrimitivesAndRemovalPairedCurrentGearActionsV2"
                         | "PrimitivesRemovalActionAndObservedUncappedPaidTechnologyV3"
+                        | "PrimitivesRemovalPaidTechnologyAndObservedMarketSellPaidAnywhereV4"
                 )
             })
             || reservations.is_empty()

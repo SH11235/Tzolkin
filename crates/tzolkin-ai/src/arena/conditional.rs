@@ -8,7 +8,9 @@ use crate::conditional_human_rl_update::{
     ConditionalMixedIdentity, ConditionalMixedOwner, ConditionalMixedPolicyHandle,
 };
 use crate::dataset::DatasetSplit;
-use crate::human_policy_dataset::{FACTORIZED_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE};
+use crate::human_policy_dataset::{
+    EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE,
+};
 use crate::human_policy_training::{ConditionalDatasetIdentity, PreparedConditionalHumanPolicy};
 use crate::policy::HeuristicWeights;
 use serde::{Deserialize, Serialize};
@@ -251,7 +253,9 @@ fn require_fresh_count_zero(identity: &ConditionalMixedIdentity) -> Result<(), S
 // an uncapped technology/pending payment, or positive coverage in actual Train rows.
 fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> bool {
     match label_scope {
-        None | Some(FACTORIZED_LABEL_SCOPE) | Some(PAID_TECHNOLOGY_LABEL_SCOPE) => {
+        None
+        | Some(FACTORIZED_LABEL_SCOPE)
+        | Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) => {
             matches!(
                 action,
                 TypedAction::Place { .. }
@@ -265,17 +269,33 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
                         ..
                     }
                 ))
-                || (label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE)
-                    && match action {
-                        TypedAction::Technology { .. } => true,
-                        TypedAction::Payment { resources } => {
-                            resources[0] == 0
-                                && resources[4] == 0
-                                && resources[1..4].iter().all(|&value| value >= 0)
-                                && resources[1..4].iter().any(|&value| value > 0)
+                || (matches!(
+                    label_scope,
+                    Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                ) && match action {
+                    TypedAction::Technology { .. } => true,
+                    TypedAction::Payment { resources } => {
+                        resources[0] == 0
+                            && resources[4] == 0
+                            && resources[1..4].iter().all(|&value| value >= 0)
+                            && resources[1..4].iter().any(|&value| value > 0)
+                    }
+                    _ => false,
+                })
+                || (label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                    && matches!(
+                        action,
+                        TypedAction::Trade {
+                            resource: tzolkin_core::Resource::Wood
+                                | tzolkin_core::Resource::Stone
+                                | tzolkin_core::Resource::Gold,
+                            buy: false
+                        } | TypedAction::UseAction {
+                            source: ActionSource::Anywhere,
+                            corn_cost: 1,
+                            ..
                         }
-                        _ => false,
-                    })
+                    ))
         }
         Some(_) => false,
     }
@@ -292,6 +312,7 @@ pub struct ConditionalDiagnostics {
     pub selected_action_kinds: BTreeMap<String, usize>,
     /// Uses the sealed scope: v1 primitives, v2 also CurrentGear UseAction,
     /// v3 also Technology and positive material-only Payment categories.
+    /// v4 also material Sell and one-corn Anywhere categories.
     /// Counts effective choices after the guard, so guard-forced Skip is outside.
     /// Membership does not establish positive Train coverage of that category.
     /// For a mixed RL actor this still refers to its original BC teacher grammar,
@@ -545,6 +566,7 @@ mod tests {
             None,
             Some(FACTORIZED_LABEL_SCOPE),
             Some(PAID_TECHNOLOGY_LABEL_SCOPE),
+            Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE),
         ] {
             for action in [
                 TypedAction::Place {
@@ -592,7 +614,10 @@ mod tests {
             ] {
                 assert_eq!(
                     teacher_grammar_contains(scope, &action),
-                    scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE)
+                    matches!(
+                        scope,
+                        Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                    )
                 );
                 assert!(!teacher_grammar_contains(Some("unknown"), &action));
             }
@@ -602,13 +627,39 @@ mod tests {
                     &TypedAction::Payment { resources }
                 ));
             }
-            assert!(!teacher_grammar_contains(
-                scope,
-                &TypedAction::Trade {
-                    resource: Resource::Wood,
-                    buy: false,
+            for resource in [
+                Resource::Wood,
+                Resource::Stone,
+                Resource::Gold,
+                Resource::Corn,
+                Resource::Skull,
+            ] {
+                for buy in [false, true] {
+                    assert_eq!(
+                        teacher_grammar_contains(scope, &TypedAction::Trade { resource, buy }),
+                        scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                            && !buy
+                            && matches!(
+                                resource,
+                                Resource::Wood | Resource::Stone | Resource::Gold
+                            )
+                    );
                 }
-            ));
+            }
+            for corn_cost in [0, 1, 2] {
+                assert_eq!(
+                    teacher_grammar_contains(
+                        scope,
+                        &TypedAction::UseAction {
+                            gear: GearId::Uxmal,
+                            position: 3,
+                            source: ActionSource::Anywhere,
+                            corn_cost
+                        }
+                    ),
+                    scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) && corn_cost == 1
+                );
+            }
             assert!(!teacher_grammar_contains(
                 scope,
                 &TypedAction::Build {
