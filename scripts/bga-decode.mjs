@@ -42,7 +42,8 @@ const copy = (value) => structuredClone(value);
 const fail = (message) => {
   throw new Error(message);
 };
-const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+// JSON object key order is incidental; fields, types and array order are exact.
+const same = isDeepStrictEqual;
 
 function closed(value, allowed, label) {
   if (!object(value) || Object.keys(value).some((key) => !allowed.includes(key)))
