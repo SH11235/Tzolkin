@@ -2400,7 +2400,12 @@ test('rolls every deferred purchase and Trade back when its original boundary or
   }
 });
 
-function deferredAnyActionFixture(chained = true, change = () => {}, alter = () => {}) {
+function deferredAnyActionFixture(
+  chained = true,
+  change = () => {},
+  alter = () => {},
+  nested = false,
+) {
   const f = deferredTradeFixture();
   f.before.snapshot.state.buildings = ['b18', 'b21'];
   f.before.snapshot.state.monuments = ['m01'];
@@ -2412,6 +2417,14 @@ function deferredAnyActionFixture(chained = true, change = () => {}, alter = () 
     f.before.observation.pendingTask.remaining = 1;
     f.before.snapshot.state.buildings = ['b21'];
   }
+  if (nested) {
+    f.before.snapshot.state.buildings = ['b21', 'b24', 'b22'];
+    f.before.snapshot.state.players[0].technologies.extraction = 3;
+  }
+  const build = (id, cost, architecture = false, discountResource = null) => ({
+    action: { type: 'build', id, cost, architecture, discountResource, renovation: null },
+    move: { type: 'choose', choiceId: `build:${id}` },
+  });
   const purchase = {
     action: {
       type: 'build',
@@ -2428,7 +2441,15 @@ function deferredAnyActionFixture(chained = true, change = () => {}, alter = () 
     const choice = request.move.choiceId;
     let next;
     let stage;
-    if (!['action-purchase', 'any:tikal:4', 'monument:m01'].includes(choice)) {
+    if (
+      !['action-purchase', 'any:tikal:4', 'monument:m01'].includes(choice) &&
+      !(
+        nested &&
+        ['build:b24', 'tech:extraction', 'resource:wood', 'resource:stone', 'build:b22'].includes(
+          choice,
+        )
+      )
+    ) {
       next = f.apply(request);
       next.snapshot.state.buildings = next.snapshot.state.buildings.map((id) =>
         id === 'b01' ? 'b21' : id,
@@ -2485,6 +2506,7 @@ function deferredAnyActionFixture(chained = true, change = () => {}, alter = () 
         };
         state.pending.title = 'Build or monument';
         next.observation.legalActions = [
+          ...(nested ? [build('b24', [0, 2, 1, 0, 0])] : []),
           {
             action: { type: 'monument', id: 'm01', cost: [0, 1, 1, 2, 0], renovation: null },
             move: { type: 'choose', choiceId: 'monument:m01' },
@@ -2492,6 +2514,70 @@ function deferredAnyActionFixture(chained = true, change = () => {}, alter = () 
           { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
         ];
         stage = 'action';
+      } else if (choice === 'build:b24') {
+        own.resources.wood -= 2;
+        own.resources.stone--;
+        own.buildings.push('b24');
+        state.buildings = state.buildings.filter((id) => id !== 'b24');
+        state.pending = {
+          title: 'Free technology',
+          task: { type: 'technology', remaining: 1, free: true },
+          after: [
+            { type: 'effects', effects: [{ type: 'resources', resources: { gold: 1 } }] },
+            {
+              type: 'build',
+              remaining: 1,
+              allowMonument: false,
+              cornPayment: false,
+              architectureAvailable: true,
+            },
+            ...state.pending.after,
+          ],
+        };
+        next.observation.legalActions = [
+          {
+            action: { type: 'technology', technology: 'extraction' },
+            move: { type: 'choose', choiceId: 'tech:extraction' },
+          },
+        ];
+        stage = 'material';
+      } else if (choice === 'tech:extraction') {
+        state.pending.after.unshift({ ...state.pending.task, remaining: 0 });
+        state.pending.task = { type: 'resource', remaining: 2 };
+        next.observation.legalActions = ['wood', 'stone'].map((resource) => ({
+          action: { type: 'resource', resource },
+          move: { type: 'choose', choiceId: `resource:${resource}` },
+        }));
+        stage = 'technology';
+      } else if (choice?.startsWith('resource:')) {
+        own.resources[choice.slice(9)]++;
+        state.pending.task.remaining--;
+        if (state.pending.task.remaining === 0) {
+          own.resources.gold++;
+          state.pending = {
+            title: 'Last building',
+            task: state.pending.after[2],
+            after: state.pending.after.slice(3),
+          };
+          next.observation.legalActions = [build('b22', [0, 1, 1, 1, 0], true, 'stone')];
+        } else
+          next.observation.legalActions = ['wood', 'stone'].map((resource) => ({
+            action: { type: 'resource', resource },
+            move: { type: 'choose', choiceId: `resource:${resource}` },
+          }));
+        stage = choice;
+      } else if (choice === 'build:b22') {
+        own.resources.wood--;
+        own.resources.stone--;
+        own.resources.gold--;
+        own.resources.corn++;
+        own.score += 7; // Architecture 2, this card 3, retained outer card 2.
+        for (const temple of ['chaac', 'quetzalcoatl', 'kukulkan']) own.temples[temple]++;
+        own.buildings.push('b22');
+        state.buildings = state.buildings.filter((id) => id !== 'b22');
+        state.pending = null;
+        next.observation.legalActions = [];
+        stage = 'finalBuild';
       } else {
         own.resources.wood--;
         own.resources.stone--;
@@ -2576,6 +2662,53 @@ function deferredAnyActionFixture(chained = true, change = () => {}, alter = () 
       },
     },
   ];
+  if (nested) {
+    const originalWitnesses = f.value.witness.witnesses;
+    const payment = (resource, amount = 1) => ({
+      raw_text: `Aは${amount === 1 ? '' : amount}\nを支払った`,
+      icons: [{ classes: `tz_icon resource_${resource}` }],
+    });
+    const gain = (resource) => ({
+      raw_text: 'Aは\nを獲得した',
+      icons: [{ classes: `tz_icon resource_${resource}` }],
+    });
+    replaceEvents(f.value, [
+      ...rows.slice(0, 3),
+      [11, [payment('wood', 2), payment('stone'), { raw_text: 'Aは建物を建てた' }, gain('gold')]],
+      [
+        12,
+        [
+          { raw_text: 'Aは収集を1レベル進めた' },
+          { raw_text: '収集技術ボーナス: Aは好きな資源2個を得た' },
+        ],
+      ],
+      [13, [gain('wood')]],
+      [14, [gain('stone')]],
+      [
+        15,
+        [
+          payment('wood'),
+          payment('stone'),
+          payment('gold'),
+          { raw_text: 'Aは建物を建てた' },
+          gain('corn'),
+          { raw_text: 'Aは2点を獲得した' },
+          ...['Chaac', 'Quetzalcoatl', 'Kukulcan'].map((temple) => ({
+            raw_text: `Aは${temple}の信仰を1段上げた`,
+          })),
+          { raw_text: 'Aは3点を獲得した' },
+        ],
+      ],
+    ]);
+    f.value.witness.witnesses = originalWitnesses;
+    delete f.value.witness.witnesses[1].expected;
+    f.value.witness.witnesses.splice(
+      3,
+      1,
+      { actionId: 11, buildings: ['b24'] },
+      { actionId: 15, buildings: ['b22'] },
+    );
+  }
   change(f.value);
   for (const row of f.value.raw.dom_entries) {
     f.value.raw.entries.find((entry) => entry.action_id === row.action_id).raw_text = row.messages
@@ -2637,9 +2770,9 @@ test('rolls an Action plus Points chain back to its earliest purchase on every l
     ['EOF at purchase', (v) => truncate(v, 9)],
     ['EOF at action', (v) => truncate(v, 10)],
     [
-      'missing direct counters',
+      'conflicting direct counter',
       (v) => {
-        delete witness(v, 9).expected.players[0].resources;
+        witness(v, 9).expected.players[0].resources.wood++;
       },
     ],
     [
@@ -2807,6 +2940,122 @@ test('rolls an Action plus Points chain back to its earliest purchase on every l
       );
       assert.deepEqual(f.value.witness.witnesses, originals, name);
     }
+});
+
+test('retains outer Action plus Points through sourced material choices and rolls back late conflicts', () => {
+  // Native-shaped injected frames exercise receipt composition, not game-rule scoring.
+  const f = deferredAnyActionFixture(false, undefined, undefined, true);
+  const originals = clone(f.value.witness.witnesses);
+  const result = decode(f.value, f.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.deepEqual(f.value.witness.witnesses, originals);
+  assert.equal(originals.find((w) => w.actionId === 9).expected, undefined);
+  assert.deepEqual(
+    result.record.steps.map((step) => step.sourceActionIds),
+    [[6], [9], [10], [11], [12], [13], [14], [15]],
+  );
+  assert.deepEqual(
+    result.record.steps.slice(-5).map((step) => step.move.choiceId),
+    ['build:b24', 'tech:extraction', 'resource:wood', 'resource:stone', 'build:b22'],
+  );
+  const receipt = result.manifest.audit.find((row) => row.continuation === 'anyActionBuild');
+  assert.deepEqual(receipt, {
+    actionId: 15,
+    deferredScoreSourceActionId: 9,
+    actor: 0,
+    amount: 2,
+    actualDelivered: true,
+    continuation: 'anyActionBuild',
+    humanPlayingBcReady: false,
+  });
+  const material = result.manifest.audit.find((row) => row.continuation === 'cappedExtraction');
+  assert.equal(material.queuedPurchaseSourceActionId, 11);
+  assert.deepEqual(material.resourceChoiceSourceActionIds, [13, 14]);
+  assert.equal(result.manifest.trainingReady, false);
+
+  for (const [name, change, alter] of [
+    [
+      'missing material choice',
+      (v) => {
+        v.raw.entries = v.raw.entries.filter((r) => r.action_id !== 14);
+        v.raw.dom_entries = v.raw.dom_entries.filter((r) => r.action_id !== 14);
+        v.raw.entry_count--;
+      },
+    ],
+    [
+      'missing final purchase',
+      (v) => {
+        v.raw.entries.pop();
+        v.raw.dom_entries.pop();
+        v.raw.entry_count--;
+        v.witness.witnesses.pop();
+      },
+    ],
+    [
+      'different source actor',
+      (v) => {
+        v.raw.dom_entries.find((r) => r.action_id === 13).messages[0].raw_text = 'Bは\nを獲得した';
+      },
+    ],
+    [
+      'conflicting real checkpoint',
+      (v) => {
+        v.witness.witnesses.at(-1).expected = { players: [{ score: 999 }, {}, {}, {}] };
+      },
+    ],
+    [
+      'reused outer points caption',
+      (v) => {
+        v.raw.dom_entries
+          .find((r) => r.action_id === 15)
+          .messages.push({ raw_text: 'Aは2点を獲得した' });
+      },
+    ],
+    [
+      'changed retained tail',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'material') frame.snapshot.state.pending.after.at(-2).effects[0].amount++;
+      },
+    ],
+    [
+      'lost retained tail at resource',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:stone') frame.snapshot.state.pending.after = [];
+      },
+    ],
+    [
+      'unrelated final mechanical change',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'finalBuild') frame.snapshot.state.players[1].score++;
+      },
+    ],
+    [
+      'undelivered outer points',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'finalBuild') frame.snapshot.state.players[0].score -= 2;
+      },
+    ],
+  ]) {
+    const bad = deferredAnyActionFixture(false, change, alter, true);
+    const unchanged = clone(bad.value.witness.witnesses);
+    const rejected = decode(bad.value, bad.dispatch);
+    assert.equal(rejected.manifest.blocked.actionId, 9, name);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.deepEqual(bad.value.witness.witnesses, unchanged, name);
+    assert.equal(
+      rejected.manifest.audit.some((row) => row.actionId > 6),
+      false,
+      name,
+    );
+  }
 });
 
 test('uses observed free technologies and the continued Build payment, then revalidates the whole chain', () => {
