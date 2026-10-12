@@ -422,6 +422,7 @@ pub struct PreparedConditionalHumanPolicy {
     reservations: BTreeMap<String, DatasetSplit>,
     kernel: ResolvedKernel,
     loaded_sources: Option<Vec<ContentPin>>,
+    loaded_boundary_sources: Option<Vec<ContentPin>>,
 }
 impl PreparedConditionalHumanPolicy {
     pub fn load(checkpoint_path: &Path, collection_path: &Path) -> Result<Self, String> {
@@ -434,11 +435,20 @@ impl PreparedConditionalHumanPolicy {
             return Err("Conditional prepared collection/checkpoint config mismatch".into());
         }
         let mut prepared = Self::new(checkpoint, &datasets)?;
+        let mut boundaries = vec![checkpoint_pin.clone(), collection_pin.clone()];
         let mut pins = vec![checkpoint_pin, collection_pin];
         for dataset in &datasets {
-            pins.extend(dataset.loaded_source_pins()?);
+            let sources = dataset.loaded_source_pins()?;
+            boundaries.push(
+                sources
+                    .first()
+                    .ok_or("Missing loaded manifest binding")?
+                    .clone(),
+            );
+            pins.extend(sources);
         }
         prepared.loaded_sources = Some(seal_loaded_sources(pins)?);
+        prepared.loaded_boundary_sources = Some(seal_loaded_sources(boundaries)?);
         Ok(prepared)
     }
 
@@ -494,12 +504,18 @@ impl PreparedConditionalHumanPolicy {
             reservations,
             kernel: Kernel::Scalar.resolve()?,
             loaded_sources: None,
+            loaded_boundary_sources: None,
         })
     }
     pub(crate) fn loaded_sources(&self) -> Result<&[ContentPin], String> {
         self.loaded_sources
             .as_deref()
             .ok_or_else(|| "Conditional RL origin requires successful source load".into())
+    }
+    pub(crate) fn loaded_boundary_sources(&self) -> Result<&[ContentPin], String> {
+        self.loaded_boundary_sources
+            .as_deref()
+            .ok_or_else(|| "Conditional boundary pins require successful source load".into())
     }
 
     pub fn model(&self) -> &ConditionalHumanPolicyArtifact {
