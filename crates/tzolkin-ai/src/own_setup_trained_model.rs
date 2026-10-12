@@ -69,45 +69,57 @@ impl TrainedOwnSetupArtifact {
         Ok(artifact)
     }
     fn expected_checksum(&self) -> Result<String, String> {
-        let mut identity = self.identity.clone();
-        identity.checksum.clear();
-        let mut bytes = b"tzolkin-own-setup-trained-model-v1\0".to_vec();
-        bytes.extend(serde_json::to_vec(&identity).map_err(|e| e.to_string())?);
-        bytes.push(0);
-        bytes.extend(self.model.parameters().iter().flat_map(|p| p.to_le_bytes()));
-        Ok(digest(&bytes))
+        expected_checksum(&self.identity, &self.model)
     }
     pub fn validate(&self) -> Result<(), String> {
-        let i = &self.identity;
-        self.model.validate()?;
-        let initial = InitializedOwnSetupArtifact::new(i.initial.seed)?;
-        if i.schema != ARTIFACT_SCHEMA
-            || i.policy_version != POLICY_VERSION
-            || i.sampling_version != SAMPLING_VERSION
-            || i.task != TASK
-            || !(1..=MAX_UPDATES).contains(&i.update_count)
-            || i.initial != initial.identity
-            || !checkpoint_digest(&i.parent_checksum)
-            || (i.update_count == 1 && i.parent_checksum != i.initial.checksum)
-            || !checkpoint_digest(&i.training_config_checksum)
-            || !checkpoint_digest(&i.playing_binding_checksum)
-            || i.numerical_target != crate::public_stochastic_native::numerical_target()
-            || i.parameter_words_checksum != word_checksum(self.model.parameters())
-            || !(1..=MAX_BATCH_EPISODES).contains(&i.sources.len())
-            || i.sources.iter().any(|s| {
-                !checkpoint_digest(&s.episode_id) || !checkpoint_digest(&s.record_checksum)
-            })
-            || i.sources.iter().enumerate().any(|(index, s)| {
-                i.sources[..index].iter().any(|old| {
-                    old.episode_id == s.episode_id || old.record_checksum == s.record_checksum
-                })
-            })
-            || i.checksum != self.expected_checksum()?
-        {
-            return Err("Incompatible trained Own Setup identity/parameters/lineage".into());
-        }
-        Ok(())
+        validate_numeric_claim(&self.identity, &self.model)
     }
+}
+fn expected_checksum(
+    identity: &TrainedOwnSetupIdentity,
+    model: &OwnSetupModel,
+) -> Result<String, String> {
+    let mut identity = identity.clone();
+    identity.checksum.clear();
+    let mut bytes = b"tzolkin-own-setup-trained-model-v1\0".to_vec();
+    bytes.extend(serde_json::to_vec(&identity).map_err(|e| e.to_string())?);
+    bytes.push(0);
+    bytes.extend(model.parameters().iter().flat_map(|p| p.to_le_bytes()));
+    Ok(digest(&bytes))
+}
+
+pub(crate) fn validate_numeric_claim(
+    i: &TrainedOwnSetupIdentity,
+    model: &OwnSetupModel,
+) -> Result<(), String> {
+    model.validate()?;
+    let initial = InitializedOwnSetupArtifact::new(i.initial.seed)?;
+    if i.schema != ARTIFACT_SCHEMA
+        || i.policy_version != POLICY_VERSION
+        || i.sampling_version != SAMPLING_VERSION
+        || i.task != TASK
+        || !(1..=MAX_UPDATES).contains(&i.update_count)
+        || i.initial != initial.identity
+        || !checkpoint_digest(&i.parent_checksum)
+        || (i.update_count == 1 && i.parent_checksum != i.initial.checksum)
+        || !checkpoint_digest(&i.training_config_checksum)
+        || !checkpoint_digest(&i.playing_binding_checksum)
+        || i.numerical_target != crate::public_stochastic_native::numerical_target()
+        || i.parameter_words_checksum != word_checksum(model.parameters())
+        || !(1..=MAX_BATCH_EPISODES).contains(&i.sources.len())
+        || i.sources
+            .iter()
+            .any(|s| !checkpoint_digest(&s.episode_id) || !checkpoint_digest(&s.record_checksum))
+        || i.sources.iter().enumerate().any(|(index, s)| {
+            i.sources[..index].iter().any(|old| {
+                old.episode_id == s.episode_id || old.record_checksum == s.record_checksum
+            })
+        })
+        || i.checksum != expected_checksum(i, model)?
+    {
+        return Err("Incompatible trained Own Setup identity/parameters/lineage".into());
+    }
+    Ok(())
 }
 pub(crate) fn word_checksum(parameters: &[f32]) -> String {
     digest(
