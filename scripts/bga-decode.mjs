@@ -1706,6 +1706,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const next = outcome.frame.snapshot.state;
     const continuation = actor < 0 ? null : queuedCornTechnology(previous, actor);
     const retainedTail = same(previous.pending?.after, []) ? [] : retainedActionTail(previous);
+    const skull = resource === 'skull';
     if (
       witnesses.catalogHash !== catalogHash ||
       actor < 0 ||
@@ -1719,7 +1720,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       action.renovation !== null ||
       !same(witness.buildings, [action.id]) ||
       !previous.buildings.includes(action.id) ||
-      !['wood', 'stone', 'gold'].includes(resource) ||
+      !['wood', 'stone', 'gold', 'skull'].includes(resource) ||
       !Number.isSafeInteger(amount) ||
       amount < 1 ||
       amount > 1000 ||
@@ -1728,10 +1729,20 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         { type: 'resources', resources: { [resource]: amount } },
       ]) ||
       task?.type !== 'build' ||
-      task.remaining !== 2 ||
+      task.remaining !== (skull ? 1 : 2) ||
       task.cornPayment !== false ||
       retainedTail === null ||
       continuation === null ||
+      (skull &&
+        (amount !== 1 ||
+          action.architecture !== true ||
+          retainedTail.length !== 0 ||
+          continuation.technology !== 'theology' ||
+          !Number.isSafeInteger(before.technologies.theology) ||
+          before.technologies.theology < 0 ||
+          before.technologies.theology >= 3 ||
+          !Number.isSafeInteger(previous.skullSupply) ||
+          previous.skullSupply < amount)) ||
       (action.architecture &&
         (task.architectureAvailable === false ||
           ![2, 3].includes(before.technologies.architecture))) ||
@@ -1772,7 +1783,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         { type: 'effects', effects: [effects[1]] },
         {
           type: 'build',
-          remaining: 1,
+          remaining: task.remaining - 1,
           allowMonument: false,
           cornPayment: false,
           architectureAvailable: task.architectureAvailable !== false && !action.architecture,
@@ -1923,6 +1934,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const technology = event.detail.technology;
     const expected = receipt.pending.after[1];
     const corn = receipt.kind === 'cornTheology';
+    // An observed final Skull-card purchase queues a zero Build, which the
+    // engine consumes after the uncapped Theology choice delivers its reward.
+    const finishedSkull = receipt.kind === 'materialTechnology' && receipt.resource === 'skull';
     if (
       !corn &&
       technology === 'extraction' &&
@@ -1959,6 +1973,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     if (uncapped) {
       uncapped.players[actor].technologies[technology]++;
       uncapped.players[actor].resources[receipt.resource] += receipt.amount;
+      if (finishedSkull) uncapped.skullSupply -= receipt.amount;
       uncapped.pending = copy(next.pending);
     }
     if (
@@ -1966,9 +1981,14 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       next.currentPlayer !== actor ||
       next.round !== receipt.round ||
       next.phase !== before.phase ||
-      !sameReceipt(next.pending?.task, expected) ||
-      !sameReceipt(frame.observation.pendingTask, expected) ||
-      !sameReceipt(next.pending?.after, receipt.retainedTail ?? []) ||
+      (finishedSkull
+        ? expected.remaining !== 0 ||
+          receipt.retainedTail.length !== 0 ||
+          next.pending !== null ||
+          frame.observation.pendingTask !== null
+        : !sameReceipt(next.pending?.task, expected) ||
+          !sameReceipt(frame.observation.pendingTask, expected) ||
+          !sameReceipt(next.pending?.after, receipt.retainedTail ?? [])) ||
       next.players[actor].technologies[technology] !==
         before.players[actor].technologies[technology] + Number(!corn) ||
       next.players.some((player, id) =>
