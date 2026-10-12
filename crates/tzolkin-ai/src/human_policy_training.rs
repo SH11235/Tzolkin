@@ -22,7 +22,6 @@ pub const INPUT_CONTRACT: &str = "conditional-basic-unlimited-3-4p-public512-pla
 pub const MAX_TABLES: usize = 128;
 pub const MAX_SAMPLES: usize = 65_536;
 pub const MAX_CANDIDATES: usize = 262_144;
-const SHUFFLE_BUFFER: usize = 8;
 pub const COLLECTION_SCHEMA: &str = "tzolkin-conditional-human-policy-training-input-v1";
 
 #[derive(Deserialize, Serialize, PartialEq)]
@@ -505,8 +504,12 @@ pub fn train_conditional_datasets(
         }
     };
     let mut gradient = vec![0.0; crate::public_model::PARAMETER_COUNT];
-    let mut buffer: Vec<&HumanPolicySample> = Vec::with_capacity(SHUFFLE_BUFFER);
     for _ in completed..config.epochs {
+        let mut order = (0..train.len()).collect::<Vec<_>>();
+        for i in (1..order.len()).rev() {
+            let j = random.index(i + 1);
+            order.swap(i, j);
+        }
         let mut batch = 0;
         let mut consume = |sample: &HumanPolicySample| -> Result<(), String> {
             policy_loss(
@@ -523,17 +526,8 @@ pub fn train_conditional_datasets(
             }
             Ok(())
         };
-        for sample in &train {
-            if buffer.len() < SHUFFLE_BUFFER {
-                buffer.push(sample);
-            } else {
-                let i = random.index(buffer.len());
-                consume(std::mem::replace(&mut buffer[i], sample))?;
-            }
-        }
-        while !buffer.is_empty() {
-            let i = random.index(buffer.len());
-            consume(buffer.swap_remove(i))?;
+        for index in order {
+            consume(train[index])?;
         }
         if batch > 0 {
             optimizer.update(&mut model, &mut gradient, batch, config.learning_rate)?;
@@ -620,7 +614,11 @@ mod tests {
     }
     #[test]
     fn conditional_resume_matches_continuous_and_rejects_identity_or_config_changes() {
-        let datasets = datasets(0, 1);
+        let mut datasets = datasets(0, 1);
+        datasets.extend([
+            ConditionalHumanPolicyDataset::training_fixture("125", DatasetSplit::Train, 1),
+            ConditionalHumanPolicyDataset::training_fixture("126", DatasetSplit::Train, 0),
+        ]);
         let first = train_conditional_datasets(&datasets, &config(1), None).unwrap();
         let continuous = train_conditional_datasets(&datasets, &config(2), None).unwrap();
         let resumed =
