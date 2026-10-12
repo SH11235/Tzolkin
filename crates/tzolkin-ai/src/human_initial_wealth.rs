@@ -1299,8 +1299,7 @@ fn selected_dom_crosscheck(
     }
     let area = choice_area(capture)?;
     require_unhidden_choice_ancestry(area, Some(&id.player))?;
-    let workers = retained_panel(area, "workers", None)?;
-    for tag in HtmlTags::new(workers) {
+    for tag in HtmlTags::new(area) {
         let tag = tag?;
         if !tag.closing
             && optional_attribute(tag.opening, "class")?
@@ -1315,6 +1314,8 @@ fn selected_dom_crosscheck(
     let boards = text(capture, "playerBoardsHtml")?;
     require_unhidden_choice_ancestry(boards, Some(&id.player))?;
     let own = retained_panel(boards, &format!("player_board_{}", id.player), None)?;
+    let own_start = own.as_ptr().addr() - boards.as_ptr().addr();
+    let own_end = own_start + own.len();
     let gains = Gains::pair(input.candidates()[chosen].each_ref().map(String::as_str))?;
     for (kind, expected) in ["corn", "wood", "stone", "gold", "skull", "worker"]
         .iter()
@@ -1332,7 +1333,8 @@ fn selected_dom_crosscheck(
                 let end = tail.find('<').ok_or("Unterminated retained own counter")?;
                 if tail[..end].trim() != expected.to_string()
                     || !tail[end..].starts_with("</span>")
-                    || !own.contains(&boards[tag.start..tag.end + end + "</span>".len()])
+                    || tag.start < own_start
+                    || tag.end + end + "</span>".len() > own_end
                 {
                     return Err("Chosen artwork differs from retained own counter DOM".into());
                 }
@@ -1363,6 +1365,19 @@ fn selected_dom_crosscheck(
     ] {
         for (name, level) in names.iter().zip(expected) {
             let wanted = format!("marker_{}_{kind}_{name}", id.player);
+            let mut live_count = 0;
+            for tag in HtmlTags::new(area) {
+                let tag = tag?;
+                if !tag.closing && optional_attribute(tag.opening, "id")? == Some(wanted.as_str()) {
+                    if tag.name != "div" {
+                        return Err("Malformed retained own marker DOM".into());
+                    }
+                    live_count += 1;
+                }
+            }
+            if live_count != 1 {
+                return Err("Missing/duplicate retained own marker DOM".into());
+            }
             let node = retained_panel(board, &wanted, None)?;
             let opening = HtmlTags::new(node)
                 .next()
@@ -2590,18 +2605,28 @@ mod tests {
             ),
             (
                 "interfaceHtml",
-                "id=\"marker_100_temple_chaac\"",
-                "id=\"marker_100_temple_chaac\" style=\"display:none\"",
+                "id=\"marker_100_temple_chaac\" style=\"top: 191px; left: 17px;\"",
+                "id=\"marker_100_temple_chaac\" style=\"top: 191px; left: 17px; display:none;\"",
             ),
             (
                 "boardHtml",
-                "id=\"marker_100_temple_chaac\"",
-                "id=\"marker_100_temple_chaac\" style=\"top:167px;\"",
+                "id=\"marker_100_temple_chaac\" style=\"top: 191px; left: 17px;\"",
+                "id=\"marker_100_temple_chaac\" style=\"top: 167px; left: 17px;\"",
             ),
             (
                 "interfaceHtml",
                 "<div id=\"workers\"></div>",
                 "<div id=\"workers\"><div class=\"worker\"></div></div>",
+            ),
+            (
+                "interfaceHtml",
+                "<div id=\"workers\"></div>",
+                "<div id=\"workers\"></div><div id=\"worker_99\" class=\"worker\"></div>",
+            ),
+            (
+                "interfaceHtml",
+                "<div id=\"workers\"></div>",
+                "<div id=\"workers\"></div><span id=\"marker_100_temple_chaac\" style=\"top: 191px; left: 17px;\"></span>",
             ),
         ] {
             let mut wrong = dom.clone();
@@ -2613,6 +2638,19 @@ mod tests {
                 selected_crosscheck(&wrong, &id, &input(), 4, &wrong).is_err(),
                 "{field}: {replacement}"
             );
+        }
+        let corn = "<span id=\"corn_number_player_100\">15</span>";
+        for own_text in [format!("<!--{corn}-->"), format!("<script>{corn}</script>")] {
+            let mut foreign = dom.clone();
+            foreign["playerBoardsHtml"] = text(&foreign, "playerBoardsHtml")
+                .unwrap()
+                .replace(corn, &own_text)
+                .replace(
+                    "<div id=\"player_board_101\"></div>",
+                    &format!("<div id=\"player_board_101\">{corn}</div>"),
+                )
+                .into();
+            assert!(selected_crosscheck(&foreign, &id, &input(), 4, &foreign).is_err());
         }
         let mut partial = dom.clone();
         partial["interfaceHtml"] = text(&partial, "interfaceHtml")
