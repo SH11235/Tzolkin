@@ -5030,6 +5030,128 @@ test('matches first-player payouts to the claimer and announcements to the next 
     assert.equal(reused.manifest.blocked.actionId, 8);
     assert.equal(reused.record.steps.length, 3);
   }
+  for (const [firstPlayer, amount] of [
+    [0, 0],
+    [0, 2],
+    [1, 1],
+  ]) {
+    const initial = clone(saved.core.initialFrame);
+    const names = initial.snapshot.state.players.map((player) => player.name);
+    const claimer = (firstPlayer + names.length - 1) % names.length;
+    Object.assign(initial.snapshot.state, {
+      round: 3,
+      firstPlayer,
+      firstPlayerClaimed: claimer,
+      currentPlayer: claimer,
+      accumulatedCorn: amount,
+      turnOrder: names.map((_, offset) => (firstPlayer + offset) % names.length),
+      turnIndex: names.length - 1,
+    });
+    initial.observation.pendingTask = null;
+    initial.observation.legalActions = [
+      { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
+    ];
+    const paid = clone(initial);
+    paid.snapshot.state.accumulatedCorn = 0;
+    paid.snapshot.state.players[claimer].resources.corn += amount;
+    paid.observation.pendingTask = { type: 'rotation' };
+    paid.observation.legalActions = [
+      { action: { type: 'rotate', days: 1 }, move: { type: 'choose', choiceId: 'rotate:1' } },
+    ];
+    const advanced = clone(paid);
+    Object.assign(advanced.snapshot.state, {
+      round: 4,
+      firstPlayer: claimer,
+      firstPlayerClaimed: null,
+    });
+    advanced.observation.pendingTask = null;
+    advanced.observation.legalActions = [];
+    const payout = {
+      raw_text: `${names[claimer]}は${amount}\nを歯車から獲得した`,
+      icons: [{ classes: 'tz_icon resource_corn' }],
+    };
+    const announcement = { raw_text: `${names[claimer]}がこのラウンドのスタートプレイヤーです` };
+    const fixture = (messages) => {
+      const value = input();
+      value.witness.initial = clone(initial.snapshot.state);
+      replaceEvents(value, [
+        [6, messages],
+        [
+          7,
+          [
+            { raw_text: '歯車が進んだ' },
+            {
+              raw_text: `スタートプレイヤースペースに置かれているワーカーは${names[claimer]}の手元に戻った`,
+            },
+          ],
+        ],
+      ]);
+      value.witness.witnesses = [
+        { actionId: 6, expected: { round: 3, players: clone(paid.snapshot.state.players) } },
+      ];
+      return value;
+    };
+    const dispatch = (post = paid) =>
+      dispatcher(initial, (request) => {
+        if (request.move.type === 'endTurn') return clone(post);
+        assert.deepEqual(request.move, { type: 'choose', choiceId: 'rotate:1' });
+        return clone(advanced);
+      });
+    const success = decode(fixture([payout, announcement]), dispatch());
+    assert.equal(success.manifest.blocked, null);
+    assert.deepEqual(
+      success.record.steps.map((step) => step.sourceActionIds),
+      [[6], [7]],
+    );
+    assert.equal(success.record.steps[0].move.type, 'endTurn');
+    assert.equal(success.manifest.pendingCalendarAnnouncement, null);
+    for (const messages of [
+      [
+        { ...payout, raw_text: `${names[claimer]}は${amount + 1}\nを歯車から獲得した` },
+        announcement,
+      ],
+      [
+        { ...payout, raw_text: `${names[firstPlayer]}は${amount}\nを歯車から獲得した` },
+        announcement,
+      ],
+      [payout, { raw_text: `${names[firstPlayer]}がこのラウンドのスタートプレイヤーです` }],
+      [{ ...payout, icons: [{ classes: 'tz_icon resource_wood' }] }, announcement],
+      [payout, payout, announcement],
+      [payout, announcement, announcement],
+    ]) {
+      const refused = decode(fixture(messages), dispatch());
+      assert.equal(refused.manifest.blocked.actionId, 6);
+      assert.equal(refused.record.steps.length, 0);
+    }
+    for (const mutate of [
+      (post) => {
+        post.observation.pendingTask = null;
+      },
+      (post) => {
+        post.snapshot.state.round++;
+      },
+      (post) => {
+        post.snapshot.state.players[claimer].resources.corn--;
+      },
+      (post) => {
+        post.snapshot.state.players[claimer].resources.corn++;
+      },
+      (post) => {
+        post.snapshot.state.firstPlayerClaimed = null;
+      },
+    ]) {
+      const post = clone(paid);
+      mutate(post);
+      const refused = decode(fixture([payout, announcement]), dispatch(post));
+      assert.equal(refused.manifest.blocked.actionId, 6);
+      assert.equal(refused.record.steps.length, 0);
+    }
+    const checkpoint = fixture([payout, announcement]);
+    checkpoint.witness.witnesses[0].expected.players[claimer].resources.corn++;
+    const refused = decode(checkpoint, dispatch());
+    assert.equal(refused.manifest.blocked.actionId, 6);
+    assert.equal(refused.record.steps.length, 0);
+  }
 });
 
 test('keeps automatic payments distinct from typed theology offerings and temple spellings', () => {
