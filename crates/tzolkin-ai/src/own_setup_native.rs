@@ -17,7 +17,10 @@ use crate::own_setup_model::{
 };
 use crate::own_setup_record::{
     self, Callback, CallbackRole, Choice, FixedPlayingIdentity, GuardedWire, Header,
-    OwnSetupCounts, RECORD_SCHEMA, Record, SAMPLING_VERSION, SOURCE_KIND, SeatRole, SetupSample,
+    OwnSetupCounts, Record, SeatRole, SetupSample,
+};
+use crate::own_setup_trained_model::{
+    BorrowedTrainedOwnSetup, TrainedOwnSetupArtifact, TrainedOwnSetupIdentity,
 };
 use crate::public_stochastic::{
     DENOMINATOR_BITS, RNG_VERSION, TICKS, UNIFORM_MIXTURE, behavior_distribution,
@@ -31,6 +34,49 @@ use crate::public_stochastic_record::{
 use crate::replay::state_key;
 
 pub const MAX_ROWS_PER_CALLBACK: usize = 1024;
+
+// The native runner accepts only the two concrete immutable Setup bindings.
+trait NativeOwnSetup {
+    type Identity: serde::Serialize + Clone;
+    const RECORD_SCHEMA: &'static str;
+    const SOURCE_KIND: &'static str;
+    const SAMPLING_VERSION: &'static str;
+    fn identity(&self) -> &Self::Identity;
+    fn predict(
+        &self,
+        candidates: &SetupCandidates,
+    ) -> Result<tzolkin_inference::policy::NumericPolicyDistribution, String>;
+}
+impl NativeOwnSetup for BorrowedInitializedOwnSetup<'_> {
+    type Identity = crate::own_setup_model::InitializedOwnSetupIdentity;
+    const RECORD_SCHEMA: &'static str = own_setup_record::RECORD_SCHEMA;
+    const SOURCE_KIND: &'static str = own_setup_record::SOURCE_KIND;
+    const SAMPLING_VERSION: &'static str = own_setup_record::SAMPLING_VERSION;
+    fn identity(&self) -> &Self::Identity {
+        self.identity()
+    }
+    fn predict(
+        &self,
+        c: &SetupCandidates,
+    ) -> Result<tzolkin_inference::policy::NumericPolicyDistribution, String> {
+        self.predict(c)
+    }
+}
+impl NativeOwnSetup for BorrowedTrainedOwnSetup<'_> {
+    type Identity = TrainedOwnSetupIdentity;
+    const RECORD_SCHEMA: &'static str = own_setup_record::TRAINED_RECORD_SCHEMA;
+    const SOURCE_KIND: &'static str = own_setup_record::TRAINED_SOURCE_KIND;
+    const SAMPLING_VERSION: &'static str = crate::own_setup_trained_model::SAMPLING_VERSION;
+    fn identity(&self) -> &Self::Identity {
+        self.identity()
+    }
+    fn predict(
+        &self,
+        c: &SetupCandidates,
+    ) -> Result<tzolkin_inference::policy::NumericPolicyDistribution, String> {
+        self.predict(c)
+    }
+}
 
 /// Closed base generator/stream/cap configuration plus one absolute learner seat.
 pub struct OwnSetupNativeConfig {
@@ -72,6 +118,20 @@ impl<'a> OwnSetupCollector<'a> {
             setup: BorrowedInitializedOwnSetup::new(setup)?,
             playing: Some(playing),
         })
+    }
+    pub(crate) fn from_parts(
+        setup: BorrowedInitializedOwnSetup<'a>,
+        playing: LoadedDeployment,
+    ) -> Self {
+        Self {
+            setup,
+            playing: Some(playing),
+        }
+    }
+    pub(crate) fn into_playing(mut self) -> Result<LoadedDeployment, String> {
+        self.playing
+            .take()
+            .ok_or_else(|| "Own Setup Playing storage unavailable".into())
     }
     pub fn playing(&self) -> Result<&LoadedDeployment, String> {
         self.playing
@@ -154,37 +214,60 @@ impl AuditedOwnSetupGame {
     }
     /// Only a complete fresh audited game containing one applied Setup sample seals.
     pub fn into_episode(self) -> Result<ValidatedOwnSetupEpisode, String> {
-        let r = &self.record;
-        let c = &r.counts;
-        if !self.complete()
-            || c.setup_accepted != 1
-            || c.setup_applied != 1
-            || c.setup_attempts != 1
-            || c.setup_reserved_rows != 6
-            || c.apply_successes != c.observed_callbacks
-            || c.validated_transitions != c.observed_callbacks
-            || c.guard_notifications != c.observed_callbacks
-            || c.setup_accepted + c.playing_choices + c.opponent_choices != c.observed_callbacks
-        {
-            return Err("Own Setup episode requires a complete fresh audited single sample".into());
-        }
-        let setup_index = r
-            .callbacks
-            .iter()
-            .position(|cb| matches!(cb.choice, Some(Choice::SetupSample { .. })))
-            .ok_or("Missing applied Own Setup sample")?;
-        let scores = &r.terminal.as_ref().ok_or("Missing terminal")?.final_scores;
-        let winner_share = winner_share(scores, r.header.learner_seat, r.header.config.players)?;
-        let mut hash = Sha256::new();
-        hash.update(b"tzolkin-own-setup-audited-episode-v1\0");
-        hash.update(r.checksum.as_bytes());
+        let e = seal(self.record)?;
         Ok(ValidatedOwnSetupEpisode {
-            record: self.record,
-            setup_index,
-            winner_share,
-            episode_id: format!("{:x}", hash.finalize()),
+            record: e.record,
+            setup_index: e.setup_index,
+            winner_share: e.winner_share,
+            episode_id: e.episode_id,
         })
     }
+}
+
+struct SuccessfulEpisode<S> {
+    record: Record<S>,
+    setup_index: usize,
+    winner_share: f64,
+    episode_id: String,
+}
+fn seal<S: Serialize>(record: Record<S>) -> Result<SuccessfulEpisode<S>, String> {
+    let r = &record;
+    let c = &r.counts;
+    if r.terminal.is_none()
+        || r.failure.is_some()
+        || c.setup_accepted != 1
+        || c.setup_applied != 1
+        || c.setup_attempts != 1
+        || c.setup_reserved_rows != 6
+        || c.apply_successes != c.observed_callbacks
+        || c.validated_transitions != c.observed_callbacks
+        || c.guard_notifications != c.observed_callbacks
+        || c.setup_accepted + c.playing_choices + c.opponent_choices != c.observed_callbacks
+    {
+        return Err("Own Setup episode requires a complete fresh audited single sample".into());
+    }
+    let setup_index = r
+        .callbacks
+        .iter()
+        .position(|cb| matches!(cb.choice, Some(Choice::SetupSample { .. })))
+        .ok_or("Missing applied Own Setup sample")?;
+    let scores = &r.terminal.as_ref().ok_or("Missing terminal")?.final_scores;
+    let winner_share = winner_share(scores, r.header.learner_seat, r.header.config.players)?;
+    let mut hash = Sha256::new();
+    hash.update(match r.schema.as_str() {
+        own_setup_record::RECORD_SCHEMA => b"tzolkin-own-setup-audited-episode-v1\0".as_slice(),
+        own_setup_record::TRAINED_RECORD_SCHEMA => {
+            b"tzolkin-own-setup-trained-audited-episode-v2\0".as_slice()
+        }
+        _ => return Err("Unknown Own Setup episode source".into()),
+    });
+    hash.update(r.checksum.as_bytes());
+    Ok(SuccessfulEpisode {
+        record,
+        setup_index,
+        winner_share,
+        episode_id: format!("{:x}", hash.finalize()),
+    })
 }
 
 /// Non-Deserialize successful mechanical seal, separate from any learning owner.
@@ -194,74 +277,88 @@ pub struct ValidatedOwnSetupEpisode {
     winner_share: f64,
     episode_id: String,
 }
-impl ValidatedOwnSetupEpisode {
-    pub fn episode_id(&self) -> &str {
-        &self.episode_id
-    }
-    pub fn record_checksum(&self) -> &str {
-        &self.record.checksum
-    }
-    pub fn family_id(&self) -> &str {
-        &self.record.header.native_family_id
-    }
-    pub fn players(&self) -> usize {
-        self.record.header.config.players
-    }
-    pub fn learner_seat(&self) -> usize {
-        self.record.header.learner_seat
-    }
-    pub fn native_config(&self) -> Result<NativeStochasticConfig, String> {
-        self.record.header.config.checked_config()
-    }
-    pub fn setup_identity(&self) -> &crate::own_setup_model::InitializedOwnSetupIdentity {
-        &self.record.header.setup
-    }
-    pub fn counts(&self) -> &OwnSetupCounts {
-        &self.record.counts
-    }
-    pub fn setup_observation(&self) -> &Observation {
-        self.record.callbacks[self.setup_index]
-            .observation
-            .as_ref()
-            .expect("audited admitted Setup")
-    }
-    pub fn winner_share(&self) -> f64 {
-        self.winner_share
-    }
-    pub fn chosen_index(&self) -> usize {
-        self.sample().chosen_index
-    }
-    pub fn chosen_nominal_probability(&self) -> f64 {
-        f64::from_bits(
-            parse_hex64(&self.sample().chosen_nominal_probability_bits)
-                .expect("audited probability bits"),
-        )
-    }
-    pub fn chosen_behavior_probability(&self) -> f64 {
-        f64::from_bits(
-            parse_hex64(&self.sample().chosen_behavior_probability_bits)
-                .expect("audited behavior bits"),
-        )
-    }
-    pub fn logits_bits(&self) -> &[String] {
-        &self.sample().logits_bits
-    }
-    pub fn mass_ticks(&self) -> &[u64] {
-        &self.sample().mass_ticks
-    }
-    fn sample(&self) -> &SetupSample {
-        match self.record.callbacks[self.setup_index]
-            .choice
-            .as_ref()
-            .expect("audited choice")
-        {
-            Choice::SetupSample { sample, .. } => sample,
-            _ => unreachable!("sealed Setup sample"),
+macro_rules! episode_getters {
+    ($episode:ty, $identity:ty) => {
+        impl $episode {
+            pub fn episode_id(&self) -> &str {
+                &self.episode_id
+            }
+            pub fn record_checksum(&self) -> &str {
+                &self.record.checksum
+            }
+            pub fn family_id(&self) -> &str {
+                &self.record.header.native_family_id
+            }
+            pub fn players(&self) -> usize {
+                self.record.header.config.players
+            }
+            pub fn learner_seat(&self) -> usize {
+                self.record.header.learner_seat
+            }
+            pub fn native_config(&self) -> Result<NativeStochasticConfig, String> {
+                self.record.header.config.checked_config()
+            }
+            pub fn setup_identity(&self) -> &$identity {
+                &self.record.header.setup
+            }
+            pub(crate) fn playing_binding(&self) -> &FixedPlayingIdentity {
+                &self.record.header.playing
+            }
+            pub fn counts(&self) -> &OwnSetupCounts {
+                &self.record.counts
+            }
+            pub fn setup_observation(&self) -> &Observation {
+                self.record.callbacks[self.setup_index]
+                    .observation
+                    .as_ref()
+                    .expect("audited admitted Setup")
+            }
+            pub fn winner_share(&self) -> f64 {
+                self.winner_share
+            }
+            pub fn chosen_index(&self) -> usize {
+                self.sample().chosen_index
+            }
+            pub fn chosen_nominal_probability(&self) -> f64 {
+                f64::from_bits(
+                    parse_hex64(&self.sample().chosen_nominal_probability_bits)
+                        .expect("audited probability bits"),
+                )
+            }
+            pub fn chosen_behavior_probability(&self) -> f64 {
+                f64::from_bits(
+                    parse_hex64(&self.sample().chosen_behavior_probability_bits)
+                        .expect("audited behavior bits"),
+                )
+            }
+            pub fn logits_bits(&self) -> &[String] {
+                &self.sample().logits_bits
+            }
+            pub fn mass_ticks(&self) -> &[u64] {
+                &self.sample().mass_ticks
+            }
+            pub(crate) fn sample(&self) -> &SetupSample {
+                match self.record.callbacks[self.setup_index]
+                    .choice
+                    .as_ref()
+                    .expect("audited choice")
+                {
+                    Choice::SetupSample { sample, .. } => sample,
+                    _ => unreachable!("sealed Setup sample"),
+                }
+            }
         }
-    }
+    };
 }
+episode_getters!(
+    ValidatedOwnSetupEpisode,
+    crate::own_setup_model::InitializedOwnSetupIdentity
+);
+episode_getters!(ValidatedTrainedOwnSetupEpisode, TrainedOwnSetupIdentity);
 
-fn fixed_playing_identity(loaded: &LoadedDeployment) -> Result<FixedPlayingIdentity, String> {
+pub(crate) fn fixed_playing_identity(
+    loaded: &LoadedDeployment,
+) -> Result<FixedPlayingIdentity, String> {
     let identity = loaded
         .current_mixed_identity()
         .ok_or("Own Setup continuation requires actual current-mixed deployment")?;
@@ -287,13 +384,143 @@ fn fixed_playing_identity(loaded: &LoadedDeployment) -> Result<FixedPlayingIdent
         projection_version: PROJECTION_VERSION.into(),
     })
 }
-fn header(
+
+/// Actual updated Setup collection has its own v2 record and concrete episode.
+pub struct TrainedOwnSetupCollector<'a> {
+    setup: BorrowedTrainedOwnSetup<'a>,
+    playing: Option<LoadedDeployment>,
+}
+impl<'a> TrainedOwnSetupCollector<'a> {
+    pub fn new(
+        setup: &'a TrainedOwnSetupArtifact,
+        playing: LoadedDeployment,
+    ) -> Result<Self, String> {
+        let binding = fixed_playing_identity(&playing)?;
+        if setup.identity().playing_binding_checksum != playing_binding_checksum(&binding)? {
+            return Err("Trained Setup immutable Playing binding mismatch".into());
+        }
+        Ok(Self {
+            setup: BorrowedTrainedOwnSetup::new(setup)?,
+            playing: Some(playing),
+        })
+    }
+    pub fn playing(&self) -> Result<&LoadedDeployment, String> {
+        self.playing
+            .as_ref()
+            .ok_or_else(|| "Trained Setup Playing storage unavailable".into())
+    }
+    pub(crate) fn from_parts(
+        setup: BorrowedTrainedOwnSetup<'a>,
+        playing: LoadedDeployment,
+    ) -> Self {
+        Self {
+            setup,
+            playing: Some(playing),
+        }
+    }
+    pub(crate) fn into_playing(mut self) -> Result<LoadedDeployment, String> {
+        self.playing
+            .take()
+            .ok_or_else(|| "Trained Setup Playing storage unavailable".into())
+    }
+    pub fn collect(
+        &mut self,
+        config: &OwnSetupNativeConfig,
+    ) -> Result<CollectedTrainedOwnSetupGame, String> {
+        self.run(config, None)
+            .map(|record| CollectedTrainedOwnSetupGame { record })
+    }
+    pub fn audit(&mut self, bytes: &[u8]) -> Result<AuditedTrainedOwnSetupGame, String> {
+        let record = own_setup_record::decode_trained(bytes)?;
+        let config = OwnSetupNativeConfig::new(
+            record.header.config.checked_config()?,
+            record.header.learner_seat,
+        )?;
+        if record.callbacks.len() > config.native.limits().max_callbacks() {
+            return Err("Trained Setup saved callback cap".into());
+        }
+        same_bytes(
+            &header(&config, &self.setup, self.playing()?)?,
+            &record.header,
+            "Trained Setup header/immutable identities mismatch",
+        )?;
+        self.run(&config, Some(&record))
+            .map(|record| AuditedTrainedOwnSetupGame { record })
+    }
+    fn run(
+        &mut self,
+        config: &OwnSetupNativeConfig,
+        expected: Option<&Record<TrainedOwnSetupIdentity>>,
+    ) -> Result<Record<TrainedOwnSetupIdentity>, String> {
+        let guard_config = TradeGuardConfig::default();
+        guard_config.configuration_key()?;
+        let playing = self
+            .playing
+            .take()
+            .ok_or("Trained Setup Playing storage unavailable")?;
+        let mut guard = GuardedDeployment::new(playing, guard_config)?;
+        let result = run(config, &self.setup, &mut guard, expected);
+        self.playing = Some(guard.into_policy());
+        result
+    }
+}
+pub struct CollectedTrainedOwnSetupGame {
+    record: Record<TrainedOwnSetupIdentity>,
+}
+impl CollectedTrainedOwnSetupGame {
+    pub fn complete(&self) -> bool {
+        self.record.terminal.is_some() && self.record.failure.is_none()
+    }
+    pub fn counts(&self) -> &OwnSetupCounts {
+        &self.record.counts
+    }
+    pub fn failure_reason(&self) -> Option<FailureReason> {
+        self.record.failure.as_ref().map(|f| f.reason)
+    }
+    pub fn checksum(&self) -> &str {
+        &self.record.checksum
+    }
+    pub(crate) fn record(&self) -> &Record<TrainedOwnSetupIdentity> {
+        &self.record
+    }
+}
+pub struct AuditedTrainedOwnSetupGame {
+    record: Record<TrainedOwnSetupIdentity>,
+}
+impl AuditedTrainedOwnSetupGame {
+    pub fn complete(&self) -> bool {
+        self.record.terminal.is_some() && self.record.failure.is_none()
+    }
+    pub fn counts(&self) -> &OwnSetupCounts {
+        &self.record.counts
+    }
+    pub fn into_episode(self) -> Result<ValidatedTrainedOwnSetupEpisode, String> {
+        let e = seal(self.record)?;
+        Ok(ValidatedTrainedOwnSetupEpisode {
+            record: e.record,
+            setup_index: e.setup_index,
+            winner_share: e.winner_share,
+            episode_id: e.episode_id,
+        })
+    }
+}
+pub struct ValidatedTrainedOwnSetupEpisode {
+    record: Record<TrainedOwnSetupIdentity>,
+    setup_index: usize,
+    winner_share: f64,
+    episode_id: String,
+}
+pub(crate) fn playing_binding_checksum(binding: &FixedPlayingIdentity) -> Result<String, String> {
+    crate::public_policy_update::hash(b"tzolkin-own-setup-fixed-playing-binding-v1\0", binding)
+}
+
+fn header<P: NativeOwnSetup>(
     config: &OwnSetupNativeConfig,
-    setup: &BorrowedInitializedOwnSetup<'_>,
+    setup: &P,
     playing: &LoadedDeployment,
-) -> Result<Header, String> {
+) -> Result<Header<P::Identity>, String> {
     Ok(Header {
-        source_kind: SOURCE_KIND.into(),
+        source_kind: P::SOURCE_KIND.into(),
         config: Config::from_config(&config.native),
         learner_seat: config.learner_seat,
         native_family_id: seed_family_id(config.native.environment_seed()),
@@ -309,7 +536,7 @@ fn header(
             })
             .collect(),
         opponent: ResourceCycleConfig::v5(),
-        sampling_version: SAMPLING_VERSION.into(),
+        sampling_version: P::SAMPLING_VERSION.into(),
         rng_version: RNG_VERSION.into(),
         numerical_target: numerical_target(),
         denominator_bits: DENOMINATOR_BITS,
@@ -335,8 +562,8 @@ fn state_valid(state: &GameState) -> Result<(), String> {
     }
     Ok(())
 }
-fn failed(
-    record: &mut Record,
+fn failed<S>(
+    record: &mut Record<S>,
     reason: FailureReason,
     stage: AttemptStage,
     index: Option<usize>,
@@ -358,11 +585,7 @@ fn reserve(used: &mut usize, amount: usize, limit: usize) -> Result<(), String> 
         .ok_or("Own Setup reservation limit")?;
     Ok(())
 }
-fn sample(
-    setup: &BorrowedInitializedOwnSetup<'_>,
-    o: &Observation,
-    rng: u64,
-) -> Result<SetupSample, String> {
+fn sample<P: NativeOwnSetup>(setup: &P, o: &Observation, rng: u64) -> Result<SetupSample, String> {
     let candidates = SetupCandidates::from_observation(o)?;
     let logits = setup.predict(&candidates)?.logits;
     let (nominal, masses, distribution_digest) = behavior_distribution(&logits)?;
@@ -418,12 +641,12 @@ fn unique_action(
     Ok(actions[0].clone())
 }
 
-fn run(
+fn run<P: NativeOwnSetup>(
     config: &OwnSetupNativeConfig,
-    setup: &BorrowedInitializedOwnSetup<'_>,
+    setup: &P,
     guard: &mut GuardedDeployment,
-    expected: Option<&Record>,
-) -> Result<Record, String> {
+    expected: Option<&Record<P::Identity>>,
+) -> Result<Record<P::Identity>, String> {
     let native = &config.native;
     let limits = native.limits();
     let header = header(config, setup, guard.policy())?;
@@ -434,7 +657,7 @@ fn run(
         return Err("Own Setup header exceeds source cap".into());
     }
     let mut record = Record {
-        schema: RECORD_SCHEMA.into(),
+        schema: P::RECORD_SCHEMA.into(),
         header,
         callbacks: Vec::new(),
         terminal: None,
@@ -651,10 +874,10 @@ fn run(
 }
 
 type StepFailure = (FailureReason, AttemptStage, String);
-fn step(
-    record: &mut Record,
+fn step<P: NativeOwnSetup>(
+    record: &mut Record<P::Identity>,
     config: &OwnSetupNativeConfig,
-    setup: &BorrowedInitializedOwnSetup<'_>,
+    setup: &P,
     guard: &mut GuardedDeployment,
     state: &mut GameState,
     observation: &Observation,
@@ -860,7 +1083,7 @@ fn winner_share(scores: &[FinalScoreWire], learner: usize, players: usize) -> Re
         },
     )
 }
-fn source_size(record: &Record) -> Result<usize, String> {
+fn source_size<S: Serialize>(record: &Record<S>) -> Result<usize, String> {
     // Exact sizes of source fragments excluding the separately charged choices.
     let mut bytes = serialized_size(
         &(
@@ -896,11 +1119,11 @@ fn source_size(record: &Record) -> Result<usize, String> {
     }
     Ok(bytes)
 }
-fn finish(
-    mut record: Record,
+fn finish<S: Serialize>(
+    mut record: Record<S>,
     config: &OwnSetupNativeConfig,
-    expected: Option<&Record>,
-) -> Result<Record, String> {
+    expected: Option<&Record<S>>,
+) -> Result<Record<S>, String> {
     record.counts.stopped = true;
     record.counts.actual_trace_bytes = record
         .callbacks
@@ -947,7 +1170,7 @@ fn finish(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::public_stochastic::{SamplingSeed, SamplingStreamIdentity};
     use crate::public_stochastic_native::CollectionLimits;
@@ -956,7 +1179,7 @@ mod tests {
 
     // Synthetic numeric-only identity with actual zero-word actor fingerprint;
     // this fixture supplies no native learner or trained owner.
-    fn playing() -> LoadedDeployment {
+    pub(crate) fn playing() -> LoadedDeployment {
         let target = numerical_target();
         let mut hash = Sha256::new();
         hash.update(b"tzolkin-mixed-inference-actor-v1\0");
