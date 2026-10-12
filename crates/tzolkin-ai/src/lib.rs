@@ -4,6 +4,7 @@
 //! here so existing `tzolkin_ai::` paths keep working.
 pub mod arena;
 pub mod conditional_human_rl;
+pub mod conditional_human_rl_update;
 pub mod dataset;
 pub mod experiment;
 pub mod features;

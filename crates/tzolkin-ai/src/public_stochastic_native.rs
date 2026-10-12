@@ -282,6 +282,9 @@ pub(crate) enum NativePolicy<'handle, 'model> {
     Long(&'handle crate::public_rl_native::LongRlHandle<'model>),
     Paired(&'handle crate::public_rl_native::PairedRlHandle<'model>),
     CurrentMixed(&'handle crate::public_policy_mixed_continued::CurrentMixedPolicyHandle<'model>),
+    ConditionalMixed(
+        &'handle crate::conditional_human_rl_update::ConditionalMixedPolicyHandle<'model>,
+    ),
 }
 impl<'handle, 'model> NativePolicy<'handle, 'model> {
     fn session(
@@ -289,6 +292,10 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
         identity: SamplingStreamIdentity,
     ) -> Result<NativeSession<'handle, 'model>, String> {
         match self {
+            Self::ConditionalMixed(policy) => {
+                crate::public_stochastic::ConditionalMixedStochasticSession::new(policy, identity)
+                    .map(NativeSession::ConditionalMixed)
+            }
             Self::Bc(policy) => StochasticSession::new(policy, identity).map(NativeSession::Bc),
             Self::Rl(policy) => RlStochasticSession::new(policy, identity).map(NativeSession::Rl),
             Self::Repeated(policy) => {
@@ -310,6 +317,7 @@ impl<'handle, 'model> NativePolicy<'handle, 'model> {
     }
     fn sampling_version(self) -> &'static str {
         match self {
+            Self::ConditionalMixed(_) => crate::conditional_human_rl_update::SAMPLING_VERSION,
             Self::Bc(_) => SAMPLING_VERSION,
             Self::Rl(_) => RL_SAMPLING_VERSION,
             Self::Repeated(_) => REPEATED_SAMPLING_VERSION,
@@ -326,10 +334,12 @@ enum NativeSession<'handle, 'model> {
     Long(crate::public_stochastic::LongStochasticSession<'handle, 'model>),
     Paired(crate::public_stochastic::PairedStochasticSession<'handle, 'model>),
     CurrentMixed(crate::public_stochastic::CurrentMixedStochasticSession<'handle, 'model>),
+    ConditionalMixed(crate::public_stochastic::ConditionalMixedStochasticSession<'handle, 'model>),
 }
 impl NativeSession<'_, '_> {
     fn sample(&mut self, observation: &Observation) -> Result<SampledDecision, String> {
         match self {
+            Self::ConditionalMixed(session) => session.sample(observation),
             Self::Bc(session) => session.sample(observation),
             Self::Rl(session) => session.sample(observation),
             Self::Repeated(session) => session.sample(observation),
@@ -340,6 +350,7 @@ impl NativeSession<'_, '_> {
     }
     fn counters(&self) -> SamplingCounters {
         match self {
+            Self::ConditionalMixed(session) => session.counters(),
             Self::Bc(session) => session.counters(),
             Self::Rl(session) => session.counters(),
             Self::Repeated(session) => session.counters(),
@@ -350,6 +361,7 @@ impl NativeSession<'_, '_> {
     }
     fn stop(&mut self) {
         match self {
+            Self::ConditionalMixed(session) => session.stop(),
             Self::Bc(session) => session.stop(),
             Self::Rl(session) => session.stop(),
             Self::Repeated(session) => session.stop(),
@@ -553,16 +565,66 @@ pub(crate) fn run_current_mixed_shared(
     )
 }
 
+pub(crate) fn run_conditional_mixed_shared(
+    config: &NativeStochasticConfig,
+    policy: &crate::conditional_human_rl_update::ConditionalMixedPolicyHandle<'_>,
+    roster: &crate::conditional_human_rl_update::ConditionalFrozenMixRoster<'_>,
+    header: Header<crate::conditional_human_rl_update::ConditionalMixedSource>,
+    expected: Option<&Record<crate::conditional_human_rl_update::ConditionalMixedSource>>,
+) -> Result<Record<crate::conditional_human_rl_update::ConditionalMixedSource>, String> {
+    header.base_policy.require_handle(policy, roster)?;
+    if header.config != Config::from_config(config)
+        || header.source_kind != crate::conditional_human_rl_update::SOURCE_KIND
+        || header.sampling_version != crate::conditional_human_rl_update::SAMPLING_VERSION
+    {
+        return Err("Conditional native full configuration/source differs".into());
+    }
+    run_loop(
+        config,
+        NativePolicy::ConditionalMixed(policy),
+        SamplingActors::ConditionalFrozen(roster),
+        crate::conditional_human_rl_update::RECORD_SCHEMA,
+        header,
+        expected,
+        apply_move,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn conditional_test_start(
+    config: &NativeStochasticConfig,
+    policy: &crate::conditional_human_rl_update::ConditionalMixedPolicyHandle<'_>,
+    roster: &crate::conditional_human_rl_update::ConditionalFrozenMixRoster<'_>,
+    header: Header<crate::conditional_human_rl_update::ConditionalMixedSource>,
+    expected: Option<&Record<crate::conditional_human_rl_update::ConditionalMixedSource>>,
+    start: GameState,
+) -> Result<Record<crate::conditional_human_rl_update::ConditionalMixedSource>, String> {
+    run_loop_with_start(
+        config,
+        NativePolicy::ConditionalMixed(policy),
+        SamplingActors::ConditionalFrozen(roster),
+        crate::conditional_human_rl_update::RECORD_SCHEMA,
+        header,
+        expected,
+        apply_move,
+        || Ok(start),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum SamplingActors<'roster, 'owner> {
     All,
     One(usize),
     Frozen(&'roster crate::public_rl_mixed_native::FrozenMixedRoster<'owner>),
     CurrentFrozen(&'roster crate::public_rl_mixed_native::FrozenMixedRoster<'owner>),
+    ConditionalFrozen(
+        &'roster crate::conditional_human_rl_update::ConditionalFrozenMixRoster<'owner>,
+    ),
 }
 impl SamplingActors<'_, '_> {
     fn learner_seat(self) -> Option<usize> {
         match self {
+            Self::ConditionalFrozen(roster) => Some(roster.learner_seat()),
             Self::All => None,
             Self::One(learner) => Some(learner),
             Self::Frozen(roster) | Self::CurrentFrozen(roster) => Some(roster.learner_seat()),
@@ -570,6 +632,7 @@ impl SamplingActors<'_, '_> {
     }
     fn samples(self, actor: usize) -> bool {
         match self {
+            Self::ConditionalFrozen(roster) => actor == roster.learner_seat(),
             Self::All => true,
             Self::One(learner) => actor == learner,
             Self::Frozen(roster) | Self::CurrentFrozen(roster) => actor == roster.learner_seat(),
@@ -577,6 +640,7 @@ impl SamplingActors<'_, '_> {
     }
     fn mixed_schema(self) -> Option<&'static str> {
         match self {
+            Self::ConditionalFrozen(_) => Some(crate::conditional_human_rl_update::RECORD_SCHEMA),
             Self::All => None,
             Self::One(_) => Some(crate::public_mixed_native::RECORD_SCHEMA),
             Self::Frozen(_) => Some(crate::public_rl_mixed_native::RECORD_SCHEMA),
@@ -641,6 +705,11 @@ fn run_loop_with_start<P: Serialize + PartialEq>(
     mut apply: impl FnMut(&GameState, GameMove) -> Result<GameState, String>,
     start: impl FnOnce() -> Result<GameState, String>,
 ) -> Result<Record<P>, String> {
+    if matches!(policy, NativePolicy::ConditionalMixed(_))
+        != matches!(actors, SamplingActors::ConditionalFrozen(_))
+    {
+        return Err("Conditional sampler requires its distinct frozen source route".into());
+    }
     if matches!(policy, NativePolicy::CurrentMixed(_))
         != matches!(actors, SamplingActors::CurrentFrozen(_))
     {
@@ -686,6 +755,15 @@ fn run_loop_with_start<P: Serialize + PartialEq>(
     }
     let mut session = policy.session(config.sampling_identity)?;
     let mut opponent_guards = match actors {
+        SamplingActors::ConditionalFrozen(roster) => (0..config.players)
+            .map(|actor| {
+                if actor == roster.learner_seat() {
+                    Ok(None)
+                } else {
+                    roster.opponent(actor)?.trade_guard_session()
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?,
         SamplingActors::Frozen(roster) | SamplingActors::CurrentFrozen(roster) => (0..config
             .players)
             .map(|actor| {
@@ -730,6 +808,13 @@ fn run_loop_with_start<P: Serialize + PartialEq>(
             None,
             &error,
         );
+    }
+    // The actual generator uses default Basic options. Conditional headers bind
+    // unlimited Uxmal trading, the core's sole Basic market implementation.
+    if matches!(actors, SamplingActors::ConditionalFrozen(_))
+        && (state.additional_buildings || state.expansion.is_some())
+    {
+        return Err("Conditional source refuses non-default native options".into());
     }
     while record.failure.is_none() && state.phase != Phase::Finished {
         let index = record.callbacks.len();
@@ -933,6 +1018,9 @@ fn run_loop_with_start<P: Serialize + PartialEq>(
         } else {
             record.callbacks[index].opponent_attempted = true;
             let opponent = match actors {
+                SamplingActors::ConditionalFrozen(roster) => {
+                    Some(roster.opponent(observation.actor)?)
+                }
                 SamplingActors::Frozen(roster) | SamplingActors::CurrentFrozen(roster) => {
                     Some(roster.opponent(observation.actor)?)
                 }

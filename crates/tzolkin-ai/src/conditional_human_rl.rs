@@ -89,6 +89,9 @@ pub struct ConditionalRlIdentity {
     checksum: String,
 }
 impl ConditionalRlIdentity {
+    pub(crate) fn sampling_seed(&self) -> u64 {
+        self.sampling_seed
+    }
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
@@ -115,6 +118,16 @@ pub struct ConditionalRlOwner {
     identity: ConditionalRlIdentity,
 }
 impl ConditionalRlOwner {
+    pub(crate) fn into_mixed_parts(
+        self,
+    ) -> (
+        ConditionalRlOrigin,
+        PublicPolicyModel,
+        Vec<f32>,
+        ConditionalRlIdentity,
+    ) {
+        (self.origin, self.actor, self.critic, self.identity)
+    }
     pub fn from_prepared(
         prepared: &PreparedConditionalHumanPolicy,
         critic_seed: u64,
@@ -122,6 +135,31 @@ impl ConditionalRlOwner {
     ) -> Result<Self, String> {
         let origin = ConditionalRlOrigin::from_prepared(prepared)?;
         let actor = prepared.model().model.clone();
+        Self::initialize(origin, actor, critic_seed, sampling_seed)
+    }
+    #[cfg(test)]
+    pub(crate) fn synthetic(prepared: &PreparedConditionalHumanPolicy) -> Result<Self, String> {
+        let origin = ConditionalRlOrigin {
+            checkpoint_checksum: prepared.checkpoint_checksum().into(),
+            model_checksum: prepared.model().checksum.clone(),
+            dataset: prepared.identity().clone(),
+            table_reservations: prepared.reservations().clone(),
+            source_pins: Vec::new(),
+            checksum: digest(b"synthetic conditional origin, test-only"),
+        };
+        Self::initialize(
+            origin,
+            prepared.model().model.clone(),
+            11,
+            SamplingSeed::new(17),
+        )
+    }
+    fn initialize(
+        origin: ConditionalRlOrigin,
+        actor: PublicPolicyModel,
+        critic_seed: u64,
+        sampling_seed: SamplingSeed,
+    ) -> Result<Self, String> {
         actor.validate()?;
         let critic = crate::public_policy_baseline::zero_output_parameters(critic_seed);
         // A distinct domain binds fresh critic bits to this conditional source.
@@ -140,7 +178,7 @@ impl ConditionalRlOwner {
             game_options: GameOptions::default(),
             uxmal_corn_limit: false,
             origin_checksum: origin.checksum().into(),
-            actor_checksum: prepared.model().checksum.clone(),
+            actor_checksum: origin.model_checksum.clone(),
             critic_checksum: digest(&critic_bytes),
             critic_seed,
             sampling_seed: sampling_seed.value(),
