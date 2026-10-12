@@ -7,11 +7,13 @@ use std::sync::OnceLock;
 #[path = "support/temp_root.rs"]
 mod test_temp_root;
 use tzolkin_ai::dataset::{self, DatasetSplit};
-use tzolkin_ai::features::{FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
+use tzolkin_ai::features::{FeatureEncoder, PUBLIC_FEATURE_SCHEMA, SEMANTIC_SETUP_FEATURE_SCHEMA};
 use tzolkin_ai::policy::HeuristicWeights;
 use tzolkin_ai::policy_dataset::{
-    self, PolicyDatasetManifest, export_native_files, export_resource_cycle_v5_teacher_files,
-    load_policy_dataset, load_resource_cycle_v5_teacher_dataset,
+    self, PolicyDatasetManifest, export_native_files,
+    export_resource_cycle_v5_semantic_setup_teacher_files, export_resource_cycle_v5_teacher_files,
+    load_policy_dataset, load_resource_cycle_v5_semantic_setup_teacher_dataset,
+    load_resource_cycle_v5_teacher_dataset,
 };
 use tzolkin_ai::public_model::{LoadedPublicPolicy, PublicPolicyArtifact};
 use tzolkin_ai::replay::{self, GameReplay, ReplaySource};
@@ -230,6 +232,9 @@ fn resource_cycle_v5_teacher_roundtrip_and_closed_admission(
     }
     assert!(samples.iter().any(|s| s.phase() == &Phase::Setup));
     assert!(samples.iter().any(|s| s.phase() == &Phase::Playing));
+    semantic_setup_teacher_roundtrip_and_closed_admission(
+        &temp, &sources, &records, &manifest, &samples,
+    );
     assert!(export_native_files(&sources, &temp.0.join("native")).is_err());
     assert!(!temp.0.join("native").exists());
     assert!(dataset::export_dataset(&records, &temp.0.join("legacy-teacher")).is_err());
@@ -263,6 +268,14 @@ fn resource_cycle_v5_teacher_roundtrip_and_closed_admission(
             != s.chosen.r#move
     }));
     let relabeled = temp.source("relabeled.json", &relabeled);
+    let semantic_relabeled = temp.0.join("semantic-relabeled");
+    let error = export_resource_cycle_v5_semantic_setup_teacher_files(
+        std::slice::from_ref(&relabeled),
+        &semantic_relabeled,
+    )
+    .unwrap_err();
+    assert!(error.contains("regenerated teacher choice"));
+    assert!(!semantic_relabeled.exists());
     let error = export_resource_cycle_v5_teacher_files(&[relabeled], &temp.0.join("relabeled"))
         .unwrap_err();
     assert!(error.contains("regenerated teacher choice"));
@@ -301,6 +314,15 @@ fn resource_cycle_v5_teacher_roundtrip_and_closed_admission(
             _ => unreachable!(),
         }
         let source = temp.source(&format!("wrong-{i}.json"), &record);
+        let semantic_output = temp.0.join(format!("semantic-wrong-{i}"));
+        assert!(
+            export_resource_cycle_v5_semantic_setup_teacher_files(
+                std::slice::from_ref(&source),
+                &semantic_output,
+            )
+            .is_err()
+        );
+        assert!(!semantic_output.exists());
         let output = temp.0.join(format!("wrong-{i}"));
         assert!(export_resource_cycle_v5_teacher_files(&[source], &output).is_err());
         assert!(!output.exists());
@@ -315,6 +337,193 @@ fn resource_cycle_v5_teacher_roundtrip_and_closed_admission(
     lines[0]["candidates"][0]["values"][0] = Value::from(0.99);
     rewrite_lines(&temp.dataset(), &mut forged, &lines);
     assert!(load_resource_cycle_v5_teacher_dataset(&temp.dataset()).is_err());
+}
+
+fn semantic_setup_teacher_roundtrip_and_closed_admission(
+    temp: &Temp,
+    sources: &[PathBuf],
+    records: &[GameReplay],
+    old_manifest: &PolicyDatasetManifest,
+    old_samples: &[policy_dataset::ValidatedPolicySample],
+) {
+    let output = temp.0.join("semantic-teacher");
+    let manifest = export_resource_cycle_v5_semantic_setup_teacher_files(sources, &output).unwrap();
+    assert_eq!(manifest.feature_schema, SEMANTIC_SETUP_FEATURE_SCHEMA);
+    assert_eq!(
+        manifest.source_kind,
+        policy_dataset::RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_SOURCE_KIND
+    );
+    assert_eq!(
+        manifest.task,
+        policy_dataset::RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_TASK
+    );
+    assert!(!manifest.value_supervised);
+    assert_eq!(manifest.games, old_manifest.games);
+    assert_eq!(manifest.strata, old_manifest.strata);
+    assert_eq!(manifest.samples, old_manifest.samples);
+    assert_eq!(manifest.candidates, old_manifest.candidates);
+    assert_ne!(manifest.fingerprint, old_manifest.fingerprint);
+    for game in &manifest.games {
+        assert_eq!(
+            fs::read(output.join(&game.source_file)).unwrap(),
+            fs::read(temp.dataset().join(&game.source_file)).unwrap()
+        );
+    }
+    assert!(load_policy_dataset(&output).is_err());
+    assert!(load_resource_cycle_v5_teacher_dataset(&output).is_err());
+    assert!(load_resource_cycle_v5_semantic_setup_teacher_dataset(&temp.dataset()).is_err());
+    assert!(export_resource_cycle_v5_semantic_setup_teacher_files(sources, &output).is_err());
+    let dataset = load_resource_cycle_v5_semantic_setup_teacher_dataset(&output).unwrap();
+    assert_eq!(dataset.manifest(), &manifest);
+    let samples = dataset.iter().map(Result::unwrap).collect::<Vec<_>>();
+    assert_eq!(samples.len(), old_samples.len());
+    let mut changed_setup = false;
+    for ((sample, old), step) in samples
+        .iter()
+        .zip(old_samples)
+        .zip(records.iter().flat_map(|r| &r.steps))
+    {
+        assert_eq!(sample.sample_id(), old.sample_id());
+        assert_eq!(sample.game_id(), old.game_id());
+        assert_eq!(sample.family_id(), old.family_id());
+        assert_eq!(sample.source_index(), old.source_index());
+        assert_eq!(sample.actor(), old.actor());
+        assert_eq!(sample.phase(), old.phase());
+        assert_eq!(sample.chosen(), old.chosen());
+        assert_eq!(sample.value_target(), None);
+        assert_eq!(sample.candidates().len(), old.candidates().len());
+        assert_eq!(step.observation.legal_actions[sample.chosen()], step.chosen);
+        let encoder = FeatureEncoder::new_semantic_setup(&step.observation).unwrap();
+        for (index, (row, old_row)) in sample.candidates().iter().zip(old.candidates()).enumerate()
+        {
+            assert_eq!(row, &encoder.encode_legal_tagged(index).unwrap());
+            assert!(row.values_for_schema(PUBLIC_FEATURE_SCHEMA).is_err());
+            let values = row
+                .values_for_schema(SEMANTIC_SETUP_FEATURE_SCHEMA)
+                .unwrap();
+            let previous = old_row.values_for_schema(PUBLIC_FEATURE_SCHEMA).unwrap();
+            assert_eq!(
+                values[..384]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                previous[..384]
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            let same = values
+                .iter()
+                .zip(previous)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            if sample.phase() == &Phase::Playing {
+                assert!(same);
+            } else {
+                for (slot, (a, b)) in values.iter().zip(previous).enumerate() {
+                    if !(480..494).contains(&slot) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+                assert!(values[480..494].iter().all(|v| (0.0..=17.0).contains(v)));
+                changed_setup |= !same;
+            }
+        }
+    }
+    assert!(changed_setup);
+    for split in [
+        DatasetSplit::Train,
+        DatasetSplit::Validation,
+        DatasetSplit::Test,
+    ] {
+        let count = dataset.iter_split(split).map(Result::unwrap).count();
+        assert_eq!(
+            count,
+            manifest
+                .games
+                .iter()
+                .filter(|g| g.split == split)
+                .map(|g| g.samples)
+                .sum::<usize>()
+        );
+    }
+    // A complete replay with the wrong teacher header remains closed on this route.
+    let mut wrong = records[0].clone();
+    wrong.header.source = ReplaySource::SelfPlay {
+        policy_version: tzolkin_ai::POLICY_VERSION.into(),
+        weights: HeuristicWeights::default(),
+    };
+    let wrong = temp.source("semantic-wrong-source.json", &wrong);
+    let wrong_output = temp.0.join("semantic-wrong-source");
+    assert!(
+        export_resource_cycle_v5_semantic_setup_teacher_files(&[wrong], &wrong_output).is_err()
+    );
+    assert!(!wrong_output.exists());
+
+    // Rehashing schema-2 shards with new schema tags cannot replace re-encoding.
+    let retagged = temp.0.join("semantic-retagged");
+    fs::create_dir(&retagged).unwrap();
+    fs::create_dir(retagged.join("sources")).unwrap();
+    let mut forged = old_manifest.clone();
+    forged.feature_schema = manifest.feature_schema;
+    forged.source_kind = manifest.source_kind.clone();
+    forged.task = manifest.task.clone();
+    for game in &forged.games {
+        fs::copy(
+            temp.dataset().join(&game.source_file),
+            retagged.join(&game.source_file),
+        )
+        .unwrap();
+    }
+    for shard in &mut forged.shards {
+        let lines = fs::read_to_string(temp.dataset().join(&shard.file)).unwrap();
+        let mut bytes = Vec::new();
+        for line in lines.lines() {
+            let mut row: Value = serde_json::from_str(line).unwrap();
+            for candidate in row["candidates"].as_array_mut().unwrap() {
+                candidate["featureSchema"] = SEMANTIC_SETUP_FEATURE_SCHEMA.into();
+            }
+            bytes.extend(serde_json::to_vec(&row).unwrap());
+            bytes.push(b'\n');
+        }
+        shard.bytes = bytes.len() as u64;
+        shard.sha256 = hash(&bytes);
+        fs::write(retagged.join(&shard.file), bytes).unwrap();
+    }
+    resign(&mut forged);
+    write_manifest(&retagged, &forged);
+    assert!(
+        load_resource_cycle_v5_semantic_setup_teacher_dataset(&retagged)
+            .err()
+            .unwrap()
+            .contains("differs from full source re-encoding")
+    );
+    let manifest_path = output.join("manifest.json");
+    let original_manifest = fs::read(&manifest_path).unwrap();
+    let mut changed = original_manifest.clone();
+    changed.push(b' ');
+    fs::write(&manifest_path, &changed).unwrap();
+    let mut failed = dataset.iter();
+    assert!(failed.next().unwrap().is_err());
+    assert!(failed.next().is_none());
+    fs::write(&manifest_path, &original_manifest).unwrap();
+    let mut eof = dataset.iter();
+    eof.next().unwrap().unwrap();
+    fs::write(&manifest_path, changed).unwrap();
+    assert!(eof.any(|row| row.is_err()));
+    assert!(eof.next().is_none());
+    fs::write(&manifest_path, original_manifest).unwrap();
+    for path in [
+        output.join(&manifest.games[0].source_file),
+        output.join(&manifest.shards[0].file),
+    ] {
+        let original = fs::read(&path).unwrap();
+        fs::write(&path, b"{}").unwrap();
+        let mut failed = dataset.iter();
+        assert!(failed.next().unwrap().is_err());
+        assert!(failed.next().is_none());
+        fs::write(path, original).unwrap();
+    }
+    assert_eq!(dataset.iter().map(Result::unwrap).count(), manifest.samples);
 }
 
 fn resource_cycle_v5_record(players: usize, seed: u32) -> GameReplay {
