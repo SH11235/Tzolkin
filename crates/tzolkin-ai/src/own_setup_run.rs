@@ -798,7 +798,7 @@ impl PreparedContinuation {
                         .into(),
                 );
             }
-            let reports = saved_reports(&directory, original.configs.len())?;
+            let reports = saved_reports(&directory, original.configs.len(), true)?;
             if terminal(&reports).is_some()
                 || check_intents(
                     &directory,
@@ -860,7 +860,11 @@ impl PreparedContinuation {
     }
 }
 
-fn saved_reports(directory: &Path, batches: usize) -> Result<Vec<OwnSetupAttemptReport>, String> {
+fn saved_reports(
+    directory: &Path,
+    batches: usize,
+    require_nonabandoned: bool,
+) -> Result<Vec<OwnSetupAttemptReport>, String> {
     (0..batches)
         .map(|batch| {
             let bytes = read_bounded(
@@ -870,8 +874,13 @@ fn saved_reports(directory: &Path, batches: usize) -> Result<Vec<OwnSetupAttempt
                 MAX_STATE_BYTES,
             )?;
             let value = unique_json(&bytes, MAX_STATE_BYTES)?;
-            if value["event"]["kind"] != "closed" || value["event"]["abandoned"] != false {
-                return Err("Original source lacks a nonabandoned Closed report".into());
+            if value["schema"] != "tzolkin-own-setup-durable-head-v1"
+                || value["sequence"] != 2 * batch as u64 + 2
+                || value["event"]["kind"] != "closed"
+                || value["event"]["abandoned"].as_bool().is_none()
+                || (require_nonabandoned && value["event"]["abandoned"] != false)
+            {
+                return Err("Saved source lacks its required Closed report metadata".into());
             }
             serde_json::from_value(value["event"]["report"].clone()).map_err(|e| e.to_string())
         })
@@ -1220,6 +1229,7 @@ pub fn resume_continuation(
     if DurableOwnSetupOwner::inspect_tip(&directory.join(ARCHIVE))? != state.tip {
         return Err("Continuation requires the exact latest externally pinned source tip".into());
     }
+    check_saved_child_intents(&directory, &state, prepared.prepared.configs.len())?;
     if began.elapsed().as_secs() >= prepared.prepared.spec.max_seconds {
         return Err("Continuation validation exhausted time".into());
     }
@@ -1575,6 +1585,29 @@ fn intent_closed(ledger: &[OwnSetupAttemptReport], batch: usize) -> bool {
         .get(batch)
         .is_some_and(|r| matches!(r.outcome, OwnSetupAttemptOutcome::Updated { .. }))
 }
+fn check_saved_child_intents(
+    directory: &Path,
+    state: &OwnSetupRunState,
+    batches: usize,
+) -> Result<(), String> {
+    let closed = state.tip.sequence / 2;
+    if state.tip.sequence > 128 || state.tip.sequence.div_ceil(2) as usize > batches {
+        return Err("Child intent metadata exceeds the original schedule".into());
+    }
+    let reports = saved_reports(directory, closed as usize, false)?;
+    // These are bounded claims only. Source cold restore must still rebuild and
+    // compare every report; an unresolved/terminal prefix remains a finite stop.
+    check_intents(directory, &state.manifest, &reports, batches)?;
+    if !state.tip.sequence.is_multiple_of(2)
+        && !directory
+            .join(intent_name(closed as usize))
+            .try_exists()
+            .map_err(|e| e.to_string())?
+    {
+        return Err("Child Pending lacks its original pre-call intent".into());
+    }
+    Ok(())
+}
 fn check_intents(
     directory: &Path,
     manifest: &ContentPin,
@@ -1582,8 +1615,8 @@ fn check_intents(
     batches: usize,
 ) -> Result<bool, String> {
     let mut unfinished = false;
-    // This bounded metadata check runs once per invocation. Source cold restore
-    // has already validated the archive; live updates never replay old records.
+    // Before a cold load this validates only saved metadata. After source restore
+    // it uses the actual rebuilt ledger; live updates never replay old records.
     for batch in 0..batches {
         let path = directory.join(intent_name(batch));
         match fs::symlink_metadata(&path) {
@@ -1982,6 +2015,82 @@ mod tests {
         assert!(check_segment_reports(std::slice::from_ref(&continued), &spec, 240, 0).is_err());
         continued.next_episode_ordinal = None;
         assert!(check_segment_reports(&[continued], &spec, 240, 60).is_err());
+
+        // Caller metadata only, deliberately without a valid native archive or owner.
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Directory(std::env::temp_dir().join(format!(
+            "tzolkin-own-setup-child-intents-{}-{nonce}",
+            std::process::id()
+        )));
+        fs::create_dir(&directory.0).unwrap();
+        fs::create_dir(directory.0.join(ARCHIVE)).unwrap();
+        let head_bytes = b"metadata before-head only";
+        fs::write(
+            directory.0.join(ARCHIVE).join("head-00000000.json"),
+            head_bytes,
+        )
+        .unwrap();
+        let mut state = OwnSetupRunState {
+            schema: CONTINUE_STATE_SCHEMA.into(),
+            manifest: ContentPin::of(b"original child manifest"),
+            root: ContentPin::of(b"metadata root only"),
+            tip: OwnSetupArchiveTip {
+                sequence: 0,
+                name: "head-00000000.json".into(),
+                bytes: head_bytes.len(),
+                sha256: digest(head_bytes),
+            },
+        };
+        check_saved_child_intents(&directory.0, &state, 2).unwrap();
+        let mut intent = BatchIntent {
+            schema: "tzolkin-own-setup-run-batch-intent-v1".into(),
+            manifest: state.manifest.clone(),
+            batch: 0,
+            before: state.tip.clone(),
+        };
+        let intent_path = directory.0.join(intent_name(0));
+        fs::write(&intent_path, b"{}").unwrap();
+        assert!(check_saved_child_intents(&directory.0, &state, 2).is_err());
+        intent.manifest = ContentPin::of(b"another manifest");
+        fs::write(&intent_path, json(&intent, MAX_STATE_BYTES).unwrap()).unwrap();
+        assert!(check_saved_child_intents(&directory.0, &state, 2).is_err());
+        intent.manifest = state.manifest.clone();
+        fs::write(&intent_path, json(&intent, MAX_STATE_BYTES).unwrap()).unwrap();
+        check_saved_child_intents(&directory.0, &state, 2).unwrap();
+        state.tip.sequence = 1;
+        check_saved_child_intents(&directory.0, &state, 2).unwrap();
+        fs::remove_file(&intent_path).unwrap();
+        assert!(check_saved_child_intents(&directory.0, &state, 2).is_err());
+        fs::write(&intent_path, json(&intent, MAX_STATE_BYTES).unwrap()).unwrap();
+        state.tip.sequence = 2;
+        for (abandoned, report) in [
+            (false, &updated[0]),
+            (false, &no_change[0]),
+            (true, &rejected[0]),
+        ] {
+            let head = serde_json::json!({
+                "schema": "tzolkin-own-setup-durable-head-v1", "sequence": 2,
+                "event": {"kind": "closed", "abandoned": abandoned, "report": report}
+            });
+            fs::write(
+                directory.0.join(ARCHIVE).join("head-00000002.json"),
+                serde_json::to_vec(&head).unwrap(),
+            )
+            .unwrap();
+            check_saved_child_intents(&directory.0, &state, 2).unwrap();
+            if abandoned {
+                assert!(saved_reports(&directory.0, 1, true).is_err());
+            }
+        }
     }
 
     #[test]
