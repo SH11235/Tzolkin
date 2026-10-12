@@ -452,7 +452,13 @@ fn source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
             policy_version,
             weights,
         } => {
-            if policy_version != crate::POLICY_VERSION {
+            // Recorded labels before the overdue-food reserve correction retain
+            // their original identity. Replay verifies saved actions, without
+            // executing either version of the heuristic.
+            const HISTORICAL_SELF_PLAY_POLICY_VERSION: &str = "heuristic-v1";
+            if policy_version != crate::POLICY_VERSION
+                && policy_version != HISTORICAL_SELF_PLAY_POLICY_VERSION
+            {
                 return Err("Unsupported native heuristic source version".into());
             }
             weights.validate()?;
@@ -1407,6 +1413,94 @@ mod tests {
     }
     fn directory() -> PathBuf {
         test_temp_root::create("tzolkin-policy-publication").unwrap()
+    }
+    fn incomplete_source_error(provenance: ReplaySource) -> String {
+        let parent = directory();
+        let path = parent.join("source.json");
+        let record = GameReplay {
+            header: ReplayHeader {
+                replay_schema: replay::REPLAY_SCHEMA,
+                rules_version: replay::RULES_VERSION,
+                rules_baseline: replay::RULES_BASELINE.into(),
+                catalog_hash: replay::catalog_hash(),
+                move_schema: MOVE_SCHEMA,
+                observation_schema: OBSERVATION_SCHEMA,
+                source: provenance,
+                names: vec!["A".into(), "B".into(), "C".into()],
+                seed: 42,
+                options: GameOptions::default(),
+            },
+            steps: Vec::new(),
+            final_scores: Vec::new(),
+            final_state: String::new(),
+            verified_complete: false,
+        };
+        let raw = serde_json::to_vec(&record).unwrap();
+        fs::write(&path, &raw).unwrap();
+        let error = source(&path).unwrap_err();
+        assert_eq!(fs::read(&path).unwrap(), raw);
+        fs::remove_dir_all(parent).unwrap();
+        error
+    }
+    #[test]
+    fn historical_self_play_versions_still_require_complete_replay() {
+        for policy_version in ["heuristic-v1", crate::POLICY_VERSION] {
+            assert_eq!(
+                incomplete_source_error(ReplaySource::SelfPlay {
+                    policy_version: policy_version.into(),
+                    weights: crate::policy::HeuristicWeights::default(),
+                }),
+                "Partial logs cannot be verified as complete games",
+            );
+        }
+    }
+    #[test]
+    fn historical_self_play_versions_reject_unknown_and_spoofed_provenance() {
+        for policy_version in ["heuristic-v3", "unknown", "heuristic-v1 "] {
+            assert_eq!(
+                incomplete_source_error(ReplaySource::SelfPlay {
+                    policy_version: policy_version.into(),
+                    weights: crate::policy::HeuristicWeights::default(),
+                }),
+                "Unsupported native heuristic source version",
+            );
+        }
+    }
+    #[test]
+    fn historical_self_play_versions_still_validate_weights() {
+        let weights = crate::policy::HeuristicWeights {
+            corn_base: 1001.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            incomplete_source_error(ReplaySource::SelfPlay {
+                policy_version: "heuristic-v1".into(),
+                weights,
+            }),
+            "Heuristic coefficients must be finite and within -1000..1000",
+        );
+    }
+    #[test]
+    fn historical_self_play_versions_do_not_extend_other_source_routes() {
+        let policy = replay::SeatPolicy::Heuristic {
+            policy_version: "heuristic-v1".into(),
+            weights: crate::policy::HeuristicWeights::default(),
+        };
+        assert!(policy.validate().is_err());
+        assert_eq!(
+            incomplete_source_error(ReplaySource::PolicySelfPlay {
+                policies: vec![policy; 3],
+            }),
+            "Unsupported selfplay seat-policy provenance",
+        );
+        assert_eq!(
+            incomplete_source_error(ReplaySource::Human {
+                provider: "synthetic".into(),
+                reference: "example".into(),
+                skill_rating: None,
+            }),
+            "Human/public source admission is not implemented",
+        );
     }
     #[test]
     fn source_changed_on_second_pass_leaves_no_completion_marker() {
