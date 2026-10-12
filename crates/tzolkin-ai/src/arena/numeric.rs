@@ -1,6 +1,9 @@
-//! Inference-only paired development evaluation of preloaded numeric policies.
+//! Inference-only paired evaluation, also reused by explicit conditional origins.
 //! Numeric identities and external exclusions do not authenticate a producer,
 //! recreate an owner, or grant training, fresh Test, or strength authority.
+use super::conditional::{
+    ConditionalDiagnostics, ConditionalIdentity, ConditionalPolicy, GameSession,
+};
 use super::{
     ArmResult, BorrowedArenaPolicy, BorrowedArenaWorkBounds, InitialConditions, PairedStatistics,
     PolicyChooser, PolicyHandle, SeatPair, SeedBlock, block, family_id, seed_partition, summarize,
@@ -165,9 +168,13 @@ pub enum PolicyIdentity {
     ResourceCycle {
         configuration: super::resource_cycle::ResourceCycleConfig,
     },
+    ConditionalHumanHybrid {
+        identity: Box<ConditionalIdentity>,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
+    Conditional(Box<ConditionalPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
@@ -193,12 +200,22 @@ impl<'a> Role<'a> {
             Self::Numeric(policy) => PolicyIdentity::GuardedNumeric {
                 identity: policy.identity.clone(),
             },
+            Self::Conditional(policy) => PolicyIdentity::ConditionalHumanHybrid {
+                identity: Box::new(policy.identity().clone()),
+            },
             Self::Reactive(policy) => PolicyIdentity::Reactive {
                 provenance: policy.description.provenance.clone(),
             },
             Self::ResourceCycle(configuration) => PolicyIdentity::ResourceCycle {
                 configuration: configuration.clone(),
             },
+        }
+    }
+    fn guard_key(&self) -> Option<&str> {
+        match self {
+            Self::Numeric(policy) => Some(&policy.identity.configuration_key),
+            Self::Conditional(policy) => Some(&policy.identity().configuration_key),
+            _ => None,
         }
     }
     fn search(&self) -> Option<&PreparedSearch> {
@@ -227,6 +244,8 @@ pub struct GuardDiagnostics {
     pub repeat_exits: usize,
     pub budget_exits: usize,
     pub applied_choices: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditional: Option<ConditionalDiagnostics>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -301,6 +320,7 @@ fn choose(
     observation: &Observation,
     roster: &[&mut Role<'_>],
     guards: &mut [Option<GuardedDeployment>],
+    conditional_sessions: &mut [Option<GameSession>],
     diagnostics: &mut [Option<GuardDiagnostics>],
     search: &mut [Option<SearchSummary>],
 ) -> Result<Decision, String> {
@@ -309,6 +329,14 @@ fn choose(
             let d = diagnostics[i].as_mut().expect("numeric diagnostic");
             d.notifications_attempted += 1;
             guard.on_callback(index, observation)?;
+            d.notifications_returned += 1;
+        }
+    }
+    for (i, session) in conditional_sessions.iter_mut().enumerate() {
+        if let Some(session) = session {
+            let d = diagnostics[i].as_mut().expect("conditional diagnostic");
+            d.notifications_attempted += 1;
+            session.on_callback(index, observation)?;
             d.notifications_returned += 1;
         }
     }
@@ -336,6 +364,49 @@ fn choose(
             policy_version: decision.policy_version,
             score: decision.score,
         }
+    } else if let Some(session) = conditional_sessions.get_mut(actor).and_then(Option::as_mut) {
+        let Role::Conditional(policy) = &**roster
+            .get(actor)
+            .ok_or("Conditional Arena actor outside roster")?
+        else {
+            return Err("Conditional Arena game session/role mismatch".into());
+        };
+        let d = diagnostics[actor].as_mut().expect("conditional diagnostic");
+        d.choices_attempted += 1;
+        d.candidate_rows_attempted += observation.legal_actions.len();
+        let result = session.choose_move(index, observation, policy)?;
+        d.choices_returned += 1;
+        d.candidate_rows_returned += observation.legal_actions.len();
+        if let Some(trade) = result.trade {
+            d.forced_exits += usize::from(trade.overridden);
+            d.repeat_exits += usize::from(trade.overridden && trade.repeat_seen);
+            d.budget_exits += usize::from(trade.overridden && trade.budget_reached);
+        }
+        let conditional = d
+            .conditional
+            .as_mut()
+            .expect("conditional choice diagnostic");
+        if observation.phase == Phase::Setup {
+            conditional.setup_choices += 1;
+        } else {
+            conditional.playing_choices += 1;
+            let action = observation
+                .legal_actions
+                .iter()
+                .find(|a| a.r#move == result.decision.r#move)
+                .expect("conditional session returned a legal row");
+            let kind = serde_json::to_value(&action.action).map_err(|e| e.to_string())?;
+            let kind = kind["type"]
+                .as_str()
+                .ok_or("Conditional action kind missing")?;
+            *conditional
+                .selected_action_kinds
+                .entry(kind.into())
+                .or_default() += 1;
+            conditional.outside_teacher_grammar_choices +=
+                usize::from(!matches!(kind, "place" | "remove" | "firstPlayer"));
+        }
+        result.decision
     } else {
         let role = &**roster
             .get(actor)
@@ -347,6 +418,7 @@ fn choose(
                 None,
             ),
             Role::Numeric(_) => return Err("Numeric Arena missing game guard".into()),
+            Role::Conditional(_) => return Err("Conditional Arena missing game session".into()),
         };
         match (roster[actor].search(), trace) {
             (Some(prepared), Some(trace)) => {
@@ -431,9 +503,23 @@ fn play_arm_using<'a>(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let mut diagnostics = guards
+    let mut conditional_sessions = roster
         .iter()
-        .map(|g| g.as_ref().map(|_| GuardDiagnostics::default()))
+        .map(|role| match &**role {
+            Role::Conditional(policy) => Some(GameSession::new(policy)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostics = roster
+        .iter()
+        .map(|role| match &**role {
+            Role::Numeric(_) => Some(GuardDiagnostics::default()),
+            Role::Conditional(_) => Some(GuardDiagnostics {
+                conditional: Some(ConditionalDiagnostics::default()),
+                ..GuardDiagnostics::default()
+            }),
+            _ => None,
+        })
         .collect::<Vec<_>>();
     let mut search = roster
         .iter()
@@ -449,6 +535,7 @@ fn play_arm_using<'a>(
             observation,
             &roster,
             &mut guards,
+            &mut conditional_sessions,
             &mut diagnostics,
             &mut search,
         )
@@ -464,6 +551,9 @@ fn play_arm_using<'a>(
             policy.loaded = Some(guard.into_policy());
         }
     }
+    // Conditional policies borrow immutable parameters. Their sessions have no
+    // weight ownership to return, and every arm drops all callback/Trade state.
+    drop(conditional_sessions);
     let mut result = ArmResult {
         search,
         trade_guard: None,
@@ -513,27 +603,52 @@ pub fn run_validation(
     reference: NumericPolicy,
     opponent_pool: Vec<Opponent<'_>>,
 ) -> Result<NumericArenaReport, String> {
+    run_roles(
+        config,
+        Role::Numeric(candidate),
+        Role::Numeric(reference),
+        opponent_pool,
+        SCHEMA,
+    )
+}
+
+/// Conditional Human Playing with explicit Corn-first Setup, paired against a
+/// preloaded numeric reference. This grants no native or training qualification.
+pub fn run_conditional_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: ConditionalPolicy<'a>,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    run_roles(
+        config,
+        Role::Conditional(Box::new(candidate)),
+        Role::Numeric(reference),
+        opponent_pool,
+        super::conditional::ARENA_SCHEMA,
+    )
+}
+
+fn run_roles<'a>(
+    config: &NumericArenaConfig,
+    mut candidate: Role<'a>,
+    mut reference: Role<'a>,
+    opponent_pool: Vec<Opponent<'a>>,
+    schema: &str,
+) -> Result<NumericArenaReport, String> {
     config.validate()?;
     if opponent_pool.len() != config.players {
         return Err("Numeric Arena absolute-seat pool count mismatch".into());
     }
-    let mut candidate = Role::Numeric(candidate);
-    let mut reference = Role::Numeric(reference);
     let mut pool = opponent_pool
         .into_iter()
         .map(Role::from_opponent)
         .collect::<Result<Vec<_>, _>>()?;
-    let Role::Numeric(candidate_policy) = &candidate else {
-        unreachable!()
-    };
-    let Role::Numeric(reference_policy) = &reference else {
-        unreachable!()
-    };
-    let guard_key = &candidate_policy.identity.configuration_key;
-    if guard_key != &reference_policy.identity.configuration_key
-        || pool.iter().any(
-            |role| matches!(role, Role::Numeric(p) if &p.identity.configuration_key != guard_key),
-        )
+    let guard_key = candidate.guard_key().expect("guarded focal role");
+    if Some(guard_key) != reference.guard_key()
+        || pool
+            .iter()
+            .any(|role| role.guard_key().is_some_and(|key| key != guard_key))
     {
         return Err("Numeric Arena requires one fixed shared guard configuration".into());
     }
@@ -583,7 +698,7 @@ pub fn run_validation(
         });
     }
     Ok(NumericArenaReport {
-        schema: SCHEMA.into(),
+        schema: schema.into(),
         config: config.clone(),
         options: GameOptions::default(),
         configuration_sha256,
@@ -669,6 +784,30 @@ mod tests {
         let mut unknown = serde_json::to_value(&config).unwrap();
         unknown["allowTest"] = true.into();
         assert!(serde_json::from_value::<NumericArenaConfig>(unknown).is_err());
+        assert!(
+            serde_json::to_value(GuardDiagnostics::default())
+                .unwrap()
+                .get("conditional")
+                .is_none()
+        );
+        let mut other_guard = synthetic_policy();
+        other_guard.identity.guard.max_trades_per_episode = 1;
+        other_guard.identity.configuration_key =
+            other_guard.identity.guard.configuration_key().unwrap();
+        let refusal = run_validation(
+            &config,
+            synthetic_policy(),
+            other_guard,
+            (0..3)
+                .map(|_| Opponent::GuardedNumeric(Box::new(synthetic_policy())))
+                .collect(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            refusal,
+            "Numeric Arena requires one fixed shared guard configuration"
+        );
 
         let mut focal = Role::Numeric(synthetic_policy());
         let mut pool = (0..3)
