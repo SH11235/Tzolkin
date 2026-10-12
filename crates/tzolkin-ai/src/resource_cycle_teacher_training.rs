@@ -218,6 +218,11 @@ pub(crate) fn audit_dataset(
 ) -> Result<TeacherDatasetIdentity, String> {
     audit_route(TeacherRoute::Public(dataset))
 }
+pub(crate) fn audit_semantic_setup_dataset(
+    dataset: &ValidatedSemanticSetupTeacherDataset,
+) -> Result<TeacherDatasetIdentity, String> {
+    audit_route(TeacherRoute::SemanticSetup(dataset))
+}
 fn audit_route(route: TeacherRoute<'_>) -> Result<TeacherDatasetIdentity, String> {
     let identity = TeacherDatasetIdentity::from_route(route)?;
     let mut counts = [0usize; 2];

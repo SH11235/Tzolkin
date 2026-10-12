@@ -6,7 +6,11 @@ use super::conditional::{
     ConditionalIdentity, ConditionalMixedArenaIdentity, ConditionalMixedArenaPolicy,
     ConditionalPolicy, GameSession,
 };
-use super::teacher::{ResourceCycleTeacherArenaIdentity, ResourceCycleTeacherArenaPolicy};
+use super::teacher::{
+    ResourceCycleTeacherArenaIdentity, ResourceCycleTeacherArenaPolicy,
+    SemanticSetupResourceCycleTeacherArenaPolicy, SemanticSetupTeacherArenaIdentity,
+    SemanticSetupTeacherReference,
+};
 use super::{
     ArmResult, BorrowedArenaPolicy, BorrowedArenaWorkBounds, InitialConditions, PairedStatistics,
     PolicyChooser, PolicyHandle, SeatPair, SeedBlock, block, family_id, seed_partition, summarize,
@@ -185,6 +189,9 @@ pub enum PolicyIdentity {
     ResourceCycleV5LearnedTeacher {
         identity: Box<ResourceCycleTeacherArenaIdentity>,
     },
+    ResourceCycleV5SemanticSetupLearnedTeacher {
+        identity: Box<SemanticSetupTeacherArenaIdentity>,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
@@ -192,10 +199,19 @@ enum Role<'a> {
     ConditionalMixed(Box<ConditionalMixedArenaPolicy<'a>>),
     ConditionalCountZero(Box<ConditionalCountZeroArenaPolicy<'a>>),
     Teacher(Box<ResourceCycleTeacherArenaPolicy<'a>>),
+    SemanticSetupTeacher(Box<SemanticSetupResourceCycleTeacherArenaPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
 impl<'a> Role<'a> {
+    fn from_semantic_setup_reference(reference: SemanticSetupTeacherReference<'a>) -> Self {
+        match reference {
+            SemanticSetupTeacherReference::GuardedNumeric(policy) => Self::Numeric(*policy),
+            SemanticSetupTeacherReference::ConditionalHumanCountZeroAllPhase(policy) => {
+                Self::ConditionalCountZero(policy)
+            }
+        }
+    }
     fn from_opponent(opponent: Opponent<'a>) -> Result<Self, String> {
         let reactive = match opponent {
             Opponent::GuardedNumeric(policy) => return Ok(Self::Numeric(*policy)),
@@ -231,6 +247,11 @@ impl<'a> Role<'a> {
             Self::Teacher(policy) => PolicyIdentity::ResourceCycleV5LearnedTeacher {
                 identity: Box::new(policy.identity().clone()),
             },
+            Self::SemanticSetupTeacher(policy) => {
+                PolicyIdentity::ResourceCycleV5SemanticSetupLearnedTeacher {
+                    identity: Box::new(policy.identity().clone()),
+                }
+            }
             Self::Reactive(policy) => PolicyIdentity::Reactive {
                 provenance: policy.description.provenance.clone(),
             },
@@ -246,6 +267,9 @@ impl<'a> Role<'a> {
             Self::ConditionalMixed(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalCountZero(policy) => Some(&policy.identity().configuration_key),
             Self::Teacher(policy) => Some(&policy.identity().configuration_key),
+            Self::SemanticSetupTeacher(policy) => {
+                Some(&policy.identity().teacher.configuration_key)
+            }
             _ => None,
         }
     }
@@ -409,6 +433,9 @@ fn choose(
                 session.choose_count_zero(index, observation, policy)?
             }
             Role::Teacher(policy) => session.choose_teacher(index, observation, policy)?,
+            Role::SemanticSetupTeacher(policy) => {
+                session.choose_semantic_setup_teacher(index, observation, policy)?
+            }
             _ => return Err("Conditional Arena game session/role mismatch".into()),
         };
         d.choices_returned += 1;
@@ -469,6 +496,9 @@ fn choose(
                 return Err("Conditional Arena missing game session".into());
             }
             Role::Teacher(_) => return Err("Teacher Arena missing game session".into()),
+            Role::SemanticSetupTeacher(_) => {
+                return Err("Semantic Setup teacher Arena missing game session".into());
+            }
         };
         match (roster[actor].search(), trace) {
             (Some(prepared), Some(trace)) => {
@@ -560,13 +590,18 @@ fn play_arm_using<'a>(
             Role::ConditionalMixed(policy) => Some(GameSession::new_mixed(policy)),
             Role::ConditionalCountZero(policy) => Some(GameSession::new_count_zero(policy)),
             Role::Teacher(policy) => Some(GameSession::new_teacher(policy)),
+            Role::SemanticSetupTeacher(policy) => {
+                Some(GameSession::new_semantic_setup_teacher(policy))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
     let mut diagnostics = roster
         .iter()
         .map(|role| match &**role {
-            Role::Numeric(_) | Role::Teacher(_) => Some(GuardDiagnostics::default()),
+            Role::Numeric(_) | Role::Teacher(_) | Role::SemanticSetupTeacher(_) => {
+                Some(GuardDiagnostics::default())
+            }
             Role::Conditional(_) | Role::ConditionalMixed(_) | Role::ConditionalCountZero(_) => {
                 Some(GuardDiagnostics {
                     conditional: Some(ConditionalDiagnostics::default()),
@@ -709,6 +744,29 @@ pub fn run_resource_cycle_teacher_validation<'a>(
     );
     // Also audit after an attempted run returning an error. No report may be
     // published with a changed retained manifest, copied replay or shard.
+    prepared.recheck_sources()?;
+    result
+}
+
+/// Schema-3 teacher candidate through the existing paired all-seat engine.
+/// The reference retains its own validated profile and guard. This is known
+/// Development Validation, without training, native or fresh Test authority.
+pub fn run_semantic_setup_resource_cycle_teacher_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: SemanticSetupResourceCycleTeacherArenaPolicy<'a>,
+    reference: SemanticSetupTeacherReference<'a>,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    candidate.validate_arena_config(config)?;
+    let prepared = candidate.prepared;
+    let reference = Role::from_semantic_setup_reference(reference);
+    let result = run_roles(
+        config,
+        Role::SemanticSetupTeacher(Box::new(candidate)),
+        reference,
+        opponent_pool,
+        super::teacher::SEMANTIC_SETUP_ARENA_SCHEMA,
+    );
     prepared.recheck_sources()?;
     result
 }
@@ -910,6 +968,14 @@ mod tests {
 
     #[test]
     fn numeric_validation_preflight_and_failed_arm_discard_only_game_history() {
+        let numeric_reference = Role::from_semantic_setup_reference(
+            SemanticSetupTeacherReference::GuardedNumeric(Box::new(synthetic_policy())),
+        );
+        assert_eq!(
+            serde_json::to_value(numeric_reference.identity()).unwrap(),
+            serde_json::to_value(Role::Numeric(synthetic_policy()).identity()).unwrap()
+        );
+        assert!(matches!(numeric_reference, Role::Numeric(_)));
         let config = NumericArenaConfig {
             schema: SCHEMA.into(),
             players: 3,
@@ -1143,6 +1209,18 @@ mod tests {
             ConditionalCountZeroArenaPolicy::fixture(&zero, TradeGuardConfig::default()).unwrap(),
         ));
         let zero_identity = serde_json::to_value(zero_focal.identity()).unwrap();
+        let zero_reference = Role::from_semantic_setup_reference(
+            SemanticSetupTeacherReference::ConditionalHumanCountZeroAllPhase(Box::new(
+                ConditionalCountZeroArenaPolicy::fixture(&zero, TradeGuardConfig::default())
+                    .unwrap(),
+            )),
+        );
+        assert!(matches!(zero_reference, Role::ConditionalCountZero(_)));
+        assert_eq!(
+            serde_json::to_value(zero_reference.identity()).unwrap(),
+            zero_identity
+        );
+        assert_eq!(zero_reference.guard_key(), zero_focal.guard_key());
         assert_eq!(zero_identity["kind"], "conditionalHumanCountZeroAllPhase");
         assert_eq!(zero_identity["identity"]["countZero"], zero_before);
         assert_eq!(

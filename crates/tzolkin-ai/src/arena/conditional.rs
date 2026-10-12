@@ -393,6 +393,15 @@ impl GameSession {
         )
         .expect("teacher constructor validated guard configuration")
     }
+    pub(super) fn new_semantic_setup_teacher(
+        policy: &super::teacher::SemanticSetupResourceCycleTeacherArenaPolicy<'_>,
+    ) -> Self {
+        Self::with_route(
+            SetupRoute::NumericAllPhase(super::teacher::SEMANTIC_SETUP_POLICY_VERSION),
+            &policy.identity().teacher.guard,
+        )
+        .expect("semantic Setup teacher constructor validated guard configuration")
+    }
     fn with_config(setup: ConditionalSetup, guard: &TradeGuardConfig) -> Result<Self, String> {
         let route = match setup {
             ConditionalSetup::CornFirst => SetupRoute::CornFirst,
@@ -475,6 +484,14 @@ impl GameSession {
         index: usize,
         o: &Observation,
         policy: &super::teacher::ResourceCycleTeacherArenaPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.prepared.distribution(o))
+    }
+    pub(super) fn choose_semantic_setup_teacher(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &super::teacher::SemanticSetupResourceCycleTeacherArenaPolicy<'_>,
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.prepared.distribution(o))
     }
@@ -766,6 +783,89 @@ mod tests {
         assert!(GameSession::with_config(ConditionalSetup::CornFirst, &invalid).is_err());
         let state = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
         let o = observe(&state, state.current_player).unwrap();
+        // Exercise the actual candidate encoder and numeric borrow without
+        // constructing an audited checkpoint/source or granting an Arena role.
+        use tzolkin_inference::policy::{
+            BorrowedPolicy, BorrowedSemanticSetupPolicy, PARAMETER_COUNT,
+        };
+        let mut parameters = vec![0.0; PARAMETER_COUNT];
+        parameters[480] = 1.0;
+        parameters[512 * 32 + 32] = 1.0;
+        let model = serde_json::from_value::<
+            crate::resource_cycle_teacher_training::SemanticSetupTeacherModel,
+        >(serde_json::json!({"semanticSetupParameters": parameters}))
+        .unwrap();
+        model.validate().unwrap();
+        assert!(
+            serde_json::from_value::<
+                crate::resource_cycle_teacher_training::SemanticSetupTeacherModel,
+            >(serde_json::json!({"parameters": model.parameters()}))
+            .is_err()
+        );
+        let scalar = crate::kernel::Kernel::Scalar.resolve().unwrap();
+        let encoded = |encoder: crate::features::FeatureEncoder<'_>| {
+            (0..o.legal_actions.len())
+                .map(|i| encoder.encode_legal_tagged(i).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let semantic_rows =
+            encoded(crate::features::FeatureEncoder::new_semantic_setup(&o).unwrap());
+        let public_rows = encoded(crate::features::FeatureEncoder::new_public(&o).unwrap());
+        let semantic =
+            BorrowedSemanticSetupPolicy::from_validated_parameters(model.parameters()).unwrap();
+        let public = BorrowedPolicy::from_validated_parameters(model.parameters()).unwrap();
+        assert!(semantic.predict(scalar, &public_rows).is_err());
+        assert!(public.predict(scalar, &semantic_rows).is_err());
+        let prediction =
+            super::super::teacher::semantic_setup_distribution(&model, scalar, &o).unwrap();
+        let expected = semantic.predict(scalar, &semantic_rows).unwrap();
+        assert_eq!(prediction.logits, expected.logits);
+        assert_eq!(prediction.probabilities, expected.probabilities);
+        assert_ne!(
+            prediction.logits,
+            public.predict(scalar, &public_rows).unwrap().logits
+        );
+        let mut semantic_game = GameSession::with_route(
+            SetupRoute::NumericAllPhase(super::super::teacher::SEMANTIC_SETUP_POLICY_VERSION),
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        semantic_game.on_callback(0, &o).unwrap();
+        let decision = semantic_game
+            .choose_using(0, &o, |o| {
+                super::super::teacher::semantic_setup_distribution(&model, scalar, o)
+            })
+            .unwrap()
+            .decision;
+        let first_max = (1..prediction.logits.len()).fold(0, |best, i| {
+            if prediction.logits[i] > prediction.logits[best] {
+                i
+            } else {
+                best
+            }
+        });
+        assert_eq!(decision.r#move, o.legal_actions[first_max].r#move);
+        assert_eq!(decision.score, f64::from(prediction.logits[first_max]));
+        assert_eq!(
+            decision.policy_version,
+            super::super::teacher::SEMANTIC_SETUP_POLICY_VERSION
+        );
+        assert_eq!(
+            serde_json::to_value(
+                super::super::teacher::SemanticSetupTeacherInputProfile::SemanticSetupAllPhase
+            )
+            .unwrap(),
+            "semanticSetupAllPhase"
+        );
+        let mut too_many = o.clone();
+        too_many.legal_actions =
+            vec![o.legal_actions[0].clone(); super::super::numeric::MAX_ROWS_PER_CALLBACK + 1];
+        assert_eq!(
+            super::super::teacher::semantic_setup_distribution(&model, scalar, &too_many)
+                .err()
+                .unwrap(),
+            "Semantic Setup teacher candidate-row cap exceeded before prediction"
+        );
         let mut game = session();
         game.on_callback(0, &o).unwrap();
         let selected = game
@@ -790,6 +890,7 @@ mod tests {
             MIXED_POLICY_VERSION,
             COUNT_ZERO_POLICY_VERSION,
             super::super::teacher::POLICY_VERSION,
+            super::super::teacher::SEMANTIC_SETUP_POLICY_VERSION,
         ] {
             let mut numeric = GameSession::with_route(
                 SetupRoute::NumericAllPhase(version),
@@ -875,6 +976,7 @@ mod tests {
             SetupRoute::NumericAllPhase(MIXED_POLICY_VERSION),
             SetupRoute::NumericAllPhase(COUNT_ZERO_POLICY_VERSION),
             SetupRoute::NumericAllPhase(super::super::teacher::POLICY_VERSION),
+            SetupRoute::NumericAllPhase(super::super::teacher::SEMANTIC_SETUP_POLICY_VERSION),
         ] {
             state.current_player = o.actor;
             let mut game = GameSession::with_route(route, &TradeGuardConfig::default()).unwrap();
