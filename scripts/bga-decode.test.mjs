@@ -1619,6 +1619,243 @@ test('binds selected capped Architecture captions to paid choices and refuses st
   assert.equal(prefix.record.steps.length, 2);
 });
 
+test('binds a final paid capped Theology choice to its own skull caption and atomic state delta', () => {
+  const fixture = (material = 'wood', explicitFalse = false, alter = () => {}) => {
+    const initial = clone(saved.core.initialFrame);
+    const own = initial.snapshot.state.players[0];
+    own.resources = { corn: 8, wood: 0, stone: 0, gold: 0, skull: 0 };
+    own.resources[material] = 4;
+    own.technologies.theology = 2;
+    own.score = 7;
+    initial.snapshot.state.skullSupply = 2;
+    const task = (remaining) => ({
+      type: 'technology',
+      remaining,
+      free: false,
+      ...(explicitFalse ? { mandatory: false } : {}),
+    });
+    const technology = {
+      action: { type: 'technology', technology: 'theology' },
+      move: { type: 'choose', choiceId: 'tech:theology' },
+    };
+    initial.observation.pendingTask = task(2);
+    initial.snapshot.state.pending = { title: 'Technology', task: task(2), after: [] };
+    initial.observation.legalActions = [technology];
+    const value = input();
+    value.witness.initial = clone(initial.snapshot.state);
+    const payment = (amount) => ({
+      raw_text: `Aは${amount}\nを支払った`,
+      icons: [{ classes: `tz_icon resource_${material}` }],
+    });
+    const advance = { raw_text: 'Aは神学を1レベル進めた' };
+    const bonus = { raw_text: '神学技術ボーナス: Aは追加で水晶ドクロ1個を得た' };
+    replaceEvents(value, [
+      [6, [payment(3), advance]],
+      [7, [payment(1), advance, bonus]],
+    ]);
+    const frames = [];
+    const apply = (request) => {
+      const next = clone(initial);
+      next.snapshot.state = clone(request.state);
+      const state = next.snapshot.state;
+      const player = state.players[0];
+      const capped = player.technologies.theology === 3;
+      if (request.move.choiceId === 'tech:theology') {
+        const amount = capped ? 1 : player.technologies.theology + 1;
+        state.pending = {
+          title: 'Pay Theology',
+          task: {
+            type: 'payTechnology',
+            technology: 'theology',
+            amount,
+            ...(explicitFalse ? { optional: false } : {}),
+          },
+          after: [task(request.state.pending.task.remaining - 1)],
+        };
+        next.observation.legalActions = [
+          {
+            action: {
+              type: 'payment',
+              resources: ['corn', 'wood', 'stone', 'gold', 'skull'].map((r) =>
+                r === material ? amount : 0,
+              ),
+            },
+            move: { type: 'choose', choiceId: `pay:${material}` },
+          },
+        ];
+        alter(next, capped ? 'capSelection' : 'firstSelection');
+      } else {
+        assert.equal(request.move.choiceId, `pay:${material}`);
+        player.resources[material] -= request.state.pending.task.amount;
+        if (capped) {
+          player.resources.skull++;
+          state.skullSupply--;
+        } else player.technologies.theology++;
+        const remaining = request.state.pending.after[0].remaining;
+        state.pending = remaining
+          ? { title: 'Technology', task: task(remaining), after: [] }
+          : null;
+        next.observation.legalActions = remaining ? [technology] : [];
+        alter(next, capped ? 'capPayment' : 'firstPayment');
+      }
+      next.observation.pendingTask = clone(state.pending?.task ?? null);
+      frames.push(clone(next));
+      return next;
+    };
+    return { value, initial, apply, bonus, frames };
+  };
+  for (const [material, explicitFalse] of [
+    ['wood', false],
+    ['stone', false],
+    ['gold', false],
+    ['wood', true],
+  ]) {
+    const f = fixture(material, explicitFalse);
+    const result = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(result.manifest.blocked, null);
+    assert.deepEqual(
+      result.record.steps.map((step) => step.sourceActionIds),
+      [[6], [6], [7], [7]],
+    );
+    const final = f.frames.at(-1).snapshot.state;
+    assert.equal(final.players[0].resources[material], 0);
+    assert.equal(final.players[0].resources.skull, 1);
+    assert.equal(final.players[0].technologies.theology, 3);
+    assert.equal(final.skullSupply, 1);
+    assert.equal(final.pending, null);
+    assert.equal(result.manifest.trainingReady, false);
+  }
+  for (const [name, change, alter, reason] of [
+    [
+      'missing bonus at EOF',
+      (f) => f.value.raw.dom_entries.at(-1).messages.pop(),
+      undefined,
+      /same-source skull caption/,
+    ],
+    [
+      'foreign bonus actor',
+      (f) => {
+        f.value.raw.dom_entries.at(-1).messages[2].raw_text = f.bonus.raw_text.replace(
+          'Aは',
+          'Bは',
+        );
+      },
+      undefined,
+      /unconsumed selected paid advance/,
+    ],
+    [
+      'duplicate bonus',
+      (f) => f.value.raw.dom_entries.at(-1).messages.push(clone(f.bonus)),
+      undefined,
+      /source-bound paid final/,
+    ],
+    [
+      'extra payment',
+      (f) => {
+        f.value.raw.dom_entries.at(-1).messages[0].raw_text = 'Aは2\nを支払った';
+      },
+      undefined,
+      /source-bound paid final/,
+    ],
+    [
+      'corn payment',
+      (f) => {
+        f.value.raw.dom_entries.at(-1).messages[0].icons[0].classes = 'tz_icon resource_corn';
+      },
+      undefined,
+      /source-bound paid final/,
+    ],
+    [
+      'skull payment',
+      (f) => {
+        f.value.raw.dom_entries.at(-1).messages[0].icons[0].classes = 'tz_icon resource_skull';
+      },
+      undefined,
+      /source-bound paid final/,
+    ],
+    [
+      'empty supply',
+      undefined,
+      (f, stage) => {
+        if (stage === 'firstPayment') f.snapshot.state.skullSupply = 0;
+      },
+      /source-bound paid final/,
+    ],
+    [
+      'nonfinal technology choice',
+      undefined,
+      (f, stage) => {
+        if (stage === 'firstPayment') f.snapshot.state.pending.task.remaining = 2;
+      },
+      /source-bound paid final/,
+    ],
+    [
+      'changed payment continuation',
+      undefined,
+      (f, stage) => {
+        if (stage === 'capSelection') f.snapshot.state.pending.after[0].remaining = 1;
+      },
+      /actual material payment continuation/,
+    ],
+    [
+      'wrong delivered skull',
+      undefined,
+      (f, stage) => {
+        if (stage === 'capPayment') f.snapshot.state.players[0].resources.skull++;
+      },
+      /exact payment and skull transition/,
+    ],
+    [
+      'unchanged supply',
+      undefined,
+      (f, stage) => {
+        if (stage === 'capPayment') f.snapshot.state.skullSupply++;
+      },
+      /exact payment and skull transition/,
+    ],
+    [
+      'unrelated actor score',
+      undefined,
+      (f, stage) => {
+        if (stage === 'capPayment') f.snapshot.state.players[1].score++;
+      },
+      /exact payment and skull transition/,
+    ],
+  ]) {
+    const f = fixture('wood', false, alter);
+    change?.(f);
+    replaceEvents(
+      f.value,
+      f.value.raw.dom_entries
+        .filter((entry) => entry.action_id > 5)
+        .map((entry) => [
+          entry.action_id,
+          entry.messages.map((message) => ({ ...message, html: message.raw_text })),
+        ]),
+    );
+    const refused = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(refused.manifest.blocked.actionId, 7, name);
+    assert.match(refused.manifest.blocked.reason, reason, name);
+    assert.deepEqual(
+      refused.record.steps.map((step) => step.sourceActionIds),
+      [[6], [6]],
+      name,
+    );
+  }
+  const stale = fixture();
+  const first = stale.value.raw.dom_entries.find((entry) => entry.action_id === 6).messages;
+  const second = stale.value.raw.dom_entries.find((entry) => entry.action_id === 7).messages;
+  replaceEvents(stale.value, [
+    [6, first],
+    [7, second],
+    [8, [stale.bonus]],
+  ]);
+  const result = decode(stale.value, dispatcher(stale.initial, stale.apply));
+  assert.equal(result.manifest.blocked.actionId, 8);
+  assert.match(result.manifest.blocked.reason, /fixed purchase receipt/);
+  assert.equal(result.record.steps.length, 4);
+});
+
 function workerPurchaseFixture(remaining = 1) {
   const initial = clone(saved.core.initialFrame);
   const own = initial.snapshot.state.players[0];
