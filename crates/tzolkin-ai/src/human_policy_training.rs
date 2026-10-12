@@ -1,6 +1,7 @@
 //! Separate policy-only BC for sealed conditional Human inputs, never native admission.
 use crate::dataset::DatasetSplit;
 use crate::features::{FEATURE_COUNT, FeatureEncoder, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
+use crate::human_initial_wealth::ContentPin;
 use crate::human_initial_wealth::table_family_id;
 use crate::human_policy_dataset::{
     ConditionalHumanPolicyDataset, FACTORIZED_LABEL_SCOPE, HumanPolicySample, TASK,
@@ -10,7 +11,7 @@ use crate::model::{Random, digest};
 use crate::policy_training::{
     MAX_CANDIDATE_EVALUATIONS, MAX_UPDATES, PolicyAdamState, PolicyBcConfig, PolicyLossReport,
     PolicyTrainingMetrics, Scratch, bounded_json, policy_loss, publish, read_local_json,
-    validate_new_output_directory,
+    read_local_json_pinned, validate_new_output_directory,
 };
 use crate::public_model::{
     MODEL_VERSION, PublicPolicyArtifact, PublicPolicyModel, ValueValidity, predict_numeric,
@@ -64,6 +65,12 @@ fn load_collection(
     path: &Path,
 ) -> Result<(CollectionInput, Vec<ConditionalHumanPolicyDataset>), String> {
     let input: CollectionInput = read_local_json(path)?;
+    load_collection_input(path, input)
+}
+fn load_collection_input(
+    path: &Path,
+    input: CollectionInput,
+) -> Result<(CollectionInput, Vec<ConditionalHumanPolicyDataset>), String> {
     if input.schema != COLLECTION_SCHEMA
         || input.datasets.is_empty()
         || input.datasets.len() > MAX_TABLES
@@ -414,20 +421,24 @@ pub struct PreparedConditionalHumanPolicy {
     checkpoint: Box<ConditionalHumanPolicyCheckpoint>,
     reservations: BTreeMap<String, DatasetSplit>,
     kernel: ResolvedKernel,
+    loaded_sources: Option<Vec<ContentPin>>,
 }
 impl PreparedConditionalHumanPolicy {
     pub fn load(checkpoint_path: &Path, collection_path: &Path) -> Result<Self, String> {
-        let checkpoint = ConditionalHumanPolicyCheckpoint::load(checkpoint_path)?;
-        let (input, datasets) = load_collection(collection_path)?;
+        let (checkpoint, checkpoint_pin): (ConditionalHumanPolicyCheckpoint, _) =
+            read_local_json_pinned(checkpoint_path)?;
+        checkpoint.validate()?;
+        let (input, collection_pin) = read_local_json_pinned(collection_path)?;
+        let (input, datasets) = load_collection_input(collection_path, input)?;
         if input.config != checkpoint.config {
             return Err("Conditional prepared collection/checkpoint config mismatch".into());
         }
-        let prepared = Self::new(checkpoint, &datasets)?;
-        if read_local_json::<CollectionInput>(collection_path)? != input
-            || ConditionalHumanPolicyCheckpoint::load(checkpoint_path)? != *prepared.checkpoint
-        {
-            return Err("Conditional preparation inputs changed before completion".into());
+        let mut prepared = Self::new(checkpoint, &datasets)?;
+        let mut pins = vec![checkpoint_pin, collection_pin];
+        for dataset in &datasets {
+            pins.extend(dataset.loaded_source_pins()?);
         }
+        prepared.loaded_sources = Some(seal_loaded_sources(pins)?);
         Ok(prepared)
     }
 
@@ -482,7 +493,13 @@ impl PreparedConditionalHumanPolicy {
             checkpoint: Box::new(checkpoint),
             reservations,
             kernel: Kernel::Scalar.resolve()?,
+            loaded_sources: None,
         })
+    }
+    pub(crate) fn loaded_sources(&self) -> Result<&[ContentPin], String> {
+        self.loaded_sources
+            .as_deref()
+            .ok_or_else(|| "Conditional RL origin requires successful source load".into())
     }
 
     pub fn model(&self) -> &ConditionalHumanPolicyArtifact {
@@ -522,6 +539,28 @@ impl PreparedConditionalHumanPolicy {
             .collect::<Result<Vec<_>, _>>()?;
         predict_numeric(&self.checkpoint.model.model, self.kernel, &rows)
     }
+}
+fn seal_loaded_sources(pins: Vec<ContentPin>) -> Result<Vec<ContentPin>, String> {
+    // Each dataset has at most 32 evidence leaves, five direct leaves and one manifest.
+    if pins.len() > MAX_TABLES * 38 + 2 {
+        return Err("Conditional origin source count bound".into());
+    }
+    let mut unique = BTreeMap::<String, ContentPin>::new();
+    for pin in pins {
+        crate::human_policy_dataset::recheck_absolute_pin(&pin)?;
+        let canonical = fs::canonicalize(&pin.path).map_err(|e| e.to_string())?;
+        let key = canonical.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let key = key.to_lowercase();
+        if let Some(previous) = unique.get(&key) {
+            if previous.bytes != pin.bytes || previous.sha256 != pin.sha256 {
+                return Err("Conflicting conditional origin pins for one physical source".into());
+            }
+        } else {
+            unique.insert(key, pin);
+        }
+    }
+    Ok(unique.into_values().collect())
 }
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

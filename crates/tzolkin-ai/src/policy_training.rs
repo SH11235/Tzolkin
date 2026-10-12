@@ -11,7 +11,7 @@ use crate::public_model::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 pub const CHECKPOINT_SCHEMA: &str = "tzolkin-public-policy-checkpoint-v1";
@@ -823,6 +823,43 @@ pub(crate) fn read_local_json<T: serde::de::DeserializeOwned>(path: &Path) -> Re
         return Err("Policy training input must be a local regular file".into());
     }
     read_json(path)
+}
+/// Pin the exact bounded buffer parsed by a load-backed conditional origin.
+pub(crate) fn read_local_json_pinned<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<(T, crate::human_initial_wealth::ContentPin), String> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    local_path(&path)?;
+    if !fs::symlink_metadata(&path)
+        .map_err(|e| e.to_string())?
+        .is_file()
+    {
+        return Err("Policy training input must be a local regular file".into());
+    }
+    let mut bytes = Vec::new();
+    File::open(&path)
+        .map_err(|e| e.to_string())?
+        .take(MAX_ARTIFACT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > MAX_ARTIFACT_BYTES {
+        return Err("Artifact exceeds bounded 8 MiB input".into());
+    }
+    let value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Ok((
+        value,
+        crate::human_initial_wealth::ContentPin {
+            path: path.to_string_lossy().into_owned(),
+            bytes: bytes.len() as u64,
+            sha256: digest(&bytes),
+        },
+    ))
 }
 pub(crate) fn publish(path: &Path, value: &impl Serialize) -> Result<(), String> {
     local_path(path)?;

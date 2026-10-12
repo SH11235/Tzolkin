@@ -268,7 +268,7 @@ impl ResidualFitProposal {
     }
 }
 
-fn zero_output_parameters(seed: u64) -> Vec<f32> {
+pub(crate) fn zero_output_parameters(seed: u64) -> Vec<f32> {
     let mut parameters = initialized_parameters(seed);
     parameters[WV..].fill(0.0);
     parameters
