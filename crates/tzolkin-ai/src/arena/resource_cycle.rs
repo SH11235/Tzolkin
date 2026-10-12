@@ -413,7 +413,7 @@ fn v5_adjustment(
             // already-pending UseAction must not forfeit its current harvest.
             if matches!(action, TypedAction::Remove { .. })
                 && *gear == GearId::Yaxchilan
-                && (1..4).contains(position)
+                && (1..5).contains(position)
                 && level >= 2
                 && !urgent_food
                 && (p.resources[0] as f64) >= target
@@ -1127,25 +1127,27 @@ mod tests {
         state.pending = None;
         state.turn.mode = tzolkin_core::TurnMode::Remove;
         state.turn.count = 1;
-        state.gears.get_mut(&GearId::Yaxchilan).unwrap().fill(None);
-        state.gears.get_mut(&GearId::Yaxchilan).unwrap()[3] = Some(GearWorker {
-            player_id: 1,
-            dummy: false,
-        });
         state.round = 18;
         state.age = 2;
         state.food_days = vec![8, 14];
-        let o = observe(&state, 1).unwrap();
-        let decision = choose_move(&o, &config).unwrap();
-        assert!(matches!(
-            o.legal_actions
-                .iter()
-                .find(|row| row.r#move == decision.r#move)
-                .unwrap()
-                .action,
-            TypedAction::EndTurn { .. }
-        ));
-        assert!(apply_move(&state, decision.r#move).is_ok());
+        for position in [3, 4] {
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap().fill(None);
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[position] = Some(GearWorker {
+                player_id: 1,
+                dummy: false,
+            });
+            let o = observe(&state, 1).unwrap();
+            let decision = choose_move(&o, &config).unwrap();
+            assert!(matches!(
+                o.legal_actions
+                    .iter()
+                    .find(|row| row.r#move == decision.r#move)
+                    .unwrap()
+                    .action,
+                TypedAction::EndTurn { .. }
+            ));
+            assert!(apply_move(&state, decision.r#move).is_ok());
+        }
         for (round, corn) in [(20, 2), (25, 20)] {
             state.round = round;
             state.food_days = if round == 25 {
