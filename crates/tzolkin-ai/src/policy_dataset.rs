@@ -15,6 +15,8 @@ use tzolkin_core::{
 };
 
 pub const DATASET_SCHEMA: &str = "tzolkin-public-policy-dataset-v1";
+pub const RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND: &str = "verifiedNativeResourceCycleV5Teacher";
+pub const RESOURCE_CYCLE_V5_TEACHER_TASK: &str = "resourceCycleV5PolicyOnlyTeacher";
 pub const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_SHARD_BYTES: u64 = 32 * 1024 * 1024;
@@ -22,6 +24,29 @@ pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_FILES: usize = 100_000;
 pub const MAX_PARTITION_SAMPLES: usize = 100_000;
 pub const MAX_PARTITION_CANDIDATES: usize = 1_000_000;
+
+#[derive(Clone, Copy)]
+enum SourceRoute {
+    Native,
+    ResourceCycleV5Teacher,
+}
+impl SourceRoute {
+    fn labels(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Native => ("verifiedNativePolicy", "policyOnlyBc"),
+            Self::ResourceCycleV5Teacher => (
+                RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND,
+                RESOURCE_CYCLE_V5_TEACHER_TASK,
+            ),
+        }
+    }
+    fn read(self, path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
+        match self {
+            Self::Native => source(path),
+            Self::ResourceCycleV5Teacher => resource_cycle_v5_teacher_source(path),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -410,6 +435,52 @@ fn source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
     replay::verify_replay(&record)?;
     Ok((bytes, record))
 }
+
+fn verify_resource_cycle_v5_teacher(record: &GameReplay) -> Result<(), String> {
+    use crate::arena::resource_cycle::{self, ResourceCycleConfig};
+    let configuration = ResourceCycleConfig::v5();
+    configuration.validate()?;
+    let ReplaySource::PolicySelfPlay { policies } = &record.header.source else {
+        return Err("ResourceCycleV5 teacher requires explicit all-seat policy provenance".into());
+    };
+    if !(3..=4).contains(&record.header.names.len())
+        || record.header.options != GameOptions::default()
+        || policies.len() != record.header.names.len()
+        || policies.iter().any(|policy| {
+            !matches!(policy, replay::SeatPolicy::ResourceCycle { configuration: actual }
+                if actual == &configuration)
+        })
+    {
+        return Err("ResourceCycleV5 teacher requires fixed v5, all seats and base 3-4p".into());
+    }
+    // The complete independent replay verifies every observation, transition and
+    // terminal score. Teacher quality is separate from this consistency check.
+    replay::verify_replay(record)?;
+    for step in &record.steps {
+        let decision = resource_cycle::choose_move(&step.observation, &configuration)?;
+        if decision.policy_version != resource_cycle::V5_POLICY_VERSION
+            || !decision.score.is_finite()
+            || decision.actor != step.actor
+            || decision.r#move != step.chosen.r#move
+        {
+            return Err(format!(
+                "ResourceCycleV5 regenerated teacher choice differs at step {}",
+                step.index
+            ));
+        }
+    }
+    Ok(())
+}
+fn resource_cycle_v5_teacher_source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
+    let bytes = read_bytes(path, MAX_SOURCE_BYTES)?;
+    let parsed: NativeReplay = serde_json::from_value(
+        crate::public_stochastic_record::unique_json(&bytes, MAX_SOURCE_BYTES as usize)?,
+    )
+    .map_err(|e| format!("Invalid strict ResourceCycleV5 teacher replay: {e}"))?;
+    let record = parsed.into_replay();
+    verify_resource_cycle_v5_teacher(&record)?;
+    Ok((bytes, record))
+}
 // State-MC consumes the same closed native source boundary without changing it.
 pub(crate) fn read_state_native_source(
     path: &Path,
@@ -638,10 +709,32 @@ pub fn export_native_files(
 ) -> Result<PolicyDatasetManifest, String> {
     export_sources(paths.len(), |index| source(&paths[index]), output)
 }
+/// Export deterministic all-seat v5 demonstrations with separate teacher labels.
+/// This grants no Human provenance, value supervision or policy qualification.
+/// Original native, legacy and State-MC admission remains unchanged.
+pub fn export_resource_cycle_v5_teacher_files(
+    paths: &[PathBuf],
+    output: &Path,
+) -> Result<PolicyDatasetManifest, String> {
+    export_sources_with_route(
+        paths.len(),
+        |index| resource_cycle_v5_teacher_source(&paths[index]),
+        output,
+        SourceRoute::ResourceCycleV5Teacher,
+    )
+}
 fn export_sources(
+    count: usize,
+    read_source: impl FnMut(usize) -> Result<(Vec<u8>, GameReplay), String>,
+    output: &Path,
+) -> Result<PolicyDatasetManifest, String> {
+    export_sources_with_route(count, read_source, output, SourceRoute::Native)
+}
+fn export_sources_with_route(
     count: usize,
     mut read_source: impl FnMut(usize) -> Result<(Vec<u8>, GameReplay), String>,
     output: &Path,
+    route: SourceRoute,
 ) -> Result<PolicyDatasetManifest, String> {
     local_path(output)?;
     if fs::symlink_metadata(output).is_ok() {
@@ -697,8 +790,8 @@ fn export_sources(
         catalog_hash: replay::catalog_hash(),
         move_schema: MOVE_SCHEMA,
         observation_schema: OBSERVATION_SCHEMA,
-        source_kind: "verifiedNativePolicy".into(),
-        task: "policyOnlyBc".into(),
+        source_kind: route.labels().0.into(),
+        task: route.labels().1.into(),
         value_supervised: false,
         fingerprint: String::new(),
         samples: 0,
@@ -746,11 +839,12 @@ fn export_sources(
     }
     m.strata = strata(&m.games);
     m.fingerprint = fingerprint(&m)?;
-    validate_manifest(&m)?;
+    validate_manifest(&m, route)?;
     // Audit the published source/shards before the completion marker can exist.
     let dataset = ValidatedPolicyDataset {
         directory: output.to_path_buf(),
         manifest: m.clone(),
+        route,
     };
     audit_all(&dataset)?;
     let bytes = serde_json::to_vec_pretty(&m).map_err(|e| e.to_string())?;
@@ -760,7 +854,7 @@ fn export_sources(
     publish_bytes(output, "manifest.json", &bytes)?;
     Ok(m)
 }
-fn validate_manifest(m: &PolicyDatasetManifest) -> Result<(), String> {
+fn validate_manifest(m: &PolicyDatasetManifest, route: SourceRoute) -> Result<(), String> {
     if m.schema != DATASET_SCHEMA
         || m.feature_schema != PUBLIC_FEATURE_SCHEMA
         || m.feature_count != FEATURE_COUNT
@@ -769,8 +863,8 @@ fn validate_manifest(m: &PolicyDatasetManifest) -> Result<(), String> {
         || m.catalog_hash != replay::catalog_hash()
         || m.move_schema != MOVE_SCHEMA
         || m.observation_schema != OBSERVATION_SCHEMA
-        || m.source_kind != "verifiedNativePolicy"
-        || m.task != "policyOnlyBc"
+        || m.source_kind != route.labels().0
+        || m.task != route.labels().1
         || m.value_supervised
         || !digest_id(&m.fingerprint)
         || m.fingerprint != fingerprint(m)?
@@ -852,6 +946,7 @@ fn validate_manifest(m: &PolicyDatasetManifest) -> Result<(), String> {
 pub struct ValidatedPolicyDataset {
     directory: PathBuf,
     manifest: PolicyDatasetManifest,
+    route: SourceRoute,
 }
 impl ValidatedPolicyDataset {
     pub fn manifest(&self) -> &PolicyDatasetManifest {
@@ -867,6 +962,7 @@ impl ValidatedPolicyDataset {
         PolicyDatasetIter {
             directory: self.directory.clone(),
             manifest: self.manifest.clone(),
+            route: self.route,
             split,
             next_shard: 0,
             current: None,
@@ -892,6 +988,7 @@ struct ReadingShard {
 pub struct PolicyDatasetIter {
     directory: PathBuf,
     manifest: PolicyDatasetManifest,
+    route: SourceRoute,
     split: Option<DatasetSplit>,
     next_shard: usize,
     current: Option<ReadingShard>,
@@ -939,7 +1036,9 @@ impl PolicyDatasetIter {
                     continue;
                 }
                 if self.game.is_none() {
-                    let (bytes, record) = source(&self.directory.join(&game_meta.source_file))?;
+                    let (bytes, record) = self
+                        .route
+                        .read(&self.directory.join(&game_meta.source_file))?;
                     if game_metadata(meta.game_index, &bytes, &record)? != *game_meta {
                         return Err("Copied native source metadata/hash mismatch".into());
                     }
@@ -1045,13 +1144,27 @@ fn audit_all(dataset: &ValidatedPolicyDataset) -> Result<(), String> {
 /// Each subsequent iterator independently verifies sources and shard EOF digests again.
 /// An iterator must be consumed through EOF to complete its integrity pass.
 pub fn load_policy_dataset(directory: &Path) -> Result<ValidatedPolicyDataset, String> {
+    load_dataset_with_route(directory, SourceRoute::Native)
+}
+/// The dedicated teacher handle rechecks fixed v5 choices on every iteration.
+/// Its distinct source/task labels cannot enter original native admission.
+pub fn load_resource_cycle_v5_teacher_dataset(
+    directory: &Path,
+) -> Result<ValidatedPolicyDataset, String> {
+    load_dataset_with_route(directory, SourceRoute::ResourceCycleV5Teacher)
+}
+fn load_dataset_with_route(
+    directory: &Path,
+    route: SourceRoute,
+) -> Result<ValidatedPolicyDataset, String> {
     let bytes = read_bytes(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
     let manifest: PolicyDatasetManifest =
         serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    validate_manifest(&manifest)?;
+    validate_manifest(&manifest, route)?;
     let dataset = ValidatedPolicyDataset {
         directory: directory.to_path_buf(),
         manifest,
+        route,
     };
     audit_all(&dataset)?;
     Ok(dataset)
