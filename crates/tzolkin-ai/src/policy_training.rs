@@ -119,7 +119,7 @@ fn digest_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 impl PolicyDatasetIdentity {
-    fn from_dataset(dataset: &ValidatedPolicyDataset) -> Self {
+    pub(crate) fn from_dataset(dataset: &ValidatedPolicyDataset) -> Self {
         let m = dataset.manifest();
         let mut samples = [0; 3];
         let mut candidates = [0; 3];
@@ -147,6 +147,12 @@ impl PolicyDatasetIdentity {
         }
     }
     fn validate(&self, require_training: bool) -> Result<(), String> {
+        if self.source_kind != "verifiedNativePolicy" || self.task != "policyOnlyBc" {
+            return Err("Incompatible public BC dataset identity".into());
+        }
+        self.validate_structure(require_training)
+    }
+    pub(crate) fn validate_structure(&self, require_training: bool) -> Result<(), String> {
         if self.schema != DATASET_SCHEMA
             || !digest_id(&self.fingerprint)
             || self.feature_schema != PUBLIC_FEATURE_SCHEMA
@@ -156,8 +162,6 @@ impl PolicyDatasetIdentity {
             || self.catalog_hash != crate::replay::catalog_hash()
             || self.move_schema != tzolkin_core::observation::MOVE_SCHEMA
             || self.observation_schema != tzolkin_core::observation::OBSERVATION_SCHEMA
-            || self.source_kind != "verifiedNativePolicy"
-            || self.task != "policyOnlyBc"
             || self.input_contract != INPUT_CONTRACT
             || self.strata.is_empty()
             || self.strata.len() > crate::policy_dataset::MAX_FILES
@@ -547,7 +551,7 @@ pub(crate) fn policy_loss(
     }
     Ok((loss, best == chosen))
 }
-fn evaluate(
+pub(crate) fn evaluate(
     dataset: &ValidatedPolicyDataset,
     identity: &PolicyDatasetIdentity,
     model: &PublicPolicyModel,
@@ -600,6 +604,71 @@ pub fn evaluate_dataset(
     }
     Ok(report)
 }
+pub(crate) struct PolicyEpochState<'a> {
+    pub optimizer: &'a mut PolicyAdamState,
+    pub random: &'a mut Random,
+    pub scratch: &'a mut Scratch,
+}
+
+// Source admission belongs to the closed native/teacher wrappers, never this
+// shared numerical loop. Batches and shuffle order remain identical.
+pub(crate) fn train_epochs(
+    dataset: &ValidatedPolicyDataset,
+    config: &PolicyBcConfig,
+    completed: usize,
+    expected_samples: usize,
+    model: &mut PublicPolicyModel,
+    state: PolicyEpochState<'_>,
+) -> Result<(), String> {
+    let PolicyEpochState {
+        optimizer,
+        random,
+        scratch,
+    } = state;
+    let mut gradient = vec![0.0; PARAMETER_COUNT];
+    let mut buffer: Vec<ValidatedPolicySample> = Vec::with_capacity(SHUFFLE_BUFFER);
+    for _ in completed..config.epochs {
+        let mut seen = 0;
+        let mut batch = 0;
+        let mut consume = |sample: ValidatedPolicySample| -> Result<(), String> {
+            policy_loss(
+                model,
+                sample.candidates(),
+                sample.chosen(),
+                scratch,
+                Some(&mut gradient),
+            )?;
+            seen += 1;
+            batch += 1;
+            if batch == config.batch_size {
+                optimizer.update(model, &mut gradient, batch, config.learning_rate)?;
+                batch = 0;
+            }
+            Ok(())
+        };
+        for sample in dataset.iter_split(DatasetSplit::Train) {
+            let sample = sample?;
+            if buffer.len() < SHUFFLE_BUFFER {
+                buffer.push(sample);
+            } else {
+                let i = random.index(buffer.len());
+                consume(std::mem::replace(&mut buffer[i], sample))?;
+            }
+        }
+        while !buffer.is_empty() {
+            let i = random.index(buffer.len());
+            consume(buffer.swap_remove(i))?;
+        }
+        if seen != expected_samples {
+            return Err("BC train count changed".into());
+        }
+        if batch > 0 {
+            optimizer.update(model, &mut gradient, batch, config.learning_rate)?;
+        }
+    }
+    Ok(())
+}
+
 /// Epoch-boundary, deterministic Scalar training. No external unqualified/raw sample API.
 pub fn train_dataset(
     dataset: &ValidatedPolicyDataset,
@@ -672,57 +741,18 @@ pub fn train_dataset(
             strength_measured: false,
         }
     };
-    let mut gradient = vec![0.0; PARAMETER_COUNT];
-    let mut buffer: Vec<ValidatedPolicySample> = Vec::with_capacity(SHUFFLE_BUFFER);
-    for _ in completed..config.epochs {
-        let mut seen = 0;
-        let mut batch = 0;
-        let mut consume = |sample: ValidatedPolicySample| -> Result<(), String> {
-            policy_loss(
-                &artifact.model,
-                sample.candidates(),
-                sample.chosen(),
-                &mut scratch,
-                Some(&mut gradient),
-            )?;
-            seen += 1;
-            batch += 1;
-            if batch == config.batch_size {
-                optimizer.update(
-                    &mut artifact.model,
-                    &mut gradient,
-                    batch,
-                    config.learning_rate,
-                )?;
-                batch = 0;
-            }
-            Ok(())
-        };
-        for sample in dataset.iter_split(DatasetSplit::Train) {
-            let sample = sample?;
-            if buffer.len() < SHUFFLE_BUFFER {
-                buffer.push(sample);
-            } else {
-                let i = random.index(buffer.len());
-                consume(std::mem::replace(&mut buffer[i], sample))?;
-            }
-        }
-        while !buffer.is_empty() {
-            let i = random.index(buffer.len());
-            consume(buffer.swap_remove(i))?;
-        }
-        if seen != identity.samples[0] {
-            return Err("BC train count changed".into());
-        }
-        if batch > 0 {
-            optimizer.update(
-                &mut artifact.model,
-                &mut gradient,
-                batch,
-                config.learning_rate,
-            )?;
-        }
-    }
+    train_epochs(
+        dataset,
+        config,
+        completed,
+        identity.samples[0],
+        &mut artifact.model,
+        PolicyEpochState {
+            optimizer: &mut optimizer,
+            random: &mut random,
+            scratch: &mut scratch,
+        },
+    )?;
     metrics.completed_epochs = config.epochs;
     metrics.final_train = evaluate(
         dataset,

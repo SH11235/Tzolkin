@@ -298,6 +298,22 @@ fn content_id<T: Serialize>(domain: &[u8], value: &T) -> Result<String, String> 
     serde_json::to_writer(&mut sink, value).map_err(|e| e.to_string())?;
     Ok(hex(sink.0.finalize()))
 }
+pub(crate) fn resource_cycle_v5_teacher_policy_id(players: usize) -> Result<String, String> {
+    if !(3..=4).contains(&players) {
+        return Err("V5 teacher identity requires base 3/4p".into());
+    }
+    content_id(
+        b"tzolkin-native-policy-source-v1\0",
+        &ReplaySource::PolicySelfPlay {
+            policies: vec![
+                replay::SeatPolicy::ResourceCycle {
+                    configuration: crate::arena::resource_cycle::ResourceCycleConfig::v5(),
+                };
+                players
+            ],
+        },
+    )
+}
 fn fingerprint(m: &PolicyDatasetManifest) -> Result<String, String> {
     let mut canonical = m.clone();
     canonical.fingerprint.clear();
@@ -951,6 +967,14 @@ pub struct ValidatedPolicyDataset {
 impl ValidatedPolicyDataset {
     pub fn manifest(&self) -> &PolicyDatasetManifest {
         &self.manifest
+    }
+    pub(crate) fn require_resource_cycle_v5_teacher_route(&self) -> Result<(), String> {
+        if !matches!(self.route, SourceRoute::ResourceCycleV5Teacher) {
+            return Err(
+                "ResourceCycleV5 training requires its dedicated validated source route".into(),
+            );
+        }
+        validate_manifest(&self.manifest, self.route)
     }
     pub fn iter(&self) -> PolicyDatasetIter {
         self.iterator(None)
