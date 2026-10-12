@@ -389,6 +389,54 @@ test('reads an omitted trade icon list only from its exact preserved HTML captio
   }
 });
 
+test('reads missing feeding icons only from the exact actor, worker and payment HTML', () => {
+  const feeding = {
+    raw_text: '食料供給日: Aはワーカー4個で 8\nを支払った',
+    html: '食料供給日: Aはワーカー4個で 8 <div class="tz_icon resource_corn"></div>を支払った',
+    icons: [],
+  };
+  const original = structuredClone(feeding);
+  const parsed = parseMessage(feeding, ['A', 'B']);
+  assert.equal(parsed.actor, 'A');
+  assert.equal(parsed.kind, 'feeding');
+  assert.deepEqual(parsed.detail, { workers: 4 });
+  assert.deepEqual(parsed.iconResources, ['corn']);
+  assert.deepEqual(feeding, original);
+  assert.deepEqual(
+    parseMessage({ ...feeding, raw_text: feeding.raw_text.replace('\n', ' ') }, ['A'])
+      .iconResources,
+    ['corn'],
+  );
+  for (const html of [
+    feeding.html.replace('Aは', 'Bは'),
+    feeding.html.replace('ワーカー4個', 'ワーカー3個'),
+    feeding.html.replace('で 8 ', 'で 7 '),
+    feeding.html.replace('resource_corn', 'resource_wood'),
+    feeding.html.replace('resource_corn', 'resource_unknown'),
+    feeding.html.replace('<div class=', '<div hidden class='),
+    feeding.html.replace('<div class=', '<div style="display:none" class='),
+    `<span>${feeding.html}</span>`,
+    `${feeding.html}<div class="tz_icon resource_corn"></div>`,
+    feeding.html.replace('8 <div', '8<div'),
+  ])
+    assert.deepEqual(parseMessage({ ...feeding, html }, ['A', 'B']).iconResources, []);
+  for (const raw_text of [
+    feeding.raw_text.replace('ワーカー4個', 'ワーカー3個'),
+    feeding.raw_text.replace('で 8', 'で 7'),
+    `${feeding.raw_text}余分な文`,
+  ])
+    assert.deepEqual(parseMessage({ ...feeding, raw_text }, ['A']).iconResources, []);
+  assert.deepEqual(parseMessage(feeding, ['B']).iconResources, []);
+  for (const classes of ['tz_icon resource_stone', 'tz_icon resource_corn', 'tz_icon']) {
+    const message = { ...feeding, icons: [{ classes }] };
+    const original = structuredClone(message);
+    assert.deepEqual(parseMessage(message, ['A']).iconResources, [
+      classes.split('resource_')[1] ?? null,
+    ]);
+    assert.deepEqual(message, original);
+  }
+});
+
 test('rejects evidence mismatches, malformed identities and duplicate actions', () => {
   for (const mutate of [
     (g) => {
