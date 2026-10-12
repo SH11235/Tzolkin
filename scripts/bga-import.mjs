@@ -140,6 +140,14 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
       result.kind = m[2] === '獲得した' ? 'resourceGain' : 'resourcePayment';
       result.detail = { explicitAmount: m[1] ? Number(m[1]) : null, iconResources };
     }
+  } else if (actor && (m = match(/^は(\d+)\s*を歯車から獲得した$/))) {
+    // Keep the calendar caption unparsed: the decoder checks its payout receipt.
+    if (
+      !iconResources.length &&
+      message.html ===
+        `${actor}は${m[1]}<div class="tz_icon resource_corn"></div>を歯車から獲得した`
+    )
+      iconResources.push('corn');
   } else if (actor && text === 'は建物を建てた') result.kind = 'build';
   else if (actor && /記念碑.*(建てた|獲得した)/.test(text)) result.kind = 'monument';
   else if (actor && text.includes('の信仰を') && /コーン[1-3]個を受け取った/.test(text))
