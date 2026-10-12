@@ -1,7 +1,7 @@
 //! Metadata-only journal restoration. Applied-link checks do not seal episodes
 //! or confer fresh audit/learning capability on serialized records.
 use super::*;
-use crate::public_policy_episode::{applied_mixed_plan, canonical_record_checksum};
+use crate::public_policy_episode::applied_mixed_plan;
 use serde_json::{Value, json};
 
 /// An externally pinned saved tip. This untrusted request cannot construct an
@@ -75,6 +75,7 @@ impl MemberSummary {
         record: &crate::public_stochastic_record::Record<source::CurrentMixedSource>,
         plan: &PlannedCurrentMixedCohort,
         member: usize,
+        checksum: String,
     ) -> Result<Self, String> {
         if record.terminal.is_none() || record.failure.is_some() {
             return Err("Current mixed saved member is incomplete".into());
@@ -104,10 +105,7 @@ impl MemberSummary {
             return Err("Saved learner link coverage differs".into());
         }
         Ok(Self {
-            checksum: canonical_record_checksum(
-                record,
-                b"tzolkin-applied-current-mixed-episode-v2\0",
-            )?,
+            checksum,
             counts,
             observed: record.counts.observed_callbacks,
         })
@@ -303,15 +301,27 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     let raw = read_record(&s.batch(r.attempt), pin, *member, &s.spec)?;
                     let p = plan.as_ref().ok_or("Saved current mixed plan missing")?;
                     let record = source::check_record(&raw, &p.headers[*member])?;
-                    crate::public_stochastic_native::require_payload_reservations(
-                        &record,
-                        &p.configurations()[*member],
-                    )?;
+                    let checksum = if *complete {
+                        Some(
+                            crate::public_stochastic_native::require_payload_reservations_and_checksum(
+                                &record,
+                                &p.configurations()[*member],
+                                b"tzolkin-applied-current-mixed-episode-v2\0",
+                            )?,
+                        )
+                    } else {
+                        crate::public_stochastic_native::require_payload_reservations(
+                            &record,
+                            &p.configurations()[*member],
+                        )?;
+                        None
+                    };
                     if *complete != (record.terminal.is_some() && record.failure.is_none()) {
                         return Err("Saved collection return differs from record outcome".into());
                     }
-                    if *complete {
-                        summaries[*member] = Some(MemberSummary::read(&record, p, *member)?);
+                    if let Some(checksum) = checksum {
+                        summaries[*member] =
+                            Some(MemberSummary::read(&record, p, *member, checksum)?);
                     } else if error.as_deref()
                         != Some(
                             bounded_error(

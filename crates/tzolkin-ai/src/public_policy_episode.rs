@@ -586,6 +586,13 @@ pub(crate) fn canonical_record_checksum<P: serde::Serialize>(
     record: &Record<P>,
     domain: &[u8],
 ) -> Result<String, String> {
+    canonical_record_checksum_with_size(record, domain).map(|(checksum, _)| checksum)
+}
+
+pub(crate) fn canonical_record_checksum_with_size<P: serde::Serialize>(
+    record: &Record<P>,
+    domain: &[u8],
+) -> Result<(String, usize), String> {
     let mut writer = CanonicalHash {
         hash: Sha256::new(),
         bytes: 0,
@@ -594,12 +601,26 @@ pub(crate) fn canonical_record_checksum<P: serde::Serialize>(
     writer.hash.update(TARGET_CONTRACT.as_bytes());
     writer.hash.update(b"\0");
     serde_json::to_writer(&mut writer, record).map_err(|e| e.to_string())?;
-    Ok(format!("{:x}", writer.hash.finalize()))
+    // The domain prefix is hashed directly and is not serialized payload.
+    Ok((format!("{:x}", writer.hash.finalize()), writer.bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn canonical_record_sink_keeps_payload_bound_and_overflow_refusal() {
+        let mut writer = CanonicalHash {
+            hash: Sha256::new(),
+            bytes: MAX_RECORD_BYTES - 1,
+        };
+        writer.write_all(b"x").unwrap();
+        assert_eq!(writer.bytes, MAX_RECORD_BYTES);
+        assert!(writer.write_all(b"x").is_err());
+        writer.bytes = usize::MAX;
+        assert!(writer.write_all(b"x").is_err());
+    }
+
     #[test]
     fn actor_links_ties_and_incomplete_boundaries_are_explicit() {
         assert_eq!(
