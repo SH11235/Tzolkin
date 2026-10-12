@@ -12,6 +12,17 @@ const saved = JSON.parse(
 );
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const clone = (value) => structuredClone(value);
+// Match the recursive object-key order of native serde_json::Value transport.
+const nativeJsonShape = (value) =>
+  Array.isArray(value)
+    ? value.map(nativeJsonShape)
+    : value !== null && typeof value === 'object'
+      ? Object.fromEntries(
+          Object.keys(value)
+            .sort()
+            .map((key) => [key, nativeJsonShape(value[key])]),
+        )
+      : value;
 
 function input() {
   const raw = clone(saved.raw);
@@ -59,7 +70,7 @@ function decode(value, dispatch, tableBytes = null) {
 }
 function dispatcher(initial, apply) {
   return (request) => {
-    if (request.operation === 'publicApply') return apply(request);
+    if (request.operation === 'publicApply') return nativeJsonShape(apply(request));
     assert.equal(request.operation, 'publicReplay');
     assert.deepEqual(request.replay.source.actionIds, [5]);
     const frames = [clone(initial)];
@@ -67,14 +78,14 @@ function dispatcher(initial, apply) {
       frames.push(
         apply({ operation: 'publicApply', state: frames.at(-1).snapshot.state, ...step }),
       );
-    return {
+    return nativeJsonShape({
       status: 'partial',
       verifiedComplete: false,
       verifiedSteps: request.replay.steps.length,
       checkpointsVerified: request.replay.steps.filter((step) => step.checkpoint).length,
       sourceCoverage: { complete: false },
       frames,
-    };
+    });
   };
 }
 
@@ -3976,19 +3987,6 @@ test('holds queued corn until observed technology completion and preserves cappe
       architectureLevel,
       renovationSibling,
     );
-    // serde_json::Value transport sorts object keys, including nested receipts.
-    const nativeShape = (value) =>
-      Array.isArray(value)
-        ? value.map(nativeShape)
-        : value !== null && typeof value === 'object'
-          ? Object.fromEntries(
-              Object.keys(value)
-                .sort()
-                .map((key) => [key, nativeShape(value[key])]),
-            )
-          : value;
-    const originalDispatch = f.dispatch;
-    f.dispatch = (request) => nativeShape(originalDispatch(request));
     return f;
   };
   const materialSuccess = materialFixture();
@@ -4390,6 +4388,27 @@ test('holds queued corn until observed technology completion and preserves cappe
       () => {},
       alter('purchase', (f) => {
         f.snapshot.state.pending.after[0].effects[0].resources.corn++;
+      }),
+    ],
+    [
+      'wrong queued amount type',
+      () => {},
+      alter('purchase', (f) => {
+        f.snapshot.state.pending.after[0].effects[0].resources.corn = String(amount);
+      }),
+    ],
+    [
+      'extra continuation field',
+      () => {},
+      alter('purchase', (f) => {
+        f.snapshot.state.pending.after[1].extra = false;
+      }),
+    ],
+    [
+      'reordered continuation queue',
+      () => {},
+      alter('purchase', (f) => {
+        f.snapshot.state.pending.after.reverse();
       }),
     ],
     [
