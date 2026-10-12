@@ -194,6 +194,15 @@ pub struct ConditionalFrozenPool {
     checksum: String,
 }
 impl ConditionalFrozenPool {
+    pub(crate) fn binding(
+        &self,
+        prepared: Option<&PreparedPublicPolicy>,
+    ) -> Result<serde_json::Value, String> {
+        let rosters = self.freeze(prepared)?;
+        Ok(serde_json::json!({"checksum":self.checksum,
+            "rosters":rosters.iter().map(|r|serde_json::json!({"learner":r.learner,
+                "opponents":r.descriptions,"checksum":r.checksum})).collect::<Vec<_>>()}))
+    }
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
         if raw.len() > 64 * 1024 {
             return Err("Conditional pool byte bound".into());
@@ -346,6 +355,12 @@ pub struct ConditionalMixedIdentity {
     checksum: String,
 }
 impl ConditionalMixedIdentity {
+    pub(crate) fn next_ordinal(&self) -> u64 {
+        self.next_episode_ordinal
+    }
+    pub(crate) fn origin_checksum(&self) -> &str {
+        &self.origin_checksum
+    }
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
@@ -426,6 +441,28 @@ fn make_identity(
     sampling_seed: u64,
     next: u64,
 ) -> Result<ConditionalMixedIdentity, String> {
+    identity_from_checksum(
+        origin.checksum(),
+        actor,
+        critic,
+        root,
+        parent,
+        count,
+        sampling_seed,
+        next,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn identity_from_checksum(
+    origin: &str,
+    actor: &PublicPolicyModel,
+    critic: &[f32],
+    root: &str,
+    parent: &str,
+    count: u64,
+    sampling_seed: u64,
+    next: u64,
+) -> Result<ConditionalMixedIdentity, String> {
     actor.validate()?;
     if critic.len() != crate::public_state_critic::PARAMETER_COUNT
         || critic.iter().any(|x| !x.is_finite())
@@ -437,7 +474,7 @@ fn make_identity(
     let mut identity = ConditionalMixedIdentity {
         policy_version: POLICY_VERSION.into(),
         input_contract: INPUT_CONTRACT.into(),
-        origin_checksum: origin.checksum().into(),
+        origin_checksum: origin.into(),
         root_identity_checksum: root.into(),
         parent_identity_checksum: parent.into(),
         actor_checksum: hash(
@@ -459,6 +496,51 @@ fn make_identity(
     };
     identity.checksum = hash(b"tzolkin-conditional-current-identity-v1\0", &identity)?;
     Ok(identity)
+}
+pub(crate) fn checked_tip_identity(
+    parent: &ConditionalMixedIdentity,
+    actor: &[f32],
+    critic: &[f32],
+    next: u64,
+    updated: bool,
+) -> Result<ConditionalMixedIdentity, String> {
+    let model = PublicPolicyModel {
+        parameters: actor.to_vec(),
+    };
+    identity_from_checksum(
+        &parent.origin_checksum,
+        &model,
+        critic,
+        &parent.root_identity_checksum,
+        parent.checksum(),
+        parent.mixed_update_count + u64::from(updated),
+        parent.sampling_seed,
+        next,
+    )
+}
+pub(crate) fn check_identity_bits(
+    identity: &ConditionalMixedIdentity,
+    actor: &[f32],
+    critic: &[f32],
+) -> Result<(), String> {
+    let model = PublicPolicyModel {
+        parameters: actor.to_vec(),
+    };
+    if !identity.compatible()
+        || identity_from_checksum(
+            &identity.origin_checksum,
+            &model,
+            critic,
+            &identity.root_identity_checksum,
+            &identity.parent_identity_checksum,
+            identity.mixed_update_count,
+            identity.sampling_seed,
+            identity.next_episode_ordinal,
+        )? != *identity
+    {
+        return Err("Conditional identity/actor/critic bits differ".into());
+    }
+    Ok(())
 }
 pub struct ConditionalMixedPolicyHandle<'a> {
     owner: &'a ConditionalMixedOwner,
@@ -788,6 +870,53 @@ impl ConditionalMixedSession {
         actor_config: OneStepConfig,
         critic_config: ResidualFitConfig,
     ) -> Result<ConditionalMixedOutcome, String> {
+        if self.stopped {
+            return Err("Conditional session stopped or reservation bound".into());
+        }
+        if let Err(e) = self.full_source_check() {
+            self.stop();
+            return Err(e);
+        }
+        let plan = self.plan(
+            seeds,
+            pool,
+            prepared_opponent,
+            limits,
+            actor_config,
+            critic_config,
+        )?;
+        self.reserve(&plan)?;
+        let proposal = match self.stage(&plan, pool, prepared_opponent, None) {
+            Ok(proposal) => proposal,
+            Err(e) => {
+                self.stop();
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.full_source_check() {
+            self.stop();
+            return Err(e);
+        }
+        self.admit(proposal).inspect_err(|_| self.stopped = true)
+    }
+    pub(crate) fn full_source_check(&self) -> Result<(), String> {
+        self.owner
+            .origin
+            .recheck_sources()
+            .and_then(|()| self.external.recheck())
+    }
+    pub(crate) fn stop(&mut self) {
+        self.stopped = true;
+    }
+    pub(crate) fn plan(
+        &self,
+        seeds: [u32; 4],
+        pool: &ConditionalFrozenPool,
+        prepared_opponent: Option<&PreparedPublicPolicy>,
+        limits: CollectionLimits,
+        actor_config: OneStepConfig,
+        critic_config: ResidualFitConfig,
+    ) -> Result<ConditionalReservation, String> {
         if self.stopped
             || self.attempts >= MAX_ATTEMPTS
             || self
@@ -797,15 +926,6 @@ impl ConditionalMixedSession {
                 .is_none_or(|n| n > MAX_SPENT_FAMILIES)
         {
             return Err("Conditional session stopped or reservation bound".into());
-        }
-        if let Err(e) = self
-            .owner
-            .origin
-            .recheck_sources()
-            .and_then(|()| self.external.recheck())
-        {
-            self.stopped = true;
-            return Err(e);
         }
         actor_config.validate()?;
         let rosters = pool.freeze(prepared_opponent)?;
@@ -854,83 +974,139 @@ impl ConditionalMixedSession {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Reserve before game creation. Failure never refunds this ordinal/family set.
+        Ok(ConditionalReservation {
+            parent: self.owner.identity.clone(),
+            previous_next: self.next,
+            previous_attempts: self.attempts,
+            seeds,
+            families: families
+                .try_into()
+                .map_err(|_| "Conditional family shape")?,
+            configs,
+            headers: headers.try_into().map_err(|_| "Conditional header shape")?,
+            actor_config,
+            critic_config,
+        })
+    }
+    pub(crate) fn reserve(&mut self, plan: &ConditionalReservation) -> Result<(), String> {
+        self.reserve_inner(plan, false)
+    }
+    pub(crate) fn reserve_after_publish_error(
+        &mut self,
+        plan: &ConditionalReservation,
+    ) -> Result<(), String> {
+        self.reserve_inner(plan, true)
+    }
+    fn reserve_inner(
+        &mut self,
+        plan: &ConditionalReservation,
+        dead_commit: bool,
+    ) -> Result<(), String> {
+        if (!dead_commit && self.stopped)
+            || plan.parent != self.owner.identity
+            || plan.previous_next != self.next
+            || plan.previous_attempts != self.attempts
+            || plan.families.iter().any(|f| self.spent.contains(f))
+        {
+            return Err("Conditional reservation differs from live immediate parent".into());
+        }
         self.next = self
             .next
             .checked_add(4)
             .ok_or("Conditional ordinal overflow")?;
         self.attempts += 1;
-        self.spent.extend(families.iter().cloned());
-        let result = (|| {
-            let mut episodes = Vec::new();
-            for i in 0..4 {
-                let record = run_conditional_mixed_shared(
-                    &configs[i],
-                    &handle,
-                    &rosters[i],
-                    headers[i].clone(),
-                    None,
-                )?;
-                let raw = encode_typed_record(&record)?;
-                let expected: Record<ConditionalMixedSource> = decode_typed_record(&raw)?;
-                if expected.schema != RECORD_SCHEMA
-                    || expected.header != headers[i]
-                    || expected.training_admission != "unavailable-distinct-codec-required"
-                {
-                    return Err("Conditional full source/header differs before audit".into());
-                }
-                let audited = run_conditional_mixed_shared(
-                    &configs[i],
-                    &handle,
-                    &rosters[i],
-                    headers[i].clone(),
-                    Some(&expected),
-                )?;
-                episodes.push(ConditionalEpisode::from_audited(
-                    audited,
-                    configs[i].clone(),
-                )?);
-            }
-            prepare(
-                &self.owner,
-                &episodes,
-                families
-                    .try_into()
-                    .map_err(|_| "Conditional whole-four family shape")?,
-                pool,
-                actor_config,
-                critic_config,
-                self.attempts,
+        self.spent.extend(plan.families.iter().cloned());
+        Ok(())
+    }
+    pub(crate) fn proposed_identity(
+        &self,
+        proposal: &JointProposal,
+    ) -> Result<ConditionalMixedIdentity, String> {
+        match &proposal.updated {
+            Some((_, _, artifact)) => Ok(artifact.identity.clone()),
+            None => checked_tip_identity(
+                &self.owner.identity,
+                self.owner.actor.parameters(),
+                &self.owner.critic,
                 self.next,
-                self.credited,
-            )
-        })();
-        let proposal = match result {
-            Ok(p) => p,
-            Err(e) => {
-                self.stopped = true;
-                return Err(e);
-            }
-        };
-        // Full raw checks at the closing boundary, never in a callback.
-        if let Err(e) = self
-            .owner
-            .origin
-            .recheck_sources()
-            .and_then(|()| self.external.recheck())
-        {
-            self.stopped = true;
-            return Err(e);
-        }
-        match self.admit(proposal) {
-            Ok(outcome) => Ok(outcome),
-            Err(e) => {
-                self.stopped = true;
-                Err(e)
-            }
+                false,
+            ),
         }
     }
-    fn admit(&mut self, proposal: JointProposal) -> Result<ConditionalMixedOutcome, String> {
+    pub(crate) fn stage(
+        &self,
+        plan: &ConditionalReservation,
+        pool: &ConditionalFrozenPool,
+        prepared_opponent: Option<&PreparedPublicPolicy>,
+        saved: Option<&[Vec<u8>; 4]>,
+    ) -> Result<JointProposal, String> {
+        if self.stopped
+            || plan.parent != self.owner.identity
+            || self.next != plan.previous_next + 4
+            || self.attempts != plan.previous_attempts + 1
+            || plan.families.iter().any(|f| !self.spent.contains(f))
+        {
+            return Err("Conditional stage has no exact reserved parent".into());
+        }
+        let handle = self.owner.handle()?;
+        let rosters = pool.freeze(prepared_opponent)?;
+        let mut episodes = Vec::new();
+        for i in 0..4 {
+            let actual_header = header(
+                &plan.configs[i],
+                &handle,
+                &rosters[i],
+                &pool.checksum,
+                &self.external,
+            )?;
+            if actual_header != plan.headers[i] {
+                return Err("Conditional frozen stage binding differs".into());
+            }
+            let raw = match saved {
+                Some(records) => records[i].clone(),
+                None => encode_typed_record(&run_conditional_mixed_shared(
+                    &plan.configs[i],
+                    &handle,
+                    &rosters[i],
+                    actual_header.clone(),
+                    None,
+                )?)?,
+            };
+            let expected: Record<ConditionalMixedSource> = decode_typed_record(&raw)?;
+            if expected.schema != RECORD_SCHEMA
+                || expected.header != actual_header
+                || expected.training_admission != "unavailable-distinct-codec-required"
+            {
+                return Err("Conditional full source/header differs before audit".into());
+            }
+            let audited = run_conditional_mixed_shared(
+                &plan.configs[i],
+                &handle,
+                &rosters[i],
+                actual_header,
+                Some(&expected),
+            )?;
+            episodes.push(ConditionalEpisode::from_audited(
+                audited,
+                plan.configs[i].clone(),
+            )?);
+        }
+        prepare(
+            &self.owner,
+            &episodes,
+            plan.families.clone(),
+            pool,
+            plan.actor_config,
+            plan.critic_config,
+            self.attempts,
+            self.next,
+            self.credited,
+        )
+    }
+    pub(crate) fn admit(
+        &mut self,
+        proposal: JointProposal,
+    ) -> Result<ConditionalMixedOutcome, String> {
         if proposal.parent != self.owner.identity
             || proposal.report.next_episode_ordinal != self.next
             || proposal.report.attempted_whole_four != self.attempts
@@ -998,11 +1174,109 @@ impl ConditionalMixedSession {
         })
     }
 }
-struct JointProposal {
+pub(crate) struct ConditionalReservation {
+    parent: ConditionalMixedIdentity,
+    previous_next: u64,
+    previous_attempts: u64,
+    seeds: [u32; 4],
+    families: [NativeSeedFamily; 4],
+    configs: [NativeStochasticConfig; 4],
+    headers: [Header<ConditionalMixedSource>; 4],
+    actor_config: OneStepConfig,
+    critic_config: ResidualFitConfig,
+}
+impl ConditionalReservation {
+    pub(crate) fn seeds(&self) -> [u32; 4] {
+        self.seeds
+    }
+    pub(crate) fn families(&self) -> [String; 4] {
+        self.families.each_ref().map(|f| f.digest.clone())
+    }
+    pub(crate) fn parent(&self) -> &ConditionalMixedIdentity {
+        &self.parent
+    }
+}
+pub(crate) struct JointProposal {
     parent: ConditionalMixedIdentity,
     report: ConditionalMixedReport,
     updated: Option<(PublicPolicyModel, Vec<f32>, ConditionalMixedArtifact)>,
     records: [Vec<u8>; 4],
+}
+impl JointProposal {
+    pub(crate) fn payload(&self) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+        let report = crate::policy_training::bounded_json(&self.report)?;
+        let artifact = self
+            .updated
+            .as_ref()
+            .map(|(_, _, artifact)| crate::policy_training::bounded_json(artifact))
+            .transpose()?;
+        Ok((report, artifact))
+    }
+    pub(crate) fn records(&self) -> &[Vec<u8>; 4] {
+        &self.records
+    }
+    pub(crate) fn is_updated(&self) -> bool {
+        self.updated.is_some()
+    }
+    pub(crate) fn own_credit(&self) -> u64 {
+        self.report.credited_own_decisions
+    }
+}
+#[cfg(test)]
+pub(crate) fn test_short_stage(
+    session: &ConditionalMixedSession,
+    plan: &ConditionalReservation,
+    pool: &ConditionalFrozenPool,
+    winning: bool,
+    saved: Option<&[Vec<u8>; 4]>,
+) -> Result<JointProposal, String> {
+    let handle = session.owner.handle()?;
+    let rosters = pool.freeze(None)?;
+    let mut episodes = Vec::new();
+    for (i, roster) in rosters.iter().enumerate() {
+        let config = &plan.configs[i];
+        let mut start = tests::terminal_start(config.players(), plan.seeds[i]);
+        if !winning {
+            start.players[0].score = 0.0;
+            for player in start.players.iter_mut().skip(1) {
+                player.score = 100.0;
+            }
+        }
+        let expected = match saved {
+            Some(raw) => Some(decode_typed_record::<ConditionalMixedSource>(&raw[i])?),
+            None => None,
+        };
+        let record = crate::public_stochastic_native::conditional_test_start(
+            config,
+            &handle,
+            roster,
+            plan.headers[i].clone(),
+            expected.as_ref(),
+            start.clone(),
+        )?;
+        let raw = encode_typed_record(&record)?;
+        let expected = decode_typed_record::<ConditionalMixedSource>(&raw)?;
+        let audited = crate::public_stochastic_native::conditional_test_start(
+            config,
+            &handle,
+            roster,
+            plan.headers[i].clone(),
+            Some(&expected),
+            start,
+        )?;
+        episodes.push(ConditionalEpisode::from_audited(audited, config.clone())?);
+    }
+    prepare(
+        &session.owner,
+        &episodes,
+        plan.families.clone(),
+        pool,
+        plan.actor_config,
+        plan.critic_config,
+        session.attempts,
+        session.next,
+        session.credited,
+    )
 }
 #[allow(clippy::too_many_arguments)]
 fn prepare(
@@ -1172,7 +1446,7 @@ fn prepare(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::human_policy_dataset::ConditionalHumanPolicyDataset;
     use crate::human_policy_training::{
@@ -1222,7 +1496,7 @@ mod tests {
             "rosters":[[null,opponent,opponent],[null,opponent,opponent],
                 [null,opponent,opponent,opponent],[null,opponent,opponent,opponent]]})
     }
-    fn owner() -> ConditionalMixedOwner {
+    pub(crate) fn owner() -> ConditionalMixedOwner {
         let datasets = [
             ConditionalHumanPolicyDataset::training_fixture("123", DatasetSplit::Train, 0),
             ConditionalHumanPolicyDataset::training_fixture("124", DatasetSplit::Validation, 1),
@@ -1302,7 +1576,7 @@ mod tests {
         );
         assert_eq!(session.attempts(), 1);
     }
-    fn terminal_start(players: usize, seed: u32) -> tzolkin_core::GameState {
+    pub(crate) fn terminal_start(players: usize, seed: u32) -> tzolkin_core::GameState {
         let mut state = tzolkin_core::create_game_with_options(
             (0..players).map(|p| format!("P{p}")).collect(),
             seed,
