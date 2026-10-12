@@ -2,6 +2,7 @@
 pub use super::numeric::run_conditional_validation;
 use crate::Decision;
 use crate::dataset::DatasetSplit;
+use crate::human_policy_dataset::FACTORIZED_LABEL_SCOPE;
 use crate::human_policy_training::PreparedConditionalHumanPolicy;
 use crate::policy::HeuristicWeights;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,19 @@ impl<'a> ConditionalPolicy<'a> {
     pub fn identity(&self) -> &ConditionalIdentity {
         &self.identity
     }
+    pub(super) fn teacher_grammar_contains(&self, kind: &str) -> bool {
+        teacher_grammar_contains(self.prepared.identity().label_scope.as_deref(), kind)
+    }
+}
+
+fn teacher_grammar_contains(label_scope: Option<&str>, kind: &str) -> bool {
+    match label_scope {
+        None => matches!(kind, "place" | "remove" | "firstPlayer"),
+        Some(FACTORIZED_LABEL_SCOPE) => {
+            matches!(kind, "place" | "remove" | "firstPlayer" | "useAction")
+        }
+        Some(_) => false,
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -93,6 +107,8 @@ pub struct ConditionalDiagnostics {
     /// Counts categories even when the training dataset had no such labels.
     /// A grammar-supported category need not occur in the actual Train tables.
     pub selected_action_kinds: BTreeMap<String, usize>,
+    /// Uses the sealed dataset label scope: v1 primitives, v2 also UseAction.
+    /// Membership does not establish positive Train coverage of that category.
     pub outside_teacher_grammar_choices: usize,
 }
 
@@ -292,6 +308,40 @@ mod tests {
     }
     #[test]
     fn conditional_callbacks_and_setup_are_explicit_and_fail_closed() {
+        for scope in [None, Some(FACTORIZED_LABEL_SCOPE)] {
+            for kind in ["place", "remove", "firstPlayer"] {
+                assert!(teacher_grammar_contains(scope, kind));
+            }
+            assert_eq!(
+                teacher_grammar_contains(scope, "useAction"),
+                scope.is_some()
+            );
+            assert!(!teacher_grammar_contains(scope, "trade"));
+            assert!(!teacher_grammar_contains(scope, "build"));
+        }
+        assert!(!teacher_grammar_contains(Some("unknown"), "place"));
+        let legacy = serde_json::json!({
+            "task": "ConditionalBasicHumanPolicy", "inputContract": "synthetic",
+            "featureSchema": 1, "featureCount": 512, "rulesVersion": 1,
+            "catalogHash": "synthetic", "sourceAuthenticated": false,
+            "sourceQualified": false, "verifiedNativePolicy": false, "tables": [],
+            "samples": [0, 0, 0], "candidates": [0, 0, 0], "fingerprint": "synthetic"
+        });
+        // Structural serialization only; this is not a qualified dataset identity.
+        let mut identity: crate::human_policy_training::ConditionalDatasetIdentity =
+            serde_json::from_value(legacy.clone()).unwrap();
+        assert!(identity.label_scope.is_none());
+        assert_eq!(serde_json::to_value(&identity).unwrap(), legacy);
+        identity.label_scope = Some(FACTORIZED_LABEL_SCOPE.into());
+        let expanded = serde_json::to_value(&identity).unwrap();
+        assert_eq!(expanded["labelScope"], FACTORIZED_LABEL_SCOPE);
+        assert_eq!(
+            serde_json::from_value::<crate::human_policy_training::ConditionalDatasetIdentity>(
+                expanded
+            )
+            .unwrap(),
+            identity
+        );
         let invalid = TradeGuardConfig {
             max_trades_per_episode: 0,
             ..TradeGuardConfig::default()

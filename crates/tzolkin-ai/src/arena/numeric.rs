@@ -404,7 +404,7 @@ fn choose(
                 .entry(kind.into())
                 .or_default() += 1;
             conditional.outside_teacher_grammar_choices +=
-                usize::from(!matches!(kind, "place" | "remove" | "firstPlayer"));
+                usize::from(!policy.teacher_grammar_contains(kind));
         }
         result.decision
     } else {
