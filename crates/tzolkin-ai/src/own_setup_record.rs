@@ -25,6 +25,9 @@ const CHECKSUM_DOMAIN: &[u8] = b"tzolkin-own-setup-native-record-v1\0";
 pub const TRAINED_RECORD_SCHEMA: &str = "tzolkin-own-setup-trained-native-record-v2";
 pub const TRAINED_SOURCE_KIND: &str = "trainedOwnSetupSampleFixedGuardedPlayingV5";
 const TRAINED_CHECKSUM_DOMAIN: &[u8] = b"tzolkin-own-setup-trained-native-record-v2\0";
+pub const ROSTERED_RECORD_SCHEMA: &str = "tzolkin-own-setup-rostered-trained-native-record-v1";
+pub const ROSTERED_SOURCE_KIND: &str = "trainedOwnSetupSampleClosedV5FixedPlayingRoster";
+const ROSTERED_CHECKSUM_DOMAIN: &[u8] = b"tzolkin-own-setup-rostered-trained-native-record-v1\0";
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -56,6 +59,9 @@ pub(crate) struct Header<S = InitializedOwnSetupIdentity> {
     pub producer_authenticated: bool,
     pub independent_seed_origins_verified: bool,
     pub training_admission: String,
+    // Absent in both legacy schemas: their ordered serialized bytes stay exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster: Option<crate::own_setup_roster::OwnSetupRosterBinding>,
 }
 pub(crate) use tzolkin_inference::own_setup_deployment::FixedPlayingIdentity;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -63,6 +69,7 @@ pub(crate) use tzolkin_inference::own_setup_deployment::FixedPlayingIdentity;
 pub(crate) enum SeatRole {
     LearnerSetupFixedPlaying,
     V5Opponent,
+    FixedPlayingNnOpponent,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +77,7 @@ pub(crate) enum CallbackRole {
     SetupSample,
     FixedPlaying,
     V5Opponent,
+    FixedPlayingNnOpponent,
 }
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -90,6 +98,15 @@ pub(crate) struct Callback {
     pub state_after: Option<String>,
     pub state_validated: bool,
     pub failure: Option<Failure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guards: Option<Vec<GuardNotification>>,
+}
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct GuardNotification {
+    pub seat: usize,
+    pub attempted: bool,
+    pub returned: bool,
 }
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(
@@ -111,12 +128,17 @@ pub(crate) enum Choice {
         decision: DecisionWire,
         chosen: LegalAction,
     },
+    FixedPlayingNnOpponent {
+        guarded: GuardedWire,
+        chosen: LegalAction,
+    },
 }
 impl Choice {
     pub(crate) fn chosen(&self) -> &LegalAction {
         match self {
             Self::SetupSample { chosen, .. }
             | Self::FixedPlaying { chosen, .. }
+            | Self::FixedPlayingNnOpponent { chosen, .. }
             | Self::V5Opponent { chosen, .. } => chosen,
         }
     }
@@ -125,6 +147,7 @@ impl Choice {
             Self::SetupSample { .. } => CallbackRole::SetupSample,
             Self::FixedPlaying { .. } => CallbackRole::FixedPlaying,
             Self::V5Opponent { .. } => CallbackRole::V5Opponent,
+            Self::FixedPlayingNnOpponent { .. } => CallbackRole::FixedPlayingNnOpponent,
         }
     }
 }
@@ -277,6 +300,7 @@ pub(crate) fn checksum<S: Serialize>(record: &Record<S>) -> Result<String, Strin
     out.hash.update(match record.schema.as_str() {
         RECORD_SCHEMA => CHECKSUM_DOMAIN,
         TRAINED_RECORD_SCHEMA => TRAINED_CHECKSUM_DOMAIN,
+        ROSTERED_RECORD_SCHEMA => ROSTERED_CHECKSUM_DOMAIN,
         _ => return Err("Unsupported Own Setup checksum domain".into()),
     });
     serde_json::to_writer(&mut out, &ChecksumPayload(record)).map_err(|e| e.to_string())?;
@@ -291,6 +315,20 @@ fn decode_kind<S: serde::de::DeserializeOwned + Serialize>(
     if raw != serde_json::to_value(&record).map_err(|e| e.to_string())? || record.schema != schema {
         return Err("Own Setup record closed schema/field mismatch".into());
     }
+    if schema != ROSTERED_RECORD_SCHEMA
+        && (record.header.roster.is_some()
+            || record
+                .header
+                .roles
+                .contains(&SeatRole::FixedPlayingNnOpponent)
+            || record.callbacks.iter().any(|cb| {
+                cb.guards.is_some()
+                    || cb.role == CallbackRole::FixedPlayingNnOpponent
+                    || matches!(cb.choice, Some(Choice::FixedPlayingNnOpponent { .. }))
+            }))
+    {
+        return Err("Legacy Own Setup record cannot contain roster fields or NN opponents".into());
+    }
     if record.checksum.len() != 64 || record.checksum != checksum(&record)? {
         return Err("Own Setup record checksum mismatch".into());
     }
@@ -301,6 +339,16 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Record, String> {
 }
 pub(crate) fn decode_trained(bytes: &[u8]) -> Result<Record<TrainedOwnSetupIdentity>, String> {
     decode_kind(bytes, TRAINED_RECORD_SCHEMA)
+}
+pub(crate) fn decode_rostered(bytes: &[u8]) -> Result<Record<TrainedOwnSetupIdentity>, String> {
+    decode_kind(bytes, ROSTERED_RECORD_SCHEMA)
+}
+/// Encode only a source-produced roster collection, including a failure prefix.
+pub fn encode_rostered_record(
+    game: &crate::own_setup_roster::CollectedRosteredOwnSetupGame,
+) -> Result<Vec<u8>, String> {
+    serialized_size(&game.record, MAX_RECORD_BYTES)?;
+    serde_json::to_vec(&game.record).map_err(|e| e.to_string())
 }
 /// Encode only an actual collection result, including a closed failure prefix.
 pub fn encode_record(game: &CollectedOwnSetupGame) -> Result<Vec<u8>, String> {

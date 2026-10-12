@@ -19,6 +19,7 @@ pub mod own_setup_model;
 pub mod own_setup_native;
 pub mod own_setup_pullback;
 pub mod own_setup_record;
+pub mod own_setup_roster;
 pub mod own_setup_run;
 pub mod own_setup_trained_model;
 pub mod own_setup_training;
