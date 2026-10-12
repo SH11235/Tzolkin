@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use tzolkin_ai::dataset::DatasetSplit;
 use tzolkin_ai::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
 use tzolkin_ai::human_policy_dataset::{
-    ConditionalHumanPolicyDataset, FACTORIZED_LABEL_SCOPE, INPUT_SCHEMA, INPUT_SCHEMA_V2,
-    INPUT_SCHEMA_V3, PAID_TECHNOLOGY_LABEL_SCOPE,
+    ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
+    INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{
@@ -351,6 +351,152 @@ impl Fixture {
         );
         self.raw["dom_entries"][0]["messages"] = json!(messages);
     }
+    fn explicit_operation(anywhere: bool, resource: tzolkin_core::Resource) -> Self {
+        use tzolkin_core::Resource;
+        use tzolkin_core::observation::ActionSource;
+        // Actual dealt wealth, then a few legal turn cycles to Uxmal 2 or 5.
+        let (seed, tiles) = if resource == Resource::Gold {
+            (18, ["w16", "w19"])
+        } else {
+            (9, ["w07", "w10"])
+        };
+        let mut state =
+            create_game((0..4).map(|i| format!("P{i}")).collect(), seed, false).unwrap();
+        while state.phase == Phase::Setup {
+            let row = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .filter(|row| match &row.action {
+                    TypedAction::ChooseWealth { ids } if state.current_player == 0 => {
+                        tiles.iter().all(|tile| ids.iter().any(|id| id == tile))
+                    }
+                    TypedAction::ChooseWealth { .. } => true,
+                    _ => false,
+                })
+                .max_by_key(|row| {
+                    let TypedAction::ChooseWealth { ids } = &row.action else {
+                        unreachable!()
+                    };
+                    ids.iter()
+                        .map(|id| {
+                            tzolkin_core::catalog::wealth(id)
+                                .unwrap()
+                                .resources
+                                .get(&Resource::Corn)
+                                .copied()
+                                .unwrap_or(0)
+                        })
+                        .sum::<i64>()
+                })
+                .unwrap();
+            state = apply_move(&state, row.r#move).unwrap();
+        }
+        let initial = PublicState::from_game_state(&state).unwrap();
+        assert_eq!(state.current_player, 0);
+        let mut steps = Vec::new();
+        let cycles = if anywhere { 5 } else { 2 };
+        for turn in 0..4 * cycles {
+            let rows = observe(&state, state.current_player).unwrap().legal_actions;
+            let gear = if turn == 0 {
+                GearId::Uxmal
+            } else {
+                GearId::Palenque
+            };
+            let row = rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: g, discount: false, .. } if g == gear))
+                .or_else(|| rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Palenque, .. }))).unwrap();
+            steps.push(json!({"actor":state.current_player,"move":row.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            state = apply_move(&state, row.r#move.clone()).unwrap();
+            while state.pending.is_some() {
+                let skip = observe(&state, state.current_player)
+                    .unwrap()
+                    .legal_actions
+                    .into_iter()
+                    .find(|row| row.action == TypedAction::Skip)
+                    .unwrap();
+                steps.push(json!({"actor":state.current_player,"move":skip.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+                state = apply_move(&state, skip.r#move).unwrap();
+            }
+            let end = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|row| {
+                    matches!(
+                        row.action,
+                        TypedAction::EndTurn {
+                            double_advance: None | Some(false)
+                        }
+                    )
+                })
+                .unwrap();
+            steps.push(json!({"actor":state.current_player,"move":end.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            state = apply_move(&state, end.r#move).unwrap();
+        }
+        assert_eq!(state.current_player, 0);
+        let removal = observe(&state, 0)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                row.action
+                    == TypedAction::Remove {
+                        gear: GearId::Uxmal,
+                        position: cycles,
+                    }
+            })
+            .unwrap();
+        steps.push(json!({"actor":0,"move":removal.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+        state = apply_move(&state, removal.r#move).unwrap();
+        let action = observe(&state, 0).unwrap().legal_actions.into_iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Uxmal, position, source: ActionSource::CurrentGear, .. } if position == cycles)).unwrap();
+        steps.push(json!({"actor":0,"move":action.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+        state = apply_move(&state, action.r#move).unwrap();
+        let choice = observe(&state, 0)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                if anywhere {
+                    row.action
+                        == TypedAction::UseAction {
+                            gear: GearId::Uxmal,
+                            position: 3,
+                            source: ActionSource::Anywhere,
+                            corn_cost: 1,
+                        }
+                } else {
+                    row.action
+                        == TypedAction::Trade {
+                            resource,
+                            buy: false,
+                        }
+                }
+            })
+            .unwrap();
+        let mut fixture = Self::new();
+        fixture.record["initial"] = serde_json::to_value(initial).unwrap();
+        let decision_step = steps.len() + 1;
+        steps.push(json!({"actor":0,"move":choice.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
+        fixture.record["steps"] = json!(steps);
+        fixture.audit["audit"] = json!([{ "step":decision_step,"actionId":10,"actor":0,"action":choice.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1 }]);
+        fixture.raw["metadata"]["players"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"text":"P3","url":"https://boardgamearena.com/player?id=104"}));
+        let message = if anywhere {
+            json!({"raw_text":"P0はコーン1個を支払ってUxmal n°3のアクションを行った"})
+        } else {
+            let (name, corn) = match resource {
+                Resource::Wood => ("wood", 2),
+                Resource::Stone => ("stone", 3),
+                Resource::Gold => ("gold", 4),
+                _ => unreachable!(),
+            };
+            json!({"raw_text":format!("P0は1\nを{corn}\nに交換した"),"html":format!("P0は1<div class=\"tz_icon resource_{name}\"></div>を{corn}<div class=\"tz_icon resource_corn\"></div>に交換した"),"icons":[]})
+        };
+        fixture.set_messages(vec![message]);
+        fixture
+    }
     fn pin(&self, name: &str, value: &Value) -> Value {
         let bytes = serde_json::to_vec(value).unwrap();
         fs::write(self.root.join(name), &bytes).unwrap();
@@ -381,7 +527,9 @@ impl Fixture {
             manifest["labelScope"] = scope;
         }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V3 {
+        let file = if schema == INPUT_SCHEMA_V4 {
+            "manifest-v4.json"
+        } else if schema == INPUT_SCHEMA_V3 {
             "manifest-v3.json"
         } else if schema == INPUT_SCHEMA_V2 {
             "manifest-v2.json"
@@ -558,6 +706,160 @@ fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel
         fs::write(path, original).unwrap();
     }
     owner.origin().recheck_sources().unwrap();
+}
+
+#[test]
+fn observed_market_and_paid_anywhere_v4_require_exact_source_authority() {
+    use tzolkin_core::Resource;
+    let load = |f: &Fixture| {
+        f.load_scope(
+            INPUT_SCHEMA_V4,
+            Some(json!(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)),
+        )
+    };
+    for anywhere in [false, true] {
+        let fixture = Fixture::explicit_operation(anywhere, Resource::Wood);
+        assert!(
+            fixture
+                .load_scope(INPUT_SCHEMA_V3, Some(json!(PAID_TECHNOLOGY_LABEL_SCOPE)))
+                .unwrap()
+                .samples()
+                .is_empty()
+        );
+        let dataset = load(&fixture).unwrap();
+        assert_eq!(dataset.samples().len(), 1);
+        let report = serde_json::to_value(dataset.report()).unwrap();
+        assert_eq!(
+            report["schema"],
+            "tzolkin-conditional-basic-human-policy-dataset-v4"
+        );
+        assert_eq!(
+            report["samples"][0]["sourceLabelPart"],
+            if anywhere {
+                "paidAnywhere"
+            } else {
+                "marketSell"
+            }
+        );
+        assert_eq!(report["samples"][0]["valueTarget"], Value::Null);
+        assert!(dataset.samples()[0].candidates().len() > 1);
+        for flag in [
+            "sourceAuthenticated",
+            "sourceQualified",
+            "verifiedNativePolicy",
+            "trainingReady",
+            "valueSupervised",
+        ] {
+            assert_eq!(report[flag], false);
+        }
+        for change in [
+            "actor",
+            "amount",
+            "target",
+            "duplicate",
+            "extraMarkup",
+            "iconMismatch",
+            "badAudit",
+            "rollback",
+        ] {
+            let mut f = Fixture::explicit_operation(anywhere, Resource::Wood);
+            let mut message = f.raw["dom_entries"][0]["messages"][0].clone();
+            match change {
+                "actor" => {
+                    message["raw_text"] = json!(
+                        message["raw_text"]
+                            .as_str()
+                            .unwrap()
+                            .replacen("P0", "P1", 1)
+                    )
+                }
+                "amount" => {
+                    message["raw_text"] =
+                        json!(message["raw_text"].as_str().unwrap().replacen('1', "2", 1))
+                }
+                "target" => {
+                    message["raw_text"] = json!(message["raw_text"].as_str().unwrap().replace(
+                        if anywhere { "Uxmal" } else { "を2" },
+                        if anywhere { "Tikal" } else { "を3" }
+                    ));
+                }
+                "extraMarkup" => {
+                    message["html"] = json!(format!(
+                        "{}<span></span>",
+                        message
+                            .get("html")
+                            .and_then(Value::as_str)
+                            .unwrap_or(message["raw_text"].as_str().unwrap())
+                    ))
+                }
+                "iconMismatch" => {
+                    message["icons"] = json!([{"classes":"tz_icon resource_gold"},{"classes":"tz_icon resource_corn"}])
+                }
+                "badAudit" => f.audit["audit"][0]["equivalentChoices"] = json!(2),
+                "rollback" => f.audit["audit"][0]["removedSteps"] = json!([]),
+                "duplicate" => {}
+                _ => unreachable!(),
+            }
+            f.set_messages(if change == "duplicate" {
+                vec![message.clone(), message]
+            } else {
+                vec![message]
+            });
+            if let Ok(dataset) = load(&f) {
+                assert!(dataset.samples().is_empty(), "{anywhere}/{change}");
+            }
+        }
+    }
+    // The structured icon list cannot be overridden by otherwise correct HTML.
+    let mut f = Fixture::explicit_operation(false, Resource::Stone);
+    let mut message = f.raw["dom_entries"][0]["messages"][0].clone();
+    message["icons"] =
+        json!([{"classes":"tz_icon resource_stone"},{"classes":"tz_icon resource_corn"}]);
+    f.set_messages(vec![message]);
+    assert_eq!(load(&f).unwrap().samples().len(), 1);
+    assert_eq!(
+        load(&Fixture::explicit_operation(false, Resource::Gold))
+            .unwrap()
+            .samples()
+            .len(),
+        1
+    );
+    f.raw["schema_version"] = json!(1);
+    f.raw["source_type"] = json!("public_ui_dom");
+    f.raw["export_scope"] = json!("all_rendered_gamereview_log_entries");
+    f.raw["dom_entry_count"] = json!(1);
+    f.raw["metadata"] = json!({"tableUrl":"https://boardgamearena.com/table?table=123","players":
+        (0..4).map(|i| json!({"name":format!("P{i}"),"id":format!("{}",101+i)})).collect::<Vec<_>>()});
+    for icon in f.raw["dom_entries"][0]["messages"][0]["icons"]
+        .as_array_mut()
+        .unwrap()
+    {
+        icon["class"] = icon["classes"].clone();
+    }
+    f.raw["entries"][0]["raw_text"] = json!(format!(
+        "行動 10 :\n12:00\n{}",
+        f.raw["entries"][0]["raw_text"].as_str().unwrap()
+    ));
+    assert_eq!(load(&f).unwrap().samples().len(), 1);
+    // Existing v3 labels and IDs are byte-identical in v4, while scope is distinct.
+    for f in [
+        Fixture::paired_action(2, 1),
+        Fixture::paid_technology(4, 1, [1, 1, 0]),
+    ] {
+        let v3 = f
+            .load_scope(INPUT_SCHEMA_V3, Some(json!(PAID_TECHNOLOGY_LABEL_SCOPE)))
+            .unwrap();
+        let v4 = load(&f).unwrap();
+        assert_eq!(
+            serde_json::to_vec(v3.samples()).unwrap(),
+            serde_json::to_vec(v4.samples()).unwrap()
+        );
+        assert_ne!(v3.fingerprint().unwrap(), v4.fingerprint().unwrap());
+    }
+    assert!(
+        f.load_scope(INPUT_SCHEMA_V4, Some(json!(PAID_TECHNOLOGY_LABEL_SCOPE)))
+            .is_err()
+    );
 }
 
 #[test]

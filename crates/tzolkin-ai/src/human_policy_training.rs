@@ -4,8 +4,8 @@ use crate::features::{FEATURE_COUNT, FeatureEncoder, MAX_LEGAL_ACTIONS, PUBLIC_F
 use crate::human_initial_wealth::ContentPin;
 use crate::human_initial_wealth::table_family_id;
 use crate::human_policy_dataset::{
-    ConditionalHumanPolicyDataset, FACTORIZED_LABEL_SCOPE, HumanPolicySample,
-    PAID_TECHNOLOGY_LABEL_SCOPE, TASK,
+    ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
+    HumanPolicySample, PAID_TECHNOLOGY_LABEL_SCOPE, TASK,
 };
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::model::{Random, digest};
@@ -158,7 +158,9 @@ impl ConditionalDatasetIdentity {
         if self.task != TASK
             || self.input_contract != INPUT_CONTRACT
             || self.label_scope.as_deref().is_some_and(|scope| {
-                scope != FACTORIZED_LABEL_SCOPE && scope != PAID_TECHNOLOGY_LABEL_SCOPE
+                scope != FACTORIZED_LABEL_SCOPE
+                    && scope != PAID_TECHNOLOGY_LABEL_SCOPE
+                    && scope != EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
             })
             || self.feature_schema != PUBLIC_FEATURE_SCHEMA
             || self.feature_count != FEATURE_COUNT

@@ -20,7 +20,9 @@ use tzolkin_core::public_replay::{
     PUBLIC_RULES_VERSION, PublicReplayRecord, PublicReplayReport, inspect_public,
     public_catalog_hash, verify_public_replay,
 };
-use tzolkin_core::{GameOptions, GearId, Pending, Phase, RESOURCE_IDS, Task, TechnologyId};
+use tzolkin_core::{
+    GameOptions, GearId, Pending, Phase, RESOURCE_IDS, Resource, Task, TechnologyId,
+};
 
 pub const INPUT_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-source-v1";
 pub const DATASET_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-dataset-v1";
@@ -31,6 +33,10 @@ pub const INPUT_SCHEMA_V3: &str = "tzolkin-conditional-basic-human-policy-source
 pub const DATASET_SCHEMA_V3: &str = "tzolkin-conditional-basic-human-policy-dataset-v3";
 pub const PAID_TECHNOLOGY_LABEL_SCOPE: &str =
     "PrimitivesRemovalActionAndObservedUncappedPaidTechnologyV3";
+pub const INPUT_SCHEMA_V4: &str = "tzolkin-conditional-basic-human-policy-source-v4";
+pub const DATASET_SCHEMA_V4: &str = "tzolkin-conditional-basic-human-policy-dataset-v4";
+pub const EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE: &str =
+    "PrimitivesRemovalPaidTechnologyAndObservedMarketSellPaidAnywhereV4";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -81,6 +87,9 @@ impl Manifest {
             (INPUT_SCHEMA_V2, Some(FACTORIZED_LABEL_SCOPE)) => Ok(Some(FACTORIZED_LABEL_SCOPE)),
             (INPUT_SCHEMA_V3, Some(PAID_TECHNOLOGY_LABEL_SCOPE)) => {
                 Ok(Some(PAID_TECHNOLOGY_LABEL_SCOPE))
+            }
+            (INPUT_SCHEMA_V4, Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)) => {
+                Ok(Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE))
             }
             _ => Err("Conditional Human manifest label scope mismatch".into()),
         }
@@ -683,6 +692,75 @@ struct PaidTechnologyEvidence {
     payment_observation: tzolkin_core::observation::Observation,
     payment_chosen: usize,
 }
+
+// The complete literal caption is the authority, not an inferred resource delta.
+// Nonempty captured icons must agree with both literal icons in their order.
+fn market_sell_caption(
+    message: &Value,
+    name: &str,
+    resource: Resource,
+    corn: i64,
+    current_format: bool,
+) -> bool {
+    if !(1..=1000).contains(&corn) {
+        return false;
+    }
+    let resource = match resource {
+        Resource::Wood => "wood",
+        Resource::Stone => "stone",
+        Resource::Gold => "gold",
+        _ => return false,
+    };
+    let prefix = format!("{name}は");
+    let Some(body) = message["raw_text"]
+        .as_str()
+        .and_then(|text| text.strip_prefix(&prefix))
+    else {
+        return false;
+    };
+    let Some((from, to)) = body
+        .strip_suffix("に交換した")
+        .and_then(|body| body.split_once('を'))
+    else {
+        return false;
+    };
+    if from.trim() != "1" || to.trim() != corn.to_string()
+        || message["html"].as_str() != Some(format!("{prefix}1<div class=\"tz_icon resource_{resource}\"></div>を{corn}<div class=\"tz_icon resource_corn\"></div>に交換した").as_str())
+    {
+        return false;
+    }
+    let Some(icons) = message["icons"].as_array() else {
+        return false;
+    };
+    icons.is_empty()
+        || (icons.len() == 2
+            && icons
+                .iter()
+                .zip([resource, "corn"])
+                .all(|(icon, resource)| {
+                    icon[if current_format { "class" } else { "classes" }].as_str()
+                        == Some(format!("tz_icon resource_{resource}").as_str())
+                }))
+}
+
+fn paid_anywhere_caption(message: &Value, name: &str, gear: GearId, position: i64) -> bool {
+    let gear = match gear {
+        GearId::Palenque => "Palenque",
+        GearId::Yaxchilan => "Yaxchilan",
+        GearId::Tikal => "Tikal",
+        GearId::Uxmal => "Uxmal",
+        GearId::ChichenItza => "Chichen Itza",
+    };
+    let caption = format!("{name}はコーン1個を支払って{gear} n°{position}のアクションを行った");
+    message["raw_text"].as_str() == Some(caption.as_str())
+        && message
+            .get("html")
+            .is_none_or(|html| html.as_str() == Some(caption.as_str()))
+        && message
+            .get("icons")
+            .is_none_or(|icons| icons.as_array().is_some_and(Vec::is_empty))
+}
+
 fn paid_technology_evidence(
     index: usize,
     technology: TechnologyId,
@@ -1172,8 +1250,10 @@ impl ConditionalHumanPolicyDataset {
             if paid_payment_steps.contains(&index) {
                 continue;
             }
-            if label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE)
-                && let TypedAction::Technology { technology } = row.action
+            if matches!(
+                label_scope,
+                Some(PAID_TECHNOLOGY_LABEL_SCOPE | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+            ) && let TypedAction::Technology { technology } = row.action
             {
                 if !teachers.contains(&actor_ids[step.actor]) || !observed_audit(entry) {
                     *counts
@@ -1273,7 +1353,20 @@ impl ConditionalHumanPolicyDataset {
                         ..
                     }
                 );
+            let explicit = label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE)
+                && matches!(
+                    row.action,
+                    TypedAction::Trade {
+                        resource: Resource::Wood | Resource::Stone | Resource::Gold,
+                        buy: false
+                    } | TypedAction::UseAction {
+                        source: ActionSource::Anywhere,
+                        corn_cost: 1,
+                        ..
+                    }
+                );
             let reason = if !factorized
+                && !explicit
                 && !matches!(
                     row.action,
                     TypedAction::Place { .. }
@@ -1297,6 +1390,24 @@ impl ConditionalHumanPolicyDataset {
             };
             if let Some(reason) = reason {
                 *counts.excluded.entry(reason.into()).or_default() += 1;
+                continue;
+            }
+            if explicit
+                && (step.refills != Default::default()
+                    || observation.legal_actions.len() < 2
+                    || !matches!(
+                        (&row.action, &observation.pending_task),
+                        (TypedAction::Trade { .. }, Some(Task::Trade))
+                            | (
+                                TypedAction::UseAction { .. },
+                                Some(Task::AnyAction { cost: Some(1), .. })
+                            )
+                    ))
+            {
+                *counts
+                    .excluded
+                    .entry("unobservedExplicitOperation".into())
+                    .or_default() += 1;
                 continue;
             }
             let pair = if factorized {
@@ -1369,10 +1480,23 @@ impl ConditionalHumanPolicyDataset {
                 continue;
             }
             let name = &record.initial.players[step.actor].name;
+            let raw_messages = if explicit {
+                Some(
+                    sources.raw["dom_entries"]
+                        .as_array()
+                        .ok_or("Missing source messages")?
+                        .iter()
+                        .find(|node| node["action_id"].as_u64() == Some(source_id))
+                        .and_then(|node| node["messages"].as_array())
+                        .ok_or("Missing explicit operation source")?,
+                )
+            } else {
+                None
+            };
             let matches: Vec<_> = texts
                 .iter()
                 .enumerate()
-                .filter(|(_, text)| {
+                .filter(|(message_index, text)| {
                     let source_actor = record
                         .initial
                         .players
@@ -1385,6 +1509,19 @@ impl ConditionalHumanPolicyDataset {
                                 matches!(row.action, TypedAction::UseAction { gear, position, corn_cost, .. }
                                     if caption.gear == gear && caption.action_position == position && caption.corn_cost == corn_cost)
                             })
+                        } else if let Some(messages) = raw_messages {
+                            let message = &messages[*message_index];
+                            match row.action {
+                                TypedAction::Trade { resource, buy: false } => {
+                                    let before = &report.frames[index].snapshot.state;
+                                    let after = &report.frames[index + 1].snapshot.state;
+                                    let corn = after.players[step.actor].resources[&Resource::Corn]
+                                        - before.players[step.actor].resources[&Resource::Corn];
+                                    market_sell_caption(message, name, resource, corn, sources.raw["schema_version"] == 1)
+                                }
+                                TypedAction::UseAction { gear, position, .. } => paid_anywhere_caption(message, name, gear, position),
+                                _ => false,
+                            }
                         } else {
                             observed_label(text, name, &row.action)
                         }
@@ -1416,6 +1553,12 @@ impl ConditionalHumanPolicyDataset {
             };
             let part = if factorized {
                 "removalAction"
+            } else if explicit {
+                if matches!(row.action, TypedAction::Trade { .. }) {
+                    "marketSell"
+                } else {
+                    "paidAnywhere"
+                }
             } else {
                 "primitive"
             };
@@ -1442,7 +1585,7 @@ impl ConditionalHumanPolicyDataset {
                     return Err("Conditional Human features exceed finite1024 bound".into());
                 }
             }
-            if factorized {
+            if factorized || explicit {
                 let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
                 if candidates.iter().enumerate().any(|(i, candidate)| {
                     i != chosen
@@ -1464,6 +1607,9 @@ impl ConditionalHumanPolicyDataset {
             );
             if factorized {
                 identity.push_str("\0removalAction");
+            } else if explicit {
+                identity.push('\0');
+                identity.push_str(part);
             }
             let sample_id = digest(identity.as_bytes());
             samples.push(HumanPolicySample {
@@ -1481,7 +1627,7 @@ impl ConditionalHumanPolicyDataset {
                 candidates,
                 chosen,
                 value_target: (),
-                source_label_part: factorized.then_some("removalAction"),
+                source_label_part: (factorized || explicit).then_some(part),
                 paired_sample_id: pair.map(|(id, _, _, _)| id),
                 source_label_support: support,
                 paid_technology_support: None,
@@ -1650,7 +1796,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
+                DATASET_SCHEMA_V4
+            } else if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
                 DATASET_SCHEMA_V3
             } else if self.label_scope.is_some() {
                 DATASET_SCHEMA_V2
@@ -1666,7 +1814,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
+                "originalVisibleTextAndFinalAppliedStepAuditWithObservedPaidTechnologyMarketSellAndPaidAnywhere"
+            } else if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedPaidTechnologyAndMaterials"
             } else if self.label_scope.is_some() {
                 "originalVisibleTextAndFinalAppliedStepAuditWithFactorizedRemovalCaption"
