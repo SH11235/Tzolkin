@@ -23,6 +23,15 @@ pub struct GuardedDeployment {
     game: GuardedGame,
 }
 
+/// One game-local guard borrowing an immutable loaded deployment. Multiple
+/// views may share its model storage; each view has its own callback and Trade
+/// history. Notify every seat's callback to each view, in order, and discard a
+/// view after a callback, choice or downstream core application fails.
+pub struct BorrowedGuardedDeployment<'a> {
+    policy: &'a LoadedDeployment,
+    game: GuardedGame,
+}
+
 /// Shared callback/Trade lifecycle; immutable model storage stays with each
 /// closed deployment type. No serialized state can restore this game history.
 pub(crate) struct GuardedGame {
@@ -48,6 +57,42 @@ impl GuardedDeployment {
     }
 
     pub fn into_policy(self) -> LoadedDeployment {
+        self.policy
+    }
+
+    pub fn configuration_key(&self) -> &str {
+        self.game.configuration_key()
+    }
+
+    pub fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
+        self.game.on_callback(index, o)
+    }
+
+    pub fn choose_move(
+        &mut self,
+        index: usize,
+        o: &Observation,
+    ) -> Result<GuardedDeploymentDecision, String> {
+        self.game.choose_move(
+            index,
+            o,
+            || self.policy.distribution(o),
+            self.policy.policy_version(),
+            self.policy.checksum(),
+            GUARDED_DEPLOYMENT_VERSION,
+        )
+    }
+}
+
+impl<'a> BorrowedGuardedDeployment<'a> {
+    pub fn new(policy: &'a LoadedDeployment, config: TradeGuardConfig) -> Result<Self, String> {
+        Ok(Self {
+            policy,
+            game: GuardedGame::new(config)?,
+        })
+    }
+
+    pub fn policy(&self) -> &LoadedDeployment {
         self.policy
     }
 
