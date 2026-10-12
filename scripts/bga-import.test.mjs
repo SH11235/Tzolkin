@@ -263,6 +263,104 @@ test('combines explicit quantities with ordered icons; missing icons stay unknow
     {},
   );
 });
+test('reads an omitted trade icon list only from its exact preserved HTML caption', () => {
+  const message = {
+    raw_text: 'Aは1\nを4\nに交換した',
+    html: 'Aは1<div class="tz_icon resource_gold"></div>を4<div class="tz_icon resource_corn"></div>に交換した',
+    icons: [],
+  };
+  const before = structuredClone(message);
+  const event = parseMessage(message, ['A']);
+  assert.deepEqual(event.detail, {
+    from: { resource: 'gold', amount: 1 },
+    to: { resource: 'corn', amount: 4 },
+  });
+  assert.deepEqual(message, before);
+  for (const html of [
+    message.html.replace('Aは1', 'Bは1'),
+    message.html.replace('を4', 'を5'),
+    message.html.replace('<div class=', '<div hidden class='),
+    `<span hidden>${message.html}</span>`,
+    message.html + '<div class="tz_icon resource_wood"></div>',
+  ])
+    assert.deepEqual(parseMessage({ ...message, html }, ['A']).detail, {});
+  // An existing explicit list remains authoritative, even if HTML differs.
+  assert.equal(
+    parseMessage({ ...message, icons: [{ classes: 'tz_icon resource_wood' }] }, ['A'])
+      .iconResources[0],
+    'wood',
+  );
+  for (const [verb, kind] of [
+    ['獲得した', 'resourceGain'],
+    ['支払った', 'resourcePayment'],
+  ]) {
+    for (const space of ['', ' ']) {
+      const single = {
+        raw_text: `Aは4\nを${verb}`,
+        html: `Aは4${space}<div class="tz_icon resource_corn"></div>を${verb}`,
+        icons: [],
+      };
+      const original = structuredClone(single);
+      const parsed = parseMessage(single, ['A']);
+      assert.equal(parsed.kind, kind);
+      assert.deepEqual(parsed.detail, { explicitAmount: 4, iconResources: ['corn'] });
+      assert.deepEqual(single, original);
+      for (const html of [
+        single.html.replace('Aは4', 'Bは4'),
+        single.html.replace('Aは4', 'Aは5'),
+        single.html.replace('<div class=', '<div hidden class='),
+        `<span hidden>${single.html}</span>`,
+        single.html + '<div class="tz_icon resource_wood"></div>',
+        single.html.replace('<div class=', ' <div class=').replace('4 ', '4  '),
+      ])
+        assert.equal(parseMessage({ ...single, html }, ['A']).kind, 'unparsed');
+      assert.deepEqual(
+        parseMessage({ ...single, icons: [{ classes: 'tz_icon resource_wood' }] }, ['A']).detail,
+        { explicitAmount: 4, iconResources: ['wood'] },
+      );
+    }
+    for (const count of [1, 3]) {
+      const icon = '<div class="tz_icon resource_wood"></div>';
+      const implicit = {
+        raw_text: `Aは\nを${verb}`,
+        html: `Aは${icon.repeat(count)}を${verb}`,
+        icons: [],
+      };
+      const original = structuredClone(implicit);
+      const parsed = parseMessage(implicit, ['A']);
+      assert.equal(parsed.kind, kind);
+      assert.deepEqual(parsed.detail, {
+        explicitAmount: null,
+        iconResources: Array(count).fill('wood'),
+      });
+      assert.deepEqual(implicit, original);
+      for (const html of [
+        implicit.html.replace('Aは', 'Bは'),
+        implicit.html.replace('Aは', 'Aは1'),
+        implicit.html.replace('<div class=', '<div hidden class='),
+        `<span>${implicit.html}</span>`,
+        implicit.html.replace('Aは', 'Aは '),
+        implicit.html.replace('</div>', '</div> '),
+        implicit.html.replace('を', '<div class="tz_icon resource_gold"></div>を'),
+        implicit.html.replace('resource_wood', 'resource_unknown'),
+      ])
+        assert.equal(parseMessage({ ...implicit, html }, ['A']).kind, 'unparsed');
+      assert.equal(
+        parseMessage({ ...implicit, raw_text: `Aは2\nを${verb}` }, ['A']).kind,
+        'unparsed',
+      );
+      assert.deepEqual(
+        parseMessage({ ...implicit, icons: [{ classes: 'tz_icon resource_stone' }] }, ['A']).detail,
+        { explicitAmount: null, iconResources: ['stone'] },
+      );
+    }
+    assert.equal(
+      parseMessage({ raw_text: `Aはを${verb}`, html: `Aはを${verb}`, icons: [] }, ['A']).kind,
+      'unparsed',
+    );
+  }
+});
+
 test('rejects evidence mismatches, malformed identities and duplicate actions', () => {
   for (const mutate of [
     (g) => {

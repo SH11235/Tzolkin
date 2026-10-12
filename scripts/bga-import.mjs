@@ -87,6 +87,22 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
     result.detail = { technology: technologies[m[1]], steps: Number(m[2]) };
   } else if (actor && (m = match(/^は(\d+)\s*を(\d+)\s*に交換した$/))) {
     result.kind = 'trade';
+    // Some exports omit the icon list while preserving the complete literal
+    // trade HTML. Accept only that exact two-icon caption, never arbitrary HTML.
+    if (!iconResources.length && typeof message.html === 'string') {
+      const resources = Array.from(
+        message.html.matchAll(
+          /<div class="tz_icon resource_(corn|wood|stone|gold|skull)"><\/div>/g,
+        ),
+        (match) => match[1],
+      );
+      if (
+        resources.length === 2 &&
+        message.html ===
+          `${actor}は${m[1]}<div class="tz_icon resource_${resources[0]}"></div>を${m[2]}<div class="tz_icon resource_${resources[1]}"></div>に交換した`
+      )
+        iconResources.push(...resources);
+    }
     if (
       iconResources.length === 2 &&
       iconResources.every((r) => ['corn', 'wood', 'stone', 'gold', 'skull'].includes(r))
@@ -96,12 +112,34 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
         to: { resource: iconResources[1], amount: Number(m[2]) },
       };
     }
-  } else if (actor && /^は\d*\s*を(獲得した|支払った)$/.test(text) && iconResources.length > 0) {
-    result.kind = text.endsWith('獲得した') ? 'resourceGain' : 'resourcePayment';
-    result.detail = {
-      explicitAmount: text.match(/^は(\d+)/)?.[1] ? Number(text.match(/^は(\d+)/)[1]) : null,
-      iconResources,
-    };
+  } else if (actor && (m = match(/^は(\d*)\s*を(獲得した|支払った)$/))) {
+    if (!iconResources.length && typeof message.html === 'string') {
+      const resources = Array.from(
+        message.html.matchAll(
+          /<div class="tz_icon resource_(corn|wood|stone|gold|skull)"><\/div>/g,
+        ),
+        (match) => match[1],
+      );
+      const explicitSingle =
+        m[1] &&
+        resources.length === 1 &&
+        ['', ' '].some(
+          (space) =>
+            message.html ===
+            `${actor}は${m[1]}${space}<div class="tz_icon resource_${resources[0]}"></div>を${m[2]}`,
+        );
+      const implicitRun =
+        !m[1] &&
+        resources.length > 0 &&
+        resources.every((resource) => resource === resources[0]) &&
+        message.html ===
+          `${actor}は${`<div class="tz_icon resource_${resources[0]}"></div>`.repeat(resources.length)}を${m[2]}`;
+      if (explicitSingle || implicitRun) iconResources.push(...resources);
+    }
+    if (iconResources.length > 0) {
+      result.kind = m[2] === '獲得した' ? 'resourceGain' : 'resourcePayment';
+      result.detail = { explicitAmount: m[1] ? Number(m[1]) : null, iconResources };
+    }
   } else if (actor && text === 'は建物を建てた') result.kind = 'build';
   else if (actor && /記念碑.*(建てた|獲得した)/.test(text)) result.kind = 'monument';
   else if (actor && text.includes('の信仰を') && /コーン[1-3]個を受け取った/.test(text))
