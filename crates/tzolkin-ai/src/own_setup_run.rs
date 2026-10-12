@@ -12,7 +12,8 @@ use tzolkin_inference::deployment::{LoadedDeployment, MAX_DEPLOYMENT_BYTES};
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::model::digest;
 use crate::own_setup_durable::{
-    DurableOwnSetupOwner, OwnSetupArchiveLimits, OwnSetupArchiveTip, OwnSetupRestoreWork,
+    DurableOwnSetupOwner, OwnSetupArchiveLimits, OwnSetupArchiveSource, OwnSetupArchiveTip,
+    OwnSetupRestoreWork,
 };
 use crate::own_setup_model::InitializedOwnSetupArtifact;
 use crate::own_setup_native::OwnSetupNativeConfig;
@@ -29,6 +30,9 @@ use crate::public_stochastic_record::{MAX_RECORD_BYTES, hex64, parse_hex64, uniq
 pub const SPEC_SCHEMA: &str = "tzolkin-own-setup-run-spec-v1";
 pub const EXCLUSIONS_SCHEMA: &str = "tzolkin-own-setup-run-exclusions-v1";
 pub const STATE_SCHEMA: &str = "tzolkin-own-setup-run-state-v1";
+pub const CONTINUE_SPEC_SCHEMA: &str = "tzolkin-own-setup-continue-spec-v1";
+pub const LINEAGE_SCHEMA: &str = "tzolkin-own-setup-run-lineage-v1";
+const CONTINUE_STATE_SCHEMA: &str = "tzolkin-own-setup-continue-state-v1";
 pub const MAX_SPEC_BYTES: usize = 256 * 1024;
 pub const MAX_EXCLUSIONS_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_STATE_BYTES: usize = 128 * 1024;
@@ -271,6 +275,58 @@ impl OwnSetupRunSpec {
     }
 }
 
+/// A new prospective segment, never an edit of a completed original schedule.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnSetupContinueSpec {
+    pub schema: String,
+    pub lineage: ContentPin,
+    pub segment: OwnSetupRunSpec,
+}
+impl OwnSetupContinueSpec {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let spec: Self = decode(bytes, MAX_SPEC_BYTES)?;
+        if spec.schema != CONTINUE_SPEC_SCHEMA {
+            return Err("Unknown Own Setup continuation specification".into());
+        }
+        spec.lineage.validate(MAX_SPEC_BYTES)?;
+        Ok(spec)
+    }
+}
+
+/// Explicit locations relative to the declaration's directory. Each source has
+/// its own original plan, full baseline and externally retained exact state.
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum OriginalRunSource {
+    Train {
+        output: String,
+        spec: String,
+        exclusions: String,
+        state: String,
+        expected_sha256: String,
+    },
+    Continue {
+        output: String,
+        spec: String,
+        exclusions: String,
+        lineage: String,
+        state: String,
+        expected_sha256: String,
+    },
+}
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnSetupRunLineage {
+    pub schema: String,
+    pub sources: Vec<OriginalRunSource>,
+}
+
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Reservation {
@@ -282,7 +338,7 @@ struct Reservation {
     /// suffixes and failures. These are distinct originals, not all-seat samples.
     all_families_spent: bool,
 }
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Manifest {
     schema: String,
@@ -291,6 +347,22 @@ struct Manifest {
     exclusions: ContentPin,
     ordered_configs_digest: String,
     reservation: ContentPin,
+}
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SegmentOffsets {
+    attempted_episodes: u64,
+    updates: u64,
+    ledger_entries: usize,
+}
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContinuationManifest {
+    schema: String,
+    plan: Manifest,
+    lineage: ContentPin,
+    parent_state: ContentPin,
+    offsets: SegmentOffsets,
 }
 /// An externally retained byte pin of this receipt binds the original complete
 /// plan and source-produced root/tip. It is custody metadata, not a model owner.
@@ -356,6 +428,8 @@ pub struct OwnSetupRunReport {
     state: ContentPin,
     elapsed_seconds: f64,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation: Option<SegmentOffsets>,
 }
 
 struct Prepared {
@@ -365,6 +439,47 @@ struct Prepared {
     configs: Vec<Vec<OwnSetupNativeConfig>>,
     reservation: Reservation,
     manifest: Manifest,
+}
+
+struct Ancestor {
+    directory: PathBuf,
+    prepared: Prepared,
+    state: OwnSetupRunState,
+}
+struct PreparedContinuation {
+    prepared: Prepared,
+    ancestors: Vec<Ancestor>,
+    manifest: ContinuationManifest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinuationRootBindings {
+    schema: String,
+    config: RootBindings,
+    parent: ContinuationParentBinding,
+    offsets: DurableOffsetBindings,
+    additional_episodes: u64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContinuationParentBinding {
+    root: RootPinBinding,
+    tip: OwnSetupArchiveTip,
+}
+#[derive(Deserialize)]
+struct RootPinBinding {
+    name: String,
+    bytes: usize,
+    sha256: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DurableOffsetBindings {
+    segments: usize,
+    attempted_episodes: u64,
+    updates: u64,
+    ledger_entries: usize,
 }
 
 // Reads only original-plan bindings from the source's persisted root. It cannot
@@ -394,6 +509,14 @@ impl RootBindings {
         declaration: &ExclusionDeclaration,
     ) -> Result<(), String> {
         let run = spec.run.native()?;
+        self.check_run(spec, declaration, &run)
+    }
+    fn check_run(
+        &self,
+        spec: &OwnSetupRunSpec,
+        declaration: &ExclusionDeclaration,
+        run: &OwnSetupRunConfig,
+    ) -> Result<(), String> {
         let adam_words = |a: &OwnSetupAdamConfig| {
             [
                 a.learning_rate.to_bits(),
@@ -416,7 +539,7 @@ impl RootBindings {
             || self.initial.seed != parse_hex64(&spec.initial_seed_hex)?
             || self.initial.completed_updates != 0
             || adam_words(&self.adam) != adam_words(&spec.adam)
-            || run_words(&self.run) != run_words(&run)
+            || run_words(&self.run) != run_words(run)
             || self.limits.max_attempts != spec.archive_limits.max_attempts
             || self.limits.max_disk_bytes != spec.archive_limits.max_disk_bytes
             || self.excluded_families != declaration.families
@@ -431,16 +554,29 @@ impl Prepared {
     fn read(inputs: &RunInputs<'_>) -> Result<Self, String> {
         let spec_bytes = read_bounded(inputs.spec, MAX_SPEC_BYTES)?;
         let spec = OwnSetupRunSpec::from_json(&spec_bytes)?;
-        let exclusion_bytes = read_bounded(inputs.exclusions, MAX_EXCLUSIONS_BYTES)?;
+        Self::read_spec(
+            spec,
+            ContentPin::of(&spec_bytes),
+            inputs.playing,
+            inputs.exclusions,
+        )
+    }
+    fn read_spec(
+        spec: OwnSetupRunSpec,
+        spec_pin: ContentPin,
+        playing: &Path,
+        exclusions: &Path,
+    ) -> Result<Self, String> {
+        let exclusion_bytes = read_bounded(exclusions, MAX_EXCLUSIONS_BYTES)?;
         spec.exclusions
             .check(&exclusion_bytes, MAX_EXCLUSIONS_BYTES)?;
         let declaration: ExclusionDeclaration = decode(&exclusion_bytes, MAX_EXCLUSIONS_BYTES)?;
         let configs = spec.validate(&declaration)?;
-        let playing_bytes = read_bounded(inputs.playing, MAX_DEPLOYMENT_BYTES)?;
+        let playing_bytes = read_bounded(playing, MAX_DEPLOYMENT_BYTES)?;
         spec.playing.check(&playing_bytes, MAX_DEPLOYMENT_BYTES)?;
         let reservation = Reservation {
             schema: "tzolkin-own-setup-run-reservation-v1".into(),
-            spec: ContentPin::of(&spec_bytes),
+            spec: spec_pin.clone(),
             ordered_configs_digest: spec.ordered_configs_digest.clone(),
             families: spec
                 .batches
@@ -452,7 +588,7 @@ impl Prepared {
         };
         let manifest = Manifest {
             schema: "tzolkin-own-setup-planned-run-v1".into(),
-            spec: ContentPin::of(&spec_bytes),
+            spec: spec_pin,
             playing: spec.playing.clone(),
             exclusions: spec.exclusions.clone(),
             ordered_configs_digest: spec.ordered_configs_digest.clone(),
@@ -515,6 +651,377 @@ impl Prepared {
         }
         Ok(())
     }
+}
+
+impl PreparedContinuation {
+    fn read(inputs: &RunInputs<'_>, lineage_path: &Path) -> Result<Self, String> {
+        let bytes = read_bounded(inputs.spec, MAX_SPEC_BYTES)?;
+        let spec = OwnSetupContinueSpec::from_json(&bytes)?;
+        let lineage_bytes = read_bounded(lineage_path, MAX_SPEC_BYTES)?;
+        spec.lineage.check(&lineage_bytes, MAX_SPEC_BYTES)?;
+        let lineage: OwnSetupRunLineage = decode(&lineage_bytes, MAX_SPEC_BYTES)?;
+        if lineage.schema != LINEAGE_SCHEMA || !(1..=15).contains(&lineage.sources.len()) {
+            return Err(
+                "Continuation requires one original source and at most14 successors".into(),
+            );
+        }
+        let prepared = Prepared::read_spec(
+            spec.segment,
+            ContentPin::of(&bytes),
+            inputs.playing,
+            inputs.exclusions,
+        )?;
+        if prepared.spec.update_budget != prepared.configs.len() as u64 {
+            return Err("A prospective continuation must budget every original batch".into());
+        }
+        let lineage_directory = local(lineage_path, false)?;
+        let lineage_directory = lineage_directory
+            .parent()
+            .ok_or("Lineage lacks a directory")?;
+        let full = prepared.declaration.checked()?;
+        let mut ancestors = Vec::<Ancestor>::new();
+        let mut directories = BTreeSet::new();
+        let mut offsets = SegmentOffsets {
+            attempted_episodes: 0,
+            updates: 0,
+            ledger_entries: 0,
+        };
+        let mut parent_state = None;
+        for (index, source) in lineage.sources.iter().enumerate() {
+            let (output, original_spec, exclusions, state, expected, original_lineage) =
+                match source {
+                    OriginalRunSource::Train {
+                        output,
+                        spec,
+                        exclusions,
+                        state,
+                        expected_sha256,
+                    } if index == 0 => (output, spec, exclusions, state, expected_sha256, None),
+                    OriginalRunSource::Continue {
+                        output,
+                        spec,
+                        exclusions,
+                        state,
+                        expected_sha256,
+                        lineage,
+                    } if index != 0 => (
+                        output,
+                        spec,
+                        exclusions,
+                        state,
+                        expected_sha256,
+                        Some(lineage),
+                    ),
+                    _ => {
+                        return Err(
+                            "Lineage must begin with train followed only by continuations".into(),
+                        );
+                    }
+                };
+            let resolve = |p: &str| -> Result<PathBuf, String> {
+                if p.is_empty() || p.len() > 4096 {
+                    return Err("Invalid original source location".into());
+                }
+                local(&lineage_directory.join(p), false)
+            };
+            let directory = resolve(output)?;
+            let canonical = fs::canonicalize(directory.join(ARCHIVE)).map_err(|e| e.to_string())?;
+            if !directories.insert(canonical) {
+                return Err("Lineage repeats a source archive".into());
+            }
+            let state_path = resolve(state)?;
+            let original_state = pinned_state(&state_path, expected)?;
+            let state_pin = ContentPin::of(&read_bounded(&state_path, MAX_STATE_BYTES)?);
+            if state_pin.sha256 != *expected {
+                return Err("Original external state changed during validation".into());
+            }
+            let original_spec_path = resolve(original_spec)?;
+            let original_bytes = read_bounded(&original_spec_path, MAX_SPEC_BYTES)?;
+            let original_exclusions = resolve(exclusions)?;
+            let (original, original_lineage_pin) = if let Some(location) = original_lineage {
+                let original_spec = OwnSetupContinueSpec::from_json(&original_bytes)?;
+                let original_lineage_bytes = read_bounded(&resolve(location)?, MAX_SPEC_BYTES)?;
+                original_spec
+                    .lineage
+                    .check(&original_lineage_bytes, MAX_SPEC_BYTES)?;
+                let original_declaration: OwnSetupRunLineage =
+                    decode(&original_lineage_bytes, MAX_SPEC_BYTES)?;
+                if original_declaration.schema != LINEAGE_SCHEMA
+                    || original_declaration.sources != lineage.sources[..index]
+                {
+                    return Err(
+                        "Original successor lineage differs from the declared complete prefix"
+                            .into(),
+                    );
+                }
+                (original_spec.segment, Some(original_spec.lineage))
+            } else {
+                (OwnSetupRunSpec::from_json(&original_bytes)?, None)
+            };
+            let original = Prepared::read_spec(
+                original,
+                ContentPin::of(&original_bytes),
+                inputs.playing,
+                &original_exclusions,
+            )?;
+            if let Some(original_lineage_pin) = original_lineage_pin {
+                let expected_manifest = ContinuationManifest {
+                    schema: "tzolkin-own-setup-continue-manifest-v1".into(),
+                    plan: original.manifest.clone(),
+                    lineage: original_lineage_pin,
+                    parent_state: parent_state
+                        .clone()
+                        .ok_or("Successor lacks its original parent state")?,
+                    offsets: SegmentOffsets {
+                        attempted_episodes: offsets.attempted_episodes,
+                        updates: offsets.updates,
+                        ledger_entries: offsets.ledger_entries,
+                    },
+                };
+                verify_continuation_saved(
+                    &original,
+                    &expected_manifest,
+                    &directory,
+                    &original_state,
+                    &ancestors,
+                )?;
+            } else {
+                original.verify_saved(&directory, &original_state)?;
+            }
+            if original_state.tip.sequence != 2 * original.configs.len() as u64
+                || DurableOwnSetupOwner::inspect_tip(&directory.join(ARCHIVE))?
+                    != original_state.tip
+                || read_stop(&directory, &original_state.manifest)?.is_some()
+            {
+                return Err(
+                    "Continuation requires exact latest complete successful original schedules"
+                        .into(),
+                );
+            }
+            let reports = saved_reports(&directory, original.configs.len())?;
+            if terminal(&reports).is_some()
+                || check_intents(
+                    &directory,
+                    &original_state.manifest,
+                    &reports,
+                    original.configs.len(),
+                )?
+            {
+                return Err("Original source has rejected/NoChange/unfinished intent work".into());
+            }
+            check_segment_reports(
+                &reports,
+                &original.spec,
+                offsets.attempted_episodes,
+                offsets.updates,
+            )?;
+            if !original
+                .declaration
+                .checked()?
+                .families()
+                .is_subset(full.families())
+                || original
+                    .reservation
+                    .families
+                    .iter()
+                    .any(|f| !full.families().contains(f))
+            {
+                return Err(
+                    "New full baseline omits an ancestral exclusion or permanently reserved family"
+                        .into(),
+                );
+            }
+            offsets.attempted_episodes = offsets
+                .attempted_episodes
+                .checked_add(original.spec.run.max_attempted_episodes)
+                .ok_or("Ancestral original count overflow")?;
+            offsets.updates += reports.len() as u64;
+            offsets.ledger_entries += reports.len();
+            parent_state = Some(state_pin);
+            ancestors.push(Ancestor {
+                directory,
+                prepared: original,
+                state: original_state,
+            });
+        }
+        check_successor_stream(&prepared.spec, &ancestors, &offsets)?;
+        let manifest = ContinuationManifest {
+            schema: "tzolkin-own-setup-continue-manifest-v1".into(),
+            plan: prepared.manifest.clone(),
+            lineage: spec.lineage,
+            parent_state: parent_state.ok_or("Continuation lacks original sources")?,
+            offsets,
+        };
+        Ok(Self {
+            prepared,
+            ancestors,
+            manifest,
+        })
+    }
+}
+
+fn saved_reports(directory: &Path, batches: usize) -> Result<Vec<OwnSetupAttemptReport>, String> {
+    (0..batches)
+        .map(|batch| {
+            let bytes = read_bounded(
+                &directory
+                    .join(ARCHIVE)
+                    .join(format!("head-{:08}.json", 2 * batch + 2)),
+                MAX_STATE_BYTES,
+            )?;
+            let value = unique_json(&bytes, MAX_STATE_BYTES)?;
+            if value["event"]["kind"] != "closed" || value["event"]["abandoned"] != false {
+                return Err("Original source lacks a nonabandoned Closed report".into());
+            }
+            serde_json::from_value(value["event"]["report"].clone()).map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+fn check_successor_stream(
+    spec: &OwnSetupRunSpec,
+    ancestors: &[Ancestor],
+    offsets: &SegmentOffsets,
+) -> Result<(), String> {
+    let original = &ancestors
+        .first()
+        .ok_or("Missing original train source")?
+        .prepared
+        .spec;
+    let origin = original.run.native()?;
+    let successor = spec.run.native()?;
+    let expected_ordinal = origin
+        .first_episode_ordinal
+        .checked_add(offsets.attempted_episodes)
+        .ok_or("Cumulative episode ordinal overflow")?;
+    if spec.initial_seed_hex != original.initial_seed_hex
+        || successor.sampling_seed != origin.sampling_seed
+        || successor.replicate_ordinal != origin.replicate_ordinal
+        || successor.first_episode_ordinal != expected_ordinal
+        || offsets
+            .attempted_episodes
+            .checked_add(successor.max_attempted_episodes)
+            .is_none_or(|n| n > 4096)
+    {
+        return Err(
+            "Continuation changes initialization/stream or exceeds cumulative originals".into(),
+        );
+    }
+    let bits = |a: &OwnSetupAdamConfig| {
+        [
+            a.learning_rate.to_bits(),
+            a.beta1.to_bits(),
+            a.beta2.to_bits(),
+            a.epsilon.to_bits(),
+            a.max_gradient_norm.to_bits(),
+            a.max_parameter_delta.to_bits(),
+        ]
+    };
+    if bits(&spec.adam) != bits(&original.adam) {
+        return Err("Continuation changes exact Adam configuration".into());
+    }
+    Ok(())
+}
+
+fn verify_continuation_saved(
+    prepared: &Prepared,
+    expected: &ContinuationManifest,
+    directory: &Path,
+    state: &OwnSetupRunState,
+    ancestors: &[Ancestor],
+) -> Result<(), String> {
+    if state.schema != CONTINUE_STATE_SCHEMA {
+        return Err("Unknown continuation state".into());
+    }
+    let reservation = read_bounded(&directory.join(RESERVATION), MAX_STATE_BYTES)?;
+    expected
+        .plan
+        .reservation
+        .check(&reservation, MAX_STATE_BYTES)?;
+    if decode::<Reservation>(&reservation, MAX_STATE_BYTES)? != prepared.reservation {
+        return Err("Continuation original reservation differs".into());
+    }
+    let manifest_bytes = read_bounded(&directory.join(MANIFEST), MAX_STATE_BYTES)?;
+    state.manifest.check(&manifest_bytes, MAX_STATE_BYTES)?;
+    if decode::<ContinuationManifest>(&manifest_bytes, MAX_STATE_BYTES)? != *expected {
+        return Err("Continuation requires its exact original ancestry/spec/full baseline".into());
+    }
+    let root_bytes = read_bounded(
+        &directory.join(ARCHIVE).join("root.json"),
+        MAX_EXCLUSIONS_BYTES,
+    )?;
+    state.root.check(&root_bytes, MAX_EXCLUSIONS_BYTES)?;
+    let root: ContinuationRootBindings = decode(&root_bytes, MAX_EXCLUSIONS_BYTES)?;
+    let parent = ancestors.last().ok_or("Continuation lacks a predecessor")?;
+    let mut run = prepared.spec.run.native()?;
+    run.first_episode_ordinal = ancestors[0]
+        .prepared
+        .spec
+        .run
+        .native()?
+        .first_episode_ordinal;
+    run.max_attempted_episodes = expected
+        .offsets
+        .attempted_episodes
+        .checked_add(run.max_attempted_episodes)
+        .ok_or("Cumulative run budget overflow")?;
+    if root.schema != "tzolkin-own-setup-durable-continuation-root-v1"
+        || root.parent.root.name != "root.json"
+        || root.parent.root.bytes != parent.state.root.bytes
+        || root.parent.root.sha256 != parent.state.root.sha256
+        || root.parent.tip != parent.state.tip
+        || root.offsets.segments != ancestors.len() + 1
+        || root.offsets.attempted_episodes != expected.offsets.attempted_episodes
+        || root.offsets.updates != expected.offsets.updates
+        || root.offsets.ledger_entries != expected.offsets.ledger_entries
+        || root.additional_episodes != prepared.spec.run.max_attempted_episodes
+    {
+        return Err("Continuation actual source parent/offset/schedule binding differs".into());
+    }
+    root.config
+        .check_run(&prepared.spec, &prepared.declaration, &run)?;
+    prepared.check_pending_configs(directory, state.tip.sequence)?;
+    read_stop(directory, &state.manifest)?;
+    Ok(())
+}
+
+fn check_segment_reports(
+    reports: &[OwnSetupAttemptReport],
+    spec: &OwnSetupRunSpec,
+    attempted_offset: u64,
+    update_offset: u64,
+) -> Result<(), String> {
+    if reports.len() > spec.batches.len() {
+        return Err("Segment exceeds its original batches".into());
+    }
+    let mut ordinal = spec.run.native()?.first_episode_ordinal;
+    let mut episodes = attempted_offset;
+    for (index, (report, batch)) in reports.iter().zip(&spec.batches).enumerate() {
+        episodes = episodes
+            .checked_add(batch.len() as u64)
+            .ok_or("Cumulative attempt overflow")?;
+        if report.first_episode_ordinal != ordinal
+            || report.reserved_episodes != batch.len()
+            || report.families
+                != batch
+                    .iter()
+                    .map(|g| seed_family_id(g.environment_seed))
+                    .collect::<Vec<_>>()
+            || report.attempted_episodes != episodes
+            || matches!(report.outcome, OwnSetupAttemptOutcome::Updated { update_count, .. } if update_count != update_offset + index as u64 + 1)
+        {
+            return Err(
+                "Segment ledger differs from its original ordered reservation and offsets".into(),
+            );
+        }
+        ordinal = ordinal
+            .checked_add(batch.len() as u64)
+            .ok_or("Episode ordinal overflow")?;
+        if report.next_episode_ordinal != Some(ordinal) {
+            return Err("Segment report cursor differs".into());
+        }
+    }
+    Ok(())
 }
 
 fn config_value(config: &OwnSetupNativeConfig) -> serde_json::Value {
@@ -614,6 +1121,228 @@ pub fn resume(
     )
 }
 
+/// Reserves the entire new segment before one Playing load and ancestral replay.
+/// Only the source's reconstructed live owner can create the child archive.
+pub fn continue_run(inputs: RunInputs<'_>, lineage: &Path) -> Result<OwnSetupRunReport, String> {
+    let began = Instant::now();
+    let mut prepared = PreparedContinuation::read(&inputs, lineage)?;
+    let directory = output(&inputs, true)?;
+    outside_original_archives(&directory, &prepared.ancestors)?;
+    fs::create_dir(&directory).map_err(|e| e.to_string())?;
+    publish(
+        &directory,
+        RESERVATION,
+        &prepared.prepared.reservation,
+        MAX_STATE_BYTES,
+    )?;
+    let manifest = publish(&directory, MANIFEST, &prepared.manifest, MAX_STATE_BYTES)?;
+    if began.elapsed().as_secs() >= prepared.prepared.spec.max_seconds {
+        return Err(
+            "Continuation preparation exhausted time; all new reservations remain spent".into(),
+        );
+    }
+    let playing = LoadedDeployment::load(&prepared.prepared.playing_bytes)?;
+    let directories: Vec<_> = prepared
+        .ancestors
+        .iter()
+        .map(|a| a.directory.join(ARCHIVE))
+        .collect();
+    let tips: Vec<_> = prepared
+        .ancestors
+        .iter()
+        .map(|a| a.state.tip.clone())
+        .collect();
+    let sources = original_sources(&mut prepared.ancestors, &directories, &tips)?;
+    let (parent, work) = DurableOwnSetupOwner::restore_chain(sources, playing)?;
+    let offsets = &prepared.manifest.offsets;
+    let owner = parent.owner()?;
+    if owner.attempted_episodes() != offsets.attempted_episodes
+        || owner.update_count() != offsets.updates
+        || owner.ledger().len() != offsets.ledger_entries
+        || owner.next_episode_ordinal()
+            != Some(prepared.prepared.spec.run.native()?.first_episode_ordinal)
+    {
+        return Err(
+            "Reconstructed parent differs from the exact cumulative schedule offsets".into(),
+        );
+    }
+    if began.elapsed().as_secs() >= prepared.prepared.spec.max_seconds {
+        return Err(
+            "Ancestral cold audit exhausted time; all new reservations remain spent".into(),
+        );
+    }
+    let mut durable = parent.continue_in(
+        &directory.join(ARCHIVE),
+        prepared.prepared.spec.run.max_attempted_episodes,
+        prepared.prepared.declaration.checked()?,
+        prepared.prepared.spec.archive_limits.clone(),
+    )?;
+    let state = OwnSetupRunState {
+        schema: CONTINUE_STATE_SCHEMA.into(),
+        manifest,
+        root: ContentPin::of(&read_bounded(
+            &directory.join(ARCHIVE).join("root.json"),
+            MAX_EXCLUSIONS_BYTES,
+        )?),
+        tip: durable.tip().clone(),
+    };
+    publish(&directory, INITIAL_STATE, &state, MAX_STATE_BYTES)?;
+    finish_segment(
+        inputs,
+        &directory,
+        prepared.prepared,
+        &mut durable,
+        state,
+        Some(work),
+        began,
+        Some(prepared.manifest.offsets),
+    )
+}
+
+/// Reuses only the exact original child plan and full named source chain.
+pub fn resume_continuation(
+    inputs: RunInputs<'_>,
+    lineage: &Path,
+    state_path: &Path,
+    expected_sha256: &str,
+) -> Result<OwnSetupRunReport, String> {
+    let began = Instant::now();
+    let mut prepared = PreparedContinuation::read(&inputs, lineage)?;
+    let directory = output(&inputs, false)?;
+    let state = pinned_state(state_path, expected_sha256)?;
+    verify_continuation_saved(
+        &prepared.prepared,
+        &prepared.manifest,
+        &directory,
+        &state,
+        &prepared.ancestors,
+    )?;
+    if DurableOwnSetupOwner::inspect_tip(&directory.join(ARCHIVE))? != state.tip {
+        return Err("Continuation requires the exact latest externally pinned source tip".into());
+    }
+    if began.elapsed().as_secs() >= prepared.prepared.spec.max_seconds {
+        return Err("Continuation validation exhausted time".into());
+    }
+    let playing = LoadedDeployment::load(&prepared.prepared.playing_bytes)?;
+    let mut directories: Vec<_> = prepared
+        .ancestors
+        .iter()
+        .map(|a| a.directory.join(ARCHIVE))
+        .collect();
+    let mut tips: Vec<_> = prepared
+        .ancestors
+        .iter()
+        .map(|a| a.state.tip.clone())
+        .collect();
+    directories.push(directory.join(ARCHIVE));
+    tips.push(state.tip.clone());
+    let mut sources = original_sources(
+        &mut prepared.ancestors,
+        &directories[..directories.len() - 1],
+        &tips[..tips.len() - 1],
+    )?;
+    sources.push(OwnSetupArchiveSource {
+        directory: directories.last().ok_or("Missing child source")?,
+        expected_tip: tips.last().ok_or("Missing child tip")?,
+        exclusions: prepared.prepared.declaration.checked()?,
+    });
+    let (mut durable, work) = DurableOwnSetupOwner::restore_chain(sources, playing)?;
+    finish_segment(
+        inputs,
+        &directory,
+        prepared.prepared,
+        &mut durable,
+        state,
+        Some(work),
+        began,
+        Some(prepared.manifest.offsets),
+    )
+}
+
+fn original_sources<'a>(
+    ancestors: &mut [Ancestor],
+    directories: &'a [PathBuf],
+    tips: &'a [OwnSetupArchiveTip],
+) -> Result<Vec<OwnSetupArchiveSource<'a>>, String> {
+    if ancestors.len() != directories.len() || ancestors.len() != tips.len() {
+        return Err("Original source list differs".into());
+    }
+    ancestors
+        .iter_mut()
+        .zip(directories)
+        .zip(tips)
+        .map(|((a, directory), expected_tip)| {
+            // The metadata has already been checked. Transfer its large baseline
+            // strings rather than retaining a second copy during source cold replay.
+            let families = std::mem::take(&mut a.prepared.declaration.families);
+            Ok(OwnSetupArchiveSource {
+                directory,
+                expected_tip,
+                exclusions: DeclaredOwnSetupExclusions::from_families(
+                    families,
+                    a.prepared.declaration.count,
+                    &a.prepared.declaration.digest,
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn outside_original_archives(directory: &Path, ancestors: &[Ancestor]) -> Result<(), String> {
+    let parent = directory
+        .parent()
+        .ok_or("Continuation output lacks parent")?;
+    let name = directory
+        .file_name()
+        .ok_or("Continuation output lacks leaf")?;
+    let canonical = fs::canonicalize(parent)
+        .map_err(|e| e.to_string())?
+        .join(name);
+    for ancestor in ancestors {
+        let source =
+            fs::canonicalize(ancestor.directory.join(ARCHIVE)).map_err(|e| e.to_string())?;
+        if canonical.starts_with(source) {
+            return Err("Continuation output must be outside every original source archive".into());
+        }
+    }
+    Ok(())
+}
+
+/// Metadata-only candidate recovery; no owner or model authority is returned.
+pub fn inspect_continuation_tip(
+    output: &Path,
+    state_path: &Path,
+    expected_sha256: &str,
+    new_tip: &str,
+) -> Result<ContentPin, String> {
+    let directory = local(output, false)?;
+    leaf(new_tip)?;
+    absent(&directory.join(new_tip))?;
+    let mut state = pinned_state(state_path, expected_sha256)?;
+    if state.schema != CONTINUE_STATE_SCHEMA {
+        return Err("Unknown continuation state".into());
+    }
+    let manifest_bytes = read_bounded(&directory.join(MANIFEST), MAX_STATE_BYTES)?;
+    state.manifest.check(&manifest_bytes, MAX_STATE_BYTES)?;
+    let manifest: ContinuationManifest = decode(&manifest_bytes, MAX_STATE_BYTES)?;
+    if manifest.schema != "tzolkin-own-setup-continue-manifest-v1" {
+        return Err("Unknown continuation manifest".into());
+    }
+    manifest.plan.reservation.check(
+        &read_bounded(&directory.join(RESERVATION), MAX_STATE_BYTES)?,
+        MAX_STATE_BYTES,
+    )?;
+    state.root.check(
+        &read_bounded(
+            &directory.join(ARCHIVE).join("root.json"),
+            MAX_EXCLUSIONS_BYTES,
+        )?,
+        MAX_EXCLUSIONS_BYTES,
+    )?;
+    state.tip = DurableOwnSetupOwner::inspect_tip(&directory.join(ARCHIVE))?;
+    publish(&directory, new_tip, &state, MAX_STATE_BYTES)
+}
+
 /// Metadata-only recovery after an uncertain publication. The returned tip is
 /// a candidate; only a later full source restore can confer an owner.
 pub fn inspect_tip(
@@ -643,22 +1372,62 @@ fn finish(
     directory: &Path,
     prepared: Prepared,
     durable: &mut DurableOwnSetupOwner,
-    mut state: OwnSetupRunState,
+    state: OwnSetupRunState,
     work: Option<OwnSetupRestoreWork>,
     began: Instant,
 ) -> Result<OwnSetupRunReport, String> {
+    finish_segment(
+        inputs, directory, prepared, durable, state, work, began, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_segment(
+    inputs: RunInputs<'_>,
+    directory: &Path,
+    prepared: Prepared,
+    durable: &mut DurableOwnSetupOwner,
+    mut state: OwnSetupRunState,
+    work: Option<OwnSetupRestoreWork>,
+    began: Instant,
+    continuation: Option<SegmentOffsets>,
+) -> Result<OwnSetupRunReport, String> {
     let mut error = None;
+    let ledger_offset = continuation.as_ref().map_or(0, |s| s.ledger_entries);
+    let attempted_offset = continuation.as_ref().map_or(0, |s| s.attempted_episodes);
+    let update_offset = continuation.as_ref().map_or(0, |s| s.updates);
+    if durable.ledger_offset() != ledger_offset
+        || durable.attempted_episode_offset() != attempted_offset
+        || durable.update_offset() != update_offset
+    {
+        return Err("Actual carried owner segment offsets differ from original manifest".into());
+    }
+    let ledger = durable
+        .owner()?
+        .ledger()
+        .get(ledger_offset..)
+        .ok_or("Invalid cumulative ledger offset")?;
     let saved_stop = read_stop(directory, &state.manifest)?;
-    let unfinished_intent = check_intents(
-        directory,
-        &state.manifest,
-        durable.owner()?.ledger(),
-        prepared.configs.len(),
-    )?;
+    let unfinished_intent =
+        check_intents(directory, &state.manifest, ledger, prepared.configs.len())?;
     let reason = loop {
         let owner = durable.owner()?;
-        let consumed = validate_ledger(owner, &prepared)?;
-        if let Some(reason) = terminal(owner.ledger()) {
+        let consumed = if continuation.is_some() {
+            validate_segment_ledger(
+                owner,
+                &prepared,
+                ledger_offset,
+                attempted_offset,
+                update_offset,
+            )?
+        } else {
+            validate_ledger(owner, &prepared)?
+        };
+        let ledger = owner
+            .ledger()
+            .get(ledger_offset..)
+            .ok_or("Invalid segment ledger slice")?;
+        if let Some(reason) = terminal(ledger) {
             break reason.to_owned();
         }
         if unfinished_intent {
@@ -667,7 +1436,12 @@ fn finish(
         if let Some(reason) = &saved_stop {
             break reason.clone();
         }
-        if owner.update_count() >= prepared.spec.update_budget {
+        if owner
+            .update_count()
+            .checked_sub(update_offset)
+            .ok_or("Update offset exceeds owner")?
+            >= prepared.spec.update_budget
+        {
             break "updateBudgetReached".into();
         }
         if consumed == prepared.configs.len() {
@@ -739,7 +1513,11 @@ fn finish(
     state.tip = durable.tip().clone();
     let state_pin = publish(directory, inputs.tip, &state, MAX_STATE_BYTES)?;
     let report = OwnSetupRunReport {
-        schema: "tzolkin-own-setup-run-report-v1",
+        schema: if continuation.is_some() {
+            "tzolkin-own-setup-continue-report-v1"
+        } else {
+            "tzolkin-own-setup-run-report-v1"
+        },
         exit_code: match reason.as_str() {
             "updateBudgetReached" => 0,
             "sourceRejected" | "sourceAttemptError" | "unfinishedIntent" => 1,
@@ -749,17 +1527,22 @@ fn finish(
         update_count: owner.map(|o| o.update_count()),
         attempted_episodes: owner.map(|o| o.attempted_episodes()),
         next_episode_ordinal_hex: owner.and_then(|o| o.next_episode_ordinal()).map(hex64),
-        closed_attempts: owner.map(|o| o.ledger().len()),
-        original_collections: owner.map(|o| o.ledger().iter().map(|r| r.receipts.len()).sum()),
+        closed_attempts: owner.map(|o| o.ledger().len() - ledger_offset),
+        original_collections: owner.map(|o| {
+            o.ledger()[ledger_offset..]
+                .iter()
+                .map(|r| r.receipts.len())
+                .sum()
+        }),
         fresh_audit_seals: owner.map(|o| {
-            o.ledger()
+            o.ledger()[ledger_offset..]
                 .iter()
                 .flat_map(|r| &r.receipts)
                 .filter(|r| r.episode_id.is_some())
                 .count()
         }),
         planned_reserved_families: prepared.reservation.families.len(),
-        source_ledger_terminal: owner.map(|o| terminal(o.ledger()).is_some()),
+        source_ledger_terminal: owner.map(|o| terminal(&o.ledger()[ledger_offset..]).is_some()),
         training_playing_loads: 1,
         // The reviewed exporter validates the Playing binding, numeric checksum
         // and final composite by constructing three additional Playing loads.
@@ -770,6 +1553,7 @@ fn finish(
         state: state_pin,
         elapsed_seconds: began.elapsed().as_secs_f64(),
         error,
+        continuation,
     };
     publish(directory, inputs.report, &report, MAX_REPORT_BYTES)?;
     Ok(report)
@@ -866,6 +1650,39 @@ fn validate_ledger(owner: &OwnSetupTrainingOwner, prepared: &Prepared) -> Result
     }
     if owner.attempted_episodes() != episodes || owner.next_episode_ordinal() != Some(ordinal) {
         return Err("Source cursor differs from complete original plan".into());
+    }
+    Ok(ledger.len())
+}
+
+fn validate_segment_ledger(
+    owner: &OwnSetupTrainingOwner,
+    prepared: &Prepared,
+    ledger_offset: usize,
+    attempted_offset: u64,
+    update_offset: u64,
+) -> Result<usize, String> {
+    let ledger = owner
+        .ledger()
+        .get(ledger_offset..)
+        .ok_or("Segment ledger offset exceeds source")?;
+    check_segment_reports(ledger, &prepared.spec, attempted_offset, update_offset)?;
+    let consumed = ledger
+        .iter()
+        .map(|r| r.reserved_episodes as u64)
+        .sum::<u64>();
+    let cursor = prepared
+        .spec
+        .run
+        .native()?
+        .first_episode_ordinal
+        .checked_add(consumed);
+    if owner.attempted_episodes()
+        != attempted_offset
+            .checked_add(consumed)
+            .ok_or("Cumulative source attempted overflow")?
+        || owner.next_episode_ordinal() != cursor
+    {
+        return Err("Cumulative source cursor differs from the new segment schedule".into());
     }
     Ok(ledger.len())
 }
@@ -1148,6 +1965,23 @@ mod tests {
         assert!(terminal(&updated).is_none());
         assert!(intent_closed(&updated, 0));
         assert!(!intent_closed(&updated, 1));
+        // Counter/plan metadata only, with no source owner or learning credit.
+        let spec = spec();
+        let first = spec.run.native().unwrap().first_episode_ordinal;
+        let mut continued = report(OwnSetupAttemptOutcome::Updated {
+            update_count: 61,
+            changed_parameters: 1,
+            max_parameter_delta: 0.001,
+        });
+        continued.first_episode_ordinal = first;
+        continued.next_episode_ordinal = first.checked_add(1);
+        continued.attempted_episodes = 241;
+        continued.families = vec![seed_family_id(spec.batches[0][0].environment_seed)];
+        check_segment_reports(std::slice::from_ref(&continued), &spec, 240, 60).unwrap();
+        assert!(check_segment_reports(std::slice::from_ref(&continued), &spec, 0, 60).is_err());
+        assert!(check_segment_reports(std::slice::from_ref(&continued), &spec, 240, 0).is_err());
+        continued.next_episode_ordinal = None;
+        assert!(check_segment_reports(&[continued], &spec, 240, 60).is_err());
     }
 
     #[test]
@@ -1158,6 +1992,17 @@ mod tests {
         let mut value = serde_json::to_value(spec()).unwrap();
         value["unrecognized"] = true.into();
         assert!(OwnSetupRunSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+        let continuation = OwnSetupContinueSpec {
+            schema: CONTINUE_SPEC_SCHEMA.into(),
+            lineage: ContentPin::of(b"metadata-only"),
+            segment: spec(),
+        };
+        let bytes = serde_json::to_vec(&continuation).unwrap();
+        let decoded = OwnSetupContinueSpec::from_json(&bytes).unwrap();
+        assert_eq!(decoded.segment.run.sampling_seed_hex, "ffffffffffffffff");
+        let mut value = serde_json::to_value(&continuation).unwrap();
+        value["unknown"] = true.into();
+        assert!(OwnSetupContinueSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
         for name in [
             "archive",
             "terminal-stop.json",
