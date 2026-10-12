@@ -1,6 +1,9 @@
 //! Scalar policy-only BC on fully source-validated V2 native datasets. No value head or labels.
 use crate::dataset::DatasetSplit;
-use crate::features::{EncodedCandidate, FEATURE_COUNT, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
+use crate::features::{
+    EncodedCandidate, FEATURE_COUNT, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA,
+    SEMANTIC_SETUP_FEATURE_SCHEMA,
+};
 use crate::kernel::Kernel;
 use crate::model::{MAX_ARTIFACT_BYTES, Random, digest, dot, policy_softmax, read_json};
 use crate::policy_dataset::{
@@ -22,6 +25,28 @@ pub const MAX_CANDIDATE_EVALUATIONS: usize = 10_000_000;
 pub const MAX_UPDATES: u64 = 1_000_000;
 const SHUFFLE_BUFFER: usize = 8;
 const GRADIENT_CLIP: f64 = 5.0;
+
+// Internal numerical profiles grant no dataset/model/owner admission. Existing
+// public entrypoints always select Public; only the typed teacher route selects 3.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PolicyFeatureProfile {
+    Public,
+    SemanticSetup,
+}
+impl PolicyFeatureProfile {
+    pub(crate) fn schema(self) -> u32 {
+        match self {
+            Self::Public => PUBLIC_FEATURE_SCHEMA,
+            Self::SemanticSetup => SEMANTIC_SETUP_FEATURE_SCHEMA,
+        }
+    }
+    pub(crate) const fn input_contract(self) -> &'static str {
+        match self {
+            Self::Public => INPUT_CONTRACT,
+            Self::SemanticSetup => "base-3-4p-native-semantic-setup-public-playing-v3",
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -122,7 +147,12 @@ fn digest_id(id: &str) -> bool {
 }
 impl PolicyDatasetIdentity {
     pub(crate) fn from_dataset(dataset: &ValidatedPolicyDataset) -> Self {
-        let m = dataset.manifest();
+        Self::from_manifest(dataset.manifest(), PolicyFeatureProfile::Public)
+    }
+    pub(crate) fn from_manifest(
+        m: &crate::policy_dataset::PolicyDatasetManifest,
+        profile: PolicyFeatureProfile,
+    ) -> Self {
         let mut samples = [0; 3];
         let mut candidates = [0; 3];
         for game in &m.games {
@@ -142,7 +172,7 @@ impl PolicyDatasetIdentity {
             observation_schema: m.observation_schema,
             source_kind: m.source_kind.clone(),
             task: m.task.clone(),
-            input_contract: INPUT_CONTRACT.into(),
+            input_contract: profile.input_contract().into(),
             samples,
             candidates,
             strata: m.strata.clone(),
@@ -155,16 +185,23 @@ impl PolicyDatasetIdentity {
         self.validate_structure(require_training)
     }
     pub(crate) fn validate_structure(&self, require_training: bool) -> Result<(), String> {
+        self.validate_structure_using(require_training, PolicyFeatureProfile::Public)
+    }
+    pub(crate) fn validate_structure_using(
+        &self,
+        require_training: bool,
+        profile: PolicyFeatureProfile,
+    ) -> Result<(), String> {
         if self.schema != DATASET_SCHEMA
             || !digest_id(&self.fingerprint)
-            || self.feature_schema != PUBLIC_FEATURE_SCHEMA
+            || self.feature_schema != profile.schema()
             || self.feature_count != FEATURE_COUNT
             || self.rules_version != crate::replay::RULES_VERSION
             || self.rules_baseline != crate::replay::RULES_BASELINE
             || self.catalog_hash != crate::replay::catalog_hash()
             || self.move_schema != tzolkin_core::observation::MOVE_SCHEMA
             || self.observation_schema != tzolkin_core::observation::OBSERVATION_SCHEMA
-            || self.input_contract != INPUT_CONTRACT
+            || self.input_contract != profile.input_contract()
             || self.strata.is_empty()
             || self.strata.len() > crate::policy_dataset::MAX_FILES
         {
@@ -490,17 +527,35 @@ fn policy_loss_using<const REUSE_PREFIX: bool>(
     scratch: &mut Scratch,
     gradient: Option<&mut [f32]>,
 ) -> Result<(f64, bool), String> {
+    policy_loss_using_profile::<REUSE_PREFIX>(
+        model,
+        rows,
+        chosen,
+        scratch,
+        gradient,
+        PolicyFeatureProfile::Public,
+    )
+}
+fn policy_loss_using_profile<const REUSE_PREFIX: bool>(
+    model: &PublicPolicyModel,
+    rows: &[EncodedCandidate],
+    chosen: usize,
+    scratch: &mut Scratch,
+    gradient: Option<&mut [f32]>,
+    profile: PolicyFeatureProfile,
+) -> Result<(f64, bool), String> {
     if rows.is_empty() || rows.len() > MAX_LEGAL_ACTIONS || chosen >= rows.len() {
         return Err("Invalid BC complete-legal candidate batch".into());
     }
-    let context = &rows[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384];
+    let schema = profile.schema();
+    let context = &rows[0].values_for_schema(schema)?[..384];
     // Eligibility only: bad tags or numeric-equal signed-zero differences keep
     // the original per-row path and its guard/error order. No cache escapes
     // this call or its current immutable parameters.
     let reusable = REUSE_PREFIX
         && rows.len() > 1
         && rows.iter().all(|row| {
-            row.values_for_schema(PUBLIC_FEATURE_SCHEMA)
+            row.values_for_schema(schema)
                 .is_ok_and(|values| prefix_bits_equal(context, &values[..384]))
         });
     let mut prefix = None;
@@ -508,9 +563,12 @@ fn policy_loss_using<const REUSE_PREFIX: bool>(
     scratch.logits.resize(rows.len(), 0.0);
     scratch.probabilities.resize(rows.len(), 0.0);
     for (i, row) in rows.iter().enumerate() {
-        let values = row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        let values = row.values_for_schema(schema)?;
         if &values[..384] != context || values.iter().any(|v| !v.is_finite() || v.abs() > 1024.0) {
             return Err("Invalid BC tagged/context/finite features".into());
+        }
+        if profile == PolicyFeatureProfile::SemanticSetup {
+            tzolkin_inference::policy::validated_semantic_setup_values(row)?;
         }
         let hidden = &mut scratch.hidden[i * HIDDEN..(i + 1) * HIDDEN];
         let mut continued = [0.0; HIDDEN];
@@ -581,11 +639,7 @@ fn policy_loss_using<const REUSE_PREFIX: bool>(
                 let activation =
                     delta * model.parameters[WP + unit] * (1.0 - hidden[unit] * hidden[unit]);
                 gradient[B1 + unit] += activation;
-                for (feature, value) in row
-                    .values_for_schema(PUBLIC_FEATURE_SCHEMA)?
-                    .iter()
-                    .enumerate()
-                {
+                for (feature, value) in row.values_for_schema(schema)?.iter().enumerate() {
                     gradient[unit * FEATURE_COUNT + feature] += activation * value;
                 }
             }
@@ -612,6 +666,23 @@ pub(crate) fn evaluate_samples<S: Borrow<ValidatedPolicySample>>(
     split: DatasetSplit,
     scratch: &mut Scratch,
 ) -> Result<PolicyLossReport, String> {
+    evaluate_samples_using(
+        samples,
+        identity,
+        model,
+        split,
+        scratch,
+        PolicyFeatureProfile::Public,
+    )
+}
+pub(crate) fn evaluate_samples_using<S: Borrow<ValidatedPolicySample>>(
+    samples: impl IntoIterator<Item = Result<S, String>>,
+    identity: &PolicyDatasetIdentity,
+    model: &PublicPolicyModel,
+    split: DatasetSplit,
+    scratch: &mut Scratch,
+    profile: PolicyFeatureProfile,
+) -> Result<PolicyLossReport, String> {
     let mut report = PolicyLossReport {
         samples: 0,
         candidates: 0,
@@ -624,8 +695,14 @@ pub(crate) fn evaluate_samples<S: Borrow<ValidatedPolicySample>>(
     for sample in samples {
         let sample = sample?;
         let sample = sample.borrow();
-        let (loss, correct) =
-            policy_loss(model, sample.candidates(), sample.chosen(), scratch, None)?;
+        let (loss, correct) = policy_loss_using_profile::<true>(
+            model,
+            sample.candidates(),
+            sample.chosen(),
+            scratch,
+            None,
+            profile,
+        )?;
         report.samples += 1;
         report.candidates += sample.candidates().len();
         report.policy_loss += loss;
@@ -696,6 +773,29 @@ where
     S: Borrow<ValidatedPolicySample>,
     I: IntoIterator<Item = Result<S, String>>,
 {
+    train_epochs_using_profile(
+        samples,
+        config,
+        completed,
+        expected_samples,
+        model,
+        state,
+        PolicyFeatureProfile::Public,
+    )
+}
+pub(crate) fn train_epochs_using_profile<S, I>(
+    samples: impl Fn() -> I,
+    config: &PolicyBcConfig,
+    completed: usize,
+    expected_samples: usize,
+    model: &mut PublicPolicyModel,
+    state: PolicyEpochState<'_>,
+    profile: PolicyFeatureProfile,
+) -> Result<(), String>
+where
+    S: Borrow<ValidatedPolicySample>,
+    I: IntoIterator<Item = Result<S, String>>,
+{
     let PolicyEpochState {
         optimizer,
         random,
@@ -708,12 +808,13 @@ where
         let mut batch = 0;
         let mut consume = |sample: S| -> Result<(), String> {
             let sample = sample.borrow();
-            policy_loss(
+            policy_loss_using_profile::<true>(
                 model,
                 sample.candidates(),
                 sample.chosen(),
                 scratch,
                 Some(&mut gradient),
+                profile,
             )?;
             seen += 1;
             batch += 1;
@@ -1032,6 +1133,9 @@ mod tests {
     }
 
     fn short_numeric_batches() -> Vec<Vec<EncodedCandidate>> {
+        short_numeric_batches_for(PolicyFeatureProfile::Public)
+    }
+    fn short_numeric_batches_for(profile: PolicyFeatureProfile) -> Vec<Vec<EncodedCandidate>> {
         let mut batches = Vec::new();
         for players in [3, 4] {
             let mut state = tzolkin_core::create_game(
@@ -1051,7 +1155,11 @@ mod tests {
                 }
                 assert_eq!(state.phase, phase);
                 let o = observe(&state, state.current_player).unwrap();
-                let encoder = FeatureEncoder::new_public(&o).unwrap();
+                let encoder = match profile {
+                    PolicyFeatureProfile::Public => FeatureEncoder::new_public(&o),
+                    PolicyFeatureProfile::SemanticSetup => FeatureEncoder::new_semantic_setup(&o),
+                }
+                .unwrap();
                 // The private numeric primitive's ragged fixture may repeat
                 // an encoded legal row. No raw candidate or dataset is made;
                 // production still accepts only a regenerated full legal set.
@@ -1072,26 +1180,34 @@ mod tests {
         values.iter().map(|v| v.to_bits()).collect()
     }
     fn forward_gradient_parity(model: &PublicPolicyModel) -> (Vec<f32>, Vec<f32>) {
+        forward_gradient_parity_for(model, PolicyFeatureProfile::Public)
+    }
+    fn forward_gradient_parity_for(
+        model: &PublicPolicyModel,
+        profile: PolicyFeatureProfile,
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut old = Scratch::default();
         let mut new = Scratch::default();
         let mut old_gradient = vec![0.0; PARAMETER_COUNT];
         let mut new_gradient = vec![0.0; PARAMETER_COUNT];
-        for batch in short_numeric_batches() {
+        for batch in short_numeric_batches_for(profile) {
             for size in [1, 2, 3, 7] {
-                let old_result = policy_loss_using::<false>(
+                let old_result = policy_loss_using_profile::<false>(
                     model,
                     &batch[..size],
                     size - 1,
                     &mut old,
                     Some(&mut old_gradient),
+                    profile,
                 )
                 .unwrap();
-                let new_result = policy_loss(
+                let new_result = policy_loss_using_profile::<true>(
                     model,
                     &batch[..size],
                     size - 1,
                     &mut new,
                     Some(&mut new_gradient),
+                    profile,
                 )
                 .unwrap();
                 assert_eq!(old_result.0.to_bits(), new_result.0.to_bits());
@@ -1147,6 +1263,33 @@ mod tests {
             assert!(gradient[BP].abs() < 2.0e-7); // shared policy bias cancels under softmax.
         }
         forward_gradient_parity(&artifact.model);
+        forward_gradient_parity_for(&artifact.model, PolicyFeatureProfile::SemanticSetup);
+        let numeric =
+            tzolkin_inference::policy::BorrowedSemanticSetupPolicy::from_validated_parameters(
+                artifact.model.parameters(),
+            )
+            .unwrap();
+        for batch in short_numeric_batches_for(PolicyFeatureProfile::SemanticSetup) {
+            let prediction = numeric
+                .predict(Kernel::Scalar.resolve().unwrap(), &batch)
+                .unwrap();
+            let mut scratch = Scratch::default();
+            policy_loss_using_profile::<true>(
+                &artifact.model,
+                &batch,
+                0,
+                &mut scratch,
+                None,
+                PolicyFeatureProfile::SemanticSetup,
+            )
+            .unwrap();
+            assert_eq!(bits(&scratch.logits), bits(&prediction.logits));
+            assert_eq!(
+                bits(&scratch.probabilities),
+                bits(&prediction.probabilities)
+            );
+            assert!(policy_loss(&artifact.model, &batch, 0, &mut scratch, None).is_err());
+        }
     }
 
     #[test]

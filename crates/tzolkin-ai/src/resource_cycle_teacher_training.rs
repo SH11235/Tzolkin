@@ -2,18 +2,20 @@
 //! Consistency is checked; teacher quality and producer authenticity are not claimed.
 use crate::arena::resource_cycle::ResourceCycleConfig;
 use crate::dataset::{DatasetSplit, split_for_family};
-use crate::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
+use crate::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA, SEMANTIC_SETUP_FEATURE_SCHEMA};
 use crate::model::{Random, digest};
 use crate::policy_dataset::{
     MAX_FILES, MAX_PARTITION_CANDIDATES, MAX_PARTITION_SAMPLES,
-    RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND, RESOURCE_CYCLE_V5_TEACHER_TASK, ValidatedPolicyDataset,
-    ValidatedPolicySample, resource_cycle_v5_teacher_policy_id,
+    RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_SOURCE_KIND,
+    RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_TASK, RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND,
+    RESOURCE_CYCLE_V5_TEACHER_TASK, ValidatedPolicyDataset, ValidatedPolicySample,
+    ValidatedSemanticSetupTeacherDataset, resource_cycle_v5_teacher_policy_id,
 };
 use crate::policy_training::{
     MAX_CANDIDATE_EVALUATIONS, MAX_UPDATES, PolicyAdamState, PolicyBcConfig, PolicyDatasetIdentity,
-    PolicyEpochState, PolicyLossReport, PolicyTrainingMetrics, Scratch, bounded_json, evaluate,
-    evaluate_samples, publish, read_local_json, train_epochs, train_epochs_using,
-    validate_new_output_directory,
+    PolicyEpochState, PolicyFeatureProfile, PolicyLossReport, PolicyTrainingMetrics, Scratch,
+    bounded_json, evaluate, evaluate_samples_using, publish, read_local_json,
+    train_epochs_using_profile, validate_new_output_directory,
 };
 use crate::public_model::{INPUT_CONTRACT, MODEL_VERSION, PublicPolicyModel, ValueValidity};
 use serde::{Deserialize, Serialize};
@@ -24,8 +26,69 @@ use std::path::Path;
 pub const CHECKPOINT_SCHEMA: &str = "tzolkin-resource-cycle-v5-teacher-checkpoint-v1";
 pub const TRAINING_VERSION: &str = "resource-cycle-v5-policy-distillation-scalar-adam-v1";
 pub const TASK: &str = "resourceCycleV5PolicyOnlyDistillation";
+pub const SEMANTIC_SETUP_CHECKPOINT_SCHEMA: &str =
+    "tzolkin-resource-cycle-v5-semantic-setup-teacher-checkpoint-v1";
+pub const SEMANTIC_SETUP_TRAINING_VERSION: &str =
+    "resource-cycle-v5-semantic-setup-policy-distillation-scalar-adam-v1";
+pub const SEMANTIC_SETUP_TASK: &str = "resourceCycleV5SemanticSetupPolicyOnlyDistillation";
+pub const SEMANTIC_SETUP_MODEL_VERSION: &str = "tiny-semantic-setup-teacher-policy-mlp-v1";
+pub const SEMANTIC_SETUP_INPUT_CONTRACT: &str =
+    PolicyFeatureProfile::SemanticSetup.input_contract();
 // Account owned Vec/String allocations, not allocator overhead or process RSS.
 const MAX_ENCODED_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+// Private, closed dispatch. No caller can pass another dataset profile or
+// convert the semantic handle into the old Native/schema-2 teacher handle.
+#[derive(Clone, Copy)]
+enum TeacherRoute<'a> {
+    Public(&'a ValidatedPolicyDataset),
+    SemanticSetup(&'a ValidatedSemanticSetupTeacherDataset),
+}
+impl<'a> TeacherRoute<'a> {
+    fn profile(self) -> PolicyFeatureProfile {
+        match self {
+            Self::Public(_) => PolicyFeatureProfile::Public,
+            Self::SemanticSetup(_) => PolicyFeatureProfile::SemanticSetup,
+        }
+    }
+    fn manifest(self) -> &'a crate::policy_dataset::PolicyDatasetManifest {
+        match self {
+            Self::Public(d) => d.manifest(),
+            Self::SemanticSetup(d) => d.manifest(),
+        }
+    }
+    fn iter(self, split: Option<DatasetSplit>) -> TeacherRows<'a> {
+        match self {
+            Self::Public(d) => TeacherRows::Public(match split {
+                Some(s) => d.iter_split(s),
+                None => d.iter(),
+            }),
+            Self::SemanticSetup(d) => TeacherRows::SemanticSetup(match split {
+                Some(s) => d.iter_split(s),
+                None => d.iter(),
+            }),
+        }
+    }
+    fn recheck(self) -> Result<(u64, String), String> {
+        match self {
+            Self::Public(d) => d.recheck_resource_cycle_v5_teacher_bytes(),
+            Self::SemanticSetup(d) => d.recheck_teacher_bytes(),
+        }
+    }
+}
+enum TeacherRows<'a> {
+    Public(crate::policy_dataset::PolicyDatasetIter),
+    SemanticSetup(crate::policy_dataset::SemanticSetupTeacherDatasetIter<'a>),
+}
+impl Iterator for TeacherRows<'_> {
+    type Item = Result<ValidatedPolicySample, String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Public(rows) => rows.next(),
+            Self::SemanticSetup(rows) => rows.next(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -51,10 +114,12 @@ fn split_index(split: DatasetSplit) -> usize {
     }
 }
 impl TeacherDatasetIdentity {
-    fn from_dataset(dataset: &ValidatedPolicyDataset) -> Result<Self, String> {
-        dataset.require_resource_cycle_v5_teacher_route()?;
+    fn from_route(route: TeacherRoute<'_>) -> Result<Self, String> {
+        if let TeacherRoute::Public(dataset) = route {
+            dataset.require_resource_cycle_v5_teacher_route()?;
+        }
         let mut families = BTreeMap::<String, TeacherFamily>::new();
-        for game in &dataset.manifest().games {
+        for game in &route.manifest().games {
             let f = families
                 .entry(game.family_id.clone())
                 .or_insert(TeacherFamily {
@@ -72,22 +137,39 @@ impl TeacherDatasetIdentity {
             f.candidates += game.candidates;
         }
         let identity = Self {
-            dataset: PolicyDatasetIdentity::from_dataset(dataset),
+            dataset: PolicyDatasetIdentity::from_manifest(route.manifest(), route.profile()),
             families: families.into_values().collect(),
         };
-        identity.validate(false)?;
+        identity.validate_using(false, route.profile())?;
         Ok(identity)
     }
     fn validate(&self, require_training: bool) -> Result<(), String> {
+        self.validate_using(require_training, PolicyFeatureProfile::Public)
+    }
+    fn validate_using(
+        &self,
+        require_training: bool,
+        profile: PolicyFeatureProfile,
+    ) -> Result<(), String> {
         let d = &self.dataset;
-        if d.source_kind != RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND
-            || d.task != RESOURCE_CYCLE_V5_TEACHER_TASK
+        let (kind, task) = match profile {
+            PolicyFeatureProfile::Public => (
+                RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND,
+                RESOURCE_CYCLE_V5_TEACHER_TASK,
+            ),
+            PolicyFeatureProfile::SemanticSetup => (
+                RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_SOURCE_KIND,
+                RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_TASK,
+            ),
+        };
+        if d.source_kind != kind
+            || d.task != task
             || self.families.is_empty()
             || self.families.len() > MAX_FILES
         {
             return Err("Incompatible V5 teacher dataset identity".into());
         }
-        d.validate_structure(require_training)?;
+        d.validate_structure_using(require_training, profile)?;
         for stratum in &d.strata {
             if stratum.policy_id != resource_cycle_v5_teacher_policy_id(stratum.players)? {
                 return Err("Teacher strata require the exact all-seat V5 configuration".into());
@@ -134,9 +216,12 @@ impl TeacherDatasetIdentity {
 pub(crate) fn audit_dataset(
     dataset: &ValidatedPolicyDataset,
 ) -> Result<TeacherDatasetIdentity, String> {
-    let identity = TeacherDatasetIdentity::from_dataset(dataset)?;
+    audit_route(TeacherRoute::Public(dataset))
+}
+fn audit_route(route: TeacherRoute<'_>) -> Result<TeacherDatasetIdentity, String> {
+    let identity = TeacherDatasetIdentity::from_route(route)?;
     let mut counts = [0usize; 2];
-    for sample in dataset.iter() {
+    for sample in route.iter(None) {
         let sample = sample?;
         if sample.value_target().is_some() {
             return Err("V5 distillation cannot consume value labels".into());
@@ -149,7 +234,7 @@ pub(crate) fn audit_dataset(
             identity.dataset.samples.iter().sum::<usize>(),
             identity.dataset.candidates.iter().sum::<usize>(),
         ]
-        || TeacherDatasetIdentity::from_dataset(dataset)? != identity
+        || TeacherDatasetIdentity::from_route(route)? != identity
     {
         return Err("Teacher source changed during full integrity audit".into());
     }
@@ -163,8 +248,15 @@ struct TeacherSamples {
     allocation_bytes: usize,
 }
 impl TeacherSamples {
+    #[cfg(test)]
     fn load(
         dataset: &ValidatedPolicyDataset,
+        identity: &TeacherDatasetIdentity,
+    ) -> Result<Self, String> {
+        Self::load_route(TeacherRoute::Public(dataset), identity)
+    }
+    fn load_route(
+        route: TeacherRoute<'_>,
         identity: &TeacherDatasetIdentity,
     ) -> Result<Self, String> {
         let d = &identity.dataset;
@@ -185,7 +277,7 @@ impl TeacherSamples {
         if minimum > MAX_ENCODED_CACHE_BYTES {
             return Err("Teacher encoded cache exceeds 256 MiB".into());
         }
-        let manifest_pin = dataset.recheck_resource_cycle_v5_teacher_bytes()?;
+        let manifest_pin = route.recheck()?;
         let mut cache = Self {
             train: Vec::new(),
             validation: Vec::new(),
@@ -218,7 +310,7 @@ impl TeacherSamples {
         let mut counts = [[0usize; 2]; 3];
         // Consuming every partition to EOF retains full source replay, fixed
         // teacher-choice regeneration and shard checks. Test rows are discarded.
-        for sample in dataset.iter() {
+        for sample in route.iter(None) {
             let sample = sample?;
             let split = *splits
                 .get(sample.family_id())
@@ -248,14 +340,14 @@ impl TeacherSamples {
                 return Err("Teacher cache partition count mismatch".into());
             }
         }
-        if TeacherDatasetIdentity::from_dataset(dataset)? != *identity {
+        if TeacherDatasetIdentity::from_route(route)? != *identity {
             return Err("Teacher source changed during cache validation".into());
         }
-        cache.recheck(dataset)?;
+        cache.recheck(route)?;
         Ok(cache)
     }
-    fn recheck(&self, dataset: &ValidatedPolicyDataset) -> Result<(), String> {
-        if dataset.recheck_resource_cycle_v5_teacher_bytes()? != self.manifest_pin {
+    fn recheck(&self, route: TeacherRoute<'_>) -> Result<(), String> {
+        if route.recheck()? != self.manifest_pin {
             return Err("Teacher cache manifest bytes changed".into());
         }
         Ok(())
@@ -266,13 +358,21 @@ impl TeacherSamples {
         model: &PublicPolicyModel,
         split: DatasetSplit,
         scratch: &mut Scratch,
+        profile: PolicyFeatureProfile,
     ) -> Result<PolicyLossReport, String> {
         let rows = match split {
             DatasetSplit::Train => &self.train,
             DatasetSplit::Validation => &self.validation,
             DatasetSplit::Test => return Err("Teacher cache does not retain Test loss rows".into()),
         };
-        evaluate_samples(rows.iter().map(Ok), identity, model, split, scratch)
+        evaluate_samples_using(
+            rows.iter().map(Ok),
+            identity,
+            model,
+            split,
+            scratch,
+            profile,
+        )
     }
 }
 
@@ -402,20 +502,94 @@ fn train_dataset_after_cache<const CACHED: bool>(
     after_cache: impl FnOnce() -> Result<(), String>,
 ) -> Result<TeacherTrainingOutcome, String> {
     config.validate()?;
-    let completed = resume.map_or(0, |p| p.completed_epochs);
     if let Some(p) = resume {
         p.validate()?;
-        if !config.compatible(&p.config) || config.epochs < completed {
-            return Err("Teacher resume dataset/config/epoch mismatch".into());
+    }
+    train_route_after_cache::<CACHED, _>(
+        TeacherRoute::Public(dataset),
+        config,
+        resume.map(TeacherResume::public),
+        after_cache,
+        |run| {
+            let mut checkpoint = TeacherTrainingCheckpoint {
+                schema: CHECKPOINT_SCHEMA.into(),
+                training_version: TRAINING_VERSION.into(),
+                source_kind: RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND.into(),
+                task: TASK.into(),
+                model_version: MODEL_VERSION.into(),
+                input_contract: INPUT_CONTRACT.into(),
+                feature_schema: PUBLIC_FEATURE_SCHEMA,
+                feature_count: FEATURE_COUNT,
+                backend: "scalar".into(),
+                value_validity: ValueValidity::UnavailablePolicyOnly,
+                teacher: ResourceCycleConfig::v5(),
+                dataset: run.identity,
+                config: config.clone(),
+                completed_epochs: config.epochs,
+                random_state: run.random_state,
+                model: run.model,
+                optimizer: run.optimizer,
+                metrics: run.metrics.clone(),
+                checksum: String::new(),
+            };
+            checkpoint.checksum = checkpoint.expected_checksum()?;
+            checkpoint.validate()?;
+            Ok(TeacherTrainingOutcome {
+                checkpoint,
+                metrics: run.metrics,
+            })
+        },
+    )
+}
+struct TeacherResume<'a> {
+    dataset: &'a TeacherDatasetIdentity,
+    config: &'a PolicyBcConfig,
+    completed_epochs: usize,
+    random_state: u64,
+    parameters: &'a [f32],
+    optimizer: &'a PolicyAdamState,
+    metrics: &'a PolicyTrainingMetrics,
+}
+impl<'a> TeacherResume<'a> {
+    fn public(p: &'a TeacherTrainingCheckpoint) -> Self {
+        Self {
+            dataset: &p.dataset,
+            config: &p.config,
+            completed_epochs: p.completed_epochs,
+            random_state: p.random_state,
+            parameters: p.model.parameters(),
+            optimizer: &p.optimizer,
+            metrics: &p.metrics,
         }
     }
+}
+struct TeacherRun {
+    identity: TeacherDatasetIdentity,
+    random_state: u64,
+    model: PublicPolicyModel,
+    optimizer: PolicyAdamState,
+    metrics: PolicyTrainingMetrics,
+}
+fn train_route_after_cache<const CACHED: bool, O>(
+    route: TeacherRoute<'_>,
+    config: &PolicyBcConfig,
+    resume: Option<TeacherResume<'_>>,
+    after_cache: impl FnOnce() -> Result<(), String>,
+    finish: impl FnOnce(TeacherRun) -> Result<O, String>,
+) -> Result<O, String> {
+    let completed = resume.as_ref().map_or(0, |p| p.completed_epochs);
+    if let Some(p) = &resume
+        && (!config.compatible(p.config) || config.epochs < completed)
+    {
+        return Err("Teacher resume dataset/config/epoch mismatch".into());
+    }
     let identity = if CACHED {
-        TeacherDatasetIdentity::from_dataset(dataset)?
+        TeacherDatasetIdentity::from_route(route)?
     } else {
-        audit_dataset(dataset)?
+        audit_route(route)?
     };
-    identity.validate(true)?;
-    if resume.is_some_and(|p| p.dataset != identity) {
+    identity.validate_using(true, route.profile())?;
+    if resume.as_ref().is_some_and(|p| *p.dataset != identity) {
         return Err("Teacher resume dataset/config/epoch mismatch".into());
     }
     let d = &identity.dataset;
@@ -433,36 +607,49 @@ fn train_dataset_after_cache<const CACHED: bool>(
         return Err("Teacher candidate/update budget exceeded".into());
     }
     let cache = if CACHED {
-        Some(TeacherSamples::load(dataset, &identity)?)
+        Some(TeacherSamples::load_route(route, &identity)?)
     } else {
         None
     };
     let evaluate = |model: &PublicPolicyModel, split, scratch: &mut Scratch| {
         if let Some(cache) = &cache {
-            cache.evaluate(d, model, split, scratch)
+            cache.evaluate(d, model, split, scratch, route.profile())
         } else {
-            evaluate(dataset, d, model, split, scratch)
+            evaluate_samples_using(
+                route.iter(Some(split)),
+                d,
+                model,
+                split,
+                scratch,
+                route.profile(),
+            )
         }
     };
-    let result: Result<TeacherTrainingOutcome, String> = (|| {
+    let result = (|| {
         after_cache()?;
-        let mut model = resume.map_or_else(
+        let mut model = resume.as_ref().map_or_else(
             || crate::public_model::initialized_model(config.seed),
-            |p| p.model.clone(),
+            |p| PublicPolicyModel {
+                parameters: p.parameters.to_vec(),
+            },
         );
         model.validate()?;
-        let mut optimizer = resume.map_or_else(PolicyAdamState::new, |p| p.optimizer.clone());
+        let mut optimizer = resume
+            .as_ref()
+            .map_or_else(PolicyAdamState::new, |p| (*p.optimizer).clone());
         let mut random = Random {
-            state: resume.map_or(config.seed ^ 0xd1b54a32d192ed03, |p| p.random_state),
+            state: resume
+                .as_ref()
+                .map_or(config.seed ^ 0xd1b54a32d192ed03, |p| p.random_state),
         };
         let mut scratch = Scratch::default();
         let train = evaluate(&model, DatasetSplit::Train, &mut scratch)?;
         let validation = evaluate(&model, DatasetSplit::Validation, &mut scratch)?;
-        let mut metrics = if let Some(p) = resume {
+        let mut metrics = if let Some(p) = &resume {
             if train != p.metrics.final_train || validation != p.metrics.final_validation {
                 return Err("Teacher resume metric/model/source mismatch".into());
             }
-            p.metrics.clone()
+            (*p.metrics).clone()
         } else {
             PolicyTrainingMetrics {
                 completed_epochs: 0,
@@ -479,54 +666,43 @@ fn train_dataset_after_cache<const CACHED: bool>(
             scratch: &mut scratch,
         };
         if let Some(cache) = &cache {
-            train_epochs_using(
+            train_epochs_using_profile(
                 || cache.train.iter().map(Ok),
                 config,
                 completed,
                 d.samples[0],
                 &mut model,
                 state,
+                route.profile(),
             )?;
         } else {
-            train_epochs(dataset, config, completed, d.samples[0], &mut model, state)?;
+            train_epochs_using_profile(
+                || route.iter(Some(DatasetSplit::Train)),
+                config,
+                completed,
+                d.samples[0],
+                &mut model,
+                state,
+                route.profile(),
+            )?;
         }
         metrics.completed_epochs = config.epochs;
         metrics.final_train = evaluate(&model, DatasetSplit::Train, &mut scratch)?;
         metrics.final_validation = evaluate(&model, DatasetSplit::Validation, &mut scratch)?;
-        if audit_dataset(dataset)? != identity {
+        if audit_route(route)? != identity {
             return Err("Teacher dataset changed before completion".into());
         }
-        let mut checkpoint = TeacherTrainingCheckpoint {
-            schema: CHECKPOINT_SCHEMA.into(),
-            training_version: TRAINING_VERSION.into(),
-            source_kind: RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND.into(),
-            task: TASK.into(),
-            model_version: MODEL_VERSION.into(),
-            input_contract: INPUT_CONTRACT.into(),
-            feature_schema: PUBLIC_FEATURE_SCHEMA,
-            feature_count: FEATURE_COUNT,
-            backend: "scalar".into(),
-            value_validity: ValueValidity::UnavailablePolicyOnly,
-            teacher: ResourceCycleConfig::v5(),
-            dataset: identity.clone(),
-            config: config.clone(),
-            completed_epochs: config.epochs,
+        finish(TeacherRun {
+            identity: identity.clone(),
             random_state: random.state,
             model,
             optimizer,
-            metrics: metrics.clone(),
-            checksum: String::new(),
-        };
-        checkpoint.checksum = checkpoint.expected_checksum()?;
-        checkpoint.validate()?;
-        Ok(TeacherTrainingOutcome {
-            checkpoint,
             metrics,
         })
     })();
     if let Some(cache) = &cache {
         // Also run on numerical failure. No changed-source cached outcome is returned.
-        cache.recheck(dataset)?;
+        cache.recheck(route)?;
     }
     result
 }
@@ -563,6 +739,239 @@ pub fn evaluate_dataset(
         return Err("Teacher evaluation source changed".into());
     }
     Ok(report)
+}
+
+/// Parameters for the explicit semantic teacher checkpoint only. There is no
+/// public constructor/conversion from an old policy model or unqualified rows.
+/// The distinct serialized key also rejects an old model under retagged metadata.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticSetupTeacherModel {
+    semantic_setup_parameters: Vec<f32>,
+}
+impl SemanticSetupTeacherModel {
+    pub fn parameters(&self) -> &[f32] {
+        &self.semantic_setup_parameters
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        tzolkin_inference::policy::validate_parameters(self.parameters())
+    }
+}
+
+/// A schema-3 teacher checkpoint with its own model and resume contract.
+/// Checksums establish consistency, not producer or training-history authenticity.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SemanticSetupTeacherTrainingCheckpoint {
+    pub schema: String,
+    pub training_version: String,
+    pub source_kind: String,
+    pub task: String,
+    pub model_version: String,
+    pub input_contract: String,
+    pub feature_schema: u32,
+    pub feature_count: usize,
+    pub backend: String,
+    pub value_validity: ValueValidity,
+    pub teacher: ResourceCycleConfig,
+    pub dataset: TeacherDatasetIdentity,
+    pub config: PolicyBcConfig,
+    pub completed_epochs: usize,
+    pub random_state: u64,
+    pub model: SemanticSetupTeacherModel,
+    pub optimizer: PolicyAdamState,
+    pub metrics: PolicyTrainingMetrics,
+    pub checksum: String,
+}
+impl SemanticSetupTeacherTrainingCheckpoint {
+    fn expected_checksum(&self) -> Result<String, String> {
+        let mut copy = self.clone();
+        copy.checksum.clear();
+        Ok(digest(
+            &serde_json::to_vec(&copy).map_err(|e| e.to_string())?,
+        ))
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        self.config.validate()?;
+        self.dataset
+            .validate_using(true, PolicyFeatureProfile::SemanticSetup)?;
+        self.model.validate()?;
+        self.optimizer.validate()?;
+        if self.schema != SEMANTIC_SETUP_CHECKPOINT_SCHEMA
+            || self.training_version != SEMANTIC_SETUP_TRAINING_VERSION
+            || self.source_kind != RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_SOURCE_KIND
+            || self.task != SEMANTIC_SETUP_TASK
+            || self.model_version != SEMANTIC_SETUP_MODEL_VERSION
+            || self.input_contract != SEMANTIC_SETUP_INPUT_CONTRACT
+            || self.feature_schema != SEMANTIC_SETUP_FEATURE_SCHEMA
+            || self.feature_count != FEATURE_COUNT
+            || self.backend != "scalar"
+            || self.value_validity != ValueValidity::UnavailablePolicyOnly
+            || self.teacher != ResourceCycleConfig::v5()
+            || self.completed_epochs == 0
+            || self.completed_epochs != self.config.epochs
+            || self.metrics.completed_epochs != self.completed_epochs
+            || self.metrics.strength_measured
+            || self.optimizer.step
+                != self.dataset.dataset.samples[0].div_ceil(self.config.batch_size) as u64
+                    * self.completed_epochs as u64
+        {
+            return Err("Invalid semantic Setup V5 teacher checkpoint contract".into());
+        }
+        let d = &self.dataset.dataset;
+        for r in [&self.metrics.initial_train, &self.metrics.final_train] {
+            r.validate(d.samples[0], d.candidates[0])?;
+        }
+        for r in [
+            &self.metrics.initial_validation,
+            &self.metrics.final_validation,
+        ] {
+            r.validate(d.samples[1], d.candidates[1])?;
+        }
+        if self.checksum.len() != 64 || self.checksum != self.expected_checksum()? {
+            return Err("Semantic Setup teacher checkpoint checksum mismatch".into());
+        }
+        Ok(())
+    }
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let checkpoint: Self = read_local_json(path)?;
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+    pub fn save_new(&self, path: &Path) -> Result<(), String> {
+        self.validate()?;
+        publish(path, self)
+    }
+}
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticSetupTeacherTrainingOutcome {
+    pub checkpoint: SemanticSetupTeacherTrainingCheckpoint,
+    pub metrics: PolicyTrainingMetrics,
+}
+impl SemanticSetupTeacherTrainingOutcome {
+    pub fn save_new_directory(&self, directory: &Path) -> Result<(), String> {
+        self.checkpoint.validate()?;
+        if self.metrics != self.checkpoint.metrics {
+            return Err("Inconsistent semantic Setup V5 teacher outcome".into());
+        }
+        validate_new_output_directory(directory)?;
+        bounded_json(&self.checkpoint)?;
+        bounded_json(&self.metrics)?;
+        fs::create_dir(directory).map_err(|e| e.to_string())?;
+        publish(&directory.join("checkpoint.json"), &self.checkpoint)?;
+        publish(&directory.join("metrics.json"), &self.metrics)
+    }
+}
+/// Fresh seeded schema-3 training or same-type resume only; no old weights input.
+/// ```compile_fail
+/// use tzolkin_ai::policy_dataset::ValidatedSemanticSetupTeacherDataset;
+/// use tzolkin_ai::policy_training::PolicyBcConfig;
+/// use tzolkin_ai::resource_cycle_teacher_training::{self as teacher, TeacherTrainingCheckpoint};
+/// fn old_resume(d: &ValidatedSemanticSetupTeacherDataset, old: &TeacherTrainingCheckpoint) {
+///     let _ = teacher::train_semantic_setup_dataset(d, &PolicyBcConfig::default(), Some(old));
+/// }
+/// ```
+pub fn train_semantic_setup_dataset(
+    dataset: &ValidatedSemanticSetupTeacherDataset,
+    config: &PolicyBcConfig,
+    resume: Option<&SemanticSetupTeacherTrainingCheckpoint>,
+) -> Result<SemanticSetupTeacherTrainingOutcome, String> {
+    train_semantic_setup_after_cache::<true>(dataset, config, resume, || Ok(()))
+}
+fn train_semantic_setup_after_cache<const CACHED: bool>(
+    dataset: &ValidatedSemanticSetupTeacherDataset,
+    config: &PolicyBcConfig,
+    resume: Option<&SemanticSetupTeacherTrainingCheckpoint>,
+    after_cache: impl FnOnce() -> Result<(), String>,
+) -> Result<SemanticSetupTeacherTrainingOutcome, String> {
+    config.validate()?;
+    if let Some(p) = resume {
+        p.validate()?;
+    }
+    let resume = resume.map(|p| TeacherResume {
+        dataset: &p.dataset,
+        config: &p.config,
+        completed_epochs: p.completed_epochs,
+        random_state: p.random_state,
+        parameters: p.model.parameters(),
+        optimizer: &p.optimizer,
+        metrics: &p.metrics,
+    });
+    train_route_after_cache::<CACHED, _>(
+        TeacherRoute::SemanticSetup(dataset),
+        config,
+        resume,
+        after_cache,
+        |run| {
+            let mut checkpoint = SemanticSetupTeacherTrainingCheckpoint {
+                schema: SEMANTIC_SETUP_CHECKPOINT_SCHEMA.into(),
+                training_version: SEMANTIC_SETUP_TRAINING_VERSION.into(),
+                source_kind: RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_SOURCE_KIND.into(),
+                task: SEMANTIC_SETUP_TASK.into(),
+                model_version: SEMANTIC_SETUP_MODEL_VERSION.into(),
+                input_contract: SEMANTIC_SETUP_INPUT_CONTRACT.into(),
+                feature_schema: SEMANTIC_SETUP_FEATURE_SCHEMA,
+                feature_count: FEATURE_COUNT,
+                backend: "scalar".into(),
+                value_validity: ValueValidity::UnavailablePolicyOnly,
+                teacher: ResourceCycleConfig::v5(),
+                dataset: run.identity,
+                config: config.clone(),
+                completed_epochs: config.epochs,
+                random_state: run.random_state,
+                model: SemanticSetupTeacherModel {
+                    semantic_setup_parameters: run.model.parameters,
+                },
+                optimizer: run.optimizer,
+                metrics: run.metrics.clone(),
+                checksum: String::new(),
+            };
+            checkpoint.checksum = checkpoint.expected_checksum()?;
+            checkpoint.validate()?;
+            Ok(SemanticSetupTeacherTrainingOutcome {
+                checkpoint,
+                metrics: run.metrics,
+            })
+        },
+    )
+}
+pub fn validate_semantic_setup_checkpoint_dataset(
+    dataset: &ValidatedSemanticSetupTeacherDataset,
+    checkpoint: &SemanticSetupTeacherTrainingCheckpoint,
+) -> Result<(), String> {
+    let audited = train_semantic_setup_dataset(dataset, &checkpoint.config, Some(checkpoint))?;
+    if audited.checkpoint != *checkpoint {
+        return Err("Semantic Setup teacher checkpoint differs from audited no-op resume".into());
+    }
+    Ok(())
+}
+pub fn evaluate_semantic_setup_dataset(
+    dataset: &ValidatedSemanticSetupTeacherDataset,
+    checkpoint: &SemanticSetupTeacherTrainingCheckpoint,
+    split: DatasetSplit,
+) -> Result<PolicyLossReport, String> {
+    checkpoint.validate()?;
+    let route = TeacherRoute::SemanticSetup(dataset);
+    let identity = audit_route(route)?;
+    if identity != checkpoint.dataset {
+        return Err("Semantic Setup teacher evaluation dataset mismatch".into());
+    }
+    let model = PublicPolicyModel {
+        parameters: checkpoint.model.parameters().to_vec(),
+    };
+    let result = evaluate_samples_using(
+        route.iter(Some(split)),
+        &identity.dataset,
+        &model,
+        split,
+        &mut Scratch::default(),
+        route.profile(),
+    );
+    if audit_route(route)? != identity {
+        return Err("Semantic Setup teacher evaluation source changed".into());
+    }
+    result
 }
 
 #[cfg(test)]
@@ -661,7 +1070,213 @@ mod tests {
         let training_manifest =
             export_resource_cycle_v5_teacher_files(&training_sources, &training_directory).unwrap();
         let training = load_resource_cycle_v5_teacher_dataset(&training_directory).unwrap();
+        let semantic_directory = temp.0.join("semantic-teacher-training-dataset");
+        policy_dataset::export_resource_cycle_v5_semantic_setup_teacher_files(
+            &training_sources,
+            &semantic_directory,
+        )
+        .unwrap();
+        let semantic = policy_dataset::load_resource_cycle_v5_semantic_setup_teacher_dataset(
+            &semantic_directory,
+        )
+        .unwrap();
+        let semantic_continuous = train_semantic_setup_dataset(&semantic, &config, None).unwrap();
+        let semantic_streaming =
+            train_semantic_setup_after_cache::<false>(&semantic, &config, None, || Ok(())).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&semantic_continuous).unwrap(),
+            serde_json::to_vec(&semantic_streaming).unwrap()
+        );
+        let semantic_first = train_semantic_setup_dataset(
+            &semantic,
+            &PolicyBcConfig {
+                epochs: 1,
+                ..config.clone()
+            },
+            None,
+        )
+        .unwrap();
+        let semantic_resumed =
+            train_semantic_setup_dataset(&semantic, &config, Some(&semantic_first.checkpoint))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&semantic_continuous).unwrap(),
+            serde_json::to_vec(&semantic_resumed).unwrap()
+        );
+        assert_eq!(
+            train_semantic_setup_dataset(&semantic, &config, Some(&semantic_resumed.checkpoint))
+                .unwrap(),
+            semantic_resumed
+        );
+        validate_semantic_setup_checkpoint_dataset(&semantic, &semantic_resumed.checkpoint)
+            .unwrap();
+        let semantic_streaming_resume = train_semantic_setup_after_cache::<false>(
+            &semantic,
+            &config,
+            Some(&semantic_first.checkpoint),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&semantic_resumed).unwrap(),
+            serde_json::to_vec(&semantic_streaming_resume).unwrap()
+        );
+        assert_eq!(
+            evaluate_semantic_setup_dataset(
+                &semantic,
+                &semantic_resumed.checkpoint,
+                DatasetSplit::Validation
+            )
+            .unwrap(),
+            semantic_resumed.metrics.final_validation
+        );
+        assert!(
+            evaluate_semantic_setup_dataset(
+                &semantic,
+                &semantic_resumed.checkpoint,
+                DatasetSplit::Test
+            )
+            .is_err()
+        );
+        let semantic_cache = TeacherSamples::load_route(
+            TeacherRoute::SemanticSetup(&semantic),
+            &semantic_continuous.checkpoint.dataset,
+        )
+        .unwrap();
+        assert!(semantic_cache.allocation_bytes <= MAX_ENCODED_CACHE_BYTES);
+        assert_eq!(
+            semantic
+                .iter_split(DatasetSplit::Train)
+                .map(|s| s.unwrap().sample_id().to_owned())
+                .collect::<Vec<_>>(),
+            semantic_cache
+                .train
+                .iter()
+                .map(|s| s.sample_id().to_owned())
+                .collect::<Vec<_>>()
+        );
+        let mut too_large_semantic = semantic_continuous.checkpoint.dataset.clone();
+        too_large_semantic.dataset.candidates[0] =
+            MAX_ENCODED_CACHE_BYTES / std::mem::size_of::<crate::features::EncodedCandidate>() + 1;
+        assert!(
+            TeacherSamples::load_route(TeacherRoute::SemanticSetup(&semantic), &too_large_semantic)
+                .err()
+                .unwrap()
+                .contains("256 MiB")
+        );
+        assert_eq!(
+            semantic_continuous.checkpoint.feature_schema,
+            SEMANTIC_SETUP_FEATURE_SCHEMA
+        );
+        assert_eq!(
+            semantic_continuous
+                .checkpoint
+                .dataset
+                .dataset
+                .input_contract,
+            SEMANTIC_SETUP_INPUT_CONTRACT
+        );
+        assert_eq!(semantic_continuous.metrics.final_train.value_loss, ());
+        assert!(!semantic_continuous.metrics.strength_measured);
+        let semantic_output = temp.0.join("semantic-teacher-checkpoint");
+        semantic_resumed
+            .save_new_directory(&semantic_output)
+            .unwrap();
+        assert_eq!(
+            SemanticSetupTeacherTrainingCheckpoint::load(&semantic_output.join("checkpoint.json"))
+                .unwrap(),
+            semantic_resumed.checkpoint
+        );
+        assert!(!semantic_output.join("model.json").exists());
+        assert!(
+            semantic_resumed
+                .save_new_directory(&semantic_output)
+                .is_err()
+        );
+        let semantic_bytes = serde_json::to_vec(&semantic_resumed.checkpoint).unwrap();
+        assert!(serde_json::from_slice::<TeacherTrainingCheckpoint>(&semantic_bytes).is_err());
+        assert!(serde_json::from_slice::<PolicyTrainingCheckpoint>(&semantic_bytes).is_err());
+        assert!(serde_json::from_slice::<PublicPolicyArtifact>(&semantic_bytes).is_err());
+        for field in [
+            "featureSchema",
+            "sourceKind",
+            "inputContract",
+            "modelVersion",
+            "trainingVersion",
+            "teacher",
+            "family",
+            "policyId",
+        ] {
+            let mut bad = semantic_resumed.checkpoint.clone();
+            match field {
+                "featureSchema" => bad.feature_schema = PUBLIC_FEATURE_SCHEMA,
+                "sourceKind" => bad.source_kind = RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND.into(),
+                "inputContract" => bad.input_contract = INPUT_CONTRACT.into(),
+                "modelVersion" => bad.model_version = MODEL_VERSION.into(),
+                "trainingVersion" => bad.training_version = TRAINING_VERSION.into(),
+                "teacher" => bad.teacher = ResourceCycleConfig::default(),
+                "family" => {
+                    bad.dataset.families.pop().unwrap();
+                }
+                "policyId" => bad.dataset.dataset.strata[0].policy_id = "0".repeat(64),
+                _ => unreachable!(),
+            }
+            bad.checksum = bad.expected_checksum().unwrap();
+            assert!(bad.validate().is_err());
+            assert!(train_semantic_setup_dataset(&semantic, &config, Some(&bad)).is_err());
+        }
+        // JSON retains full u64 RNG/seed values; no f64 roundtrip is involved.
+        let mut large_integer = semantic_resumed.checkpoint.clone();
+        large_integer.config.seed = u64::MAX;
+        large_integer.random_state = u64::MAX - 1;
+        large_integer.checksum = large_integer.expected_checksum().unwrap();
+        large_integer.validate().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<SemanticSetupTeacherTrainingCheckpoint>(
+                &serde_json::to_vec(&large_integer).unwrap()
+            )
+            .unwrap(),
+            large_integer
+        );
+        assert!(train_semantic_setup_dataset(&semantic, &config, Some(&large_integer)).is_err());
         let continuous = teacher::train_dataset(&training, &config, None).unwrap();
+        assert!(
+            serde_json::from_slice::<SemanticSetupTeacherTrainingCheckpoint>(
+                &serde_json::to_vec(&continuous.checkpoint).unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_slice::<SemanticSetupTeacherModel>(
+                &serde_json::to_vec(&continuous.checkpoint.model).unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_slice::<PublicPolicyModel>(
+                &serde_json::to_vec(&semantic_continuous.checkpoint.model).unwrap()
+            )
+            .is_err()
+        );
+        // Re-signing every outer route field still cannot reinterpret the old
+        // inner model's serialized parameters as a semantic model.
+        let mut retag = serde_json::to_value(&continuous.checkpoint).unwrap();
+        for field in [
+            "schema",
+            "trainingVersion",
+            "sourceKind",
+            "task",
+            "modelVersion",
+            "inputContract",
+            "featureSchema",
+            "dataset",
+        ] {
+            retag[field] =
+                serde_json::to_value(&semantic_continuous.checkpoint).unwrap()[field].clone();
+        }
+        retag["checksum"] = serde_json::Value::String(String::new());
+        retag["checksum"] = serde_json::Value::String(hash(&serde_json::to_vec(&retag).unwrap()));
+        assert!(serde_json::from_value::<SemanticSetupTeacherTrainingCheckpoint>(retag).is_err());
         let streaming = train_dataset_using::<false>(&training, &config, None).unwrap();
         // Includes every parameter/moment, RNG, metric, identity and checksum byte.
         assert_eq!(
@@ -902,5 +1517,28 @@ mod tests {
         assert!(teacher::validate_checkpoint_dataset(&training, &resumed.checkpoint).is_err());
         assert!(handle.validate_arena_config(&arena_config).is_err());
         fs::write(training_source, original_training_source).unwrap();
+        // All raw source classes are rechecked even when the numeric work fails
+        // after cache creation; no cached outcome is returned for changed bytes.
+        for path in [
+            semantic_directory.join("manifest.json"),
+            semantic_directory.join(&semantic.manifest().games[0].source_file),
+            semantic_directory.join(&semantic.manifest().shards[0].file),
+        ] {
+            let original = fs::read(&path).unwrap();
+            let error = train_semantic_setup_after_cache::<true>(
+                &semantic,
+                &config,
+                Some(&semantic_resumed.checkpoint),
+                || {
+                    let mut changed = original.clone();
+                    changed.push(b' ');
+                    fs::write(&path, changed).map_err(|e| e.to_string())?;
+                    Err("injected numeric failure".into())
+                },
+            )
+            .unwrap_err();
+            assert_ne!(error, "injected numeric failure");
+            fs::write(&path, &original).unwrap();
+        }
     }
 }
