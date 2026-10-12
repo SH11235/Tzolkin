@@ -2656,9 +2656,66 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           payouts.length &&
           announcements.length
         ) {
-          const receipt = calendarEvidence.corn;
+          let receipt = calendarEvidence.corn;
           const claimed = state().firstPlayerClaimed;
           const future = claimed === state().firstPlayer ? (claimed + 1) % names.length : claimed;
+          // The final-seat claimer has no later actor switch to end their turn.
+          // Admit only this exact payout boundary, then use its real EndTurn receipt.
+          if (
+            claimed !== null &&
+            claimed === state().currentPlayer &&
+            state().turnIndex === state().turnOrder.length - 1 &&
+            state().turnOrder[state().turnIndex] === claimed &&
+            (!receipt || (receipt.consumed && receipt.round < state().round))
+          ) {
+            const round = state().round;
+            const amount = state().accumulatedCorn;
+            const corn = state().players[claimed].resources.corn;
+            const foodDays = copy(state().foodDays);
+            if (
+              events.length !== 2 ||
+              payouts.length !== 1 ||
+              announcements.length !== 1 ||
+              future === state().firstPlayer ||
+              actorId(payouts[0].actor) !== claimed ||
+              accumulatedCornPayout(payouts[0]) !== amount ||
+              !same(payouts[0].iconResources, ['corn']) ||
+              actorId(announcements[0].actor) !== future ||
+              announcements[0].iconResources.length ||
+              announcements[0].rawText !==
+                `${announcements[0].actor}がこのラウンドのスタートプレイヤーです` ||
+              legal().filter(
+                (row) => row.action.type === 'endTurn' && row.action.doubleAdvance === null,
+              ).length !== 1
+            )
+              fail('Final-seat payout boundary has no exact legal EndTurn');
+            choose(
+              (action) => action.type === 'endTurn' && action.doubleAdvance === null,
+              'observed final-seat corn payout',
+              true,
+              true,
+              null,
+              false,
+              false,
+            );
+            receipt = calendarEvidence.corn;
+            if (
+              pending() !== 'rotation' ||
+              state().round !== round ||
+              state().firstPlayerClaimed !== claimed ||
+              state().currentPlayer !== claimed ||
+              state().accumulatedCorn !== 0 ||
+              state().players[claimed].resources.corn - corn !== amount ||
+              !same(state().foodDays, foodDays) ||
+              context.feeding.length !== 0 ||
+              !receipt ||
+              receipt.actor !== claimed ||
+              receipt.round !== round ||
+              receipt.amount !== amount ||
+              receipt.consumed
+            )
+              fail('Final-seat payout did not establish the exact pending rotation receipt');
+          }
           if (
             events.length !== 2 ||
             payouts.length !== 1 ||
