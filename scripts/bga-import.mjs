@@ -161,6 +161,16 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
       result.actor = m[1];
       result.kind = 'feeding';
       result.detail = { workers: Number(m[2]) };
+      const payment = raw.match(/^食料供給日: (.+?)はワーカー(\d+)個で\s*(\d+)\s*を支払った$/);
+      if (
+        !iconResources.length &&
+        payment &&
+        payment[1] === m[1] &&
+        payment[2] === m[2] &&
+        message.html ===
+          `食料供給日: ${m[1]}はワーカー${m[2]}個で ${payment[3]} <div class="tz_icon resource_corn"></div>を支払った`
+      )
+        iconResources.push('corn');
     }
   }
   return result;
