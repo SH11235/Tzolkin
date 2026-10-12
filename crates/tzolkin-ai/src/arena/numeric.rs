@@ -2,8 +2,9 @@
 //! Numeric identities and external exclusions do not authenticate a producer,
 //! recreate an owner, or grant training, fresh Test, or strength authority.
 use super::conditional::{
-    ConditionalDiagnostics, ConditionalIdentity, ConditionalMixedArenaIdentity,
-    ConditionalMixedArenaPolicy, ConditionalPolicy, GameSession,
+    ConditionalCountZeroArenaIdentity, ConditionalCountZeroArenaPolicy, ConditionalDiagnostics,
+    ConditionalIdentity, ConditionalMixedArenaIdentity, ConditionalMixedArenaPolicy,
+    ConditionalPolicy, GameSession,
 };
 use super::{
     ArmResult, BorrowedArenaPolicy, BorrowedArenaWorkBounds, InitialConditions, PairedStatistics,
@@ -175,11 +176,15 @@ pub enum PolicyIdentity {
     ConditionalHumanMixedRl {
         identity: Box<ConditionalMixedArenaIdentity>,
     },
+    ConditionalHumanCountZeroAllPhase {
+        identity: Box<ConditionalCountZeroArenaIdentity>,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
     Conditional(Box<ConditionalPolicy<'a>>),
     ConditionalMixed(Box<ConditionalMixedArenaPolicy<'a>>),
+    ConditionalCountZero(Box<ConditionalCountZeroArenaPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
@@ -211,6 +216,11 @@ impl<'a> Role<'a> {
             Self::ConditionalMixed(policy) => PolicyIdentity::ConditionalHumanMixedRl {
                 identity: Box::new(policy.identity().clone()),
             },
+            Self::ConditionalCountZero(policy) => {
+                PolicyIdentity::ConditionalHumanCountZeroAllPhase {
+                    identity: Box::new(policy.identity().clone()),
+                }
+            }
             Self::Reactive(policy) => PolicyIdentity::Reactive {
                 provenance: policy.description.provenance.clone(),
             },
@@ -224,6 +234,7 @@ impl<'a> Role<'a> {
             Self::Numeric(policy) => Some(&policy.identity.configuration_key),
             Self::Conditional(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalMixed(policy) => Some(&policy.identity().configuration_key),
+            Self::ConditionalCountZero(policy) => Some(&policy.identity().configuration_key),
             _ => None,
         }
     }
@@ -383,6 +394,9 @@ fn choose(
         let result = match role {
             Role::Conditional(policy) => session.choose_move(index, observation, policy)?,
             Role::ConditionalMixed(policy) => session.choose_mixed(index, observation, policy)?,
+            Role::ConditionalCountZero(policy) => {
+                session.choose_count_zero(index, observation, policy)?
+            }
             _ => return Err("Conditional Arena game session/role mismatch".into()),
         };
         d.choices_returned += 1;
@@ -416,6 +430,9 @@ fn choose(
             let in_origin_grammar = match role {
                 Role::Conditional(policy) => policy.teacher_grammar_contains(&action.action),
                 Role::ConditionalMixed(policy) => policy.teacher_grammar_contains(&action.action),
+                Role::ConditionalCountZero(policy) => {
+                    policy.teacher_grammar_contains(&action.action)
+                }
                 _ => unreachable!("conditional session requires a conditional role"),
             };
             conditional.outside_teacher_grammar_choices += usize::from(!in_origin_grammar);
@@ -434,6 +451,9 @@ fn choose(
             Role::Numeric(_) => return Err("Numeric Arena missing game guard".into()),
             Role::Conditional(_) => return Err("Conditional Arena missing game session".into()),
             Role::ConditionalMixed(_) => {
+                return Err("Conditional Arena missing game session".into());
+            }
+            Role::ConditionalCountZero(_) => {
                 return Err("Conditional Arena missing game session".into());
             }
         };
@@ -525,6 +545,7 @@ fn play_arm_using<'a>(
         .map(|role| match &**role {
             Role::Conditional(policy) => Some(GameSession::new(policy)),
             Role::ConditionalMixed(policy) => Some(GameSession::new_mixed(policy)),
+            Role::ConditionalCountZero(policy) => Some(GameSession::new_count_zero(policy)),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -532,10 +553,12 @@ fn play_arm_using<'a>(
         .iter()
         .map(|role| match &**role {
             Role::Numeric(_) => Some(GuardDiagnostics::default()),
-            Role::Conditional(_) | Role::ConditionalMixed(_) => Some(GuardDiagnostics {
-                conditional: Some(ConditionalDiagnostics::default()),
-                ..GuardDiagnostics::default()
-            }),
+            Role::Conditional(_) | Role::ConditionalMixed(_) | Role::ConditionalCountZero(_) => {
+                Some(GuardDiagnostics {
+                    conditional: Some(ConditionalDiagnostics::default()),
+                    ..GuardDiagnostics::default()
+                })
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -662,6 +685,25 @@ pub fn run_conditional_mixed_validation<'a>(
         Role::Numeric(reference),
         opponent_pool,
         super::conditional::MIXED_ARENA_SCHEMA,
+    )
+}
+
+/// Genuine fresh BC count0 control with the same Setup/Playing prediction,
+/// callback ownership and Trade guard as the updated conditional actor.
+/// Development only; this does not relax the positive-current adapter or grant
+/// learning, native/source qualification, value supervision or fresh Test.
+pub fn run_conditional_count_zero_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: ConditionalCountZeroArenaPolicy<'a>,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    run_roles(
+        config,
+        Role::ConditionalCountZero(Box::new(candidate)),
+        Role::Numeric(reference),
+        opponent_pool,
+        super::conditional::COUNT_ZERO_ARENA_SCHEMA,
     )
 }
 
@@ -940,7 +982,113 @@ mod tests {
 
         let zero = crate::conditional_human_rl_update::tests::owner();
         assert!(ConditionalMixedArenaPolicy::new(&zero, TradeGuardConfig::default()).is_err());
+        assert_eq!(
+            ConditionalCountZeroArenaPolicy::new_bc_control(&zero, TradeGuardConfig::default())
+                .err()
+                .unwrap(),
+            "Count0 BC control requires original loaded source custody"
+        );
+        let zero_before = serde_json::to_value(zero.identity()).unwrap();
+        let zero_actor = zero.actor_parameters().to_vec();
+        let zero_critic = zero.critic_parameters().to_vec();
+        let mut zero_focal = Role::ConditionalCountZero(Box::new(
+            ConditionalCountZeroArenaPolicy::fixture(&zero, TradeGuardConfig::default()).unwrap(),
+        ));
+        let zero_identity = serde_json::to_value(zero_focal.identity()).unwrap();
+        assert_eq!(zero_identity["kind"], "conditionalHumanCountZeroAllPhase");
+        assert_eq!(zero_identity["identity"]["countZero"], zero_before);
+        assert_eq!(
+            zero_identity["identity"]["selection"],
+            "orderedFirstMaxSetupPlaying"
+        );
+        assert_eq!(zero_identity["identity"]["sourceQualified"], false);
+        assert_eq!(zero_identity["identity"]["verifiedNativePolicy"], false);
+        assert_eq!(
+            zero_identity["identity"]["valueValidity"],
+            "unavailablePolicyOnly"
+        );
+        let mut wrong_guard = synthetic_policy();
+        wrong_guard.identity.configuration_key = "wrong".into();
+        assert_eq!(
+            run_conditional_count_zero_validation(
+                &config,
+                ConditionalCountZeroArenaPolicy::fixture(&zero, TradeGuardConfig::default())
+                    .unwrap(),
+                wrong_guard,
+                (0..3)
+                    .map(|_| Opponent::ResourceCycle(
+                        super::super::resource_cycle::ResourceCycleConfig::v5()
+                    ))
+                    .collect(),
+            )
+            .err()
+            .unwrap(),
+            "Numeric Arena requires one fixed shared guard configuration"
+        );
+        for phase in [Phase::Setup, Phase::Playing, Phase::Playing] {
+            let (arm, diagnostics) =
+                play_arm_using(3, 0, &mut zero_focal, &mut pool, |players, seed, decide| {
+                    let state = if phase == Phase::Setup {
+                        tzolkin_core::create_game(
+                            (0..players).map(|i| format!("Seat {i}")).collect(),
+                            seed,
+                            false,
+                        )?
+                    } else {
+                        crate::conditional_human_rl_update::tests::terminal_start(players, seed)
+                    };
+                    let o = observe(&state, state.current_player)?;
+                    let prediction = zero.handle()?.distribution(&o)?;
+                    let expected = (1..prediction.logits().len()).fold(0, |best, i| {
+                        if prediction.logits()[i] > prediction.logits()[best] {
+                            i
+                        } else {
+                            best
+                        }
+                    });
+                    let decision = decide(0, &o)?;
+                    assert_eq!(decision.r#move, o.legal_actions[expected].r#move);
+                    assert_eq!(decision.score, f64::from(prediction.logits()[expected]));
+                    assert_eq!(
+                        decision.policy_version,
+                        super::super::conditional::COUNT_ZERO_POLICY_VERSION
+                    );
+                    Err("Injected count0 downstream failure".into())
+                });
+            assert_eq!(
+                arm.error.as_deref(),
+                Some("Injected count0 downstream failure")
+            );
+            assert!(arm.decisions.is_none() && arm.score.is_none() && arm.rank.is_none());
+            assert!(
+                diagnostics
+                    .iter()
+                    .flatten()
+                    .all(|d| d.notifications_attempted == 1
+                        && d.notifications_returned == 1
+                        && d.applied_choices.is_none())
+            );
+            let d = diagnostics[0]
+                .as_ref()
+                .unwrap()
+                .conditional
+                .as_ref()
+                .unwrap();
+            assert_eq!(d.setup_choices, usize::from(phase == Phase::Setup));
+            assert_eq!(d.playing_choices, usize::from(phase == Phase::Playing));
+            assert_eq!(
+                serde_json::to_value(zero_focal.identity()).unwrap(),
+                zero_identity
+            );
+        }
+        assert_eq!(serde_json::to_value(zero.identity()).unwrap(), zero_before);
+        assert_eq!(zero.actor_parameters(), zero_actor);
+        assert_eq!(zero.critic_parameters(), zero_critic);
         let updated = crate::conditional_human_rl_update::tests::updated_owner();
+        assert!(
+            ConditionalCountZeroArenaPolicy::fixture(&updated, TradeGuardConfig::default())
+                .is_err()
+        );
         let actor_bits = updated
             .actor_parameters()
             .iter()

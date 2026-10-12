@@ -1,5 +1,8 @@
 //! Conditional Human origin and explicit Setup/Playing composition for Dev only.
-pub use super::numeric::{run_conditional_mixed_validation, run_conditional_validation};
+pub use super::numeric::{
+    run_conditional_count_zero_validation, run_conditional_mixed_validation,
+    run_conditional_validation,
+};
 use crate::Decision;
 use crate::conditional_human_rl_update::{
     ConditionalMixedIdentity, ConditionalMixedOwner, ConditionalMixedPolicyHandle,
@@ -22,6 +25,10 @@ pub const POLICY_VERSION: &str = "conditional-human-corn-setup-guarded-playing-v
 pub const ARENA_SCHEMA: &str = "tzolkin-conditional-human-policy-development-arena-v1";
 pub const MIXED_POLICY_VERSION: &str = "conditional-human-current-allphase-guarded-argmax-v1";
 pub const MIXED_ARENA_SCHEMA: &str = "tzolkin-conditional-human-mixed-development-arena-v1";
+pub const COUNT_ZERO_POLICY_VERSION: &str =
+    "conditional-human-countzero-allphase-guarded-argmax-v1";
+pub const COUNT_ZERO_ARENA_SCHEMA: &str =
+    "tzolkin-conditional-human-countzero-development-arena-v1";
 
 /// The algorithm and weights are the existing frozen Corn-first Setup policy.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -153,6 +160,93 @@ impl<'a> ConditionalMixedArenaPolicy<'a> {
     }
 }
 
+/// Fresh BC control identity. This is neither an updated deployment nor a
+/// training, producing-process, value or source-authentication certificate.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalCountZeroArenaIdentity {
+    pub policy_version: String,
+    pub input_contract: String,
+    pub origin_checksum: String,
+    pub dataset: ConditionalDatasetIdentity,
+    pub reservations: BTreeMap<String, DatasetSplit>,
+    pub count_zero: ConditionalMixedIdentity,
+    pub backend: String,
+    pub selection: String,
+    pub guard: TradeGuardConfig,
+    pub configuration_key: String,
+    pub source_qualified: bool,
+    pub verified_native_policy: bool,
+    pub value_validity: crate::public_model::ValueValidity,
+}
+
+/// Read-only all-phase control borrowed from a genuine, freshly loaded BC
+/// origin. No sampler, reservation, counter mutation or portable export exists.
+pub struct ConditionalCountZeroArenaPolicy<'a> {
+    handle: ConditionalMixedPolicyHandle<'a>,
+    identity: ConditionalCountZeroArenaIdentity,
+}
+impl<'a> ConditionalCountZeroArenaPolicy<'a> {
+    pub fn new_bc_control(
+        owner: &'a ConditionalMixedOwner,
+        guard: TradeGuardConfig,
+    ) -> Result<Self, String> {
+        if owner.origin().source_pins().is_empty() {
+            return Err("Count0 BC control requires original loaded source custody".into());
+        }
+        // Lifecycle IO only; prediction and notifications borrow unchanged bits.
+        owner.origin().recheck_sources()?;
+        Self::from_owner(owner, guard)
+    }
+    fn from_owner(
+        owner: &'a ConditionalMixedOwner,
+        guard: TradeGuardConfig,
+    ) -> Result<Self, String> {
+        let handle = owner.handle()?;
+        require_fresh_count_zero(handle.identity())?;
+        let configuration_key = guard.configuration_key()?;
+        Ok(Self {
+            identity: ConditionalCountZeroArenaIdentity {
+                policy_version: COUNT_ZERO_POLICY_VERSION.into(),
+                input_contract: crate::conditional_human_rl::INPUT_CONTRACT.into(),
+                origin_checksum: owner.origin().checksum().into(),
+                dataset: owner.origin().dataset().clone(),
+                reservations: owner.origin().table_reservations().clone(),
+                count_zero: handle.identity().clone(),
+                backend: "scalar".into(),
+                selection: "orderedFirstMaxSetupPlaying".into(),
+                guard,
+                configuration_key,
+                source_qualified: false,
+                verified_native_policy: false,
+                value_validity: crate::public_model::ValueValidity::UnavailablePolicyOnly,
+            },
+            handle,
+        })
+    }
+    pub fn identity(&self) -> &ConditionalCountZeroArenaIdentity {
+        &self.identity
+    }
+    pub(super) fn teacher_grammar_contains(&self, action: &TypedAction) -> bool {
+        teacher_grammar_contains(self.identity.dataset.label_scope.as_deref(), action)
+    }
+    #[cfg(test)]
+    pub(super) fn fixture(
+        owner: &'a ConditionalMixedOwner,
+        guard: TradeGuardConfig,
+    ) -> Result<Self, String> {
+        // Existing tiny synthetic owners intentionally have no loaded custody.
+        // The public constructor's refusal is tested separately.
+        Self::from_owner(owner, guard)
+    }
+}
+fn require_fresh_count_zero(identity: &ConditionalMixedIdentity) -> Result<(), String> {
+    if identity.mixed_update_count() != 0 || identity.next_ordinal() != 0 {
+        return Err("Count0 BC control requires fresh zero-update/zero-ordinal owner".into());
+    }
+    Ok(())
+}
+
 // Category membership is diagnostic only: it does not check observed captions,
 // an uncapped technology/pending payment, or positive coverage in actual Train rows.
 fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> bool {
@@ -214,13 +308,13 @@ pub(super) struct ConditionalDecision {
 #[derive(Clone, Copy)]
 enum SetupRoute {
     CornFirst,
-    NumericAllPhase,
+    NumericAllPhase(&'static str),
 }
 impl SetupRoute {
     fn policy_version(self) -> &'static str {
         match self {
             Self::CornFirst => POLICY_VERSION,
-            Self::NumericAllPhase => MIXED_POLICY_VERSION,
+            Self::NumericAllPhase(version) => version,
         }
     }
 }
@@ -240,8 +334,18 @@ impl GameSession {
             .expect("conditional constructor validated guard configuration")
     }
     pub(super) fn new_mixed(policy: &ConditionalMixedArenaPolicy<'_>) -> Self {
-        Self::with_route(SetupRoute::NumericAllPhase, &policy.identity.guard)
-            .expect("conditional mixed constructor validated guard configuration")
+        Self::with_route(
+            SetupRoute::NumericAllPhase(MIXED_POLICY_VERSION),
+            &policy.identity.guard,
+        )
+        .expect("conditional mixed constructor validated guard configuration")
+    }
+    pub(super) fn new_count_zero(policy: &ConditionalCountZeroArenaPolicy<'_>) -> Self {
+        Self::with_route(
+            SetupRoute::NumericAllPhase(COUNT_ZERO_POLICY_VERSION),
+            &policy.identity.guard,
+        )
+        .expect("conditional count0 constructor validated guard configuration")
     }
     fn with_config(setup: ConditionalSetup, guard: &TradeGuardConfig) -> Result<Self, String> {
         let route = match setup {
@@ -309,6 +413,14 @@ impl GameSession {
         index: usize,
         o: &Observation,
         policy: &ConditionalMixedArenaPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.handle.numeric_distribution(o))
+    }
+    pub(super) fn choose_count_zero(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &ConditionalCountZeroArenaPolicy<'_>,
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.handle.numeric_distribution(o))
     }
@@ -561,26 +673,43 @@ mod tests {
             .unwrap();
         assert!(o.legal_actions.len() > 1);
         let target = (corn_index + 1) % o.legal_actions.len();
-        let mut numeric =
-            GameSession::with_route(SetupRoute::NumericAllPhase, &TradeGuardConfig::default())
-                .unwrap();
-        numeric.on_callback(0, &o).unwrap();
-        let mixed = numeric
-            .choose_using(0, &o, |o| {
-                let mut logits = vec![0.; o.legal_actions.len()];
-                logits[target] = 1.;
-                let mut probabilities = vec![0.; o.legal_actions.len()];
-                probabilities[target] = 1.;
-                Ok(NumericPolicyDistribution {
-                    logits,
-                    probabilities,
+        for version in [MIXED_POLICY_VERSION, COUNT_ZERO_POLICY_VERSION] {
+            let mut numeric = GameSession::with_route(
+                SetupRoute::NumericAllPhase(version),
+                &TradeGuardConfig::default(),
+            )
+            .unwrap();
+            numeric.on_callback(0, &o).unwrap();
+            let mixed = numeric
+                .choose_using(0, &o, |o| {
+                    let mut logits = vec![0.; o.legal_actions.len()];
+                    logits[target] = 1.;
+                    let mut probabilities = vec![0.; o.legal_actions.len()];
+                    probabilities[target] = 1.;
+                    Ok(NumericPolicyDistribution {
+                        logits,
+                        probabilities,
+                    })
                 })
-            })
-            .unwrap()
-            .decision;
-        assert_eq!(mixed.r#move, o.legal_actions[target].r#move);
-        assert_eq!(mixed.policy_version, MIXED_POLICY_VERSION);
-        assert!(numeric.choose_using(0, &o, |_| unreachable!()).is_err());
+                .unwrap()
+                .decision;
+            assert_eq!(mixed.r#move, o.legal_actions[target].r#move);
+            assert_eq!(mixed.policy_version, version);
+            assert!(numeric.choose_using(0, &o, |_| unreachable!()).is_err());
+        }
+        let zero = crate::conditional_human_rl_update::tests::owner();
+        require_fresh_count_zero(zero.identity()).unwrap();
+        let no_change_tip = crate::conditional_human_rl_update::checked_tip_identity(
+            zero.identity(),
+            zero.actor_parameters(),
+            zero.critic_parameters(),
+            4,
+            false,
+        )
+        .unwrap();
+        assert_eq!(no_change_tip.mixed_update_count(), 0);
+        assert!(require_fresh_count_zero(&no_change_tip).is_err());
+        assert!(ConditionalCountZeroArenaPolicy::fixture(&zero, invalid).is_err());
         assert!(game.choose_using(0, &o, |_| unreachable!()).is_err());
         assert!(game.on_callback(1, &o).is_err());
         let mut stale = session();
@@ -624,48 +753,76 @@ mod tests {
                 probabilities: vec![1. / o.legal_actions.len() as f32; o.legal_actions.len()],
             })
         };
-        let mut game = session();
-        game.on_callback(0, &o).unwrap();
-        let first = game.choose_using(0, &o, predict).unwrap();
-        assert_eq!(first.decision.r#move, o.legal_actions[0].r#move);
-        assert!(!first.trade.unwrap().overridden);
-        game.on_callback(1, &o).unwrap();
-        let repeated = game.choose_using(1, &o, predict).unwrap();
-        assert_eq!(
-            repeated.decision.r#move,
-            o.legal_actions[skip_index(&o).unwrap()].r#move
-        );
-        assert!(repeated.trade.unwrap().repeat_seen);
-        game.on_callback(2, &o).unwrap();
-        assert!(
-            !game
-                .choose_using(2, &o, predict)
-                .unwrap()
-                .trade
-                .unwrap()
-                .repeat_seen
-        );
-        state.current_player = (state.current_player + 1) % 3;
-        let other = observe(&state, state.current_player).unwrap();
-        game.on_callback(3, &other).unwrap();
-        game.on_callback(4, &o).unwrap();
-        assert!(
-            !game
-                .choose_using(4, &o, predict)
-                .unwrap()
-                .trade
-                .unwrap()
-                .repeat_seen
-        );
-        let mut fresh = session();
-        fresh.on_callback(0, &o).unwrap();
-        assert!(
-            !fresh
-                .choose_using(0, &o, predict)
-                .unwrap()
-                .trade
-                .unwrap()
-                .repeat_seen
-        );
+        for route in [
+            SetupRoute::CornFirst,
+            SetupRoute::NumericAllPhase(MIXED_POLICY_VERSION),
+            SetupRoute::NumericAllPhase(COUNT_ZERO_POLICY_VERSION),
+        ] {
+            state.current_player = o.actor;
+            let mut game = GameSession::with_route(route, &TradeGuardConfig::default()).unwrap();
+            game.on_callback(0, &o).unwrap();
+            let first = game.choose_using(0, &o, predict).unwrap();
+            assert_eq!(first.decision.r#move, o.legal_actions[0].r#move);
+            assert!(!first.trade.unwrap().overridden);
+            game.on_callback(1, &o).unwrap();
+            let repeated = game.choose_using(1, &o, predict).unwrap();
+            assert_eq!(
+                repeated.decision.r#move,
+                o.legal_actions[skip_index(&o).unwrap()].r#move
+            );
+            assert!(repeated.trade.unwrap().repeat_seen);
+            game.on_callback(2, &o).unwrap();
+            assert!(
+                !game
+                    .choose_using(2, &o, predict)
+                    .unwrap()
+                    .trade
+                    .unwrap()
+                    .repeat_seen
+            );
+            state.current_player = (state.current_player + 1) % 3;
+            let other = observe(&state, state.current_player).unwrap();
+            game.on_callback(3, &other).unwrap();
+            game.on_callback(4, &o).unwrap();
+            assert!(
+                !game
+                    .choose_using(4, &o, predict)
+                    .unwrap()
+                    .trade
+                    .unwrap()
+                    .repeat_seen
+            );
+            let mut fresh = GameSession::with_route(route, &TradeGuardConfig::default()).unwrap();
+            fresh.on_callback(0, &o).unwrap();
+            assert!(
+                !fresh
+                    .choose_using(0, &o, predict)
+                    .unwrap()
+                    .trade
+                    .unwrap()
+                    .repeat_seen
+            );
+            let bound = TradeGuardConfig {
+                max_trades_per_episode: 1,
+                ..TradeGuardConfig::default()
+            };
+            let mut bounded = GameSession::with_route(route, &bound).unwrap();
+            bounded.on_callback(0, &o).unwrap();
+            assert!(
+                !bounded
+                    .choose_using(0, &o, predict)
+                    .unwrap()
+                    .trade
+                    .unwrap()
+                    .budget_reached
+            );
+            bounded.on_callback(1, &o).unwrap();
+            let forced = bounded.choose_using(1, &o, predict).unwrap();
+            assert!(forced.trade.unwrap().budget_reached);
+            assert_eq!(
+                forced.decision.r#move,
+                o.legal_actions[skip_index(&o).unwrap()].r#move
+            );
+        }
     }
 }
