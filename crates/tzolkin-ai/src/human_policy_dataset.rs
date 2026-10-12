@@ -17,16 +17,20 @@ use tzolkin_core::observation::{
     ActionSource, LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, TypedAction,
 };
 use tzolkin_core::public_replay::{
-    PUBLIC_RULES_VERSION, PublicReplayRecord, inspect_public, public_catalog_hash,
-    verify_public_replay,
+    PUBLIC_RULES_VERSION, PublicReplayRecord, PublicReplayReport, inspect_public,
+    public_catalog_hash, verify_public_replay,
 };
-use tzolkin_core::{GameOptions, GearId, Phase, Task};
+use tzolkin_core::{GameOptions, GearId, Pending, Phase, RESOURCE_IDS, Task, TechnologyId};
 
 pub const INPUT_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-source-v1";
 pub const DATASET_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-dataset-v1";
 pub const INPUT_SCHEMA_V2: &str = "tzolkin-conditional-basic-human-policy-source-v2";
 pub const DATASET_SCHEMA_V2: &str = "tzolkin-conditional-basic-human-policy-dataset-v2";
 pub const FACTORIZED_LABEL_SCOPE: &str = "PrimitivesAndRemovalPairedCurrentGearActionsV2";
+pub const INPUT_SCHEMA_V3: &str = "tzolkin-conditional-basic-human-policy-source-v3";
+pub const DATASET_SCHEMA_V3: &str = "tzolkin-conditional-basic-human-policy-dataset-v3";
+pub const PAID_TECHNOLOGY_LABEL_SCOPE: &str =
+    "PrimitivesRemovalActionAndObservedUncappedPaidTechnologyV3";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -75,6 +79,9 @@ impl Manifest {
         match (self.schema.as_str(), self.label_scope.as_deref()) {
             (INPUT_SCHEMA, None) => Ok(None),
             (INPUT_SCHEMA_V2, Some(FACTORIZED_LABEL_SCOPE)) => Ok(Some(FACTORIZED_LABEL_SCOPE)),
+            (INPUT_SCHEMA_V3, Some(PAID_TECHNOLOGY_LABEL_SCOPE)) => {
+                Ok(Some(PAID_TECHNOLOGY_LABEL_SCOPE))
+            }
             _ => Err("Conditional Human manifest label scope mismatch".into()),
         }
     }
@@ -130,6 +137,23 @@ pub struct HumanPolicySample {
     paired_sample_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     source_label_support: Option<RemovalActionSupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    paid_technology_support: Option<PaidTechnologySupport>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaidTechnologySupport {
+    observed_operation_id: String,
+    technology: TechnologyId,
+    technology_replay_step_index: usize,
+    payment_replay_step_index: usize,
+    technology_message_index: usize,
+    payment_message_indices: Vec<usize>,
+    technology_caption: String,
+    payment_caption_html: Vec<String>,
+    observed_materials: [i64; 5],
+    pending_amount: i64,
+    basis: &'static str,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -544,6 +568,411 @@ fn removal_action_caption(text: &str, name: &str) -> Option<RemovalCaption> {
     })
 }
 
+fn observed_audit(entry: &Value) -> bool {
+    entry["derivedFromVisibleBoundary"] == false
+        && entry["equivalentChoices"].as_u64() == Some(1)
+        && [
+            "cancellation",
+            "removedSteps",
+            "physicalSelectionUnknown",
+            "buildingEquivalenceClass",
+        ]
+        .iter()
+        .all(|field| entry.get(*field).is_none())
+}
+
+// Accept only literal, bounded material icons and visible quantity. Nonempty
+// captured icons are authoritative; an empty array requires exact complete HTML.
+// No cost/holdings-based payment inference.
+fn material_caption(message: &Value, name: &str, current_format: bool) -> Option<[i64; 5]> {
+    let prefix = format!("{name}は");
+    let text = message["raw_text"]
+        .as_str()?
+        .strip_prefix(&prefix)?
+        .strip_suffix("を支払った")?
+        .trim();
+    let html = message["html"].as_str()?;
+    if html.len() > 16_384 {
+        return None;
+    }
+    let mut body = html
+        .strip_prefix(&prefix)?
+        .strip_suffix("を支払った")?
+        .trim();
+    let digits = body.bytes().take_while(u8::is_ascii_digit).count();
+    let quantity = if digits == 0 {
+        None
+    } else {
+        Some(number(&body[..digits])?)
+    };
+    if text != body[..digits].trim() {
+        return None;
+    }
+    body = body[digits..].trim_start();
+    let icons = message["icons"].as_array()?;
+    if icons.len() > 3 || quantity.is_some_and(|n| n < 1) {
+        return None;
+    }
+    if icons.is_empty() {
+        let mut values = [0; 5];
+        let mut literal = String::new();
+        let mut count = 0;
+        while !body.is_empty() {
+            if count == 3 {
+                return None;
+            }
+            let (classes, remaining) = body
+                .strip_prefix("<div class=\"")?
+                .split_once("\"></div>")?;
+            let resource = match classes {
+                "tz_icon resource_wood" => 1,
+                "tz_icon resource_stone" => 2,
+                "tz_icon resource_gold" => 3,
+                _ => return None,
+            };
+            values[resource] += quantity.unwrap_or(1);
+            literal.push_str(&format!("<div class=\"{classes}\"></div>"));
+            count += 1;
+            body = remaining;
+        }
+        if count == 0 || (quantity.is_some() && count != 1) {
+            return None;
+        }
+        let quantity_text = quantity.map_or_else(String::new, |value| value.to_string());
+        return ["", " "]
+            .iter()
+            .any(|space| {
+                (quantity.is_some() || space.is_empty())
+                    && html == format!("{prefix}{quantity_text}{space}{literal}を支払った")
+            })
+            .then_some(values);
+    }
+    let mut values = [0; 5];
+    for icon in icons {
+        let (classes, remaining) = body
+            .strip_prefix("<div class=\"")?
+            .split_once("\"></div>")?;
+        let declared = icon[if current_format { "class" } else { "classes" }].as_str()?;
+        if classes != declared {
+            return None;
+        }
+        let classes = classes.split_whitespace().collect::<BTreeSet<_>>();
+        if classes.len() != 2 || !classes.contains("tz_icon") {
+            return None;
+        }
+        let resource = if classes.contains("resource_wood") {
+            1
+        } else if classes.contains("resource_stone") {
+            2
+        } else if classes.contains("resource_gold") {
+            3
+        } else {
+            return None;
+        };
+        values[resource] += quantity.unwrap_or(1);
+        body = remaining.trim_start();
+    }
+    if !body.is_empty() || (quantity.is_some() && icons.len() != 1) {
+        return None;
+    }
+    Some(values)
+}
+
+struct PaidTechnologyEvidence {
+    support: PaidTechnologySupport,
+    payment_observation: tzolkin_core::observation::Observation,
+    payment_chosen: usize,
+}
+fn paid_technology_evidence(
+    index: usize,
+    technology: TechnologyId,
+    sources: &Sources,
+    report: &PublicReplayReport,
+    audit_rows: &[Value],
+    family: &str,
+    source_actor_id: &str,
+) -> Result<Option<PaidTechnologyEvidence>, String> {
+    let record = &sources.record;
+    let step = &record.steps[index];
+    let Some(payment) = record.steps.get(index + 1) else {
+        return Ok(None);
+    };
+    let before = &report.frames[index].snapshot.state;
+    let current = &report.frames[index + 1].snapshot.state;
+    let after = &report.frames[index + 2].snapshot.state;
+    let before_frame = inspect_public(before)?;
+    let before_o = before_frame
+        .observation
+        .as_ref()
+        .ok_or("Missing technology observation")?;
+    let current_frame = inspect_public(current)?;
+    let payment_o = current_frame
+        .observation
+        .ok_or("Missing payment observation")?;
+    if before_o.players.len() != 4
+        || before_o.legal_actions.len() < 2
+        || !matches!(
+            before_o.pending_task,
+            Some(Task::Technology { free: false, .. })
+        )
+        || before.players[step.actor].technologies[&technology] >= 3
+        || payment.actor != step.actor
+        || payment.source_action_ids != step.source_action_ids
+        || step.refills != Default::default()
+        || payment.refills != Default::default()
+        || [current, after].iter().any(|s| {
+            s.round != before.round
+                || s.phase != before.phase
+                || s.current_player != before.current_player
+        })
+    {
+        return Ok(None);
+    }
+    let amount = match payment_o.pending_task {
+        Some(Task::PayTechnology {
+            technology: t,
+            amount,
+            optional: false,
+        }) if t == technology && amount > 0 => amount,
+        _ => return Ok(None),
+    };
+    let Some(pending_before) = before.pending.as_ref() else {
+        return Ok(None);
+    };
+    let (remaining, mandatory) = match pending_before.task {
+        Task::Technology {
+            remaining: remaining @ 1..=2,
+            free: false,
+            mandatory,
+        } if pending_before.after.is_empty() => (remaining, mandatory),
+        _ => return Ok(None),
+    };
+    let matched = payment_o
+        .legal_actions
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.r#move == payment.r#move)
+        .collect::<Vec<_>>();
+    if payment_o.actor != step.actor || matched.len() != 1 {
+        return Ok(None);
+    }
+    let (payment_chosen, payment_row) = matched[0];
+    let typed = serde_json::to_value(&payment_row.action).map_err(|e| e.to_string())?;
+    let bound = audit_rows
+        .iter()
+        .filter(|entry| {
+            entry["step"].as_u64() == Some((index + 2) as u64)
+                && entry["actionId"].as_u64() == Some(step.source_action_ids[0])
+                && entry["actor"].as_u64() == Some(step.actor as u64)
+                && entry["action"] == typed
+        })
+        .collect::<Vec<_>>();
+    if bound.len() != 1 || !observed_audit(bound[0]) {
+        return Ok(None);
+    }
+    let TypedAction::Payment { resources } = payment_row.action else {
+        return Ok(None);
+    };
+    if resources[0] != 0
+        || resources[4] != 0
+        || resources.iter().any(|n| *n < 0)
+        || resources.iter().sum::<i64>() != amount
+    {
+        return Ok(None);
+    }
+    let raw_messages = sources.raw["dom_entries"]
+        .as_array()
+        .ok_or("Missing source messages")?
+        .iter()
+        .find(|node| node["action_id"].as_u64() == Some(step.source_action_ids[0]))
+        .and_then(|node| node["messages"].as_array())
+        .ok_or("Missing paid technology source")?;
+    let technology_name = match technology {
+        TechnologyId::Agriculture => "農業",
+        TechnologyId::Extraction => "収集",
+        TechnologyId::Architecture => "建築",
+        TechnologyId::Theology => "神学",
+    };
+    let name = &record.initial.players[step.actor].name;
+    let caption = format!("{name}は{technology_name}を1レベル進めた");
+    let mut technology_message_index = None;
+    let mut payment_message_indices = Vec::new();
+    let mut payment_caption_html = Vec::new();
+    let mut observed = [0i64; 5];
+    for (message_index, message) in raw_messages.iter().enumerate() {
+        let text = message["raw_text"].as_str().ok_or("Missing source text")?;
+        let actor = record
+            .initial
+            .players
+            .iter()
+            .filter(|player| text.starts_with(&format!("{}は", player.name)))
+            .max_by_key(|player| player.name.len());
+        if actor.is_none_or(|player| &player.name != name) {
+            return Ok(None);
+        }
+        if text == caption {
+            if message
+                .get("icons")
+                .is_some_and(|icons| !icons.as_array().is_some_and(Vec::is_empty))
+                || message
+                    .get("html")
+                    .is_some_and(|html| html.as_str() != Some(caption.as_str()))
+                || technology_message_index.replace(message_index).is_some()
+            {
+                return Ok(None);
+            }
+        } else if let Some(vector) =
+            material_caption(message, name, sources.raw["schema_version"] == 1)
+        {
+            for (total, n) in observed.iter_mut().zip(vector) {
+                *total += n;
+            }
+            payment_message_indices.push(message_index);
+            payment_caption_html.push(
+                message["html"]
+                    .as_str()
+                    .ok_or("Missing payment HTML")?
+                    .into(),
+            );
+        } else {
+            // Includes cancellation, multiple advances, bonuses and unknown captions.
+            return Ok(None);
+        }
+    }
+    let Some(technology_message_index) = technology_message_index else {
+        return Ok(None);
+    };
+    if payment_message_indices.is_empty() || observed != resources {
+        return Ok(None);
+    }
+    // Canonical mechanical equality permits log-only differences. Explicitly
+    // require the simple paid continuation, not queued effects or deliveries.
+    let following = Task::Technology {
+        remaining: remaining - 1,
+        free: false,
+        mandatory,
+    };
+    let mut expected_current = before.clone();
+    expected_current.log = current.log.clone();
+    expected_current.pending = Some(Pending {
+        title: format!(
+            "{}：資源 {amount} 個を支払う",
+            tzolkin_core::catalog::CATALOG.technology_labels[&technology]
+        ),
+        task: Task::PayTechnology {
+            technology,
+            amount,
+            optional: false,
+        },
+        after: vec![following.clone()],
+    });
+    let mut expected_after = before.clone();
+    expected_after.log = after.log.clone();
+    expected_after.pending = (remaining > 1).then(|| Pending {
+        title: format!("技術を進める（残り {} 回）", remaining - 1),
+        task: following,
+        after: vec![],
+    });
+    *expected_after.players[step.actor]
+        .technologies
+        .get_mut(&technology)
+        .ok_or("Missing technology")? += 1;
+    for (resource, amount) in RESOURCE_IDS.iter().zip(observed) {
+        *expected_after.players[step.actor]
+            .resources
+            .get_mut(resource)
+            .ok_or("Missing resource")? -= amount;
+    }
+    if current != &expected_current || after != &expected_after {
+        return Ok(None);
+    }
+    let observed_operation_id = digest(
+        format!(
+            "tzolkin-human-paid-technology-operation-v3\0{family}\0{source_actor_id}\0{}",
+            step.source_action_ids[0]
+        )
+        .as_bytes(),
+    );
+    Ok(Some(PaidTechnologyEvidence {
+        support: PaidTechnologySupport {
+            observed_operation_id,
+            technology,
+            technology_replay_step_index: index,
+            payment_replay_step_index: index + 1,
+            technology_message_index,
+            payment_message_indices,
+            technology_caption: caption,
+            payment_caption_html,
+            observed_materials: observed,
+            pending_amount: amount,
+            basis: "oneObservedPaidTechnologyAndMaterialOperation",
+        },
+        payment_observation: payment_o,
+        payment_chosen,
+    }))
+}
+
+fn paid_technology_sample(
+    observation: &tzolkin_core::observation::Observation,
+    chosen: usize,
+    label: (String, Option<String>, &'static str),
+    support: &PaidTechnologySupport,
+    dataset: (&str, &str, DatasetSplit, &str, u64),
+    counts: &mut HumanPolicyCounts,
+) -> Result<HumanPolicySample, String> {
+    let (sample_id, paired_sample_id, part) = label;
+    let (family, table_id, split, source_actor_id, source_action_id) = dataset;
+    let encoder = FeatureEncoder::new_public(observation)?;
+    let candidates = (0..observation.legal_actions.len())
+        .map(|i| encoder.encode_legal_tagged(i))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    for (i, candidate) in candidates.iter().enumerate() {
+        let values = candidate.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 1024.0)
+            || (i != chosen && values == selected)
+        {
+            return Err("Paid technology features are unbounded or aliased".into());
+        }
+    }
+    counts.candidates = counts
+        .candidates
+        .checked_add(candidates.len())
+        .filter(|n| *n <= MAX_CANDIDATES)
+        .ok_or("Human dataset candidate limit exceeded")?;
+    let technology = part == "paidTechnology";
+    Ok(HumanPolicySample {
+        sample_id,
+        family_id: family.into(),
+        split,
+        table_id: table_id.into(),
+        source_actor_id: source_actor_id.into(),
+        source_action_id,
+        source_message_index: if technology {
+            support.technology_message_index
+        } else {
+            support.payment_message_indices[0]
+        },
+        replay_step_index: if technology {
+            support.technology_replay_step_index
+        } else {
+            support.payment_replay_step_index
+        },
+        actor: observation.actor,
+        observation_key: observation.observation_key.clone(),
+        legal_actions: observation.legal_actions.clone(),
+        candidates,
+        chosen,
+        value_target: (),
+        source_label_part: Some(part),
+        paired_sample_id,
+        source_label_support: None,
+        paid_technology_support: Some(support.clone()),
+    })
+}
+
 impl ConditionalHumanPolicyDataset {
     pub fn load(
         path: &Path,
@@ -698,6 +1127,7 @@ impl ConditionalHumanPolicyDataset {
         };
         let mut samples: Vec<HumanPolicySample> = Vec::new();
         let mut labels = BTreeSet::new();
+        let mut paid_payment_steps = BTreeSet::new();
         for (index, step) in record.steps.iter().enumerate() {
             let frame = inspect_public(&report.frames[index].snapshot.state)?;
             let observation = frame
@@ -739,6 +1169,102 @@ impl ConditionalHumanPolicyDataset {
                 return Err("Final applied-step audit is absent or ambiguous".into());
             }
             let entry = bound[0];
+            if paid_payment_steps.contains(&index) {
+                continue;
+            }
+            if label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE)
+                && let TypedAction::Technology { technology } = row.action
+            {
+                if !teachers.contains(&actor_ids[step.actor]) || !observed_audit(entry) {
+                    *counts
+                        .excluded
+                        .entry("unobservedPaidTechnology".into())
+                        .or_default() += 1;
+                    continue;
+                }
+                let Some(evidence) = paid_technology_evidence(
+                    index,
+                    technology,
+                    sources,
+                    &report,
+                    audit_rows,
+                    &family,
+                    &actor_ids[step.actor],
+                )?
+                else {
+                    *counts
+                        .excluded
+                        .entry("unobservedPaidTechnology".into())
+                        .or_default() += 1;
+                    continue;
+                };
+                let support = &evidence.support;
+                let technology_id = digest(
+                    format!(
+                        "tzolkin-human-paid-technology-factor-v3\0{}\0paidTechnology",
+                        support.observed_operation_id
+                    )
+                    .as_bytes(),
+                );
+                let payment_id = digest(
+                    format!(
+                        "tzolkin-human-paid-technology-factor-v3\0{}\0technologyMaterialPayment",
+                        support.observed_operation_id
+                    )
+                    .as_bytes(),
+                );
+                let has_payment_choice = evidence.payment_observation.legal_actions.len() >= 2;
+                let identity = (
+                    family.as_str(),
+                    manifest.table_id.as_str(),
+                    split,
+                    actor_ids[step.actor].as_str(),
+                    source_id,
+                );
+                if !labels.insert((
+                    source_id,
+                    support.technology_message_index,
+                    "paidTechnology",
+                )) {
+                    return Err("Paid technology source label was consumed twice".into());
+                }
+                samples.push(paid_technology_sample(
+                    observation,
+                    chosen,
+                    (
+                        technology_id.clone(),
+                        has_payment_choice.then(|| payment_id.clone()),
+                        "paidTechnology",
+                    ),
+                    support,
+                    identity,
+                    &mut counts,
+                )?);
+                if has_payment_choice {
+                    if !labels.insert((
+                        source_id,
+                        support.payment_message_indices[0],
+                        "technologyMaterialPayment",
+                    )) {
+                        return Err("Material source label was consumed twice".into());
+                    }
+                    samples.push(paid_technology_sample(
+                        &evidence.payment_observation,
+                        evidence.payment_chosen,
+                        (payment_id, Some(technology_id), "technologyMaterialPayment"),
+                        support,
+                        identity,
+                        &mut counts,
+                    )?);
+                } else {
+                    *counts
+                        .excluded
+                        .entry("forcedPaymentNoChoice".into())
+                        .or_default() += 1;
+                }
+                paid_payment_steps.insert(index + 1);
+                continue;
+            }
             let factorized = label_scope.is_some()
                 && matches!(
                     row.action,
@@ -958,6 +1484,7 @@ impl ConditionalHumanPolicyDataset {
                 source_label_part: factorized.then_some("removalAction"),
                 paired_sample_id: pair.map(|(id, _, _, _)| id),
                 source_label_support: support,
+                paid_technology_support: None,
             });
         }
         counts.samples = samples.len();
@@ -1106,6 +1633,7 @@ impl ConditionalHumanPolicyDataset {
                 source_label_part: None,
                 paired_sample_id: None,
                 source_label_support: None,
+                paid_technology_support: None,
             }],
         }
     }
@@ -1122,7 +1650,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope.is_some() {
+            schema: if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
+                DATASET_SCHEMA_V3
+            } else if self.label_scope.is_some() {
                 DATASET_SCHEMA_V2
             } else {
                 DATASET_SCHEMA
@@ -1136,7 +1666,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope.is_some() {
+            source_label_basis: if self.label_scope == Some(PAID_TECHNOLOGY_LABEL_SCOPE) {
+                "originalVisibleTextAndFinalAppliedStepAuditWithObservedPaidTechnologyAndMaterials"
+            } else if self.label_scope.is_some() {
                 "originalVisibleTextAndFinalAppliedStepAuditWithFactorizedRemovalCaption"
             } else {
                 "originalVisibleTextAndFinalAppliedStepAudit"
