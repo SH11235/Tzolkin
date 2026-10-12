@@ -1,23 +1,34 @@
 //! Audited V5-distillation storage and a distinct, borrowed Development Arena role.
 //! Source consistency does not authenticate training history or measure strength.
-pub use super::numeric::run_resource_cycle_teacher_validation;
+pub use super::numeric::{
+    run_resource_cycle_teacher_validation, run_semantic_setup_resource_cycle_teacher_validation,
+};
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::features::FeatureEncoder;
 use crate::kernel::{Kernel, ResolvedKernel};
-use crate::policy_dataset::{ValidatedPolicyDataset, load_resource_cycle_v5_teacher_dataset};
+use crate::policy_dataset::{
+    ValidatedPolicyDataset, ValidatedSemanticSetupTeacherDataset,
+    load_resource_cycle_v5_semantic_setup_teacher_dataset, load_resource_cycle_v5_teacher_dataset,
+};
 use crate::public_model::{NumericPolicyDistribution, ValueValidity, predict_numeric};
 use crate::resource_cycle_teacher_training::{
-    TeacherDatasetIdentity, TeacherTrainingCheckpoint, audit_dataset, validate_checkpoint_dataset,
+    SemanticSetupTeacherModel, SemanticSetupTeacherTrainingCheckpoint, TeacherDatasetIdentity,
+    TeacherTrainingCheckpoint, audit_dataset, audit_semantic_setup_dataset,
+    validate_checkpoint_dataset, validate_semantic_setup_checkpoint_dataset,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use tzolkin_core::observation::Observation;
-use tzolkin_inference::policy::validate_contract;
+use tzolkin_inference::policy::{BorrowedSemanticSetupPolicy, validate_contract};
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 pub const POLICY_VERSION: &str = "resource-cycle-v5-learned-teacher-allphase-guarded-argmax-v1";
 pub const ARENA_SCHEMA: &str = "tzolkin-resource-cycle-v5-learned-teacher-development-arena-v1";
+pub const SEMANTIC_SETUP_POLICY_VERSION: &str =
+    "resource-cycle-v5-semantic-setup-learned-teacher-allphase-guarded-argmax-v1";
+pub const SEMANTIC_SETUP_ARENA_SCHEMA: &str =
+    "tzolkin-resource-cycle-v5-semantic-setup-learned-teacher-development-arena-v1";
 
 /// Full typed checkpoint plus its dedicated regenerated source. No native
 /// artifact, raw-weight constructor, training owner or roster conversion exists.
@@ -175,4 +186,183 @@ impl ResourceCycleTeacherArenaPolicy<'_> {
         }
         self.prepared.recheck_sources()
     }
+}
+
+/// The semantic encoder applies in both Setup and Playing. This profile cannot
+/// select a legacy encoder or a heuristic Setup composition.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SemanticSetupTeacherInputProfile {
+    SemanticSetupAllPhase,
+}
+
+/// Schema-3 teacher storage, distinct from the schema-2 teacher and all native
+/// artifacts. Preparation consumes the dedicated typed source and checkpoint.
+pub struct PreparedSemanticSetupResourceCycleTeacher {
+    checkpoint: Box<SemanticSetupTeacherTrainingCheckpoint>,
+    dataset: ValidatedSemanticSetupTeacherDataset,
+    manifest_pin: (u64, String),
+    kernel: ResolvedKernel,
+    parameter_checksum: String,
+}
+impl PreparedSemanticSetupResourceCycleTeacher {
+    pub fn load(checkpoint: &Path, dataset: &Path, kernel: Kernel) -> Result<Self, String> {
+        Self::new(
+            SemanticSetupTeacherTrainingCheckpoint::load(checkpoint)?,
+            load_resource_cycle_v5_semantic_setup_teacher_dataset(dataset)?,
+            kernel,
+        )
+    }
+    /// Legacy teacher checkpoints and datasets cannot enter this role.
+    /// ```compile_fail
+    /// use tzolkin_ai::arena::teacher::PreparedSemanticSetupResourceCycleTeacher;
+    /// use tzolkin_ai::kernel::Kernel;
+    /// use tzolkin_ai::policy_dataset::ValidatedPolicyDataset;
+    /// use tzolkin_ai::resource_cycle_teacher_training::TeacherTrainingCheckpoint;
+    /// fn legacy(checkpoint: TeacherTrainingCheckpoint, dataset: ValidatedPolicyDataset) {
+    ///     let _ = PreparedSemanticSetupResourceCycleTeacher::new(checkpoint, dataset, Kernel::Scalar);
+    /// }
+    /// ```
+    pub fn new(
+        checkpoint: SemanticSetupTeacherTrainingCheckpoint,
+        dataset: ValidatedSemanticSetupTeacherDataset,
+        kernel: Kernel,
+    ) -> Result<Self, String> {
+        let kernel = kernel.resolve()?;
+        let manifest_pin = dataset.recheck_teacher_bytes()?;
+        validate_semantic_setup_checkpoint_dataset(&dataset, &checkpoint)?;
+        if dataset.recheck_teacher_bytes()? != manifest_pin {
+            return Err("Semantic Setup teacher manifest changed during preparation".into());
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"resource-cycle-v5-semantic-setup-teacher-parameters-f32le-v1\0");
+        for parameter in checkpoint.model.parameters() {
+            hash.update(parameter.to_bits().to_le_bytes());
+        }
+        Ok(Self {
+            checkpoint: Box::new(checkpoint),
+            dataset,
+            manifest_pin,
+            kernel,
+            parameter_checksum: format!("{:x}", hash.finalize()),
+        })
+    }
+    pub fn arena_handle(
+        &self,
+        guard: TradeGuardConfig,
+    ) -> Result<SemanticSetupResourceCycleTeacherArenaPolicy<'_>, String> {
+        let configuration_key = guard.configuration_key()?;
+        let checkpoint = &self.checkpoint;
+        Ok(SemanticSetupResourceCycleTeacherArenaPolicy {
+            prepared: self,
+            identity: SemanticSetupTeacherArenaIdentity {
+                input_profile: SemanticSetupTeacherInputProfile::SemanticSetupAllPhase,
+                teacher: ResourceCycleTeacherArenaIdentity {
+                    policy_version: SEMANTIC_SETUP_POLICY_VERSION.into(),
+                    source_kind: checkpoint.source_kind.clone(),
+                    task: checkpoint.task.clone(),
+                    training_version: checkpoint.training_version.clone(),
+                    model_version: checkpoint.model_version.clone(),
+                    input_contract: checkpoint.input_contract.clone(),
+                    feature_schema: checkpoint.feature_schema,
+                    feature_count: checkpoint.feature_count,
+                    checkpoint_checksum: checkpoint.checksum.clone(),
+                    parameter_checksum: self.parameter_checksum.clone(),
+                    dataset: checkpoint.dataset.clone(),
+                    teacher: checkpoint.teacher.clone(),
+                    backend: self.kernel.backend().into(),
+                    guard,
+                    configuration_key,
+                    value_validity: checkpoint.value_validity,
+                    producer_authenticated: false,
+                    source_qualified: false,
+                    verified_native_policy: false,
+                    strength_measured: false,
+                },
+            },
+        })
+    }
+    /// Numeric-only inference over the ordered full legal set, with schema-3
+    /// rows in both phases. Source I/O and identity copies stay at boundaries.
+    pub fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<NumericPolicyDistribution, String> {
+        semantic_setup_distribution(&self.checkpoint.model, self.kernel, observation)
+    }
+    pub(super) fn recheck_sources(&self) -> Result<(), String> {
+        if self.dataset.recheck_teacher_bytes()? != self.manifest_pin
+            || audit_semantic_setup_dataset(&self.dataset)? != self.checkpoint.dataset
+            || self.dataset.recheck_teacher_bytes()? != self.manifest_pin
+        {
+            return Err("Semantic Setup teacher source changed before Arena publication".into());
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn semantic_setup_distribution(
+    model: &SemanticSetupTeacherModel,
+    kernel: ResolvedKernel,
+    observation: &Observation,
+) -> Result<NumericPolicyDistribution, String> {
+    validate_contract(observation)?;
+    if observation.legal_actions.len() > super::numeric::MAX_ROWS_PER_CALLBACK {
+        return Err("Semantic Setup teacher candidate-row cap exceeded before prediction".into());
+    }
+    let encoder = FeatureEncoder::new_semantic_setup(observation)?;
+    let rows = (0..observation.legal_actions.len())
+        .map(|index| encoder.encode_legal_tagged(index))
+        .collect::<Result<Vec<_>, _>>()?;
+    BorrowedSemanticSetupPolicy::from_validated_parameters(model.parameters())?
+        .predict(kernel, &rows)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticSetupTeacherArenaIdentity {
+    pub input_profile: SemanticSetupTeacherInputProfile,
+    #[serde(flatten)]
+    pub teacher: ResourceCycleTeacherArenaIdentity,
+}
+
+/// Immutable schema-3 borrow. A serialized report identity cannot construct it.
+pub struct SemanticSetupResourceCycleTeacherArenaPolicy<'a> {
+    pub(super) prepared: &'a PreparedSemanticSetupResourceCycleTeacher,
+    identity: SemanticSetupTeacherArenaIdentity,
+}
+impl SemanticSetupResourceCycleTeacherArenaPolicy<'_> {
+    pub fn identity(&self) -> &SemanticSetupTeacherArenaIdentity {
+        &self.identity
+    }
+    pub fn validate_arena_config(
+        &self,
+        config: &super::numeric::NumericArenaConfig,
+    ) -> Result<(), String> {
+        config.validate()?;
+        for seed in &config.seeds {
+            let family = seed_family_id(*seed);
+            if split_for_family(&family)? != DatasetSplit::Validation
+                || self
+                    .identity
+                    .teacher
+                    .dataset
+                    .families
+                    .iter()
+                    .any(|f| f.family_id == family)
+            {
+                return Err(
+                    "Semantic Setup teacher Arena rejects all retained source families".into(),
+                );
+            }
+        }
+        self.prepared.recheck_sources()
+    }
+}
+
+/// Existing validated baselines retain their own encoder and admission rules.
+/// Neither variant accepts a semantic teacher or an unvalidated artifact.
+pub enum SemanticSetupTeacherReference<'a> {
+    GuardedNumeric(Box<super::numeric::NumericPolicy>),
+    ConditionalHumanCountZeroAllPhase(Box<super::conditional::ConditionalCountZeroArenaPolicy<'a>>),
 }
