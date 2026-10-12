@@ -35,6 +35,8 @@ import { NnLatency } from './ui/NnLatency';
 import { saveGameFile } from './game/files';
 import './App.css';
 
+const MAX_MODEL_FILE_BYTES = 1024 * 1024;
+
 function App() {
   const [saved, setSaved] = useState<Session | null>(null);
   const [active, setActive] = useState<{ session: Session; snapshot: GameSnapshot } | null>(null);
@@ -54,6 +56,8 @@ function App() {
   const [quickActions, setQuickActions] = useState(false);
   const [cpuMode, setCpuMode] = useState<'heuristic' | 'nn'>('heuristic');
   const [modelMetadata, setModelMetadata] = useState<CpuModelMetadata>();
+  const [modelPasteOpen, setModelPasteOpen] = useState(false);
+  const [modelText, setModelText] = useState('');
   const modelRef = useRef<{ bytes: Uint8Array; metadata: CpuModelMetadata } | null>(null);
   const modelOperationRef = useRef<AbortController | null>(null);
   const cpuAbortRef = useRef<AbortController | null>(null);
@@ -268,7 +272,7 @@ function App() {
       setCpuPaused(false);
     });
   }
-  async function importModel(file?: File) {
+  async function importModel(file?: File, pasted = false) {
     if (!file) return;
     await run(async () => {
       const expected = activeRef.current;
@@ -276,7 +280,8 @@ function App() {
       modelOperationRef.current = controller;
       try {
         if (expected && requiresNnCpuGuard(expected.session)) setCpuPaused(true);
-        if (file.size > 1024 * 1024) throw new Error('NNモデルが大きすぎます（上限1MiB）。');
+        if (file.size > MAX_MODEL_FILE_BYTES)
+          throw new Error('NNモデルが大きすぎます（上限1MiB）。');
         if (cpuGameRef.current) discardGuard(cpuGameRef.current);
         // Keep one payload in memory; neither its body nor its filename is saved.
         modelRef.current = null;
@@ -304,6 +309,15 @@ function App() {
             ? 'NNモデルを読み込みました。CPUを再開できます。'
             : 'NNモデルを読み込みました。',
         );
+        if (
+          pasted &&
+          !controller.signal.aborted &&
+          modelOperationRef.current === controller &&
+          activeRef.current === expected
+        ) {
+          setModelText('');
+          setModelPasteOpen(false);
+        }
       } catch (failure) {
         if (!controller.signal.aborted) throw failure;
       } finally {
@@ -583,6 +597,45 @@ function App() {
       }
     });
   }
+  const modelPaste = (
+    <>
+      <button
+        className="text-button"
+        disabled={loading || busy}
+        aria-expanded={modelPasteOpen}
+        aria-controls="nn-model-paste"
+        onClick={() => setModelPasteOpen((open) => !open)}
+      >
+        NNモデルJSONを貼り付ける
+      </button>
+      {modelPasteOpen && (
+        <section id="nn-model-paste" className="nn-model-paste" aria-label="NNモデルJSONの貼り付け">
+          <label htmlFor="nn-model-text">モデルJSON（上限1MiB）</label>
+          <textarea
+            id="nn-model-text"
+            rows={6}
+            value={modelText}
+            maxLength={MAX_MODEL_FILE_BYTES}
+            disabled={loading || busy}
+            spellCheck={false}
+            onChange={(event) => setModelText(event.target.value)}
+          />
+          <button
+            className="text-button"
+            disabled={loading || busy || !modelText.trim()}
+            onClick={() =>
+              void importModel(
+                new File([modelText], '貼り付けたNNモデル.json', { type: 'application/json' }),
+                true,
+              )
+            }
+          >
+            検証して読み込む
+          </button>
+        </section>
+      )}
+    </>
+  );
   const common = (
     <>
       <input
@@ -728,6 +781,7 @@ function App() {
               <button className="text-button" onClick={() => modelInput.current?.click()}>
                 NNモデルを読み込む
               </button>
+              {modelPaste}
               <p>{modelMetadata ? 'NNモデルを選択済み' : 'NNモデルは未選択です。'}</p>
               {modelMetadata && (
                 <code title={modelMetadata.checksum}>{modelMetadata.checksum.slice(0, 12)}</code>
@@ -943,6 +997,7 @@ function App() {
           >
             同じNNモデルを読み込む
           </button>
+          {modelPaste}
           {!guardMetadata && (
             <button className="text-button" onClick={toggleCpu} disabled={busy}>
               この局面からCPUを再開
