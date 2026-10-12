@@ -1,19 +1,26 @@
 //! Separate policy-only BC for sealed conditional Human inputs, never native admission.
 use crate::dataset::DatasetSplit;
-use crate::features::{FEATURE_COUNT, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
+use crate::features::{FEATURE_COUNT, FeatureEncoder, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
 use crate::human_initial_wealth::table_family_id;
 use crate::human_policy_dataset::{ConditionalHumanPolicyDataset, HumanPolicySample, TASK};
+use crate::kernel::{Kernel, ResolvedKernel};
 use crate::model::{Random, digest};
 use crate::policy_training::{
     MAX_CANDIDATE_EVALUATIONS, MAX_UPDATES, PolicyAdamState, PolicyBcConfig, PolicyLossReport,
     PolicyTrainingMetrics, Scratch, bounded_json, policy_loss, publish, read_local_json,
     validate_new_output_directory,
 };
-use crate::public_model::{MODEL_VERSION, PublicPolicyArtifact, PublicPolicyModel, ValueValidity};
+use crate::public_model::{
+    MODEL_VERSION, PublicPolicyArtifact, PublicPolicyModel, ValueValidity, predict_numeric,
+    validate_contract,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use tzolkin_core::Phase;
+use tzolkin_core::observation::Observation;
+use tzolkin_inference::policy::NumericPolicyDistribution;
 
 pub const CHECKPOINT_SCHEMA: &str = "tzolkin-conditional-human-policy-checkpoint-v1";
 pub const MODEL_SCHEMA: &str = "tzolkin-conditional-human-policy-model-v1";
@@ -44,6 +51,16 @@ pub fn train_collection_manifest(
     path: &Path,
     resume: Option<&ConditionalHumanPolicyCheckpoint>,
 ) -> Result<ConditionalHumanPolicyOutcome, String> {
+    let (input, datasets) = load_collection(path)?;
+    let outcome = train_conditional_datasets(&datasets, &input.config, resume)?;
+    if read_local_json::<CollectionInput>(path)? != input {
+        return Err("Conditional collection input changed before completion".into());
+    }
+    Ok(outcome)
+}
+fn load_collection(
+    path: &Path,
+) -> Result<(CollectionInput, Vec<ConditionalHumanPolicyDataset>), String> {
     let input: CollectionInput = read_local_json(path)?;
     if input.schema != COLLECTION_SCHEMA
         || input.datasets.is_empty()
@@ -75,11 +92,7 @@ pub fn train_collection_manifest(
         }
         datasets.push(dataset);
     }
-    let outcome = train_conditional_datasets(&datasets, &input.config, resume)?;
-    if read_local_json::<CollectionInput>(path)? != input {
-        return Err("Conditional collection input changed before completion".into());
-    }
-    Ok(outcome)
+    Ok((input, datasets))
 }
 
 fn checksum(value: &str) -> bool {
@@ -377,6 +390,121 @@ impl ConditionalHumanPolicyCheckpoint {
         Ok(checkpoint)
     }
 }
+
+/// Immutable conditional Human policy with source-checked table identity.
+/// Preparation preserves the scalar 512→32→1 parameters; it grants no native
+/// policy qualification, RL ownership, value supervision or measured strength.
+pub struct PreparedConditionalHumanPolicy {
+    checkpoint: Box<ConditionalHumanPolicyCheckpoint>,
+    reservations: BTreeMap<String, DatasetSplit>,
+    kernel: ResolvedKernel,
+}
+impl PreparedConditionalHumanPolicy {
+    pub fn load(checkpoint_path: &Path, collection_path: &Path) -> Result<Self, String> {
+        let checkpoint = ConditionalHumanPolicyCheckpoint::load(checkpoint_path)?;
+        let (input, datasets) = load_collection(collection_path)?;
+        if input.config != checkpoint.config {
+            return Err("Conditional prepared collection/checkpoint config mismatch".into());
+        }
+        let prepared = Self::new(checkpoint, &datasets)?;
+        if read_local_json::<CollectionInput>(collection_path)? != input
+            || ConditionalHumanPolicyCheckpoint::load(checkpoint_path)? != *prepared.checkpoint
+        {
+            return Err("Conditional preparation inputs changed before completion".into());
+        }
+        Ok(prepared)
+    }
+
+    pub fn new(
+        checkpoint: ConditionalHumanPolicyCheckpoint,
+        datasets: &[ConditionalHumanPolicyDataset],
+    ) -> Result<Self, String> {
+        checkpoint.validate()?;
+        let identity = audit(datasets)?;
+        if checkpoint.dataset != identity {
+            return Err("Conditional prepared checkpoint/source identity mismatch".into());
+        }
+        let mut reservations = BTreeMap::new();
+        for dataset in datasets {
+            for (table, split) in dataset.reservations() {
+                reservations.insert(table.clone(), *split);
+            }
+            for sample in dataset.samples() {
+                for row in sample.candidates() {
+                    PublicPolicyModel::validated_values(row)?;
+                }
+            }
+        }
+        let mut ordered = datasets.iter().collect::<Vec<_>>();
+        ordered.sort_by(|a, b| a.table_id().cmp(b.table_id()));
+        let train = ordered
+            .iter()
+            .filter(|d| d.split() == DatasetSplit::Train)
+            .flat_map(|d| d.samples())
+            .collect::<Vec<_>>();
+        let validation = ordered
+            .iter()
+            .filter(|d| d.split() == DatasetSplit::Validation)
+            .flat_map(|d| d.samples())
+            .collect::<Vec<_>>();
+        let initial = PublicPolicyArtifact::new(checkpoint.config.seed)?.model;
+        let mut scratch = Scratch::default();
+        if evaluate(&train, &initial, &mut scratch)? != checkpoint.metrics.initial_train
+            || evaluate(&validation, &initial, &mut scratch)?
+                != checkpoint.metrics.initial_validation
+            || evaluate(&train, &checkpoint.model.model, &mut scratch)?
+                != checkpoint.metrics.final_train
+            || evaluate(&validation, &checkpoint.model.model, &mut scratch)?
+                != checkpoint.metrics.final_validation
+        {
+            return Err("Conditional prepared metric/model/source mismatch".into());
+        }
+        if audit(datasets)? != identity {
+            return Err("Conditional sources changed during preparation".into());
+        }
+        Ok(Self {
+            checkpoint: Box::new(checkpoint),
+            reservations,
+            kernel: Kernel::Scalar.resolve()?,
+        })
+    }
+
+    pub fn model(&self) -> &ConditionalHumanPolicyArtifact {
+        &self.checkpoint.model
+    }
+    pub fn identity(&self) -> &ConditionalDatasetIdentity {
+        &self.checkpoint.dataset
+    }
+    pub fn checkpoint_checksum(&self) -> &str {
+        &self.checkpoint.checksum
+    }
+    /// Includes declared held-out reservations as well as the loaded tables.
+    pub fn reservations(&self) -> &BTreeMap<String, DatasetSplit> {
+        &self.reservations
+    }
+    pub fn backend(&self) -> &'static str {
+        self.kernel.backend()
+    }
+
+    /// Score every supplied legal row in its original order. Only the producer's
+    /// observed Playing Place/Remove/FirstPlayer labels were supervised; scoring
+    /// other legal actions does not establish observed Human labels for them.
+    /// The core observation/key is checked, without authenticating its source.
+    pub fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<NumericPolicyDistribution, String> {
+        validate_contract(observation)?;
+        if observation.phase != Phase::Playing {
+            return Err("Conditional Human policy requires Playing observations".into());
+        }
+        let encoder = FeatureEncoder::new_public(observation)?;
+        let rows = (0..observation.legal_actions.len())
+            .map(|index| encoder.encode_legal_tagged(index))
+            .collect::<Result<Vec<_>, _>>()?;
+        predict_numeric(&self.checkpoint.model.model, self.kernel, &rows)
+    }
+}
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionalHumanPolicyOutcome {
@@ -591,6 +719,145 @@ mod tests {
             learning_rate: 0.003,
             seed: 7,
         }
+    }
+    fn playing_observation() -> Observation {
+        let mut state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 42, false).unwrap();
+        state.phase = Phase::Playing;
+        tzolkin_core::observation::observe(&state, state.current_player).unwrap()
+    }
+    #[test]
+    fn prepared_conditional_preserves_bits_identity_and_ordered_scalar_scores() {
+        let datasets = datasets(0, 1);
+        let outcome = train_conditional_datasets(&datasets, &config(1), None).unwrap();
+        let bits = outcome
+            .model
+            .model
+            .parameters()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        let identity = outcome.checkpoint.dataset.clone();
+        let checkpoint_checksum = outcome.checkpoint.checksum.clone();
+        let prepared = PreparedConditionalHumanPolicy::new(outcome.checkpoint, &datasets).unwrap();
+        assert_eq!(
+            prepared
+                .model()
+                .model
+                .parameters()
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            bits
+        );
+        assert_eq!(prepared.identity(), &identity);
+        assert_eq!(prepared.checkpoint_checksum(), checkpoint_checksum);
+        assert_eq!(prepared.model().task, TASK);
+        assert!(!prepared.identity().verified_native_policy);
+        assert!(!prepared.identity().source_qualified);
+        assert_eq!(prepared.reservations()["123"], DatasetSplit::Train);
+        assert_eq!(prepared.reservations()["124"], DatasetSplit::Validation);
+        assert_eq!(prepared.backend(), "scalar");
+        let mut observation = playing_observation();
+        let prediction = prepared.distribution(&observation).unwrap();
+        assert_eq!(prediction.logits.len(), observation.legal_actions.len());
+        let encoder = FeatureEncoder::new_public(&observation).unwrap();
+        let rows = (0..observation.legal_actions.len())
+            .map(|index| encoder.encode_legal_tagged(index).unwrap())
+            .collect::<Vec<_>>();
+        let (loss, _) = policy_loss(
+            &prepared.model().model,
+            &rows,
+            0,
+            &mut Scratch::default(),
+            None,
+        )
+        .unwrap();
+        let maximum = prediction
+            .logits
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max) as f64;
+        let expected_loss = maximum - f64::from(prediction.logits[0])
+            + prediction
+                .logits
+                .iter()
+                .map(|value| (f64::from(*value) - maximum).exp())
+                .sum::<f64>()
+                .ln();
+        assert_eq!(loss, expected_loss);
+        observation.legal_actions.reverse();
+        observation.observation_key =
+            tzolkin_core::observation::observation_key(&observation).unwrap();
+        let reversed = prepared.distribution(&observation).unwrap();
+        assert_eq!(
+            reversed
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            prediction
+                .logits
+                .iter()
+                .rev()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn prepared_conditional_rejects_wrong_sources_test_and_resealed_metrics() {
+        let datasets = datasets(0, 1);
+        let outcome = train_conditional_datasets(&datasets, &config(1), None).unwrap();
+        assert!(
+            PreparedConditionalHumanPolicy::new(outcome.checkpoint.clone(), &self::datasets(1, 1))
+                .is_err()
+        );
+        let mut test = self::datasets(0, 1);
+        test.push(ConditionalHumanPolicyDataset::training_fixture(
+            "125",
+            DatasetSplit::Test,
+            0,
+        ));
+        assert!(PreparedConditionalHumanPolicy::new(outcome.checkpoint.clone(), &test).is_err());
+        let mut wrong = outcome.checkpoint;
+        wrong.metrics.final_validation.policy_loss += 0.5;
+        wrong.checksum = wrong.expected_checksum().unwrap();
+        wrong.validate().unwrap();
+        assert!(PreparedConditionalHumanPolicy::new(wrong, &datasets).is_err());
+    }
+    #[test]
+    fn prepared_conditional_checks_native_contract_and_playing_key_before_features() {
+        let datasets = datasets(0, 1);
+        let outcome = train_conditional_datasets(&datasets, &config(1), None).unwrap();
+        let prepared = PreparedConditionalHumanPolicy::new(outcome.checkpoint, &datasets).unwrap();
+        let state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 42, false).unwrap();
+        let setup = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+        assert!(
+            prepared
+                .distribution(&setup)
+                .err()
+                .unwrap()
+                .contains("Playing")
+        );
+        let mut observation = playing_observation();
+        observation.additional_buildings = true;
+        observation.observation_key.clear();
+        assert!(
+            prepared
+                .distribution(&observation)
+                .err()
+                .unwrap()
+                .contains("base 3-4p")
+        );
+        observation.additional_buildings = false;
+        assert!(
+            prepared
+                .distribution(&observation)
+                .err()
+                .unwrap()
+                .contains("Observation key mismatch")
+        );
     }
     #[test]
     fn conditional_heldout_labels_do_not_update_policy_but_train_labels_do() {
