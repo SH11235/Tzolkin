@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import { normalizeGame } from './bga-import.mjs';
 import { observedBasicUnlimitedOptions, uniqueJson } from './bga-observed-options.mjs';
 import {
@@ -1621,7 +1622,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       !Number.isSafeInteger(amount) ||
       amount < 1 ||
       amount > 1000 ||
-      !same(effects, [
+      !isDeepStrictEqual(effects, [
         { type: 'technology', technology: 'any', steps: 1 },
         { type: 'resources', resources: { [resource]: amount } },
       ]) ||
@@ -1637,7 +1638,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       next.pending.task.remaining !== 1 ||
       next.pending.task.free !== true ||
       next.pending.task.mandatory === true ||
-      !same(next.pending.task, outcome.frame.observation.pendingTask) ||
+      !isDeepStrictEqual(next.pending.task, outcome.frame.observation.pendingTask) ||
       (witness.pendingTask !== undefined && witness.pendingTask !== 'technology')
     )
       return null;
@@ -1666,7 +1667,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       ) ||
       !same(typedResourceCost(action), cost) ||
       !same(paymentOf(events), cost) ||
-      !same(next.pending.after, [
+      !isDeepStrictEqual(next.pending.after, [
         { type: 'effects', effects: [effects[1]] },
         {
           type: 'build',
@@ -1686,7 +1687,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     expected.players[actor].resources.corn += Number(action.architecture);
     expected.players[actor].score += 2 * Number(action.architecture);
     expected.pending = copy(next.pending);
-    if (!same(mechanical(next), expected)) return null;
+    if (!isDeepStrictEqual(mechanical(next), expected)) return null;
     return {
       ...continuation,
       kind: 'materialTechnology',
@@ -1811,6 +1812,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   }
   function finishQueuedPurchase(event) {
     const receipt = queuedPurchase;
+    const sameReceipt = receipt.kind === 'materialTechnology' ? isDeepStrictEqual : same;
     const next = state();
     const before = context.before;
     const actor = receipt.actor;
@@ -1830,9 +1832,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         record.steps.length !== receipt.stepCount + 1 ||
         next.pending?.task?.type !== 'resource' ||
         next.pending.task.remaining !== 2 ||
-        !same(next.pending.task, frame.observation.pendingTask) ||
-        !same(next.pending.after, after) ||
-        !same(mechanical(next), unchanged) ||
+        !sameReceipt(next.pending.task, frame.observation.pendingTask) ||
+        !sameReceipt(next.pending.after, after) ||
+        !sameReceipt(mechanical(next), unchanged) ||
         extractionReward?.actor !== actor ||
         extractionReward.originActionId !== context.id ||
         extractionReward.captionActionId !== context.id ||
@@ -1861,9 +1863,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       next.currentPlayer !== actor ||
       next.round !== receipt.round ||
       next.phase !== before.phase ||
-      !same(next.pending?.task, expected) ||
-      !same(frame.observation.pendingTask, expected) ||
-      !same(next.pending?.after, []) ||
+      !sameReceipt(next.pending?.task, expected) ||
+      !sameReceipt(frame.observation.pendingTask, expected) ||
+      !sameReceipt(next.pending?.after, []) ||
       next.players[actor].technologies[technology] !==
         before.players[actor].technologies[technology] + Number(!corn) ||
       next.players.some((player, id) =>
@@ -1881,7 +1883,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         ),
       ) ||
       next.players[actor].score !== before.players[actor].score ||
-      (uncapped !== null && !same(mechanical(next), uncapped)) ||
+      (uncapped !== null && !sameReceipt(mechanical(next), uncapped)) ||
       (corn &&
         (!receipt.bonusClaimed ||
           technology !== 'theology' ||
@@ -1923,6 +1925,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   }
   function finishQueuedExtraction(event) {
     const receipt = queuedPurchase;
+    const sameReceipt = receipt.kind === 'materialTechnology' ? isDeepStrictEqual : same;
     const before = context.before;
     const next = state();
     const remaining = receipt.pending.task.remaining - 1;
@@ -1937,13 +1940,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     expected.pending = copy(next.pending);
     if (
       record.steps.length !== receipt.stepCount + 1 ||
-      !same(mechanical(next), expected) ||
-      !same(next.pending?.task, frame.observation.pendingTask) ||
-      !same(
+      !sameReceipt(mechanical(next), expected) ||
+      !sameReceipt(next.pending?.task, frame.observation.pendingTask) ||
+      !sameReceipt(
         next.pending?.task,
         remaining ? { type: 'resource', remaining } : receipt.pending.after.at(-1),
       ) ||
-      !same(next.pending?.after, remaining ? receipt.pending.after : []) ||
+      !sameReceipt(next.pending?.after, remaining ? receipt.pending.after : []) ||
       extractionReward?.originActionId !== receipt.technologySourceId ||
       extractionReward.captionActionId !== receipt.technologySourceId ||
       extractionReward.remaining !== remaining ||
