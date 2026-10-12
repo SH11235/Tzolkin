@@ -6,6 +6,7 @@ use tzolkin_ai::dataset::DatasetSplit;
 use tzolkin_ai::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
 use tzolkin_ai::human_policy_dataset::{
     ConditionalHumanPolicyDataset, FACTORIZED_LABEL_SCOPE, INPUT_SCHEMA, INPUT_SCHEMA_V2,
+    INPUT_SCHEMA_V3, PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{
@@ -181,6 +182,175 @@ impl Fixture {
         ]);
         fixture
     }
+    fn paid_technology(players: usize, level: i64, payment: [i64; 3]) -> Self {
+        use tzolkin_core::observation::ActionSource;
+        use tzolkin_core::{Resource, TechnologyId};
+        // Normal dealt offers and Setup, followed by one short legal turn cycle.
+        // No declared initial resource, technology or pending-state fabrication.
+        let (seed, tiles) = match (level, payment[2] > 0) {
+            (1, _) => (9, ["w07", "w10"]),
+            (0, true) => (18, ["w16", "w19"]),
+            (0, false) => (17, ["w01", "w19"]),
+            _ => unreachable!(),
+        };
+        let mut state =
+            create_game((0..players).map(|i| format!("P{i}")).collect(), seed, false).unwrap();
+        while state.phase == Phase::Setup {
+            let row = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .filter(|row| match &row.action {
+                    TypedAction::ChooseWealth { ids } if state.current_player == 0 => {
+                        ids.len() == 2 && tiles.iter().all(|tile| ids.iter().any(|id| id == tile))
+                    }
+                    TypedAction::ChooseWealth { .. } => true,
+                    _ => false,
+                })
+                .max_by_key(|row| {
+                    let TypedAction::ChooseWealth { ids } = &row.action else {
+                        unreachable!()
+                    };
+                    ids.iter()
+                        .map(|id| {
+                            tzolkin_core::catalog::wealth(id)
+                                .unwrap()
+                                .resources
+                                .get(&Resource::Corn)
+                                .copied()
+                                .unwrap_or(0)
+                        })
+                        .sum::<i64>()
+                })
+                .unwrap();
+            state = apply_move(&state, row.r#move).unwrap();
+        }
+        let actor = state.current_player;
+        let initial = PublicState::from_game_state(&state).unwrap();
+        assert_eq!(actor, 0);
+        assert_eq!(
+            state.players[actor].technologies[&TechnologyId::Extraction],
+            level
+        );
+        let mut steps = Vec::new();
+        for turn in 0..players {
+            let row = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|row| matches!(row.action, TypedAction::Place { gear, discount: false, .. } if turn != 0 || gear == GearId::Tikal))
+                .unwrap();
+            steps.push(json!({"actor":state.current_player,"move":row.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            state = apply_move(&state, row.r#move).unwrap();
+            let end = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|row| {
+                    matches!(
+                        row.action,
+                        TypedAction::EndTurn {
+                            double_advance: None
+                        }
+                    )
+                })
+                .unwrap();
+            steps.push(json!({"actor":state.current_player,"move":end.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            state = apply_move(&state, end.r#move).unwrap();
+        }
+        assert_eq!(state.current_player, actor);
+        let removal = observe(&state, actor)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::Remove {
+                        gear: GearId::Tikal,
+                        position: 1
+                    }
+                )
+            })
+            .unwrap();
+        steps.push(json!({"actor":actor,"move":removal.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+        state = apply_move(&state, removal.r#move).unwrap();
+        let use_action = observe(&state, actor)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::UseAction {
+                        gear: GearId::Tikal,
+                        position: 1,
+                        source: ActionSource::CurrentGear,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        steps.push(json!({"actor":actor,"move":use_action.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+        state = apply_move(&state, use_action.r#move).unwrap();
+        let tech_step = steps.len() + 1;
+        let tech = observe(&state, actor)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                row.action
+                    == TypedAction::Technology {
+                        technology: TechnologyId::Extraction,
+                    }
+            })
+            .unwrap();
+        state = apply_move(&state, tech.r#move.clone()).unwrap();
+        let vector = [0, payment[0], payment[1], payment[2], 0];
+        let pay = observe(&state, actor)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| row.action == TypedAction::Payment { resources: vector })
+            .unwrap();
+        let mut fixture = Self::new();
+        fixture.record["initial"] = serde_json::to_value(initial).unwrap();
+        steps.push(json!({"actor":actor,"move":tech.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
+        steps.push(json!({"actor":actor,"move":pay.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
+        fixture.record["steps"] = json!(steps);
+        fixture.audit["audit"] = json!([
+            {"step":tech_step,"actionId":10,"actor":actor,"action":tech.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1},
+            {"step":tech_step+1,"actionId":10,"actor":actor,"action":pay.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}
+        ]);
+        fixture.raw["metadata"]["players"] = json!((0..players).map(|i| json!({"text":format!("P{i}"),"url":format!("https://boardgamearena.com/player?id={}",101+i)})).collect::<Vec<_>>());
+        let mut messages = Vec::new();
+        for (resource, amount) in ["wood", "stone", "gold"].into_iter().zip(payment) {
+            if amount == 0 {
+                continue;
+            }
+            let classes = format!("tz_icon resource_{resource}");
+            let quantity = if amount == 1 {
+                String::new()
+            } else {
+                amount.to_string()
+            };
+            messages.push(json!({"raw_text":format!("P{actor}は{quantity}を支払った"),
+                "html":format!("P{actor}は{quantity}<div class=\"{classes}\"></div>を支払った"),"icons":[{"classes":classes}]}));
+        }
+        messages.push(json!({"raw_text":format!("P{actor}は収集を1レベル進めた")}));
+        fixture.set_messages(messages);
+        fixture
+    }
+    fn set_messages(&mut self, messages: Vec<Value>) {
+        self.raw["entries"][0]["raw_text"] = json!(
+            messages
+                .iter()
+                .map(|m| m["raw_text"].as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        self.raw["dom_entries"][0]["messages"] = json!(messages);
+    }
     fn pin(&self, name: &str, value: &Value) -> Value {
         let bytes = serde_json::to_vec(value).unwrap();
         fs::write(self.root.join(name), &bytes).unwrap();
@@ -211,7 +381,9 @@ impl Fixture {
             manifest["labelScope"] = scope;
         }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V2 {
+        let file = if schema == INPUT_SCHEMA_V3 {
+            "manifest-v3.json"
+        } else if schema == INPUT_SCHEMA_V2 {
             "manifest-v2.json"
         } else {
             "manifest.json"
@@ -386,6 +558,221 @@ fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel
         fs::write(path, original).unwrap();
     }
     owner.origin().recheck_sources().unwrap();
+}
+
+#[test]
+fn observed_paid_technology_v3_requires_exact_materials_and_preserves_prior_labels() {
+    let load = |fixture: &Fixture| {
+        fixture.load_scope(INPUT_SCHEMA_V3, Some(json!(PAID_TECHNOLOGY_LABEL_SCOPE)))
+    };
+    let fixture = Fixture::paid_technology(4, 1, [1, 1, 0]);
+    assert!(
+        fixture
+            .load_scope(INPUT_SCHEMA_V2, Some(json!(FACTORIZED_LABEL_SCOPE)))
+            .unwrap()
+            .samples()
+            .is_empty()
+    );
+    let dataset = load(&fixture).unwrap();
+    let report = serde_json::to_value(dataset.report()).unwrap();
+    assert_eq!(dataset.samples().len(), 2);
+    assert_eq!(
+        report["schema"],
+        "tzolkin-conditional-basic-human-policy-dataset-v3"
+    );
+    assert_eq!(report["labelScope"], PAID_TECHNOLOGY_LABEL_SCOPE);
+    let technology = &report["samples"][0];
+    let payment = &report["samples"][1];
+    assert_ne!(technology["sampleId"], payment["sampleId"]);
+    assert_eq!(technology["pairedSampleId"], payment["sampleId"]);
+    assert_eq!(payment["pairedSampleId"], technology["sampleId"]);
+    assert_eq!(technology["sourceLabelPart"], "paidTechnology");
+    assert_eq!(payment["sourceLabelPart"], "technologyMaterialPayment");
+    assert_eq!(
+        technology["paidTechnologySupport"],
+        payment["paidTechnologySupport"]
+    );
+    assert_eq!(
+        technology["paidTechnologySupport"]["paymentMessageIndices"],
+        json!([0, 1])
+    );
+    assert_eq!(
+        technology["paidTechnologySupport"]["observedMaterials"],
+        json!([0, 1, 1, 0, 0])
+    );
+    for sample in dataset.samples() {
+        assert!(sample.candidates().len() >= 2);
+        assert_eq!(sample.value_target(), None);
+    }
+    for field in [
+        "sourceAuthenticated",
+        "sourceQualified",
+        "verifiedNativePolicy",
+        "trainingReady",
+        "valueSupervised",
+    ] {
+        assert_eq!(report[field], false);
+    }
+    let forced = load(&Fixture::paid_technology(4, 0, [1, 0, 0])).unwrap();
+    assert_eq!(forced.samples().len(), 1);
+    assert_eq!(forced.counts().excluded["forcedPaymentNoChoice"], 1);
+    assert!(
+        serde_json::to_value(&forced.samples()[0])
+            .unwrap()
+            .get("pairedSampleId")
+            .is_none()
+    );
+    assert_eq!(
+        load(&Fixture::paid_technology(4, 1, [0, 2, 0]))
+            .unwrap()
+            .samples()
+            .len(),
+        2
+    );
+    let mut current = Fixture::paid_technology(4, 0, [0, 0, 1]);
+    current.raw["schema_version"] = json!(1);
+    current.raw["source_type"] = json!("public_ui_dom");
+    current.raw["export_scope"] = json!("all_rendered_gamereview_log_entries");
+    current.raw["dom_entry_count"] = json!(1);
+    current.raw["metadata"] = json!({"tableUrl":"https://boardgamearena.com/table?table=123","players":[
+        {"name":"P0","id":"101"},{"name":"P1","id":"102"},{"name":"P2","id":"103"},{"name":"P3","id":"104"}]});
+    current.raw["dom_entries"][0]["messages"][0]["icons"][0]["class"] =
+        current.raw["dom_entries"][0]["messages"][0]["icons"][0]["classes"].clone();
+    current.raw["entries"][0]["raw_text"] = json!(format!(
+        "行動 10 :\n12:00\n{}",
+        current.raw["entries"][0]["raw_text"].as_str().unwrap()
+    ));
+    assert_eq!(load(&current).unwrap().samples().len(), 2);
+    assert!(
+        load(&Fixture::paid_technology(3, 0, [1, 0, 0]))
+            .unwrap()
+            .samples()
+            .is_empty()
+    );
+    for change in [
+        "duplicate",
+        "unknownIcon",
+        "unknownTechnologyIcon",
+        "bonus",
+        "cancel",
+        "wrongActor",
+        "wrongVector",
+        "badPaymentAudit",
+        "differentSource",
+        "ambiguousSource",
+    ] {
+        let mut fixture = Fixture::paid_technology(4, 1, [1, 1, 0]);
+        let mut messages = fixture.raw["dom_entries"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        match change {
+            "duplicate" => messages.push(messages.last().unwrap().clone()),
+            "unknownIcon" => {
+                messages[0]["html"] =
+                    json!("P0は<div class=\"tz_icon resource_unknown\"></div>を支払った");
+                messages[0]["icons"][0]["classes"] = json!("tz_icon resource_unknown");
+            }
+            "unknownTechnologyIcon" => {
+                messages.last_mut().unwrap()["icons"] =
+                    json!([{"classes":"tz_icon resource_unknown"}]);
+            }
+            "bonus" => {
+                messages.push(json!({"raw_text":"収集技術ボーナス: P0は好きな資源2個を得た"}))
+            }
+            "cancel" => messages.push(json!({"raw_text":"P0は行動をキャンセルした"})),
+            "wrongActor" => {
+                messages.last_mut().unwrap()["raw_text"] = json!("P1は収集を1レベル進めた")
+            }
+            "wrongVector" => {
+                messages[0]["html"] =
+                    json!("P0は<div class=\"tz_icon resource_gold\"></div>を支払った");
+                messages[0]["icons"][0]["classes"] = json!("tz_icon resource_gold");
+            }
+            "badPaymentAudit" => fixture.audit["audit"][1]["equivalentChoices"] = json!(2),
+            "differentSource" => {
+                fixture.record["steps"]
+                    .as_array_mut()
+                    .unwrap()
+                    .last_mut()
+                    .unwrap()["sourceActionIds"] = json!([11]);
+                fixture.audit["audit"][1]["actionId"] = json!(11);
+            }
+            "ambiguousSource" => {
+                let index = fixture.audit["audit"][0]["step"].as_u64().unwrap() as usize - 1;
+                fixture.record["steps"][index]["sourceActionIds"] = json!([10, 11]);
+            }
+            _ => unreachable!(),
+        }
+        fixture.set_messages(messages);
+        assert!(load(&fixture).unwrap().samples().is_empty(), "{change}");
+    }
+    let mut wrong_pending = Fixture::paid_technology(4, 0, [1, 0, 0]);
+    wrong_pending.record["initial"]["pending"]["task"] = json!({"type":"payResource","amount":1});
+    assert!(load(&wrong_pending).is_err());
+    // v3 adds no fields or identity changes to any existing primitive/v2 sample.
+    let old = Fixture::paired_action(2, 1);
+    let v1 = old.load().unwrap();
+    let v2 = old
+        .load_scope(INPUT_SCHEMA_V2, Some(json!(FACTORIZED_LABEL_SCOPE)))
+        .unwrap();
+    let v3 = load(&old).unwrap();
+    assert_eq!(
+        serde_json::to_vec(v1.samples()).unwrap(),
+        serde_json::to_vec(&v3.samples()[..1]).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_vec(v2.samples()).unwrap(),
+        serde_json::to_vec(v3.samples()).unwrap()
+    );
+    assert_ne!(v2.fingerprint().unwrap(), v3.fingerprint().unwrap());
+    assert!(
+        old.load_scope(INPUT_SCHEMA_V3, Some(json!(FACTORIZED_LABEL_SCOPE)))
+            .is_err()
+    );
+    // Same tables and byte-identical labels still require a fresh v3 BC origin.
+    let mut train = Fixture::paired_action(1, 1);
+    train.reservations["entries"][0]["split"] = json!("train");
+    let mut validation = Fixture::paired_action(1, 1);
+    validation.raw["table_id"] = json!("124");
+    validation.raw["metadata"]["table_id"] = json!("124");
+    validation.raw["source_url"] = json!("https://boardgamearena.com/gamereview?table=124");
+    validation.record["source"]["reference"] = validation.raw["source_url"].clone();
+    validation.audit["tableId"] = json!("124");
+    validation.reservations["entries"][0]["tableId"] = json!("124");
+    let inputs_v2 = [&train, &validation].map(|f| {
+        f.load_scope(INPUT_SCHEMA_V2, Some(json!(FACTORIZED_LABEL_SCOPE)))
+            .unwrap()
+    });
+    let inputs_v3 = [&train, &validation].map(|f| load(f).unwrap());
+    for (v2, v3) in inputs_v2.iter().zip(&inputs_v3) {
+        assert_eq!(
+            serde_json::to_vec(v2.samples()).unwrap(),
+            serde_json::to_vec(v3.samples()).unwrap()
+        );
+    }
+    let config = tzolkin_ai::policy_training::PolicyBcConfig {
+        epochs: 1,
+        batch_size: 1,
+        learning_rate: 0.001,
+        seed: 7,
+    };
+    use tzolkin_ai::human_policy_training::train_conditional_datasets;
+    let old = train_conditional_datasets(&inputs_v2, &config, None).unwrap();
+    assert!(
+        train_conditional_datasets(&inputs_v3, &config, Some(&old.checkpoint))
+            .unwrap_err()
+            .contains("dataset/config mismatch")
+    );
+    let fresh = train_conditional_datasets(&inputs_v3, &config, None).unwrap();
+    assert_eq!(
+        fresh.checkpoint.dataset.label_scope.as_deref(),
+        Some(PAID_TECHNOLOGY_LABEL_SCOPE)
+    );
+    assert_ne!(
+        old.checkpoint.dataset.fingerprint,
+        fresh.checkpoint.dataset.fingerprint
+    );
 }
 
 #[test]
