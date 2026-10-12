@@ -31,7 +31,7 @@ use crate::public_stochastic_record::{MAX_RECORD_BYTES, hex64};
 pub const TRAINING_VERSION: &str = "own-setup-onpolicy-winner-share-adam-f64-v1";
 pub const EXCLUSION_DOMAIN: &[u8] = b"tzolkin-own-setup-declared-train-exclusions-v1\0";
 const MAX_ATTEMPTED_EPISODES: u64 = 100_000;
-const MAX_EXCLUSIONS: usize = 100_000;
+const MAX_EXCLUSIONS: usize = 200_000;
 const MAX_BATCH: usize = 4;
 
 /// The caller must provide the complete teacher/opponent/held-out family union.
