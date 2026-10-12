@@ -3960,21 +3960,37 @@ test('holds queued corn until observed technology completion and preserves cappe
     alter = () => {},
     architectureLevel = 3,
     renovationSibling = false,
-  ) =>
-    fixture(
+    extractionLevel = 3,
+  ) => {
+    const f = fixture(
       (v) => {
         v.witness.witnesses = v.witness.witnesses.slice(0, 2);
         delete v.witness.witnesses[1].expected;
         change(v);
       },
       alter,
-      3,
+      extractionLevel,
       'extraction',
       'stone',
       true,
       architectureLevel,
       renovationSibling,
     );
+    // serde_json::Value transport sorts object keys, including nested receipts.
+    const nativeShape = (value) =>
+      Array.isArray(value)
+        ? value.map(nativeShape)
+        : value !== null && typeof value === 'object'
+          ? Object.fromEntries(
+              Object.keys(value)
+                .sort()
+                .map((key) => [key, nativeShape(value[key])]),
+            )
+          : value;
+    const originalDispatch = f.dispatch;
+    f.dispatch = (request) => nativeShape(originalDispatch(request));
+    return f;
+  };
   const materialSuccess = materialFixture();
   const materialWitnesses = clone(materialSuccess.value.witness.witnesses);
   const materialCompleted = decode(materialSuccess.value, materialSuccess.dispatch);
@@ -3994,6 +4010,17 @@ test('holds queued corn until observed technology completion and preserves cappe
   assert.equal(materialReceipt.purchaseCounterEvidence.score, 'unknown');
   assert.deepEqual(materialReceipt.purchaseCounterEvidence.resourceFields, []);
   assert.deepEqual(materialSuccess.value.witness.witnesses, materialWitnesses);
+  const uncappedMaterial = materialFixture(undefined, undefined, 3, false, 2);
+  const uncappedCompleted = decode(uncappedMaterial.value, uncappedMaterial.dispatch);
+  assert.equal(uncappedCompleted.manifest.blocked, null);
+  assert.deepEqual(
+    uncappedCompleted.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8]],
+  );
+  assert.equal(
+    uncappedCompleted.manifest.audit.find((row) => row.queuedPurchaseSourceActionId).continuation,
+    'uncappedTechnology',
+  );
   const sameFee = materialFixture(
     () => {},
     () => {},
@@ -4046,6 +4073,39 @@ test('holds queued corn until observed technology completion and preserves cappe
     assert.deepEqual(renovated.state, discarded);
   }
   for (const [name, change, alter, reason, architectureLevel] of [
+    ...[
+      [
+        'extra queue field',
+        (queue) => {
+          queue[1].extra = false;
+        },
+      ],
+      [
+        'wrong queued quantity',
+        (queue) => {
+          queue[0].effects[0].resources.stone++;
+        },
+      ],
+      [
+        'wrong queued quantity type',
+        (queue) => {
+          queue[0].effects[0].resources.stone = '1';
+        },
+      ],
+      [
+        'reordered queue',
+        (queue) => {
+          queue.reverse();
+        },
+      ],
+    ].map(([name, mutate]) => [
+      name,
+      () => {},
+      (f, stage) => {
+        if (stage === 'purchase') mutate(f.snapshot.state.pending.after);
+      },
+      /Source effect resource:stone=1 is not established by this macro/,
+    ]),
     [
       'wrong Architecture payment',
       (v) => {
