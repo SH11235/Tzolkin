@@ -1,6 +1,10 @@
-//! Native-only public V2 policy datasets. Source replays, not stored floats, are authoritative.
+//! Public V2 policy datasets and a separate semantic Setup teacher route.
+//! Complete source replays, not stored floats, are authoritative.
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
-use crate::features::{EncodedCandidate, FEATURE_COUNT, FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
+use crate::features::{
+    EncodedCandidate, FEATURE_COUNT, FeatureEncoder, PUBLIC_FEATURE_SCHEMA,
+    SEMANTIC_SETUP_FEATURE_SCHEMA,
+};
 use crate::model::digest;
 use crate::replay::{self, GameReplay, ReplayHeader, ReplaySource, ReplayStep};
 use serde::{Deserialize, Serialize};
@@ -17,6 +21,10 @@ use tzolkin_core::{
 pub const DATASET_SCHEMA: &str = "tzolkin-public-policy-dataset-v1";
 pub const RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND: &str = "verifiedNativeResourceCycleV5Teacher";
 pub const RESOURCE_CYCLE_V5_TEACHER_TASK: &str = "resourceCycleV5PolicyOnlyTeacher";
+pub const RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_SOURCE_KIND: &str =
+    "verifiedNativeResourceCycleV5SemanticSetupTeacher";
+pub const RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_TASK: &str =
+    "resourceCycleV5SemanticSetupPolicyOnlyTeacher";
 pub const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_SAMPLE_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_SHARD_BYTES: u64 = 32 * 1024 * 1024;
@@ -29,8 +37,15 @@ pub const MAX_PARTITION_CANDIDATES: usize = 1_000_000;
 enum SourceRoute {
     Native,
     ResourceCycleV5Teacher,
+    ResourceCycleV5SemanticSetupTeacher,
 }
 impl SourceRoute {
+    fn feature_schema(self) -> u32 {
+        match self {
+            Self::Native | Self::ResourceCycleV5Teacher => PUBLIC_FEATURE_SCHEMA,
+            Self::ResourceCycleV5SemanticSetupTeacher => SEMANTIC_SETUP_FEATURE_SCHEMA,
+        }
+    }
     fn labels(self) -> (&'static str, &'static str) {
         match self {
             Self::Native => ("verifiedNativePolicy", "policyOnlyBc"),
@@ -38,12 +53,18 @@ impl SourceRoute {
                 RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND,
                 RESOURCE_CYCLE_V5_TEACHER_TASK,
             ),
+            Self::ResourceCycleV5SemanticSetupTeacher => (
+                RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_SOURCE_KIND,
+                RESOURCE_CYCLE_V5_SEMANTIC_SETUP_TEACHER_TASK,
+            ),
         }
     }
     fn read(self, path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
         match self {
             Self::Native => source(path),
-            Self::ResourceCycleV5Teacher => resource_cycle_v5_teacher_source(path),
+            Self::ResourceCycleV5Teacher | Self::ResourceCycleV5SemanticSetupTeacher => {
+                resource_cycle_v5_teacher_source(path)
+            }
         }
     }
 }
@@ -259,7 +280,7 @@ impl ValidatedPolicySample {
     pub fn value_target(&self) -> Option<f32> {
         None
     }
-    fn wire(&self) -> Result<SampleWire, String> {
+    fn wire(&self, feature_schema: u32) -> Result<SampleWire, String> {
         Ok(SampleWire {
             sample_id: self.sample_id.clone(),
             game_id: self.game_id.clone(),
@@ -275,7 +296,7 @@ impl ValidatedPolicySample {
                 .map(|row| {
                     Ok(CandidateWire {
                         feature_schema: row.feature_schema(),
-                        values: row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?.to_vec(),
+                        values: row.values_for_schema(feature_schema)?.to_vec(),
                     })
                 })
                 .collect::<Result<_, String>>()?,
@@ -519,6 +540,7 @@ fn expected_sample(
     state: &GameState,
     step: &ReplayStep,
     game: &PolicyDatasetGame,
+    route: SourceRoute,
 ) -> Result<ValidatedPolicySample, String> {
     let observation = observe(state, state.current_player)?;
     if observation != step.observation
@@ -539,13 +561,20 @@ fn expected_sample(
     if matches.len() != 1 {
         return Err("Verified chosen action is not unique in complete ordered legal set".into());
     }
-    let encoder = FeatureEncoder::new_public(&observation)?;
+    let encoder = match route {
+        SourceRoute::Native | SourceRoute::ResourceCycleV5Teacher => {
+            FeatureEncoder::new_public(&observation)?
+        }
+        SourceRoute::ResourceCycleV5SemanticSetupTeacher => {
+            FeatureEncoder::new_semantic_setup(&observation)?
+        }
+    };
     let candidates: Vec<EncodedCandidate> = (0..observation.legal_actions.len())
         .map(|i| encoder.encode_legal_tagged(i))
         .collect::<Result<_, _>>()?;
     for row in &candidates {
         if row
-            .values_for_schema(PUBLIC_FEATURE_SCHEMA)?
+            .values_for_schema(route.feature_schema())?
             .iter()
             .any(|v| !v.is_finite() || v.abs() > 1024.0)
         {
@@ -748,6 +777,21 @@ pub fn export_resource_cycle_v5_teacher_files(
         SourceRoute::ResourceCycleV5Teacher,
     )
 }
+/// Re-encode complete all-seat V5 sources into a new semantic Setup dataset.
+/// Stored schema-2 shards and model artifacts are never an input to this builder.
+/// This grants no Human provenance, value supervision or policy qualification.
+pub fn export_resource_cycle_v5_semantic_setup_teacher_files(
+    paths: &[PathBuf],
+    output: &Path,
+) -> Result<PolicyDatasetManifest, String> {
+    let route = SourceRoute::ResourceCycleV5SemanticSetupTeacher;
+    export_sources_with_route(
+        paths.len(),
+        |index| route.read(&paths[index]),
+        output,
+        route,
+    )
+}
 fn export_sources(
     count: usize,
     read_source: impl FnMut(usize) -> Result<(Vec<u8>, GameReplay), String>,
@@ -779,8 +823,8 @@ fn export_sources_with_route(
         }
         let mut state = initial(&record)?;
         for step in &record.steps {
-            let sample = expected_sample(&state, step, &game)?;
-            if serde_json::to_vec(&sample.wire()?)
+            let sample = expected_sample(&state, step, &game, route)?;
+            if serde_json::to_vec(&sample.wire(route.feature_schema())?)
                 .map_err(|e| e.to_string())?
                 .len() as u64
                 + 1
@@ -808,7 +852,7 @@ fn export_sources_with_route(
     fs::create_dir(output.join("sources")).map_err(|e| e.to_string())?;
     let mut m = PolicyDatasetManifest {
         schema: DATASET_SCHEMA.into(),
-        feature_schema: PUBLIC_FEATURE_SCHEMA,
+        feature_schema: route.feature_schema(),
         feature_count: FEATURE_COUNT,
         rules_version: replay::RULES_VERSION,
         rules_baseline: replay::RULES_BASELINE.into(),
@@ -839,8 +883,10 @@ fn export_sources_with_route(
         let mut state = initial(&record)?;
         let mut writer: Option<ShardWriter> = None;
         for step in &record.steps {
-            let bytes = serde_json::to_vec(&expected_sample(&state, step, game)?.wire()?)
-                .map_err(|e| e.to_string())?;
+            let bytes = serde_json::to_vec(
+                &expected_sample(&state, step, game, route)?.wire(route.feature_schema())?,
+            )
+            .map_err(|e| e.to_string())?;
             if writer
                 .as_ref()
                 .is_some_and(|s| s.meta.bytes + bytes.len() as u64 + 1 > MAX_SHARD_BYTES)
@@ -881,7 +927,7 @@ fn export_sources_with_route(
 }
 fn validate_manifest(m: &PolicyDatasetManifest, route: SourceRoute) -> Result<(), String> {
     if m.schema != DATASET_SCHEMA
-        || m.feature_schema != PUBLIC_FEATURE_SCHEMA
+        || m.feature_schema != route.feature_schema()
         || m.feature_count != FEATURE_COUNT
         || m.rules_version != replay::RULES_VERSION
         || m.rules_baseline != replay::RULES_BASELINE
@@ -989,6 +1035,10 @@ impl ValidatedPolicyDataset {
         &self,
     ) -> Result<(u64, String), String> {
         self.require_resource_cycle_v5_teacher_route()?;
+        self.recheck_manifest_bytes()
+    }
+    fn recheck_manifest_bytes(&self) -> Result<(u64, String), String> {
+        validate_manifest(&self.manifest, self.route)?;
         let bytes = read_bytes(&self.directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
         let manifest: PolicyDatasetManifest =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
@@ -998,7 +1048,11 @@ impl ValidatedPolicyDataset {
         Ok((bytes.len() as u64, digest(&bytes)))
     }
     pub(crate) fn recheck_resource_cycle_v5_teacher_bytes(&self) -> Result<(u64, String), String> {
-        let manifest = self.recheck_resource_cycle_v5_teacher_manifest()?;
+        self.require_resource_cycle_v5_teacher_route()?;
+        self.recheck_all_bytes()
+    }
+    fn recheck_all_bytes(&self) -> Result<(u64, String), String> {
+        let manifest = self.recheck_manifest_bytes()?;
         for game in &self.manifest.games {
             if file_digest(&self.directory.join(&game.source_file), MAX_SOURCE_BYTES)?
                 != (game.source_bytes, game.source_sha256.clone())
@@ -1031,6 +1085,81 @@ impl ValidatedPolicyDataset {
             current: None,
             game: None,
             failed: false,
+        }
+    }
+}
+/// Complete fixed-V5 sources re-encoded with semantic Setup schema 3.
+/// This separate handle cannot enter existing schema-2 trainers or native admission.
+/// No mutable rows, deserialization or conversion into their handle is exposed.
+///
+/// ```compile_fail
+/// use tzolkin_ai::policy_dataset::ValidatedSemanticSetupTeacherDataset;
+/// use tzolkin_ai::policy_training::PolicyBcConfig;
+/// fn old_teacher_trainer(dataset: &ValidatedSemanticSetupTeacherDataset) {
+///     let _ = tzolkin_ai::resource_cycle_teacher_training::train_dataset(
+///         dataset, &PolicyBcConfig::default(), None);
+/// }
+/// ```
+pub struct ValidatedSemanticSetupTeacherDataset {
+    dataset: ValidatedPolicyDataset,
+    manifest_pin: (u64, String),
+}
+impl ValidatedSemanticSetupTeacherDataset {
+    pub fn manifest(&self) -> &PolicyDatasetManifest {
+        self.dataset.manifest()
+    }
+    /// Consume through EOF to complete replay, label regeneration and raw-byte checks.
+    pub fn iter(&self) -> SemanticSetupTeacherDatasetIter<'_> {
+        self.iterator(None)
+    }
+    pub fn iter_split(&self, split: DatasetSplit) -> SemanticSetupTeacherDatasetIter<'_> {
+        self.iterator(Some(split))
+    }
+    fn recheck_bytes(&self) -> Result<(), String> {
+        if self.dataset.recheck_all_bytes()? != self.manifest_pin {
+            return Err("Semantic Setup teacher manifest bytes changed after load".into());
+        }
+        Ok(())
+    }
+    fn iterator(&self, split: Option<DatasetSplit>) -> SemanticSetupTeacherDatasetIter<'_> {
+        SemanticSetupTeacherDatasetIter {
+            dataset: self,
+            rows: self.dataset.iterator(split),
+            started: false,
+            finished: false,
+        }
+    }
+}
+/// Only this iterator's schema-3 route receives additional manifest/source/shard pins.
+pub struct SemanticSetupTeacherDatasetIter<'a> {
+    dataset: &'a ValidatedSemanticSetupTeacherDataset,
+    rows: PolicyDatasetIter,
+    started: bool,
+    finished: bool,
+}
+impl Iterator for SemanticSetupTeacherDatasetIter<'_> {
+    type Item = Result<ValidatedPolicySample, String>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        if !self.started {
+            self.started = true;
+            if let Err(error) = self.dataset.recheck_bytes() {
+                self.finished = true;
+                return Some(Err(error));
+            }
+        }
+        match self.rows.next() {
+            Some(Ok(sample)) => Some(Ok(sample)),
+            Some(Err(error)) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+            None => {
+                self.finished = true;
+                self.dataset.recheck_bytes().err().map(Err)
+            }
         }
     }
 }
@@ -1161,8 +1290,13 @@ impl PolicyDatasetIter {
                 .steps
                 .get(game.next_source_index)
                 .ok_or("Excess native sample index")?;
-            let expected = expected_sample(&game.state, step, &self.manifest.games[game.index])?;
-            if wire != expected.wire()? {
+            let expected = expected_sample(
+                &game.state,
+                step,
+                &self.manifest.games[game.index],
+                self.route,
+            )?;
+            if wire != expected.wire(self.route.feature_schema())? {
                 return Err(format!(
                     "Stored policy sample differs from full source re-encoding at index {}",
                     game.next_source_index
@@ -1215,6 +1349,29 @@ pub fn load_resource_cycle_v5_teacher_dataset(
     directory: &Path,
 ) -> Result<ValidatedPolicyDataset, String> {
     load_dataset_with_route(directory, SourceRoute::ResourceCycleV5Teacher)
+}
+/// Admit only freshly reconstructed semantic Setup teacher rows from complete sources.
+/// The loader and every consumed iterator pin raw manifest, source and shard bytes.
+pub fn load_resource_cycle_v5_semantic_setup_teacher_dataset(
+    directory: &Path,
+) -> Result<ValidatedSemanticSetupTeacherDataset, String> {
+    let bytes = read_bytes(&directory.join("manifest.json"), MAX_MANIFEST_BYTES)?;
+    let manifest: PolicyDatasetManifest =
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let route = SourceRoute::ResourceCycleV5SemanticSetupTeacher;
+    validate_manifest(&manifest, route)?;
+    let dataset = ValidatedSemanticSetupTeacherDataset {
+        dataset: ValidatedPolicyDataset {
+            directory: directory.to_path_buf(),
+            manifest,
+            route,
+        },
+        manifest_pin: (bytes.len() as u64, digest(&bytes)),
+    };
+    dataset.recheck_bytes()?;
+    audit_all(&dataset.dataset)?;
+    dataset.recheck_bytes()?;
+    Ok(dataset)
 }
 fn load_dataset_with_route(
     directory: &Path,
