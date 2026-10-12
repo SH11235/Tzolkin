@@ -302,6 +302,74 @@ impl OwnSetupTrainingOwner {
         &self.ledger
     }
 
+    pub(crate) fn config_checksum(&self) -> &str {
+        &self.config_checksum
+    }
+
+    pub(crate) fn exclusion_families(&self) -> Vec<String> {
+        self.exclusions.families.iter().cloned().collect()
+    }
+
+    pub(crate) fn exclusion_digest(&self) -> &str {
+        self.exclusions.digest()
+    }
+
+    /// Only the durable source reader can extend a completed successful owner.
+    /// This changes the prospective binding, never the existing trained identity,
+    /// parameters, Adam moments, cumulative cursor, ledger or learning credit.
+    pub(crate) fn continue_budget(
+        &mut self,
+        additional_episodes: u64,
+        exclusions: DeclaredOwnSetupExclusions,
+    ) -> Result<OwnSetupRunConfig, String> {
+        let budget = self
+            .attempted
+            .checked_add(additional_episodes)
+            .ok_or("Own Setup continuation budget overflow")?;
+        if !(1..=256).contains(&additional_episodes)
+            || budget > MAX_ATTEMPTED_EPISODES
+            || self.attempted != self.run_config.max_attempted_episodes
+            || self.setup.count() == 0
+            || self.optimizer.step != self.setup.count()
+            || self.ledger.len() as u64 != self.setup.count()
+            || self
+                .ledger
+                .iter()
+                .any(|r| !matches!(r.outcome, OwnSetupAttemptOutcome::Updated { .. }))
+            || self
+                .next_episode
+                .and_then(|n| n.checked_add(additional_episodes - 1))
+                .is_none()
+            || !self.exclusions.families.is_subset(&exclusions.families)
+            || !self.spent_families.is_subset(&exclusions.families)
+        {
+            return Err("Own Setup continuation requires a complete successful owner, cursor and full monotone baseline".into());
+        }
+        let mut run = self.run_config.clone();
+        run.max_attempted_episodes = budget;
+        let checksum = hash(
+            b"tzolkin-own-setup-continuation-training-config-v1\0",
+            &(
+                TRAINING_VERSION,
+                &self.adam_config,
+                &run,
+                exclusions.count(),
+                exclusions.digest(),
+                self.setup.initial(),
+                &self.playing_checksum,
+                &self.config_checksum,
+                self.setup.checksum(),
+                self.attempted,
+                self.setup.count(),
+                self.ledger.len(),
+            ),
+        )?;
+        self.run_config = run.clone();
+        self.exclusions = exclusions;
+        self.config_checksum = checksum;
+        Ok(run)
+    }
+
     /// Reserves all requested slots first. Post-reservation refusals, failed games
     /// and no-change updates consume those slots and families without rewind.
     /// A batch uses one frozen Setup identity; it stops at the first failed game.
@@ -1147,6 +1215,7 @@ mod tests {
         let cfg = adam();
         let mut shadow_first = [0.0_f64; 2];
         let mut shadow_second = [0.0_f64; 2];
+        let mut carried: Option<OwnSetupTrainingOwner> = None;
         for (step, g) in [(1, [6.0_f64, -8.0]), (2, [-4.0, 3.0])] {
             let mut gradient = vec![0.0; PARAMETER_COUNT];
             gradient[0] = g[0];
@@ -1171,6 +1240,121 @@ mod tests {
             }
             assert_eq!(proposal.optimizer.step, step as u64);
             assert_eq!(proposal.changed, 2);
+            if let Some(owner) = &carried {
+                let next = adam_proposal(owner.setup.model(), &owner.optimizer, &gradient, 2, &cfg)
+                    .unwrap();
+                assert_eq!(next.optimizer.first, proposal.optimizer.first);
+                assert_eq!(next.optimizer.second, proposal.optimizer.second);
+                assert_eq!(next.optimizer.step, proposal.optimizer.step);
+                assert_eq!(
+                    next.model
+                        .parameters()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    proposal
+                        .model
+                        .parameters()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            } else {
+                // Mathematical fixture only: this grants no native source credit.
+                let mut owner = OwnSetupTrainingOwner::new(
+                    InitializedOwnSetupArtifact::new(17).unwrap(),
+                    crate::own_setup_native::tests::playing(),
+                    cfg.clone(),
+                    OwnSetupRunConfig {
+                        sampling_seed: u64::MAX,
+                        replicate_ordinal: 7,
+                        first_episode_ordinal: 0,
+                        max_attempted_episodes: 2,
+                    },
+                    exclusions(vec![]),
+                )
+                .unwrap();
+                let family = seed_family_id(train_seed());
+                let identity = TrainedOwnSetupIdentity {
+                    schema: trained::ARTIFACT_SCHEMA.into(),
+                    policy_version: trained::POLICY_VERSION.into(),
+                    sampling_version: trained::SAMPLING_VERSION.into(),
+                    task: trained::TASK.into(),
+                    initial: owner.setup.initial().clone(),
+                    parent_checksum: owner.setup_checksum().into(),
+                    update_count: 1,
+                    training_config_checksum: owner.config_checksum.clone(),
+                    playing_binding_checksum: owner.playing_checksum.clone(),
+                    numerical_target: crate::public_stochastic_native::numerical_target(),
+                    parameter_words_checksum: String::new(),
+                    checksum: String::new(),
+                    sources: vec![SetupUpdateSource {
+                        episode_id: "a".repeat(64),
+                        record_checksum: "b".repeat(64),
+                    }],
+                };
+                owner.setup = SetupState::Trained(Box::new(
+                    TrainedOwnSetupArtifact::from_update(
+                        identity,
+                        OwnSetupModel {
+                            own_setup_parameters: proposal.model.parameters().to_vec(),
+                        },
+                    )
+                    .unwrap(),
+                ));
+                owner.optimizer = proposal.optimizer.clone();
+                owner.attempted = 2;
+                owner.next_episode = Some(2);
+                owner.spent_families.insert(family.clone());
+                owner.credited_ids.insert("a".repeat(64));
+                owner.credited_records.insert("b".repeat(64));
+                owner.ledger.push(OwnSetupAttemptReport {
+                    first_episode_ordinal: 0,
+                    reserved_episodes: 2,
+                    next_episode_ordinal: Some(2),
+                    attempted_episodes: 2,
+                    families: vec![family.clone()],
+                    setup_before: String::new(),
+                    setup_after: owner.setup_checksum().into(),
+                    receipts: vec![],
+                    outcome: OwnSetupAttemptOutcome::Updated {
+                        update_count: 1,
+                        changed_parameters: 2,
+                        max_parameter_delta: proposal.max_delta,
+                    },
+                });
+                let before = owner.checkpoint().unwrap();
+                let old_identity = owner.setup.identity_bytes().unwrap();
+                let old_ledger = json(&owner.ledger).unwrap();
+                assert!(owner.continue_budget(2, exclusions(vec![])).is_err());
+                assert_eq!(
+                    json(&before).unwrap(),
+                    json(&owner.checkpoint().unwrap()).unwrap()
+                );
+                owner.continue_budget(2, exclusions(vec![family])).unwrap();
+                let after = owner.checkpoint().unwrap();
+                assert_eq!(json(&before.setup).unwrap(), json(&after.setup).unwrap());
+                assert_eq!(before.first_moment_bits, after.first_moment_bits);
+                assert_eq!(before.second_moment_bits, after.second_moment_bits);
+                assert_eq!(before.optimizer_step, after.optimizer_step);
+                assert_eq!(before.next_episode_ordinal, after.next_episode_ordinal);
+                assert_eq!(before.attempted_episodes, after.attempted_episodes);
+                assert_eq!(before.spent_families, after.spent_families);
+                assert_eq!(before.credited_episode_ids, after.credited_episode_ids);
+                assert_eq!(
+                    before.credited_record_checksums,
+                    after.credited_record_checksums
+                );
+                assert_eq!(
+                    before.run_config.first_episode_ordinal,
+                    after.run_config.first_episode_ordinal
+                );
+                assert_eq!(after.run_config.max_attempted_episodes, 4);
+                assert_ne!(before.config_checksum, after.config_checksum);
+                assert_eq!(old_identity, owner.setup.identity_bytes().unwrap());
+                assert_eq!(old_ledger, json(&owner.ledger).unwrap());
+                carried = Some(owner);
+            }
             model = proposal.model;
             state = proposal.optimizer;
         }
