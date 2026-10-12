@@ -128,7 +128,9 @@ impl TeacherDatasetIdentity {
         Ok(())
     }
 }
-fn audit_dataset(dataset: &ValidatedPolicyDataset) -> Result<TeacherDatasetIdentity, String> {
+pub(crate) fn audit_dataset(
+    dataset: &ValidatedPolicyDataset,
+) -> Result<TeacherDatasetIdentity, String> {
     let identity = TeacherDatasetIdentity::from_dataset(dataset)?;
     let mut counts = [0usize; 2];
     for sample in dataset.iter() {

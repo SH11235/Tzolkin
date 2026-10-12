@@ -453,10 +453,110 @@ fn resource_cycle_v5_teacher_training_resume_and_source_contract() {
         )
         .is_err()
     );
+    // Audited teacher inference retains its source route; no native conversion.
+    use tzolkin_ai::arena::numeric::{ExternalExclusions, NumericArenaConfig};
+    use tzolkin_ai::arena::teacher::PreparedResourceCycleTeacher;
+    use tzolkin_ai::kernel::Kernel;
+    use tzolkin_inference::policy::BorrowedPolicy;
+    use tzolkin_inference::trade_guard::TradeGuardConfig;
+    let prepared = PreparedResourceCycleTeacher::new(
+        resumed.checkpoint.clone(),
+        load_resource_cycle_v5_teacher_dataset(&training_directory).unwrap(),
+        Kernel::Scalar,
+    )
+    .unwrap();
+    let handle = prepared.arena_handle(TradeGuardConfig::default()).unwrap();
+    let identity = serde_json::to_value(handle.identity()).unwrap();
+    assert_eq!(
+        identity["sourceKind"],
+        policy_dataset::RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND
+    );
+    assert_eq!(identity["checkpointChecksum"], resumed.checkpoint.checksum);
+    assert_eq!(identity["dataset"]["families"].as_array().unwrap().len(), 2);
+    assert_eq!(identity["valueValidity"], "unavailablePolicyOnly");
+    for field in [
+        "producerAuthenticated",
+        "sourceQualified",
+        "verifiedNativePolicy",
+        "strengthMeasured",
+    ] {
+        assert_eq!(identity[field], false);
+    }
+    for phase in [Phase::Setup, Phase::Playing] {
+        let mut state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        while state.phase != phase {
+            let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+            state = tzolkin_core::apply_move(&state, o.legal_actions[0].r#move.clone()).unwrap();
+        }
+        let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+        let encoder = FeatureEncoder::new_public(&o).unwrap();
+        let rows = (0..o.legal_actions.len())
+            .map(|i| encoder.encode_legal_tagged(i).unwrap())
+            .collect::<Vec<_>>();
+        let expected =
+            BorrowedPolicy::from_validated_parameters(resumed.checkpoint.model.parameters())
+                .unwrap()
+                .predict(Kernel::Scalar.resolve().unwrap(), &rows)
+                .unwrap();
+        let actual = prepared.distribution(&o).unwrap();
+        assert_eq!(
+            actual
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual
+                .probabilities
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .probabilities
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+    let arena_config = NumericArenaConfig {
+        schema: tzolkin_ai::arena::numeric::SCHEMA.into(),
+        players: 3,
+        seeds: vec![10006],
+        bootstrap_seed: 7,
+        external_exclusions: ExternalExclusions {
+            evidence_sha256: "e".repeat(64),
+            excluded_family_ids: vec![],
+        },
+    };
+    handle.validate_arena_config(&arena_config).unwrap();
+    let mut overlap = arena_config.clone();
+    overlap.seeds = vec![10005];
+    assert!(handle.validate_arena_config(&overlap).is_err());
+    let mut excluded = arena_config.clone();
+    excluded
+        .external_exclusions
+        .excluded_family_ids
+        .push(dataset::seed_family_id(10006));
+    assert!(handle.validate_arena_config(&excluded).is_err());
+    let manifest_path = training_directory.join("manifest.json");
+    let original_manifest = fs::read(&manifest_path).unwrap();
+    let mut changed_bytes = original_manifest.clone();
+    changed_bytes.push(b' ');
+    fs::write(&manifest_path, changed_bytes).unwrap();
+    assert!(handle.validate_arena_config(&arena_config).is_err());
+    fs::write(manifest_path, original_manifest).unwrap();
     let training_source = training_directory.join(&training_manifest.games[0].source_file);
     let original_training_source = fs::read(&training_source).unwrap();
     fs::write(&training_source, b"{}").unwrap();
     assert!(teacher::validate_checkpoint_dataset(&training, &resumed.checkpoint).is_err());
+    assert!(handle.validate_arena_config(&arena_config).is_err());
     fs::write(training_source, original_training_source).unwrap();
 }
 
