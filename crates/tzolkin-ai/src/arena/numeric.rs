@@ -31,13 +31,19 @@ use std::time::Instant;
 use tzolkin_core::observation::{Observation, observe};
 use tzolkin_core::{GameOptions, Phase};
 use tzolkin_inference::deployment::{GuardedDeployment, LoadedDeployment, MAX_GAME_CALLBACKS};
+use tzolkin_inference::own_setup_deployment::{
+    self as own_setup, GuardedOwnSetupComposite, LoadedOwnSetupComposite,
+};
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 pub const SCHEMA: &str = "tzolkin-numeric-deployment-validation-arena-v1";
 pub const RESOURCE_CYCLE_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-development-validation-arena-v1";
+pub const OWN_SETUP_ARENA_SCHEMA: &str = "tzolkin-own-setup-composite-development-arena-v1";
+pub const RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA: &str =
+    "tzolkin-resource-cycle-v5-own-setup-composite-development-arena-v1";
 pub const MAX_ROWS_PER_CALLBACK: usize = 1024;
-const MAX_EXCLUDED_FAMILIES: usize = 65_536;
+const MAX_EXCLUDED_FAMILIES: usize = 200_000;
 const _: () = assert!(MAX_GAME_CALLBACKS == replay::MAX_DECISIONS);
 
 fn digest(value: &str) -> bool {
@@ -169,6 +175,69 @@ impl NumericPolicy {
     }
 }
 
+/// Complete numeric claims from an actual loaded composite, without source or
+/// training admission. Playing preserves the complete binding as Rust JSON;
+/// wide integer words never pass through a floating-point representation.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnSetupCompositeIdentity {
+    pub deployment_checksum: String,
+    pub setup: tzolkin_inference::own_setup_contract::trained::TrainedOwnSetupIdentity,
+    pub playing: serde_json::Value,
+    pub backend: String,
+    pub raw_policy_version: String,
+    pub guard: TradeGuardConfig,
+    pub configuration_key: String,
+    pub inference_version: String,
+    pub source_qualified: bool,
+    pub verified_native_policy: bool,
+}
+
+/// Owns immutable inference storage only. No artifact DTO creates a learner.
+pub struct OwnSetupCompositePolicy {
+    loaded: Option<LoadedOwnSetupComposite>,
+    identity: OwnSetupCompositeIdentity,
+}
+impl OwnSetupCompositePolicy {
+    pub fn new(loaded: LoadedOwnSetupComposite) -> Result<Self, String> {
+        let guard = TradeGuardConfig::default();
+        let identity = OwnSetupCompositeIdentity {
+            deployment_checksum: loaded.checksum().into(),
+            setup: loaded.setup_identity().clone(),
+            playing: serde_json::to_value(loaded.playing_identity()).map_err(|e| e.to_string())?,
+            backend: loaded.backend().into(),
+            raw_policy_version: loaded.policy_version().into(),
+            configuration_key: guard.configuration_key()?,
+            guard,
+            inference_version: own_setup::GUARDED_POLICY_VERSION.into(),
+            source_qualified: false,
+            verified_native_policy: false,
+        };
+        Ok(Self {
+            loaded: Some(loaded),
+            identity,
+        })
+    }
+    pub fn identity(&self) -> &OwnSetupCompositeIdentity {
+        &self.identity
+    }
+    fn borrowed_deployment(&self) -> Result<&LoadedOwnSetupComposite, String> {
+        self.loaded
+            .as_ref()
+            .ok_or_else(|| "Own Setup Arena immutable storage is unavailable".into())
+    }
+    fn validate_fixed_playing(&self, reference: &NumericPolicy) -> Result<(), String> {
+        let expected = own_setup::fixed_playing_identity(reference.borrowed_deployment()?)?;
+        if reference.identity.guard != TradeGuardConfig::default()
+            || reference.identity.configuration_key != expected.configuration_key
+            || self.borrowed_deployment()?.playing_identity() != &expected
+        {
+            return Err("Own Setup Arena requires the exact fixed numeric Playing binding".into());
+        }
+        Ok(())
+    }
+}
+
 pub enum Opponent<'a> {
     GuardedNumeric(Box<NumericPolicy>),
     Heuristic(&'a HeuristicWeights),
@@ -212,9 +281,13 @@ pub enum PolicyIdentity {
     SemanticSetupTeacherNumericPlayingDevelopment {
         identity: Box<PhaseRoutedDevelopmentIdentity>,
     },
+    OwnSetupCompositeNumericDevelopment {
+        identity: Box<OwnSetupCompositeIdentity>,
+    },
 }
 enum Role<'a> {
     Numeric(NumericPolicy),
+    OwnSetup(Box<OwnSetupCompositePolicy>),
     Conditional(Box<ConditionalPolicy<'a>>),
     ConditionalMixed(Box<ConditionalMixedArenaPolicy<'a>>),
     ConditionalCountZero(Box<ConditionalCountZeroArenaPolicy<'a>>),
@@ -254,6 +327,9 @@ impl<'a> Role<'a> {
             Self::Numeric(policy) => PolicyIdentity::GuardedNumeric {
                 identity: policy.identity.clone(),
             },
+            Self::OwnSetup(policy) => PolicyIdentity::OwnSetupCompositeNumericDevelopment {
+                identity: Box::new(policy.identity.clone()),
+            },
             Self::Conditional(policy) => PolicyIdentity::ConditionalHumanHybrid {
                 identity: Box::new(policy.identity().clone()),
             },
@@ -289,6 +365,7 @@ impl<'a> Role<'a> {
     fn guard_key(&self) -> Option<&str> {
         match self {
             Self::Numeric(policy) => Some(&policy.identity.configuration_key),
+            Self::OwnSetup(policy) => Some(&policy.identity.configuration_key),
             Self::Conditional(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalMixed(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalCountZero(policy) => Some(&policy.identity().configuration_key),
@@ -399,11 +476,34 @@ fn work_bounds(
     })
 }
 
+enum OwnedGameGuard {
+    Numeric(Box<GuardedDeployment>),
+    OwnSetup(Box<GuardedOwnSetupComposite>),
+}
+impl OwnedGameGuard {
+    fn on_callback(&mut self, index: usize, observation: &Observation) -> Result<(), String> {
+        match self {
+            Self::Numeric(guard) => guard.on_callback(index, observation),
+            Self::OwnSetup(guard) => guard.on_callback(index, observation),
+        }
+    }
+    fn choose_move(
+        &mut self,
+        index: usize,
+        observation: &Observation,
+    ) -> Result<tzolkin_inference::deployment::GuardedDeploymentDecision, String> {
+        match self {
+            Self::Numeric(guard) => guard.choose_move(index, observation),
+            Self::OwnSetup(guard) => guard.choose_move(index, observation),
+        }
+    }
+}
+
 fn choose(
     index: usize,
     observation: &Observation,
     roster: &[&mut Role<'_>],
-    guards: &mut [Option<GuardedDeployment>],
+    guards: &mut [Option<OwnedGameGuard>],
     conditional_sessions: &mut [Option<GameSession>],
     diagnostics: &mut [Option<GuardDiagnostics>],
     search: &mut [Option<SearchSummary>],
@@ -432,9 +532,23 @@ fn choose(
         let d = diagnostics[actor].as_mut().expect("numeric diagnostic");
         d.choices_attempted += 1;
         d.candidate_rows_attempted += observation.legal_actions.len();
+        if let Some(routes) = d.phase_routes.as_mut() {
+            match observation.phase {
+                Phase::Setup => routes.setup_choices_attempted += 1,
+                Phase::Playing => routes.playing_choices_attempted += 1,
+                _ => {}
+            }
+        }
         let result = guard.choose_move(index, observation)?;
         d.choices_returned += 1;
         d.candidate_rows_returned += observation.legal_actions.len();
+        if let Some(routes) = d.phase_routes.as_mut() {
+            match observation.phase {
+                Phase::Setup => routes.setup_choices_returned += 1,
+                Phase::Playing => routes.playing_choices_returned += 1,
+                _ => unreachable!("Own Setup guard returned an unsupported phase"),
+            }
+        }
         if let Some(trade) = result.trade {
             d.forced_exits += usize::from(trade.overridden);
             d.repeat_exits += usize::from(trade.overridden && trade.repeat_seen);
@@ -532,6 +646,7 @@ fn choose(
                 None,
             ),
             Role::Numeric(_) => return Err("Numeric Arena missing game guard".into()),
+            Role::OwnSetup(_) => return Err("Own Setup Arena missing game guard".into()),
             Role::Conditional(_) => return Err("Conditional Arena missing game session".into()),
             Role::ConditionalMixed(_) => {
                 return Err("Conditional Arena missing game session".into());
@@ -617,7 +732,7 @@ fn play_arm_using<'a>(
     let mut guards = roster
         .iter_mut()
         .map(|role| match role {
-            Role::Numeric(policy) => Some(
+            Role::Numeric(policy) => Some(OwnedGameGuard::Numeric(Box::new(
                 GuardedDeployment::new(
                     policy
                         .loaded
@@ -626,7 +741,16 @@ fn play_arm_using<'a>(
                     policy.identity.guard.clone(),
                 )
                 .expect("constructor already validated the immutable guard configuration"),
-            ),
+            ))),
+            Role::OwnSetup(policy) => Some(OwnedGameGuard::OwnSetup(Box::new(
+                GuardedOwnSetupComposite::new(
+                    policy
+                        .loaded
+                        .take()
+                        .expect("immutable composite returned after each arm"),
+                )
+                .expect("loaded composite uses the validated default guard"),
+            ))),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -656,7 +780,7 @@ fn play_arm_using<'a>(
                     ..GuardDiagnostics::default()
                 })
             }
-            Role::PhaseRouted(_) => Some(GuardDiagnostics {
+            Role::PhaseRouted(_) | Role::OwnSetup(_) => Some(GuardDiagnostics {
                 phase_routes: Some(PhaseRouteDiagnostics::default()),
                 ..GuardDiagnostics::default()
             }),
@@ -689,8 +813,14 @@ fn play_arm_using<'a>(
     // Always discard the game history, also after a policy or core error. Only
     // move the same immutable weights back; never reload or copy parameters.
     for (role, guard) in roster.iter_mut().zip(guards) {
-        if let (Role::Numeric(policy), Some(guard)) = (role, guard) {
-            policy.loaded = Some(guard.into_policy());
+        match (role, guard) {
+            (Role::Numeric(policy), Some(OwnedGameGuard::Numeric(guard))) => {
+                policy.loaded = Some(guard.into_policy());
+            }
+            (Role::OwnSetup(policy), Some(OwnedGameGuard::OwnSetup(guard))) => {
+                policy.loaded = Some(guard.into_policy());
+            }
+            _ => {}
         }
     }
     // Conditional policies borrow immutable parameters. Their sessions have no
@@ -751,6 +881,49 @@ pub fn run_validation(
         Role::Numeric(reference),
         opponent_pool,
         SCHEMA,
+    )
+}
+
+/// Composite Setup against its exact fixed numeric Playing continuation, using
+/// base 3/4p Validation families and every seat. Numeric claims grant no source,
+/// learning, fresh Test or strength authority; failures remain in the report.
+pub fn run_own_setup_validation(
+    config: &NumericArenaConfig,
+    candidate: OwnSetupCompositePolicy,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'_>>,
+) -> Result<NumericArenaReport, String> {
+    candidate.validate_fixed_playing(&reference)?;
+    run_roles(
+        config,
+        Role::OwnSetup(Box::new(candidate)),
+        Role::Numeric(reference),
+        opponent_pool,
+        OWN_SETUP_ARENA_SCHEMA,
+    )
+}
+
+/// Preserve the existing report sign: frozen V5 is candidate, composite is
+/// reference. Winner-share deltas are V5 minus composite. The separately loaded
+/// fixed Playing policy binds the continuation before any game; it is borrowed
+/// only for validation and is not a third focal arm.
+pub fn run_resource_cycle_own_setup_validation(
+    config: &NumericArenaConfig,
+    candidate: super::resource_cycle::ResourceCycleConfig,
+    reference: OwnSetupCompositePolicy,
+    fixed_playing: &NumericPolicy,
+    opponent_pool: Vec<Opponent<'_>>,
+) -> Result<NumericArenaReport, String> {
+    if candidate != super::resource_cycle::ResourceCycleConfig::v5() {
+        return Err("Resource-cycle candidate requires the exact frozen V5 configuration".into());
+    }
+    reference.validate_fixed_playing(fixed_playing)?;
+    run_roles(
+        config,
+        Role::ResourceCycle(candidate),
+        Role::OwnSetup(Box::new(reference)),
+        opponent_pool,
+        RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA,
     )
 }
 
@@ -1009,6 +1182,239 @@ pub(super) mod tests {
     use super::*;
     use serde_json::json;
     use tzolkin_inference::{deployment as d, features, policy};
+
+    fn own_setup_fixture() -> (OwnSetupCompositePolicy, NumericPolicy, Vec<u8>) {
+        use tzolkin_inference::own_setup_contract::{self as contract, trained};
+        // Numeric claims only: no initialized/trained owner, collection or update.
+        let playing = crate::own_setup_native::tests::playing_bytes();
+        let binding = own_setup::fixed_playing_from_bytes(&playing).unwrap();
+        let parameters = vec![0.0_f32; policy::PARAMETER_COUNT];
+        let mut initial: contract::InitializedOwnSetupIdentity = serde_json::from_value(json!({
+            "schema":contract::ARTIFACT_SCHEMA,"modelVersion":contract::MODEL_VERSION,
+            "inputContract":contract::INPUT_CONTRACT,"task":contract::TASK,
+            "initVersion":contract::INIT_VERSION,"seed":u64::MAX,"completedUpdates":0,
+            "featureSchema":features::SEMANTIC_SETUP_FEATURE_SCHEMA,
+            "featureCount":features::FEATURE_COUNT,"hiddenCount":policy::HIDDEN,
+            "parameterCount":policy::PARAMETER_COUNT,"backend":"scalar",
+            "rulesVersion":d::RULES_VERSION,"rulesBaseline":d::RULES_BASELINE,
+            "observationSchema":tzolkin_core::observation::OBSERVATION_SCHEMA,
+            "moveSchema":tzolkin_core::observation::MOVE_SCHEMA,
+            "catalogHash":d::catalog_hash(),"checksum":""
+        }))
+        .unwrap();
+        initial.checksum = contract::initialized_checksum(&initial, &parameters).unwrap();
+        let mut setup = trained::TrainedOwnSetupIdentity {
+            schema: trained::ARTIFACT_SCHEMA.into(),
+            policy_version: trained::POLICY_VERSION.into(),
+            sampling_version: trained::SAMPLING_VERSION.into(),
+            task: trained::TASK.into(),
+            parent_checksum: initial.checksum.clone(),
+            initial,
+            update_count: 1,
+            training_config_checksum: "c".repeat(64),
+            playing_binding_checksum: own_setup::playing_binding_checksum(&binding).unwrap(),
+            numerical_target: crate::public_stochastic_native::numerical_target(),
+            parameter_words_checksum: trained::word_checksum(&parameters),
+            sources: vec![trained::SetupUpdateSource {
+                episode_id: "d".repeat(64),
+                record_checksum: "e".repeat(64),
+            }],
+            checksum: String::new(),
+        };
+        setup.checksum = trained::expected_checksum(&setup, &parameters).unwrap();
+        let mut wire = json!({
+            "schema":own_setup::DEPLOYMENT_SCHEMA,
+            "playing":serde_json::from_slice::<serde_json::Value>(&playing).unwrap(),
+            "setup":{"identity":setup,"parameterBits":vec!["00000000";parameters.len()]},
+            "checksum":""
+        });
+        wire["checksum"] = own_setup::numeric_checksum(&serde_json::to_vec(&wire).unwrap())
+            .unwrap()
+            .into();
+        (
+            OwnSetupCompositePolicy::new(
+                LoadedOwnSetupComposite::load(&serde_json::to_vec(&wire).unwrap()).unwrap(),
+            )
+            .unwrap(),
+            NumericPolicy::new(
+                LoadedDeployment::load(&playing).unwrap(),
+                TradeGuardConfig::default(),
+            )
+            .unwrap(),
+            playing,
+        )
+    }
+
+    #[test]
+    fn own_setup_numeric_pair_requires_full_playing_binding_before_simulation() {
+        let (mut candidate, mut reference, playing) = own_setup_fixture();
+        candidate.validate_fixed_playing(&reference).unwrap();
+        let identity = serde_json::to_value(candidate.identity()).unwrap();
+        assert_eq!(
+            identity["setup"]["initial"]["seed"].as_u64(),
+            Some(u64::MAX)
+        );
+        assert_eq!(identity["sourceQualified"], false);
+        assert_eq!(identity["verifiedNativePolicy"], false);
+        assert_eq!(
+            identity["playing"],
+            serde_json::to_value(candidate.borrowed_deployment().unwrap().playing_identity())
+                .unwrap()
+        );
+        let mut changed: serde_json::Value = serde_json::from_slice(&playing).unwrap();
+        // Artifact/count/actor remain equal, but the complete binding differs.
+        changed["source"]["identity"]["policy"]["residualParametersChecksum"] =
+            "f".repeat(64).into();
+        changed["checksum"] = d::numeric_checksum(&serde_json::to_vec(&changed).unwrap())
+            .unwrap()
+            .into();
+        let wrong = NumericPolicy::new(
+            LoadedDeployment::load(&serde_json::to_vec(&changed).unwrap()).unwrap(),
+            TradeGuardConfig::default(),
+        )
+        .unwrap();
+        assert!(candidate.validate_fixed_playing(&wrong).is_err());
+        reference.identity.guard.max_trades_per_episode = 1;
+        assert!(candidate.validate_fixed_playing(&reference).is_err());
+        reference.identity.guard = TradeGuardConfig::default();
+        reference.loaded = None;
+        assert!(candidate.validate_fixed_playing(&reference).is_err());
+        let (_, reference, _) = own_setup_fixture();
+        candidate.loaded = None;
+        assert!(candidate.validate_fixed_playing(&reference).is_err());
+        let config = NumericArenaConfig {
+            schema: SCHEMA.into(),
+            players: 3,
+            seeds: vec![3],
+            bootstrap_seed: u64::MAX,
+            external_exclusions: ExternalExclusions {
+                evidence_sha256: "a".repeat(64),
+                excluded_family_ids: vec![],
+            },
+        };
+        assert!(run_own_setup_validation(&config, candidate, reference, vec![]).is_err());
+        let (candidate, reference, _) = own_setup_fixture();
+        assert_eq!(
+            run_resource_cycle_own_setup_validation(
+                &config,
+                super::super::resource_cycle::ResourceCycleConfig::default(),
+                candidate,
+                &reference,
+                vec![]
+            )
+            .err()
+            .unwrap(),
+            "Resource-cycle candidate requires the exact frozen V5 configuration"
+        );
+        assert_ne!(OWN_SETUP_ARENA_SCHEMA, SCHEMA);
+        assert_ne!(
+            RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA,
+            RESOURCE_CYCLE_ARENA_SCHEMA
+        );
+    }
+
+    #[test]
+    fn own_setup_failed_arm_notifies_every_actor_and_reclaims_immutable_storage() {
+        let (candidate, reference, _) = own_setup_fixture();
+        candidate.validate_fixed_playing(&reference).unwrap();
+        let mut focal = Role::OwnSetup(Box::new(candidate));
+        let mut pool = (0..3)
+            .map(|_| {
+                Role::Numeric(
+                    NumericPolicy::new(
+                        crate::own_setup_native::tests::playing(),
+                        TradeGuardConfig::default(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let before = serde_json::to_value(focal.identity()).unwrap();
+        shared_guard(
+            &Role::ResourceCycle(super::super::resource_cycle::ResourceCycleConfig::v5()),
+            &focal,
+            &pool,
+        )
+        .unwrap();
+        for wrong_actor in [false, true] {
+            let mut callbacks = 0;
+            let mut setup_choices = 0;
+            let mut playing_choices = 0;
+            let (arm, diagnostics) =
+                play_arm_using(17, 1, &mut focal, &mut pool, |players, seed, decide| {
+                    if wrong_actor {
+                        return replay::play_unrecorded_inference(players, seed, |index, o| {
+                            callbacks += 1;
+                            setup_choices += usize::from(o.actor == 1 && o.phase == Phase::Setup);
+                            playing_choices +=
+                                usize::from(o.actor == 1 && o.phase == Phase::Playing);
+                            let mut decision = decide(index, o)?;
+                            decision.actor = (decision.actor + 1) % players;
+                            Ok(decision)
+                        });
+                    }
+                    let mut state = tzolkin_core::create_game(
+                        (0..players).map(|i| format!("Seat {i}")).collect(),
+                        seed,
+                        false,
+                    )?;
+                    // Stop after the focal actor's first actual Playing choice.
+                    // This bounded prefix never completes a game.
+                    for index in 0..12 {
+                        let observation = observe(&state, state.current_player)?;
+                        callbacks += 1;
+                        setup_choices += usize::from(
+                            observation.actor == 1 && observation.phase == Phase::Setup,
+                        );
+                        playing_choices += usize::from(
+                            observation.actor == 1 && observation.phase == Phase::Playing,
+                        );
+                        let decision = decide(index, &observation)?;
+                        state = tzolkin_core::apply_move(&state, decision.r#move)?;
+                        if observation.phase == Phase::Playing && observation.actor == 1 {
+                            return Err("Injected Own Setup downstream failure".into());
+                        }
+                    }
+                    Err("Own Setup fixture did not reach its bounded Playing prefix".into())
+                });
+            assert_eq!(
+                arm.error.as_deref(),
+                Some(if wrong_actor {
+                    "Policy returned stale or wrong-actor decision"
+                } else {
+                    "Injected Own Setup downstream failure"
+                })
+            );
+            assert!(arm.decisions.is_none() && arm.score.is_none() && arm.rank.is_none());
+            assert!(
+                diagnostics
+                    .iter()
+                    .flatten()
+                    .all(|d| d.notifications_attempted == callbacks
+                        && d.notifications_returned == callbacks
+                        && d.applied_choices.is_none())
+            );
+            let routes = diagnostics[1]
+                .as_ref()
+                .unwrap()
+                .phase_routes
+                .as_ref()
+                .unwrap();
+            assert_eq!(routes.setup_choices_attempted, setup_choices);
+            assert_eq!(routes.setup_choices_returned, setup_choices);
+            assert_eq!(routes.playing_choices_attempted, playing_choices);
+            assert_eq!(routes.playing_choices_returned, playing_choices);
+            if !wrong_actor {
+                assert_eq!((setup_choices, playing_choices), (1, 1));
+            }
+            assert!(matches!(&focal, Role::OwnSetup(policy) if policy.loaded.is_some()));
+            assert!(
+                pool.iter()
+                    .all(|role| matches!(role, Role::Numeric(p) if p.loaded.is_some()))
+            );
+            assert_eq!(serde_json::to_value(focal.identity()).unwrap(), before);
+        }
+    }
 
     pub(crate) fn synthetic_policy() -> NumericPolicy {
         let mut wire = json!({
