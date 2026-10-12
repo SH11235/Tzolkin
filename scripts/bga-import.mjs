@@ -87,6 +87,22 @@ export function parseMessage(message, players, { englishTerminal = false } = {})
     result.detail = { technology: technologies[m[1]], steps: Number(m[2]) };
   } else if (actor && (m = match(/^は(\d+)\s*を(\d+)\s*に交換した$/))) {
     result.kind = 'trade';
+    // Some exports omit the icon list while preserving the complete literal
+    // trade HTML. Accept only that exact two-icon caption, never arbitrary HTML.
+    if (!iconResources.length && typeof message.html === 'string') {
+      const resources = Array.from(
+        message.html.matchAll(
+          /<div class="tz_icon resource_(corn|wood|stone|gold|skull)"><\/div>/g,
+        ),
+        (match) => match[1],
+      );
+      if (
+        resources.length === 2 &&
+        message.html ===
+          `${actor}は${m[1]}<div class="tz_icon resource_${resources[0]}"></div>を${m[2]}<div class="tz_icon resource_${resources[1]}"></div>に交換した`
+      )
+        iconResources.push(...resources);
+    }
     if (
       iconResources.length === 2 &&
       iconResources.every((r) => ['corn', 'wood', 'stone', 'gold', 'skull'].includes(r))

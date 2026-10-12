@@ -263,6 +263,35 @@ test('combines explicit quantities with ordered icons; missing icons stay unknow
     {},
   );
 });
+test('reads an omitted trade icon list only from its exact preserved HTML caption', () => {
+  const message = {
+    raw_text: 'Aは1\nを4\nに交換した',
+    html: 'Aは1<div class="tz_icon resource_gold"></div>を4<div class="tz_icon resource_corn"></div>に交換した',
+    icons: [],
+  };
+  const before = structuredClone(message);
+  const event = parseMessage(message, ['A']);
+  assert.deepEqual(event.detail, {
+    from: { resource: 'gold', amount: 1 },
+    to: { resource: 'corn', amount: 4 },
+  });
+  assert.deepEqual(message, before);
+  for (const html of [
+    message.html.replace('Aは1', 'Bは1'),
+    message.html.replace('を4', 'を5'),
+    message.html.replace('<div class=', '<div hidden class='),
+    `<span hidden>${message.html}</span>`,
+    message.html + '<div class="tz_icon resource_wood"></div>',
+  ])
+    assert.deepEqual(parseMessage({ ...message, html }, ['A']).detail, {});
+  // An existing explicit list remains authoritative, even if HTML differs.
+  assert.equal(
+    parseMessage({ ...message, icons: [{ classes: 'tz_icon resource_wood' }] }, ['A'])
+      .iconResources[0],
+    'wood',
+  );
+});
+
 test('rejects evidence mismatches, malformed identities and duplicate actions', () => {
   for (const mutate of [
     (g) => {
