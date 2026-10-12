@@ -24,7 +24,7 @@ const FEATURE_SOURCE_CHAIN = [
   },
   {
     path: 'crates/tzolkin-inference/src/lib.rs',
-    sha256: 'bf4b7eeef06f1cd9f3477b2129fbad192d0e96eac78a3ab2f79a5654743c19fe',
+    sha256: '15b947081e8a16894b8603f58415995d4f3d824d51282b7b26f567662a0bcb41',
   },
   {
     path: 'crates/tzolkin-inference/Cargo.toml',
