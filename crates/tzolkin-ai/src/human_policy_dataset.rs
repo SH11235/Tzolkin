@@ -8,10 +8,11 @@ use crate::model::{digest, write_new_json_bounded};
 use crate::public_stochastic_record::unique_json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use tzolkin_core::observation::{LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, TypedAction};
 use tzolkin_core::public_replay::{
     PUBLIC_RULES_VERSION, PublicReplayRecord, inspect_public, public_catalog_hash,
@@ -104,6 +105,12 @@ pub struct HumanPolicySample {
     value_target: (),
 }
 impl HumanPolicySample {
+    pub fn sample_id(&self) -> &str {
+        &self.sample_id
+    }
+    pub fn family_id(&self) -> &str {
+        &self.family_id
+    }
     pub fn candidates(&self) -> &[EncodedCandidate] {
         &self.candidates
     }
@@ -162,6 +169,12 @@ pub struct HumanPolicyReport<'a> {
 /// Sealed by source replay, source text and the final decoder audit. No stored
 /// float arrays or caller-supplied core report can construct this dataset.
 pub struct ConditionalHumanPolicyDataset {
+    table_id: String,
+    split: DatasetSplit,
+    reservations: BTreeMap<String, DatasetSplit>,
+    source_binding: Option<(ContentPin, PathBuf)>,
+    #[cfg(test)]
+    synthetic: bool,
     manifest_sha256: String,
     basis: InputBasis,
     observed_options: UnknownSourceOptions,
@@ -454,6 +467,14 @@ impl ConditionalHumanPolicyDataset {
         nominations_sha256: &str,
         reservations_sha256: &str,
     ) -> Result<Self, String> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(path)
+        };
+        let path = absolute.as_path();
         local(path)?;
         let size = fs::metadata(path).map_err(|e| e.to_string())?.len();
         let manifest_pin = ContentPin {
@@ -501,12 +522,13 @@ impl ConditionalHumanPolicyDataset {
             nominations: parse(&loaded[3])?,
             reservations: parse(&loaded[4])?,
         };
-        let dataset = Self::produce(&manifest, &sources, manifest_sha256, pins.clone())?;
+        let mut dataset = Self::produce(&manifest, &sources, manifest_sha256, pins.clone())?;
         // Re-pin all original leaves after the bounded reconstruction, not merely metadata.
         read_pin(&manifest_pin, Path::new(""))?;
         for pin in &pins {
             read_pin(pin, base)?;
         }
+        dataset.source_binding = Some((manifest_pin, base.to_path_buf()));
         Ok(dataset)
     }
     fn produce(
@@ -700,6 +722,15 @@ impl ConditionalHumanPolicyDataset {
             let candidates = (0..observation.legal_actions.len())
                 .map(|i| encoder.encode_legal_tagged(i))
                 .collect::<Result<Vec<_>, _>>()?;
+            for candidate in &candidates {
+                if candidate
+                    .values_for_schema(PUBLIC_FEATURE_SCHEMA)?
+                    .iter()
+                    .any(|value| !value.is_finite() || value.abs() > 1024.0)
+                {
+                    return Err("Conditional Human features exceed finite1024 bound".into());
+                }
+            }
             let sample_id = digest(
                 format!(
                     "{family}\0{}\0{source_id}\0{message_index}",
@@ -726,6 +757,12 @@ impl ConditionalHumanPolicyDataset {
         }
         counts.samples = samples.len();
         Ok(Self {
+            table_id: manifest.table_id.clone(),
+            split,
+            reservations: splits,
+            source_binding: None,
+            #[cfg(test)]
+            synthetic: false,
             manifest_sha256: manifest_sha256.into(),
             basis: manifest.basis,
             observed_options: manifest.observed_options.clone(),
@@ -739,6 +776,111 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn counts(&self) -> &HumanPolicyCounts {
         &self.counts
+    }
+    pub fn table_id(&self) -> &str {
+        &self.table_id
+    }
+    pub fn split(&self) -> DatasetSplit {
+        self.split
+    }
+    pub fn manifest_sha256(&self) -> &str {
+        &self.manifest_sha256
+    }
+    /// Canonical sealed report, including labels, features and all declared source pins.
+    pub fn fingerprint(&self) -> Result<String, String> {
+        struct BoundedHash {
+            hash: Sha256,
+            bytes: usize,
+        }
+        impl std::io::Write for BoundedHash {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > MAX_OUTPUT - self.bytes {
+                    return Err(std::io::Error::other("Human fingerprint exceeds128MiB"));
+                }
+                self.hash.update(bytes);
+                self.bytes += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = BoundedHash {
+            hash: Sha256::new(),
+            bytes: 0,
+        };
+        serde_json::to_writer(&mut writer, &self.report()).map_err(|e| e.to_string())?;
+        Ok(format!("{:x}", writer.hash.finalize()))
+    }
+    pub(crate) fn reservations(&self) -> &BTreeMap<String, DatasetSplit> {
+        &self.reservations
+    }
+    /// Checks current source bytes; a serialized report cannot substitute for this handle.
+    pub(crate) fn recheck_sources(&self) -> Result<(), String> {
+        #[cfg(test)]
+        if self.synthetic {
+            return Ok(());
+        }
+        let (manifest, base) = self
+            .source_binding
+            .as_ref()
+            .ok_or("Unbound Human dataset")?;
+        read_pin(manifest, Path::new(""))?;
+        for pin in &self.pins {
+            read_pin(pin, base)?;
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn training_fixture(table: &str, split: DatasetSplit, chosen: usize) -> Self {
+        // Only the private numerical tests can construct these synthetic labels.
+        let state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 42, false).unwrap();
+        let observation = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+        let encoder = FeatureEncoder::new_public(&observation).unwrap();
+        let candidates = (0..observation.legal_actions.len())
+            .map(|i| encoder.encode_legal_tagged(i).unwrap())
+            .collect::<Vec<_>>();
+        let family = table_family_id(table).unwrap();
+        Self {
+            table_id: table.into(),
+            split,
+            reservations: BTreeMap::from([(table.into(), split)]),
+            source_binding: None,
+            synthetic: true,
+            manifest_sha256: digest(table.as_bytes()),
+            basis: InputBasis::ConditionalBasicHumanPolicy,
+            observed_options: UnknownSourceOptions {
+                tribes: (),
+                prophecies: (),
+                additional_buildings: (),
+                quick_actions: (),
+            },
+            pins: vec![],
+            counts: HumanPolicyCounts {
+                replay_steps: 1,
+                checkpoints_verified: 0,
+                samples: 1,
+                candidates: candidates.len(),
+                excluded: BTreeMap::new(),
+            },
+            samples: vec![HumanPolicySample {
+                sample_id: digest(format!("{table}:0").as_bytes()),
+                family_id: family,
+                split,
+                table_id: table.into(),
+                source_actor_id: "101".into(),
+                source_action_id: 1,
+                source_message_index: 0,
+                replay_step_index: 0,
+                actor: 0,
+                observation_key: observation.observation_key.clone(),
+                legal_actions: observation.legal_actions.clone(),
+                candidates,
+                chosen,
+                value_target: (),
+            }],
+        }
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {

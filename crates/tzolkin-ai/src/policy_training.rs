@@ -52,7 +52,7 @@ impl PolicyBcConfig {
         }
         Ok(())
     }
-    fn compatible(&self, other: &Self) -> bool {
+    pub(crate) fn compatible(&self, other: &Self) -> bool {
         self.batch_size == other.batch_size
             && self.learning_rate.to_bits() == other.learning_rate.to_bits()
             && self.seed == other.seed
@@ -70,7 +70,7 @@ pub struct PolicyLossReport {
     pub value_validity: ValueValidity,
 }
 impl PolicyLossReport {
-    fn validate(&self, samples: usize, candidates: usize) -> Result<(), String> {
+    pub(crate) fn validate(&self, samples: usize, candidates: usize) -> Result<(), String> {
         if samples == 0
             || self.samples != samples
             || self.candidates != candidates
@@ -244,7 +244,7 @@ pub struct PolicyAdamState {
     pub second_moment: Vec<f32>,
 }
 impl PolicyAdamState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             step: 0,
             first_moment: vec![0.0; PARAMETER_COUNT],
@@ -265,7 +265,7 @@ impl PolicyAdamState {
         }
         Ok(())
     }
-    fn update(
+    pub(crate) fn update(
         &mut self,
         model: &mut PublicPolicyModel,
         gradient: &mut [f32],
@@ -456,12 +456,12 @@ impl PolicyTrainingOutcome {
     }
 }
 #[derive(Default)]
-struct Scratch {
+pub(crate) struct Scratch {
     hidden: Vec<f32>,
     logits: Vec<f32>,
     probabilities: Vec<f32>,
 }
-fn policy_loss(
+pub(crate) fn policy_loss(
     model: &PublicPolicyModel,
     rows: &[EncodedCandidate],
     chosen: usize,
@@ -807,14 +807,14 @@ fn local_path(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, String> {
+pub(crate) fn bounded_json(value: &impl Serialize) -> Result<Vec<u8>, String> {
     let bytes = serde_json::to_vec(value).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_ARTIFACT_BYTES {
         return Err("Policy checkpoint/output exceeds 8 MiB".into());
     }
     Ok(bytes)
 }
-fn read_local_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
+pub(crate) fn read_local_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     local_path(path)?;
     if !fs::symlink_metadata(path)
         .map_err(|e| e.to_string())?
@@ -824,7 +824,7 @@ fn read_local_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Str
     }
     read_json(path)
 }
-fn publish(path: &Path, value: &impl Serialize) -> Result<(), String> {
+pub(crate) fn publish(path: &Path, value: &impl Serialize) -> Result<(), String> {
     local_path(path)?;
     let bytes = bounded_json(value)?;
     let parent = path
