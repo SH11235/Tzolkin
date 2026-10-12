@@ -6,8 +6,7 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tzolkin_core::observation::{LegalAction, Observation};
-use tzolkin_inference::deployment::{CurrentMixedIdentity, GuardedDeploymentDecision};
-use tzolkin_inference::trade_guard::TradeGuardConfig;
+use tzolkin_inference::deployment::GuardedDeploymentDecision;
 
 use crate::own_setup_model::InitializedOwnSetupIdentity;
 use crate::own_setup_native::{
@@ -58,23 +57,7 @@ pub(crate) struct Header<S = InitializedOwnSetupIdentity> {
     pub independent_seed_origins_verified: bool,
     pub training_admission: String,
 }
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct FixedPlayingIdentity {
-    pub deployment_checksum: String,
-    pub source_role: String,
-    pub source_checksum: String,
-    pub update_count: Option<u64>,
-    pub current_mixed_identity: CurrentMixedIdentity,
-    pub source_numerical_target: String,
-    pub raw_policy_version: String,
-    pub backend: String,
-    pub guard: TradeGuardConfig,
-    pub configuration_key: String,
-    pub inference_version: String,
-    pub guard_version: String,
-    pub projection_version: String,
-}
+pub(crate) use tzolkin_inference::own_setup_deployment::FixedPlayingIdentity;
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum SeatRole {

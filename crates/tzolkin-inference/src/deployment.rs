@@ -198,7 +198,7 @@ impl Source {
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Wire {
+pub(crate) struct Wire {
     schema: String,
     contract: Contract,
     source: Source,
@@ -233,22 +233,7 @@ impl Wire {
         if !valid_source_target(&self.source_numerical_target) {
             return Err("Invalid deployment source numerical target".into());
         }
-        let values = self
-            .parameter_bits
-            .iter()
-            .map(|token| {
-                if token.len() != 8
-                    || !token
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err("Deployment parameters require canonical lowercase f32 bits".into());
-                }
-                let bits = u32::from_str_radix(token, 16).map_err(|error| error.to_string())?;
-                Ok(f32::from_bits(bits))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        policy::validate_parameters(&values)?;
+        let values = decode_parameter_bits(&self.parameter_bits)?;
         if let Source::RlCurrentMixed { identity } = &self.source {
             identity.validate_actor(&values, &self.source_numerical_target)?;
         }
@@ -263,7 +248,25 @@ impl Wire {
         Ok(format!("{:x}", hash.finalize()))
     }
 }
-fn parse(bytes: &[u8]) -> Result<Wire, String> {
+pub(crate) fn decode_parameter_bits(tokens: &[String]) -> Result<Vec<f32>, String> {
+    let values = tokens
+        .iter()
+        .map(|token| {
+            if token.len() != 8
+                || !token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err("Deployment parameters require canonical lowercase f32 bits".into());
+            }
+            let bits = u32::from_str_radix(token, 16).map_err(|error| error.to_string())?;
+            Ok(f32::from_bits(bits))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    policy::validate_parameters(&values)?;
+    Ok(values)
+}
+pub(crate) fn parse(bytes: &[u8]) -> Result<Wire, String> {
     if bytes.len() > MAX_DEPLOYMENT_BYTES {
         return Err("Numeric deployment exceeds 1 MiB".into());
     }
@@ -291,7 +294,9 @@ pub struct LoadedDeployment {
 }
 impl LoadedDeployment {
     pub fn load(bytes: &[u8]) -> Result<Self, String> {
-        let mut wire = parse(bytes)?;
+        Self::from_wire(parse(bytes)?)
+    }
+    pub(crate) fn from_wire(mut wire: Wire) -> Result<Self, String> {
         let parameters = wire.parameters()?;
         let checksum = wire.checksum.clone();
         if !digest(&checksum) || checksum != wire.expected_checksum()? {
