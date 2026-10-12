@@ -5,10 +5,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tzolkin_core::observation::{LegalAction, Observation, observe};
 use tzolkin_core::{GameOptions, GameState, Phase, apply_move, create_game_with_options};
-use tzolkin_inference::deployment::{
-    GUARDED_DEPLOYMENT_VERSION, GuardedDeployment, LoadedDeployment,
-};
-use tzolkin_inference::trade_guard::{GUARD_VERSION, PROJECTION_VERSION, TradeGuardConfig};
+use tzolkin_inference::deployment::{GuardedDeployment, LoadedDeployment};
+use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 use crate::arena::resource_cycle::{self, ResourceCycleConfig};
 use crate::dataset::seed_family_id;
@@ -356,34 +354,9 @@ episode_getters!(
 );
 episode_getters!(ValidatedTrainedOwnSetupEpisode, TrainedOwnSetupIdentity);
 
-pub(crate) fn fixed_playing_identity(
-    loaded: &LoadedDeployment,
-) -> Result<FixedPlayingIdentity, String> {
-    let identity = loaded
-        .current_mixed_identity()
-        .ok_or("Own Setup continuation requires actual current-mixed deployment")?;
-    if loaded.backend() != "scalar" || loaded.source_role() != "rlCurrentMixed" {
-        return Err("Own Setup continuation requires current-mixed Scalar".into());
-    }
-    Ok(FixedPlayingIdentity {
-        deployment_checksum: loaded.checksum().into(),
-        source_role: loaded.source_role().into(),
-        source_checksum: loaded.source_checksum().into(),
-        update_count: loaded.update_count(),
-        current_mixed_identity: serde_json::from_slice(
-            &serde_json::to_vec(identity).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?,
-        source_numerical_target: loaded.source_numerical_target().into(),
-        raw_policy_version: loaded.policy_version().into(),
-        backend: loaded.backend().into(),
-        guard: TradeGuardConfig::default(),
-        configuration_key: TradeGuardConfig::default().configuration_key()?,
-        inference_version: GUARDED_DEPLOYMENT_VERSION.into(),
-        guard_version: GUARD_VERSION.into(),
-        projection_version: PROJECTION_VERSION.into(),
-    })
-}
+pub(crate) use tzolkin_inference::own_setup_deployment::{
+    fixed_playing_identity, playing_binding_checksum,
+};
 
 /// Actual updated Setup collection has its own v2 record and concrete episode.
 pub struct TrainedOwnSetupCollector<'a> {
@@ -510,10 +483,6 @@ pub struct ValidatedTrainedOwnSetupEpisode {
     winner_share: f64,
     episode_id: String,
 }
-pub(crate) fn playing_binding_checksum(binding: &FixedPlayingIdentity) -> Result<String, String> {
-    crate::public_policy_update::hash(b"tzolkin-own-setup-fixed-playing-binding-v1\0", binding)
-}
-
 fn header<P: NativeOwnSetup>(
     config: &OwnSetupNativeConfig,
     setup: &P,
@@ -1180,6 +1149,9 @@ pub(crate) mod tests {
     // Synthetic numeric-only identity with actual zero-word actor fingerprint;
     // this fixture supplies no native learner or trained owner.
     pub(crate) fn playing() -> LoadedDeployment {
+        LoadedDeployment::load(&playing_bytes()).unwrap()
+    }
+    pub(crate) fn playing_bytes() -> Vec<u8> {
         let target = numerical_target();
         let mut hash = Sha256::new();
         hash.update(b"tzolkin-mixed-inference-actor-v1\0");
@@ -1207,7 +1179,7 @@ pub(crate) mod tests {
         wire["checksum"] = d::numeric_checksum(&serde_json::to_vec(&wire).unwrap())
             .unwrap()
             .into();
-        LoadedDeployment::load(&serde_json::to_vec(&wire).unwrap()).unwrap()
+        serde_json::to_vec(&wire).unwrap()
     }
     fn config(
         players: usize,
