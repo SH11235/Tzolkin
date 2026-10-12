@@ -261,6 +261,7 @@ pub struct DurableOwnSetupOwner {
     ready: bool,
     reconstructed: bool,
     continuation: Option<Continuation>,
+    source_directories: Vec<PathBuf>,
 }
 impl DurableOwnSetupOwner {
     pub fn create(
@@ -305,6 +306,7 @@ impl DurableOwnSetupOwner {
             Event::Genesis { checkpoint },
         )?;
         let disk_bytes = (root_bytes.len() + bytes.len() + head_bytes) as u64;
+        let source_directories = vec![fs::canonicalize(&directory).map_err(|e| e.to_string())?];
         Ok(Self {
             directory,
             root,
@@ -315,6 +317,7 @@ impl DurableOwnSetupOwner {
             ready: true,
             reconstructed: false,
             continuation: None,
+            source_directories,
         })
     }
 
@@ -330,6 +333,7 @@ impl DurableOwnSetupOwner {
     ) -> Result<Self, String> {
         limits.validate()?;
         let (parent, offsets) = self.continuation_parent()?;
+        let directory = continuation_directory(directory, &self.source_directories)?;
         if additional_episodes == 0
             || additional_episodes > 256
             || additional_episodes > limits.max_attempts * 4
@@ -358,11 +362,12 @@ impl DurableOwnSetupOwner {
         let head_bytes = bounded_json(&head, HEAD_CAP)?;
         let disk_bytes = (root_bytes.len() + checkpoint_bytes.len() + head_bytes.len()) as u64;
         check_campaign_space(disk_bytes, root.offsets.ancestor_bytes, &root.config.limits)?;
-        let directory = local(directory, true)?;
         fs::create_dir(&directory).map_err(|e| e.to_string())?;
         publish_metadata(&directory, "root.json", &root_bytes)?;
         publish_metadata(&directory, &checkpoint_name(0, false), &checkpoint_bytes)?;
         let head_pin = publish_metadata(&directory, &head_name(0), &head_bytes)?;
+        let mut source_directories = self.source_directories;
+        source_directories.push(fs::canonicalize(&directory).map_err(|e| e.to_string())?);
         Ok(Self {
             directory,
             root: root.config,
@@ -380,6 +385,7 @@ impl DurableOwnSetupOwner {
             continuation: Some(Continuation {
                 offsets: root.offsets,
             }),
+            source_directories,
         })
     }
 
@@ -479,6 +485,8 @@ impl DurableOwnSetupOwner {
             }
             let root_pin = pin("root.json", &root_bytes);
             let chain = read_chain(&directory, &root_pin, source.expected_tip)?;
+            let mut source_directories = restored.source_directories;
+            source_directories.push(fs::canonicalize(&directory).map_err(|e| e.to_string())?);
             let child = Self {
                 directory,
                 root: root.config,
@@ -491,6 +499,7 @@ impl DurableOwnSetupOwner {
                 continuation: Some(Continuation {
                     offsets: root.offsets,
                 }),
+                source_directories,
             };
             let (child, child_work) = Self::restore_history(child, chain, inventory, start)?;
             restored = child;
@@ -645,6 +654,7 @@ impl DurableOwnSetupOwner {
         self.require_space(configs.len())?;
         // Freeze the reservation on disk before either sampling or optimizer work.
         self.ready = false;
+        self.reconstructed = false;
         let pending = self.tip.sequence + 1;
         let event = Event::Pending {
             configs: configs.iter().map(Config::from_native).collect(),
@@ -815,6 +825,7 @@ impl DurableOwnSetupOwner {
             root.run.clone(),
             exclusions,
         )?;
+        let source_directories = vec![fs::canonicalize(&directory).map_err(|e| e.to_string())?];
         let restored = Self {
             directory,
             root,
@@ -825,6 +836,7 @@ impl DurableOwnSetupOwner {
             ready: false,
             reconstructed: false,
             continuation: None,
+            source_directories,
         };
         Self::restore_history(restored, chain, inventory, start)
     }
@@ -1145,6 +1157,21 @@ fn continuation_checksum(root: &ContinuationRoot) -> Result<String, String> {
             root.additional_episodes,
         ),
     )
+}
+
+fn continuation_directory(directory: &Path, sources: &[PathBuf]) -> Result<PathBuf, String> {
+    let directory = local(directory, true)?;
+    let parent = directory.parent().ok_or("Own Setup child lacks a parent")?;
+    let name = directory
+        .file_name()
+        .ok_or("Own Setup child lacks a leaf")?;
+    let canonical = fs::canonicalize(parent)
+        .map_err(|e| e.to_string())?
+        .join(name);
+    if sources.iter().any(|source| canonical.starts_with(source)) {
+        return Err("Own Setup child must be outside every original source archive".into());
+    }
+    Ok(directory)
 }
 
 fn check_campaign_space(
@@ -1473,8 +1500,36 @@ mod tests {
         assert_eq!(split.ledger_offset(), 0);
         assert_eq!(split.attempted_episode_offset(), 0);
         assert_eq!(split.update_offset(), 0);
-        assert!(check_campaign_space(MAX_CAMPAIGN_BYTES, 1, &split.root.limits).is_err());
+        let local_bytes = 32 * 1024 * 1024;
+        assert!(local_bytes <= split.root.limits.max_disk_bytes);
+        assert!(
+            check_campaign_space(
+                local_bytes,
+                MAX_CAMPAIGN_BYTES - local_bytes,
+                &split.root.limits
+            )
+            .is_ok()
+        );
+        assert!(
+            check_campaign_space(
+                local_bytes,
+                MAX_CAMPAIGN_BYTES - local_bytes + 1,
+                &split.root.limits
+            )
+            .is_err()
+        );
+        let sources = vec![
+            fs::canonicalize(&split.directory).unwrap(),
+            fs::canonicalize(&continuous.directory).unwrap(),
+        ];
+        assert!(continuation_directory(&split.directory.join("child"), &sources).is_err());
+        assert!(continuation_directory(&continuous.directory.join("child"), &sources).is_err());
+        assert!(continuation_directory(&temp.0.join("child"), &sources).is_ok());
+        assert!(!split.directory.join("child").exists());
+        assert!(!continuous.directory.join("child").exists());
+        assert!(split.reconstructed);
         let second = split.attempt(std::slice::from_ref(&b)).unwrap();
+        assert!(!split.reconstructed);
         let reference = continuous.attempt(std::slice::from_ref(&b)).unwrap();
         assert_eq!(json(&second).unwrap(), json(&reference).unwrap());
         assert_eq!(
