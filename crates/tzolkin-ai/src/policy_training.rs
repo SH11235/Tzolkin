@@ -11,6 +11,7 @@ use crate::public_model::{
     PublicPolicyModel, ValueValidity, WP,
 };
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -602,6 +603,15 @@ pub(crate) fn evaluate(
     split: DatasetSplit,
     scratch: &mut Scratch,
 ) -> Result<PolicyLossReport, String> {
+    evaluate_samples(dataset.iter_split(split), identity, model, split, scratch)
+}
+pub(crate) fn evaluate_samples<S: Borrow<ValidatedPolicySample>>(
+    samples: impl IntoIterator<Item = Result<S, String>>,
+    identity: &PolicyDatasetIdentity,
+    model: &PublicPolicyModel,
+    split: DatasetSplit,
+    scratch: &mut Scratch,
+) -> Result<PolicyLossReport, String> {
     let mut report = PolicyLossReport {
         samples: 0,
         candidates: 0,
@@ -611,8 +621,9 @@ pub(crate) fn evaluate(
         value_samples: 0,
         value_validity: ValueValidity::UnavailablePolicyOnly,
     };
-    for sample in dataset.iter_split(split) {
+    for sample in samples {
         let sample = sample?;
+        let sample = sample.borrow();
         let (loss, correct) =
             policy_loss(model, sample.candidates(), sample.chosen(), scratch, None)?;
         report.samples += 1;
@@ -664,17 +675,39 @@ pub(crate) fn train_epochs(
     model: &mut PublicPolicyModel,
     state: PolicyEpochState<'_>,
 ) -> Result<(), String> {
+    train_epochs_using(
+        || dataset.iter_split(DatasetSplit::Train),
+        config,
+        completed,
+        expected_samples,
+        model,
+        state,
+    )
+}
+pub(crate) fn train_epochs_using<S, I>(
+    samples: impl Fn() -> I,
+    config: &PolicyBcConfig,
+    completed: usize,
+    expected_samples: usize,
+    model: &mut PublicPolicyModel,
+    state: PolicyEpochState<'_>,
+) -> Result<(), String>
+where
+    S: Borrow<ValidatedPolicySample>,
+    I: IntoIterator<Item = Result<S, String>>,
+{
     let PolicyEpochState {
         optimizer,
         random,
         scratch,
     } = state;
     let mut gradient = vec![0.0; PARAMETER_COUNT];
-    let mut buffer: Vec<ValidatedPolicySample> = Vec::with_capacity(SHUFFLE_BUFFER);
+    let mut buffer: Vec<S> = Vec::with_capacity(SHUFFLE_BUFFER);
     for _ in completed..config.epochs {
         let mut seen = 0;
         let mut batch = 0;
-        let mut consume = |sample: ValidatedPolicySample| -> Result<(), String> {
+        let mut consume = |sample: S| -> Result<(), String> {
+            let sample = sample.borrow();
             policy_loss(
                 model,
                 sample.candidates(),
@@ -690,7 +723,7 @@ pub(crate) fn train_epochs(
             }
             Ok(())
         };
-        for sample in dataset.iter_split(DatasetSplit::Train) {
+        for sample in samples() {
             let sample = sample?;
             if buffer.len() < SHUFFLE_BUFFER {
                 buffer.push(sample);

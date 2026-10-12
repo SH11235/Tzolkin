@@ -223,6 +223,15 @@ pub struct ValidatedPolicySample {
     chosen: usize,
 }
 impl ValidatedPolicySample {
+    pub(crate) fn owned_allocation_bytes(&self) -> Result<usize, String> {
+        self.candidates
+            .capacity()
+            .checked_mul(std::mem::size_of::<EncodedCandidate>())
+            .and_then(|n| n.checked_add(self.sample_id.capacity()))
+            .and_then(|n| n.checked_add(self.game_id.capacity()))
+            .and_then(|n| n.checked_add(self.family_id.capacity()))
+            .ok_or_else(|| "Teacher encoded-cache allocation count overflow".into())
+    }
     pub fn sample_id(&self) -> &str {
         &self.sample_id
     }
@@ -987,6 +996,24 @@ impl ValidatedPolicyDataset {
             return Err("Teacher source manifest changed after load".into());
         }
         Ok((bytes.len() as u64, digest(&bytes)))
+    }
+    pub(crate) fn recheck_resource_cycle_v5_teacher_bytes(&self) -> Result<(u64, String), String> {
+        let manifest = self.recheck_resource_cycle_v5_teacher_manifest()?;
+        for game in &self.manifest.games {
+            if file_digest(&self.directory.join(&game.source_file), MAX_SOURCE_BYTES)?
+                != (game.source_bytes, game.source_sha256.clone())
+            {
+                return Err("Teacher source bytes changed after load".into());
+            }
+        }
+        for shard in &self.manifest.shards {
+            if file_digest(&self.directory.join(&shard.file), MAX_SHARD_BYTES)?
+                != (shard.bytes, shard.sha256.clone())
+            {
+                return Err("Teacher shard bytes changed after load".into());
+            }
+        }
+        Ok(manifest)
     }
     pub fn iter(&self) -> PolicyDatasetIter {
         self.iterator(None)
