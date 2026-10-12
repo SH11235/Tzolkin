@@ -41,6 +41,8 @@ const MAX_FILES: usize = 1024;
 
 /// Informational timings only. Inclusive phases overlap; do not sum them.
 /// ActorForward measures update reconstruction, not inference during a game.
+/// SourceLoad on a held update checks the complete original byte closure;
+/// initial loading, restore and export still reconstruct and validate the BC.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionalPhaseTiming {
@@ -249,7 +251,8 @@ impl ConditionalJournalSpec {
 }
 
 /// Paths and declared external custody are not an origin constructor. Every
-/// lifecycle load goes through the production BC loader and its four losses.
+/// initial or restarted load goes through the production BC loader and its four
+/// losses. Held updates retain that proof and recheck the complete byte closure.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConditionalJournalInput {
@@ -373,6 +376,39 @@ impl SourceSeal {
             return Err("Conditional loaded origin/root/raw closure differs".into());
         }
         Ok(session)
+    }
+}
+
+/// In-process proof from a successful production load, never a saved descriptor.
+/// Identical source bytes preserve its reconstruction and four-loss validation;
+/// a changed input cannot refresh this proof or create a usable owner.
+struct HeldSourceValidation {
+    source: SourceSeal,
+}
+impl HeldSourceValidation {
+    fn from_loaded(source: &SourceSeal, session: &ConditionalMixedSession) -> Result<Self, String> {
+        if source.root != *session.owner().identity()
+            || source.origin
+                != serde_json::to_value(session.owner().origin()).map_err(|e| e.to_string())?
+        {
+            return Err("Conditional held source differs from the loaded root/origin".into());
+        }
+        let proof = Self {
+            source: source.clone(),
+        };
+        proof.check(source, session)?;
+        Ok(proof)
+    }
+    fn check(&self, source: &SourceSeal, session: &ConditionalMixedSession) -> Result<(), String> {
+        if source != &self.source
+            || session.owner().origin().checksum() != self.source.root.origin_checksum()
+        {
+            return Err("Conditional held source/root/origin binding changed".into());
+        }
+        // Read and hash all loaded leaves and the full external exclusion input.
+        // This deliberately does not trust file size/mtime or serialized metadata.
+        session.full_source_check()?;
+        source.small_check()
     }
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -550,6 +586,7 @@ impl ConditionalSavedTip {
 pub struct ConditionalHumanJournal {
     directory: PathBuf,
     source: SourceSeal,
+    held_source: HeldSourceValidation,
     spec: ConditionalJournalSpec,
     pool: ConditionalFrozenPool,
     opponent_binding: serde_json::Value,
@@ -693,6 +730,7 @@ impl ConditionalHumanJournal {
         opponent_binding: serde_json::Value,
         session: ConditionalMixedSession,
     ) -> Result<Self, String> {
+        let held_source = HeldSourceValidation::from_loaded(&source, &session)?;
         let directory = local(directory, true)?;
         if fs::symlink_metadata(&directory).is_ok() {
             return Err("Conditional journal requires fresh output".into());
@@ -728,6 +766,7 @@ impl ConditionalHumanJournal {
         Ok(Self {
             directory,
             source,
+            held_source,
             spec,
             pool,
             opponent_binding,
@@ -811,7 +850,10 @@ impl ConditionalHumanJournal {
         {
             return Err("Conditional journal is stopped/unclosed/exhausted".into());
         }
-        if let Err(e) = self.require_head().and_then(|()| self.source.small_check()) {
+        if let Err(e) = self
+            .require_head()
+            .and_then(|()| self.held_source.check(&self.source, &self.session))
+        {
             self.stop();
             return Err(e);
         }
@@ -1057,6 +1099,9 @@ impl ConditionalHumanJournal {
         timer: &mut T,
     ) -> Result<ConditionalReturnedClose, String> {
         let stage = timed(timer, TimedPhase::CohortPublication, |timer| {
+            // A changed input during collection cannot publish a result payload.
+            // The durable Reserve remains spent even if this check fails.
+            self.held_source.check(&self.source, &self.session)?;
             let (report_raw, joint_raw) = proposal.payload()?;
             let attempt = self.session.attempts();
             let report =
@@ -1139,7 +1184,7 @@ impl ConditionalHumanJournal {
         self.phase = ConditionalJournalPhase::ResolvedAwaitingClose;
         if let Err(error) = timed(timer, TimedPhase::FinalGuards, |timer| {
             timed_conditional(timer, ConditionalTimedPhase::SourceLoad, |_| {
-                self.source.full_load()
+                self.held_source.check(&self.source, &self.session)
             })?;
             self.require_head()?;
             timed_conditional(timer, ConditionalTimedPhase::ArchiveVerify, |_| {
@@ -1660,6 +1705,118 @@ mod tests {
     }
     #[test]
     fn conditional_late_source_failure_preserves_updated_credit_and_stops() {
+        // The held proof checks unchanged bytes repeatedly, but never learns a
+        // changed baseline. Same-size mutations exercise hashes, not metadata.
+        for change in ["boundary", "external", "seal", "root", "origin"] {
+            let files = Files::new("conditional-journal-held-source");
+            let mut journal = start(&files, "journal", 0.001);
+            journal
+                .held_source
+                .check(&journal.source, &journal.session)
+                .unwrap();
+            journal
+                .held_source
+                .check(&journal.source, &journal.session)
+                .unwrap();
+            match change {
+                "boundary" | "external" => {
+                    let path = if change == "boundary" {
+                        &journal.source.boundary_pins[0].path
+                    } else {
+                        &journal.source.input.external_pin.path
+                    };
+                    let mut raw = fs::read(path).unwrap();
+                    raw[0] ^= 1;
+                    fs::write(path, raw).unwrap();
+                }
+                "seal" => journal.source.input.sampling_seed += 1,
+                "root" => {
+                    journal.source.root = crate::conditional_human_rl_update::checked_tip_identity(
+                        journal.session.owner().identity(),
+                        journal.session.owner().actor_parameters(),
+                        journal.session.owner().critic_parameters(),
+                        4,
+                        false,
+                    )
+                    .unwrap();
+                    assert!(
+                        HeldSourceValidation::from_loaded(&journal.source, &journal.session)
+                            .is_err()
+                    );
+                }
+                "origin" => {
+                    journal.source.origin["checksum"] = json!("0".repeat(64));
+                    assert!(
+                        HeldSourceValidation::from_loaded(&journal.source, &journal.session)
+                            .is_err()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let original_head = journal.head();
+            assert!(journal.update_whole_four(seeds()[0], None).is_err());
+            assert_eq!(journal.head(), original_head);
+            assert_eq!(journal.session.attempts(), 0);
+            assert_eq!(journal.session.next_episode_ordinal(), 0);
+            assert!(journal.session.consumed_families().is_empty());
+            assert!(journal.owner().is_err());
+            assert!(!journal.directory.join("report-0001.json").exists());
+        }
+        // A source change after the reserved numerical stage still cannot
+        // publish its report, joint parameters or cohort. Reserve stays spent.
+        let files = Files::new("conditional-journal-prepublication-source");
+        let mut journal = start(&files, "journal", 0.001);
+        journal.preflight().unwrap();
+        let plan = journal
+            .session
+            .plan(
+                seeds()[0],
+                &journal.pool,
+                None,
+                journal.spec.limits().unwrap(),
+                journal.spec.actor().unwrap(),
+                journal.spec.critic().unwrap(),
+            )
+            .unwrap();
+        journal
+            .append(Event::Reserve {
+                attempt: 1,
+                first_ordinal: 0,
+                seeds: plan.seeds(),
+                families: plan.families(),
+                parent: plan.parent().clone(),
+            })
+            .map_err(|failure| failure.error)
+            .unwrap();
+        journal.session.reserve(&plan).unwrap();
+        journal.phase = ConditionalJournalPhase::Reserved;
+        let proposal = journal
+            .stage_timed(&plan, None, None, &mut Untimed)
+            .unwrap();
+        let mut raw = fs::read(files.root.join("source-marker.json")).unwrap();
+        raw[0] ^= 1;
+        fs::write(files.root.join("source-marker.json"), raw).unwrap();
+        assert!(journal.resolve_proposal(proposal, &mut Untimed).is_err());
+        assert!(journal.owner().is_err());
+        assert!(journal.export_numeric_inference().is_err());
+        assert_eq!(journal.session.attempts(), 1);
+        assert_eq!(journal.session.next_episode_ordinal(), 4);
+        assert_eq!(journal.session.consumed_families().len(), 4);
+        assert_eq!(journal.session.owner().identity().mixed_update_count(), 0);
+        assert_eq!(journal.session.credited_own_decisions(), 0);
+        for name in [
+            "report-0001.json",
+            "joint-0001.json",
+            "record-0001-0.json.gz",
+        ] {
+            assert!(!journal.directory.join(name).exists());
+        }
+        let saved = ConditionalHumanJournal::inspect_saved_tip(&journal.directory, &journal.head())
+            .unwrap();
+        assert_eq!(saved.phase(), ConditionalJournalPhase::Stopped);
+        assert_eq!(saved.successful_updates(), 0);
+        assert_eq!(saved.next_episode_ordinal(), 4);
+
         let files = Files::new("conditional-journal-late-source");
         let mut journal = start(&files, "journal", 0.001);
         journal.change_source_after_resolve = Some(files.root.join("source-marker.json"));
@@ -2283,6 +2440,7 @@ impl ConditionalHumanJournal {
         {
             return Err("Conditional root actor/fresh critic bits differ on restore".into());
         }
+        let held_source = HeldSourceValidation::from_loaded(&parsed.source, &session)?;
         let pool = ConditionalFrozenPool::from_json(&bounded(&parsed.pool, 64 * 1024)?)?;
         if pool.binding(opponent)? != parsed.opponent_binding {
             return Err("Frozen opponents differ on restore".into());
@@ -2433,6 +2591,7 @@ impl ConditionalHumanJournal {
         let journal = Self {
             directory,
             source: parsed.source,
+            held_source,
             spec: parsed.spec,
             pool,
             opponent_binding: parsed.opponent_binding,
