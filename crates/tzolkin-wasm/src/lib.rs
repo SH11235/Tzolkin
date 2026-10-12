@@ -1,24 +1,30 @@
-use tzolkin_inference::{conditional_deployment as conditional, deployment};
+use tzolkin_inference::{
+    conditional_deployment as conditional, deployment, own_setup_deployment as own_setup,
+};
 use wasm_bindgen::prelude::*;
 
-// Closed loader alternatives: neither branch is a learning-owner constructor.
+// Closed loader alternatives: no branch is a learning-owner constructor.
 enum CpuPolicy {
     Native(Box<deployment::LoadedDeployment>),
     Conditional(Box<conditional::LoadedConditionalDeployment>),
+    OwnSetup(Box<own_setup::LoadedOwnSetupComposite>),
 }
 enum CpuGuard {
     Native(Box<deployment::GuardedDeployment>),
     Conditional(Box<conditional::GuardedConditionalDeployment>),
+    OwnSetup(Box<own_setup::GuardedOwnSetupComposite>),
 }
 enum CpuPolicyRef<'a> {
     Native(&'a deployment::LoadedDeployment),
     Conditional(&'a conditional::LoadedConditionalDeployment),
+    OwnSetup(&'a own_setup::LoadedOwnSetupComposite),
 }
 impl CpuPolicy {
     fn as_ref(&self) -> CpuPolicyRef<'_> {
         match self {
             Self::Native(policy) => CpuPolicyRef::Native(policy),
             Self::Conditional(policy) => CpuPolicyRef::Conditional(policy),
+            Self::OwnSetup(policy) => CpuPolicyRef::OwnSetup(policy),
         }
     }
     fn into_guard(self) -> Result<CpuGuard, String> {
@@ -29,6 +35,9 @@ impl CpuPolicy {
             Self::Conditional(policy) => Ok(CpuGuard::Conditional(Box::new(
                 conditional::GuardedConditionalDeployment::new(*policy, Default::default())?,
             ))),
+            Self::OwnSetup(policy) => Ok(CpuGuard::OwnSetup(Box::new(
+                own_setup::GuardedOwnSetupComposite::new(*policy)?,
+            ))),
         }
     }
 }
@@ -37,12 +46,14 @@ impl CpuPolicyRef<'_> {
         match self {
             Self::Native(policy) => policy.checksum(),
             Self::Conditional(policy) => policy.checksum(),
+            Self::OwnSetup(policy) => policy.checksum(),
         }
     }
     fn policy_version(&self) -> &str {
         match self {
             Self::Native(policy) => policy.policy_version(),
             Self::Conditional(policy) => policy.policy_version(),
+            Self::OwnSetup(policy) => policy.policy_version(),
         }
     }
     fn choose_move(
@@ -52,6 +63,7 @@ impl CpuPolicyRef<'_> {
         match self {
             Self::Native(policy) => policy.choose_move(observation),
             Self::Conditional(policy) => policy.choose_move(observation),
+            Self::OwnSetup(policy) => policy.choose_move(observation),
         }
     }
     fn metadata(&self) -> Result<serde_json::Value, String> {
@@ -96,6 +108,28 @@ impl CpuPolicyRef<'_> {
                     "valueValidity": deployment::VALUE_VALIDITY,
                 }))
             }
+            Self::OwnSetup(policy) => {
+                let setup = policy.setup_identity();
+                let mut identity = serde_json::to_value(setup).map_err(|e| e.to_string())?;
+                // Only bounded counts cross as numbers. The unbounded u64 seed
+                // becomes a decimal string before JSON.parse; raw bytes stay opaque.
+                identity["initial"]["seed"] = setup.initial.seed.to_string().into();
+                Ok(serde_json::json!({
+                    "checksum": policy.checksum(),
+                    "sourceRole": "ownSetupCurrentMixedComposite",
+                    "sourceChecksum": setup.checksum,
+                    "sourceNumericalTarget": setup.numerical_target,
+                    "updateCount": setup.update_count,
+                    "policyVersion": policy.policy_version(),
+                    "backend": policy.backend(),
+                    "ownSetupIdentity": identity,
+                    "fixedPlayingIdentity": policy.playing_identity(),
+                    "sourceAuthenticated": false,
+                    "sourceQualified": false,
+                    "verifiedNativePolicy": false,
+                    "valueValidity": deployment::VALUE_VALIDITY,
+                }))
+            }
         }
     }
 }
@@ -104,24 +138,28 @@ impl CpuGuard {
         match self {
             Self::Native(game) => CpuPolicyRef::Native(game.policy()),
             Self::Conditional(game) => CpuPolicyRef::Conditional(game.policy()),
+            Self::OwnSetup(game) => CpuPolicyRef::OwnSetup(game.policy()),
         }
     }
     fn into_policy(self) -> CpuPolicy {
         match self {
             Self::Native(game) => CpuPolicy::Native(Box::new((*game).into_policy())),
             Self::Conditional(game) => CpuPolicy::Conditional(Box::new((*game).into_policy())),
+            Self::OwnSetup(game) => CpuPolicy::OwnSetup(Box::new((*game).into_policy())),
         }
     }
     fn configuration_key(&self) -> &str {
         match self {
             Self::Native(game) => game.configuration_key(),
             Self::Conditional(game) => game.configuration_key(),
+            Self::OwnSetup(game) => game.configuration_key(),
         }
     }
     fn policy_version(&self) -> &'static str {
         match self {
             Self::Native(_) => deployment::GUARDED_DEPLOYMENT_VERSION,
             Self::Conditional(_) => conditional::GUARDED_POLICY_VERSION,
+            Self::OwnSetup(_) => own_setup::GUARDED_POLICY_VERSION,
         }
     }
     fn on_callback(
@@ -132,6 +170,7 @@ impl CpuGuard {
         match self {
             Self::Native(game) => game.on_callback(index, observation),
             Self::Conditional(game) => game.on_callback(index, observation),
+            Self::OwnSetup(game) => game.on_callback(index, observation),
         }
     }
     fn choose_move(
@@ -142,6 +181,7 @@ impl CpuGuard {
         match self {
             Self::Native(game) => game.choose_move(index, observation),
             Self::Conditional(game) => game.choose_move(index, observation),
+            Self::OwnSetup(game) => game.choose_move(index, observation),
         }
     }
 }
@@ -188,6 +228,10 @@ impl CpuDeployment {
             )),
             conditional::DEPLOYMENT_SCHEMA => CpuPolicy::Conditional(Box::new(
                 conditional::LoadedConditionalDeployment::load(bytes)
+                    .map_err(|error| JsError::new(&error))?,
+            )),
+            own_setup::DEPLOYMENT_SCHEMA => CpuPolicy::OwnSetup(Box::new(
+                own_setup::LoadedOwnSetupComposite::load(bytes)
                     .map_err(|error| JsError::new(&error))?,
             )),
             _ => return Err(JsError::new("Unsupported NN deployment format")),
