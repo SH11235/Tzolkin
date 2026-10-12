@@ -600,6 +600,41 @@ impl ConditionalHumanJournal {
         }
         Ok(self.session.owner())
     }
+    /// Actor-only portable inference after a genuine positive-count Ready
+    /// boundary. This proves no producing-process exit, adoption or source
+    /// authenticity; restarted callers need the existing positive-close restore.
+    /// Full original source validation occurs here, never in inference callbacks.
+    pub fn export_numeric_inference(&self) -> Result<Vec<u8>, String> {
+        use crate::conditional_human_rl_update::ConditionalInferenceJournal;
+        let owner = self.owner()?;
+        if owner.identity().mixed_update_count() == 0 {
+            return Err("Count0 journal has no updated conditional inference export".into());
+        }
+        self.require_head()?;
+        self.usage(&BTreeSet::new(), true)?;
+        self.source.full_load()?;
+        let bytes = owner.export_numeric_inference(ConditionalInferenceJournal {
+            head_sha256: &self.head.sha256,
+            head_bytes: self.head.bytes,
+            attempts: self.session.attempts(),
+            credited_own_decisions: self.session.credited_own_decisions(),
+            spent_native_families: self
+                .session
+                .consumed_families()
+                .iter()
+                .map(|f| f.digest())
+                .collect(),
+            external_native_count: self.source.input.external_count,
+            external_native_digest: &self.source.input.external_digest,
+            external_native_sha256: &self.source.input.external_pin.sha256,
+        })?;
+        owner.origin().recheck_sources()?;
+        self.source.small_check()?;
+        crate::human_policy_dataset::recheck_absolute_pin(&self.source.input.external_pin)?;
+        self.require_head()?;
+        self.usage(&BTreeSet::new(), true)?;
+        Ok(bytes)
+    }
     pub fn head(&self) -> ContentPin {
         absolute_pin(&self.directory, &self.head)
     }
@@ -1133,6 +1168,7 @@ mod tests {
             let files = Files::new("conditional-journal-restore");
             let mut continuous = start(&files, &format!("{name}-continuous"), rate);
             let mut journal = start(&files, &format!("{name}-restart"), rate);
+            assert!(journal.export_numeric_inference().is_err());
             continuous.update_whole_four(seeds()[0], None).unwrap();
             let first = journal.update_whole_four(seeds()[0], None).unwrap();
             let head = journal.head();
@@ -1168,11 +1204,149 @@ mod tests {
             assert_eq!(second.saved.next_episode_ordinal(), 8);
             assert_eq!(second.saved.spent_families.len(), 8);
             if expected_updates == 0 {
+                assert!(restored.export_numeric_inference().is_err());
                 assert_eq!(second.saved.credited_own_decisions(), 0);
                 assert_eq!(first.resolution, ConditionalResolution::NoChange);
                 // Nonzero residual targets may still yield zero rounded f32 change.
             } else {
                 assert!(second.saved.credited_own_decisions() > 0);
+                use tzolkin_inference::conditional_deployment::{
+                    self, LoadedConditionalDeployment,
+                };
+                let bytes = restored.export_numeric_inference().unwrap();
+                let loaded = LoadedConditionalDeployment::load(&bytes).unwrap();
+                assert_eq!(
+                    loaded.identity().checksum(),
+                    restored.owner().unwrap().identity().checksum()
+                );
+                assert_eq!(loaded.identity().mixed_update_count(), 2);
+                assert_eq!(
+                    loaded.origin_checksum(),
+                    restored.owner().unwrap().origin().checksum()
+                );
+                assert_eq!(
+                    loaded.dataset_fingerprint(),
+                    restored.owner().unwrap().origin().dataset().fingerprint
+                );
+                let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let bits = wire["parameterBits"].as_array().unwrap();
+                assert!(
+                    bits.iter()
+                        .zip(restored.owner().unwrap().actor_parameters())
+                        .all(|(word, value)| {
+                            word.as_str() == Some(format!("{:08x}", value.to_bits()).as_str())
+                        })
+                );
+                assert!(
+                    !String::from_utf8(bytes.clone())
+                        .unwrap()
+                        .contains("\"path\"")
+                );
+                // The same production scalar kernel handles both native phases.
+                let mut state =
+                    tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false)
+                        .unwrap();
+                let setup =
+                    tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+                while state.phase == tzolkin_core::Phase::Setup {
+                    let o =
+                        tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+                    state = tzolkin_core::apply_move(&state, o.legal_actions[0].r#move.clone())
+                        .unwrap();
+                }
+                let playing =
+                    tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+                for o in [&setup, &playing] {
+                    let native = restored
+                        .owner()
+                        .unwrap()
+                        .handle()
+                        .unwrap()
+                        .distribution(o)
+                        .unwrap();
+                    let portable = loaded.distribution(o).unwrap();
+                    assert!(
+                        native
+                            .logits()
+                            .iter()
+                            .zip(&portable.logits)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
+                    assert!(
+                        native
+                            .probabilities()
+                            .iter()
+                            .zip(&portable.probabilities)
+                            .all(|(a, b)| a.to_bits() == b.to_bits())
+                    );
+                    let best = (1..portable.logits.len()).fold(0, |best, i| {
+                        if portable.logits[i] > portable.logits[best] {
+                            i
+                        } else {
+                            best
+                        }
+                    });
+                    assert_eq!(
+                        loaded.choose_move(o).unwrap().r#move,
+                        o.legal_actions[best].r#move
+                    );
+                    let mut invalid = o.clone();
+                    invalid.observation_key.push('x');
+                    assert!(loaded.distribution(&invalid).is_err());
+                }
+                assert!(tzolkin_inference::deployment::LoadedDeployment::load(&bytes).is_err());
+                assert!(
+                    serde_json::from_slice::<
+                        crate::human_policy_training::ConditionalHumanPolicyCheckpoint,
+                    >(&bytes)
+                    .is_err()
+                );
+                for (pointer, replacement) in [
+                    ("/parameterBits/0", serde_json::json!("7f800000")),
+                    ("/parameterBits/0", serde_json::json!("ABCDEF00")),
+                    ("/parameterBits/0", serde_json::json!("00000001")),
+                    ("/source/current/mixedUpdateCount", serde_json::json!(0)),
+                    ("/source/sourceQualified", serde_json::json!(true)),
+                    ("/source/sourceAuthenticated", serde_json::json!(true)),
+                    (
+                        "/source/current/gameOptions/tribes",
+                        serde_json::json!(true),
+                    ),
+                    ("/source/current/uxmalCornLimit", serde_json::json!(true)),
+                    ("/source/journal/attempts", serde_json::json!(3)),
+                    ("/source/journal/creditedOwnDecisions", serde_json::json!(0)),
+                    ("/source/journal/externalNativeCount", serde_json::json!(0)),
+                    ("/contract/catalogHash", serde_json::json!("0".repeat(16))),
+                    ("/schema", serde_json::json!("other")),
+                ] {
+                    let mut changed = wire.clone();
+                    *changed.pointer_mut(pointer).unwrap() = replacement;
+                    let changed = serde_json::to_vec(&changed).unwrap();
+                    assert!(
+                        conditional_deployment::numeric_checksum(&changed).is_err(),
+                        "{pointer}"
+                    );
+                    assert!(LoadedConditionalDeployment::load(&changed).is_err());
+                }
+                let text = String::from_utf8(bytes).unwrap();
+                let id = restored
+                    .owner()
+                    .unwrap()
+                    .origin()
+                    .table_reservations()
+                    .keys()
+                    .next()
+                    .unwrap();
+                let duplicate = text.replacen(
+                    &format!("\"tableReservations\":{{\"{id}\":"),
+                    &format!("\"tableReservations\":{{\"{id}\":\"test\",\"{id}\":"),
+                    1,
+                );
+                assert_ne!(text, duplicate);
+                assert!(LoadedConditionalDeployment::load(duplicate.as_bytes()).is_err());
+                let extra =
+                    text.replacen("\"gameOptions\":{", "\"gameOptions\":{\"hidden\":false,", 1);
+                assert!(LoadedConditionalDeployment::load(extra.as_bytes()).is_err());
             }
         }
     }
@@ -1183,6 +1357,7 @@ mod tests {
         journal.change_source_after_resolve = Some(files.root.join("source-marker.json"));
         assert!(journal.update_whole_four(seeds()[0], None).is_err());
         assert!(journal.owner().is_err());
+        assert!(journal.export_numeric_inference().is_err());
         assert_eq!(journal.session.owner().identity().mixed_update_count(), 1);
         let saved = ConditionalHumanJournal::inspect_saved_tip(&journal.directory, &journal.head())
             .unwrap();
@@ -1206,6 +1381,7 @@ mod tests {
             journal.fail_after_publish = Some(label);
             assert!(journal.update_whole_four(seeds()[0], None).is_err());
             assert!(journal.owner().is_err());
+            assert!(journal.export_numeric_inference().is_err());
             let saved =
                 ConditionalHumanJournal::inspect_saved_tip(&journal.directory, &journal.head())
                     .unwrap();
