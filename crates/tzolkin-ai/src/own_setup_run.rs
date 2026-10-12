@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tzolkin_inference::deployment::{LoadedDeployment, MAX_DEPLOYMENT_BYTES};
+use tzolkin_inference::own_setup_deployment::FixedPlayingIdentity;
 
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::model::digest;
@@ -17,6 +18,7 @@ use crate::own_setup_durable::{
 };
 use crate::own_setup_model::InitializedOwnSetupArtifact;
 use crate::own_setup_native::OwnSetupNativeConfig;
+use crate::own_setup_roster::{DeclaredOwnSetupRosterPlan, OwnSetupRosterConfig, OwnSetupSeat};
 use crate::own_setup_training::{
     DeclaredOwnSetupExclusions, OwnSetupAdamConfig, OwnSetupAttemptOutcome, OwnSetupAttemptReport,
     OwnSetupRunConfig, OwnSetupTrainingOwner,
@@ -31,8 +33,10 @@ pub const SPEC_SCHEMA: &str = "tzolkin-own-setup-run-spec-v1";
 pub const EXCLUSIONS_SCHEMA: &str = "tzolkin-own-setup-run-exclusions-v1";
 pub const STATE_SCHEMA: &str = "tzolkin-own-setup-run-state-v1";
 pub const CONTINUE_SPEC_SCHEMA: &str = "tzolkin-own-setup-continue-spec-v1";
+pub const ROSTER_SPEC_SCHEMA: &str = "tzolkin-own-setup-roster-continue-spec-v1";
 pub const LINEAGE_SCHEMA: &str = "tzolkin-own-setup-run-lineage-v1";
 const CONTINUE_STATE_SCHEMA: &str = "tzolkin-own-setup-continue-state-v1";
+const ROSTER_STATE_SCHEMA: &str = "tzolkin-own-setup-roster-continue-state-v1";
 pub const MAX_SPEC_BYTES: usize = 256 * 1024;
 pub const MAX_EXCLUSIONS_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_STATE_BYTES: usize = 128 * 1024;
@@ -294,6 +298,118 @@ impl OwnSetupContinueSpec {
     }
 }
 
+/// Ordered absolute roles supplement, rather than replace, the native schedule.
+/// Full numeric identity is declaration metadata; it cannot import an owner.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnSetupRosterDeclaration {
+    pub playing: FixedPlayingIdentity,
+    pub absolute_seats: Vec<Vec<OwnSetupSeat>>,
+    pub plan_checksum: String,
+}
+impl OwnSetupRosterDeclaration {
+    fn checked_plan(&self, spec: &OwnSetupRunSpec) -> Result<DeclaredOwnSetupRosterPlan, String> {
+        let plan = self.plan(spec)?;
+        json(&plan, MAX_SPEC_BYTES)?;
+        if plan.checksum() != self.plan_checksum {
+            return Err("Original complete roster plan checksum differs".into());
+        }
+        Ok(plan)
+    }
+    fn plan(&self, spec: &OwnSetupRunSpec) -> Result<DeclaredOwnSetupRosterPlan, String> {
+        if !(1..=64).contains(&spec.batches.len())
+            || !(1..=256).contains(&self.absolute_seats.len())
+            || spec.batches.iter().any(|b| !(1..=4).contains(&b.len()))
+            || spec.batches.iter().map(Vec::len).sum::<usize>() != self.absolute_seats.len()
+        {
+            return Err("Roster requires one absolute role vector per original game".into());
+        }
+        let run = spec.run.native()?;
+        let limits = spec.collection.native()?;
+        let mut ordinal = run.first_episode_ordinal;
+        let mut configurations = Vec::new();
+        for (game, seats) in spec.batches.iter().flatten().zip(&self.absolute_seats) {
+            let config = OwnSetupNativeConfig::new(
+                NativeStochasticConfig::new(
+                    game.players,
+                    game.environment_seed,
+                    SamplingStreamIdentity::new(
+                        SamplingSeed::new(run.sampling_seed),
+                        ordinal,
+                        run.replicate_ordinal,
+                        game.players,
+                    )?,
+                    limits,
+                )?,
+                game.learner_seat,
+            )?;
+            configurations.push(OwnSetupRosterConfig::new(config, seats.clone())?);
+            ordinal = ordinal.checked_add(1).ok_or("Episode ordinal overflow")?;
+        }
+        // Only bounded typed identity data is copied, never model parameters.
+        DeclaredOwnSetupRosterPlan::new(
+            decode(&json(&self.playing, MAX_SPEC_BYTES)?, MAX_SPEC_BYTES)?,
+            configurations,
+            spec.batches.iter().map(Vec::len).collect(),
+        )
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OwnSetupRosterContinueSpec {
+    pub schema: String,
+    pub lineage: ContentPin,
+    pub segment: OwnSetupRunSpec,
+    pub roster: OwnSetupRosterDeclaration,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OwnSetupRosterDigests {
+    pub ordered_configs_digest: String,
+    pub roster_plan_checksum: String,
+}
+impl OwnSetupRosterContinueSpec {
+    pub fn from_json(bytes: &[u8]) -> Result<Self, String> {
+        let spec: Self = decode(bytes, MAX_SPEC_BYTES)?;
+        if spec.schema != ROSTER_SPEC_SCHEMA || spec.segment.schema != SPEC_SCHEMA {
+            return Err("Unknown Own Setup roster continuation specification".into());
+        }
+        spec.lineage.validate(MAX_SPEC_BYTES)?;
+        Ok(spec)
+    }
+    /// Metadata only. Expected digest fields are compared at run admission.
+    pub fn ordered_digests(&self) -> Result<OwnSetupRosterDigests, String> {
+        Ok(OwnSetupRosterDigests {
+            ordered_configs_digest: self.segment.ordered_digest()?,
+            roster_plan_checksum: self.roster.plan(&self.segment)?.checksum().into(),
+        })
+    }
+}
+
+struct ContinuationDeclaration {
+    lineage: ContentPin,
+    segment: OwnSetupRunSpec,
+    roster: Option<OwnSetupRosterDeclaration>,
+}
+fn continuation_spec(bytes: &[u8], rostered: bool) -> Result<ContinuationDeclaration, String> {
+    if rostered {
+        let spec = OwnSetupRosterContinueSpec::from_json(bytes)?;
+        Ok(ContinuationDeclaration {
+            lineage: spec.lineage,
+            segment: spec.segment,
+            roster: Some(spec.roster),
+        })
+    } else {
+        let spec = OwnSetupContinueSpec::from_json(bytes)?;
+        Ok(ContinuationDeclaration {
+            lineage: spec.lineage,
+            segment: spec.segment,
+            roster: None,
+        })
+    }
+}
+
 /// Explicit locations relative to the declaration's directory. Each source has
 /// its own original plan, full baseline and externally retained exact state.
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -319,6 +435,14 @@ pub enum OriginalRunSource {
         state: String,
         expected_sha256: String,
     },
+    RosterContinue {
+        output: String,
+        spec: String,
+        exclusions: String,
+        lineage: String,
+        state: String,
+        expected_sha256: String,
+    },
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -337,6 +461,8 @@ struct Reservation {
     /// Every family is spent once this receipt is published, including unentered
     /// suffixes and failures. These are distinct originals, not all-seat samples.
     all_families_spent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    roster_plan_checksum: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -347,6 +473,8 @@ struct Manifest {
     exclusions: ContentPin,
     ordered_configs_digest: String,
     reservation: ContentPin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    roster_plan_checksum: Option<String>,
 }
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -405,6 +533,12 @@ pub struct RunInputs<'a> {
     pub deployment: Option<&'a str>,
 }
 
+pub struct OwnSetupRosterRunInputs<'a> {
+    pub run: RunInputs<'a>,
+    /// A nonterminal invocation allowance, independent of the original budget.
+    pub max_new_batches: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OwnSetupRunReport {
@@ -430,6 +564,15 @@ pub struct OwnSetupRunReport {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     continuation: Option<SegmentOffsets>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    roster_plan_checksum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_new_batches: Option<usize>,
+}
+
+struct RosterRunPlan {
+    plan: DeclaredOwnSetupRosterPlan,
+    playing: FixedPlayingIdentity,
 }
 
 struct Prepared {
@@ -439,6 +582,7 @@ struct Prepared {
     configs: Vec<Vec<OwnSetupNativeConfig>>,
     reservation: Reservation,
     manifest: Manifest,
+    roster: Option<RosterRunPlan>,
 }
 
 struct Ancestor {
@@ -460,6 +604,8 @@ struct ContinuationRootBindings {
     parent: ContinuationParentBinding,
     offsets: DurableOffsetBindings,
     additional_episodes: u64,
+    #[serde(default)]
+    roster_plan: Option<DeclaredOwnSetupRosterPlan>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -495,6 +641,8 @@ struct RootBindings {
     limits: OwnSetupArchiveLimits,
     excluded_families: Vec<String>,
     exclusion_digest: String,
+    #[serde(default)]
+    playing: Option<FixedPlayingIdentity>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -585,6 +733,7 @@ impl Prepared {
                 .map(|g| seed_family_id(g.environment_seed))
                 .collect(),
             all_families_spent: true,
+            roster_plan_checksum: None,
         };
         let manifest = Manifest {
             schema: "tzolkin-own-setup-planned-run-v1".into(),
@@ -593,6 +742,7 @@ impl Prepared {
             exclusions: spec.exclusions.clone(),
             ordered_configs_digest: spec.ordered_configs_digest.clone(),
             reservation: ContentPin::of(&json(&reservation, MAX_STATE_BYTES)?),
+            roster_plan_checksum: None,
         };
         Ok(Self {
             spec,
@@ -601,7 +751,45 @@ impl Prepared {
             configs,
             reservation,
             manifest,
+            roster: None,
         })
+    }
+    fn install_roster(&mut self, declaration: OwnSetupRosterDeclaration) -> Result<(), String> {
+        let plan = declaration.checked_plan(&self.spec)?;
+        let expected: Vec<_> = self.configs.iter().flatten().map(config_value).collect();
+        let actual = plan
+            .configurations()
+            .iter()
+            .map(|c| Ok(config_value(&c.native_config()?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        if actual != expected
+            || plan.batch_sizes() != self.configs.iter().map(Vec::len).collect::<Vec<_>>()
+        {
+            return Err("Roster differs from the complete ordered native schedule".into());
+        }
+        let checksum = Some(plan.checksum().to_owned());
+        self.reservation.schema = "tzolkin-own-setup-roster-run-reservation-v1".into();
+        self.reservation.roster_plan_checksum = checksum.clone();
+        self.manifest.schema = "tzolkin-own-setup-roster-planned-run-v1".into();
+        self.manifest.roster_plan_checksum = checksum;
+        self.manifest.reservation = ContentPin::of(&json(&self.reservation, MAX_STATE_BYTES)?);
+        self.roster = Some(RosterRunPlan {
+            plan,
+            playing: declaration.playing,
+        });
+        Ok(())
+    }
+    fn continuation_schema(&self, plain: &'static str, roster: &'static str) -> &'static str {
+        if self.roster.is_some() { roster } else { plain }
+    }
+    fn state_schema(&self) -> &'static str {
+        self.continuation_schema(CONTINUE_STATE_SCHEMA, ROSTER_STATE_SCHEMA)
+    }
+    fn continuation_manifest_schema(&self) -> &'static str {
+        self.continuation_schema(
+            "tzolkin-own-setup-continue-manifest-v1",
+            "tzolkin-own-setup-roster-continue-manifest-v1",
+        )
     }
     fn verify_saved(&self, directory: &Path, state: &OwnSetupRunState) -> Result<(), String> {
         let reservation_bytes = read_bounded(&directory.join(RESERVATION), MAX_STATE_BYTES)?;
@@ -655,22 +843,36 @@ impl Prepared {
 
 impl PreparedContinuation {
     fn read(inputs: &RunInputs<'_>, lineage_path: &Path) -> Result<Self, String> {
+        Self::read_mode(inputs, lineage_path, false)
+    }
+    fn read_mode(
+        inputs: &RunInputs<'_>,
+        lineage_path: &Path,
+        rostered: bool,
+    ) -> Result<Self, String> {
         let bytes = read_bounded(inputs.spec, MAX_SPEC_BYTES)?;
-        let spec = OwnSetupContinueSpec::from_json(&bytes)?;
+        let ContinuationDeclaration {
+            lineage: lineage_pin,
+            segment,
+            roster,
+        } = continuation_spec(&bytes, rostered)?;
         let lineage_bytes = read_bounded(lineage_path, MAX_SPEC_BYTES)?;
-        spec.lineage.check(&lineage_bytes, MAX_SPEC_BYTES)?;
+        lineage_pin.check(&lineage_bytes, MAX_SPEC_BYTES)?;
         let lineage: OwnSetupRunLineage = decode(&lineage_bytes, MAX_SPEC_BYTES)?;
         if lineage.schema != LINEAGE_SCHEMA || !(1..=15).contains(&lineage.sources.len()) {
             return Err(
                 "Continuation requires one original source and at most14 successors".into(),
             );
         }
-        let prepared = Prepared::read_spec(
-            spec.segment,
+        let mut prepared = Prepared::read_spec(
+            segment,
             ContentPin::of(&bytes),
             inputs.playing,
             inputs.exclusions,
         )?;
+        if let Some(roster) = roster {
+            prepared.install_roster(roster)?;
+        }
         if prepared.spec.update_budget != prepared.configs.len() as u64 {
             return Err("A prospective continuation must budget every original batch".into());
         }
@@ -698,6 +900,14 @@ impl PreparedContinuation {
                         expected_sha256,
                     } if index == 0 => (output, spec, exclusions, state, expected_sha256, None),
                     OriginalRunSource::Continue {
+                        output,
+                        spec,
+                        exclusions,
+                        state,
+                        expected_sha256,
+                        lineage,
+                    }
+                    | OriginalRunSource::RosterContinue {
                         output,
                         spec,
                         exclusions,
@@ -738,35 +948,48 @@ impl PreparedContinuation {
             let original_spec_path = resolve(original_spec)?;
             let original_bytes = read_bounded(&original_spec_path, MAX_SPEC_BYTES)?;
             let original_exclusions = resolve(exclusions)?;
-            let (original, original_lineage_pin) = if let Some(location) = original_lineage {
-                let original_spec = OwnSetupContinueSpec::from_json(&original_bytes)?;
-                let original_lineage_bytes = read_bounded(&resolve(location)?, MAX_SPEC_BYTES)?;
-                original_spec
-                    .lineage
-                    .check(&original_lineage_bytes, MAX_SPEC_BYTES)?;
-                let original_declaration: OwnSetupRunLineage =
-                    decode(&original_lineage_bytes, MAX_SPEC_BYTES)?;
-                if original_declaration.schema != LINEAGE_SCHEMA
-                    || original_declaration.sources != lineage.sources[..index]
-                {
-                    return Err(
-                        "Original successor lineage differs from the declared complete prefix"
-                            .into(),
-                    );
-                }
-                (original_spec.segment, Some(original_spec.lineage))
-            } else {
-                (OwnSetupRunSpec::from_json(&original_bytes)?, None)
-            };
-            let original = Prepared::read_spec(
+            let (original, original_lineage_pin, original_roster) =
+                if let Some(location) = original_lineage {
+                    let ContinuationDeclaration {
+                        lineage: original_lineage_pin,
+                        segment: original_segment,
+                        roster: original_roster,
+                    } = continuation_spec(
+                        &original_bytes,
+                        matches!(source, OriginalRunSource::RosterContinue { .. }),
+                    )?;
+                    let original_lineage_bytes = read_bounded(&resolve(location)?, MAX_SPEC_BYTES)?;
+                    original_lineage_pin.check(&original_lineage_bytes, MAX_SPEC_BYTES)?;
+                    let original_declaration: OwnSetupRunLineage =
+                        decode(&original_lineage_bytes, MAX_SPEC_BYTES)?;
+                    if original_declaration.schema != LINEAGE_SCHEMA
+                        || original_declaration.sources != lineage.sources[..index]
+                    {
+                        return Err(
+                            "Original successor lineage differs from the declared complete prefix"
+                                .into(),
+                        );
+                    }
+                    (
+                        original_segment,
+                        Some(original_lineage_pin),
+                        original_roster,
+                    )
+                } else {
+                    (OwnSetupRunSpec::from_json(&original_bytes)?, None, None)
+                };
+            let mut original = Prepared::read_spec(
                 original,
                 ContentPin::of(&original_bytes),
                 inputs.playing,
                 &original_exclusions,
             )?;
+            if let Some(roster) = original_roster {
+                original.install_roster(roster)?;
+            }
             if let Some(original_lineage_pin) = original_lineage_pin {
                 let expected_manifest = ContinuationManifest {
-                    schema: "tzolkin-own-setup-continue-manifest-v1".into(),
+                    schema: original.continuation_manifest_schema().into(),
                     plan: original.manifest.clone(),
                     lineage: original_lineage_pin,
                     parent_state: parent_state
@@ -845,10 +1068,22 @@ impl PreparedContinuation {
             });
         }
         check_successor_stream(&prepared.spec, &ancestors, &offsets)?;
+        if let Some(roster) = &prepared.roster {
+            let first = ancestors.first().ok_or("Missing original source")?;
+            let bytes = read_bounded(
+                &first.directory.join(ARCHIVE).join("root.json"),
+                MAX_EXCLUSIONS_BYTES,
+            )?;
+            first.state.root.check(&bytes, MAX_EXCLUSIONS_BYTES)?;
+            let root: RootBindings = decode(&bytes, MAX_EXCLUSIONS_BYTES)?;
+            if root.playing.as_ref() != Some(&roster.playing) {
+                return Err("Roster Playing identity differs from original source root".into());
+            }
+        }
         let manifest = ContinuationManifest {
-            schema: "tzolkin-own-setup-continue-manifest-v1".into(),
+            schema: prepared.continuation_manifest_schema().into(),
             plan: prepared.manifest.clone(),
-            lineage: spec.lineage,
+            lineage: lineage_pin,
             parent_state: parent_state.ok_or("Continuation lacks original sources")?,
             offsets,
         };
@@ -939,7 +1174,7 @@ fn verify_continuation_saved(
     state: &OwnSetupRunState,
     ancestors: &[Ancestor],
 ) -> Result<(), String> {
-    if state.schema != CONTINUE_STATE_SCHEMA {
+    if state.schema != prepared.state_schema() {
         return Err("Unknown continuation state".into());
     }
     let reservation = read_bounded(&directory.join(RESERVATION), MAX_STATE_BYTES)?;
@@ -974,7 +1209,13 @@ fn verify_continuation_saved(
         .attempted_episodes
         .checked_add(run.max_attempted_episodes)
         .ok_or("Cumulative run budget overflow")?;
-    if root.schema != "tzolkin-own-setup-durable-continuation-root-v1"
+    let expected_roster = prepared.roster.as_ref().map(|r| &r.plan);
+    if json(&root.roster_plan, MAX_SPEC_BYTES)? != json(&expected_roster, MAX_SPEC_BYTES)?
+        || root.schema
+            != prepared.continuation_schema(
+                "tzolkin-own-setup-durable-continuation-root-v1",
+                "tzolkin-own-setup-durable-rostered-continuation-root-v1",
+            )
         || root.parent.root.name != "root.json"
         || root.parent.root.bytes != parent.state.root.bytes
         || root.parent.root.sha256 != parent.state.root.sha256
@@ -989,6 +1230,11 @@ fn verify_continuation_saved(
     }
     root.config
         .check_run(&prepared.spec, &prepared.declaration, &run)?;
+    if let Some(roster) = &prepared.roster
+        && root.config.playing.as_ref() != Some(&roster.playing)
+    {
+        return Err("Saved roster root Playing identity differs".into());
+    }
     prepared.check_pending_configs(directory, state.tip.sequence)?;
     read_stop(directory, &state.manifest)?;
     Ok(())
@@ -1133,8 +1379,30 @@ pub fn resume(
 /// Reserves the entire new segment before one Playing load and ancestral replay.
 /// Only the source's reconstructed live owner can create the child archive.
 pub fn continue_run(inputs: RunInputs<'_>, lineage: &Path) -> Result<OwnSetupRunReport, String> {
+    continue_mode(inputs, lineage, false, None)
+}
+
+/// Installs the entire prospective roster on a genuinely reconstructed owner.
+pub fn continue_rostered_run(
+    inputs: OwnSetupRosterRunInputs<'_>,
+    lineage: &Path,
+) -> Result<OwnSetupRunReport, String> {
+    continue_mode(inputs.run, lineage, true, inputs.max_new_batches)
+}
+
+fn continue_mode(
+    inputs: RunInputs<'_>,
+    lineage: &Path,
+    rostered: bool,
+    max_new_batches: Option<usize>,
+) -> Result<OwnSetupRunReport, String> {
     let began = Instant::now();
-    let mut prepared = PreparedContinuation::read(&inputs, lineage)?;
+    let mut prepared = if rostered {
+        PreparedContinuation::read_mode(&inputs, lineage, true)?
+    } else {
+        PreparedContinuation::read(&inputs, lineage)?
+    };
+    validate_batch_allowance(max_new_batches, prepared.prepared.configs.len())?;
     let directory = output(&inputs, true)?;
     outside_original_archives(&directory, &prepared.ancestors)?;
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
@@ -1180,14 +1448,23 @@ pub fn continue_run(inputs: RunInputs<'_>, lineage: &Path) -> Result<OwnSetupRun
             "Ancestral cold audit exhausted time; all new reservations remain spent".into(),
         );
     }
-    let mut durable = parent.continue_in(
-        &directory.join(ARCHIVE),
-        prepared.prepared.spec.run.max_attempted_episodes,
-        prepared.prepared.declaration.checked()?,
-        prepared.prepared.spec.archive_limits.clone(),
-    )?;
+    let mut durable = if let Some(roster) = &prepared.prepared.roster {
+        parent.continue_rostered_in(
+            &directory.join(ARCHIVE),
+            decode(&json(&roster.plan, MAX_SPEC_BYTES)?, MAX_SPEC_BYTES)?,
+            prepared.prepared.declaration.checked()?,
+            prepared.prepared.spec.archive_limits.clone(),
+        )?
+    } else {
+        parent.continue_in(
+            &directory.join(ARCHIVE),
+            prepared.prepared.spec.run.max_attempted_episodes,
+            prepared.prepared.declaration.checked()?,
+            prepared.prepared.spec.archive_limits.clone(),
+        )?
+    };
     let state = OwnSetupRunState {
-        schema: CONTINUE_STATE_SCHEMA.into(),
+        schema: prepared.prepared.state_schema().into(),
         manifest,
         root: ContentPin::of(&read_bounded(
             &directory.join(ARCHIVE).join("root.json"),
@@ -1205,6 +1482,7 @@ pub fn continue_run(inputs: RunInputs<'_>, lineage: &Path) -> Result<OwnSetupRun
         Some(work),
         began,
         Some(prepared.manifest.offsets),
+        max_new_batches,
     )
 }
 
@@ -1215,8 +1493,40 @@ pub fn resume_continuation(
     state_path: &Path,
     expected_sha256: &str,
 ) -> Result<OwnSetupRunReport, String> {
+    resume_continuation_mode(inputs, lineage, state_path, expected_sha256, false, None)
+}
+
+pub fn resume_rostered_continuation(
+    inputs: OwnSetupRosterRunInputs<'_>,
+    lineage: &Path,
+    state_path: &Path,
+    expected_sha256: &str,
+) -> Result<OwnSetupRunReport, String> {
+    resume_continuation_mode(
+        inputs.run,
+        lineage,
+        state_path,
+        expected_sha256,
+        true,
+        inputs.max_new_batches,
+    )
+}
+
+fn resume_continuation_mode(
+    inputs: RunInputs<'_>,
+    lineage: &Path,
+    state_path: &Path,
+    expected_sha256: &str,
+    rostered: bool,
+    max_new_batches: Option<usize>,
+) -> Result<OwnSetupRunReport, String> {
     let began = Instant::now();
-    let mut prepared = PreparedContinuation::read(&inputs, lineage)?;
+    let mut prepared = if rostered {
+        PreparedContinuation::read_mode(&inputs, lineage, true)?
+    } else {
+        PreparedContinuation::read(&inputs, lineage)?
+    };
+    validate_batch_allowance(max_new_batches, prepared.prepared.configs.len())?;
     let directory = output(&inputs, false)?;
     let state = pinned_state(state_path, expected_sha256)?;
     verify_continuation_saved(
@@ -1266,6 +1576,7 @@ pub fn resume_continuation(
         Some(work),
         began,
         Some(prepared.manifest.offsets),
+        max_new_batches,
     )
 }
 
@@ -1325,30 +1636,73 @@ pub fn inspect_continuation_tip(
     expected_sha256: &str,
     new_tip: &str,
 ) -> Result<ContentPin, String> {
+    inspect_continuation_mode(output, state_path, expected_sha256, new_tip, false)
+}
+
+/// Candidate custody pin only; resume still requires full source reconstruction.
+pub fn inspect_rostered_continuation_tip(
+    output: &Path,
+    state_path: &Path,
+    expected_sha256: &str,
+    new_tip: &str,
+) -> Result<ContentPin, String> {
+    inspect_continuation_mode(output, state_path, expected_sha256, new_tip, true)
+}
+
+fn inspect_continuation_mode(
+    output: &Path,
+    state_path: &Path,
+    expected_sha256: &str,
+    new_tip: &str,
+    rostered: bool,
+) -> Result<ContentPin, String> {
     let directory = local(output, false)?;
     leaf(new_tip)?;
     absent(&directory.join(new_tip))?;
     let mut state = pinned_state(state_path, expected_sha256)?;
-    if state.schema != CONTINUE_STATE_SCHEMA {
+    if state.schema
+        != if rostered {
+            ROSTER_STATE_SCHEMA
+        } else {
+            CONTINUE_STATE_SCHEMA
+        }
+    {
         return Err("Unknown continuation state".into());
     }
     let manifest_bytes = read_bounded(&directory.join(MANIFEST), MAX_STATE_BYTES)?;
     state.manifest.check(&manifest_bytes, MAX_STATE_BYTES)?;
     let manifest: ContinuationManifest = decode(&manifest_bytes, MAX_STATE_BYTES)?;
-    if manifest.schema != "tzolkin-own-setup-continue-manifest-v1" {
+    let manifest_schema = if rostered {
+        "tzolkin-own-setup-roster-continue-manifest-v1"
+    } else {
+        "tzolkin-own-setup-continue-manifest-v1"
+    };
+    if manifest.schema != manifest_schema
+        || manifest.plan.roster_plan_checksum.is_some() != rostered
+    {
         return Err("Unknown continuation manifest".into());
     }
     manifest.plan.reservation.check(
         &read_bounded(&directory.join(RESERVATION), MAX_STATE_BYTES)?,
         MAX_STATE_BYTES,
     )?;
-    state.root.check(
-        &read_bounded(
-            &directory.join(ARCHIVE).join("root.json"),
-            MAX_EXCLUSIONS_BYTES,
-        )?,
+    let root_bytes = read_bounded(
+        &directory.join(ARCHIVE).join("root.json"),
         MAX_EXCLUSIONS_BYTES,
     )?;
+    state.root.check(&root_bytes, MAX_EXCLUSIONS_BYTES)?;
+    if rostered {
+        let root: ContinuationRootBindings = decode(&root_bytes, MAX_EXCLUSIONS_BYTES)?;
+        let plan = root
+            .roster_plan
+            .ok_or("Roster source root lacks its complete plan")?;
+        plan.validate()?;
+        if root.schema != "tzolkin-own-setup-durable-rostered-continuation-root-v1"
+            || Some(plan.checksum()) != manifest.plan.roster_plan_checksum.as_deref()
+        {
+            return Err("Roster candidate root/manifest binding differs".into());
+        }
+    }
     state.tip = DurableOwnSetupOwner::inspect_tip(&directory.join(ARCHIVE))?;
     publish(&directory, new_tip, &state, MAX_STATE_BYTES)
 }
@@ -1387,7 +1741,7 @@ fn finish(
     began: Instant,
 ) -> Result<OwnSetupRunReport, String> {
     finish_segment(
-        inputs, directory, prepared, durable, state, work, began, None,
+        inputs, directory, prepared, durable, state, work, began, None, None,
     )
 }
 
@@ -1401,6 +1755,7 @@ fn finish_segment(
     work: Option<OwnSetupRestoreWork>,
     began: Instant,
     continuation: Option<SegmentOffsets>,
+    max_new_batches: Option<usize>,
 ) -> Result<OwnSetupRunReport, String> {
     let mut error = None;
     let ledger_offset = continuation.as_ref().map_or(0, |s| s.ledger_entries);
@@ -1420,6 +1775,13 @@ fn finish_segment(
     let saved_stop = read_stop(directory, &state.manifest)?;
     let unfinished_intent =
         check_intents(directory, &state.manifest, ledger, prepared.configs.len())?;
+    let initial_batches = ledger.len();
+    let expected_roster = prepared.roster.as_ref().map(|r| &r.plan);
+    if json(&durable.owner()?.roster_plan(), MAX_SPEC_BYTES)?
+        != json(&expected_roster, MAX_SPEC_BYTES)?
+    {
+        return Err("Source-restored owner differs from the original complete roster".into());
+    }
     let reason = loop {
         let owner = durable.owner()?;
         let consumed = if continuation.is_some() {
@@ -1456,6 +1818,9 @@ fn finish_segment(
         }
         if consumed == prepared.configs.len() {
             break "scheduleExhausted".into();
+        }
+        if invocation_limit_reached(consumed, initial_batches, max_new_batches) {
+            break "invocationBatchBudgetReached".into();
         }
         if began.elapsed().as_secs() >= prepared.spec.max_seconds {
             break "wallBudgetReached".into();
@@ -1524,7 +1889,10 @@ fn finish_segment(
     let state_pin = publish(directory, inputs.tip, &state, MAX_STATE_BYTES)?;
     let report = OwnSetupRunReport {
         schema: if continuation.is_some() {
-            "tzolkin-own-setup-continue-report-v1"
+            prepared.continuation_schema(
+                "tzolkin-own-setup-continue-report-v1",
+                "tzolkin-own-setup-roster-continue-report-v1",
+            )
         } else {
             "tzolkin-own-setup-run-report-v1"
         },
@@ -1564,9 +1932,21 @@ fn finish_segment(
         elapsed_seconds: began.elapsed().as_secs_f64(),
         error,
         continuation,
+        roster_plan_checksum: prepared.manifest.roster_plan_checksum,
+        max_new_batches,
     };
     publish(directory, inputs.report, &report, MAX_REPORT_BYTES)?;
     Ok(report)
+}
+
+fn validate_batch_allowance(max_new_batches: Option<usize>, batches: usize) -> Result<(), String> {
+    if max_new_batches.is_some_and(|n| !(1..=batches.min(64)).contains(&n)) {
+        return Err("Invocation batch allowance must be within 1..=original batch count".into());
+    }
+    Ok(())
+}
+fn invocation_limit_reached(consumed: usize, initial: usize, allowance: Option<usize>) -> bool {
+    allowance.is_some_and(|n| consumed.saturating_sub(initial) >= n)
 }
 
 fn terminal(ledger: &[OwnSetupAttemptReport]) -> Option<&'static str> {
@@ -1938,6 +2318,94 @@ mod tests {
         assert!(spec.validate(&excluded).is_err());
     }
 
+    fn roster_declaration() -> OwnSetupRosterDeclaration {
+        let guard = tzolkin_inference::trade_guard::TradeGuardConfig::default();
+        // Typed numeric identity claim only: no parameters, load or owner.
+        let identity = serde_json::json!({
+            "kind": "initialMixedV1", "policy": {
+                "schema": "metadata-fixture", "policyVersion": "metadata-fixture",
+                "samplingVersion": "metadata-fixture", "task": "metadata-fixture",
+                "artifactChecksum": "a".repeat(64), "importedUpdateCount": u64::MAX,
+                "mixedUpdateCount": 1, "actorModelVersion": "metadata-fixture",
+                "criticModelVersion": "metadata-fixture", "actorParametersChecksum": "b".repeat(64),
+                "residualParametersChecksum": "c".repeat(64), "featureSchema": 2,
+                "inputContract": "metadata-fixture", "contextSchema": 1,
+                "contextContract": "metadata-fixture", "backend": "scalar", "numericalTarget": "metadata-fixture"
+            }
+        });
+        OwnSetupRosterDeclaration {
+            playing: FixedPlayingIdentity {
+                deployment_checksum: "a".repeat(64),
+                source_role: "metadata-fixture".into(),
+                source_checksum: "b".repeat(64),
+                update_count: Some(u64::MAX),
+                current_mixed_identity: serde_json::from_value(identity).unwrap(),
+                source_numerical_target: "metadata-fixture".into(),
+                raw_policy_version: "metadata-fixture".into(),
+                backend: "scalar".into(),
+                configuration_key: guard.configuration_key().unwrap(),
+                guard,
+                inference_version: "metadata-fixture".into(),
+                guard_version: "metadata-fixture".into(),
+                projection_version: "metadata-fixture".into(),
+            },
+            absolute_seats: vec![vec![
+                OwnSetupSeat::Learner,
+                OwnSetupSeat::V5,
+                OwnSetupSeat::FixedPlayingNn,
+            ]],
+            plan_checksum: String::new(),
+        }
+    }
+
+    #[test]
+    fn roster_roles_identity_and_complete_schedule_bind_metadata_before_loading() {
+        let mut declaration = roster_declaration();
+        let spec = spec();
+        let plan = declaration.plan(&spec).unwrap();
+        declaration.plan_checksum = plan.checksum().into();
+        declaration.checked_plan(&spec).unwrap();
+        assert_eq!(
+            config_value(&plan.configurations()[0].native_config().unwrap()),
+            config_value(&spec.validate(&self::declaration(vec![])).unwrap()[0][0])
+        );
+        let bytes = json(&plan, MAX_SPEC_BYTES).unwrap();
+        let value = unique_json(&bytes, MAX_SPEC_BYTES).unwrap();
+        assert_eq!(value["playing"]["updateCount"].as_u64(), Some(u64::MAX));
+        declaration.playing.update_count = Some(u64::MAX - 1);
+        assert!(declaration.checked_plan(&spec).is_err());
+        declaration.playing.update_count = Some(u64::MAX);
+        declaration.absolute_seats[0].swap(0, 1);
+        assert!(declaration.plan(&spec).is_err());
+        declaration.absolute_seats[0].swap(0, 1);
+        declaration.absolute_seats[0][1] = OwnSetupSeat::FixedPlayingNn;
+        assert!(declaration.checked_plan(&spec).is_err());
+        declaration
+            .absolute_seats
+            .push(declaration.absolute_seats[0].clone());
+        assert!(declaration.plan(&spec).is_err());
+        let roster = OwnSetupRosterContinueSpec {
+            schema: ROSTER_SPEC_SCHEMA.into(),
+            lineage: ContentPin::of(b"metadata-only"),
+            segment: spec,
+            roster: roster_declaration(),
+        };
+        let bytes = json(&roster, MAX_SPEC_BYTES).unwrap();
+        let decoded = OwnSetupRosterContinueSpec::from_json(&bytes).unwrap();
+        let digests = decoded.ordered_digests().unwrap();
+        assert_eq!(
+            digests.ordered_configs_digest,
+            decoded.segment.ordered_configs_digest
+        );
+        assert_eq!(digests.roster_plan_checksum, plan.checksum());
+        assert!(OwnSetupContinueSpec::from_json(&bytes).is_err());
+        let mut value = unique_json(&bytes, MAX_SPEC_BYTES).unwrap();
+        value["roster"]["unknown"] = true.into();
+        assert!(
+            OwnSetupRosterContinueSpec::from_json(&serde_json::to_vec(&value).unwrap()).is_err()
+        );
+    }
+
     #[test]
     fn actual_root_bindings_require_exact_adam_run_limits_and_complete_exclusions() {
         let spec = spec();
@@ -1953,6 +2421,7 @@ mod tests {
             limits: spec.archive_limits.clone(),
             excluded_families: vec![],
             exclusion_digest: declaration.digest.clone(),
+            playing: None,
         };
         bindings.check(&spec, &declaration).unwrap();
         bindings.adam.beta2 = f64::from_bits(bindings.adam.beta2.to_bits() + 1);
@@ -1970,6 +2439,12 @@ mod tests {
 
     #[test]
     fn terminal_ledger_and_unfinished_intent_do_not_depend_on_cli_stop_receipts() {
+        validate_batch_allowance(Some(1), 2).unwrap();
+        assert!(validate_batch_allowance(Some(0), 2).is_err());
+        assert!(validate_batch_allowance(Some(3), 2).is_err());
+        assert!(!invocation_limit_reached(1, 1, Some(1)));
+        assert!(invocation_limit_reached(2, 1, Some(1)));
+        assert!(!invocation_limit_reached(2, 1, None));
         let report = |outcome| OwnSetupAttemptReport {
             first_episode_ordinal: u64::MAX,
             reserved_episodes: 1,
