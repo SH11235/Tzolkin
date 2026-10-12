@@ -1150,7 +1150,7 @@ mod tests {
             NativeStochasticConfig::new(
                 3,
                 17,
-                config(3, 0, 1, 6).native.sampling_identity().clone(),
+                *config(3, 0, 1, 6).native.sampling_identity(),
                 CollectionLimits::new(1, 6, 1024 * 1024, TRACE_RESERVE).unwrap(),
             )
             .unwrap(),
