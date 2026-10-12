@@ -383,6 +383,19 @@ pub struct ConditionalMixedOwner {
     critic: Vec<f32>,
     identity: ConditionalMixedIdentity,
 }
+/// Portable summary of a checked Ready journal; raw custody paths stay private.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConditionalInferenceJournal<'a> {
+    pub(crate) head_sha256: &'a str,
+    pub(crate) head_bytes: u64,
+    pub(crate) attempts: u64,
+    pub(crate) credited_own_decisions: u64,
+    pub(crate) spent_native_families: Vec<&'a str>,
+    pub(crate) external_native_count: usize,
+    pub(crate) external_native_digest: &'a str,
+    pub(crate) external_native_sha256: &'a str,
+}
 impl ConditionalMixedOwner {
     pub fn from_count_zero(owner: ConditionalRlOwner) -> Result<Self, String> {
         owner.origin().recheck_sources()?;
@@ -428,6 +441,115 @@ impl ConditionalMixedOwner {
             owner: self,
             kernel: Kernel::Scalar.resolve()?,
         })
+    }
+    pub(crate) fn export_numeric_inference(
+        &self,
+        journal: ConditionalInferenceJournal<'_>,
+    ) -> Result<Vec<u8>, String> {
+        use tzolkin_inference::{conditional_deployment as output, deployment};
+        self.handle()?;
+        check_identity_bits(&self.identity, self.actor.parameters(), &self.critic)?;
+        if self.identity.mixed_update_count == 0
+            || self.origin.table_reservations().len() > 4096
+            || journal.spent_native_families.len() > MAX_SPENT_FAMILIES
+        {
+            return Err("Conditional numeric export requires positive genuine updates".into());
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Contract {
+            model_version: &'static str,
+            input_contract: &'static str,
+            feature_schema: u32,
+            feature_count: usize,
+            hidden_count: usize,
+            parameter_count: usize,
+            rules_version: u32,
+            rules_baseline: &'static str,
+            observation_schema: u32,
+            move_schema: u32,
+            catalog_hash: String,
+            backend: &'static str,
+            numeric_contract: &'static str,
+            scope: &'static str,
+            value_validity: &'static str,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Source<'a> {
+            task: &'static str,
+            origin_checksum: &'a str,
+            checkpoint_checksum: &'a str,
+            model_checksum: &'a str,
+            dataset: &'a crate::human_policy_training::ConditionalDatasetIdentity,
+            table_reservations: &'a std::collections::BTreeMap<String, DatasetSplit>,
+            current: &'a ConditionalMixedIdentity,
+            journal: ConditionalInferenceJournal<'a>,
+            source_authenticated: bool,
+            source_qualified: bool,
+            verified_native_policy: bool,
+            close_scope: &'static str,
+        }
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Wire<'a> {
+            schema: &'static str,
+            contract: Contract,
+            source: Source<'a>,
+            source_numerical_target: String,
+            parameter_bits: Vec<String>,
+            checksum: String,
+        }
+        let (checkpoint_checksum, model_checksum) = self.origin.deployment_checksums();
+        let mut wire = Wire {
+            schema: output::DEPLOYMENT_SCHEMA,
+            contract: Contract {
+                model_version: crate::public_model::MODEL_VERSION,
+                input_contract: crate::public_model::INPUT_CONTRACT,
+                feature_schema: crate::features::PUBLIC_FEATURE_SCHEMA,
+                feature_count: crate::features::FEATURE_COUNT,
+                hidden_count: crate::public_model::HIDDEN,
+                parameter_count: crate::public_model::PARAMETER_COUNT,
+                rules_version: crate::replay::RULES_VERSION,
+                rules_baseline: crate::replay::RULES_BASELINE,
+                observation_schema: OBSERVATION_SCHEMA,
+                move_schema: MOVE_SCHEMA,
+                catalog_hash: crate::replay::catalog_hash(),
+                backend: "scalar",
+                numeric_contract: deployment::NUMERIC_CONTRACT,
+                scope: deployment::SCOPE,
+                value_validity: deployment::VALUE_VALIDITY,
+            },
+            source: Source {
+                task: "ConditionalHumanCurrentMixedPolicyInference",
+                origin_checksum: self.origin.checksum(),
+                checkpoint_checksum,
+                model_checksum,
+                dataset: self.origin.dataset(),
+                table_reservations: self.origin.table_reservations(),
+                current: &self.identity,
+                journal,
+                source_authenticated: false,
+                source_qualified: false,
+                verified_native_policy: false,
+                close_scope: "returnedLibraryReadyOnly",
+            },
+            source_numerical_target: numerical_target(),
+            parameter_bits: self
+                .actor
+                .parameters()
+                .iter()
+                .map(|v| format!("{:08x}", v.to_bits()))
+                .collect(),
+            checksum: String::new(),
+        };
+        // Finite owner shapes and explicit metadata bounds are checked by the
+        // separate closed decoder; no conversion to a native/BC wire occurs.
+        wire.checksum =
+            output::numeric_checksum(&serde_json::to_vec(&wire).map_err(|e| e.to_string())?)?;
+        let bytes = serde_json::to_vec(&wire).map_err(|e| e.to_string())?;
+        output::LoadedConditionalDeployment::load(&bytes)?;
+        Ok(bytes)
     }
 }
 #[allow(clippy::too_many_arguments)]

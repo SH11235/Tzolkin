@@ -49,6 +49,9 @@ impl ConditionalRlOrigin {
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
+    pub(crate) fn deployment_checksums(&self) -> (&str, &str) {
+        (&self.checkpoint_checksum, &self.model_checksum)
+    }
     pub fn dataset(&self) -> &ConditionalDatasetIdentity {
         &self.dataset
     }
