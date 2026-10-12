@@ -2798,6 +2798,222 @@ test('rolls an Action plus Points chain back to its earliest purchase on every l
     }
 });
 
+test('uses observed free technologies and the continued Build payment, then revalidates the whole chain', () => {
+  // Injected state frames test causal receipt boundaries, not core rule scoring.
+  const fixture = (change = () => {}, alterFrame = () => {}) => {
+    const initial = clone(saved.core.initialFrame);
+    const before = clone(initial);
+    const player = before.snapshot.state.players[0];
+    Object.assign(player.resources, { corn: 20, wood: 4, stone: 5, gold: 6 });
+    player.technologies.architecture = 1;
+    before.snapshot.state.buildings = ['b31', 'b30'];
+    before.snapshot.state.pending = {
+      title: 'Two buildings',
+      task: { type: 'build', remaining: 2, allowMonument: true, cornPayment: false },
+      after: [],
+    };
+    before.observation.pendingTask = clone(before.snapshot.state.pending.task);
+    before.observation.legalActions = [true, false].map((architecture) => ({
+      action: {
+        type: 'build',
+        id: 'b31',
+        cost: [0, 0, 1, 2, 0],
+        architecture,
+        discountResource: null,
+        renovation: null,
+      },
+      move: { type: 'choose', choiceId: `first:${architecture}` },
+    }));
+    const apply = (request) => {
+      if (request.move.type === 'place') return clone(before);
+      const next = clone(before);
+      next.snapshot.state = clone(request.state);
+      const state = next.snapshot.state;
+      const own = state.players[0];
+      const choice = request.move.choiceId;
+      if (choice.startsWith('first:')) {
+        const architecture = choice === 'first:true';
+        own.resources.stone--;
+        own.resources.gold -= 2;
+        own.resources.corn += Number(architecture);
+        own.buildings.push('b31');
+        state.buildings = ['b30'];
+        state.pending = {
+          title: 'Free technologies',
+          task: { type: 'technology', remaining: 2, free: true },
+          after: [
+            {
+              type: 'build',
+              remaining: 1,
+              allowMonument: false,
+              cornPayment: false,
+              architectureAvailable: !architecture,
+            },
+          ],
+        };
+        next.observation.legalActions = [
+          {
+            action: { type: 'technology', technology: 'architecture' },
+            move: { type: 'choose', choiceId: 'tech:architecture' },
+          },
+        ];
+      } else if (choice === 'tech:architecture') {
+        own.technologies.architecture++;
+        if (state.pending.task.remaining === 2) {
+          state.pending.task.remaining--;
+          next.observation.legalActions = [
+            {
+              action: { type: 'technology', technology: 'architecture' },
+              move: { type: 'choose', choiceId: 'tech:architecture' },
+            },
+          ];
+        } else {
+          state.pending = {
+            title: 'Remaining building',
+            task: clone(state.pending.after[0]),
+            after: [],
+          };
+          const architecture = state.pending.task.architectureAvailable;
+          next.observation.legalActions = [
+            {
+              action: {
+                type: 'build',
+                id: 'b30',
+                cost: [0, 0, 2, Number(!architecture), 0],
+                architecture,
+                discountResource: architecture ? 'gold' : null,
+                renovation: null,
+              },
+              move: { type: 'choose', choiceId: `second:${architecture}` },
+            },
+          ];
+        }
+      } else {
+        assert.equal(choice, 'second:true');
+        own.resources.stone -= 2;
+        own.resources.corn++;
+        own.score += 2;
+        own.technologies.theology++;
+        own.temples.chaac++;
+        own.temples.kukulkan++;
+        own.buildings.push('b30');
+        state.buildings = [];
+        state.pending = null;
+        next.observation.legalActions = [];
+      }
+      next.observation.pendingTask = clone(state.pending?.task ?? null);
+      alterFrame(next, choice, request);
+      return next;
+    };
+    const value = input();
+    replaceEvents(value, [
+      [6, [{ raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' }]],
+      [
+        7,
+        [
+          { raw_text: 'Aは\nを支払った', icons: [{ classes: 'tz_icon resource_stone' }] },
+          { raw_text: 'Aは2\nを支払った', icons: [{ classes: 'tz_icon resource_gold' }] },
+          { raw_text: 'Aは建物を建てた' },
+        ],
+      ],
+      [8, [{ raw_text: 'Aは建築を1レベル進めた' }]],
+      [9, [{ raw_text: 'Aは建築を1レベル進めた' }]],
+      [
+        10,
+        [
+          { raw_text: 'Aは2\nを支払った', icons: [{ classes: 'tz_icon resource_stone' }] },
+          { raw_text: 'Aはを支払った' },
+          { raw_text: 'Aは建物を建てた' },
+          { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_corn' }] },
+          { raw_text: '建築技術ボーナス: Aは2点を獲得した' },
+          { raw_text: 'AはChaacの信仰を1段上げた' },
+          { raw_text: 'AはKukulkanの信仰を1段上げた' },
+          { raw_text: 'Aは神学を1レベル進めた' },
+        ],
+      ],
+    ]);
+    value.witness.witnesses = [
+      { actionId: 6, pendingTask: 'build', expected: { players: [clone(player), {}, {}, {}] } },
+      {
+        actionId: 7,
+        buildings: ['b31'],
+        expected: { players: [{ technologies: { architecture: 1 } }, {}, {}, {}] },
+      },
+      { actionId: 10, buildings: ['b30'] },
+    ];
+    change(value);
+    return { value, dispatch: dispatcher(initial, apply) };
+  };
+  const good = fixture();
+  const result = decode(good.value, good.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.deepEqual(
+    result.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8], [9], [10]],
+  );
+  assert.equal(result.record.steps[1].move.choiceId, 'first:false');
+  assert.deepEqual(
+    result.record.steps[1].checkpoint.expected,
+    good.value.witness.witnesses[1].expected,
+  );
+  const receipt = result.manifest.audit.find((row) => row.continuation === 'pureTechnologyBuild');
+  assert.deepEqual(receipt.technologySourceActionIds, [8, 9]);
+  assert.equal(receipt.paymentSourceActionId, 10);
+  assert.equal(receipt.actualDelivered, true);
+  assert.equal(result.manifest.trainingReady, false);
+
+  for (const [name, change, alterFrame, message] of [
+    [
+      'missing explicit empty payment',
+      (value) => {
+        const row = value.raw.dom_entries.find((item) => item.action_id === 10);
+        row.messages.splice(1, 1);
+        value.raw.entries.find((item) => item.action_id === 10).raw_text = row.messages
+          .map((item) => item.raw_text)
+          .join('\n');
+      },
+      undefined,
+      /Ambiguous/,
+    ],
+    [
+      'paid choice',
+      undefined,
+      (frame, choice) => {
+        if (choice.startsWith('first:')) {
+          frame.snapshot.state.pending.task.free = false;
+          frame.observation.pendingTask.free = false;
+        }
+      },
+      /Ambiguous/,
+    ],
+    [
+      'future checkpoint cannot select the first branch',
+      (value) => {
+        value.witness.witnesses.at(-1).expected = {
+          players: [{ resources: { corn: 999 } }, {}, {}, {}],
+        };
+      },
+      undefined,
+      /checkpoint mismatch|No legal outcome/,
+    ],
+  ]) {
+    const bad = fixture(change, alterFrame);
+    const rejected = decode(bad.value, bad.dispatch);
+    assert.equal(rejected.manifest.blocked.actionId, 7, name);
+    assert.match(rejected.manifest.blocked.reason, message, name);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.equal(
+      rejected.manifest.audit.some((row) => row.continuation === 'pureTechnologyBuild'),
+      false,
+      name,
+    );
+  }
+});
+
 test('settles a queued purchase through observed technology and material choices, or rolls back the chain', () => {
   // Injected frames exercise receipt admission/settlement, not game-rule scoring.
   const placement = { raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' };
