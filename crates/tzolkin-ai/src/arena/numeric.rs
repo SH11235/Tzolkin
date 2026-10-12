@@ -26,6 +26,8 @@ use tzolkin_inference::deployment::{GuardedDeployment, LoadedDeployment, MAX_GAM
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 pub const SCHEMA: &str = "tzolkin-numeric-deployment-validation-arena-v1";
+pub const RESOURCE_CYCLE_ARENA_SCHEMA: &str =
+    "tzolkin-resource-cycle-v5-development-validation-arena-v1";
 pub const MAX_ROWS_PER_CALLBACK: usize = 1024;
 const MAX_EXCLUDED_FAMILIES: usize = 65_536;
 const _: () = assert!(MAX_GAME_CALLBACKS == replay::MAX_DECISIONS);
@@ -653,6 +655,28 @@ pub fn run_validation(
     )
 }
 
+/// Frozen ResourceCycle V5 candidate paired against a preloaded numeric
+/// reference through the same all-seat Development Validation simulation.
+/// The candidate has no Trade guard; numeric roles keep their shared guard.
+/// This grants no training, source/native qualification or strength authority.
+pub fn run_resource_cycle_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: super::resource_cycle::ResourceCycleConfig,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    if candidate != super::resource_cycle::ResourceCycleConfig::v5() {
+        return Err("Resource-cycle candidate requires the exact frozen V5 configuration".into());
+    }
+    run_roles(
+        config,
+        Role::ResourceCycle(candidate),
+        Role::Numeric(reference),
+        opponent_pool,
+        RESOURCE_CYCLE_ARENA_SCHEMA,
+    )
+}
+
 /// Conditional Human Playing with explicit Corn-first Setup, paired against a
 /// preloaded numeric reference. This grants no native or training qualification.
 pub fn run_conditional_validation<'a>(
@@ -722,14 +746,7 @@ fn run_roles<'a>(
         .into_iter()
         .map(Role::from_opponent)
         .collect::<Result<Vec<_>, _>>()?;
-    let guard_key = candidate.guard_key().expect("guarded focal role");
-    if Some(guard_key) != reference.guard_key()
-        || pool
-            .iter()
-            .any(|role| role.guard_key().is_some_and(|key| key != guard_key))
-    {
-        return Err("Numeric Arena requires one fixed shared guard configuration".into());
-    }
+    shared_guard(&candidate, &reference, &pool)?;
     let identities = (
         candidate.identity(),
         reference.identity(),
@@ -796,6 +813,26 @@ fn run_roles<'a>(
         target_arch: std::env::consts::ARCH.into(),
         target_os: std::env::consts::OS.into(),
     })
+}
+
+fn shared_guard(
+    candidate: &Role<'_>,
+    reference: &Role<'_>,
+    pool: &[Role<'_>],
+) -> Result<(), String> {
+    let guard_key = if matches!(candidate, Role::ResourceCycle(_)) {
+        reference.guard_key().expect("guarded numeric reference")
+    } else {
+        candidate.guard_key().expect("guarded focal role")
+    };
+    if Some(guard_key) != reference.guard_key()
+        || pool
+            .iter()
+            .any(|role| role.guard_key().is_some_and(|key| key != guard_key))
+    {
+        return Err("Numeric Arena requires one fixed shared guard configuration".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -979,6 +1016,81 @@ mod tests {
         let stats = summarize(&[failed], 7);
         assert_eq!((stats.complete_blocks, stats.failed_games), (0, 2));
         assert!(stats.failures_preclude_adoption && !stats.strength_improvement_declared);
+
+        let frozen = super::super::resource_cycle::ResourceCycleConfig::v5();
+        for candidate in [
+            super::super::resource_cycle::ResourceCycleConfig::default(),
+            super::super::resource_cycle::ResourceCycleConfig {
+                harvest_before_day: 26,
+                ..frozen.clone()
+            },
+        ] {
+            assert_eq!(
+                run_resource_cycle_validation(&config, candidate, synthetic_policy(), vec![])
+                    .err()
+                    .unwrap(),
+                "Resource-cycle candidate requires the exact frozen V5 configuration"
+            );
+        }
+        assert!(
+            run_resource_cycle_validation(&excluded, frozen.clone(), synthetic_policy(), vec![])
+                .is_err()
+        );
+        assert_eq!(
+            run_resource_cycle_validation(&config, frozen.clone(), synthetic_policy(), vec![])
+                .err()
+                .unwrap(),
+            "Numeric Arena absolute-seat pool count mismatch"
+        );
+        let mut teacher = Role::ResourceCycle(frozen.clone());
+        let reference = Role::Numeric(synthetic_policy());
+        let mut teacher_pool = (0..3)
+            .map(|_| Role::ResourceCycle(frozen.clone()))
+            .collect::<Vec<_>>();
+        assert!(teacher.guard_key().is_none());
+        shared_guard(&teacher, &reference, &teacher_pool).unwrap();
+        let mut wrong_pool_guard = synthetic_policy();
+        wrong_pool_guard.identity.configuration_key = "different guard".into();
+        assert!(shared_guard(&teacher, &reference, &[Role::Numeric(wrong_pool_guard)]).is_err());
+        let teacher_identity = serde_json::to_value(teacher.identity()).unwrap();
+        assert_eq!(teacher_identity["kind"], "resourceCycle");
+        assert_eq!(
+            teacher_identity["configuration"],
+            serde_json::to_value(&frozen).unwrap()
+        );
+        assert_ne!(RESOURCE_CYCLE_ARENA_SCHEMA, SCHEMA);
+        let bounds = work_bounds(&config, &teacher_pool).unwrap();
+        assert_eq!((bounds.planned_games, bounds.max_callbacks), (6, 24_000));
+        assert_eq!(bounds.max_search_atomic_steps, 0);
+        let (arm, diagnostics) = play_arm_using(
+            3,
+            1,
+            &mut teacher,
+            &mut teacher_pool,
+            |players, seed, decide| {
+                let mut state = tzolkin_core::create_game(
+                    (0..players).map(|i| format!("Seat {i}")).collect(),
+                    seed,
+                    false,
+                )?;
+                for index in 0..2 {
+                    let o = observe(&state, state.current_player)?;
+                    let decision = decide(index, &o)?;
+                    state = tzolkin_core::apply_move(&state, decision.r#move)?;
+                }
+                Err("Injected teacher downstream failure".into())
+            },
+        );
+        assert_eq!(
+            arm.error.as_deref(),
+            Some("Injected teacher downstream failure")
+        );
+        assert!(arm.decisions.is_none() && arm.score.is_none() && arm.rank.is_none());
+        assert!(diagnostics.iter().all(Option::is_none));
+        assert_eq!(
+            serde_json::to_value(teacher.identity()).unwrap(),
+            teacher_identity
+        );
 
         let zero = crate::conditional_human_rl_update::tests::owner();
         assert!(ConditionalMixedArenaPolicy::new(&zero, TradeGuardConfig::default()).is_err());
