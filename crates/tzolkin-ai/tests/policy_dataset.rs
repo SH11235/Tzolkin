@@ -10,7 +10,8 @@ use tzolkin_ai::dataset::{self, DatasetSplit};
 use tzolkin_ai::features::{FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
 use tzolkin_ai::policy::HeuristicWeights;
 use tzolkin_ai::policy_dataset::{
-    self, PolicyDatasetManifest, export_native_files, load_policy_dataset,
+    self, PolicyDatasetManifest, export_native_files, export_resource_cycle_v5_teacher_files,
+    load_policy_dataset, load_resource_cycle_v5_teacher_dataset,
 };
 use tzolkin_ai::public_model::{LoadedPublicPolicy, PublicPolicyArtifact};
 use tzolkin_ai::replay::{self, GameReplay, ReplaySource};
@@ -174,6 +175,149 @@ fn complete_native_three_and_four_players_roundtrip_all_ordered_rows_and_null_ta
     let legacy_dir = temp.0.join("legacy");
     dataset::export_dataset(&[basic(3).clone()], &legacy_dir).unwrap();
     assert!(load_policy_dataset(&legacy_dir).is_err());
+    resource_cycle_v5_teacher_roundtrip_and_closed_admission();
+}
+
+fn resource_cycle_v5_teacher_roundtrip_and_closed_admission() {
+    use tzolkin_ai::arena::resource_cycle::{self, ResourceCycleConfig};
+    use tzolkin_ai::replay::SeatPolicy;
+    let temp = Temp::new();
+    let configuration = ResourceCycleConfig::v5();
+    let records = [3, 4].map(|players| {
+        replay::play_game_using_fast(
+            players,
+            42,
+            GameOptions::default(),
+            true,
+            ReplaySource::PolicySelfPlay {
+                policies: vec![
+                    SeatPolicy::ResourceCycle {
+                        configuration: configuration.clone(),
+                    };
+                    players
+                ],
+            },
+            |o| resource_cycle::choose_move(o, &configuration),
+        )
+        .unwrap()
+        .2
+        .unwrap()
+    });
+    let sources = records
+        .iter()
+        .enumerate()
+        .map(|(i, record)| temp.source(&format!("teacher-{i}.json"), record))
+        .collect::<Vec<_>>();
+    let manifest = export_resource_cycle_v5_teacher_files(&sources, &temp.dataset()).unwrap();
+    assert_eq!(
+        manifest.source_kind,
+        policy_dataset::RESOURCE_CYCLE_V5_TEACHER_SOURCE_KIND
+    );
+    assert_eq!(
+        manifest.task,
+        policy_dataset::RESOURCE_CYCLE_V5_TEACHER_TASK
+    );
+    assert!(!manifest.value_supervised);
+    assert_eq!(manifest.games[0].family_id, manifest.games[1].family_id);
+    assert_eq!(manifest.strata.len(), 2);
+    assert!(load_policy_dataset(&temp.dataset()).is_err());
+    let dataset = load_resource_cycle_v5_teacher_dataset(&temp.dataset()).unwrap();
+    assert!(
+        tzolkin_ai::policy_training::train_dataset(
+            &dataset,
+            &tzolkin_ai::policy_training::PolicyBcConfig::default(),
+            None,
+        )
+        .is_err()
+    );
+    let samples = dataset.iter().map(Result::unwrap).collect::<Vec<_>>();
+    assert_eq!(
+        samples.len(),
+        records.iter().map(|r| r.steps.len()).sum::<usize>()
+    );
+    for (sample, step) in samples.iter().zip(records.iter().flat_map(|r| &r.steps)) {
+        assert_eq!(sample.actor(), step.actor);
+        assert_eq!(sample.phase(), &step.observation.phase);
+        assert_eq!(sample.value_target(), None);
+        assert_eq!(step.observation.legal_actions[sample.chosen()], step.chosen);
+        let encoder = FeatureEncoder::new_public(&step.observation).unwrap();
+        for (index, row) in sample.candidates().iter().enumerate() {
+            assert_eq!(row, &encoder.encode_legal_tagged(index).unwrap());
+        }
+    }
+    assert!(samples.iter().any(|s| s.phase() == &Phase::Setup));
+    assert!(samples.iter().any(|s| s.phase() == &Phase::Playing));
+    assert!(export_native_files(&sources, &temp.0.join("native")).is_err());
+    assert!(!temp.0.join("native").exists());
+    assert!(dataset::export_dataset(&records, &temp.0.join("legacy-teacher")).is_err());
+    assert!(
+        tzolkin_ai::state_mc_dataset::export_native_files(&sources, &temp.0.join("state-teacher"))
+            .is_err()
+    );
+
+    // A complete legal game cannot become v5 demonstrations by relabeling its header.
+    let mut relabeled = basic(3).clone();
+    relabeled.header.source = records[0].header.source.clone();
+    replay::verify_replay(&relabeled).unwrap();
+    assert!(relabeled.steps.iter().any(|s| {
+        resource_cycle::choose_move(&s.observation, &configuration)
+            .unwrap()
+            .r#move
+            != s.chosen.r#move
+    }));
+    let relabeled = temp.source("relabeled.json", &relabeled);
+    let error = export_resource_cycle_v5_teacher_files(&[relabeled], &temp.0.join("relabeled"))
+        .unwrap_err();
+    assert!(error.contains("regenerated teacher choice"));
+    assert!(!temp.0.join("relabeled").exists());
+
+    for (i, change) in ["v4", "coefficient", "mixed", "options", "state"]
+        .iter()
+        .enumerate()
+    {
+        let mut record = records[0].clone();
+        match *change {
+            "v4" => {
+                record.header.source = ReplaySource::PolicySelfPlay {
+                    policies: vec![
+                        SeatPolicy::ResourceCycle {
+                            configuration: ResourceCycleConfig::default(),
+                        };
+                        3
+                    ],
+                };
+            }
+            "coefficient" => {
+                if let ReplaySource::PolicySelfPlay { policies } = &mut record.header.source
+                    && let SeatPolicy::ResourceCycle { configuration } = &mut policies[0]
+                {
+                    configuration.qualified_investment_bonus += 1.0;
+                }
+            }
+            "mixed" => {
+                if let ReplaySource::PolicySelfPlay { policies } = &mut record.header.source {
+                    policies.pop();
+                }
+            }
+            "options" => record.header.options.tribes = true,
+            "state" => record.steps[0].state_after = "0".repeat(64),
+            _ => unreachable!(),
+        }
+        let source = temp.source(&format!("wrong-{i}.json"), &record);
+        let output = temp.0.join(format!("wrong-{i}"));
+        assert!(export_resource_cycle_v5_teacher_files(&[source], &output).is_err());
+        assert!(!output.exists());
+    }
+    let copied = temp.dataset().join(&manifest.games[0].source_file);
+    let original = fs::read(&copied).unwrap();
+    fs::write(&copied, b"{}").unwrap();
+    assert!(dataset.iter().next().unwrap().is_err());
+    fs::write(&copied, original).unwrap();
+    let mut forged = manifest.clone();
+    let mut lines = first_lines(&temp.dataset(), &forged);
+    lines[0]["candidates"][0]["values"][0] = Value::from(0.99);
+    rewrite_lines(&temp.dataset(), &mut forged, &lines);
+    assert!(load_resource_cycle_v5_teacher_dataset(&temp.dataset()).is_err());
 }
 
 #[test]
