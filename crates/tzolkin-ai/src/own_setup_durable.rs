@@ -29,8 +29,12 @@ use crate::public_stochastic_native::{CollectionLimits, NativeStochasticConfig, 
 use crate::public_stochastic_record::{MAX_RECORD_BYTES, unique_json};
 
 const ROOT_SCHEMA: &str = "tzolkin-own-setup-durable-root-v1";
+const CONTINUATION_SCHEMA: &str = "tzolkin-own-setup-durable-continuation-root-v1";
 const HEAD_SCHEMA: &str = "tzolkin-own-setup-durable-head-v1";
 const MAX_ATTEMPTS: u64 = 64;
+const MAX_SEGMENTS: usize = 16;
+const MAX_CAMPAIGN_EPISODES: u64 = 4096;
+const MAX_CAMPAIGN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const ROOT_CAP: usize = 16 * 1024 * 1024;
 const HEAD_CAP: usize = 128 * 1024;
 const CHECKPOINT_CAP: usize = 2 * 1024 * 1024;
@@ -105,6 +109,50 @@ struct Root {
     exclusion_digest: String,
     limits: OwnSetupArchiveLimits,
     checksum: String,
+}
+
+/// Caller-owned source locations and exact tips, in oldest-to-newest order.
+/// These metadata declarations cannot import an owner or optimizer.
+pub struct OwnSetupArchiveSource<'a> {
+    pub directory: &'a Path,
+    pub expected_tip: &'a OwnSetupArchiveTip,
+    pub exclusions: DeclaredOwnSetupExclusions,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Parent {
+    root: FilePin,
+    tip: OwnSetupArchiveTip,
+    checkpoint: FilePin,
+    config_checksum: String,
+    setup_checksum: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Offsets {
+    segments: usize,
+    attempted_episodes: u64,
+    updates: u64,
+    ledger_entries: usize,
+    ancestor_bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContinuationRoot {
+    schema: String,
+    config: Root,
+    parent: Parent,
+    offsets: Offsets,
+    additional_episodes: u64,
+    checksum: String,
+}
+
+#[derive(Debug)]
+struct Continuation {
+    offsets: Offsets,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -211,6 +259,8 @@ pub struct DurableOwnSetupOwner {
     owner: OwnSetupTrainingOwner,
     disk_bytes: u64,
     ready: bool,
+    reconstructed: bool,
+    continuation: Option<Continuation>,
 }
 impl DurableOwnSetupOwner {
     pub fn create(
@@ -263,7 +313,275 @@ impl DurableOwnSetupOwner {
             owner,
             disk_bytes,
             ready: true,
+            reconstructed: false,
+            continuation: None,
         })
+    }
+
+    /// Consumes a genuinely reconstructed, completed successful lineage. The
+    /// original archive is never edited; the child has its own bounded local
+    /// Pending/Closed sequence and retains the owner's cumulative ledger.
+    pub fn continue_in(
+        mut self,
+        directory: &Path,
+        additional_episodes: u64,
+        exclusions: DeclaredOwnSetupExclusions,
+        limits: OwnSetupArchiveLimits,
+    ) -> Result<Self, String> {
+        limits.validate()?;
+        let (parent, offsets) = self.continuation_parent()?;
+        if additional_episodes == 0
+            || additional_episodes > 256
+            || additional_episodes > limits.max_attempts * 4
+            || offsets
+                .attempted_episodes
+                .checked_add(additional_episodes)
+                .is_none_or(|n| n > MAX_CAMPAIGN_EPISODES)
+        {
+            return Err("Own Setup continuation exceeds finite local/cumulative bounds".into());
+        }
+        let config = self.apply_continuation(additional_episodes, exclusions, limits)?;
+        let checkpoint_bytes = bounded_json(&self.owner.checkpoint()?, CHECKPOINT_CAP)?;
+        let mut root = ContinuationRoot {
+            schema: CONTINUATION_SCHEMA.into(),
+            config,
+            parent,
+            offsets,
+            additional_episodes,
+            checksum: String::new(),
+        };
+        root.checksum = continuation_checksum(&root)?;
+        let root_bytes = bounded_json(&root, ROOT_CAP)?;
+        let root_pin = pin("root.json", &root_bytes);
+        let checkpoint = pin(&checkpoint_name(0, false), &checkpoint_bytes);
+        let head = new_head(0, &root_pin, None, Event::Genesis { checkpoint })?;
+        let head_bytes = bounded_json(&head, HEAD_CAP)?;
+        let disk_bytes = (root_bytes.len() + checkpoint_bytes.len() + head_bytes.len()) as u64;
+        check_campaign_space(disk_bytes, root.offsets.ancestor_bytes, &root.config.limits)?;
+        let directory = local(directory, true)?;
+        fs::create_dir(&directory).map_err(|e| e.to_string())?;
+        publish_metadata(&directory, "root.json", &root_bytes)?;
+        publish_metadata(&directory, &checkpoint_name(0, false), &checkpoint_bytes)?;
+        let head_pin = publish_metadata(&directory, &head_name(0), &head_bytes)?;
+        Ok(Self {
+            directory,
+            root: root.config,
+            root_pin,
+            tip: OwnSetupArchiveTip {
+                sequence: 0,
+                name: head_pin.name,
+                bytes: head_pin.bytes,
+                sha256: head_pin.sha256,
+            },
+            owner: self.owner,
+            disk_bytes,
+            ready: true,
+            reconstructed: false,
+            continuation: Some(Continuation {
+                offsets: root.offsets,
+            }),
+        })
+    }
+
+    fn apply_continuation(
+        &mut self,
+        additional_episodes: u64,
+        exclusions: DeclaredOwnSetupExclusions,
+        limits: OwnSetupArchiveLimits,
+    ) -> Result<Root, String> {
+        limits.validate()?;
+        if !(1..=256).contains(&additional_episodes)
+            || additional_episodes > limits.max_attempts * 4
+            || self
+                .owner
+                .attempted_episodes()
+                .checked_add(additional_episodes)
+                .is_none_or(|n| n > MAX_CAMPAIGN_EPISODES)
+        {
+            return Err("Own Setup successor episode bounds differ".into());
+        }
+        let run = self
+            .owner
+            .continue_budget(additional_episodes, exclusions)?;
+        let mut config = Root {
+            schema: ROOT_SCHEMA.into(),
+            initial: self.root.initial.clone(),
+            playing: fixed_playing_identity(self.owner.playing()?)?,
+            numerical_target: self.root.numerical_target.clone(),
+            adam: self.root.adam.clone(),
+            run,
+            excluded_families: self.owner.exclusion_families(),
+            exclusion_digest: self.owner.exclusion_digest().into(),
+            limits,
+            checksum: String::new(),
+        };
+        config.checksum = root_checksum(&config)?;
+        Ok(config)
+    }
+
+    /// Rebuilds every named ancestor from its own original sources and baseline.
+    /// Numeric genesis/checkpoint bytes are only compared to the carried owner.
+    /// Locations are caller-supplied; no directory walk discovers ancestors.
+    pub fn restore_chain(
+        sources: Vec<OwnSetupArchiveSource<'_>>,
+        playing: LoadedDeployment,
+    ) -> Result<(Self, OwnSetupRestoreWork), String> {
+        let start = Instant::now();
+        if sources.is_empty() || sources.len() > MAX_SEGMENTS {
+            return Err("Own Setup source chain exceeds finite segment bound".into());
+        }
+        let mut directories = BTreeSet::new();
+        for source in &sources {
+            let directory = local(source.directory, false)?;
+            let canonical = fs::canonicalize(directory).map_err(|e| e.to_string())?;
+            if !directories.insert(canonical) {
+                return Err("Own Setup source chain repeats an archive".into());
+            }
+        }
+        let mut sources = sources.into_iter();
+        let first = sources.next().ok_or("Own Setup source chain is empty")?;
+        let (mut restored, mut work) = Self::restore(
+            first.directory,
+            first.expected_tip,
+            playing,
+            first.exclusions,
+        )?;
+        for source in sources {
+            let (parent, offsets) = restored.continuation_parent()?;
+            let directory = local(source.directory, false)?;
+            let inventory = inventory(&directory)?;
+            let root_bytes = read_bounded(&directory.join("root.json"), ROOT_CAP)?;
+            let root: ContinuationRoot = decode(&root_bytes, ROOT_CAP)?;
+            if root.schema != CONTINUATION_SCHEMA
+                || root.checksum != continuation_checksum(&root)?
+                || root.parent != parent
+                || root.offsets != offsets
+                || inventory.keys().filter_map(|n| head_sequence(n)).max()
+                    != Some(source.expected_tip.sequence)
+            {
+                return Err("Own Setup successor parent/root/offset/latest binding differs".into());
+            }
+            let expected_config = restored.apply_continuation(
+                root.additional_episodes,
+                source.exclusions,
+                root.config.limits.clone(),
+            )?;
+            if json(&expected_config)? != json(&root.config)? {
+                return Err("Own Setup successor exact config/baseline differs".into());
+            }
+            let disk_bytes = inventory.values().try_fold(0u64, |n, bytes| {
+                n.checked_add(*bytes as u64)
+                    .ok_or("Own Setup successor disk count overflow")
+            })?;
+            check_campaign_space(disk_bytes, root.offsets.ancestor_bytes, &root.config.limits)?;
+            if source.expected_tip.sequence > 2 * root.config.limits.max_attempts {
+                return Err("Own Setup successor local head bound".into());
+            }
+            let root_pin = pin("root.json", &root_bytes);
+            let chain = read_chain(&directory, &root_pin, source.expected_tip)?;
+            let child = Self {
+                directory,
+                root: root.config,
+                root_pin,
+                tip: source.expected_tip.clone(),
+                owner: restored.owner,
+                disk_bytes,
+                ready: false,
+                reconstructed: false,
+                continuation: Some(Continuation {
+                    offsets: root.offsets,
+                }),
+            };
+            let (child, child_work) = Self::restore_history(child, chain, inventory, start)?;
+            restored = child;
+            work.closed_attempts += child_work.closed_attempts;
+            work.audited_records += child_work.audited_records;
+            work.audited_raw_bytes += child_work.audited_raw_bytes;
+            work.abandoned_pending |= child_work.abandoned_pending;
+        }
+        work.elapsed_seconds = start.elapsed().as_secs_f64();
+        Ok((restored, work))
+    }
+
+    /// Cumulative ledger index at the child's genesis; source records after this
+    /// index are this segment's new attempts rather than inherited work.
+    pub fn ledger_offset(&self) -> usize {
+        self.continuation
+            .as_ref()
+            .map_or(0, |c| c.offsets.ledger_entries)
+    }
+
+    pub fn attempted_episode_offset(&self) -> u64 {
+        self.continuation
+            .as_ref()
+            .map_or(0, |c| c.offsets.attempted_episodes)
+    }
+
+    pub fn update_offset(&self) -> u64 {
+        self.continuation.as_ref().map_or(0, |c| c.offsets.updates)
+    }
+
+    fn continuation_parent(&self) -> Result<(Parent, Offsets), String> {
+        let owner = self.owner()?;
+        let segments = self.continuation.as_ref().map_or(1, |c| c.offsets.segments);
+        if !self.reconstructed
+            || segments >= MAX_SEGMENTS
+            || self.tip.sequence == 0
+            || !self.tip.sequence.is_multiple_of(2)
+            || owner.attempted_episodes() != self.root.run.max_attempted_episodes
+            || owner.ledger().iter().any(|r| {
+                !matches!(
+                    r.outcome,
+                    crate::own_setup_training::OwnSetupAttemptOutcome::Updated { .. }
+                )
+            })
+            || Self::inspect_tip(&self.directory)? != self.tip
+        {
+            return Err("Own Setup continuation requires the latest reconstructed complete successful lineage".into());
+        }
+        read_pin(&self.directory, &self.root_pin, ROOT_CAP)?;
+        let raw = read_pin(&self.directory, &self.tip.pin()?, HEAD_CAP)?;
+        let head: Head = decode(&raw, HEAD_CAP)?;
+        if head.root != self.root_pin
+            || head.sequence != self.tip.sequence
+            || head.checksum != head_checksum(&head)?
+        {
+            return Err("Own Setup parent head binding differs".into());
+        }
+        let checkpoint = match head.event {
+            Event::Closed {
+                abandoned: false,
+                checkpoint,
+                ..
+            } => checkpoint,
+            _ => return Err("Own Setup continuation lacks a successful Closed checkpoint".into()),
+        };
+        self.check_checkpoint(&checkpoint, self.tip.sequence, false, &mut BTreeSet::new())?;
+        let ancestor_bytes = self
+            .continuation
+            .as_ref()
+            .map_or(0, |c| c.offsets.ancestor_bytes)
+            .checked_add(self.disk_bytes)
+            .ok_or("Own Setup ancestral disk count overflow")?;
+        if ancestor_bytes > MAX_CAMPAIGN_BYTES {
+            return Err("Own Setup ancestral archive byte cap".into());
+        }
+        Ok((
+            Parent {
+                root: self.root_pin.clone(),
+                tip: self.tip.clone(),
+                checkpoint,
+                config_checksum: owner.config_checksum().into(),
+                setup_checksum: owner.setup_checksum().into(),
+            },
+            Offsets {
+                segments: segments + 1,
+                attempted_episodes: owner.attempted_episodes(),
+                updates: owner.update_count(),
+                ledger_entries: owner.ledger().len(),
+                ancestor_bytes,
+            },
+        ))
     }
     /// Locates a published latest head after an uncertain I/O result. This only
     /// returns a file pin; `restore` still validates its complete source ancestry.
@@ -361,11 +679,16 @@ impl DurableOwnSetupOwner {
         }
         let reserve = (2 * CHECKPOINT_CAP + 4 * HEAD_CAP) as u64
             + (2 * storage::MAX_STORED_RECORD_BYTES) as u64 * batch as u64;
-        if self
-            .disk_bytes
-            .checked_add(reserve)
-            .is_none_or(|n| n > self.root.limits.max_disk_bytes)
-        {
+        if self.disk_bytes.checked_add(reserve).is_none_or(|n| {
+            check_campaign_space(
+                n,
+                self.continuation
+                    .as_ref()
+                    .map_or(0, |c| c.offsets.ancestor_bytes),
+                &self.root.limits,
+            )
+            .is_err()
+        }) {
             return Err("Own Setup durable disk budget cannot reserve bounded publication".into());
         }
         Ok(())
@@ -448,7 +771,7 @@ impl DurableOwnSetupOwner {
         let start = Instant::now();
         let directory = local(directory, false)?;
         let inventory = inventory(&directory)?;
-        let latest = expected_tip.pin()?;
+        expected_tip.pin()?;
         if inventory
             .keys()
             .filter_map(|name| head_sequence(name))
@@ -480,31 +803,7 @@ impl DurableOwnSetupOwner {
             return Err("Own Setup archive disk/head budget exceeded".into());
         }
         let root_pin = pin("root.json", &root_bytes);
-        let mut chain = Vec::new();
-        let mut current = Some(latest);
-        while let Some(p) = current {
-            let raw = read_pin(&directory, &p, HEAD_CAP)?;
-            let head: Head = decode(&raw, HEAD_CAP)?;
-            if head.schema != HEAD_SCHEMA
-                || head.root != root_pin
-                || p.name != head_name(head.sequence)
-                || head.checksum != head_checksum(&head)?
-                || chain.len() > 2 * MAX_ATTEMPTS as usize
-            {
-                return Err("Own Setup head ancestry/identity/checksum differs".into());
-            }
-            current = head.previous.clone();
-            chain.push((p, head));
-        }
-        chain.reverse();
-        if chain.len() != expected_tip.sequence as usize + 1
-            || chain
-                .iter()
-                .enumerate()
-                .any(|(i, (_, h))| h.sequence != i as u64)
-        {
-            return Err("Own Setup archive head chain is incomplete or unordered".into());
-        }
+        let chain = read_chain(&directory, &root_pin, expected_tip)?;
         let initial = InitializedOwnSetupArtifact::new(root.initial.seed)?;
         if initial.identity != root.initial {
             return Err("Own Setup initial root is not reproducible".into());
@@ -516,7 +815,7 @@ impl DurableOwnSetupOwner {
             root.run.clone(),
             exclusions,
         )?;
-        let mut restored = Self {
+        let restored = Self {
             directory,
             root,
             root_pin,
@@ -524,7 +823,18 @@ impl DurableOwnSetupOwner {
             owner,
             disk_bytes,
             ready: false,
+            reconstructed: false,
+            continuation: None,
         };
+        Self::restore_history(restored, chain, inventory, start)
+    }
+
+    fn restore_history(
+        mut restored: Self,
+        chain: Vec<(FilePin, Head)>,
+        inventory: BTreeMap<String, usize>,
+        start: Instant,
+    ) -> Result<(Self, OwnSetupRestoreWork), String> {
         let mut expected_names = BTreeSet::from(["root.json".to_owned()]);
         let mut pending: Option<(ReservedOwnSetupAttempt, Vec<OwnSetupNativeConfig>, u64)> = None;
         let mut work = OwnSetupRestoreWork {
@@ -660,11 +970,17 @@ impl DurableOwnSetupOwner {
             }
             require_inventory(&restored.directory, &inventory, &expected_names)?;
             let reserve = (2 * CHECKPOINT_CAP + 4 * HEAD_CAP) as u64;
-            if restored
-                .disk_bytes
-                .checked_add(reserve)
-                .is_none_or(|n| n > restored.root.limits.max_disk_bytes)
-            {
+            if restored.disk_bytes.checked_add(reserve).is_none_or(|n| {
+                check_campaign_space(
+                    n,
+                    restored
+                        .continuation
+                        .as_ref()
+                        .map_or(0, |c| c.offsets.ancestor_bytes),
+                    &restored.root.limits,
+                )
+                .is_err()
+            }) {
                 return Err("Own Setup pending recovery publication budget exhausted".into());
             }
             let report = restored.owner.abandon(reservation, &configs)?;
@@ -675,6 +991,7 @@ impl DurableOwnSetupOwner {
             restored.recover_unpublished_pending(&inventory, &expected_names)?;
             restored.ready = true;
         }
+        restored.reconstructed = true;
         work.elapsed_seconds = start.elapsed().as_secs_f64();
         Ok((restored, work))
     }
@@ -749,6 +1066,40 @@ impl DurableOwnSetupOwner {
     }
 }
 
+fn read_chain(
+    directory: &Path,
+    root_pin: &FilePin,
+    expected_tip: &OwnSetupArchiveTip,
+) -> Result<Vec<(FilePin, Head)>, String> {
+    let latest = expected_tip.pin()?;
+    let mut chain = Vec::new();
+    let mut current = Some(latest);
+    while let Some(p) = current {
+        let raw = read_pin(directory, &p, HEAD_CAP)?;
+        let head: Head = decode(&raw, HEAD_CAP)?;
+        if head.schema != HEAD_SCHEMA
+            || head.root != *root_pin
+            || p.name != head_name(head.sequence)
+            || head.checksum != head_checksum(&head)?
+            || chain.len() > 2 * MAX_ATTEMPTS as usize
+        {
+            return Err("Own Setup head ancestry/identity/checksum differs".into());
+        }
+        current = head.previous.clone();
+        chain.push((p, head));
+    }
+    chain.reverse();
+    if chain.len() != expected_tip.sequence as usize + 1
+        || chain
+            .iter()
+            .enumerate()
+            .any(|(i, (_, h))| h.sequence != i as u64)
+    {
+        return Err("Own Setup archive head chain is incomplete or unordered".into());
+    }
+    Ok(chain)
+}
+
 fn json<T: Serialize>(v: &T) -> Result<Vec<u8>, String> {
     serde_json::to_vec(v).map_err(|e| e.to_string())
 }
@@ -782,6 +1133,33 @@ fn root_checksum(root: &Root) -> Result<String, String> {
             &root.limits,
         ),
     )
+}
+fn continuation_checksum(root: &ContinuationRoot) -> Result<String, String> {
+    hash(
+        b"tzolkin-own-setup-durable-continuation-root-v1\0",
+        &(
+            &root.schema,
+            &root.config,
+            &root.parent,
+            &root.offsets,
+            root.additional_episodes,
+        ),
+    )
+}
+
+fn check_campaign_space(
+    bytes: u64,
+    ancestor_bytes: u64,
+    limits: &OwnSetupArchiveLimits,
+) -> Result<(), String> {
+    if bytes > limits.max_disk_bytes
+        || bytes
+            .checked_add(ancestor_bytes)
+            .is_none_or(|n| n > MAX_CAMPAIGN_BYTES)
+    {
+        return Err("Own Setup local/aggregate retained archive byte budget exceeded".into());
+    }
+    Ok(())
 }
 fn head_checksum(head: &Head) -> Result<String, String> {
     hash(
@@ -835,15 +1213,7 @@ fn publish_head(
     previous: Option<FilePin>,
     event: Event,
 ) -> Result<(OwnSetupArchiveTip, usize), String> {
-    let mut head = Head {
-        schema: HEAD_SCHEMA.into(),
-        sequence,
-        root: root.clone(),
-        previous,
-        event,
-        checksum: String::new(),
-    };
-    head.checksum = head_checksum(&head)?;
+    let head = new_head(sequence, root, previous, event)?;
     let raw = bounded_json(&head, HEAD_CAP)?;
     let p = publish_metadata(directory, &head_name(sequence), &raw)?;
     Ok((
@@ -855,6 +1225,23 @@ fn publish_head(
         },
         raw.len(),
     ))
+}
+fn new_head(
+    sequence: u64,
+    root: &FilePin,
+    previous: Option<FilePin>,
+    event: Event,
+) -> Result<Head, String> {
+    let mut head = Head {
+        schema: HEAD_SCHEMA.into(),
+        sequence,
+        root: root.clone(),
+        previous,
+        event,
+        checksum: String::new(),
+    };
+    head.checksum = head_checksum(&head)?;
+    Ok(head)
 }
 fn read_stored(directory: &Path, p: &FilePin) -> Result<Vec<u8>, String> {
     if p.name
@@ -1081,6 +1468,12 @@ mod tests {
         assert_eq!(work.audited_records, 1);
         assert!(work.audited_raw_bytes > 0);
         assert!(!work.abandoned_pending);
+        // A successfully recovered failed prefix cannot escape into a child.
+        assert!(split.continuation_parent().is_err());
+        assert_eq!(split.ledger_offset(), 0);
+        assert_eq!(split.attempted_episode_offset(), 0);
+        assert_eq!(split.update_offset(), 0);
+        assert!(check_campaign_space(MAX_CAMPAIGN_BYTES, 1, &split.root.limits).is_err());
         let second = split.attempt(std::slice::from_ref(&b)).unwrap();
         let reference = continuous.attempt(std::slice::from_ref(&b)).unwrap();
         assert_eq!(json(&second).unwrap(), json(&reference).unwrap());
@@ -1146,7 +1539,11 @@ mod tests {
         let mut root = serde_json::to_value(&split.root).unwrap();
         root["unexpected"] = true.into();
         assert!(decode::<Root>(&json(&root).unwrap(), ROOT_CAP).is_err());
-        assert!(decode::<OwnSetupArchiveTip>(br#"{"sequence":0,"sequence":1,"name":"head-00000000.json","bytes":1,"sha256":"a"}"#,HEAD_CAP).is_err());
+        assert!(decode::<OwnSetupArchiveTip>(
+            br#"{"sequence":0,"sequence":1,"name":"head-00000000.json","bytes":1,"sha256":"a"}"#,
+            HEAD_CAP
+        )
+        .is_err());
         let exact_tip = split.tip().clone();
         drop(split);
         let (restored, work) = DurableOwnSetupOwner::restore(
