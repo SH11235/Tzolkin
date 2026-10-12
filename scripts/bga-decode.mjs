@@ -795,7 +795,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             ),
         ))
     )
-      outcomes = outcomes.filter(outcomeFilter());
+      outcomes = outcomes.filter(outcomeFilter(outcomes));
     if (!outcomes.length) fail(`No legal outcome matches source evidence for ${reason}`);
     if (buildingClass !== null) {
       const action = (row) => ({ ...row.action, id: buildingClass[0] });
@@ -1858,6 +1858,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     return true;
   }
   function queuedPurchaseEvents(events) {
+    if (queuedPurchase.kind === 'technologyBuild')
+      return same(events, queuedPurchase.sources[queuedPurchase.sourceIndex].events);
     const first = events[0];
     if (queuedPurchase.stage === 'extraction') {
       if (events.length !== 1 || first?.kind !== 'resourceGain') return false;
@@ -1899,7 +1901,198 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       events[1].rawText === `収集技術ボーナス: ${first.actor}は好きな資源2個を得た`
     );
   }
-  function purchaseOutcome(event, events, witness) {
+  // A pure free-technology card can preserve an unused building bonus. Only
+  // immediately observed free choices and the same Build's actual payment may
+  // establish that branch; future checkpoints never select an earlier move.
+  function queuedTechnologyBuild(outcome, event, events, witness, previous = state()) {
+    const exact = (a, b) => matches(a, b) && matches(b, a);
+    const action = outcome.row.action;
+    const actor = actorId(event.actor);
+    const effects = buildings.get(action.id)?.effects;
+    const steps = effects?.[0]?.steps;
+    const before = previous.pending;
+    const next = outcome.frame.snapshot.state;
+    const level = previous.players[actor]?.technologies.architecture;
+    if (
+      witnesses.catalogHash !== catalogHash ||
+      actor < 0 ||
+      previous.currentPlayer !== actor ||
+      previous.version !== 1 ||
+      previous.additionalBuildings !== false ||
+      previous.expansion != null ||
+      ![1, 2].includes(steps) ||
+      !exact(effects, [{ type: 'technology', technology: 'any', steps }]) ||
+      ![1, 2].includes(level) ||
+      action.type !== 'build' ||
+      typeof action.architecture !== 'boolean' ||
+      action.discountResource !== null ||
+      action.renovation !== null ||
+      !same(witness.buildings, [action.id]) ||
+      before?.task?.type !== 'build' ||
+      before.task.remaining !== 2 ||
+      before.task.cornPayment !== false ||
+      !same(before.after, []) ||
+      events.at(-1) !== event ||
+      events.some(
+        (item) => item.actor !== event.actor || !['resourcePayment', 'build'].includes(item.kind),
+      ) ||
+      events.filter((item) => item.kind === 'build').length !== 1 ||
+      !same(typedResourceCost(action), paymentOf(events))
+    )
+      return null;
+    const continuation = {
+      type: 'build',
+      remaining: 1,
+      allowMonument: false,
+      cornPayment: false,
+      architectureAvailable: before.task.architectureAvailable !== false && !action.architecture,
+      ...(before.task.mandatory ? { mandatory: true } : {}),
+    };
+    const freeTask = (task, remaining) =>
+      task?.type === 'technology' &&
+      task.remaining === remaining &&
+      task.free === true &&
+      task.mandatory !== true;
+    if (
+      !freeTask(next.pending?.task, steps) ||
+      !exact(next.pending.task, outcome.frame.observation?.pendingTask) ||
+      !exact(next.pending.after, [continuation])
+    )
+      return null;
+    const expected = mechanical(previous);
+    expected.pending = copy(next.pending);
+    expected.buildings = previous.buildings.filter((id) => id !== action.id);
+    const player = expected.players[actor];
+    player.buildings.push(action.id);
+    for (const [i, resource] of RESOURCES.entries()) player.resources[resource] -= action.cost[i];
+    player.resources.corn += Number(action.architecture);
+    player.score += action.architecture && level >= 2 ? 2 : 0;
+    if (!exact(mechanical(next), expected)) return null;
+
+    const sources = context.nextSources;
+    if (sources.length < steps + 1) return null;
+    let preview = outcome.frame;
+    const evidence = [];
+    for (let index = 0; index < steps; index++) {
+      const [sourceId, sourceEvents] = sources[index];
+      const choice = sourceEvents[0];
+      const old = preview.snapshot.state;
+      const technology = choice?.detail?.technology;
+      if (
+        sourceEvents.length !== 1 ||
+        choice.kind !== 'technology' ||
+        choice.actor !== event.actor ||
+        choice.detail.steps !== 1 ||
+        !TECHNOLOGIES.includes(technology) ||
+        !freeTask(old.pending?.task, steps - index) ||
+        !Number.isSafeInteger(old.players[actor].technologies[technology]) ||
+        old.players[actor].technologies[technology] >= 3 ||
+        (observed.get(sourceId)?.refills?.currentAge?.length ?? 0) !== 0 ||
+        (observed.get(sourceId)?.refills?.age2?.length ?? 0) !== 0
+      )
+        return null;
+      const rows = preview.observation.legalActions.filter(
+        (row) => row.action.type === 'technology' && row.action.technology === technology,
+      );
+      if (rows.length !== 1) return null;
+      if (calls + 1 >= MAX_CALLS)
+        fail('Core call budget exhausted before queued technology preview');
+      preview = core({
+        operation: 'publicApply',
+        state: old,
+        actor,
+        move: rows[0].move,
+        refills: { currentAge: [], age2: [] },
+      });
+      const after = preview.snapshot.state;
+      const expectedAfter = mechanical(old);
+      expectedAfter.players[actor].technologies[technology]++;
+      expectedAfter.pending = copy(after.pending);
+      if (
+        !exact(mechanical(after), expectedAfter) ||
+        !exact(after.pending?.task, preview.observation?.pendingTask) ||
+        (index + 1 < steps
+          ? !freeTask(after.pending?.task, steps - index - 1) ||
+            !exact(after.pending.after, [continuation])
+          : !exact(after.pending?.task, continuation) || !same(after.pending?.after, []))
+      )
+        return null;
+      evidence.push({
+        sourceId,
+        events: copy(sourceEvents),
+        move: copy(rows[0].move),
+        expectedState: mechanical(after),
+      });
+    }
+    const [sourceId, sourceEvents] = sources[steps];
+    const nextWitness = observed.get(sourceId) ?? {};
+    const purchase = sourceEvents.find((item) => item.kind === 'build');
+    const prefix = sourceEvents.slice(0, sourceEvents.indexOf(purchase));
+    if (
+      !purchase ||
+      sourceEvents.filter((item) => ['build', 'monument'].includes(item.kind)).length !== 1 ||
+      sourceEvents.some((item) => purchaseActor(item) !== event.actor) ||
+      !prefix.length ||
+      prefix.some((item) => item.kind !== 'resourcePayment' && !emptyPurchasePayment(item)) ||
+      !prefix.some(emptyPurchasePayment) ||
+      sourceEvents
+        .slice(prefix.length)
+        .some((item) => item.kind === 'resourcePayment' || emptyPurchasePayment(item)) ||
+      nextWitness.buildings?.length !== 1 ||
+      nextWitness.buildingEquivalenceClass !== undefined ||
+      (nextWitness.monuments?.length ?? 0) !== 0 ||
+      (nextWitness.refills?.currentAge?.length ?? 0) !== 0 ||
+      (nextWitness.refills?.age2?.length ?? 0) !== 0
+    )
+      return null;
+    const payment = paymentOf(prefix);
+    const rows = preview.observation.legalActions.filter(
+      (row) =>
+        row.action.type === 'build' &&
+        row.action.id === nextWitness.buildings[0] &&
+        row.action.renovation === null &&
+        same(typedResourceCost(row.action), payment),
+    );
+    if (rows.length === 0) return false;
+    if (rows.length !== 1) return null;
+    evidence.push({ sourceId, events: copy(sourceEvents), move: copy(rows[0].move) });
+    return {
+      kind: 'technologyBuild',
+      actor,
+      sources: evidence,
+      sourceIndex: 0,
+      pending: copy(next.pending),
+    };
+  }
+  function finishQueuedTechnologyBuild() {
+    const receipt = queuedPurchase;
+    const source = receipt.sources[receipt.sourceIndex];
+    if (
+      record.steps.length !== receipt.stepCount + 1 ||
+      !same(record.steps.at(-1).move, source.move) ||
+      (source.expectedState &&
+        (!matches(mechanical(state()), source.expectedState) ||
+          !matches(source.expectedState, mechanical(state()))))
+    )
+      fail('Queued technology purchase differs from its actual observed continuation');
+    if (receipt.sourceIndex + 1 < receipt.sources.length) {
+      queuedPurchase = { ...receipt, sourceIndex: receipt.sourceIndex + 1 };
+      return false;
+    }
+    if (pending() !== null) fail('Queued technology purchase did not settle its final Build');
+    audit.push({
+      actionId: context.id,
+      queuedPurchaseSourceActionId: receipt.sourceId,
+      technologySourceActionIds: receipt.sources.slice(0, -1).map((item) => item.sourceId),
+      paymentSourceActionId: source.sourceId,
+      actor: receipt.actor,
+      actualDelivered: true,
+      continuation: 'pureTechnologyBuild',
+      humanPlayingBcReady: false,
+    });
+    return true;
+  }
+  function purchaseOutcome(event, events, witness, outcomes = []) {
     const actor = actorId(event.actor);
     const remaining = events.slice(events.indexOf(event) + 1);
     const workerCaps = remaining.filter(cappedWorkerCaption);
@@ -1961,6 +2154,18 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     }
     if (Object.values(gains).some((amount) => !Number.isSafeInteger(amount) || amount < 0))
       fail('Observed purchase gain is out of bounds');
+    // A branch is selected only when every candidate has the same bounded
+    // causal shape and exactly one can pay the next observed purchase. A
+    // partial proof leaves the original candidates ambiguous.
+    const technologyBuildProofs = outcomes.map((outcome) =>
+      queuedTechnologyBuild(outcome, event, events, witness),
+    );
+    const provedTechnologyBuild =
+      technologyBuildProofs.length > 1 &&
+      technologyBuildProofs.every((proof) => proof !== null) &&
+      technologyBuildProofs.filter(Boolean).length === 1
+        ? outcomes[technologyBuildProofs.findIndex(Boolean)]
+        : null;
     return (outcome) => {
       const task = outcome.frame.observation?.pendingTask?.type ?? null;
       if (workerCaps.length && !cappedPurchaseWorker(outcome)) return false;
@@ -1986,6 +2191,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       }
       if (task === 'technology' && queuedPurchaseShape(outcome, event, events, witness))
         return matches(outcome.frame.snapshot.state, witness.expected);
+      if (
+        task === 'technology' &&
+        buildings.get(outcome.row.action.id)?.effects.length === 1 &&
+        buildings.get(outcome.row.action.id).effects[0].technology === 'any'
+      )
+        return provedTechnologyBuild === null || outcome === provedTechnologyBuild;
       if (
         task === 'trade' &&
         (gains.score ?? 0) > 0 &&
@@ -2111,6 +2322,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       id,
       events,
       nextSource: groups[groupIndex + 1],
+      nextSources: groups.slice(groupIndex + 1, groupIndex + 4),
       before: copy(state()),
       pools: {
         currentAge: [...(witness.refills?.currentAge ?? [])],
@@ -2174,7 +2386,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           !same(state().pending, queuedPurchase.pending) ||
           (witness.refills?.currentAge?.length ?? 0) !== 0 ||
           (witness.refills?.age2?.length ?? 0) !== 0 ||
-          (witness.buildings?.length ?? 0) !== 0 ||
+          ((witness.buildings?.length ?? 0) !== 0 &&
+            !(
+              queuedPurchase.kind === 'technologyBuild' &&
+              queuedPurchase.sourceIndex === queuedPurchase.sources.length - 1
+            )) ||
           (witness.monuments?.length ?? 0) !== 0)
       )
         fail('Queued purchase requires the next same-actor technology or exact material choice');
@@ -2510,7 +2726,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               `observed ${event.kind}`,
               false,
               false,
-              () => purchaseOutcome(event, events, witness),
+              (outcomes) => purchaseOutcome(event, events, witness, outcomes),
               buildingClass !== null ||
                 events.some(
                   (item) =>
@@ -2542,13 +2758,21 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               workerCapped: cappedPurchaseWorker({ frame, row: { action } }, beforePurchase),
               workerCapClaimed: false,
             };
-            const receipt = queuedPurchaseShape(
-              { frame, row: { action } },
-              event,
-              events,
-              witness,
-              beforePurchase,
-            );
+            const receipt =
+              queuedPurchaseShape(
+                { frame, row: { action } },
+                event,
+                events,
+                witness,
+                beforePurchase,
+              ) ??
+              queuedTechnologyBuild(
+                { frame, row: { action } },
+                event,
+                events,
+                witness,
+                beforePurchase,
+              );
             if (
               cornTechnologyPair(action.id) !== null &&
               !['cornTheology', 'cornTechnology'].includes(receipt?.kind)
@@ -2557,7 +2781,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 'Corn plus technology purchase requires its exact observed continuation receipt',
               );
             if (receipt) {
-              if (saved.deferredScore)
+              if (saved.deferredScore || saved.queuedPurchase?.kind === 'technologyBuild')
                 fail('A deferred purchase cannot nest another unresolved receipt');
               const nextSourceId = groups[groupIndex + 1]?.[0];
               if (nextSourceId === undefined) fail('Queued purchase has no next observed source');
@@ -2571,6 +2795,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 saved,
               };
               history.at(-1).unsettledPurchase = true;
+              if (receipt.kind === 'technologyBuild') {
+                audit.at(-1).causalPreviewSourceActionIds = receipt.sources.map(
+                  (item) => item.sourceId,
+                );
+                audit.at(-1).humanPlayingBcReady = false;
+              }
             }
             const scoreReceipt = deferredScoreShape(
               { frame, row: { action } },
@@ -2917,7 +3147,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           expected: copy(witness.expected),
         };
       if (saved.queuedPurchase) {
-        if (finishQueuedPurchase(events[0])) queuedPurchase = null;
+        if (
+          saved.queuedPurchase.kind === 'technologyBuild'
+            ? finishQueuedTechnologyBuild()
+            : finishQueuedPurchase(events[0])
+        )
+          queuedPurchase = null;
         else {
           const nextSourceId = groups[groupIndex + 1]?.[0];
           if (nextSourceId === undefined)
