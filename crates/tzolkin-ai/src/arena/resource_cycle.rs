@@ -344,7 +344,7 @@ fn v5_adjustment(
                 GearId::Tikal
                     if early
                         && food_covered
-                        && material_count(p) >= level + 1
+                        && material_count(p) > level
                         && own_forward_worker(
                             o,
                             GearId::Yaxchilan,
