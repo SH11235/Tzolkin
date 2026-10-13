@@ -9,8 +9,8 @@ use crate::conditional_human_rl_update::{
 };
 use crate::dataset::DatasetSplit;
 use crate::human_policy_dataset::{
-    CAPPED_EXTRACTION_LABEL_SCOPE, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
-    OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
+    CAPPED_EXTRACTION_LABEL_SCOPE, ConditionalFeatureProfile, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE,
+    FACTORIZED_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
     PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use crate::human_policy_training::{ConditionalDatasetIdentity, PreparedConditionalHumanPolicy};
@@ -27,6 +27,8 @@ use tzolkin_inference::trade_guard::{
 
 pub const POLICY_VERSION: &str = "conditional-human-corn-setup-guarded-playing-v1";
 pub const ARENA_SCHEMA: &str = "tzolkin-conditional-human-policy-development-arena-v1";
+pub const SEMANTIC_PLAYING_POLICY_VERSION: &str =
+    "conditional-human-semantic-playing-corn-setup-guarded-v1";
 pub const MIXED_POLICY_VERSION: &str = "conditional-human-current-allphase-guarded-argmax-v1";
 pub const MIXED_ARENA_SCHEMA: &str = "tzolkin-conditional-human-mixed-development-arena-v1";
 pub const COUNT_ZERO_POLICY_VERSION: &str =
@@ -109,6 +111,63 @@ impl<'a> ConditionalPolicy<'a> {
     pub fn with_choice_diagnostics(mut self) -> Self {
         self.identity.choice_diagnostics = Some(CHOICE_DIAGNOSTICS_SCHEMA);
         self
+    }
+    pub(super) fn teacher_grammar_contains(&self, action: &TypedAction) -> bool {
+        teacher_grammar_contains(self.prepared.identity().label_scope.as_deref(), action)
+    }
+}
+
+/// Explicit schema-4 Playing with the original source-loaded conditional origin.
+/// This type cannot enter the legacy Arena, native deployment or learner APIs.
+pub struct SemanticPlayingConditionalPolicy<'a> {
+    prepared: &'a PreparedConditionalHumanPolicy,
+    identity: ConditionalIdentity,
+}
+impl<'a> SemanticPlayingConditionalPolicy<'a> {
+    pub fn new(
+        prepared: &'a PreparedConditionalHumanPolicy,
+        setup: ConditionalSetup,
+        guard: TradeGuardConfig,
+    ) -> Result<Self, String> {
+        prepared.model().validate_semantic_playing()?;
+        if prepared.identity().feature_profile()? != ConditionalFeatureProfile::SemanticPlaying4 {
+            return Err("Semantic Playing Arena requires its own schema-4 origin".into());
+        }
+        prepared.recheck_sources()?;
+        let configuration_key = guard.configuration_key()?;
+        Ok(Self {
+            prepared,
+            identity: ConditionalIdentity {
+                policy_version: SEMANTIC_PLAYING_POLICY_VERSION.into(),
+                task: serde_json::to_value(&prepared.model().task).map_err(|e| e.to_string())?,
+                input_contract: prepared.model().input_contract.clone(),
+                checkpoint_checksum: prepared.checkpoint_checksum().into(),
+                model_checksum: prepared.model().checksum.clone(),
+                dataset: serde_json::to_value(prepared.identity()).map_err(|e| e.to_string())?,
+                reservations: prepared.reservations().clone(),
+                backend: prepared.backend().into(),
+                setup,
+                setup_policy_version: crate::setup_policy::POLICY_VERSION.into(),
+                setup_weights: HeuristicWeights::default(),
+                guard,
+                configuration_key,
+                source_qualified: false,
+                verified_native_policy: false,
+                value_validity: serde_json::to_value(prepared.model().value_validity)
+                    .map_err(|e| e.to_string())?,
+                choice_diagnostics: None,
+            },
+        })
+    }
+    pub fn identity(&self) -> &ConditionalIdentity {
+        &self.identity
+    }
+    pub fn with_choice_diagnostics(mut self) -> Self {
+        self.identity.choice_diagnostics = Some(CHOICE_DIAGNOSTICS_SCHEMA);
+        self
+    }
+    pub(super) fn prepared(&self) -> &'a PreparedConditionalHumanPolicy {
+        self.prepared
     }
     pub(super) fn teacher_grammar_contains(&self, action: &TypedAction) -> bool {
         teacher_grammar_contains(self.prepared.identity().label_scope.as_deref(), action)
@@ -583,6 +642,7 @@ pub(super) struct ConditionalDecision {
 #[derive(Clone, Copy)]
 enum SetupRoute {
     CornFirst,
+    SemanticPlayingCornFirst,
     NumericAllPhase(&'static str),
     PhaseRoutedDevelopment,
 }
@@ -590,6 +650,7 @@ impl SetupRoute {
     fn policy_version(self) -> &'static str {
         match self {
             Self::CornFirst => POLICY_VERSION,
+            Self::SemanticPlayingCornFirst => SEMANTIC_PLAYING_POLICY_VERSION,
             Self::NumericAllPhase(version) => version,
             Self::PhaseRoutedDevelopment => super::phase_routed::POLICY_VERSION,
         }
@@ -609,6 +670,10 @@ impl GameSession {
     pub(super) fn new(policy: &ConditionalPolicy<'_>) -> Self {
         Self::with_config(policy.identity.setup, &policy.identity.guard)
             .expect("conditional constructor validated guard configuration")
+    }
+    pub(super) fn new_semantic_playing(policy: &SemanticPlayingConditionalPolicy<'_>) -> Self {
+        Self::with_route(SetupRoute::SemanticPlayingCornFirst, &policy.identity.guard)
+            .expect("semantic Playing constructor validated guard configuration")
     }
     pub(super) fn new_mixed(policy: &ConditionalMixedArenaPolicy<'_>) -> Self {
         Self::with_route(
@@ -709,6 +774,16 @@ impl GameSession {
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.prepared.distribution(o))
     }
+    pub(super) fn choose_semantic_playing(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &SemanticPlayingConditionalPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| {
+            policy.prepared.distribution_semantic_playing(o)
+        })
+    }
     pub(super) fn choose_mixed(
         &mut self,
         index: usize,
@@ -772,7 +847,12 @@ impl GameSession {
                 return Err("Conditional choice requires one current callback".into());
             }
             let (raw, scores) = match o.phase {
-                Phase::Setup if matches!(self.setup, SetupRoute::CornFirst) => {
+                Phase::Setup
+                    if matches!(
+                        self.setup,
+                        SetupRoute::CornFirst | SetupRoute::SemanticPlayingCornFirst
+                    ) =>
+                {
                     let decision = crate::setup_policy::choose_move_with_weights(
                         o,
                         &HeuristicWeights::default(),
@@ -1219,6 +1299,27 @@ mod tests {
         assert!(GameSession::with_config(ConditionalSetup::CornFirst, &invalid).is_err());
         let state = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
         let o = observe(&state, state.current_player).unwrap();
+        let mut semantic_setup = GameSession::with_route(
+            SetupRoute::SemanticPlayingCornFirst,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        semantic_setup.on_callback(0, &o).unwrap();
+        let semantic_setup_choice = semantic_setup
+            .choose_using(0, &o, |_| {
+                panic!("Schema-4 Playing inference must not score Setup")
+            })
+            .unwrap()
+            .decision;
+        let old_setup_choice =
+            crate::setup_policy::choose_move_with_weights(&o, &HeuristicWeights::default())
+                .unwrap();
+        assert_eq!(semantic_setup_choice.r#move, old_setup_choice.r#move);
+        assert_eq!(semantic_setup_choice.score, old_setup_choice.score);
+        assert_eq!(
+            semantic_setup_choice.policy_version,
+            SEMANTIC_PLAYING_POLICY_VERSION
+        );
         // Exercise the actual candidate encoder and numeric borrow without
         // constructing an audited checkpoint/source or granting an Arena role.
         use tzolkin_inference::policy::{
@@ -1410,6 +1511,42 @@ mod tests {
         assert_eq!(decision.decision.policy_version, POLICY_VERSION);
         assert_eq!(decision.decision.r#move, o.legal_actions[0].r#move);
         assert!(routed.choose_using(3, &o, |_| unreachable!()).is_err());
+        // Pure numeric/callback parity only; no loaded checkpoint or source admission.
+        let playing =
+            tzolkin_inference::policy::BorrowedSemanticPlayingPolicy::from_validated_parameters(
+                model.parameters(),
+            )
+            .unwrap();
+        let encoder = crate::features::FeatureEncoder::new_semantic_playing(&o).unwrap();
+        let rows = (0..o.legal_actions.len())
+            .map(|i| encoder.encode_legal_tagged(i).unwrap())
+            .collect::<Vec<_>>();
+        let prediction = playing.predict(scalar, &rows).unwrap();
+        assert!(public.predict(scalar, &rows).is_err());
+        let expected_index = (1..prediction.logits.len()).fold(0, |best, i| {
+            if prediction.logits[i] > prediction.logits[best] {
+                i
+            } else {
+                best
+            }
+        });
+        let mut semantic_game = GameSession::with_route(
+            SetupRoute::SemanticPlayingCornFirst,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        semantic_game.on_callback(0, &o).unwrap();
+        let decision = semantic_game
+            .choose_using(0, &o, |_| Ok(prediction))
+            .unwrap()
+            .decision;
+        assert_eq!(decision.r#move, o.legal_actions[expected_index].r#move);
+        assert_eq!(decision.policy_version, SEMANTIC_PLAYING_POLICY_VERSION);
+        assert!(
+            semantic_game
+                .choose_using(0, &o, |_| unreachable!())
+                .is_err()
+        );
     }
     #[test]
     fn conditional_trade_uses_shared_history_and_resets_on_other_actor() {
@@ -1438,6 +1575,7 @@ mod tests {
         };
         for route in [
             SetupRoute::CornFirst,
+            SetupRoute::SemanticPlayingCornFirst,
             SetupRoute::NumericAllPhase(MIXED_POLICY_VERSION),
             SetupRoute::NumericAllPhase(COUNT_ZERO_POLICY_VERSION),
             SetupRoute::NumericAllPhase(super::super::teacher::POLICY_VERSION),

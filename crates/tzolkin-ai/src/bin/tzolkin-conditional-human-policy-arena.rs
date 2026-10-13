@@ -7,20 +7,24 @@ use std::io::{Read, Write};
 use std::path::{Component, Path};
 use tzolkin_ai::arena::conditional::{
     CHOICE_DIAGNOSTICS_SCHEMA, ConditionalPolicy, ConditionalSetup,
+    SemanticPlayingConditionalPolicy,
 };
 use tzolkin_ai::arena::numeric::{
     ExternalExclusions, NumericArenaConfig, NumericPolicy, Opponent, SCHEMA,
-    run_corn_first_conditional_validation,
+    run_corn_first_conditional_validation, run_corn_first_semantic_playing_conditional_validation,
 };
 use tzolkin_ai::arena::resource_cycle::ResourceCycleConfig;
 use tzolkin_ai::dataset::DatasetSplit;
 use tzolkin_ai::human_initial_wealth::table_family_id;
+use tzolkin_ai::human_policy_dataset::ConditionalFeatureProfile;
 use tzolkin_ai::human_policy_training::PreparedConditionalHumanPolicy;
 use tzolkin_ai::policy_training::validate_new_output_directory;
 use tzolkin_inference::deployment::{LoadedDeployment, MAX_DEPLOYMENT_BYTES};
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 const INPUT_SCHEMA: &str = "tzolkin-conditional-human-corn-first-arena-input-v1";
+const PROFILED_INPUT_SCHEMA: &str =
+    "tzolkin-conditional-human-semantic-playing-corn-first-arena-input-v1";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
 const MAX_REPORT: usize = 32 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT: usize = 128 * 1024 * 1024;
@@ -36,6 +40,53 @@ struct Input {
     external_exclusions: ExternalExclusions,
     #[serde(default)]
     choice_diagnostics: bool,
+}
+#[derive(Deserialize)]
+struct InputSchema {
+    schema: String,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProfiledInput {
+    schema: String,
+    seeds: Vec<u32>,
+    bootstrap_seed: u64,
+    external_exclusions: ExternalExclusions,
+    actor_profiles: [ConditionalFeatureProfile; 2],
+    #[serde(default)]
+    choice_diagnostics: bool,
+}
+fn parse_input(bytes: &[u8]) -> Result<(Input, Option<[ConditionalFeatureProfile; 2]>), String> {
+    let header: InputSchema = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    match header.schema.as_str() {
+        INPUT_SCHEMA => Ok((
+            serde_json::from_slice(bytes).map_err(|e| e.to_string())?,
+            None,
+        )),
+        PROFILED_INPUT_SCHEMA => {
+            // Parse the original bytes again, retaining duplicate/unknown-field refusal.
+            let input: ProfiledInput = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+            if !input
+                .actor_profiles
+                .contains(&ConditionalFeatureProfile::SemanticPlaying4)
+            {
+                return Err(
+                    "Semantic Playing Arena input requires an explicit schema-4 actor".into(),
+                );
+            }
+            Ok((
+                Input {
+                    schema: input.schema,
+                    seeds: input.seeds,
+                    bootstrap_seed: input.bootstrap_seed,
+                    external_exclusions: input.external_exclusions,
+                    choice_diagnostics: input.choice_diagnostics,
+                },
+                Some(input.actor_profiles),
+            ))
+        }
+        _ => Err("Conditional Arena requires a closed input schema".into()),
+    }
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -134,8 +185,12 @@ fn run() -> Result<(), String> {
     let output = Path::new(&args[6]);
     validate_new_output_directory(output)?;
     let (input_bytes, input_pin) = read_pin(Path::new(&args[5]), MAX_INPUT)?;
-    let input: Input = serde_json::from_slice(&input_bytes).map_err(|e| e.to_string())?;
-    if input.schema != INPUT_SCHEMA || input.seeds.len() > MAX_SEEDS {
+    let (input, explicit_profiles) = parse_input(&input_bytes)?;
+    let profiled = explicit_profiles.is_some();
+    let profiles = explicit_profiles.unwrap_or([ConditionalFeatureProfile::Public2; 2]);
+    if ![INPUT_SCHEMA, PROFILED_INPUT_SCHEMA].contains(&input.schema.as_str())
+        || input.seeds.len() > MAX_SEEDS
+    {
         return Err(
             "Conditional Arena requires its closed schema and at most 64 Validation seeds".into(),
         );
@@ -159,11 +214,21 @@ fn run() -> Result<(), String> {
     }
     let (numeric_bytes, numeric_pin) = read_pin(Path::new(&args[4]), MAX_DEPLOYMENT_BYTES)?;
     pins.push(numeric_pin);
-    let actors = [
-        PreparedConditionalHumanPolicy::load(Path::new(&args[0]), Path::new(&args[1]))?,
-        PreparedConditionalHumanPolicy::load(Path::new(&args[2]), Path::new(&args[3]))?,
-    ];
+    let load_actor = |index: usize| match profiles[index] {
+        ConditionalFeatureProfile::Public2 => PreparedConditionalHumanPolicy::load(
+            Path::new(&args[index * 2]),
+            Path::new(&args[index * 2 + 1]),
+        ),
+        ConditionalFeatureProfile::SemanticPlaying4 => {
+            PreparedConditionalHumanPolicy::load_semantic_playing(
+                Path::new(&args[index * 2]),
+                Path::new(&args[index * 2 + 1]),
+            )
+        }
+    };
+    let actors = [load_actor(0)?, load_actor(1)?];
     let mut train_families = BTreeSet::new();
+    let mut origin_families = BTreeSet::new();
     let mut reservations = BTreeMap::new();
     for actor in &actors {
         for (table, split) in actor.reservations() {
@@ -176,6 +241,10 @@ fn run() -> Result<(), String> {
             if *split == DatasetSplit::Train {
                 train_families.insert(table_family_id(table)?);
             }
+            if profiled {
+                // Include held-out and zero-row declarations from BOTH original collections.
+                origin_families.insert(table_family_id(table)?);
+            }
         }
     }
     let mut all_excluded = input
@@ -183,13 +252,28 @@ fn run() -> Result<(), String> {
         .excluded_family_ids
         .into_iter()
         .collect::<BTreeSet<_>>();
-    all_excluded.extend(train_families.iter().cloned());
-    let evidence = serde_json::to_vec(&(
-        &pins,
-        actors[0].checkpoint_checksum(),
-        actors[1].checkpoint_checksum(),
-        &train_families,
-    ))
+    let added_families = if profiled {
+        &origin_families
+    } else {
+        &train_families
+    };
+    all_excluded.extend(added_families.iter().cloned());
+    let evidence = if profiled {
+        serde_json::to_vec(&(
+            &pins,
+            actors[0].checkpoint_checksum(),
+            actors[1].checkpoint_checksum(),
+            &origin_families,
+            profiles,
+        ))
+    } else {
+        serde_json::to_vec(&(
+            &pins,
+            actors[0].checkpoint_checksum(),
+            actors[1].checkpoint_checksum(),
+            &train_families,
+        ))
+    }
     .map_err(|e| e.to_string())?;
     for config in &mut configs {
         config.external_exclusions.excluded_family_ids = all_excluded.iter().cloned().collect();
@@ -203,20 +287,45 @@ fn run() -> Result<(), String> {
     for (i, actor) in actors.iter().enumerate() {
         for config in &configs {
             recheck(&pins, &actors)?;
-            let candidate =
-                ConditionalPolicy::new(actor, ConditionalSetup::CornFirst, guard.clone())?;
-            let candidate = if input.choice_diagnostics {
-                candidate.with_choice_diagnostics()
-            } else {
-                candidate
-            };
             let reference =
                 NumericPolicy::new(LoadedDeployment::load(&numeric_bytes)?, guard.clone())?;
             let pool = (0..config.players)
                 .map(|_| Opponent::ResourceCycle(ResourceCycleConfig::v5()))
                 .collect();
-            let report = run_corn_first_conditional_validation(config, candidate, reference, pool)?;
-            recheck(&pins, &actors)?;
+            let report = match profiles[i] {
+                ConditionalFeatureProfile::Public2 => {
+                    let candidate =
+                        ConditionalPolicy::new(actor, ConditionalSetup::CornFirst, guard.clone())?;
+                    let candidate = if input.choice_diagnostics {
+                        candidate.with_choice_diagnostics()
+                    } else {
+                        candidate
+                    };
+                    run_corn_first_conditional_validation(config, candidate, reference, pool)
+                }
+                ConditionalFeatureProfile::SemanticPlaying4 => {
+                    let candidate = SemanticPlayingConditionalPolicy::new(
+                        actor,
+                        ConditionalSetup::CornFirst,
+                        guard.clone(),
+                    )?;
+                    let candidate = if input.choice_diagnostics {
+                        candidate.with_choice_diagnostics()
+                    } else {
+                        candidate
+                    };
+                    run_corn_first_semantic_playing_conditional_validation(
+                        config, candidate, reference, pool,
+                    )
+                }
+            };
+            if profiled {
+                recheck(&pins, &actors)?;
+            }
+            let report = report?;
+            if !profiled {
+                recheck(&pins, &actors)?;
+            }
             write_new(
                 &output.join(format!("actor{}-{}p.json", i + 1, config.players)),
                 &report,
@@ -241,6 +350,12 @@ fn run() -> Result<(), String> {
     });
     if input.choice_diagnostics {
         summary["choiceDiagnostics"] = serde_json::json!(CHOICE_DIAGNOSTICS_SCHEMA);
+    }
+    if profiled {
+        summary["schema"] =
+            serde_json::json!("tzolkin-conditional-human-semantic-playing-paired-arena-cli-v1");
+        summary["actorFeatureProfiles"] = serde_json::json!(profiles);
+        summary["originReservedFamiliesAddedToExclusions"] = serde_json::json!(origin_families);
     }
     write_new(&output.join("summary.json"), &summary, &mut total)?;
     println!(

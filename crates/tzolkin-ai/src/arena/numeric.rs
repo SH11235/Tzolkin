@@ -5,6 +5,7 @@ use super::conditional::{
     ConditionalChoiceDiagnostics, ConditionalCountZeroArenaIdentity,
     ConditionalCountZeroArenaPolicy, ConditionalDiagnostics, ConditionalIdentity,
     ConditionalMixedArenaIdentity, ConditionalMixedArenaPolicy, ConditionalPolicy, GameSession,
+    SemanticPlayingConditionalPolicy,
 };
 use super::phase_routed::{
     PhaseRouteDiagnostics, PhaseRoutedDevelopmentIdentity, PhaseRoutedDevelopmentPolicy,
@@ -40,6 +41,8 @@ pub const SCHEMA: &str = "tzolkin-numeric-deployment-validation-arena-v1";
 pub const CORN_FIRST_ARENA_SCHEMA: &str = "tzolkin-numeric-corn-first-setup-validation-arena-v1";
 pub const CORN_FIRST_CONDITIONAL_ARENA_SCHEMA: &str =
     "tzolkin-conditional-human-shared-corn-first-validation-arena-v1";
+pub const CORN_FIRST_SEMANTIC_PLAYING_CONDITIONAL_ARENA_SCHEMA: &str =
+    "tzolkin-conditional-human-semantic-playing-shared-corn-first-validation-arena-v1";
 pub const RESOURCE_CYCLE_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-development-validation-arena-v1";
 pub const OWN_SETUP_ARENA_SCHEMA: &str = "tzolkin-own-setup-composite-development-arena-v1";
@@ -674,6 +677,9 @@ pub enum PolicyIdentity {
     ConditionalHumanHybrid {
         identity: Box<ConditionalIdentity>,
     },
+    ConditionalHumanSemanticPlayingHybrid {
+        identity: Box<ConditionalIdentity>,
+    },
     ConditionalHumanMixedRl {
         identity: Box<ConditionalMixedArenaIdentity>,
     },
@@ -697,6 +703,7 @@ enum Role<'a> {
     Numeric(NumericPolicy),
     OwnSetup(Box<OwnSetupCompositePolicy>),
     Conditional(Box<ConditionalPolicy<'a>>),
+    ConditionalSemanticPlaying(Box<SemanticPlayingConditionalPolicy<'a>>),
     ConditionalMixed(Box<ConditionalMixedArenaPolicy<'a>>),
     ConditionalCountZero(Box<ConditionalCountZeroArenaPolicy<'a>>),
     Teacher(Box<ResourceCycleTeacherArenaPolicy<'a>>),
@@ -751,6 +758,11 @@ impl<'a> Role<'a> {
             Self::Conditional(policy) => PolicyIdentity::ConditionalHumanHybrid {
                 identity: Box::new(policy.identity().clone()),
             },
+            Self::ConditionalSemanticPlaying(policy) => {
+                PolicyIdentity::ConditionalHumanSemanticPlayingHybrid {
+                    identity: Box::new(policy.identity().clone()),
+                }
+            }
             Self::ConditionalMixed(policy) => PolicyIdentity::ConditionalHumanMixedRl {
                 identity: Box::new(policy.identity().clone()),
             },
@@ -791,6 +803,7 @@ impl<'a> Role<'a> {
             Self::Numeric(policy) => Some(&policy.identity.configuration_key),
             Self::OwnSetup(policy) => Some(&policy.identity.configuration_key),
             Self::Conditional(policy) => Some(&policy.identity().configuration_key),
+            Self::ConditionalSemanticPlaying(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalMixed(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalCountZero(policy) => Some(&policy.identity().configuration_key),
             Self::Teacher(policy) => Some(&policy.identity().configuration_key),
@@ -1036,6 +1049,9 @@ fn choose(
         }
         let result = match role {
             Role::Conditional(policy) => session.choose_move(index, observation, policy)?,
+            Role::ConditionalSemanticPlaying(policy) => {
+                session.choose_semantic_playing(index, observation, policy)?
+            }
             Role::ConditionalMixed(policy) => session.choose_mixed(index, observation, policy)?,
             Role::ConditionalCountZero(policy) => {
                 session.choose_count_zero(index, observation, policy)?
@@ -1081,6 +1097,9 @@ fn choose(
                     .or_default() += 1;
                 let in_origin_grammar = match role {
                     Role::Conditional(policy) => policy.teacher_grammar_contains(&action.action),
+                    Role::ConditionalSemanticPlaying(policy) => {
+                        policy.teacher_grammar_contains(&action.action)
+                    }
                     Role::ConditionalMixed(policy) => {
                         policy.teacher_grammar_contains(&action.action)
                     }
@@ -1091,11 +1110,14 @@ fn choose(
                 };
                 conditional.outside_teacher_grammar_choices += usize::from(!in_origin_grammar);
                 if let Some(contexts) = conditional.choice_contexts.as_mut() {
-                    let Role::Conditional(policy) = role else {
+                    if !matches!(
+                        role,
+                        Role::Conditional(_) | Role::ConditionalSemanticPlaying(_)
+                    ) {
                         return Err(
                             "Choice contexts require the opted-in conditional BC role".into()
                         );
-                    };
+                    }
                     let effective = observation
                         .legal_actions
                         .iter()
@@ -1106,7 +1128,13 @@ fn choose(
                         result.requested_index,
                         effective,
                         result.trade.as_ref(),
-                        |action| policy.teacher_grammar_contains(action),
+                        |action| match role {
+                            Role::Conditional(policy) => policy.teacher_grammar_contains(action),
+                            Role::ConditionalSemanticPlaying(policy) => {
+                                policy.teacher_grammar_contains(action)
+                            }
+                            _ => unreachable!("choice context role was checked"),
+                        },
                     )?;
                 }
             }
@@ -1126,6 +1154,9 @@ fn choose(
             Role::Numeric(_) => return Err("Numeric Arena missing game guard".into()),
             Role::OwnSetup(_) => return Err("Own Setup Arena missing game guard".into()),
             Role::Conditional(_) => return Err("Conditional Arena missing game session".into()),
+            Role::ConditionalSemanticPlaying(_) => {
+                return Err("Semantic Playing Arena missing game session".into());
+            }
             Role::ConditionalMixed(_) => {
                 return Err("Conditional Arena missing game session".into());
             }
@@ -1354,6 +1385,9 @@ fn play_arm_using_with_setup<'a>(
         .iter()
         .map(|role| match &**role {
             Role::Conditional(policy) => Some(GameSession::new(policy)),
+            Role::ConditionalSemanticPlaying(policy) => {
+                Some(GameSession::new_semantic_playing(policy))
+            }
             Role::ConditionalMixed(policy) => Some(GameSession::new_mixed(policy)),
             Role::ConditionalCountZero(policy) => Some(GameSession::new_count_zero(policy)),
             Role::Teacher(policy) => Some(GameSession::new_teacher(policy)),
@@ -1372,23 +1406,29 @@ fn play_arm_using_with_setup<'a>(
                 ..GuardDiagnostics::default()
             }),
             Role::Teacher(_) | Role::SemanticSetupTeacher(_) => Some(GuardDiagnostics::default()),
-            Role::Conditional(_) | Role::ConditionalMixed(_) | Role::ConditionalCountZero(_) => {
-                Some(GuardDiagnostics {
-                    conditional: Some(ConditionalDiagnostics {
-                        choice_contexts: match &**role {
-                            Role::Conditional(policy)
-                                if policy.identity().choice_diagnostics.is_some() =>
-                            {
-                                Some(ConditionalChoiceDiagnostics::new())
-                            }
-                            _ => None,
-                        },
-                        ..ConditionalDiagnostics::default()
-                    }),
-                    phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
-                    ..GuardDiagnostics::default()
-                })
-            }
+            Role::Conditional(_)
+            | Role::ConditionalSemanticPlaying(_)
+            | Role::ConditionalMixed(_)
+            | Role::ConditionalCountZero(_) => Some(GuardDiagnostics {
+                conditional: Some(ConditionalDiagnostics {
+                    choice_contexts: match &**role {
+                        Role::Conditional(policy)
+                            if policy.identity().choice_diagnostics.is_some() =>
+                        {
+                            Some(ConditionalChoiceDiagnostics::new())
+                        }
+                        Role::ConditionalSemanticPlaying(policy)
+                            if policy.identity().choice_diagnostics.is_some() =>
+                        {
+                            Some(ConditionalChoiceDiagnostics::new())
+                        }
+                        _ => None,
+                    },
+                    ..ConditionalDiagnostics::default()
+                }),
+                phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
+                ..GuardDiagnostics::default()
+            }),
             Role::PhaseRouted(_) | Role::OwnSetup(_) => Some(GuardDiagnostics {
                 phase_routes: Some(PhaseRouteDiagnostics::default()),
                 ..GuardDiagnostics::default()
@@ -1879,6 +1919,44 @@ pub fn run_corn_first_conditional_validation<'a>(
         CORN_FIRST_CONDITIONAL_ARENA_SCHEMA,
         Some(SharedCornFirstSetupIdentity::current()),
     )
+}
+
+/// Schema-4 conditional Playing, with immutable original-source custody and the
+/// same Corn-first Setup at every seat. This creates no native learner or credit.
+pub fn run_corn_first_semantic_playing_conditional_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: SemanticPlayingConditionalPolicy<'a>,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    let prepared = candidate.prepared();
+    prepared.recheck_sources()?;
+    let result = (|| {
+        config.validate()?;
+        let origin_families = prepared
+            .reservations()
+            .keys()
+            .map(|table| crate::human_initial_wealth::table_family_id(table))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if config
+            .seeds
+            .iter()
+            .any(|seed| origin_families.contains(&family_id(*seed)))
+        {
+            return Err("Semantic Playing Arena overlaps an original reserved table family".into());
+        }
+        run_roles_with_setup(
+            config,
+            Role::ConditionalSemanticPlaying(Box::new(candidate)),
+            Role::Numeric(reference),
+            opponent_pool,
+            CORN_FIRST_SEMANTIC_PLAYING_CONDITIONAL_ARENA_SCHEMA,
+            Some(SharedCornFirstSetupIdentity::current()),
+        )
+    })();
+    // Also recheck after an incomplete/failed arm, without reloading weights.
+    prepared.recheck_sources()?;
+    result
 }
 
 /// Genuine updated conditional Human actor, predicting both native Setup and
