@@ -277,7 +277,7 @@ pub(super) fn encode(
         }
         TypedAction::EndTurn { .. } if o.pending_task.is_none() => {
             if o.first_player_claimed == Some(o.actor) {
-                d.add(F::PendingFirstPlayerCorn, o.accumulated_corn)?;
+                d.gain(o, [o.accumulated_corn, 0, 0, 0, 0])?;
             }
         }
         TypedAction::Skip if o.pending_task.is_some() => {}
@@ -524,7 +524,8 @@ pub(super) fn encode(
         TypedAction::Rotate { days }
             if matches!(o.pending_task, Some(Task::Rotation)) && [1, 2].contains(days) =>
         {
-            d.add(F::TaskRemaining, *days)?;
+            // Rotation distance retains its canonical position column (416),
+            // rather than overloading the pending-choice remaining count.
         }
         _ => return Err("Unsupported or mismatched semantic Playing operation".into()),
     }

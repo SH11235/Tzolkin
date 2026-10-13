@@ -944,6 +944,45 @@ mod setup_tests {
                 );
                 (values, legal.r#move.clone())
             };
+            let mut first = state.clone();
+            first.accumulated_corn = 4;
+            let (claim, mv) = describe(&first, &|a| matches!(a, TypedAction::FirstPlayer { .. }));
+            assert_eq!(claim[F::PendingFirstPlayerCorn.index()], 4.0);
+            assert_eq!(claim[F::GainCorn.index()], 0.0);
+            let claimed = apply_move(&first, mv).unwrap();
+            assert_eq!(claimed.accumulated_corn, 4);
+            assert_eq!(
+                claimed.players[actor].resources[&Resource::Corn],
+                first.players[actor].resources[&Resource::Corn] - claim[F::CostCorn.index()] as i64
+            );
+            let (place, mv) = describe(&claimed, &|a| matches!(a, TypedAction::Place { .. }));
+            assert_eq!(place[F::GainCorn.index()], 0.0);
+            let placed = apply_move(&claimed, mv).unwrap();
+            assert_eq!(placed.accumulated_corn, 4);
+            assert_eq!(
+                placed.players[actor].resources[&Resource::Corn],
+                claimed.players[actor].resources[&Resource::Corn]
+                    - place[F::CostCorn.index()] as i64
+            );
+            let (end, mv) = describe(&placed, &|a| matches!(a, TypedAction::EndTurn { .. }));
+            assert_eq!(end[F::PendingFirstPlayerCorn.index()], 0.0);
+            assert_eq!(end[F::GainCorn.index()], 4.0);
+            let ended = apply_move(&placed, mv).unwrap();
+            assert_eq!(ended.accumulated_corn, 0);
+            assert_eq!(
+                ended.players[actor].resources[&Resource::Corn],
+                placed.players[actor].resources[&Resource::Corn] + 4
+            );
+            let mut rotation = state.clone();
+            rotation.pending = Some(Pending {
+                title: "Rotation".into(),
+                task: Task::Rotation,
+                after: vec![],
+            });
+            let (rotate, _) =
+                describe(&rotation, &|a| matches!(a, TypedAction::Rotate { days: 1 }));
+            assert_eq!(rotate[F::TaskRemaining.index()], 0.0);
+            assert!(rotate[416] > 0.0);
             let (remove, mv) = describe(&state, &|a| {
                 matches!(
                     a,
