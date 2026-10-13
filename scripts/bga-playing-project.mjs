@@ -17,6 +17,10 @@ export const CONTROL_SCHEMA = 'tzolkin-bga-playing-projection-control-v1';
 export const ATLAS_SCHEMA = 'tzolkin-bga-playing-atlas-v1';
 export const LATER_WITNESS_SCHEMA = 'tzolkin-bga-playing-later-witnesses-v1';
 export const BOUNDARY_CONTROL_SCHEMA = 'tzolkin-bga-retained-boundary-control-v1';
+export const BOUNDARY_MARKER_CALIBRATION_SCHEMA =
+  'tzolkin-bga-retained-boundary-marker-calibration-v1';
+export const BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA =
+  'tzolkin-bga-retained-boundary-marker-calibration-v2';
 const BOUNDARY_CAPTURE_SCHEMA = 'bga-retained-visible-replay-board-v1';
 const LEGACY_CAPTURE_SCHEMA = 'tzolkin-bga-public-initial-selection-observation-v1';
 const LEGACY_CAPTURE_ADAPTER = 'tzolkin-bga-legacy-initial-capture-adapter-v1';
@@ -588,7 +592,66 @@ function retainedInitialFragments(capture) {
   };
 }
 
-/** Project only independently retained counters at a settled food/terminal boundary.
+function boundaryMarkerPositions(value, release, captureSha256) {
+  const cells = value?.schema === BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA;
+  closed(
+    value,
+    [
+      'schema',
+      'archiveRelease',
+      'captureSha256',
+      'catalogSha256',
+      ...(cells ? [] : ['templeTop', 'technologyLeft']),
+    ],
+    'boundary marker calibration',
+  );
+  if (
+    (!cells && value.schema !== BOUNDARY_MARKER_CALIBRATION_SCHEMA) ||
+    value.archiveRelease !== release ||
+    value.captureSha256 !== captureSha256 ||
+    value.catalogSha256 !== sha(catalogBytes)
+  )
+    fail('Boundary marker calibration release/capture/catalog mismatch');
+  if (cells) return { mode: 'labeled-cell' };
+  closed(value.templeTop, TEMPLES, 'boundary temple calibration');
+  closed(value.technologyLeft, TECHNOLOGIES, 'boundary technology calibration');
+  const positions = (entries, min, max, label) => {
+    list(entries, 10, label);
+    if (entries.length !== max - min + 1) fail(`${label}: incomplete levels`);
+    const result = new Map();
+    entries.forEach((entry, index) => {
+      closed(entry, ['pixels', 'level'], label);
+      integer(entry.level, min, max, label);
+      number(entry.pixels, -10000, 10000, label);
+      if (entry.level !== min + index || result.has(entry.pixels))
+        fail(`${label}: ambiguous or unordered levels`);
+      result.set(entry.pixels, entry.level);
+    });
+    return result;
+  };
+  return {
+    mode: 'declared-coordinate',
+    temples: Object.fromEntries(
+      TEMPLES.map((temple) => [
+        temple,
+        positions(
+          value.templeTop[temple],
+          -1,
+          catalog.TEMPLE_TRACKS[temple].points.length - 2,
+          `boundary temple ${temple}`,
+        ),
+      ]),
+    ),
+    technologies: Object.fromEntries(
+      TECHNOLOGIES.map((technology) => [
+        technology,
+        positions(value.technologyLeft[technology], 0, 3, `boundary technology ${technology}`),
+      ]),
+    ),
+  };
+}
+
+/** Project only independently retained fields at a settled food/terminal boundary.
  * The returned witness fits the ordinary later-witness collection; its separate
  * provenance must travel with it. This does not establish full board coverage. */
 export function projectRetainedBoundary(
@@ -596,12 +659,14 @@ export function projectRetainedBoundary(
   rawLogBytes,
   controlBytes,
   tableBytes = null,
+  markerCalibrationBytes = null,
 ) {
   const inputs = [
     captureBytes,
     rawLogBytes,
     controlBytes,
     ...(tableBytes === null ? [] : [tableBytes]),
+    ...(markerCalibrationBytes === null ? [] : [markerCalibrationBytes]),
   ];
   if (
     inputs.some((input) => !Buffer.isBuffer(input)) ||
@@ -613,7 +678,7 @@ export function projectRetainedBoundary(
     control,
     ['schema', 'capture', 'rawLog', 'archiveRelease', 'seatOrder', 'mechanicalProfile'],
     'boundary control',
-    ['table'],
+    ['table', 'markerCalibration'],
   );
   if (control.schema !== BOUNDARY_CONTROL_SCHEMA) fail('Unsupported boundary control');
   pin(captureBytes, control.capture, MAX_BYTES, 'boundary capture');
@@ -621,6 +686,9 @@ export function projectRetainedBoundary(
   if (tableBytes !== null) pin(tableBytes, control.table, MAX_BYTES, 'table evidence');
   else if (control.table !== undefined && control.table !== null)
     fail('Missing declared table evidence');
+  if (markerCalibrationBytes !== null)
+    pin(markerCalibrationBytes, control.markerCalibration, MAX_CONTROL_BYTES, 'marker calibration');
+  else if (Object.hasOwn(control, 'markerCalibration')) fail('Missing declared marker calibration');
   const capture = uniqueJson(captureBytes, MAX_BYTES, 'boundary capture');
   const raw = uniqueJson(rawLogBytes, MAX_BYTES, 'raw log');
   const table = tableBytes === null ? null : uniqueJson(tableBytes, MAX_BYTES, 'table evidence');
@@ -670,6 +738,14 @@ export function projectRetainedBoundary(
     !/^\d+$/.test(url.searchParams.get('player') ?? '')
   )
     fail('Retained boundary identity mismatch');
+  const markerPositions =
+    markerCalibrationBytes === null
+      ? null
+      : boundaryMarkerPositions(
+          uniqueJson(markerCalibrationBytes, MAX_CONTROL_BYTES, 'marker calibration'),
+          release,
+          sha(captureBytes),
+        );
   text(capture.capturedAt, 64, 'boundary capture time');
   text(capture.renderedReplayControls, 4096, 'retained replay controls');
   text(capture.roundText, 160, 'boundary round text');
@@ -959,6 +1035,106 @@ export function projectRetainedBoundary(
     !same([...names].sort(), [...game.context.players].sort())
   )
     fail('Boundary roster differs from raw log');
+  const markerCellTracks = [],
+    ownedMarkers = new Map();
+  if (markerPositions !== null) {
+    const markers = trees.flatMap((tree) =>
+      tree.nodes.filter(
+        (node) =>
+          (node.attrs.id ?? '').startsWith('marker_') ||
+          (node.attrs.class ?? '').split(/\s+/).some((name) => /^marker(?:_|$)/.test(name)),
+      ),
+    );
+    if (markers.length !== ids.length * (TEMPLES.length + TECHNOLOGIES.length))
+      fail('Incomplete/extra boundary markers');
+    if (markerPositions.mode === 'labeled-cell') {
+      const cells = trees.flatMap((tree) =>
+        tree.nodes.filter(
+          (node) =>
+            /^(?:temple_.+_step_|technology_.+_level_)/.test(node.attrs.id ?? '') ||
+            (node.attrs.class ?? '')
+              .split(/\s+/)
+              .some((name) => ['temple_step', 'technology_level'].includes(name)),
+        ),
+      );
+      if (
+        cells.length !==
+        TEMPLES.reduce((total, track) => total + catalog.TEMPLE_TRACKS[track].points.length, 0) +
+          TECHNOLOGIES.length * 5
+      )
+        fail('Incomplete/extra boundary marker cells');
+    }
+    const groups = [
+      ['temples', TEMPLES, 'temple', 'top'],
+      ['technologies', TECHNOLOGIES, 'technology', 'left'],
+    ];
+    for (const [group, tracks, kind, coordinate] of groups) {
+      const container = byId(board, group);
+      readVisible(board, container);
+      if (container.tag !== 'div' || !root.children.includes(container))
+        fail('Malformed boundary marker container');
+      if (markerPositions.mode === 'labeled-cell')
+        for (const track of tracks) {
+          const suffix = track === 'kukulkan' ? 'kukulcan' : track;
+          const count = kind === 'temple' ? catalog.TEMPLE_TRACKS[track].points.length : 5;
+          const cells = Array.from({ length: count }, (_unused, index) => {
+            const node = byId(
+              board,
+              `${kind}_${suffix}_${kind === 'temple' ? 'step' : 'level'}_${index}`,
+            );
+            readVisible(board, node);
+            const style = styles(node);
+            closed(
+              style,
+              kind === 'temple' ? ['bottom', 'left'] : ['top', 'left', 'width'],
+              'boundary marker cell style',
+            );
+            Object.values(style).forEach((value) => pixels(value, 'boundary marker cell style'));
+            if (
+              node.tag !== 'div' ||
+              node.attrs.class !== (kind === 'temple' ? 'temple_step' : 'technology_level') ||
+              node.children.length !== 0 ||
+              !container.children.includes(node) ||
+              (kind === 'technology' && pixels(style.width, 'boundary cell width') <= 0)
+            )
+              fail('Malformed/unowned boundary marker cell');
+            return node;
+          });
+          if (cells.some((node, index) => index > 0 && node.start <= cells[index - 1].start))
+            fail('Unordered boundary marker cells');
+          markerCellTracks.push({ group, kind, track, container, cells });
+        }
+      ids.forEach((id, index) => {
+        players[index][group] = Object.fromEntries(
+          tracks.map((track) => {
+            const suffix = track === 'kukulkan' ? 'kukulcan' : track;
+            const node = byId(board, `marker_${id}_${kind}_${suffix}`);
+            readVisible(board, node);
+            const classes = (node.attrs.class ?? '').trim().split(/\s+/);
+            const style = styles(node);
+            if (
+              node.tag !== 'div' ||
+              node.children.length !== 0 ||
+              !container.children.includes(node) ||
+              classes.length !== 2 ||
+              !classes.includes('marker') ||
+              !classes.includes(`marker_${identities.get(id).color}`) ||
+              Object.keys(style).some((key) => !['top', 'left'].includes(key))
+            )
+              fail('Malformed/unowned boundary marker');
+            pixels(style.top, 'boundary marker top');
+            pixels(style.left, 'boundary marker left');
+            ownedMarkers.set(node.attrs.id, node);
+            if (markerPositions.mode === 'labeled-cell') return [track, null];
+            const position = pixels(style[coordinate], 'boundary marker coordinate');
+            const level = markerPositions[group][track].get(position);
+            if (level === undefined) fail('Uncalibrated boundary marker position');
+            return [track, level];
+          }),
+        );
+      });
+    }
+  }
   const prompt = capture.prompt.trim(),
     suffix = 'はワーカーを置くか取り除くかしてください';
   if (!terminal && !names.some((name) => prompt === name + suffix) && prompt !== `あなた${suffix}`)
@@ -1099,6 +1275,88 @@ export function projectRetainedBoundary(
       return null;
     return rect;
   };
+  if (markerPositions?.mode === 'labeled-cell') {
+    const requiredRect = (node) => {
+      const item = geometry.get(node.attrs.id);
+      if (!item) fail('Missing visible boundary marker/cell geometry');
+      closed(
+        item,
+        [
+          'id',
+          'className',
+          'inlineStyle',
+          'parentId',
+          'computedDisplay',
+          'computedVisibility',
+          'rect',
+        ],
+        'boundary marker/cell geometry',
+      );
+      const rect = visibleRect(node);
+      if (rect === null || rect.width <= 0 || rect.height <= 0)
+        fail('Invalid visible boundary marker/cell rectangle');
+      closed(rect, ['x', 'y', 'width', 'height'], 'boundary marker/cell rectangle');
+      for (const key of ['x', 'y', 'width', 'height'])
+        number(rect[key], -10000000, 10000000, 'boundary marker/cell rectangle');
+      return rect;
+    };
+    const contains = (outer, inner) =>
+      inner.x >= outer.x &&
+      inner.y >= outer.y &&
+      inner.x + inner.width <= outer.x + outer.width &&
+      inner.y + inner.height <= outer.y + outer.height;
+    const intersects = (a, b) =>
+      a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+    const boardBox = requiredRect(root),
+      cellBoxes = [];
+    for (const entry of markerCellTracks) {
+      const containerBox = requiredRect(entry.container);
+      if (!contains(boardBox, containerBox)) fail('Boundary marker container outside board');
+      entry.rects = entry.cells.map((node, index) => {
+        const rect = requiredRect(node);
+        if (!contains(containerBox, rect)) fail('Boundary marker cell outside container');
+        if (index > 0) {
+          const previous = requiredRect(entry.cells[index - 1]);
+          if (
+            entry.kind === 'temple'
+              ? rect.x !== previous.x || rect.width !== previous.width || rect.y >= previous.y
+              : rect.y !== previous.y || rect.height !== previous.height || rect.x <= previous.x
+          )
+            fail('Misaligned/unordered boundary marker cell rectangles');
+        }
+        if (cellBoxes.some((other) => intersects(other, rect)))
+          fail('Overlapping boundary marker cells');
+        cellBoxes.push(rect);
+        return rect;
+      });
+      ids.forEach((id, index) => {
+        const suffix = entry.track === 'kukulkan' ? 'kukulcan' : entry.track;
+        const node = ownedMarkers.get(`marker_${id}_${entry.kind}_${suffix}`);
+        const markerBox = requiredRect(node);
+        if (!contains(containerBox, markerBox)) fail('Boundary marker outside own container');
+        const center = {
+          x: markerBox.x + markerBox.width / 2,
+          y: markerBox.y + markerBox.height / 2,
+        };
+        const hits = entry.rects
+          .map((rect, cellIndex) => ({ rect, cellIndex }))
+          .filter(
+            ({ rect }) =>
+              center.x > rect.x &&
+              center.x < rect.x + rect.width &&
+              center.y > rect.y &&
+              center.y < rect.y + rect.height,
+          );
+        if (hits.length !== 1) fail('Ambiguous/outside boundary marker cell center');
+        // Temple step0 is the negative level; technology cell4 is an action,
+        // never a persisted technology level. No caller supplies these offsets.
+        const level = hits[0].cellIndex - (entry.kind === 'temple' ? 1 : 0);
+        if (entry.kind === 'technology' && level === 4)
+          fail('Boundary technology marker on action endpoint');
+        players[index][entry.group][entry.track] = level;
+      });
+    }
+  }
   const boardRect = visibleRect(root),
     layerRect = visibleRect(workerRoot);
   const geometricWorkers = [...geometry.values()].filter((item) =>
@@ -1153,6 +1411,23 @@ export function projectRetainedBoundary(
       tableEvidenceSha256: tableBytes === null ? null : sha(tableBytes),
       archiveRelease: release,
       mechanicalProfile,
+      ...(markerPositions === null
+        ? {}
+        : {
+            markerObservation: {
+              calibrationSha256: sha(markerCalibrationBytes),
+              catalogSha256: sha(catalogBytes),
+              interpretation:
+                markerPositions.mode === 'labeled-cell'
+                  ? 'owned retained marker centers inside source-labeled cells; consistency only'
+                  : 'owned retained marker coordinates using caller-declared calibration; consistency only',
+              calibrationSchema:
+                markerPositions.mode === 'labeled-cell'
+                  ? BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA
+                  : BOUNDARY_MARKER_CALIBRATION_SCHEMA,
+              calibrationAuthenticated: false,
+            },
+          }),
       sourceActionIds: split ? [priorId, actionId] : [actionId],
       foodDay,
       kind: terminal ? 'terminal' : 'post-food',
@@ -1175,7 +1450,7 @@ export function projectRetainedBoundary(
         'foodDays',
         'turnOrder',
         'turnIndex',
-        'markers',
+        ...(markerPositions === null ? ['markers'] : []),
         'card identities',
         'gear positions',
         'covered corn',
