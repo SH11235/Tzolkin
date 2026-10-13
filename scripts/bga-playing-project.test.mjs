@@ -11,6 +11,7 @@ import { decodeConditionalPublicGame, decodePublicGame } from './bga-decode.mjs'
 import {
   ATLAS_SCHEMA,
   BOUNDARY_CONTROL_SCHEMA,
+  BOUNDARY_JUNGLE_TOPS_SCHEMA,
   BOUNDARY_MARKER_CALIBRATION_SCHEMA,
   BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA,
   BOUNDARY_WORKER_CELL_SCHEMA,
@@ -437,7 +438,7 @@ function fragmentFixture(n = 4) {
   return value;
 }
 
-function boundaryFixture({ split = false, terminal = false, n = 4 } = {}) {
+function boundaryFixture({ split = false, terminal = false, n = 4, jungleTops = false } = {}) {
   const value = fragmentFixture(n),
     capture = value.capture;
   const displayedRound = terminal ? 28 : split ? 22 : 9;
@@ -530,6 +531,92 @@ function boundaryFixture({ split = false, terminal = false, n = 4 } = {}) {
     })),
     ...placed,
   ];
+  if (jungleTops) {
+    const corners = [
+      null,
+      ['bottom', 'right'],
+      ['bottom', 'left'],
+      ['top', 'right'],
+      ['top', 'left'],
+    ];
+    for (const box of [2, 3, 4, 5]) {
+      const tops =
+        box === 2
+          ? Array.from({ length: n }, (_unused, i) => [i + 1, 'corn'])
+          : box === 3
+            ? [
+                [1, 'wood'],
+                [2, 'wood'],
+                [3, 'wood'],
+              ]
+            : box === 4
+              ? []
+              : [
+                  [1, 'wood'],
+                  [4, 'corn'],
+                ];
+      const containerRect = { x: box === 3 ? -2 : box * 100, y: 300, width: 80, height: 80 };
+      const geometry = (id, className, inlineStyle, parentId, rect) => ({
+        id,
+        className,
+        inlineStyle,
+        parentId,
+        computedDisplay: 'block',
+        computedVisibility: 'visible',
+        rect,
+      });
+      const tileHtml = tops
+        .map(([slot, kind]) => {
+          const id = `jungle_${box}_tile_${slot}`,
+            className = `tile board_tile ${kind}_tile`,
+            [vertical, horizontal] = corners[slot],
+            inlineStyle = `${vertical}:0px;${horizontal}:0px`;
+          capture.retainedDomGeometry.push(
+            geometry(id, className, inlineStyle, `jungle_${box}`, {
+              x: containerRect.x + (horizontal === 'right' ? 42 : 0),
+              y: containerRect.y + (vertical === 'bottom' ? 42 : 0),
+              width: 38,
+              height: 38,
+            }),
+          );
+          return element('div', id, '', ` class="${className}" style="${inlineStyle}"`);
+        })
+        .join('');
+      capture.retainedDomGeometry.push(
+        geometry(`jungle_${box}`, 'jungle', null, 'board', containerRect),
+      );
+      const old = element(
+        'div',
+        `jungle_${box}`,
+        Array.from({ length: n }, (_unused, i) =>
+          element(
+            'div',
+            `jungle_${box}_tile_${i + 1}`,
+            '',
+            ` class="board_tile ${box === 2 ? 'corn_tile' : 'wood_tile'}"`,
+          ),
+        ).join(''),
+      );
+      assert.ok(capture.boardHtml.includes(old));
+      capture.boardHtml = capture.boardHtml.replace(
+        old,
+        element('div', `jungle_${box}`, tileHtml, ' class="jungle"'),
+      );
+    }
+    // Rotated top-tile bounding boxes can overlap without sharing a CSS corner.
+    capture.retainedDomGeometry.find((item) => item.id === 'jungle_3_tile_1').rect.x = 20;
+    capture.retainedDomGeometry.find((item) => item.id === 'jungle_3_tile_2').rect.y = 325;
+    const row = capture.playerBoards[0];
+    row.rowHtml =
+      row.rowHtml.slice(0, -6) +
+      element(
+        'div',
+        `corn_tile_player_${row.playerId}`,
+        '',
+        ' class="tile player_tile corn_tile"',
+      ) +
+      '</div>';
+  }
   const feeding = {
     raw_text: '食料供給日: Aはワーカー3個で 6\nを支払った',
     html: '食料供給日: Aはワーカー3個で 6<div class="tz_icon resource_corn"></div>を支払った',
@@ -564,6 +651,15 @@ function boundaryFixture({ split = false, terminal = false, n = 4 } = {}) {
         archiveRelease: 'fixture',
         seatOrder: value.control.seatOrder,
         mechanicalProfile: value.control.mechanicalProfile,
+        ...(jungleTops
+          ? {
+              jungleTops: {
+                schema: BOUNDARY_JUNGLE_TOPS_SCHEMA,
+                archiveRelease: 'fixture',
+                stackMechanics: 'basic-corn-under-wood-v1',
+              },
+            }
+          : {}),
       }),
     ];
   };
@@ -1062,6 +1158,202 @@ test('retained boundary binds original food/rotation scope and separates availab
     () => projectRetainedBoundary(wrongRelease[0], wrongRelease[1], bytes(workerControl)),
     /release-mismatched/,
   );
+  for (const n of [3, 4]) {
+    const value = boundaryFixture({ n, jungleTops: true }),
+      prepared = value.repin(),
+      projected = projectRetainedBoundary(...prepared),
+      control = JSON.parse(prepared[2]);
+    assert.deepEqual(projected.witness.expected.jungle, {
+      2: { corn: n, wood: 0 },
+      3: { corn: 3, wood: 3 },
+      4: { corn: 0, wood: 0 },
+      5: { corn: 2, wood: 1 },
+    });
+    assert.deepEqual(projected.provenance.jungleObservation.visibleTops[3], {
+      exposedCornTops: 0,
+      woodTops: 3,
+    });
+    assert.deepEqual(
+      projected.provenance.jungleObservation.conditionalDerivedCounts,
+      projected.witness.expected.jungle,
+    );
+    assert.equal(projected.provenance.jungleObservation.coveredLayersObserved, false);
+    assert.equal(projected.provenance.jungleObservation.sourceAuthenticated, false);
+    assert.equal(projected.provenance.omitted.includes('covered corn'), true);
+    for (const key of [
+      'visibilityVerified',
+      'geometryVerified',
+      'sourceAuthenticated',
+      'completeSourceBoard',
+      'completeNativeReplayQualified',
+      'humanBcQualified',
+      'policyTrainingReady',
+      'valueTrainingReady',
+    ])
+      assert.equal(projected.provenance[key], false);
+    assert.equal(Object.hasOwn(projected.witness.expected, 'skullSpaces'), false);
+    assert.equal(Object.hasOwn(projected.witness.expected, 'buildings'), false);
+    delete control.jungleTops;
+    const without = projectRetainedBoundary(prepared[0], prepared[1], bytes(control)),
+      original = projectRetainedBoundary(...boundaryFixture({ n }).repin());
+    assert.deepEqual(without.witness, original.witness);
+    const withoutProvenance = { ...without.provenance },
+      originalProvenance = { ...original.provenance };
+    delete withoutProvenance.captureSha256;
+    delete originalProvenance.captureSha256;
+    assert.deepEqual(withoutProvenance, originalProvenance);
+  }
+  const jungleNode = (value, id) =>
+    value.capture.retainedDomGeometry.find((item) => item.id === id);
+  for (const mutate of [
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="jungle_2_tile_1" class="tile board_tile corn_tile"',
+        'id="jungle_2_tile_1" class="tile board_tile wood_tile"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="jungle_3_tile_1" class="tile board_tile wood_tile"',
+        'id="jungle_3_tile_1" class="tile board_tile wood_tile corn_tile"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="jungle_3_tile_1" class="tile board_tile wood_tile"',
+        'id="jungle_3_tile_1" class="tile board_tile unknown"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="jungle_3_tile_1"',
+        'id="jungle_3_tile_0"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="jungle_3_tile_1"',
+        'id="jungle_3_tile_1" onclick="void(0)"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="jungle_3_tile_1" class="tile board_tile wood_tile" style="bottom:0px;right:0px"',
+        'id="jungle_3_tile_1" class="tile board_tile wood_tile" style="top:0px;right:0px"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="jungle_4" class="jungle"></div>',
+        '',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="jungle_4" class="jungle"></div>',
+        '<div id="foreign"><div id="jungle_4" class="jungle"></div></div>',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="jungle_3" class="jungle">',
+        '<div id="jungle_3" class="jungle" style="opacity:0%">',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="jungle_4" class="jungle"></div>',
+        '<div id="jungle_4" class="jungle"><span>unknown</span></div>',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml =
+        value.capture.boardHtml.slice(0, -6) + '<div id="ghost" class="corn_tile"></div></div>';
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="jungle_4" class="jungle"></div>',
+        '<div id="jungle_4" class="jungle"><div id="jungle_3_tile_1" class="tile board_tile wood_tile" style="bottom:0px;right:0px"></div></div>',
+      );
+    },
+    (value) => {
+      value.capture.retainedDomGeometry = value.capture.retainedDomGeometry.filter(
+        (item) => item.id !== 'jungle_4',
+      );
+    },
+    (value) => {
+      jungleNode(value, 'jungle_3').parentId = 'foreign';
+    },
+    (value) => {
+      jungleNode(value, 'jungle_3').computedVisibility = 'hidden';
+    },
+    (value) => {
+      jungleNode(value, 'jungle_3').rect.width = 0;
+    },
+    (value) => {
+      jungleNode(value, 'jungle_3').rect.x = -100;
+    },
+    (value) => {
+      jungleNode(value, 'jungle_3_tile_1').rect.width = Infinity;
+    },
+    (value) => {
+      jungleNode(value, 'jungle_3_tile_1').rect.x = -3;
+    },
+    (value) => {
+      jungleNode(value, 'jungle_3_tile_1').inlineStyle = 'top:0px;right:0px';
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.push({
+        ...structuredClone(jungleNode(value, 'jungle_3_tile_1')),
+        id: 'jungle_9_tile_1',
+      });
+    },
+  ]) {
+    const value = boundaryFixture({ jungleTops: true });
+    mutate(value);
+    assert.throws(
+      () => projectRetainedBoundary(...value.repin()),
+      /boundary|jungle|Hidden retained/i,
+    );
+  }
+  const overfull = boundaryFixture({ n: 3, jungleTops: true });
+  overfull.capture.boardHtml = overfull.capture.boardHtml.replace(
+    '<div id="jungle_4" class="jungle"></div>',
+    '<div id="jungle_4" class="jungle">' +
+      Array.from({ length: 4 }, (_unused, i) =>
+        element(
+          'div',
+          `jungle_4_tile_${i + 1}`,
+          '',
+          ` class="tile board_tile corn_tile" style="${i < 2 ? 'bottom' : 'top'}:0px;${i % 2 ? 'left' : 'right'}:0px"`,
+        ),
+      ).join('') +
+      '</div>',
+  );
+  assert.throws(() => projectRetainedBoundary(...overfull.repin()), /player-count/);
+  for (const mutate of [
+    (control) => {
+      control.jungleTops.archiveRelease = 'foreign';
+    },
+    (control) => {
+      control.jungleTops.stackMechanics = 'unknown';
+    },
+    (control) => {
+      control.jungleTops.expected = { corn: 4 };
+    },
+    (control) => {
+      delete control.jungleTops.stackMechanics;
+    },
+  ]) {
+    const value = boundaryFixture({ jungleTops: true }),
+      prepared = value.repin(),
+      control = JSON.parse(prepared[2]);
+    mutate(control);
+    assert.throws(
+      () => projectRetainedBoundary(prepared[0], prepared[1], bytes(control)),
+      /boundary jungle/,
+    );
+  }
   const modern = boundaryFixture();
   Object.assign(modern.raw, {
     ...modern.raw,
