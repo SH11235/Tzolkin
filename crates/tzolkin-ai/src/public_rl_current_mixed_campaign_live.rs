@@ -7,6 +7,8 @@ const SEGMENT_PLAN_SCHEMA: &str = "tzolkin-current-mixed-live-segment-plan-v1";
 const RESERVATION_SCHEMA: &str = "tzolkin-current-mixed-live-reservation-v1";
 const CALL_CAP: usize = 64 * 1024;
 const INPUT_CAP: usize = 128 * 1024 * 1024;
+// Publication and readback share the existing paired regular-file ceiling.
+const RESERVATION_CAP: usize = MAX_RECORD_BYTES;
 const WRAPPER_CAP: u64 = 128 * 1024 * 1024;
 const MAX_LIVE_UPDATES: usize = 1000;
 const MAX_LIVE_SEGMENTS: usize = 24;
@@ -138,10 +140,7 @@ impl CurrentMixedLivePlanSpec {
         }
         if total > MAX_LIVE_UPDATES
             || aggregate > wire.max_aggregate_input_bytes
-            || (total as u64)
-                .checked_mul((CALL_CAP + 1024) as u64)
-                .and_then(|n| n.checked_add(4 * HEAD_CAP as u64))
-                .is_none_or(|n| n > wire.max_wrapper_bytes)
+            || wrapper_records_bytes(total)? > wire.max_wrapper_bytes
         {
             return Err("Live plan aggregate updates/input/report capacity".into());
         }
@@ -339,9 +338,46 @@ impl CurrentMixedLivePlanSpec {
             "allDeclaredFamiliesRemainSpent":true,"segmentInputs":self.wire.segments,
             "configurations":pre.configurations,"families":pre.families,"externalExclusions":self.wire.exclusions,
             "producerAuthenticated":false,"freshTestAdmission":false,"strengthOrAdoptionAdmission":false}),
-            INPUT_CAP,
+            RESERVATION_CAP,
         )
     }
+    fn require_wrapper_headroom(
+        &self,
+        cursor: Cursor,
+        used: u64,
+        new_reservation: Option<usize>,
+        deployment: bool,
+        inspection: bool,
+    ) -> Result<(), String> {
+        let remaining = self
+            .total
+            .checked_sub(cursor.total_updates)
+            .ok_or("Live plan wrapper cursor exceeds total")?;
+        // Every remaining update may occupy its own invocation. Reserve all
+        // call/intent/report/close caps, even when this invocation pauses early.
+        let mut required = add(used, wrapper_records_bytes(remaining)?)?;
+        if let Some(reservation_bytes) = new_reservation {
+            required = add(
+                add(required, self.raw.len() as u64)?,
+                reservation_bytes as u64,
+            )?;
+        }
+        if deployment {
+            required = add(required, ARTIFACT_CAP as u64)?;
+        }
+        if inspection {
+            required = add(required, HEAD_CAP as u64)?;
+        }
+        if required > self.wire.max_wrapper_bytes {
+            return Err("Live plan remaining wrapper/closed-return/deployment capacity".into());
+        }
+        Ok(())
+    }
+}
+fn wrapper_records_bytes(updates: usize) -> Result<u64, String> {
+    (updates as u64)
+        .checked_mul((CALL_CAP + 3 * HEAD_CAP) as u64)
+        .ok_or_else(|| "Live plan wrapper accounting overflow".into())
 }
 struct Budget {
     attempts: u64,
@@ -353,6 +389,9 @@ struct Budget {
 }
 impl Budget {
     fn reserve(&mut self, contract: &Value, run: &CurrentMixedRunSpec) -> Result<(), String> {
+        if run.max_families as u64 > number(contract, "maxFamilies")? {
+            return Err("Live plan local maxFamilies exceeds established contract".into());
+        }
         self.attempts = add(self.attempts, run.max_attempts)?;
         self.updates = add(self.updates, run.max_successful_updates)?;
         self.work = self.work.add(Work {
@@ -844,6 +883,16 @@ fn start_segment<'a>(
     Ok(next)
 }
 
+fn require_protected_directory(path: &Path) -> Result<PathBuf, String> {
+    let path = local(path, false)?;
+    if !fs::symlink_metadata(&path)
+        .map_err(|e| e.to_string())?
+        .is_dir()
+    {
+        return Err("Live plan protected root is not a directory".into());
+    }
+    Ok(path)
+}
 fn wrapper_bytes(output: &Path) -> Result<u64, String> {
     if !output.exists() {
         return Ok(0);
@@ -929,7 +978,8 @@ pub fn current_mixed_live_plan(
             for directory in dirs {
                 let path: PathBuf =
                     serde_json::from_value(directory.clone()).map_err(|e| e.to_string())?;
-                require_output_outside_directory(&local(&path, false)?, &output)?;
+                let directory = require_protected_directory(&path)?;
+                require_output_outside_directory(&directory, &output)?;
             }
         }
     }
@@ -948,7 +998,7 @@ pub fn current_mixed_live_plan(
         (Cursor::initial(), Vec::new(), Vec::new())
     } else {
         if read_bounded(&output.join("live-plan.json"), CAMPAIGN_CAP)? != plan.raw
-            || read_bounded(&output.join("reservation.json"), INPUT_CAP)? != reservation
+            || read_bounded(&output.join("reservation.json"), RESERVATION_CAP)? != reservation
         {
             return Err("Live plan original full reservation differs".into());
         }
@@ -962,6 +1012,13 @@ pub fn current_mixed_live_plan(
     if output.join(report).exists() || deployment.is_some_and(|name| output.join(name).exists()) {
         return Err("Live plan outputs must be new".into());
     }
+    plan.require_wrapper_headroom(
+        cursor,
+        wrapper_used,
+        (command == "live-continue").then_some(reservation.len()),
+        command != "live-inspect" && deployment.is_some(),
+        command == "live-inspect",
+    )?;
     if command == "live-inspect" {
         publish_live(
             &output,
@@ -1415,7 +1472,57 @@ pub(super) fn metadata_boundaries(original: &CampaignWire, next_spec: &Value) {
             .unwrap_err()
             .contains("maxAttempts")
     );
+    let mut invalid_run = run.clone();
+    invalid_run.max_families = number(&contract, "maxFamilies").unwrap() as usize + 1;
+    let before = budget.attempts;
+    assert!(
+        budget
+            .reserve(&contract, &invalid_run)
+            .unwrap_err()
+            .contains("maxFamilies")
+    );
+    assert_eq!(budget.attempts, before);
     assert!(add(u64::MAX, 1).is_err());
+    let base_required = wrapper_records_bytes(plan.total).unwrap();
+    let mut bounded = plan;
+    bounded.wire.max_wrapper_bytes = base_required;
+    bounded
+        .require_wrapper_headroom(Cursor::initial(), 0, None, false, false)
+        .unwrap();
+    assert!(
+        bounded
+            .require_wrapper_headroom(Cursor::initial(), 0, None, true, false)
+            .is_err()
+    );
+    assert!(
+        bounded
+            .require_wrapper_headroom(Cursor::initial(), 0, Some(1), false, false)
+            .is_err()
+    );
+    assert!(
+        bounded
+            .require_wrapper_headroom(Cursor::initial(), 0, None, false, true)
+            .is_err()
+    );
+    bounded.wire.max_wrapper_bytes = add(base_required, ARTIFACT_CAP as u64).unwrap();
+    bounded
+        .require_wrapper_headroom(Cursor::initial(), 0, None, true, false)
+        .unwrap();
+    // A paused prefix keeps enough room for every remaining closed invocation.
+    let paused = Cursor {
+        segment: 0,
+        updates_in_segment: 1,
+        total_updates: 1,
+    };
+    let used = wrapper_records_bytes(1).unwrap();
+    bounded
+        .require_wrapper_headroom(paused, used, None, true, false)
+        .unwrap();
+    assert!(
+        bounded
+            .require_wrapper_headroom(paused, used + 1, None, true, false)
+            .is_err()
+    );
     // Wrapper capacity fails before publishing a new file.
     let mut used = WRAPPER_CAP;
     assert!(
@@ -1429,4 +1536,32 @@ pub(super) fn metadata_boundaries(original: &CampaignWire, next_spec: &Value) {
         .is_err()
     );
     assert_eq!(used, WRAPPER_CAP);
+    let directory = std::env::temp_dir().join(format!(
+        "tzolkin-live-metadata-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).unwrap();
+    require_protected_directory(&directory).unwrap();
+    let reservation = b"synthetic reservation metadata";
+    let mut used = 0;
+    publish_live(
+        &directory,
+        "reservation.json",
+        reservation,
+        WRAPPER_CAP,
+        &mut used,
+    )
+    .unwrap();
+    assert_eq!(
+        read_bounded(&directory.join("reservation.json"), RESERVATION_CAP).unwrap(),
+        reservation
+    );
+    assert!(require_protected_directory(&directory.join("reservation.json")).is_err());
+    assert!(require_protected_directory(&directory.join("missing")).is_err());
+    assert_eq!(directory.parent(), Some(std::env::temp_dir().as_path()));
+    fs::remove_dir_all(&directory).unwrap();
 }
