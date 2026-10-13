@@ -5,7 +5,8 @@ use crate::human_initial_wealth::ContentPin;
 use crate::human_initial_wealth::table_family_id;
 use crate::human_policy_dataset::{
     ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
-    HumanPolicySample, OBSERVED_CORN_BEG_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE, TASK,
+    HumanPolicySample, OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
+    PAID_TECHNOLOGY_LABEL_SCOPE, TASK,
 };
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::model::{Random, digest};
@@ -162,6 +163,7 @@ impl ConditionalDatasetIdentity {
                     && scope != PAID_TECHNOLOGY_LABEL_SCOPE
                     && scope != EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
                     && scope != OBSERVED_CORN_BEG_LABEL_SCOPE
+                    && scope != OBSERVED_PENDING_CHOICE_LABEL_SCOPE
             })
             || self.feature_schema != PUBLIC_FEATURE_SCHEMA
             || self.feature_count != FEATURE_COUNT
