@@ -1841,7 +1841,7 @@ impl ResourceRouteContext {
                         o,
                         p,
                         p.resources[0],
-                        p.resources[0] - *corn_cost,
+                        p.resources[0] + o.accumulated_corn - *corn_cost,
                         o.round + 1,
                     )
             }
@@ -3865,6 +3865,61 @@ mod tests {
         assert!(
             crate::dispatch_cpu_resource_aligned_v2(&serde_json::to_string(&malformed).unwrap())
                 .is_err()
+        );
+
+        // First-player corn arrives at EndTurn before any feeding stage.
+        // Baseline hunger is permitted; the placement must not invent more.
+        let mut first = playing(None);
+        first.pending = None;
+        first.round = 7;
+        first.accumulated_corn = 2;
+        first.turn.mode = TurnMode::Place;
+        first.turn.count = 2;
+        let actor = first.current_player;
+        first.players[actor].resources.insert(Resource::Corn, 4);
+        for gear in [GearId::Palenque, GearId::Yaxchilan] {
+            let slots = first.gears.get_mut(&gear).unwrap();
+            let slot = slots.iter().position(Option::is_none).unwrap();
+            slots[slot] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+        }
+        let first_observation = observe(&first, actor).unwrap();
+        let player = &first_observation.players[actor];
+        assert_eq!(player.workers, 3);
+        assert_eq!(resource_base_feeding_penalty(player, 4), 3.0);
+        assert_eq!(resource_base_feeding_penalty(player, 2), 6.0);
+        let placement = first_observation
+            .legal_actions
+            .iter()
+            .find(|row| matches!(row.action, TypedAction::FirstPlayer { corn_cost: 2 }))
+            .unwrap();
+        let context = ResourceRouteContext::new(&first_observation, &weights);
+        assert_eq!(
+            context.score(&first_observation, &placement.action, &weights),
+            context.score(
+                &first_observation,
+                &TypedAction::EndTurn {
+                    double_advance: None,
+                },
+                &weights,
+            )
+        );
+        let placed = apply_move(&first, placement.r#move.clone()).unwrap();
+        assert_eq!(placed.players[actor].resources[&Resource::Corn], 2);
+        let ended = apply_move(
+            &placed,
+            GameMove::EndTurn {
+                double_advance: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(ended.players[actor].resources[&Resource::Corn], 4);
+        assert_eq!(ended.accumulated_corn, 0);
+        assert_eq!(
+            resource_food_tradeoff(&first_observation, player, 4, 4, 8),
+            0.0
         );
 
         state.pending = Some(Pending {
