@@ -3,12 +3,12 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 use tzolkin_ai::dataset::DatasetSplit;
-use tzolkin_ai::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
+use tzolkin_ai::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA, SEMANTIC_PLAYING_FEATURE_SCHEMA};
 use tzolkin_ai::human_policy_dataset::{
     CAPPED_EXTRACTION_LABEL_SCOPE, ConditionalHumanPolicyDataset,
     EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, INPUT_SCHEMA, INPUT_SCHEMA_V2,
     INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5, INPUT_SCHEMA_V6, INPUT_SCHEMA_V7,
-    OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
+    INPUT_SCHEMA_V8, OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
     PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
@@ -1050,8 +1050,13 @@ impl Fixture {
         if let Some(scope) = scope {
             manifest["labelScope"] = scope;
         }
+        if schema == INPUT_SCHEMA_V8 {
+            manifest["featureProfile"] = json!("semanticPlaying4");
+        }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V7 {
+        let file = if schema == INPUT_SCHEMA_V8 {
+            "manifest-v8.json"
+        } else if schema == INPUT_SCHEMA_V7 {
             "manifest-v7.json"
         } else if schema == INPUT_SCHEMA_V6 {
             "manifest-v6.json"
@@ -1067,7 +1072,23 @@ impl Fixture {
             "manifest.json"
         };
         fs::write(self.root.join(file), &bytes).unwrap();
-        ConditionalHumanPolicyDataset::load(
+        if schema == INPUT_SCHEMA_V8 {
+            assert!(
+                ConditionalHumanPolicyDataset::load(
+                    &self.root.join(file),
+                    &sha(&bytes),
+                    manifest["nominations"]["sha256"].as_str().unwrap(),
+                    manifest["reservations"]["sha256"].as_str().unwrap(),
+                )
+                .is_err()
+            );
+        }
+        let load = if schema == INPUT_SCHEMA_V8 {
+            ConditionalHumanPolicyDataset::load_semantic_playing
+        } else {
+            ConditionalHumanPolicyDataset::load
+        };
+        load(
             &self.root.join(file),
             &sha(&bytes),
             manifest["nominations"]["sha256"].as_str().unwrap(),
@@ -1236,6 +1257,140 @@ fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel
         fs::write(path, original).unwrap();
     }
     owner.origin().recheck_sources().unwrap();
+
+    // Schema 4 is generated from the same original labels, never retagged rows.
+    let semantic_datasets = [&train, &validation].map(|fixture| {
+        fixture
+            .load_scope(INPUT_SCHEMA_V8, Some(json!(CAPPED_EXTRACTION_LABEL_SCOPE)))
+            .unwrap()
+    });
+    for (old, semantic) in datasets.iter().zip(&semantic_datasets) {
+        assert_eq!(old.counts().samples, semantic.counts().samples);
+        assert_eq!(old.counts().candidates, semantic.counts().candidates);
+        let report = serde_json::to_value(semantic.report()).unwrap();
+        assert_eq!(report["featureSchema"], SEMANTIC_PLAYING_FEATURE_SCHEMA);
+        assert_eq!(report["featureProfile"], "semanticPlaying4");
+        assert_eq!(
+            report["featureEligibility"]["trainingSelection"],
+            "schema2EligibleCommonSubset"
+        );
+        assert_eq!(
+            report["featureEligibility"]["public2"]["samples"],
+            old.counts().samples
+        );
+        assert!(!report["sourceQualified"].as_bool().unwrap());
+        for (original, encoded) in old.samples().iter().zip(semantic.samples()) {
+            let mut original = serde_json::to_value(original).unwrap();
+            let mut encoded = serde_json::to_value(encoded).unwrap();
+            original.as_object_mut().unwrap().remove("candidates");
+            encoded.as_object_mut().unwrap().remove("candidates");
+            assert_eq!(original, encoded);
+        }
+        for row in semantic
+            .samples()
+            .iter()
+            .flat_map(|sample| sample.candidates())
+        {
+            assert!(row.values_for_schema(PUBLIC_FEATURE_SCHEMA).is_err());
+            assert!(tzolkin_inference::policy::validated_semantic_playing_values(row).is_ok());
+        }
+    }
+    use tzolkin_ai::human_policy_training::{
+        SEMANTIC_PLAYING_COLLECTION_SCHEMA, train_semantic_playing_collection_manifest,
+    };
+    let inputs = [&train, &validation].map(|fixture| {
+        let path = fixture.root.join("manifest-v8.json");
+        let bytes = fs::read(&path).unwrap();
+        let manifest: Value = serde_json::from_slice(&bytes).unwrap();
+        json!({"manifestPath":path.to_string_lossy(), "manifestSha256":sha(&bytes),
+            "nominationsSha256":manifest["nominations"]["sha256"],
+            "reservationsSha256":manifest["reservations"]["sha256"]})
+    });
+    let semantic_collection = train.root.join("semantic-collection.json");
+    fs::write(
+        &semantic_collection,
+        serde_json::to_vec(&json!({"schema":SEMANTIC_PLAYING_COLLECTION_SCHEMA,
+        "config":config,"datasets":inputs}))
+        .unwrap(),
+    )
+    .unwrap();
+    let semantic_outcome =
+        train_semantic_playing_collection_manifest(&semantic_collection).unwrap();
+    let semantic_output = train.root.join("semantic-checkpoint");
+    semantic_outcome
+        .save_new_semantic_playing_directory(&semantic_output)
+        .unwrap();
+    assert!(
+        PreparedConditionalHumanPolicy::load(
+            &semantic_output.join("checkpoint.json"),
+            &semantic_collection
+        )
+        .is_err()
+    );
+    let semantic_prepared = PreparedConditionalHumanPolicy::load_semantic_playing(
+        &semantic_output.join("checkpoint.json"),
+        &semantic_collection,
+    )
+    .unwrap();
+    assert_eq!(semantic_prepared.reservations()["125"], DatasetSplit::Test);
+    assert!(
+        ConditionalRlOwner::from_prepared(&semantic_prepared, 11, SamplingSeed::new(17))
+            .err()
+            .unwrap()
+            .contains("public2")
+    );
+    assert!(
+        tzolkin_ai::arena::conditional::ConditionalPolicy::new(
+            &semantic_prepared,
+            tzolkin_ai::arena::conditional::ConditionalSetup::CornFirst,
+            tzolkin_inference::trade_guard::TradeGuardConfig::default(),
+        )
+        .is_err()
+    );
+    assert!(
+        semantic_prepared
+            .distribution(&observe(&playing_state(), 0).unwrap())
+            .is_err()
+    );
+    assert!(
+        semantic_prepared
+            .distribution_semantic_playing(&observe(&playing_state(), 0).unwrap())
+            .is_ok()
+    );
+    let public_validation = train.root.join("public-validation.json");
+    let semantic_validation = train.root.join("semantic-validation.json");
+    let public_manifest = validation.root.join("manifest.json");
+    let public_bytes = fs::read(&public_manifest).unwrap();
+    let public_input: Value = serde_json::from_slice(&public_bytes).unwrap();
+    fs::write(&public_validation, serde_json::to_vec(&json!({"schema":COLLECTION_SCHEMA,
+        "config":config,"datasets":[{"manifestPath":public_manifest.to_string_lossy(),"manifestSha256":sha(&public_bytes),
+        "nominationsSha256":public_input["nominations"]["sha256"],"reservationsSha256":public_input["reservations"]["sha256"]}]})).unwrap()).unwrap();
+    fs::write(
+        &semantic_validation,
+        serde_json::to_vec(&json!({"schema":SEMANTIC_PLAYING_COLLECTION_SCHEMA,
+        "config":config,"datasets":[inputs[1].clone()]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let comparison =
+        tzolkin_ai::human_policy_training::compare_semantic_playing_validation_collections(
+            &prepared,
+            &semantic_prepared,
+            &public_validation,
+            &semantic_validation,
+        )
+        .unwrap();
+    assert_eq!(comparison.samples(), 1);
+    assert_eq!(comparison.candidates(), datasets[1].counts().candidates);
+    let mut heldout = Fixture::new();
+    heldout.reservations["entries"][0]["split"] = json!("test");
+    assert!(
+        heldout
+            .load_scope(INPUT_SCHEMA_V8, Some(json!(CAPPED_EXTRACTION_LABEL_SCOPE)))
+            .err()
+            .unwrap()
+            .contains("non-Test")
+    );
 }
 
 #[test]

@@ -1,10 +1,12 @@
 //! Separate policy-only BC for sealed conditional Human inputs, never native admission.
 use crate::dataset::DatasetSplit;
-use crate::features::{FEATURE_COUNT, FeatureEncoder, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
+#[cfg(test)]
+use crate::features::FeatureEncoder;
+use crate::features::{FEATURE_COUNT, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA};
 use crate::human_initial_wealth::ContentPin;
 use crate::human_initial_wealth::table_family_id;
 use crate::human_policy_dataset::{
-    CAPPED_EXTRACTION_LABEL_SCOPE, ConditionalHumanPolicyDataset,
+    CAPPED_EXTRACTION_LABEL_SCOPE, ConditionalFeatureProfile, ConditionalHumanPolicyDataset,
     EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, HumanPolicySample,
     OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
     PAID_TECHNOLOGY_LABEL_SCOPE, TASK,
@@ -14,11 +16,11 @@ use crate::model::{Random, digest};
 use crate::policy_training::{
     MAX_CANDIDATE_EVALUATIONS, MAX_UPDATES, PolicyAdamState, PolicyBcConfig, PolicyLossReport,
     PolicyTrainingMetrics, Scratch, bounded_json, policy_loss, publish, read_local_json,
-    read_local_json_pinned, validate_new_output_directory,
+    read_local_json_pinned, semantic_playing_policy_loss, validate_new_output_directory,
 };
 use crate::public_model::{
     MODEL_VERSION, PublicPolicyArtifact, PublicPolicyModel, ValueValidity, predict_numeric,
-    validate_contract,
+    predict_semantic_playing_numeric, validate_contract,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,6 +39,56 @@ pub const MAX_TABLES: usize = 128;
 pub const MAX_SAMPLES: usize = 65_536;
 pub const MAX_CANDIDATES: usize = 262_144;
 pub const COLLECTION_SCHEMA: &str = "tzolkin-conditional-human-policy-training-input-v1";
+pub const SEMANTIC_PLAYING_COLLECTION_SCHEMA: &str =
+    "tzolkin-conditional-human-semantic-playing-training-input-v2";
+pub const SEMANTIC_PLAYING_INPUT_CONTRACT: &str =
+    "conditional-basic-unlimited-3-4p-semantic-playing512-v4";
+pub const SEMANTIC_PLAYING_MODEL_SCHEMA: &str =
+    "tzolkin-conditional-human-semantic-playing-model-v2";
+pub const SEMANTIC_PLAYING_MODEL_VERSION: &str = "conditional-semantic-playing-512x32x1-scalar-v1";
+pub const SEMANTIC_PLAYING_CHECKPOINT_SCHEMA: &str =
+    "tzolkin-conditional-human-semantic-playing-checkpoint-v2";
+pub const SEMANTIC_PLAYING_TRAINING_VERSION: &str =
+    "conditional-human-semantic-playing-bc-scalar-adam-v2";
+
+impl ConditionalFeatureProfile {
+    fn input_contract(self) -> &'static str {
+        match self {
+            Self::Public2 => INPUT_CONTRACT,
+            Self::SemanticPlaying4 => SEMANTIC_PLAYING_INPUT_CONTRACT,
+        }
+    }
+    fn collection_schema(self) -> &'static str {
+        match self {
+            Self::Public2 => COLLECTION_SCHEMA,
+            Self::SemanticPlaying4 => SEMANTIC_PLAYING_COLLECTION_SCHEMA,
+        }
+    }
+    fn model_schema(self) -> &'static str {
+        match self {
+            Self::Public2 => MODEL_SCHEMA,
+            Self::SemanticPlaying4 => SEMANTIC_PLAYING_MODEL_SCHEMA,
+        }
+    }
+    fn model_version(self) -> &'static str {
+        match self {
+            Self::Public2 => MODEL_VERSION,
+            Self::SemanticPlaying4 => SEMANTIC_PLAYING_MODEL_VERSION,
+        }
+    }
+    fn checkpoint_schema(self) -> &'static str {
+        match self {
+            Self::Public2 => CHECKPOINT_SCHEMA,
+            Self::SemanticPlaying4 => SEMANTIC_PLAYING_CHECKPOINT_SCHEMA,
+        }
+    }
+    fn training_version(self) -> &'static str {
+        match self {
+            Self::Public2 => TRAINING_VERSION,
+            Self::SemanticPlaying4 => SEMANTIC_PLAYING_TRAINING_VERSION,
+        }
+    }
+}
 
 #[derive(Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -65,6 +117,24 @@ pub fn train_collection_manifest(
     }
     Ok(outcome)
 }
+/// Fresh BC only: neither an old checkpoint nor its optimizer can seed this profile.
+pub fn train_semantic_playing_collection_manifest(
+    path: &Path,
+) -> Result<ConditionalHumanPolicyOutcome, String> {
+    let input: CollectionInput = read_local_json(path)?;
+    let (input, datasets) =
+        load_collection_input_using(path, input, ConditionalFeatureProfile::SemanticPlaying4)?;
+    let outcome = train_using_profile(
+        &datasets,
+        &input.config,
+        None,
+        ConditionalFeatureProfile::SemanticPlaying4,
+    )?;
+    if read_local_json::<CollectionInput>(path)? != input {
+        return Err("Conditional collection input changed before completion".into());
+    }
+    Ok(outcome)
+}
 fn load_collection(
     path: &Path,
 ) -> Result<(CollectionInput, Vec<ConditionalHumanPolicyDataset>), String> {
@@ -75,7 +145,14 @@ fn load_collection_input(
     path: &Path,
     input: CollectionInput,
 ) -> Result<(CollectionInput, Vec<ConditionalHumanPolicyDataset>), String> {
-    if input.schema != COLLECTION_SCHEMA
+    load_collection_input_using(path, input, ConditionalFeatureProfile::Public2)
+}
+fn load_collection_input_using(
+    path: &Path,
+    input: CollectionInput,
+    profile: ConditionalFeatureProfile,
+) -> Result<(CollectionInput, Vec<ConditionalHumanPolicyDataset>), String> {
+    if input.schema != profile.collection_schema()
         || input.datasets.is_empty()
         || input.datasets.len() > MAX_TABLES
     {
@@ -86,7 +163,13 @@ fn load_collection_input(
     let mut datasets = Vec::with_capacity(input.datasets.len());
     let mut totals = (0usize, 0usize);
     for source in &input.datasets {
-        let dataset = ConditionalHumanPolicyDataset::load(
+        let load = match profile {
+            ConditionalFeatureProfile::Public2 => ConditionalHumanPolicyDataset::load,
+            ConditionalFeatureProfile::SemanticPlaying4 => {
+                ConditionalHumanPolicyDataset::load_semantic_playing
+            }
+        };
+        let dataset = load(
             &base.join(&source.manifest_path),
             &source.manifest_sha256,
             &source.nominations_sha256,
@@ -161,8 +244,24 @@ impl ConditionalDatasetIdentity {
         self.validate_partition(false)
     }
     fn validate_partition(&self, validation_only: bool) -> Result<(), String> {
+        self.validate_partition_using(validation_only, ConditionalFeatureProfile::Public2)
+    }
+    pub fn feature_profile(&self) -> Result<ConditionalFeatureProfile, String> {
+        match (self.input_contract.as_str(), self.feature_schema) {
+            (INPUT_CONTRACT, PUBLIC_FEATURE_SCHEMA) => Ok(ConditionalFeatureProfile::Public2),
+            (SEMANTIC_PLAYING_INPUT_CONTRACT, crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA) => {
+                Ok(ConditionalFeatureProfile::SemanticPlaying4)
+            }
+            _ => Err("Conditional input contract/feature profile mismatch".into()),
+        }
+    }
+    fn validate_partition_using(
+        &self,
+        validation_only: bool,
+        profile: ConditionalFeatureProfile,
+    ) -> Result<(), String> {
         if self.task != TASK
-            || self.input_contract != INPUT_CONTRACT
+            || self.input_contract != profile.input_contract()
             || self.label_scope.as_deref().is_some_and(|scope| {
                 scope != FACTORIZED_LABEL_SCOPE
                     && scope != PAID_TECHNOLOGY_LABEL_SCOPE
@@ -171,7 +270,9 @@ impl ConditionalDatasetIdentity {
                     && scope != OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                     && scope != CAPPED_EXTRACTION_LABEL_SCOPE
             })
-            || self.feature_schema != PUBLIC_FEATURE_SCHEMA
+            || self.feature_schema != profile.schema()
+            || (profile == ConditionalFeatureProfile::SemanticPlaying4
+                && self.label_scope.as_deref() != Some(CAPPED_EXTRACTION_LABEL_SCOPE))
             || self.feature_count != FEATURE_COUNT
             || self.rules_version != tzolkin_core::public_replay::PUBLIC_RULES_VERSION
             || self.catalog_hash != tzolkin_core::public_replay::public_catalog_hash()
@@ -228,12 +329,25 @@ impl ConditionalDatasetIdentity {
         Ok(())
     }
 }
+#[cfg(test)]
 fn audit(datasets: &[ConditionalHumanPolicyDataset]) -> Result<ConditionalDatasetIdentity, String> {
     audit_partition(datasets, false)
 }
+#[cfg(test)]
 fn audit_partition(
     datasets: &[ConditionalHumanPolicyDataset],
     validation_only: bool,
+) -> Result<ConditionalDatasetIdentity, String> {
+    audit_partition_using(
+        datasets,
+        validation_only,
+        ConditionalFeatureProfile::Public2,
+    )
+}
+fn audit_partition_using(
+    datasets: &[ConditionalHumanPolicyDataset],
+    validation_only: bool,
+    profile: ConditionalFeatureProfile,
 ) -> Result<ConditionalDatasetIdentity, String> {
     if datasets.is_empty() || datasets.len() > MAX_TABLES {
         return Err("Conditional collection table bound exceeded".into());
@@ -241,14 +355,14 @@ fn audit_partition(
     let label_scope = datasets[0].label_scope();
     if datasets
         .iter()
-        .any(|dataset| dataset.label_scope() != label_scope)
+        .any(|dataset| dataset.label_scope() != label_scope || dataset.feature_profile() != profile)
     {
         return Err("Conditional collections cannot mix label scopes".into());
     }
     let mut identity = ConditionalDatasetIdentity {
         task: TASK.into(),
-        input_contract: INPUT_CONTRACT.into(),
-        feature_schema: PUBLIC_FEATURE_SCHEMA,
+        input_contract: profile.input_contract().into(),
+        feature_schema: profile.schema(),
         feature_count: FEATURE_COUNT,
         rules_version: tzolkin_core::public_replay::PUBLIC_RULES_VERSION,
         catalog_hash: tzolkin_core::public_replay::public_catalog_hash(),
@@ -294,9 +408,9 @@ fn audit_partition(
             {
                 return Err("Invalid/duplicate sealed conditional sample".into());
             }
-            let context = &sample.candidates()[0].values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..384];
+            let context = &sample.candidates()[0].values_for_schema(profile.schema())?[..384];
             for row in sample.candidates() {
-                let values = row.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+                let values = row.values_for_schema(profile.schema())?;
                 if &values[..384] != context
                     || values
                         .iter()
@@ -337,7 +451,7 @@ fn audit_partition(
     }
     identity.tables.sort_by(|a, b| a.table_id.cmp(&b.table_id));
     identity.fingerprint = identity.expected_fingerprint()?;
-    identity.validate_partition(validation_only)?;
+    identity.validate_partition_using(validation_only, profile)?;
     Ok(identity)
 }
 /// Conditional provenance is separate from the native public-policy artifact wire format.
@@ -348,6 +462,8 @@ pub struct ConditionalHumanPolicyArtifact {
     pub model_version: String,
     pub task: String,
     pub input_contract: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feature_profile: Option<ConditionalFeatureProfile>,
     pub dataset_fingerprint: String,
     pub value_validity: ValueValidity,
     pub model: PublicPolicyModel,
@@ -360,15 +476,26 @@ impl ConditionalHumanPolicyArtifact {
         Ok(digest(&bounded_json(&artifact)?))
     }
     fn reseal(&mut self) -> Result<(), String> {
+        self.reseal_using(ConditionalFeatureProfile::Public2)
+    }
+    fn reseal_using(&mut self, profile: ConditionalFeatureProfile) -> Result<(), String> {
         self.checksum = self.expected_checksum()?;
-        self.validate()
+        self.validate_using(profile)
     }
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_using(ConditionalFeatureProfile::Public2)
+    }
+    pub fn validate_semantic_playing(&self) -> Result<(), String> {
+        self.validate_using(ConditionalFeatureProfile::SemanticPlaying4)
+    }
+    fn validate_using(&self, profile: ConditionalFeatureProfile) -> Result<(), String> {
         self.model.validate()?;
-        if self.schema != MODEL_SCHEMA
-            || self.model_version != MODEL_VERSION
+        if self.schema != profile.model_schema()
+            || self.model_version != profile.model_version()
             || self.task != TASK
-            || self.input_contract != INPUT_CONTRACT
+            || self.input_contract != profile.input_contract()
+            || self.feature_profile
+                != (profile == ConditionalFeatureProfile::SemanticPlaying4).then_some(profile)
             || !checksum(&self.dataset_fingerprint)
             || self.value_validity != ValueValidity::UnavailablePolicyOnly
             || !checksum(&self.checksum)
@@ -400,12 +527,23 @@ impl ConditionalHumanPolicyCheckpoint {
         Ok(digest(&bounded_json(&checkpoint)?))
     }
     pub fn validate(&self) -> Result<(), String> {
-        self.dataset.validate()?;
+        self.validate_using(ConditionalFeatureProfile::Public2)
+    }
+    pub fn validate_semantic_playing(&self) -> Result<(), String> {
+        self.validate_using(ConditionalFeatureProfile::SemanticPlaying4)
+    }
+    fn validate_using(&self, profile: ConditionalFeatureProfile) -> Result<(), String> {
+        match profile {
+            ConditionalFeatureProfile::Public2 => self.dataset.validate()?,
+            ConditionalFeatureProfile::SemanticPlaying4 => {
+                self.dataset.validate_partition_using(false, profile)?
+            }
+        }
         self.config.validate()?;
-        self.model.validate()?;
+        self.model.validate_using(profile)?;
         self.optimizer.validate()?;
-        if self.schema != CHECKPOINT_SCHEMA
-            || self.training_version != TRAINING_VERSION
+        if self.schema != profile.checkpoint_schema()
+            || self.training_version != profile.training_version()
             || self.completed_epochs == 0
             || self.completed_epochs != self.config.epochs
             || self.metrics.completed_epochs != self.completed_epochs
@@ -436,6 +574,11 @@ impl ConditionalHumanPolicyCheckpoint {
         checkpoint.validate()?;
         Ok(checkpoint)
     }
+    pub fn load_semantic_playing(path: &Path) -> Result<Self, String> {
+        let checkpoint: Self = read_local_json(path)?;
+        checkpoint.validate_semantic_playing()?;
+        Ok(checkpoint)
+    }
 }
 
 /// Immutable conditional Human policy with source-checked table identity.
@@ -447,18 +590,41 @@ pub struct PreparedConditionalHumanPolicy {
     kernel: ResolvedKernel,
     loaded_sources: Option<Vec<ContentPin>>,
     loaded_boundary_sources: Option<Vec<ContentPin>>,
+    feature_profile: ConditionalFeatureProfile,
+    source_labels_by_split: [String; 3],
 }
 impl PreparedConditionalHumanPolicy {
     pub fn load(checkpoint_path: &Path, collection_path: &Path) -> Result<Self, String> {
+        Self::load_using(
+            checkpoint_path,
+            collection_path,
+            ConditionalFeatureProfile::Public2,
+        )
+    }
+    pub fn load_semantic_playing(
+        checkpoint_path: &Path,
+        collection_path: &Path,
+    ) -> Result<Self, String> {
+        Self::load_using(
+            checkpoint_path,
+            collection_path,
+            ConditionalFeatureProfile::SemanticPlaying4,
+        )
+    }
+    fn load_using(
+        checkpoint_path: &Path,
+        collection_path: &Path,
+        profile: ConditionalFeatureProfile,
+    ) -> Result<Self, String> {
         let (checkpoint, checkpoint_pin): (ConditionalHumanPolicyCheckpoint, _) =
             read_local_json_pinned(checkpoint_path)?;
-        checkpoint.validate()?;
+        checkpoint.validate_using(profile)?;
         let (input, collection_pin) = read_local_json_pinned(collection_path)?;
-        let (input, datasets) = load_collection_input(collection_path, input)?;
+        let (input, datasets) = load_collection_input_using(collection_path, input, profile)?;
         if input.config != checkpoint.config {
             return Err("Conditional prepared collection/checkpoint config mismatch".into());
         }
-        let mut prepared = Self::new(checkpoint, &datasets)?;
+        let mut prepared = Self::new_using(checkpoint, &datasets, profile)?;
         let mut boundaries = vec![checkpoint_pin.clone(), collection_pin.clone()];
         let mut pins = vec![checkpoint_pin, collection_pin];
         for dataset in &datasets {
@@ -480,8 +646,15 @@ impl PreparedConditionalHumanPolicy {
         checkpoint: ConditionalHumanPolicyCheckpoint,
         datasets: &[ConditionalHumanPolicyDataset],
     ) -> Result<Self, String> {
-        checkpoint.validate()?;
-        let identity = audit(datasets)?;
+        Self::new_using(checkpoint, datasets, ConditionalFeatureProfile::Public2)
+    }
+    fn new_using(
+        checkpoint: ConditionalHumanPolicyCheckpoint,
+        datasets: &[ConditionalHumanPolicyDataset],
+        profile: ConditionalFeatureProfile,
+    ) -> Result<Self, String> {
+        checkpoint.validate_using(profile)?;
+        let identity = audit_partition_using(datasets, false, profile)?;
         if checkpoint.dataset != identity {
             return Err("Conditional prepared checkpoint/source identity mismatch".into());
         }
@@ -492,7 +665,14 @@ impl PreparedConditionalHumanPolicy {
             }
             for sample in dataset.samples() {
                 for row in sample.candidates() {
-                    PublicPolicyModel::validated_values(row)?;
+                    match profile {
+                        ConditionalFeatureProfile::Public2 => {
+                            PublicPolicyModel::validated_values(row)?;
+                        }
+                        ConditionalFeatureProfile::SemanticPlaying4 => {
+                            tzolkin_inference::policy::validated_semantic_playing_values(row)?;
+                        }
+                    }
                 }
             }
         }
@@ -508,19 +688,25 @@ impl PreparedConditionalHumanPolicy {
             .filter(|d| d.split() == DatasetSplit::Validation)
             .flat_map(|d| d.samples())
             .collect::<Vec<_>>();
+        let source_labels_by_split = [
+            ordered_source_labels(&train)?,
+            ordered_source_labels(&validation)?,
+            ordered_source_labels(&[])?,
+        ];
         let initial = PublicPolicyArtifact::new(checkpoint.config.seed)?.model;
         let mut scratch = Scratch::default();
-        if evaluate(&train, &initial, &mut scratch)? != checkpoint.metrics.initial_train
-            || evaluate(&validation, &initial, &mut scratch)?
+        if evaluate_using(&train, &initial, &mut scratch, profile)?
+            != checkpoint.metrics.initial_train
+            || evaluate_using(&validation, &initial, &mut scratch, profile)?
                 != checkpoint.metrics.initial_validation
-            || evaluate(&train, &checkpoint.model.model, &mut scratch)?
+            || evaluate_using(&train, &checkpoint.model.model, &mut scratch, profile)?
                 != checkpoint.metrics.final_train
-            || evaluate(&validation, &checkpoint.model.model, &mut scratch)?
+            || evaluate_using(&validation, &checkpoint.model.model, &mut scratch, profile)?
                 != checkpoint.metrics.final_validation
         {
             return Err("Conditional prepared metric/model/source mismatch".into());
         }
-        if audit(datasets)? != identity {
+        if audit_partition_using(datasets, false, profile)? != identity {
             return Err("Conditional sources changed during preparation".into());
         }
         Ok(Self {
@@ -529,14 +715,24 @@ impl PreparedConditionalHumanPolicy {
             kernel: Kernel::Scalar.resolve()?,
             loaded_sources: None,
             loaded_boundary_sources: None,
+            feature_profile: profile,
+            source_labels_by_split,
         })
     }
     pub(crate) fn loaded_sources(&self) -> Result<&[ContentPin], String> {
+        if self.feature_profile != ConditionalFeatureProfile::Public2 {
+            return Err("Legacy conditional RL origin requires public2 preparation".into());
+        }
         self.loaded_sources
             .as_deref()
             .ok_or_else(|| "Conditional RL origin requires successful source load".into())
     }
     pub(crate) fn loaded_boundary_sources(&self) -> Result<&[ContentPin], String> {
+        if self.feature_profile != ConditionalFeatureProfile::Public2 {
+            return Err(
+                "Legacy conditional journal/deployment requires public2 preparation".into(),
+            );
+        }
         self.loaded_boundary_sources
             .as_deref()
             .ok_or_else(|| "Conditional boundary pins require successful source load".into())
@@ -575,15 +771,44 @@ impl PreparedConditionalHumanPolicy {
         &self,
         observation: &Observation,
     ) -> Result<NumericPolicyDistribution, String> {
+        if self.feature_profile != ConditionalFeatureProfile::Public2 {
+            return Err(
+                "Legacy conditional distribution cannot score semantic Playing weights".into(),
+            );
+        }
+        self.distribution_using(observation, ConditionalFeatureProfile::Public2)
+    }
+    /// Explicit input layout only; Arena/deployment admission is a separate boundary.
+    pub fn distribution_semantic_playing(
+        &self,
+        observation: &Observation,
+    ) -> Result<NumericPolicyDistribution, String> {
+        if self.feature_profile != ConditionalFeatureProfile::SemanticPlaying4 {
+            return Err("Semantic Playing distribution requires its own loaded profile".into());
+        }
+        self.distribution_using(observation, ConditionalFeatureProfile::SemanticPlaying4)
+    }
+    fn distribution_using(
+        &self,
+        observation: &Observation,
+        profile: ConditionalFeatureProfile,
+    ) -> Result<NumericPolicyDistribution, String> {
         validate_contract(observation)?;
         if observation.phase != Phase::Playing {
             return Err("Conditional Human policy requires Playing observations".into());
         }
-        let encoder = FeatureEncoder::new_public(observation)?;
+        let encoder = profile.encoder(observation)?;
         let rows = (0..observation.legal_actions.len())
             .map(|index| encoder.encode_legal_tagged(index))
             .collect::<Result<Vec<_>, _>>()?;
-        predict_numeric(&self.checkpoint.model.model, self.kernel, &rows)
+        match profile {
+            ConditionalFeatureProfile::Public2 => {
+                predict_numeric(&self.checkpoint.model.model, self.kernel, &rows)
+            }
+            ConditionalFeatureProfile::SemanticPlaying4 => {
+                predict_semantic_playing_numeric(&self.checkpoint.model.model, self.kernel, &rows)
+            }
+        }
     }
 }
 fn seal_loaded_sources(pins: Vec<ContentPin>) -> Result<Vec<ContentPin>, String> {
@@ -610,6 +835,17 @@ fn seal_loaded_sources(pins: Vec<ContentPin>) -> Result<Vec<ContentPin>, String>
 }
 
 pub const VALIDATION_COMPARISON_SCHEMA: &str = "tzolkin-conditional-human-shared-validation-v1";
+pub const SEMANTIC_PLAYING_VALIDATION_SCHEMA: &str =
+    "tzolkin-conditional-human-semantic-playing-validation-v2";
+
+fn ordered_source_labels(samples: &[&HumanPolicySample]) -> Result<String, String> {
+    let mut hash = Sha256::new();
+    hash.update(b"tzolkin-conditional-source-label-order-v1\0");
+    for sample in samples {
+        hash.update(sample.source_label_digest()?.as_bytes());
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -664,7 +900,11 @@ impl ConditionalValidationComparison {
 }
 
 fn recheck_prepared_origin(policy: &PreparedConditionalHumanPolicy) -> Result<(), String> {
-    for pin in policy.loaded_sources()? {
+    let pins = policy
+        .loaded_sources
+        .as_deref()
+        .ok_or("Conditional source recheck requires successful source load")?;
+    for pin in pins {
         crate::human_policy_dataset::recheck_absolute_pin(pin)?;
     }
     Ok(())
@@ -677,6 +917,12 @@ pub fn compare_validation_collection(
     actors: [&PreparedConditionalHumanPolicy; 2],
     validation_collection: &Path,
 ) -> Result<ConditionalValidationComparison, String> {
+    if actors
+        .iter()
+        .any(|actor| actor.feature_profile != ConditionalFeatureProfile::Public2)
+    {
+        return Err("Legacy shared Validation requires public2 origins".into());
+    }
     for actor in actors {
         recheck_prepared_origin(actor)?;
     }
@@ -702,7 +948,12 @@ fn compare_validation_datasets(
     actors: [&PreparedConditionalHumanPolicy; 2],
     datasets: &[ConditionalHumanPolicyDataset],
 ) -> Result<ConditionalValidationComparison, String> {
-    let identity = audit_partition(datasets, true)?;
+    compare_validation_datasets_using(actors, datasets, ConditionalFeatureProfile::Public2)
+}
+fn validate_shared_reservations(
+    actors: [&PreparedConditionalHumanPolicy; 2],
+    datasets: &[ConditionalHumanPolicyDataset],
+) -> Result<(), String> {
     let mut reservations = BTreeMap::new();
     let mut train_families = BTreeSet::new();
     for actor in actors {
@@ -744,6 +995,18 @@ fn compare_validation_datasets(
             }
         }
     }
+    Ok(())
+}
+fn compare_validation_datasets_using(
+    actors: [&PreparedConditionalHumanPolicy; 2],
+    datasets: &[ConditionalHumanPolicyDataset],
+    profile: ConditionalFeatureProfile,
+) -> Result<ConditionalValidationComparison, String> {
+    if actors.iter().any(|actor| actor.feature_profile != profile) {
+        return Err("Validation features must match each actor's loaded profile".into());
+    }
+    let identity = audit_partition_using(datasets, true, profile)?;
+    validate_shared_reservations(actors, datasets)?;
     let mut ordered = datasets.iter().collect::<Vec<_>>();
     ordered.sort_by(|a, b| a.table_id().cmp(b.table_id()));
     let samples = ordered
@@ -758,7 +1021,13 @@ fn compare_validation_datasets(
     let mut hasher = Sha256::new();
     let mut action_counts = BTreeMap::new();
     let mut candidate_count_samples = BTreeMap::new();
-    hasher.update(b"tzolkin-conditional-human-shared-validation-ordered-public512-v1\0");
+    match profile {
+        ConditionalFeatureProfile::Public2 => {
+            hasher.update(b"tzolkin-conditional-human-shared-validation-ordered-public512-v1\0")
+        }
+        ConditionalFeatureProfile::SemanticPlaying4 => hasher
+            .update(b"tzolkin-conditional-human-shared-validation-ordered-semantic-playing4-v1\0"),
+    }
     for sample in &samples {
         let action = serde_json::to_value(sample.chosen_action()?).map_err(|e| e.to_string())?;
         let kind = action["type"]
@@ -774,7 +1043,7 @@ fn compare_validation_datasets(
         hasher.update((sample.chosen() as u64).to_le_bytes());
         hasher.update((sample.candidates().len() as u64).to_le_bytes());
         for row in sample.candidates() {
-            for value in row.values_for_schema(PUBLIC_FEATURE_SCHEMA)? {
+            for value in row.values_for_schema(profile.schema())? {
                 hasher.update(value.to_bits().to_le_bytes());
             }
         }
@@ -788,11 +1057,16 @@ fn compare_validation_datasets(
                 origin: actor.identity().clone(),
                 config: actor.checkpoint.config.clone(),
                 backend: actor.backend(),
-                all_rows: evaluate(&samples, &actor.model().model, &mut scratch)?,
+                all_rows: evaluate_using(&samples, &actor.model().model, &mut scratch, profile)?,
                 multi_candidate_rows: if multiple.is_empty() {
                     None
                 } else {
-                    Some(evaluate(&multiple, &actor.model().model, &mut scratch)?)
+                    Some(evaluate_using(
+                        &multiple,
+                        &actor.model().model,
+                        &mut scratch,
+                        profile,
+                    )?)
                 },
             })
         })
@@ -800,13 +1074,16 @@ fn compare_validation_datasets(
         .collect::<Result<Vec<_>, String>>()?
         .try_into()
         .map_err(|_| "Shared Validation actor pair shape")?;
-    if audit_partition(datasets, true)? != identity {
+    if audit_partition_using(datasets, true, profile)? != identity {
         return Err("Shared Validation sources changed during evaluation".into());
     }
     Ok(ConditionalValidationComparison {
-        schema: VALIDATION_COMPARISON_SCHEMA,
+        schema: match profile {
+            ConditionalFeatureProfile::Public2 => VALIDATION_COMPARISON_SCHEMA,
+            ConditionalFeatureProfile::SemanticPlaying4 => SEMANTIC_PLAYING_VALIDATION_SCHEMA,
+        },
         task: TASK,
-        input_contract: INPUT_CONTRACT,
+        input_contract: profile.input_contract(),
         validation_collection: None,
         validation_fingerprint: identity.fingerprint,
         validation_tables: identity.tables,
@@ -825,6 +1102,158 @@ fn compare_validation_datasets(
         strength_measured: false,
     })
 }
+
+/// Same original Train labels and same Validation source decisions, independently
+/// re-encoded for each profile. Numerical feature digests are deliberately separate.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticPlayingValidationComparison {
+    schema: &'static str,
+    training_selection: &'static str,
+    common_train_source_labels_sha256: String,
+    ordered_validation_source_labels_sha256: String,
+    validation_collections: [ContentPin; 2],
+    validation_fingerprints: [String; 2],
+    ordered_features_sha256: [String; 2],
+    validation_tables: [Vec<ConditionalTableIdentity>; 2],
+    samples: usize,
+    candidates: usize,
+    single_candidate_samples: usize,
+    action_counts: BTreeMap<String, usize>,
+    candidate_count_samples: BTreeMap<usize, usize>,
+    semantic_feature_eligibility: Vec<crate::human_policy_dataset::FeatureEligibilityComparison>,
+    actors: [ValidationActorReport; 2],
+    source_authenticated: bool,
+    source_qualified: bool,
+    verified_native_policy: bool,
+    value_validity: ValueValidity,
+    strength_measured: bool,
+}
+impl SemanticPlayingValidationComparison {
+    pub fn samples(&self) -> usize {
+        self.samples
+    }
+    pub fn candidates(&self) -> usize {
+        self.candidates
+    }
+    pub fn save_new_directory(&self, directory: &Path) -> Result<(), String> {
+        validate_new_output_directory(directory)?;
+        bounded_json(self)?;
+        fs::create_dir(directory).map_err(|e| e.to_string())?;
+        publish(&directory.join("report.json"), self)
+    }
+}
+
+pub fn compare_semantic_playing_validation_collections(
+    public: &PreparedConditionalHumanPolicy,
+    semantic: &PreparedConditionalHumanPolicy,
+    public_validation: &Path,
+    semantic_validation: &Path,
+) -> Result<SemanticPlayingValidationComparison, String> {
+    if public.feature_profile != ConditionalFeatureProfile::Public2
+        || semantic.feature_profile != ConditionalFeatureProfile::SemanticPlaying4
+        || public.source_labels_by_split[0] != semantic.source_labels_by_split[0]
+    {
+        return Err("Feature comparison requires the same original Train labels and distinct explicit profiles".into());
+    }
+    let actors = [public, semantic];
+    for actor in actors {
+        recheck_prepared_origin(actor)?;
+    }
+    let (left_input, left_pin): (CollectionInput, _) = read_local_json_pinned(public_validation)?;
+    let (right_input, right_pin): (CollectionInput, _) =
+        read_local_json_pinned(semantic_validation)?;
+    let (left_input, left) = load_collection_input_using(
+        public_validation,
+        left_input,
+        ConditionalFeatureProfile::Public2,
+    )?;
+    let (right_input, right) = load_collection_input_using(
+        semantic_validation,
+        right_input,
+        ConditionalFeatureProfile::SemanticPlaying4,
+    )?;
+    validate_shared_reservations(actors, &left)?;
+    validate_shared_reservations(actors, &right)?;
+    let labels = |datasets: &[ConditionalHumanPolicyDataset]| {
+        let mut ordered = datasets.iter().collect::<Vec<_>>();
+        ordered.sort_by(|a, b| a.table_id().cmp(b.table_id()));
+        let rows = ordered
+            .iter()
+            .flat_map(|dataset| dataset.samples())
+            .collect::<Vec<_>>();
+        ordered_source_labels(&rows)
+    };
+    let source_labels = labels(&left)?;
+    if labels(&right)? != source_labels {
+        return Err("Validation feature profiles differ in source labels/legal order".into());
+    }
+    let l = compare_validation_datasets_using(
+        [public, public],
+        &left,
+        ConditionalFeatureProfile::Public2,
+    )?;
+    let r = compare_validation_datasets_using(
+        [semantic, semantic],
+        &right,
+        ConditionalFeatureProfile::SemanticPlaying4,
+    )?;
+    if l.samples != r.samples
+        || l.candidates != r.candidates
+        || l.single_candidate_samples != r.single_candidate_samples
+        || l.action_counts != r.action_counts
+        || l.candidate_count_samples != r.candidate_count_samples
+    {
+        return Err("Shared source decisions differ between feature profiles".into());
+    }
+    let eligibility = right
+        .iter()
+        .map(|dataset| {
+            dataset
+                .feature_eligibility()
+                .cloned()
+                .ok_or_else(|| "Missing semantic common/full eligibility comparison".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if read_local_json::<CollectionInput>(public_validation)? != left_input
+        || read_local_json::<CollectionInput>(semantic_validation)? != right_input
+    {
+        return Err("Profile Validation collections changed during evaluation".into());
+    }
+    for pin in [&left_pin, &right_pin] {
+        crate::human_policy_dataset::recheck_absolute_pin(pin)?;
+    }
+    for dataset in left.iter().chain(&right) {
+        dataset.recheck_sources()?;
+    }
+    for actor in actors {
+        recheck_prepared_origin(actor)?;
+    }
+    let [left_actor, _] = l.actors;
+    let [right_actor, _] = r.actors;
+    Ok(SemanticPlayingValidationComparison {
+        schema: SEMANTIC_PLAYING_VALIDATION_SCHEMA,
+        training_selection: "schema2EligibleCommonSubset",
+        common_train_source_labels_sha256: public.source_labels_by_split[0].clone(),
+        ordered_validation_source_labels_sha256: source_labels,
+        validation_collections: [left_pin, right_pin],
+        validation_fingerprints: [l.validation_fingerprint, r.validation_fingerprint],
+        ordered_features_sha256: [l.ordered_samples_sha256, r.ordered_samples_sha256],
+        validation_tables: [l.validation_tables, r.validation_tables],
+        samples: l.samples,
+        candidates: l.candidates,
+        single_candidate_samples: l.single_candidate_samples,
+        action_counts: l.action_counts,
+        candidate_count_samples: l.candidate_count_samples,
+        semantic_feature_eligibility: eligibility,
+        actors: [left_actor, right_actor],
+        source_authenticated: false,
+        source_qualified: false,
+        verified_native_policy: false,
+        value_validity: ValueValidity::UnavailablePolicyOnly,
+        strength_measured: false,
+    })
+}
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionalHumanPolicyOutcome {
@@ -834,7 +1263,17 @@ pub struct ConditionalHumanPolicyOutcome {
 }
 impl ConditionalHumanPolicyOutcome {
     pub fn save_new_directory(&self, directory: &Path) -> Result<(), String> {
-        self.checkpoint.validate()?;
+        self.save_using(directory, ConditionalFeatureProfile::Public2)
+    }
+    pub fn save_new_semantic_playing_directory(&self, directory: &Path) -> Result<(), String> {
+        self.save_using(directory, ConditionalFeatureProfile::SemanticPlaying4)
+    }
+    fn save_using(
+        &self,
+        directory: &Path,
+        profile: ConditionalFeatureProfile,
+    ) -> Result<(), String> {
+        self.checkpoint.validate_using(profile)?;
         if self.model != self.checkpoint.model || self.metrics != self.checkpoint.metrics {
             return Err("Inconsistent conditional training output".into());
         }
@@ -848,10 +1287,35 @@ impl ConditionalHumanPolicyOutcome {
         publish(&directory.join("metrics.json"), &self.metrics)
     }
 }
-fn evaluate(
+fn conditional_policy_loss(
+    model: &PublicPolicyModel,
+    sample: &HumanPolicySample,
+    scratch: &mut Scratch,
+    gradient: Option<&mut [f32]>,
+    profile: ConditionalFeatureProfile,
+) -> Result<(f64, bool), String> {
+    match profile {
+        ConditionalFeatureProfile::Public2 => policy_loss(
+            model,
+            sample.candidates(),
+            sample.chosen(),
+            scratch,
+            gradient,
+        ),
+        ConditionalFeatureProfile::SemanticPlaying4 => semantic_playing_policy_loss(
+            model,
+            sample.candidates(),
+            sample.chosen(),
+            scratch,
+            gradient,
+        ),
+    }
+}
+fn evaluate_using(
     samples: &[&HumanPolicySample],
     model: &PublicPolicyModel,
     scratch: &mut Scratch,
+    profile: ConditionalFeatureProfile,
 ) -> Result<PolicyLossReport, String> {
     let mut report = PolicyLossReport {
         samples: 0,
@@ -863,8 +1327,7 @@ fn evaluate(
         value_validity: ValueValidity::UnavailablePolicyOnly,
     };
     for sample in samples {
-        let (loss, correct) =
-            policy_loss(model, sample.candidates(), sample.chosen(), scratch, None)?;
+        let (loss, correct) = conditional_policy_loss(model, sample, scratch, None, profile)?;
         report.samples += 1;
         report.candidates += sample.candidates().len();
         report.policy_loss += loss;
@@ -884,11 +1347,19 @@ pub fn train_conditional_datasets(
     config: &PolicyBcConfig,
     resume: Option<&ConditionalHumanPolicyCheckpoint>,
 ) -> Result<ConditionalHumanPolicyOutcome, String> {
+    train_using_profile(datasets, config, resume, ConditionalFeatureProfile::Public2)
+}
+fn train_using_profile(
+    datasets: &[ConditionalHumanPolicyDataset],
+    config: &PolicyBcConfig,
+    resume: Option<&ConditionalHumanPolicyCheckpoint>,
+    profile: ConditionalFeatureProfile,
+) -> Result<ConditionalHumanPolicyOutcome, String> {
     config.validate()?;
-    let identity = audit(datasets)?;
+    let identity = audit_partition_using(datasets, false, profile)?;
     let completed = resume.map_or(0, |checkpoint| checkpoint.completed_epochs);
     if let Some(previous) = resume {
-        previous.validate()?;
+        previous.validate_using(profile)?;
         if previous.dataset != identity
             || !config.compatible(&previous.config)
             || config.epochs < completed
@@ -932,8 +1403,8 @@ pub fn train_conditional_datasets(
         state: resume.map_or(config.seed ^ 0xd1b54a32d192ed03, |p| p.random_state),
     };
     let mut scratch = Scratch::default();
-    let current_train = evaluate(&train, &model, &mut scratch)?;
-    let current_validation = evaluate(&validation, &model, &mut scratch)?;
+    let current_train = evaluate_using(&train, &model, &mut scratch, profile)?;
+    let current_validation = evaluate_using(&validation, &model, &mut scratch, profile)?;
     let mut metrics = if let Some(previous) = resume {
         if current_train != previous.metrics.final_train
             || current_validation != previous.metrics.final_validation
@@ -960,13 +1431,7 @@ pub fn train_conditional_datasets(
         }
         let mut batch = 0;
         let mut consume = |sample: &HumanPolicySample| -> Result<(), String> {
-            policy_loss(
-                &model,
-                sample.candidates(),
-                sample.chosen(),
-                &mut scratch,
-                Some(&mut gradient),
-            )?;
+            conditional_policy_loss(&model, sample, &mut scratch, Some(&mut gradient), profile)?;
             batch += 1;
             if batch == config.batch_size {
                 optimizer.update(&mut model, &mut gradient, batch, config.learning_rate)?;
@@ -982,25 +1447,30 @@ pub fn train_conditional_datasets(
         }
     }
     metrics.completed_epochs = config.epochs;
-    metrics.final_train = evaluate(&train, &model, &mut scratch)?;
-    metrics.final_validation = evaluate(&validation, &model, &mut scratch)?;
-    if audit(datasets)? != identity {
+    metrics.final_train = evaluate_using(&train, &model, &mut scratch, profile)?;
+    metrics.final_validation = evaluate_using(&validation, &model, &mut scratch, profile)?;
+    if audit_partition_using(datasets, false, profile)? != identity {
         return Err("Conditional source bytes changed before completion".into());
     }
     let mut artifact = ConditionalHumanPolicyArtifact {
-        schema: MODEL_SCHEMA.into(),
-        model_version: MODEL_VERSION.into(),
+        schema: profile.model_schema().into(),
+        model_version: profile.model_version().into(),
         task: TASK.into(),
-        input_contract: INPUT_CONTRACT.into(),
+        input_contract: profile.input_contract().into(),
+        feature_profile: (profile == ConditionalFeatureProfile::SemanticPlaying4)
+            .then_some(profile),
         dataset_fingerprint: identity.fingerprint.clone(),
         value_validity: ValueValidity::UnavailablePolicyOnly,
         model,
         checksum: String::new(),
     };
-    artifact.reseal()?;
+    match profile {
+        ConditionalFeatureProfile::Public2 => artifact.reseal()?,
+        ConditionalFeatureProfile::SemanticPlaying4 => artifact.reseal_using(profile)?,
+    }
     let mut checkpoint = ConditionalHumanPolicyCheckpoint {
-        schema: CHECKPOINT_SCHEMA.into(),
-        training_version: TRAINING_VERSION.into(),
+        schema: profile.checkpoint_schema().into(),
+        training_version: profile.training_version().into(),
         dataset: identity,
         config: config.clone(),
         completed_epochs: config.epochs,
@@ -1011,7 +1481,7 @@ pub fn train_conditional_datasets(
         checksum: String::new(),
     };
     checkpoint.checksum = checkpoint.expected_checksum()?;
-    checkpoint.validate()?;
+    checkpoint.validate_using(profile)?;
     Ok(ConditionalHumanPolicyOutcome {
         model: artifact,
         checkpoint,
@@ -1198,6 +1668,87 @@ mod tests {
         wrong.checksum = wrong.expected_checksum().unwrap();
         wrong.validate().unwrap();
         assert!(PreparedConditionalHumanPolicy::new(wrong, &datasets).is_err());
+        let semantic_datasets = vec![
+            ConditionalHumanPolicyDataset::training_fixture_using(
+                "123",
+                DatasetSplit::Train,
+                0,
+                ConditionalFeatureProfile::SemanticPlaying4,
+                true,
+            ),
+            ConditionalHumanPolicyDataset::training_fixture_using(
+                "124",
+                DatasetSplit::Validation,
+                1,
+                ConditionalFeatureProfile::SemanticPlaying4,
+                true,
+            ),
+        ];
+        let semantic = train_using_profile(
+            &semantic_datasets,
+            &config(1),
+            None,
+            ConditionalFeatureProfile::SemanticPlaying4,
+        )
+        .unwrap();
+        semantic.checkpoint.validate_semantic_playing().unwrap();
+        assert!(semantic.checkpoint.validate().is_err());
+        assert!(semantic.model.validate().is_err());
+        assert_eq!(
+            semantic.model.feature_profile,
+            Some(ConditionalFeatureProfile::SemanticPlaying4)
+        );
+        assert!(
+            PreparedConditionalHumanPolicy::new(semantic.checkpoint.clone(), &semantic_datasets)
+                .is_err()
+        );
+        let prepared = PreparedConditionalHumanPolicy::new_using(
+            semantic.checkpoint.clone(),
+            &semantic_datasets,
+            ConditionalFeatureProfile::SemanticPlaying4,
+        )
+        .unwrap();
+        let playing = playing_observation();
+        assert!(prepared.distribution(&playing).is_err());
+        assert_eq!(
+            prepared
+                .distribution_semantic_playing(&playing)
+                .unwrap()
+                .logits
+                .len(),
+            playing.legal_actions.len()
+        );
+        let public_playing = ConditionalHumanPolicyDataset::training_fixture_using(
+            "123",
+            DatasetSplit::Train,
+            0,
+            ConditionalFeatureProfile::Public2,
+            true,
+        );
+        assert_eq!(
+            public_playing.samples()[0].source_label_digest().unwrap(),
+            semantic_datasets[0].samples()[0]
+                .source_label_digest()
+                .unwrap()
+        );
+        assert!(
+            tzolkin_inference::policy::validated_semantic_playing_values(
+                &public_playing.samples()[0].candidates()[0]
+            )
+            .is_err()
+        );
+        let mut resealed = semantic.checkpoint;
+        resealed.metrics.final_validation.policy_loss += 0.5;
+        resealed.checksum = resealed.expected_checksum().unwrap();
+        resealed.validate_semantic_playing().unwrap();
+        assert!(
+            PreparedConditionalHumanPolicy::new_using(
+                resealed,
+                &semantic_datasets,
+                ConditionalFeatureProfile::SemanticPlaying4
+            )
+            .is_err()
+        );
     }
     #[test]
     fn prepared_conditional_checks_native_contract_and_playing_key_before_features() {

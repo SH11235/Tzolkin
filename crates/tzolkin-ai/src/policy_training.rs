@@ -2,7 +2,7 @@
 use crate::dataset::DatasetSplit;
 use crate::features::{
     EncodedCandidate, FEATURE_COUNT, MAX_LEGAL_ACTIONS, PUBLIC_FEATURE_SCHEMA,
-    SEMANTIC_SETUP_FEATURE_SCHEMA,
+    SEMANTIC_PLAYING_FEATURE_SCHEMA, SEMANTIC_SETUP_FEATURE_SCHEMA,
 };
 use crate::kernel::Kernel;
 use crate::model::{MAX_ARTIFACT_BYTES, Random, digest, dot, policy_softmax, read_json};
@@ -44,6 +44,32 @@ impl PolicyFeatureProfile {
         match self {
             Self::Public => INPUT_CONTRACT,
             Self::SemanticSetup => "base-3-4p-native-semantic-setup-public-playing-v3",
+        }
+    }
+}
+
+// Only loss arithmetic selects 4. The native dataset/teacher profile above
+// remains closed to 2/3 and cannot acquire conditional schema-4 admission.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NumericFeatureProfile {
+    Public,
+    SemanticSetup,
+    SemanticPlaying,
+}
+impl From<PolicyFeatureProfile> for NumericFeatureProfile {
+    fn from(profile: PolicyFeatureProfile) -> Self {
+        match profile {
+            PolicyFeatureProfile::Public => Self::Public,
+            PolicyFeatureProfile::SemanticSetup => Self::SemanticSetup,
+        }
+    }
+}
+impl NumericFeatureProfile {
+    fn schema(self) -> u32 {
+        match self {
+            Self::Public => PUBLIC_FEATURE_SCHEMA,
+            Self::SemanticSetup => SEMANTIC_SETUP_FEATURE_SCHEMA,
+            Self::SemanticPlaying => SEMANTIC_PLAYING_FEATURE_SCHEMA,
         }
     }
 }
@@ -513,6 +539,23 @@ pub(crate) fn policy_loss(
 ) -> Result<(f64, bool), String> {
     policy_loss_using::<true>(model, rows, chosen, scratch, gradient)
 }
+
+pub(crate) fn semantic_playing_policy_loss(
+    model: &PublicPolicyModel,
+    rows: &[EncodedCandidate],
+    chosen: usize,
+    scratch: &mut Scratch,
+    gradient: Option<&mut [f32]>,
+) -> Result<(f64, bool), String> {
+    policy_loss_for_layout::<true>(
+        model,
+        rows,
+        chosen,
+        scratch,
+        gradient,
+        NumericFeatureProfile::SemanticPlaying,
+    )
+}
 fn prefix_bits_equal(left: &[f32], right: &[f32]) -> bool {
     left.len() == right.len()
         && left
@@ -544,6 +587,16 @@ fn policy_loss_using_profile<const REUSE_PREFIX: bool>(
     gradient: Option<&mut [f32]>,
     profile: PolicyFeatureProfile,
 ) -> Result<(f64, bool), String> {
+    policy_loss_for_layout::<REUSE_PREFIX>(model, rows, chosen, scratch, gradient, profile.into())
+}
+fn policy_loss_for_layout<const REUSE_PREFIX: bool>(
+    model: &PublicPolicyModel,
+    rows: &[EncodedCandidate],
+    chosen: usize,
+    scratch: &mut Scratch,
+    gradient: Option<&mut [f32]>,
+    profile: NumericFeatureProfile,
+) -> Result<(f64, bool), String> {
     if rows.is_empty() || rows.len() > MAX_LEGAL_ACTIONS || chosen >= rows.len() {
         return Err("Invalid BC complete-legal candidate batch".into());
     }
@@ -567,8 +620,11 @@ fn policy_loss_using_profile<const REUSE_PREFIX: bool>(
         if &values[..384] != context || values.iter().any(|v| !v.is_finite() || v.abs() > 1024.0) {
             return Err("Invalid BC tagged/context/finite features".into());
         }
-        if profile == PolicyFeatureProfile::SemanticSetup {
+        if profile == NumericFeatureProfile::SemanticSetup {
             tzolkin_inference::policy::validated_semantic_setup_values(row)?;
+        }
+        if profile == NumericFeatureProfile::SemanticPlaying {
+            tzolkin_inference::policy::validated_semantic_playing_values(row)?;
         }
         let hidden = &mut scratch.hidden[i * HIDDEN..(i + 1) * HIDDEN];
         let mut continued = [0.0; HIDDEN];
@@ -1136,6 +1192,11 @@ mod tests {
         short_numeric_batches_for(PolicyFeatureProfile::Public)
     }
     fn short_numeric_batches_for(profile: PolicyFeatureProfile) -> Vec<Vec<EncodedCandidate>> {
+        short_numeric_batches_for_layout(profile.into())
+    }
+    fn short_numeric_batches_for_layout(
+        profile: NumericFeatureProfile,
+    ) -> Vec<Vec<EncodedCandidate>> {
         let mut batches = Vec::new();
         for players in [3, 4] {
             let mut state = tzolkin_core::create_game(
@@ -1145,6 +1206,11 @@ mod tests {
             )
             .unwrap();
             for phase in [tzolkin_core::Phase::Setup, tzolkin_core::Phase::Playing] {
+                if profile == NumericFeatureProfile::SemanticPlaying
+                    && phase == tzolkin_core::Phase::Setup
+                {
+                    continue;
+                }
                 for _ in 0..players {
                     if state.phase == phase {
                         break;
@@ -1156,8 +1222,11 @@ mod tests {
                 assert_eq!(state.phase, phase);
                 let o = observe(&state, state.current_player).unwrap();
                 let encoder = match profile {
-                    PolicyFeatureProfile::Public => FeatureEncoder::new_public(&o),
-                    PolicyFeatureProfile::SemanticSetup => FeatureEncoder::new_semantic_setup(&o),
+                    NumericFeatureProfile::Public => FeatureEncoder::new_public(&o),
+                    NumericFeatureProfile::SemanticSetup => FeatureEncoder::new_semantic_setup(&o),
+                    NumericFeatureProfile::SemanticPlaying => {
+                        FeatureEncoder::new_semantic_playing(&o)
+                    }
                 }
                 .unwrap();
                 // The private numeric primitive's ragged fixture may repeat
@@ -1186,13 +1255,19 @@ mod tests {
         model: &PublicPolicyModel,
         profile: PolicyFeatureProfile,
     ) -> (Vec<f32>, Vec<f32>) {
+        forward_gradient_parity_for_layout(model, profile.into())
+    }
+    fn forward_gradient_parity_for_layout(
+        model: &PublicPolicyModel,
+        profile: NumericFeatureProfile,
+    ) -> (Vec<f32>, Vec<f32>) {
         let mut old = Scratch::default();
         let mut new = Scratch::default();
         let mut old_gradient = vec![0.0; PARAMETER_COUNT];
         let mut new_gradient = vec![0.0; PARAMETER_COUNT];
-        for batch in short_numeric_batches_for(profile) {
+        for batch in short_numeric_batches_for_layout(profile) {
             for size in [1, 2, 3, 7] {
-                let old_result = policy_loss_using_profile::<false>(
+                let old_result = policy_loss_for_layout::<false>(
                     model,
                     &batch[..size],
                     size - 1,
@@ -1201,7 +1276,7 @@ mod tests {
                     profile,
                 )
                 .unwrap();
-                let new_result = policy_loss_using_profile::<true>(
+                let new_result = policy_loss_for_layout::<true>(
                     model,
                     &batch[..size],
                     size - 1,
@@ -1289,6 +1364,26 @@ mod tests {
                 bits(&prediction.probabilities)
             );
             assert!(policy_loss(&artifact.model, &batch, 0, &mut scratch, None).is_err());
+        }
+        forward_gradient_parity_for_layout(&artifact.model, NumericFeatureProfile::SemanticPlaying);
+        let numeric =
+            tzolkin_inference::policy::BorrowedSemanticPlayingPolicy::from_validated_parameters(
+                artifact.model.parameters(),
+            )
+            .unwrap();
+        for batch in short_numeric_batches_for_layout(NumericFeatureProfile::SemanticPlaying) {
+            let prediction = numeric
+                .predict(Kernel::Scalar.resolve().unwrap(), &batch)
+                .unwrap();
+            let mut scratch = Scratch::default();
+            semantic_playing_policy_loss(&artifact.model, &batch, 0, &mut scratch, None).unwrap();
+            assert_eq!(bits(&scratch.logits), bits(&prediction.logits));
+            assert_eq!(
+                bits(&scratch.probabilities),
+                bits(&prediction.probabilities)
+            );
+            assert!(policy_loss(&artifact.model, &batch, 0, &mut scratch, None).is_err());
+            assert!(tzolkin_inference::policy::validated_semantic_setup_values(&batch[0]).is_err());
         }
     }
 
