@@ -41,6 +41,10 @@ enum ExternalSource {
         reservation_receipt: InputPin,
         source_plan: InputPin,
     },
+    ReservedCampaign {
+        reservation_receipt: InputPin,
+        source_plan: InputPin,
+    },
     LongReservations {
         receipt: InputPin,
         spec: InputPin,
@@ -383,6 +387,25 @@ pub(super) fn checked_range(
     }
     Ok((families.into_iter().collect(), next))
 }
+pub(super) fn checked_reserved_range(
+    configs: &[Config],
+    prefix: [u64; 2],
+    predecessor_next: u64,
+) -> Result<(Vec<String>, u64), String> {
+    let first = configs
+        .first()
+        .ok_or("Reserved campaign has no configurations")?
+        .checked_config()?
+        .sampling_identity()
+        .episode_ordinal();
+    if first
+        .checked_sub(predecessor_next)
+        .is_none_or(|n| !n.is_multiple_of(4))
+    {
+        return Err("Reserved campaign range must follow the predecessor in whole fours".into());
+    }
+    checked_range(configs, prefix, first)
+}
 impl Binding {
     pub(super) fn first(&self) -> u64 {
         self.first_episode_ordinal
@@ -592,6 +615,10 @@ impl ExternalSource {
             Self::Campaign {
                 reservation_receipt,
                 source_plan,
+            }
+            | Self::ReservedCampaign {
+                reservation_receipt,
+                source_plan,
             } => reservation_receipt.bytes.checked_add(source_plan.bytes),
             Self::LongReservations {
                 receipt,
@@ -618,18 +645,30 @@ impl ExternalSource {
             Self::Campaign {
                 reservation_receipt,
                 source_plan,
+            }
+            | Self::ReservedCampaign {
+                reservation_receipt,
+                source_plan,
             } => {
                 reservation_receipt.read(1024 * 1024)?;
                 let raw = source_plan.read(1024 * 1024)?;
-                let (configs, pool, tip) =
-                    campaign::sampling_plan_configs(&raw, &source_plan.sha256)?;
+                let reserved = matches!(self, Self::ReservedCampaign { .. });
+                let (configs, pool, tip) = if reserved {
+                    campaign::reserved_sampling_plan_configs(&raw, &source_plan.sha256)?
+                } else {
+                    campaign::sampling_plan_configs(&raw, &source_plan.sha256)?
+                };
                 if pool != predecessor.pool
                     || tip.head.sha256 != predecessor.head
                     || local(&tip.directory, false)? != predecessor.directory
                 {
                     return Err("V2 original campaign predecessor differs".into());
                 }
-                checked_range(&configs, predecessor.prefix, predecessor.next)?;
+                if reserved {
+                    checked_reserved_range(&configs, predecessor.prefix, predecessor.next)?;
+                } else {
+                    checked_range(&configs, predecessor.prefix, predecessor.next)?;
+                }
                 Ok(configs)
             }
             Self::LongReservations {
