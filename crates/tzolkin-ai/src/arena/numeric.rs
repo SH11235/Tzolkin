@@ -286,18 +286,21 @@ pub enum Opponent<'a> {
 pub enum AppProfile {
     FoodAlignedV2,
     MonumentAlignedV1,
+    MonumentAlignedV2,
 }
 impl AppProfile {
     pub fn policy_version(self) -> &'static str {
         match self {
             Self::FoodAlignedV2 => tzolkin_bot::FOOD_ALIGNED_V2_POLICY_VERSION,
             Self::MonumentAlignedV1 => tzolkin_bot::MONUMENT_ALIGNED_POLICY_VERSION,
+            Self::MonumentAlignedV2 => tzolkin_bot::MONUMENT_ALIGNED_V2_POLICY_VERSION,
         }
     }
     fn choose_move(self, observation: &Observation) -> Result<Decision, String> {
         match self {
             Self::FoodAlignedV2 => tzolkin_bot::choose_move_food_aligned_v2(observation),
             Self::MonumentAlignedV1 => tzolkin_bot::choose_move_monument_aligned(observation),
+            Self::MonumentAlignedV2 => tzolkin_bot::choose_move_monument_aligned_v2(observation),
         }
     }
 }
@@ -2368,7 +2371,11 @@ pub(super) mod tests {
             );
         }
         assert!(serde_json::from_value::<AppProfile>(json!("nativeV2")).is_err());
-        assert!(serde_json::from_value::<AppProfile>(json!("monumentAlignedV2")).is_err());
+        assert_eq!(
+            serde_json::from_value::<AppProfile>(json!("monumentAlignedV2")).unwrap(),
+            AppProfile::MonumentAlignedV2
+        );
+        assert!(serde_json::from_value::<AppProfile>(json!("monumentAlignedV3")).is_err());
         let mut reanalysis = config.clone();
         reanalysis.external_exclusions.excluded_family_ids = vec![family_id(3), family_id(10)];
         let consent = AppDiagnosticConsent {
@@ -2580,13 +2587,20 @@ pub(super) mod tests {
 
         let shared_setup = SharedCornFirstSetupIdentity::current();
         let assert_app_parity = |observation: &Observation| -> Result<(), String> {
-            for profile in [AppProfile::FoodAlignedV2, AppProfile::MonumentAlignedV1] {
+            for profile in [
+                AppProfile::FoodAlignedV2,
+                AppProfile::MonumentAlignedV1,
+                AppProfile::MonumentAlignedV2,
+            ] {
                 let expected = match profile {
                     AppProfile::FoodAlignedV2 => {
                         tzolkin_bot::choose_move_food_aligned_v2(observation)?
                     }
                     AppProfile::MonumentAlignedV1 => {
                         tzolkin_bot::choose_move_monument_aligned(observation)?
+                    }
+                    AppProfile::MonumentAlignedV2 => {
+                        tzolkin_bot::choose_move_monument_aligned_v2(observation)?
                     }
                 };
                 let mut roles = (0..observation.players.len())
@@ -2665,6 +2679,51 @@ pub(super) mod tests {
                     let o = observe(&state, state.current_player)?;
                     assert_eq!(o.phase, Phase::Playing);
                     assert_app_parity(&o)?;
+                    if players == 4 {
+                        let mut preview = state.clone();
+                        let actor = preview.current_player;
+                        preview.players[actor]
+                            .technologies
+                            .insert(tzolkin_core::TechnologyId::Extraction, 3);
+                        let slot = &mut preview
+                            .gears
+                            .get_mut(&tzolkin_core::GearId::Yaxchilan)
+                            .unwrap()[5];
+                        assert!(slot.is_none());
+                        *slot = Some(tzolkin_core::GearWorker {
+                            player_id: actor as i64,
+                            dummy: false,
+                        });
+                        let preview = observe(&preview, actor)?;
+                        let remove = preview
+                            .legal_actions
+                            .iter()
+                            .find(|row| {
+                                matches!(
+                                    row.action,
+                                    tzolkin_core::observation::TypedAction::Remove {
+                                        gear: tzolkin_core::GearId::Yaxchilan,
+                                        position: 5
+                                    }
+                                )
+                            })
+                            .unwrap();
+                        assert_ne!(
+                            tzolkin_bot::policy::score_action_monument_aligned_v2(
+                                &preview,
+                                &remove.action,
+                                &HeuristicWeights::default()
+                            )
+                            .to_bits(),
+                            tzolkin_bot::policy::score_action_monument_aligned(
+                                &preview,
+                                &remove.action,
+                                &HeuristicWeights::default()
+                            )
+                            .to_bits()
+                        );
+                        assert_app_parity(&preview)?;
+                    }
                     let actual = decide(players, &o)?;
                     assert_eq!(actual.policy_version, d::GUARDED_DEPLOYMENT_VERSION);
                     assert_eq!(actual.r#move, o.legal_actions[0].r#move);
