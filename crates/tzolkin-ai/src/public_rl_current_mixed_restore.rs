@@ -24,6 +24,15 @@ pub enum CurrentMixedRestoreStep<'s> {
         spec: CurrentMixedSegmentSpec,
         tip: CurrentMixedRestoreTip<'s>,
     },
+    /// Complete cyclic roles from a genuine latest-Updated Ready owner.
+    /// Shifts are [3p, 4p]; campaign coverage is separately caller-declared.
+    SeatRotation {
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &'s CurrentMixedCollectionSpec,
+        new_pool: &'s CurrentMixedCollectionSpec,
+        shifts: [u8; 2],
+        tip: CurrentMixedRestoreTip<'s>,
+    },
     GuardedPoolFork {
         spec: CurrentMixedSegmentSpec,
         old_pool: &'s CurrentMixedCollectionSpec,
@@ -57,6 +66,7 @@ pub(super) fn check_chain_tips<'s>(
     let tips = std::iter::once(initial).chain(steps.iter().map(|step| match step {
         CurrentMixedRestoreStep::Segment { tip, .. }
         | CurrentMixedRestoreStep::BudgetAmendment { tip, .. }
+        | CurrentMixedRestoreStep::SeatRotation { tip, .. }
         | CurrentMixedRestoreStep::GuardedPoolFork { tip, .. } => tip,
     }));
     for tip in tips {
@@ -171,6 +181,13 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 CurrentMixedRestoreStep::BudgetAmendment { spec, tip } => {
                     session.restore_chain_budget_amendment(spec, tip.head_raw, tip.directory)?
                 }
+                CurrentMixedRestoreStep::SeatRotation {
+                    spec,
+                    old_pool,
+                    new_pool,
+                    shifts,
+                    tip,
+                } => session.restore_chain_seat_rotation(spec, old_pool, new_pool, shifts, tip)?,
                 CurrentMixedRestoreStep::GuardedPoolFork {
                     spec,
                     old_pool,

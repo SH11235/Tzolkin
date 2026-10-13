@@ -7,6 +7,7 @@ pub const SEGMENT_SPEC_SCHEMA: &str = "tzolkin-current-mixed-segment-spec-v1";
 pub const SEGMENT_JOURNAL_SCHEMA: &str = "tzolkin-current-mixed-segment-journal-v1";
 pub const GLOBAL_CONTRACT_SCHEMA: &str = "tzolkin-current-mixed-global-contract-v1";
 const BUDGET_AMENDMENT_SCHEMA: &str = "tzolkin-current-mixed-ready-budget-amendment-v1";
+const SEAT_ROTATION_SCHEMA: &str = "tzolkin-current-mixed-ready-seat-rotation-v1";
 pub(super) const MAX_SEGMENTS: usize = 64;
 const MAX_PROTECTED_DIRECTORIES: usize = 16;
 
@@ -300,6 +301,58 @@ fn require_guarded_pool_replacement(
     Ok(checksum)
 }
 
+fn require_rotation_shifts(shifts: [u8; 2]) -> Result<(), String> {
+    if shifts[0] >= 3 || shifts[1] >= 4 || shifts == [0, 0] {
+        return Err(
+            "Current mixed cyclic shifts require 3p 0..2 and 4p 0..3, not both zero".into(),
+        );
+    }
+    Ok(())
+}
+fn require_cyclic_seat_rotation(
+    old: &CurrentMixedCollectionSpec,
+    new: &CurrentMixedCollectionSpec,
+    old_checksum: &str,
+    shifts: [u8; 2],
+) -> Result<String, String> {
+    require_rotation_shifts(shifts)?;
+    if old.pool_checksum()? != old_checksum
+        || bytes(&old.inner.wire.weights, SPEC_CAP)? != bytes(&new.inner.wire.weights, SPEC_CAP)?
+        || bytes(&old.inner.wire.search, SPEC_CAP)? != bytes(&new.inner.wire.search, SPEC_CAP)?
+    {
+        return Err("Seat rotation cannot replace weights, Search or the actual old pool".into());
+    }
+    for (before, after) in old.inner.wire.rosters.iter().zip(&new.inner.wire.rosters) {
+        let shift = match before.len() {
+            3 => shifts[0] as usize,
+            4 => shifts[1] as usize,
+            _ => return Err("Seat rotation requires 3p or 4p roster members".into()),
+        };
+        if before.len() != after.len() {
+            return Err("Seat rotation cannot reorder player-count members".into());
+        }
+        for (seat, role) in before.iter().enumerate() {
+            if bytes(role, SPEC_CAP)? != bytes(&after[(seat + shift) % before.len()], SPEC_CAP)? {
+                return Err("Seat rotation must move every complete role cyclically".into());
+            }
+        }
+    }
+    let checksum = new.pool_checksum()?;
+    if checksum == old_checksum {
+        return Err("Seat rotation requires a different immediate predecessor pool".into());
+    }
+    Ok(checksum)
+}
+impl Progress {
+    fn require_updated_seat_rotation(&self, blocked: bool, has_head: bool) -> Result<(), String> {
+        self.require_ready_continuation(blocked, has_head)?;
+        if self.outcome.as_deref() != Some("updated") {
+            return Err("Seat rotation requires the latest resolved Updated outcome".into());
+        }
+        Ok(())
+    }
+}
+
 /// Owns the complete known-failed tip and its last genuinely resolved joint owner.
 /// It cannot be built from an artifact, metadata, an older checkpoint or a Ready token.
 /// The predecessor remains stopped in its immutable saved archive.
@@ -348,6 +401,8 @@ pub(super) struct SegmentBinding {
     pool_fork: Option<PoolForkBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     budget_amendment: Option<BudgetAmendmentBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seat_rotation: Option<SeatRotationBinding>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -356,9 +411,56 @@ struct BudgetAmendmentBinding {
     predecessor_contract_checksum: String,
     ordinal: u64,
 }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SeatRotationBinding {
+    schema: String,
+    predecessor_pool: String,
+    new_pool: String,
+    shifts: [u8; 2],
+    predecessor_outcome: String,
+    // Cumulative Updated/NoChange/Failed/Abandoned rows, including missingness.
+    // Campaign callers compare their declared non-updated baseline; historical
+    // failures are not erased or required to be zero by this transition.
+    predecessor_own_counters: [[u64; 5]; 4],
+}
 impl SegmentBinding {
     fn checksum(&self) -> Result<String, String> {
+        if let Some(rotation) = &self.seat_rotation {
+            require_rotation_shifts(rotation.shifts)?;
+            if rotation.schema != SEAT_ROTATION_SCHEMA
+                || rotation.predecessor_outcome != "updated"
+                || rotation.new_pool != self.pool
+                || rotation.new_pool == rotation.predecessor_pool
+                || self.pool_fork.is_some()
+                || self.budget_amendment.is_some()
+            {
+                return Err(
+                    "Current mixed seat rotation binding must be exclusive and Updated".into(),
+                );
+            }
+        }
         hash(b"tzolkin-current-mixed-segment-root-v1\0", self)
+    }
+    fn require_start_bytes(&self, spec: &CurrentMixedRunSpec) -> Result<(), String> {
+        let raw = bytes(spec, SPEC_CAP)?;
+        let event = Event::SegmentStart {
+            run_spec: file_pin("run-spec.json", &raw),
+            binding: Box::new(self.clone()),
+        };
+        bytes(
+            &Entry {
+                schema: SEGMENT_JOURNAL_SCHEMA.into(),
+                sequence: 1,
+                previous: String::new(),
+                root: self.checksum()?,
+                spec: spec.checksum()?,
+                pool: self.pool.clone(),
+                event,
+            },
+            HEAD_CAP,
+        )?;
+        Ok(())
     }
 }
 
@@ -438,6 +540,31 @@ impl SegmentContext {
 }
 
 impl ReadyCurrentMixedContinuation<'_> {
+    /// Preflight an explicit cyclic roster successor after the latest Updated.
+    /// `shifts` is [3p, 4p]; every role moves with the learner. This checks no
+    /// campaign-wide seat coverage or non-updated baseline. No output is written.
+    pub fn preflight_seat_rotation(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        shifts: [u8; 2],
+        output: &Path,
+    ) -> Result<(), String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed successor output must be new".into());
+        }
+        self.session.seat_rotation_binding(
+            spec,
+            old_pool,
+            new_pool,
+            shifts,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+        )?;
+        Ok(())
+    }
     /// Read-only preflight for an explicit monotonic contract amendment. The
     /// established contract, actual Ready owner and all spent work are required.
     /// Predictable refusal leaves this token owned by the caller.
@@ -525,6 +652,35 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             validation,
             amend_budget,
         )
+    }
+    fn seat_rotation_binding(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        shifts: [u8; 2],
+        directory: &Path,
+        validation: restore::ArchiveValidation,
+    ) -> Result<SegmentBinding, String> {
+        self.progress
+            .require_updated_seat_rotation(self.blocked, self.head.is_some())?;
+        if self.continued.is_none() {
+            return Err("Seat rotation requires a genuinely resolved joint owner".into());
+        }
+        self.current_policy()?;
+        let pool = require_cyclic_seat_rotation(old_pool, new_pool, &self.pool, shifts)?;
+        let rotation = SeatRotationBinding {
+            schema: SEAT_ROTATION_SCHEMA.into(),
+            predecessor_pool: self.pool.clone(),
+            new_pool: pool.clone(),
+            shifts,
+            predecessor_outcome: "updated".into(),
+            predecessor_own_counters: own_snapshot(self.cumulative_own_decisions()?),
+        };
+        let mut binding = self.successor_binding(spec, directory, pool, None, validation, false)?;
+        binding.seat_rotation = Some(rotation);
+        binding.require_start_bytes(&spec.run_spec)?;
+        Ok(binding)
     }
     fn require_stopped_fork_source(&self) -> Result<(), String> {
         self.progress
@@ -667,24 +823,9 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             contract_checksum: spec.global_contract.checksum()?,
             pool_fork,
             budget_amendment,
+            seat_rotation: None,
         };
-        let raw = bytes(&spec.run_spec, SPEC_CAP)?;
-        let event = Event::SegmentStart {
-            run_spec: file_pin("run-spec.json", &raw),
-            binding: Box::new(binding.clone()),
-        };
-        bytes(
-            &Entry {
-                schema: SEGMENT_JOURNAL_SCHEMA.into(),
-                sequence: 1,
-                previous: String::new(),
-                root: binding.checksum()?,
-                spec: spec.run_spec.checksum()?,
-                pool,
-                event,
-            },
-            HEAD_CAP,
-        )?;
+        binding.require_start_bytes(&spec.run_spec)?;
         Ok(binding)
     }
     fn initial_segment(
@@ -783,6 +924,26 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         )?;
         Self::from_predecessor(self, spec, binding, directory)?.restore_entries_in_chain(head_raw)
     }
+    pub(super) fn restore_chain_seat_rotation(
+        self,
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        shifts: [u8; 2],
+        tip: restore::CurrentMixedRestoreTip<'_>,
+    ) -> Result<Self, String> {
+        let directory = local(tip.directory, false)?;
+        let binding = self.seat_rotation_binding(
+            &spec,
+            old_pool,
+            new_pool,
+            shifts,
+            &directory,
+            restore::ArchiveValidation::AtChainClose,
+        )?;
+        Self::from_predecessor(self, spec, binding, directory)?
+            .restore_entries_in_chain(tip.head_raw)
+    }
     pub(super) fn restore_chain_budget_amendment(
         self,
         spec: CurrentMixedSegmentSpec,
@@ -829,6 +990,60 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             return Err("Current mixed successor output must be new".into());
         }
         Self::publish_successor(Self::initial_segment(predecessor, spec, directory, false)?)
+    }
+    /// Consumes only a genuine latest-Updated Ready owner. Every complete role
+    /// rotates by `shifts` [3p, 4p]; the actor, critic and stream are retained.
+    /// The caller must declare seat coverage and stop on new non-updated work.
+    /// Preflight first; I/O errors may consume the token.
+    pub fn new_seat_rotation_segment(
+        predecessor: ReadyCurrentMixedContinuation<'a>,
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        shifts: [u8; 2],
+        output: &Path,
+    ) -> Result<Self, String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed successor output must be new".into());
+        }
+        let binding = predecessor.session.seat_rotation_binding(
+            &spec,
+            old_pool,
+            new_pool,
+            shifts,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+        )?;
+        Self::publish_successor(Self::from_predecessor(
+            predecessor.session,
+            spec,
+            binding,
+            directory,
+        )?)
+    }
+    /// Reconstructs rotation admission from the genuine predecessor and exact
+    /// externally pinned latest child tip. Saved rotation metadata is not an owner.
+    pub fn restore_seat_rotation_segment(
+        predecessor: ReadyCurrentMixedContinuation<'a>,
+        spec: CurrentMixedSegmentSpec,
+        old_pool: &CurrentMixedCollectionSpec,
+        new_pool: &CurrentMixedCollectionSpec,
+        shifts: [u8; 2],
+        tip: restore::CurrentMixedRestoreTip<'_>,
+    ) -> Result<Self, String> {
+        Self::check_latest_head(tip.head_raw, tip.expected_sha256)?;
+        let directory = local(tip.directory, false)?;
+        let binding = predecessor.session.seat_rotation_binding(
+            &spec,
+            old_pool,
+            new_pool,
+            shifts,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+        )?;
+        Self::from_predecessor(predecessor.session, spec, binding, directory)?
+            .restore_entries(tip.head_raw)
     }
     /// Consumes an actual Ready continuation to start a finite successor under
     /// strictly extended global limits. Pool/configuration, prior spend, families
