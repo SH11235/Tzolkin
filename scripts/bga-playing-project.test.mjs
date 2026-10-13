@@ -1197,8 +1197,10 @@ test('retained boundary binds original food/rotation scope and separates availab
     const without = projectRetainedBoundary(prepared[0], prepared[1], bytes(control)),
       original = projectRetainedBoundary(...boundaryFixture({ n }).repin());
     assert.deepEqual(without.witness, original.witness);
-    const { captureSha256: _withoutCapture, ...withoutProvenance } = without.provenance,
-      { captureSha256: _originalCapture, ...originalProvenance } = original.provenance;
+    const withoutProvenance = { ...without.provenance },
+      originalProvenance = { ...original.provenance };
+    delete withoutProvenance.captureSha256;
+    delete originalProvenance.captureSha256;
     assert.deepEqual(withoutProvenance, originalProvenance);
   }
   const jungleNode = (value, id) =>
