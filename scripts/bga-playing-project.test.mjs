@@ -11,6 +11,8 @@ import { decodeConditionalPublicGame, decodePublicGame } from './bga-decode.mjs'
 import {
   ATLAS_SCHEMA,
   BOUNDARY_CONTROL_SCHEMA,
+  BOUNDARY_MARKER_CALIBRATION_SCHEMA,
+  BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA,
   CONTROL_SCHEMA,
   LATER_WITNESS_SCHEMA,
   decodeProjectedInitial,
@@ -560,6 +562,177 @@ function boundaryFixture({ split = false, terminal = false } = {}) {
   return { ...value, repin };
 }
 
+function boundaryMarkerFixture(options = {}) {
+  const value = boundaryFixture(options);
+  const colors = ['008000', 'ff0000', '0000ff', 'ffa500'];
+  const templeLevels = [
+    [-1, 7, 6],
+    [5, 0, 1],
+    [0, -1, 2],
+    [1, 3, -1],
+  ];
+  const technologyLevels = [
+    [3, 0, 1, 2],
+    [0, 3, 2, 1],
+    [1, 2, 3, 0],
+    [2, 1, 0, 3],
+  ];
+  const markers = (kind, tracks, levels) =>
+    value.control.seatOrder
+      .flatMap((id, index) =>
+        tracks.map((track, j) =>
+          element(
+            'div',
+            `marker_${id}_${kind}_${track}`,
+            '',
+            ` class="marker marker_${colors[index]}" style="top: ${kind === 'temple' ? 100 - 10 * levels[index][j] : j * 20}px; left: ${kind === 'temple' ? j * 20 : 10 * levels[index][j]}px;"`,
+          ),
+        ),
+      )
+      .join('');
+  value.capture.boardHtml =
+    value.capture.boardHtml.replace(/<div id="marker_\d+_[^"]+"[^>]*><\/div>/g, '').slice(0, -6) +
+    element('div', 'temples', markers('temple', templeNames, templeLevels)) +
+    element('div', 'technologies', markers('technology', markerNames, technologyLevels)) +
+    '</div>';
+  const tracks = JSON.parse(catalogBytes).TEMPLE_TRACKS;
+  const positions = (min, max, coordinate) =>
+    Array.from({ length: max - min + 1 }, (_v, index) => {
+      const level = min + index;
+      return { pixels: coordinate(level), level };
+    });
+  const calibration = {
+    schema: BOUNDARY_MARKER_CALIBRATION_SCHEMA,
+    archiveRelease: 'fixture',
+    catalogSha256: sha(catalogBytes),
+    templeTop: Object.fromEntries(
+      Object.keys(tracks).map((track) => [
+        track,
+        positions(-1, tracks[track].points.length - 2, (level) => 100 - 10 * level),
+      ]),
+    ),
+    technologyLeft: Object.fromEntries(
+      markerNames.map((track) => [track, positions(0, 3, (level) => 10 * level)]),
+    ),
+  };
+  return {
+    ...value,
+    templeLevels,
+    technologyLevels,
+    repinMarkers: (mutate = () => {}) => {
+      const prepared = value.repin();
+      const declared = { ...structuredClone(calibration), captureSha256: sha(prepared[0]) };
+      mutate(declared);
+      const calibrated = bytes(declared),
+        control = JSON.parse(prepared[2]);
+      control.markerCalibration = pin(calibrated);
+      return [prepared[0], prepared[1], bytes(control), null, calibrated];
+    },
+  };
+}
+
+function boundaryCellMarkerFixture(options = {}) {
+  const value = boundaryMarkerFixture(options);
+  value.templeLevels[1][0] = -1;
+  value.technologyLevels[1][0] = 3;
+  const colors = ['008000', 'ff0000', '0000ff', 'ffa500'];
+  const groups = [
+    ['temples', 'temple', templeNames, value.templeLevels, { x: 0, y: 0, width: 300, height: 250 }],
+    [
+      'technologies',
+      'technology',
+      markerNames,
+      value.technologyLevels,
+      { x: 400, y: 0, width: 300, height: 250 },
+    ],
+  ];
+  const blocks = groups.map(([group, kind, tracks, levels, containerRect]) => {
+    const cells = [],
+      markers = [];
+    value.capture.retainedDomGeometry.push({
+      id: group,
+      className: '',
+      inlineStyle: null,
+      parentId: 'board',
+      computedDisplay: 'block',
+      computedVisibility: 'visible',
+      rect: containerRect,
+    });
+    const add = (id, className, inlineStyle, rect) => {
+      value.capture.retainedDomGeometry.push({
+        id,
+        className,
+        inlineStyle,
+        parentId: group,
+        computedDisplay: 'block',
+        computedVisibility: 'visible',
+        rect,
+      });
+      return element('div', id, '', ` class="${className}" style="${inlineStyle}"`);
+    };
+    tracks.forEach((track, trackIndex) => {
+      const canonical = track === 'kukulcan' ? 'kukulkan' : track;
+      const count =
+        kind === 'temple' ? JSON.parse(catalogBytes).TEMPLE_TRACKS[canonical].points.length : 5;
+      for (let index = 0; index < count; index++) {
+        const rect =
+          kind === 'temple'
+            ? { x: trackIndex * 100, y: 220 - index * 24, width: 80, height: 20 }
+            : { x: 400 + index * 60, y: trackIndex * 50, width: 50, height: 40 };
+        cells.push(
+          add(
+            `${kind}_${track}_${kind === 'temple' ? 'step' : 'level'}_${index}`,
+            kind === 'temple' ? 'temple_step' : 'technology_level',
+            kind === 'temple'
+              ? `bottom: ${10 + index * 24}px; left: ${trackIndex * 100}px;`
+              : `top: ${trackIndex * 50}px; left: ${index * 60}px; width: 50px;`,
+            rect,
+          ),
+        );
+      }
+      value.control.seatOrder.forEach((id, playerIndex) => {
+        const level = levels[playerIndex][trackIndex];
+        const left =
+          kind === 'temple'
+            ? trackIndex * 100 + 8 + playerIndex * 16
+            : level * 60 + 5 + playerIndex * 0.003;
+        const top =
+          kind === 'temple'
+            ? 220 - (level + 1) * 24 + 4 + playerIndex * 0.05
+            : trackIndex * 50 + 4 + playerIndex * 8;
+        markers.push(
+          add(
+            `marker_${id}_${kind}_${track}`,
+            `marker marker_${colors[playerIndex]}`,
+            `top: ${top}px; left: ${left}px;`,
+            { x: containerRect.x + left, y: top, width: kind === 'temple' ? 12 : 10, height: 8 },
+          ),
+        );
+      });
+    });
+    return element('div', group, cells.join('') + markers.join(''));
+  });
+  value.capture.boardHtml =
+    value.capture.boardHtml.slice(0, value.capture.boardHtml.indexOf('<div id="temples">')) +
+    blocks.join('') +
+    '</div>';
+  value.repinMarkers = (mutate = () => {}) => {
+    const prepared = value.repin();
+    const calibration = {
+      schema: BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA,
+      archiveRelease: 'fixture',
+      captureSha256: sha(prepared[0]),
+      catalogSha256: sha(catalogBytes),
+    };
+    mutate(calibration);
+    const calibrated = bytes(calibration),
+      control = JSON.parse(prepared[2]);
+    control.markerCalibration = pin(calibrated);
+    return [prepared[0], prepared[1], bytes(control), null, calibrated];
+  };
+  return value;
+}
+
 test('retained boundary binds original food/rotation scope and separates available from total workers', () => {
   for (const split of [false, true]) {
     const value = boundaryFixture({ split }),
@@ -581,6 +754,28 @@ test('retained boundary binds original food/rotation scope and separates availab
     assert.equal(projected.provenance.policyTrainingReady, false);
     assert.equal(Object.hasOwn(projected.witness.expected, 'foodDays'), false);
     assert.equal(Object.hasOwn(projected.witness.expected, 'gears'), false);
+    assert.equal(Object.hasOwn(projected.provenance, 'markerObservation'), false);
+  }
+  for (const options of [{}, { split: true }, { terminal: true }]) {
+    for (const createFixture of [boundaryMarkerFixture, boundaryCellMarkerFixture]) {
+      const value = createFixture(options),
+        projected = projectRetainedBoundary(...value.repinMarkers());
+      const players = projected.witness.expected.players;
+      assert.deepEqual(
+        players.map((p) => Object.values(p.temples)),
+        value.templeLevels,
+      );
+      assert.deepEqual(
+        players.map((p) => Object.values(p.technologies)),
+        value.technologyLevels,
+      );
+      assert.equal(projected.provenance.markerObservation.calibrationAuthenticated, false);
+      assert.equal(projected.provenance.completeSourceBoard, false);
+      assert.equal(projected.provenance.humanBcQualified, false);
+      assert.equal(projected.provenance.omitted.includes('markers'), false);
+      assert.equal(Object.hasOwn(players[0], 'score'), false);
+      assert.match(projected.provenance.markerObservation.interpretation, /consistency only/);
+    }
   }
   const modern = boundaryFixture();
   Object.assign(modern.raw, {
@@ -893,6 +1088,200 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
       /Legacy input requires embedded table settings/,
     );
   }
+  for (const mutate of [
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'marker_100_temple_chaac',
+        'marker_999_temple_chaac',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="marker_100_temple_chaac"',
+        '<div hidden id="marker_100_temple_chaac"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'class="marker marker_008000"',
+        'class="marker marker_ff0000"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace('top: 110px;', 'top: 111px;');
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="temples">',
+        '<div id="temples" inert>',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        /<div id="marker_100_temple_chaac"[^>]*><\/div>/,
+        '',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="temples">',
+        `<div id="temples">${element('div', 'marker_100_temple_chaac')}`,
+      );
+    },
+    (value) => {
+      value.capture.playerBoards[0].rowHtml = value.capture.playerBoards[0].rowHtml.replace(
+        '<h3',
+        `${element('div', 'marker_100_temple_chaac')}<h3`,
+      );
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.push({
+        id: 'marker_100_temple_chaac',
+        computedVisibility: 'hidden',
+      });
+    },
+  ]) {
+    const value = boundaryMarkerFixture();
+    mutate(value);
+    assert.throws(
+      () => projectRetainedBoundary(...value.repinMarkers()),
+      /marker|Marker|Hidden|geometry|duplicate/,
+    );
+  }
+  for (const mutate of [
+    (c) => {
+      c.archiveRelease = 'other';
+    },
+    (c) => {
+      c.captureSha256 = '0'.repeat(64);
+    },
+    (c) => {
+      c.catalogSha256 = '0'.repeat(64);
+    },
+    (c) => {
+      c.templeTop.chaac.pop();
+    },
+    (c) => {
+      c.templeTop.chaac[0].level = 8;
+    },
+    (c) => {
+      c.templeTop.chaac[0].pixels = c.templeTop.chaac[1].pixels;
+    },
+    (c) => {
+      c.technologyLeft.theology[3].level = 4;
+    },
+    (c) => {
+      c.technologyLeft.architecture.reverse();
+    },
+    (c) => {
+      c.expected = {};
+    },
+  ]) {
+    const value = boundaryMarkerFixture();
+    assert.throws(
+      () => projectRetainedBoundary(...value.repinMarkers(mutate)),
+      /calibration|levels|integer/,
+    );
+  }
+  const geometry = (value, id) =>
+    value.capture.retainedDomGeometry.find((entry) => entry.id === id);
+  for (const mutate of [
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        '<div id="temples">',
+        '<div id="temples" inert>',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="temple_chaac_step_0"',
+        'id="temple_chaac_step_0" hidden',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        /<div id="temple_chaac_step_0"[^>]*><\/div>/,
+        '',
+      );
+    },
+    (value) => {
+      value.capture.playerBoards[0].rowHtml = value.capture.playerBoards[0].rowHtml.replace(
+        '<h3',
+        `${element('div', 'temple_chaac_step_0', '', ' class="temple_step"')}<h3`,
+      );
+    },
+    (value) => {
+      geometry(value, 'temple_chaac_step_0').computedVisibility = 'hidden';
+    },
+    (value) => {
+      geometry(value, 'temple_chaac_step_0').parentId = 'technologies';
+    },
+    (value) => {
+      geometry(value, 'temple_chaac_step_0').rect.width = 0;
+    },
+    (value) => {
+      geometry(value, 'temple_chaac_step_0').rect.extra = 1;
+    },
+    (value) => {
+      geometry(value, 'temple_chaac_step_0').className = 'technology_level';
+    },
+    (value) => {
+      value.capture.retainedDomGeometry = value.capture.retainedDomGeometry.filter(
+        (entry) => entry.id !== 'marker_100_temple_chaac',
+      );
+    },
+    (value) => {
+      geometry(value, 'technology_agriculture_level_1').rect.x = 420;
+    },
+    (value) => {
+      geometry(value, 'marker_100_technology_agriculture').rect.y = 54;
+    },
+    (value) => {
+      geometry(value, 'marker_100_technology_agriculture').rect.x = 575;
+    },
+    (value) => {
+      geometry(value, 'marker_100_technology_agriculture').rect.x = 645;
+    },
+    (value) => {
+      geometry(value, 'temples').rect.x = -1;
+    },
+    (value) => {
+      const first = /<div id="temple_chaac_step_0"[^>]*><\/div>/.exec(value.capture.boardHtml)[0];
+      const second = /<div id="temple_chaac_step_1"[^>]*><\/div>/.exec(value.capture.boardHtml)[0];
+      value.capture.boardHtml = value.capture.boardHtml.replace(first + second, second + first);
+    },
+  ]) {
+    const value = boundaryCellMarkerFixture();
+    mutate(value);
+    assert.throws(
+      () => projectRetainedBoundary(...value.repinMarkers()),
+      /marker|Marker|Hidden|geometry|rectangle|duplicate/,
+    );
+  }
+  for (const mutate of [
+    (declaration) => {
+      declaration.captureSha256 = '0'.repeat(64);
+    },
+    (declaration) => {
+      declaration.templeTop = {};
+    },
+    (declaration) => {
+      declaration.expected = {};
+    },
+  ]) {
+    const value = boundaryCellMarkerFixture();
+    assert.throws(() => projectRetainedBoundary(...value.repinMarkers(mutate)), /calibration/);
+  }
+  const calibrated = boundaryMarkerFixture().repinMarkers();
+  assert.throws(
+    () => projectRetainedBoundary(...calibrated.slice(0, 4)),
+    /Missing declared marker/,
+  );
+  const unbound = [...calibrated],
+    declaration = JSON.parse(unbound[2]);
+  delete declaration.markerCalibration;
+  unbound[2] = bytes(declaration);
+  assert.throws(() => projectRetainedBoundary(...unbound), /marker calibration/);
 });
 
 test('legacy nested initial panels project only consistent retained state with unknown options', () => {
