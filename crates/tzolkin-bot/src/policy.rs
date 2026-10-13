@@ -608,6 +608,40 @@ pub fn score_action_monument_aligned(
     score_action_for_profile(o, a, w, ScoringProfile::MonumentAligned)
 }
 
+/// Only an owned, untaxed Yaxchilan removal at positions 1..5 changes from V1.
+/// Taxed rewards and higher free-choice positions retain the V1 approximation.
+pub fn score_action_monument_aligned_v2(
+    o: &Observation,
+    a: &TypedAction,
+    w: &HeuristicWeights,
+) -> f64 {
+    let TypedAction::Remove {
+        gear: GearId::Yaxchilan,
+        position,
+    } = a
+    else {
+        return score_action_monument_aligned(o, a, w);
+    };
+    if o.phase != Phase::Playing
+        || !(1..=5).contains(position)
+        || !o.gears.get(&GearId::Yaxchilan).is_some_and(|slots| {
+            slots.get(*position as usize).is_some_and(|slot| {
+                slot.as_ref()
+                    .is_some_and(|worker| !worker.dummy && worker.player_id == o.actor as i64)
+            })
+        })
+    {
+        return score_action_monument_aligned(o, a, w);
+    }
+    let p = &o.players[o.actor];
+    let Some(amounts) = selected_action_resources(o, p, GearId::Yaxchilan, *position) else {
+        return score_action_monument_aligned(o, a, w);
+    };
+    10.0 + amount_value(o, p, &amounts, w, ScoringProfile::MonumentAligned)
+        + if *position >= 4 { 6.0 } else { 0.0 }
+        + if o.round >= 25 { 15.0 } else { 0.0 }
+}
+
 fn score_action_for_profile(
     o: &Observation,
     a: &TypedAction,
@@ -1419,6 +1453,154 @@ mod tests {
                 None
             );
         }
+        // Removal previews use the same exact rewards as the subsequent action.
+        for (extraction, position, prophecy, amounts) in [
+            (0, 5, None, [2, 0, 1, 1, 0]),
+            (1, 1, None, [0, 2, 0, 0, 0]),
+            (2, 2, None, [1, 0, 2, 0, 0]),
+            (2, 2, Some(ProphecyId::GoldShortage), [1, 0, 2, 0, 0]),
+            (3, 3, None, [2, 0, 0, 2, 0]),
+            (3, 5, None, [2, 0, 2, 2, 0]),
+            (0, 4, None, [0, 0, 0, 0, 1]),
+            (3, 5, Some(ProphecyId::ForgottenLore), [2, 0, 1, 2, 0]),
+        ] {
+            let mut state = playing(prophecy);
+            state.pending = None;
+            let actor = state.current_player;
+            state.players[actor]
+                .technologies
+                .insert(TechnologyId::Extraction, extraction);
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[position as usize] =
+                Some(GearWorker {
+                    player_id: actor as i64,
+                    dummy: false,
+                });
+            let observation = observe(&state, actor).unwrap();
+            let player = &observation.players[actor];
+            let action = TypedAction::Remove {
+                gear: GearId::Yaxchilan,
+                position,
+            };
+            assert!(
+                observation
+                    .legal_actions
+                    .iter()
+                    .any(|row| row.action == action)
+            );
+            let after_remove = apply_move(
+                &state,
+                GameMove::Remove {
+                    gear: GearId::Yaxchilan,
+                    position,
+                },
+            )
+            .unwrap();
+            let pending = observe(&after_remove, actor).unwrap();
+            let selected = pending.legal_actions.iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Yaxchilan, position: p, corn_cost: 0, .. } if p == position)).unwrap();
+            let after = apply_move(&after_remove, selected.r#move.clone()).unwrap();
+            for (resource, expected) in RESOURCE_IDS.into_iter().zip(amounts) {
+                assert_eq!(
+                    after.players[actor].resources[&resource]
+                        - state.players[actor].resources[&resource],
+                    expected
+                );
+            }
+            let exact =
+                10.0 + amount_value(
+                    &observation,
+                    player,
+                    &amounts,
+                    &weights,
+                    ScoringProfile::MonumentAligned,
+                ) + if position >= 4 { 6.0 } else { 0.0 }
+                    + 0.0;
+            assert_eq!(
+                score_action_monument_aligned_v2(&observation, &action, &weights).to_bits(),
+                exact.to_bits()
+            );
+            let legacy =
+                10.0 + action_value(
+                    &observation,
+                    player,
+                    GearId::Yaxchilan,
+                    position,
+                    &weights,
+                    ScoringProfile::MonumentAligned,
+                ) + if position >= 4 { 6.0 } else { 0.0 }
+                    + 0.0;
+            for score in [
+                score_action(&observation, &action, &weights),
+                score_action_for_revision(&observation, &action, &weights, HeuristicRevision::V1),
+                score_action_food_aligned(&observation, &action, &weights),
+                score_action_food_aligned_v2(&observation, &action, &weights),
+                score_action_monument_aligned(&observation, &action, &weights),
+            ] {
+                assert_eq!(score.to_bits(), legacy.to_bits());
+            }
+            for row in &observation.legal_actions {
+                if row.action != action {
+                    assert_eq!(
+                        score_action_monument_aligned_v2(&observation, &row.action, &weights)
+                            .to_bits(),
+                        score_action_monument_aligned(&observation, &row.action, &weights)
+                            .to_bits()
+                    );
+                }
+            }
+            assert_eq!(
+                crate::choose_move_monument_aligned_v2(&observation)
+                    .unwrap()
+                    .policy_version,
+                crate::MONUMENT_ALIGNED_V2_POLICY_VERSION
+            );
+            for replacement in [
+                None,
+                Some(GearWorker {
+                    player_id: actor as i64,
+                    dummy: true,
+                }),
+                Some(GearWorker {
+                    player_id: ((actor + 1) % state.players.len()) as i64,
+                    dummy: false,
+                }),
+            ] {
+                let mut unowned = observation.clone();
+                unowned.gears.get_mut(&GearId::Yaxchilan).unwrap()[position as usize] = replacement;
+                assert_eq!(
+                    score_action_monument_aligned_v2(&unowned, &action, &weights).to_bits(),
+                    score_action_monument_aligned(&unowned, &action, &weights).to_bits()
+                );
+            }
+        }
+        for (position, prophecy) in [
+            (3, Some(ProphecyId::GoldShortage)),
+            (5, Some(ProphecyId::GoldShortage)),
+            (4, Some(ProphecyId::Desecration)),
+            (6, None),
+            (7, None),
+        ] {
+            let mut state = playing(prophecy);
+            state.pending = None;
+            let actor = state.current_player;
+            state.players[actor]
+                .technologies
+                .insert(TechnologyId::Extraction, 3);
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[position as usize] =
+                Some(GearWorker {
+                    player_id: actor as i64,
+                    dummy: false,
+                });
+            let observation = observe(&state, actor).unwrap();
+            let action = TypedAction::Remove {
+                gear: GearId::Yaxchilan,
+                position,
+            };
+            assert_eq!(
+                score_action_monument_aligned_v2(&observation, &action, &weights).to_bits(),
+                score_action_monument_aligned(&observation, &action, &weights).to_bits()
+            );
+        }
+
         // Marginal feed effects telescope and stop at the real saturated cost.
         for (workers, farms, discount, all, hunger, yaluk, effects, saved) in [
             (
