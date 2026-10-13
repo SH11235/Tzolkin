@@ -558,19 +558,31 @@ fn candidate_features(
     mut out: [f32; FEATURE_COUNT],
 ) -> Result<[f32; FEATURE_COUNT], String> {
     let n = o.players.len();
-    let mut canonical_action = action.clone();
-    if let TypedAction::ProphecyGain { recipient, .. } = &mut canonical_action {
-        if *recipient >= n {
-            return Err("Invalid action recipient".into());
+    let canonical_action = match action {
+        TypedAction::ProphecyGain {
+            recipient,
+            resources,
+            corn_cost,
+            temple_losses,
+        } => {
+            if *recipient >= n {
+                return Err("Invalid action recipient".into());
+            }
+            std::borrow::Cow::Owned(TypedAction::ProphecyGain {
+                recipient: relative(o.actor, *recipient, n),
+                resources: *resources,
+                corn_cost: *corn_cost,
+                temple_losses: *temple_losses,
+            })
         }
-        *recipient = relative(o.actor, *recipient, n);
-    }
+        _ => std::borrow::Cow::Borrowed(action),
+    };
     hashed_value(
         &mut out,
         443,
         480,
         hash(1, b"candidate"),
-        &serde_json::to_value(canonical_action).map_err(|e| e.to_string())?,
+        &serde_json::to_value(canonical_action.as_ref()).map_err(|e| e.to_string())?,
     );
     let mut cost = [0i64; 5];
     let mut gain = [0i64; 5];
