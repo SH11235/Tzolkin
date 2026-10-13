@@ -1205,6 +1205,23 @@ test('retained boundary binds original food/rotation scope and separates availab
   }
   const jungleNode = (value, id) =>
     value.capture.retainedDomGeometry.find((item) => item.id === id);
+  for (const [axis, size] of [
+    ['x', 'width'],
+    ['y', 'height'],
+  ]) {
+    const value = boundaryFixture({ jungleTops: true }),
+      original = projectRetainedBoundary(...value.repin()),
+      container = jungleNode(value, 'jungle_3').rect,
+      tile = jungleNode(value, 'jungle_3_tile_1').rect;
+    tile[axis] = container[axis] + container[size] - tile[size] + 0.125;
+    assert.ok(tile[axis] + tile[size] > container[axis] + container[size]);
+    const projected = projectRetainedBoundary(...value.repin());
+    assert.deepEqual(projected.witness.expected, original.witness.expected);
+    assert.deepEqual(projected.provenance.jungleObservation, original.provenance.jungleObservation);
+    assert.equal(projected.provenance.geometryVerified, false);
+    assert.equal(projected.provenance.completeNativeReplayQualified, false);
+    assert.equal(projected.provenance.humanBcQualified, false);
+  }
   for (const mutate of [
     (value) => {
       value.capture.boardHtml = value.capture.boardHtml.replace(
@@ -1297,7 +1314,25 @@ test('retained boundary binds original food/rotation scope and separates availab
       jungleNode(value, 'jungle_3_tile_1').rect.width = Infinity;
     },
     (value) => {
-      jungleNode(value, 'jungle_3_tile_1').rect.x = -3;
+      const tile = jungleNode(value, 'jungle_3_tile_1').rect;
+      tile.x = jungleNode(value, 'jungle_3').rect.x - tile.width;
+    },
+    (value) => {
+      const tile = jungleNode(value, 'jungle_3_tile_1').rect,
+        container = jungleNode(value, 'jungle_3').rect;
+      tile.y = container.y + container.height;
+    },
+    (value) => {
+      const tile = jungleNode(value, 'jungle_3_tile_1').rect,
+        container = jungleNode(value, 'jungle_3').rect;
+      tile.x = container.x;
+      tile.width = container.width + 1;
+    },
+    (value) => {
+      const tile = jungleNode(value, 'jungle_3_tile_1').rect,
+        container = jungleNode(value, 'jungle_3').rect;
+      tile.y = container.y;
+      tile.height = container.height + 1;
     },
     (value) => {
       jungleNode(value, 'jungle_3_tile_1').inlineStyle = 'top:0px;right:0px';
