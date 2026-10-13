@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dataset::{DatasetSplit, split_for_family};
-use crate::features::{FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
+use crate::features::PUBLIC_FEATURE_SCHEMA;
+use crate::human_policy_dataset::ConditionalFeatureProfile;
 use crate::model::MAX_CANDIDATES;
 use crate::public_model::{self, PARAMETER_COUNT, PublicPolicyModel};
 use crate::public_policy_cohort::{COHORT_CONTRACT, ValidatedBcCohort};
@@ -756,6 +757,33 @@ pub(crate) fn accumulate_step_with_baseline_timed<T: PhaseTimer>(
     baseline: impl FnOnce(&tzolkin_core::observation::Observation) -> Result<f64, String>,
     timer: &mut T,
 ) -> Result<(), String> {
+    accumulate_step_with_baseline_timed_for_profile(
+        ConditionalFeatureProfile::Public2,
+        model,
+        step,
+        config,
+        own,
+        counts,
+        deltas,
+        baseline,
+        timer,
+    )
+}
+
+/// Only selects a closed numeric layout. The applied-step/old likelihood checks
+/// still run in full; this helper grants no source, owner or update authority.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accumulate_step_with_baseline_timed_for_profile<T: PhaseTimer>(
+    profile: ConditionalFeatureProfile,
+    model: &PublicPolicyModel,
+    step: AppliedActorStep<'_>,
+    config: &OneStepConfig,
+    own: &mut [f64],
+    counts: &mut [usize; 3],
+    deltas: &mut Deltas,
+    baseline: impl FnOnce(&tzolkin_core::observation::Observation) -> Result<f64, String>,
+    timer: &mut T,
+) -> Result<(), String> {
     let observation = step.observation();
     let count = observation.legal_actions.len();
     if !(1..=MAX_CANDIDATES).contains(&count)
@@ -774,13 +802,16 @@ pub(crate) fn accumulate_step_with_baseline_timed<T: PhaseTimer>(
     }
     let rows = timed(timer, TimedPhase::ActorEncode, |_| {
         public_model::validate_contract(observation)?;
-        let encoder = FeatureEncoder::new_public(observation)?;
+        let encoder = profile.encoder(observation)?;
         (0..count)
             .map(|index| encoder.encode_legal_tagged(index))
             .collect::<Result<Vec<_>, _>>()
     })?;
-    let cache = timed(timer, TimedPhase::ActorForward, |_| {
-        ScalarPolicyPullback::new(model, &rows)
+    let cache = timed(timer, TimedPhase::ActorForward, |_| match profile {
+        ConditionalFeatureProfile::Public2 => ScalarPolicyPullback::new(model, &rows),
+        ConditionalFeatureProfile::SemanticPlaying4 => {
+            ScalarPolicyPullback::new_semantic_playing(model, &rows)
+        }
     })?;
     let likelihood = timed(timer, TimedPhase::ActorTrace, |_| {
         let likelihood = BehaviorLikelihood::from_logits(cache.logits(), step.chosen_index())?;
