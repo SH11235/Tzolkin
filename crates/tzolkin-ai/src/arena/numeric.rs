@@ -610,7 +610,7 @@ fn choose(
                 _ => unreachable!("Own Setup guard returned an unsupported phase"),
             }
         }
-        if let Some(trade) = result.trade.as_ref() {
+        if let Some(trade) = result.trade {
             d.forced_exits += usize::from(trade.overridden);
             d.repeat_exits += usize::from(trade.overridden && trade.repeat_seen);
             d.budget_exits += usize::from(trade.overridden && trade.budget_reached);
@@ -659,7 +659,7 @@ fn choose(
                 _ => unreachable!("phase-routed session returned an unsupported phase"),
             }
         }
-        if let Some(trade) = result.trade {
+        if let Some(trade) = result.trade.as_ref() {
             d.forced_exits += usize::from(trade.overridden);
             d.repeat_exits += usize::from(trade.overridden && trade.repeat_seen);
             d.budget_exits += usize::from(trade.overridden && trade.budget_reached);
