@@ -224,6 +224,11 @@ pub fn dispatch_cpu_resource_aligned_v2(observation: &str) -> Result<String, JsE
     tzolkin_bot::dispatch_cpu_resource_aligned_v2(observation).map_err(|error| JsError::new(&error))
 }
 
+#[wasm_bindgen]
+pub fn dispatch_cpu_resource_aligned_v3(observation: &str) -> Result<String, JsError> {
+    tzolkin_bot::dispatch_cpu_resource_aligned_v3(observation).map_err(|error| JsError::new(&error))
+}
+
 /// Immutable numeric-only model storage. Loading does not establish training
 /// ownership or source authenticity; the Worker owns this instance until reset.
 #[wasm_bindgen]
