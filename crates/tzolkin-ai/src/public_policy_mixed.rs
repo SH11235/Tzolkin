@@ -1,5 +1,6 @@
 //! One sealed mixed learner joint update; no durable continuation admission.
 use crate::dataset::{DatasetSplit, split_for_family};
+use crate::human_policy_dataset::ConditionalFeatureProfile;
 use crate::public_model::{self, PublicPolicyModel};
 use crate::public_policy_baseline::{self, InitializedResidualBaseline, ResidualFitConfig};
 use crate::public_policy_episode::AppliedActorStep;
@@ -566,6 +567,38 @@ pub(crate) fn prepare_numeric_timed<T: PhaseTimer>(
     ),
     String,
 > {
+    prepare_numeric_timed_for_profile(
+        ConditionalFeatureProfile::Public2,
+        model,
+        residual,
+        members,
+        counts,
+        actor_config,
+        critic_config,
+        timer,
+    )
+}
+
+/// A numeric proposal only. The profile does not admit an original source or
+/// alter the actor-own SUM/4, frozen public384 critic or rounded-delta contract.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_numeric_timed_for_profile<T: PhaseTimer>(
+    profile: ConditionalFeatureProfile,
+    model: &PublicPolicyModel,
+    residual: &[f32],
+    members: &[MixedNumericMember<'_>; 4],
+    counts: [usize; 3],
+    actor_config: &OneStepConfig,
+    critic_config: &ResidualFitConfig,
+    timer: &mut T,
+) -> Result<
+    (
+        Deltas,
+        public_policy_update::Proposal,
+        public_policy_baseline::NumericResidualFit,
+    ),
+    String,
+> {
     actor_config.validate()?;
     critic_config.check_callbacks(counts[0])?;
     model.validate()?;
@@ -584,7 +617,8 @@ pub(crate) fn prepare_numeric_timed<T: PhaseTimer>(
             if step.actor() != e.learner || step.observation().players.len() != e.players {
                 return Err("Mixed update opponent/absolute learner actor mismatch".into());
             }
-            public_policy_update::accumulate_step_with_baseline_timed(
+            public_policy_update::accumulate_step_with_baseline_timed_for_profile(
+                profile,
                 model,
                 step,
                 actor_config,
@@ -668,5 +702,38 @@ mod tests {
         );
         assert!(rounded_delta(&[1.0], &[1.02], 0.01).is_err());
         assert!(rounded_delta(&[0.0], &[-0.0], 0.01).is_err());
+        // Neither layout may turn absent applied steps into an admitted update.
+        let model = crate::public_model::PublicPolicyArtifact::new(17)
+            .unwrap()
+            .model;
+        let residual = public_policy_baseline::zero_output_parameters(17);
+        let members = std::array::from_fn(|i| MixedNumericMember {
+            learner: i % if i < 2 { 3 } else { 4 },
+            players: if i < 2 { 3 } else { 4 },
+            coefficient: 0.25,
+            steps: Vec::new(),
+        });
+        let actor = OneStepConfig::new(1e-4, 0.01, 4).unwrap();
+        let critic = ResidualFitConfig::new(1e-4, 0.01, 4).unwrap();
+        for profile in [
+            ConditionalFeatureProfile::Public2,
+            ConditionalFeatureProfile::SemanticPlaying4,
+        ] {
+            assert_eq!(
+                prepare_numeric_timed_for_profile(
+                    profile,
+                    &model,
+                    &residual,
+                    &members,
+                    [4, 4, 0],
+                    &actor,
+                    &critic,
+                    &mut Untimed
+                )
+                .err()
+                .as_deref(),
+                Some("Mixed update sealed learner count mismatch")
+            );
+        }
     }
 }
