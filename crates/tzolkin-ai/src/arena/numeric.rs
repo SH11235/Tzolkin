@@ -287,6 +287,7 @@ pub enum AppProfile {
     FoodAlignedV2,
     MonumentAlignedV1,
     MonumentAlignedV2,
+    ResourceAlignedV2,
 }
 impl AppProfile {
     pub fn policy_version(self) -> &'static str {
@@ -294,6 +295,7 @@ impl AppProfile {
             Self::FoodAlignedV2 => tzolkin_bot::FOOD_ALIGNED_V2_POLICY_VERSION,
             Self::MonumentAlignedV1 => tzolkin_bot::MONUMENT_ALIGNED_POLICY_VERSION,
             Self::MonumentAlignedV2 => tzolkin_bot::MONUMENT_ALIGNED_V2_POLICY_VERSION,
+            Self::ResourceAlignedV2 => tzolkin_bot::RESOURCE_ALIGNED_V2_POLICY_VERSION,
         }
     }
     fn choose_move(self, observation: &Observation) -> Result<Decision, String> {
@@ -301,6 +303,7 @@ impl AppProfile {
             Self::FoodAlignedV2 => tzolkin_bot::choose_move_food_aligned_v2(observation),
             Self::MonumentAlignedV1 => tzolkin_bot::choose_move_monument_aligned(observation),
             Self::MonumentAlignedV2 => tzolkin_bot::choose_move_monument_aligned_v2(observation),
+            Self::ResourceAlignedV2 => tzolkin_bot::choose_move_resource_aligned_v2(observation),
         }
     }
 }
@@ -2591,6 +2594,7 @@ pub(super) mod tests {
                 AppProfile::FoodAlignedV2,
                 AppProfile::MonumentAlignedV1,
                 AppProfile::MonumentAlignedV2,
+                AppProfile::ResourceAlignedV2,
             ] {
                 let expected = match profile {
                     AppProfile::FoodAlignedV2 => {
@@ -2601,6 +2605,9 @@ pub(super) mod tests {
                     }
                     AppProfile::MonumentAlignedV2 => {
                         tzolkin_bot::choose_move_monument_aligned_v2(observation)?
+                    }
+                    AppProfile::ResourceAlignedV2 => {
+                        tzolkin_bot::choose_move_resource_aligned_v2(observation)?
                     }
                 };
                 let mut roles = (0..observation.players.len())
