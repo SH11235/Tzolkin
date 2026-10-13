@@ -991,6 +991,106 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
     let raw = encoded_sampling_claim(&consumed);
     assert!(CurrentMixedSamplingConsumptionSpec::from_json(&raw, &"5".repeat(64)).is_err());
     assert!(CurrentMixedSamplingConsumptionSpec::from_json(&raw, &sha(&raw)).is_err());
+
+    // V2 overlaps may consume the same ordinal with the same or a different
+    // environment family. Only the cursor extent is deduplicated by ordinal.
+    let mut overlap = configs.to_vec();
+    overlap.extend(configs.clone());
+    assert_eq!(
+        sampling::covered_range(&overlap, b.prefix, b.next).unwrap(),
+        (external.clone(), next)
+    );
+    let mut second = configs.clone();
+    let mut seed = 100_000u32;
+    for c in &mut second {
+        loop {
+            let family = seed_family_id(seed);
+            if split_for_family(&family).unwrap() == DatasetSplit::Train
+                && external.binary_search(&family).is_err()
+                && b.consumed.binary_search(&family).is_err()
+            {
+                break;
+            }
+            seed += 1;
+        }
+        c.environment_seed = seed;
+        seed += 1;
+    }
+    overlap.extend(second.clone());
+    let (v2_families, v2_next) = sampling::covered_range(&overlap, b.prefix, b.next).unwrap();
+    assert_eq!((v2_families.len(), v2_next - b.next), (8, 4));
+    let mut following = second;
+    for c in &mut following {
+        c.episode_ordinal = format!(
+            "{:016x}",
+            c.checked_config()
+                .unwrap()
+                .sampling_identity()
+                .episode_ordinal()
+                + 4
+        );
+    }
+    overlap.extend(following);
+    assert_eq!(
+        sampling::covered_range(&overlap, b.prefix, b.next)
+            .unwrap()
+            .1,
+        next + 4
+    );
+    let mut gap = overlap.clone();
+    gap.retain(|c| c.episode_ordinal != format!("{:016x}", b.next + 1));
+    assert!(sampling::covered_range(&gap, b.prefix, b.next).is_err());
+    assert!(sampling::covered_range(&overlap, [b.prefix[0], b.prefix[1] + 1], b.next).is_err());
+    assert!(sampling::covered_range(&overlap, b.prefix, u64::MAX).is_err());
+    let mut bad = overlap;
+    bad[0].options.tribes = true;
+    assert!(sampling::covered_range(&bad, b.prefix, b.next).is_err());
+
+    let v1_raw = bytes(consumed.sampling_consumption.as_ref().unwrap(), HEAD_CAP).unwrap();
+    assert!(
+        unique_json(&v1_raw, HEAD_CAP)
+            .unwrap()
+            .get("nativeIntersection")
+            .is_none()
+    );
+    let mut v2 = serde_json::to_value(&consumed).unwrap();
+    let claim = &mut v2["samplingConsumption"];
+    claim["schema"] = json!("tzolkin-current-mixed-external-sampling-consumption-v2");
+    claim["declaration"] = json!({
+        "schema":"tzolkin-current-mixed-external-sampling-consumption-v2",
+        "predecessor":serde_json::to_value(consumed.sampling_consumption.as_ref().unwrap()).unwrap()["declaration"]["predecessor"],
+        "sources":[{"kind":"campaign","reservationReceipt":pin,"sourcePlan":pin}],
+        "exclusions":exclusions});
+    claim["unavailableFamilies"] = json!(v2_families);
+    claim["nativeIntersection"] = json!([]);
+    v2["externalUnavailable"]["schema"] =
+        json!("tzolkin-current-mixed-external-unavailable-baseline-v2");
+    v2["externalUnavailable"]["families"] = json!(v2_families);
+    let v2: SegmentBinding = serde_json::from_value(v2).unwrap();
+    v2.require_start_bytes(&run_spec()).unwrap();
+    let mut v2_progress = progress(&v2);
+    v2_progress.apply(&start(&v2), &run_spec()).unwrap();
+    assert_eq!(
+        (
+            v2_progress.parent_count().unwrap(),
+            v2_progress.attempts,
+            v2_progress.successful,
+            v2_progress.work,
+            v2_progress.consumed.clone()
+        ),
+        counters
+    );
+    assert_eq!(v2_progress.external_unavailable.len(), 8);
+    assert_eq!(v2_progress.next, next);
+    assert_eq!((&v2.parent, &v2.inherited), (&b.parent, &b.inherited));
+    let reparsed: sampling::Binding = closed(&v1_raw, HEAD_CAP).unwrap();
+    assert_eq!(bytes(&reparsed, HEAD_CAP).unwrap(), v1_raw);
+    let mut wrong = v2.clone();
+    let claim = wrong.sampling_consumption.as_mut().unwrap();
+    let mut value = serde_json::to_value(&claim).unwrap();
+    value["nativeIntersection"] = json!(["f".repeat(64)]);
+    *claim = serde_json::from_value(value).unwrap();
+    assert!(wrong.checksum().is_err());
     let mut fork = b.clone();
     fork.pool = "1".repeat(64);
     fork.pool_fork = Some(PoolForkBinding {

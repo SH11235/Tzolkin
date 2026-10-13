@@ -475,6 +475,7 @@ impl SegmentBinding {
         }
         if let Some(c) = &self.sampling_consumption {
             c.shape()?;
+            c.require_native(&self.consumed)?;
             if self.pool_fork.is_some()
                 || self.budget_amendment.is_some()
                 || self.seat_rotation.is_some()
