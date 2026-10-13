@@ -13,6 +13,10 @@ const CAMPAIGN_CAP: usize = 1024 * 1024;
 const EXCLUSION_CAP: usize = 16 * 1024 * 1024;
 const MAX_EXCLUSIONS: usize = 200_000;
 const PREFLIGHT_CAP: usize = 256 * 1024 * 1024;
+#[path = "public_rl_current_mixed_campaign_live.rs"]
+mod live;
+pub use live::{CurrentMixedLivePlanSpec, current_mixed_live_plan};
+
 const SEAT_CAMPAIGN_SCHEMA: &str = "tzolkin-current-mixed-ready-seat-campaign-v1";
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -308,6 +312,7 @@ struct MetadataTip {
     binding: Option<segment::SegmentBinding>,
     entry: Entry,
     directory: PathBuf,
+    archive_usage: [u64; 3],
 }
 /// Same journal reducer, without records, gradients or a model. These claims are
 /// only a pre-load refusal gate; restore_chain still proves the actual owner.
@@ -353,6 +358,9 @@ fn metadata_tip(
     let mut first_binding = None;
     let mut references = BTreeMap::<u64, Vec<FilePin>>::new();
     let mut total_bytes = 0usize;
+    let mut raw_records = 0u64;
+    let mut stored_records = 0u64;
+    let mut metadata_bytes = native_spec.len() as u64;
     for sequence in 1..=latest.sequence {
         let bytes = read_bounded(
             &directory.join(format!("head-{sequence:016x}.json")),
@@ -364,6 +372,9 @@ fn metadata_tip(
         if total_bytes > PREFLIGHT_CAP {
             return Err("Campaign metadata byte capacity".into());
         }
+        metadata_bytes = metadata_bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or("Campaign metadata accounting overflow")?;
         let entry: Entry = closed(&bytes, HEAD_CAP)?;
         if entry.sequence != sequence
             || entry.previous != previous
@@ -430,6 +441,18 @@ fn metadata_tip(
             progress = Some(p);
         }
         let p = progress.as_mut().ok_or("Campaign native Start missing")?;
+        if let Event::CollectReturn {
+            record: Some(record),
+            ..
+        } = &entry.event
+        {
+            raw_records = raw_records
+                .checked_add(record.raw_bytes() as u64)
+                .ok_or("Campaign raw accounting overflow")?;
+            stored_records = stored_records
+                .checked_add(record.file().bytes as u64)
+                .ok_or("Campaign stored accounting overflow")?;
+        }
         let reference = match &entry.event {
             Event::ReserveWhole4 { reservation: r } => {
                 Some((r.attempt, vec![r.collection_spec.clone(), r.plan.clone()]))
@@ -492,6 +515,11 @@ fn metadata_tip(
                 {
                     return Err("Campaign native archive reference is not a regular file".into());
                 }
+                if !pin.name.starts_with("record-") {
+                    metadata_bytes = metadata_bytes
+                        .checked_add(pin.bytes as u64)
+                        .ok_or("Campaign metadata accounting overflow")?;
+                }
                 refs.push(pin);
             }
         }
@@ -541,6 +569,7 @@ fn metadata_tip(
         binding: first_binding,
         entry: latest,
         directory,
+        archive_usage: [raw_records, stored_records, metadata_bytes],
     })
 }
 
@@ -1003,6 +1032,108 @@ fn prior_invocations(
     Ok(())
 }
 
+// Shared genuine restore path; metadata never constructs an owner.
+fn restore_campaign_owner<'a, 's>(
+    spec: &'s CurrentMixedCampaignSpec,
+    pre: &'s Preflight,
+    prepared: &'a PreparedPublicPolicy,
+    extra: Vec<CurrentMixedRestoreStep<'s>>,
+) -> Result<(CurrentMixedTrainingSession<'a>, f64), String> {
+    let parent = match &spec.wire.bootstrap {
+        Bootstrap::Count1 { checkpoint } => ImportedMixedRlParent::from_count1(
+            prepared,
+            &checkpoint.read(crate::public_rl_session::MAX_CHECKPOINT_BYTES)?,
+            &checkpoint.sha256,
+        )?,
+        Bootstrap::Paired {
+            spec: paired,
+            head,
+            directory,
+        } => ImportedMixedRlParent::from_paired(
+            prepared,
+            PairedRunSpec::from_json(&encoded(paired)?)?,
+            &head.read(crate::public_rl_paired_session::MAX_CHECKPOINT_BYTES)?,
+            &head.sha256,
+            directory,
+        )?,
+    };
+    let original = &spec.wire.original_mixed;
+    let root = AdmittedCurrentMixedRoot::restore_one_batch(
+        parent,
+        prepared,
+        MixedOneBatchSpec::from_json(&encoded(&original.spec)?)?,
+        &original
+            .tip
+            .head
+            .read(crate::public_rl_mixed_training_session::MAX_HEAD_BYTES)?,
+        &original.tip.head.sha256,
+        &original.tip.directory,
+    )?;
+    let initial_pool = collection(&spec.wire.initial.pool)?;
+    let step_pools = spec
+        .wire
+        .steps
+        .iter()
+        .map(|step| match step {
+            SavedStep::GuardedPoolFork {
+                old_pool, new_pool, ..
+            }
+            | SavedStep::SeatRotation {
+                old_pool, new_pool, ..
+            } => Ok(Some((collection(old_pool)?, collection(new_pool)?))),
+            _ => Ok(None),
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut steps = spec
+        .wire
+        .steps
+        .iter()
+        .zip(&pre.steps)
+        .zip(&step_pools)
+        .map(|((saved, metadata), pools)| {
+            let tip = saved.tip().tip(&metadata.raw);
+            let s = segment_spec(saved.spec())?;
+            Ok(match saved {
+                SavedStep::Segment { .. } => CurrentMixedRestoreStep::Segment { spec: s, tip },
+                SavedStep::BudgetAmendment { .. } => {
+                    CurrentMixedRestoreStep::BudgetAmendment { spec: s, tip }
+                }
+                SavedStep::GuardedPoolFork { .. } => {
+                    let (old_pool, new_pool) =
+                        pools.as_ref().ok_or("Campaign fork pool missing")?;
+                    CurrentMixedRestoreStep::GuardedPoolFork {
+                        spec: s,
+                        old_pool,
+                        new_pool,
+                        tip,
+                    }
+                }
+                SavedStep::SeatRotation { shifts, .. } => {
+                    let (old_pool, new_pool) =
+                        pools.as_ref().ok_or("Campaign rotation pool missing")?;
+                    CurrentMixedRestoreStep::SeatRotation {
+                        spec: s,
+                        old_pool,
+                        new_pool,
+                        shifts: *shifts,
+                        tip,
+                    }
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    steps.extend(extra);
+    let began = Instant::now();
+    let session = CurrentMixedTrainingSession::restore_chain(
+        root,
+        run_spec(&spec.wire.initial.run_spec)?,
+        &initial_pool,
+        spec.wire.initial.tip.tip(&pre.initial.raw),
+        steps,
+    )?;
+    Ok((session, began.elapsed().as_secs_f64()))
+}
+
 /// One finite invocation. `continue` publishes the whole chunk reservation before
 /// any model/owner load. `resume` requires its exact successful prefix; unknown
 /// work is never recollected. An external single-writer wall watchdog is required.
@@ -1155,89 +1286,7 @@ pub fn current_mixed_campaign(
     )?;
     spec.require_input_pins()?;
     let qualification_seconds = qualification.elapsed().as_secs_f64();
-    let parent = match &spec.wire.bootstrap {
-        Bootstrap::Count1 { checkpoint } => ImportedMixedRlParent::from_count1(
-            &prepared,
-            &checkpoint.read(crate::public_rl_session::MAX_CHECKPOINT_BYTES)?,
-            &checkpoint.sha256,
-        )?,
-        Bootstrap::Paired {
-            spec: paired,
-            head,
-            directory,
-        } => ImportedMixedRlParent::from_paired(
-            &prepared,
-            PairedRunSpec::from_json(&encoded(paired)?)?,
-            &head.read(crate::public_rl_paired_session::MAX_CHECKPOINT_BYTES)?,
-            &head.sha256,
-            directory,
-        )?,
-    };
-    let original = &spec.wire.original_mixed;
-    let root = AdmittedCurrentMixedRoot::restore_one_batch(
-        parent,
-        &prepared,
-        MixedOneBatchSpec::from_json(&encoded(&original.spec)?)?,
-        &original
-            .tip
-            .head
-            .read(crate::public_rl_mixed_training_session::MAX_HEAD_BYTES)?,
-        &original.tip.head.sha256,
-        &original.tip.directory,
-    )?;
-    let initial_pool = collection(&spec.wire.initial.pool)?;
-    let step_pools = spec
-        .wire
-        .steps
-        .iter()
-        .map(|step| match step {
-            SavedStep::GuardedPoolFork {
-                old_pool, new_pool, ..
-            }
-            | SavedStep::SeatRotation {
-                old_pool, new_pool, ..
-            } => Ok(Some((collection(old_pool)?, collection(new_pool)?))),
-            _ => Ok(None),
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut steps = spec
-        .wire
-        .steps
-        .iter()
-        .zip(&pre.steps)
-        .zip(&step_pools)
-        .map(|((saved, metadata), pools)| {
-            let tip = saved.tip().tip(&metadata.raw);
-            let s = segment_spec(saved.spec())?;
-            Ok(match saved {
-                SavedStep::Segment { .. } => CurrentMixedRestoreStep::Segment { spec: s, tip },
-                SavedStep::BudgetAmendment { .. } => {
-                    CurrentMixedRestoreStep::BudgetAmendment { spec: s, tip }
-                }
-                SavedStep::GuardedPoolFork { .. } => {
-                    let (old_pool, new_pool) =
-                        pools.as_ref().ok_or("Campaign fork pool missing")?;
-                    CurrentMixedRestoreStep::GuardedPoolFork {
-                        spec: s,
-                        old_pool,
-                        new_pool,
-                        tip,
-                    }
-                }
-                SavedStep::SeatRotation { shifts, .. } => {
-                    let (old_pool, new_pool) =
-                        pools.as_ref().ok_or("Campaign rotation pool missing")?;
-                    CurrentMixedRestoreStep::SeatRotation {
-                        spec: s,
-                        old_pool,
-                        new_pool,
-                        shifts: *shifts,
-                        tip,
-                    }
-                }
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut steps = Vec::new();
     if let Some(child) = &child {
         let digest = head.ok_or("Campaign child tip missing")?.1;
         let tip = CurrentMixedRestoreTip {
@@ -1268,15 +1317,7 @@ pub fn current_mixed_campaign(
             }
         });
     }
-    let restored = Instant::now();
-    let mut session = CurrentMixedTrainingSession::restore_chain(
-        root,
-        run_spec(&spec.wire.initial.run_spec)?,
-        &initial_pool,
-        spec.wire.initial.tip.tip(&pre.initial.raw),
-        steps,
-    )?;
-    let restore_seconds = restored.elapsed().as_secs_f64();
+    let (mut session, restore_seconds) = restore_campaign_owner(&spec, &pre, &prepared, steps)?;
     let latest = pre.steps.last().unwrap_or(&pre.initial);
     let expected_consumed = latest
         .progress
@@ -1653,6 +1694,7 @@ mod tests {
                 event: Event::CollectStart { member: 0 },
             },
             directory: PathBuf::new(),
+            archive_usage: [0; 3],
         };
         assert!(
             require_established_seat_contract(&child, &Value::Null)
@@ -1702,6 +1744,7 @@ mod tests {
                 .unwrap_err()
                 .contains("changes the established global contract")
         );
+        live::metadata_boundaries(&wire, &next_spec);
         child.binding = None;
         let directory = std::env::temp_dir().join(format!(
             "tzolkin-campaign-metadata-{}-{}",
