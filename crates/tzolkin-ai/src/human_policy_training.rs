@@ -542,6 +542,12 @@ impl PreparedConditionalHumanPolicy {
             .ok_or_else(|| "Conditional boundary pins require successful source load".into())
     }
 
+    /// Recheck the immutable pins captured by a successful original source load.
+    /// This is content consistency, not source authentication or native admission.
+    pub fn recheck_sources(&self) -> Result<(), String> {
+        recheck_prepared_origin(self)
+    }
+
     pub fn model(&self) -> &ConditionalHumanPolicyArtifact {
         &self.checkpoint.model
     }
@@ -1186,6 +1192,7 @@ mod tests {
             ConditionalHumanPolicyDataset::training_fixture("124", DatasetSplit::Validation, 1),
         ];
         assert!(compare_validation_datasets([&left, &right], &duplicate).is_err());
+        assert!(left.recheck_sources().is_err());
         let mut wrong = outcome.checkpoint;
         wrong.metrics.final_validation.policy_loss += 0.5;
         wrong.checksum = wrong.expected_checksum().unwrap();
