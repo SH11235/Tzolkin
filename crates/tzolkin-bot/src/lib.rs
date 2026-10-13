@@ -11,6 +11,7 @@ pub const MONUMENT_ALIGNED_POLICY_VERSION: &str = "heuristic-monument-aligned-v1
 pub const MONUMENT_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-monument-aligned-v2";
 pub const RESOURCE_ALIGNED_POLICY_VERSION: &str = "heuristic-resource-aligned-v1";
 pub const RESOURCE_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-resource-aligned-v2";
+pub const RESOURCE_ALIGNED_V3_POLICY_VERSION: &str = "heuristic-resource-aligned-v3";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {
@@ -111,6 +112,22 @@ pub fn choose_move_resource_aligned_v2(observation: &Observation) -> Result<Deci
         |action| {
             context
                 .get_or_init(|| policy::ResourceRouteContext::new(observation, &weights))
+                .score(observation, action, &weights)
+        },
+    )
+}
+
+/// Opt-in lifetime investment forecast; the current App continues to use V2.
+pub fn choose_move_resource_aligned_v3(observation: &Observation) -> Result<Decision, String> {
+    let weights = policy::HeuristicWeights::default();
+    let context = std::cell::OnceCell::new();
+    choose_scored(
+        observation,
+        &weights,
+        RESOURCE_ALIGNED_V3_POLICY_VERSION,
+        |action| {
+            context
+                .get_or_init(|| policy::ResourceRouteContext::new_v3(observation, &weights))
                 .score(observation, action, &weights)
         },
     )
