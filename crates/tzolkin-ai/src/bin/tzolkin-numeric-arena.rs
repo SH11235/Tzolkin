@@ -16,6 +16,8 @@ const COMMAND_SCHEMA: &str = "tzolkin-numeric-corn-first-validation-command-v1";
 const APP_COMMAND_SCHEMA: &str = "tzolkin-app-profile-validation-command-v1";
 const APP_DIAGNOSTIC_COMMAND_SCHEMA: &str = "tzolkin-app-profile-diagnostic-command-v1";
 const APP_FEEDING_COMMAND_SCHEMA: &str = "tzolkin-app-profile-feeding-diagnostic-command-v1";
+const APP_INVESTMENT_COMMAND_SCHEMA: &str =
+    "tzolkin-app-profile-applied-investment-diagnostic-command-v1";
 const MAX_CONFIG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMMAND_SEEDS: usize = 64;
 const HELP: &str = "tzolkin-numeric-arena corn-first-validation CONFIG.json CONFIG_SHA256 NEW_REPORT.json\n\
@@ -26,10 +28,12 @@ The config is at most16MiB, each deployment at most1MiB, and the create-new repo
 const APP_HELP: &str = "tzolkin-numeric-arena app-validation CONFIG.json CONFIG_SHA256 NEW_REPORT.json\n\
 tzolkin-numeric-arena app-diagnostic CONFIG.json CONFIG_SHA256 NEW_REPORT.json\n\
 tzolkin-numeric-arena app-feeding-diagnostic CONFIG.json CONFIG_SHA256 NEW_REPORT.json\n\
+tzolkin-numeric-arena app-investment-diagnostic CONFIG.json CONFIG_SHA256 NEW_REPORT.json\n\
 Closed camelCase App config: schema=tzolkin-app-profile-validation-command-v1 (or tzolkin-app-profile-diagnostic-command-v1), arena, candidate=foodAlignedV2|monumentAlignedV1|monumentAlignedV2|resourceAlignedV2, reference, opponentPool (one role per absolute seat), diagnosticConsent (absent for Validation, required for diagnostic). A role is {kind:appProfile,profile:...}, {kind:nativeV2}, {kind:cornFirstSetupV2}, {kind:resourceCycleV5}, or {kind:numeric,deployment:{path,bytes,sha256}}. App roles call the actual fixed-weight App chooser in both Setup and Playing; there is no implicit Setup override. Numeric roles use the regular loader/default guard, retain independent per-arm history and receive every actor callback.\n\
 Validation preserves the full exclusions and unique Validation families. Diagnostic consent uses schema=tzolkin-app-development-reanalysis-consent-v1, evidenceSha256, exposedDevelopmentFamilyIds and protectedHoldoutFamilyIds. The exact selected allowlist must already be excluded, any declared additional protected list must be excluded and disjoint, and Test families are always refused. Caller digests bind declarations, not historical authenticity or completeness. Diagnostic is count-neutral exposed Development reanalysis, never fresh Test, training or adoption. Feeding events and actual unfed-worker counts are not collected and remain unknown.\n\
 Both routes keep the finite 3/4p all-seat paired engine, 1..64 seeds, existing byte caps, create-new report rules and external watchdog/exit conventions above. The caller must bind complete exclusions and explicit prior exposure or future reservation before execution.\n";
 const FEEDING_HELP: &str = "The explicit app-feeding-diagnostic sibling requires schema=tzolkin-app-profile-feeding-diagnostic-command-v1 and the same Development consent. It wraps the unchanged diagnostic report with actual Core Feeding receipts, indexed by seed/absolute focal seat/arm and zero-based applied move index. Every completed arm requires all four food days and every player; an arm or later paired-block failure discards the entire block's receipts as null, never zero. Scheduled food day and actual round are separate. Legacy unfedWorkers stays unknown. There are at most8192 events (64 seeds, 4 players, both arms/all focal seats), within the existing32MiB report cap. These output-only penalties do not guide policy selection, grant training/adoption authority or require zero early-food penalties.\n";
+const INVESTMENT_HELP: &str = "The explicit app-investment-diagnostic sibling requires schema=tzolkin-app-profile-applied-investment-diagnostic-command-v1 and the same Development consent. Applied counters are recorded only after successful legal Core moves: paid technology at payment resolution, free choices separately, track increments separately from capped actions, Uxmal3 worker increments (including zero at the cap), Uxmal2 entry separately from actual buys/sells, and Yaxchilan5 net resource changes. Unknown payment/trade origins stay separate. All four actual Feeding snapshots include Agriculture/Extraction/Architecture/Theology levels at that stage. The unchanged ordinary diagnostic report remains nested; arm or paired-block failure discards the sibling receipts. Existing finite games,32MiB output cap and watchdog rules apply; no policy input, training credit, fresh Test or zero-food-loss rule is added.\n";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -245,6 +249,9 @@ fn run_app(args: &[String]) -> Result<i32, String> {
         ("app-feeding-diagnostic", APP_FEEDING_COMMAND_SCHEMA, Some(consent)) => {
             consent.validate_for(&config.arena)?
         }
+        ("app-investment-diagnostic", APP_INVESTMENT_COMMAND_SCHEMA, Some(consent)) => {
+            consent.validate_for(&config.arena)?
+        }
         _ => return Err("App Arena route/schema/diagnostic consent mismatch".into()),
     }
     let output = new_report(Path::new(&args[3]))?;
@@ -261,6 +268,23 @@ fn run_app(args: &[String]) -> Result<i32, String> {
         .map(|role| role.into_opponent(directory, &weights))
         .collect::<Result<Vec<_>, _>>()?;
     let (schema, checksum, planned, completed, failed) = match config.diagnostic_consent {
+        Some(consent) if args[0] == "app-investment-diagnostic" => {
+            let report = numeric::run_app_profile_investment_diagnostic(
+                &config.arena,
+                &consent,
+                config.candidate,
+                reference,
+                pool,
+            )?;
+            report.save_new(&output)?;
+            (
+                report.schema,
+                report.configuration_sha256,
+                report.diagnostic.paired.statistics.planned_games,
+                report.diagnostic.paired.statistics.completed_games,
+                report.diagnostic.paired.statistics.failed_games,
+            )
+        }
         Some(consent) if args[0] == "app-feeding-diagnostic" => {
             let report = numeric::run_app_profile_feeding_diagnostic(
                 &config.arena,
@@ -325,7 +349,12 @@ fn run_app(args: &[String]) -> Result<i32, String> {
 
 fn run(args: &[String]) -> Result<i32, String> {
     match args.first().map(String::as_str) {
-        Some("app-validation" | "app-diagnostic" | "app-feeding-diagnostic") => run_app(args),
+        Some(
+            "app-validation"
+            | "app-diagnostic"
+            | "app-feeding-diagnostic"
+            | "app-investment-diagnostic",
+        ) => run_app(args),
         _ => run_corn_first(args),
     }
 }
@@ -333,7 +362,7 @@ fn run(args: &[String]) -> Result<i32, String> {
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--help"] {
-        print!("{HELP}{APP_HELP}{FEEDING_HELP}");
+        print!("{HELP}{APP_HELP}{FEEDING_HELP}{INVESTMENT_HELP}");
         return;
     }
     match run(&args) {
