@@ -595,10 +595,24 @@ test('retained boundary omits total workers when complete visible geometry is mi
   }
   const anonymous = boundaryFixture();
   anonymous.capture.retainedDomGeometry.push(
-    { id: '', parentId: 'player_board_100' },
-    { id: '', parentId: 'player_board_200' },
+    ...anonymous.capture.playerBoards.map(() => ({
+      id: '',
+      parentId: 'tzolkin-interface',
+      className: 'whiteblock',
+      inlineStyle: null,
+    })),
   );
   assert.equal(projectRetainedBoundary(...anonymous.repin()).provenance.totalWorkersObserved, true);
+  const unowned = structuredClone(anonymous.capture.retainedDomGeometry.at(-1));
+  anonymous.capture.retainedDomGeometry.at(-1).parentId = 'unretained-parent';
+  assert.throws(() => projectRetainedBoundary(...anonymous.repin()), /Unknown anonymous/);
+  anonymous.capture.retainedDomGeometry[anonymous.capture.retainedDomGeometry.length - 1] = unowned;
+  anonymous.capture.retainedDomGeometry.pop();
+  assert.throws(
+    () => projectRetainedBoundary(...anonymous.repin()),
+    /Anonymous boundary row metadata/,
+  );
+  anonymous.capture.retainedDomGeometry.push(unowned);
   anonymous.capture.retainedDomGeometry.at(-1).parentId = 'workers';
   assert.throws(
     () => projectRetainedBoundary(...anonymous.repin()),
@@ -666,6 +680,20 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
     (value) => {
       value.capture.retainedDomGeometry.at(-1).inlineStyle = 'left: 999px;';
     },
+    (value) => {
+      value.capture.retainedDomGeometry.push({
+        ...structuredClone(value.capture.retainedDomGeometry.at(-1)),
+        id: 'ghost',
+      });
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.push({
+        ...structuredClone(value.capture.retainedDomGeometry.at(-1)),
+        id: 'worker_999',
+        parentId: 'unretained-parent',
+        className: '',
+      });
+    },
   ]) {
     const value = boundaryFixture();
     mutate(value);
@@ -685,6 +713,21 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
   });
   split.raw.entry_count++;
   assert.throws(() => projectRetainedBoundary(...split.repin()));
+  for (const tableId of [123, 124]) {
+    const legacy = boundaryFixture(),
+      retained = legacy.repin(),
+      control = JSON.parse(retained[2]),
+      table = bytes({
+        schema: 'tzolkin-bga-public-table-ui-v1',
+        url: `https://boardgamearena.com/table?table=${tableId}`,
+        optionsText: '',
+      });
+    control.table = pin(table);
+    assert.throws(
+      () => projectRetainedBoundary(retained[0], retained[1], bytes(control), table),
+      /Legacy input requires embedded table settings/,
+    );
+  }
 });
 
 test('legacy nested initial panels project only consistent retained state with unknown options', () => {

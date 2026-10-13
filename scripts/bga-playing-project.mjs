@@ -627,6 +627,8 @@ export function projectRetainedBoundary(
   const mechanicalProfile = profile(control.mechanicalProfile);
   observedBasicUnlimitedOptions(raw, table);
   const game = normalizeGame(raw, sha(rawLogBytes), tableBytes);
+  if (tableBytes !== null && game.source.adapter !== 'bga-public-ui-dom-v1')
+    fail('Legacy input requires embedded table settings, not separate table evidence');
   closed(
     capture,
     [
@@ -748,7 +750,8 @@ export function projectRetainedBoundary(
     fail('Incomplete retained boundary roster/view');
   const trees = [board],
     identities = new Map(),
-    displayedPlayers = [];
+    displayedPlayers = [],
+    anonymousRows = [];
   const players = ids.map((id, index) => {
     const item = one(fragments, (item) => item.playerId === id, 'boundary player identity');
     closed(
@@ -785,6 +788,12 @@ export function projectRetainedBoundary(
       }
     unhiddenFragmentNode(panel, owner);
     unhiddenFragmentNode(row, rowRoot);
+    if (
+      !rowRoot.attrs.id &&
+      rowRoot.attrs.class === 'whiteblock' &&
+      rowRoot.attrs.style === undefined
+    )
+      anonymousRows.push(rowRoot);
     const heading = one(
       rowRoot.children.filter(object),
       (node) => node.tag === 'h3',
@@ -883,17 +892,42 @@ export function projectRetainedBoundary(
     if (owner) counts[colors.indexOf(owner.slice(7))]++;
   }
   const geometry = new Map();
+  let anonymousRowMetadata = 0;
   for (const item of list(capture.retainedDomGeometry, 20000, 'boundary geometry')) {
     if (!object(item) || typeof item.id !== 'string')
       fail('Invalid/duplicate boundary geometry identity');
-    // Anonymous panel icons are retained metadata, not an addressable worker.
+    const declaresWorker =
+      item.parentId === 'workers' ||
+      /^worker_[1-9]\d*$/.test(item.id) ||
+      (typeof item.className === 'string' && item.className.split(/\s+/).includes('worker'));
+    // The retained anonymous row wrappers are separately owner-validated above.
+    // Their external parent and rect are metadata, never canvas worker evidence.
     if (item.id === '') {
-      if (item.parentId === 'workers') fail('Unidentified boundary worker geometry');
+      if (declaresWorker) fail('Unidentified boundary worker geometry');
+      if (
+        item.parentId !== 'tzolkin-interface' ||
+        item.className !== 'whiteblock' ||
+        item.inlineStyle != null
+      )
+        fail('Unknown anonymous boundary geometry');
+      anonymousRowMetadata++;
       continue;
     }
     if (geometry.has(item.id)) fail('Invalid/duplicate boundary geometry identity');
+    if (declaresWorker) {
+      const node = placed.find((node) => node.attrs.id === item.id);
+      if (
+        !node ||
+        item.parentId !== 'workers' ||
+        (item.className ?? '') !== (node.attrs.class ?? '') ||
+        (item.inlineStyle ?? '') !== (node.attrs.style ?? '')
+      )
+        fail('Unbound boundary worker geometry');
+    }
     geometry.set(item.id, item);
   }
+  if (anonymousRowMetadata !== 0 && anonymousRowMetadata !== anonymousRows.length)
+    fail('Anonymous boundary row metadata differs from retained owned rows');
   const visibleRect = (node) => {
     const item = geometry.get(node.attrs.id);
     if (!item) return null;
