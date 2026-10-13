@@ -19,6 +19,12 @@ pub enum CurrentMixedRestoreStep<'s> {
         spec: CurrentMixedSegmentSpec,
         tip: CurrentMixedRestoreTip<'s>,
     },
+    /// Caller-declared unavailable words, regenerated after genuine parent restore.
+    SamplingConsumption {
+        spec: CurrentMixedSegmentSpec,
+        consumption: &'s CurrentMixedSamplingConsumptionSpec,
+        tip: CurrentMixedRestoreTip<'s>,
+    },
     /// Explicit Ready-only extension of an established global contract.
     BudgetAmendment {
         spec: CurrentMixedSegmentSpec,
@@ -65,6 +71,7 @@ pub(super) fn check_chain_tips<'s>(
     }
     let tips = std::iter::once(initial).chain(steps.iter().map(|step| match step {
         CurrentMixedRestoreStep::Segment { tip, .. }
+        | CurrentMixedRestoreStep::SamplingConsumption { tip, .. }
         | CurrentMixedRestoreStep::BudgetAmendment { tip, .. }
         | CurrentMixedRestoreStep::SeatRotation { tip, .. }
         | CurrentMixedRestoreStep::GuardedPoolFork { tip, .. } => tip,
@@ -178,6 +185,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 CurrentMixedRestoreStep::Segment { spec, tip } => {
                     session.restore_chain_segment(spec, tip.head_raw, tip.directory)?
                 }
+                CurrentMixedRestoreStep::SamplingConsumption {
+                    spec,
+                    consumption,
+                    tip,
+                } => session.restore_chain_sampling_consumption(spec, consumption, tip)?,
                 CurrentMixedRestoreStep::BudgetAmendment { spec, tip } => {
                     session.restore_chain_budget_amendment(spec, tip.head_raw, tip.directory)?
                 }

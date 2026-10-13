@@ -36,6 +36,10 @@ use std::{
     time::Instant,
 };
 
+#[path = "public_rl_current_mixed_sampling_consumption.rs"]
+mod sampling;
+pub use sampling::CurrentMixedSamplingConsumptionSpec;
+
 #[path = "public_rl_current_mixed_restore.rs"]
 mod restore;
 pub use restore::{CurrentMixedRestoreStep, CurrentMixedRestoreTip};
@@ -701,6 +705,7 @@ struct Progress {
     prefix: [u64; 2],
     next: u64,
     consumed: BTreeSet<String>,
+    external_unavailable: BTreeSet<String>,
     attempts: u64,
     successful: u64,
     imported: u64,
@@ -777,6 +782,7 @@ impl Progress {
             prefix,
             next,
             consumed: consumed.clone(),
+            external_unavailable: BTreeSet::new(),
             attempts: 0,
             successful: 0,
             imported: parent.imported_update_count(),
@@ -834,6 +840,7 @@ impl Progress {
                     || binding.prefix != self.prefix
                     || binding.next != self.next
                     || binding.consumed.iter().cloned().collect::<BTreeSet<_>>() != self.consumed
+                    || binding.external_families() != self.external_unavailable
                 {
                     return fail();
                 }
@@ -855,7 +862,8 @@ impl Progress {
                     || self
                         .consumed
                         .len()
-                        .checked_add(4)
+                        .checked_add(self.external_unavailable.len())
+                        .and_then(|n| n.checked_add(4))
                         .is_none_or(|n| n > s.max_families)
                     || self.next.checked_add(4).is_none()
                 {
@@ -877,6 +885,7 @@ impl Progress {
                         || c.episode_ordinal != format!("{:016x}", self.next + i as u64)
                         || seed_family_id(c.environment_seed) != r.families[i]
                         || self.consumed.contains(&r.families[i])
+                        || self.external_unavailable.contains(&r.families[i])
                         || r.families[..i].contains(&r.families[i])
                         || split_for_family(&r.families[i])? != DatasetSplit::Train
                     {
@@ -1350,6 +1359,8 @@ pub struct CurrentMixedSessionStatus {
     storage_usage: Option<StorageUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     segment_usage: Option<segment::SegmentUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_unavailable_family_count: Option<usize>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1536,6 +1547,10 @@ impl<'a> CurrentMixedTrainingSession<'a> {
     pub fn reserved_families(&self) -> &BTreeSet<String> {
         &self.progress.consumed
     }
+    /// Caller-declared unavailable families, not native executions or update credit.
+    pub fn external_unavailable_families(&self) -> &BTreeSet<String> {
+        &self.progress.external_unavailable
+    }
     /// Resolved learner-own totals across this session's genuine journal chain.
     /// Imported original training and unresolved counts are not credited. Semantic
     /// restore rebuilds the totals from predecessor reducers; reading them performs
@@ -1597,6 +1612,8 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     temporary_reserve_bytes: storage.max_temporary_bytes,
                 }),
             segment_usage: self.segment_usage(),
+            external_unavailable_family_count: (!self.progress.external_unavailable.is_empty())
+                .then_some(self.progress.external_unavailable.len()),
         }
     }
     fn batch(&self, attempt: u64) -> PathBuf {
@@ -1843,6 +1860,13 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         }
         let handle = self.handle()?;
         let configs = spec.inner.configs()?;
+        if configs.iter().any(|c| {
+            self.progress
+                .external_unavailable
+                .contains(&seed_family_id(c.environment_seed()))
+        }) {
+            return Err("Current mixed external-unavailable family cannot be collected".into());
+        }
         let rosters = self.rosters_with_profile(spec, profile)?;
         let headers = configs
             .iter()
