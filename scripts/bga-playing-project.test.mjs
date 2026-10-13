@@ -736,7 +736,14 @@ function boundaryCellMarkerFixture(options = {}) {
 test('retained boundary binds original food/rotation scope and separates available from total workers', () => {
   for (const split of [false, true]) {
     const value = boundaryFixture({ split }),
-      projected = projectRetainedBoundary(...value.repin());
+      scores = [7, -2, 13, 0];
+    value.capture.playerBoards.forEach((player, index) => {
+      player.boardHtml = player.boardHtml.replace(
+        element('span', `player_score_${player.playerId}`, '0'),
+        element('span', `player_score_${player.playerId}`, String(scores[index])),
+      );
+    });
+    const projected = projectRetainedBoundary(...value.repin());
     assert.equal(projected.witness.actionId, split ? 9 : 8);
     assert.equal(projected.witness.expected.round, split ? 22 : 9);
     assert.deepEqual(projected.provenance.sourceActionIds, split ? [8, 9] : [8]);
@@ -749,6 +756,15 @@ test('retained boundary binds original food/rotation scope and separates availab
       projected.provenance.displayedPlayers.map((player) => player.availableWorkers),
       [1, 2, 3, 3],
     );
+    assert.deepEqual(
+      projected.witness.expected.players.map((player) => player.score),
+      scores,
+    );
+    assert.deepEqual(
+      projected.provenance.displayedPlayers.map((player) => player.scoreDisplay),
+      scores,
+    );
+    assert.equal(projected.provenance.omitted.includes('exact scores'), false);
     assert.equal(projected.provenance.completeSourceBoard, false);
     assert.equal(projected.provenance.humanBcQualified, false);
     assert.equal(projected.provenance.policyTrainingReady, false);
@@ -773,7 +789,7 @@ test('retained boundary binds original food/rotation scope and separates availab
       assert.equal(projected.provenance.completeSourceBoard, false);
       assert.equal(projected.provenance.humanBcQualified, false);
       assert.equal(projected.provenance.omitted.includes('markers'), false);
-      assert.equal(Object.hasOwn(players[0], 'score'), false);
+      assert.equal(Object.hasOwn(players[0], 'score'), !options.terminal);
       assert.match(projected.provenance.markerObservation.interpretation, /consistency only/);
     }
   }
@@ -878,6 +894,7 @@ test('retained boundary keeps terminal day and integer score displays out of exa
   assert.equal(projected.witness.expected.phase, 'finished');
   assert.equal(Object.hasOwn(projected.witness.expected, 'round'), false);
   assert.ok(projected.witness.expected.players.every((player) => !Object.hasOwn(player, 'score')));
+  assert.equal(projected.provenance.omitted.includes('exact scores'), true);
   assert.equal(Object.hasOwn(projected, 'terminalCheckpoint'), false);
   assert.equal(projected.provenance.completeNativeReplayQualified, false);
   const outsideDom = boundaryFixture({ terminal: true });
@@ -971,24 +988,28 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
     (value) => {
       value.capture.retainedDomGeometry[0].computedDisplay = 'none';
     },
-    ...['current_round', 'skull_left', 'player_board_100', 'corn_number_player_100'].map(
-      (id) => (value) => {
-        value.capture.retainedDomGeometry.push({
-          id,
-          className: '',
-          inlineStyle: null,
-          parentId:
-            id === 'current_round'
-              ? 'rounds_wrap'
-              : id === 'skull_left'
-                ? 'board'
-                : id === 'corn_number_player_100'
-                  ? 'player_board_100'
-                  : '',
-          computedVisibility: 'hidden',
-        });
-      },
-    ),
+    ...[
+      'current_round',
+      'skull_left',
+      'player_board_100',
+      'corn_number_player_100',
+      'player_score_100',
+    ].map((id) => (value) => {
+      value.capture.retainedDomGeometry.push({
+        id,
+        className: '',
+        inlineStyle: null,
+        parentId:
+          id === 'current_round'
+            ? 'rounds_wrap'
+            : id === 'skull_left'
+              ? 'board'
+              : ['corn_number_player_100', 'player_score_100'].includes(id)
+                ? 'player_board_100'
+                : '',
+        computedVisibility: 'hidden',
+      });
+    }),
     (value) => {
       value.capture.retainedDomGeometry.push({
         id: 'current_round',
