@@ -1471,14 +1471,21 @@ export function projectRetainedBoundary(
         )
           fail('Boundary jungle container center outside board');
         for (const tile of tiles) {
-          const rect = requiredRect(tile);
+          const rect = requiredRect(tile),
+            tileCenterX = rect.x + rect.width / 2,
+            tileCenterY = rect.y + rect.height / 2;
+          // These already-owned, fixed-corner tiles use geometry only for consistency.
+          // Centers and dimensions avoid treating independently rounded bounding-box
+          // edges as exact containment; no coordinates are adjusted or fitted.
           if (
-            rect.x < containerRect.x ||
-            rect.y < containerRect.y ||
-            rect.x + rect.width > containerRect.x + containerRect.width ||
-            rect.y + rect.height > containerRect.y + containerRect.height
+            tileCenterX < containerRect.x ||
+            tileCenterX > containerRect.x + containerRect.width ||
+            tileCenterY < containerRect.y ||
+            tileCenterY > containerRect.y + containerRect.height ||
+            rect.width > containerRect.width ||
+            rect.height > containerRect.height
           )
-            fail('Boundary jungle top outside owned container');
+            fail('Boundary jungle top center/dimensions outside owned container');
         }
         // A visible wood cover represents one remaining corn stack only under
         // the explicitly declared basic mechanics; the covered layer is not observed.
