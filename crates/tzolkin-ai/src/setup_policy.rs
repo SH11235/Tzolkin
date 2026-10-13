@@ -624,13 +624,14 @@ mod tests {
                     weights: weights.clone(),
                 }
             };
-            policy.validate().unwrap();
+            assert!(policy.validate().is_err());
+            policy.validate_historical_restore().unwrap();
             let mut wire = serde_json::to_value(&policy).unwrap();
             wire["policyVersion"] = "unknown-historical-version".into();
             assert!(
                 serde_json::from_value::<SeatPolicy>(wire)
                     .unwrap()
-                    .validate()
+                    .validate_historical_restore()
                     .is_err()
             );
             let mut invalid = weights.clone();
@@ -641,15 +642,35 @@ mod tests {
             policy_version: HeuristicRevision::V1.policy_version().into(),
             weights: weights.clone(),
         };
-        v1.validate().unwrap();
+        assert!(v1.validate().is_err());
+        v1.validate_historical_restore().unwrap();
         let mut wire = serde_json::to_value(&v1).unwrap();
         wire["policyVersion"] = "heuristic-v0".into();
         assert!(
             serde_json::from_value::<SeatPolicy>(wire)
                 .unwrap()
-                .validate()
+                .validate_historical_restore()
                 .is_err()
         );
+        for mut policy in [
+            v1,
+            SeatPolicy::CornFirstSetup {
+                policy_version: LEGACY_POLICY_VERSION.into(),
+                weights: weights.clone(),
+            },
+            SeatPolicy::CornFirstUxmalOpening {
+                policy_version: LEGACY_UXMAL_OPENING_POLICY_VERSION.into(),
+                weights: weights.clone(),
+            },
+        ] {
+            match &mut policy {
+                SeatPolicy::Heuristic { weights, .. }
+                | SeatPolicy::CornFirstSetup { weights, .. }
+                | SeatPolicy::CornFirstUxmalOpening { weights, .. } => weights.worker = f64::NAN,
+                _ => unreachable!(),
+            }
+            assert!(policy.validate_historical_restore().is_err());
+        }
         let mut stale = o;
         stale.observation_key = "stale".into();
         assert!(choose_move_for_revision(&stale, &weights, HeuristicRevision::V1).is_err());

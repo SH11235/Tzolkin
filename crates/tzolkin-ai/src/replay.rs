@@ -163,6 +163,32 @@ pub enum SeatPolicy {
 }
 
 impl SeatPolicy {
+    /// Only saved-plan restoration may use this closed historical vocabulary.
+    /// A recognized description is not an executable policy or owner admission.
+    // The restoration consumer is the following source unit; ordinary source
+    // validators deliberately keep calling `validate` below.
+    #[allow(dead_code)]
+    pub(crate) fn validate_historical_restore(&self) -> Result<(), String> {
+        match self {
+            Self::Heuristic {
+                policy_version,
+                weights,
+            } if policy_version == tzolkin_bot::policy::HeuristicRevision::V1.policy_version() => {
+                weights.validate()
+            }
+            Self::CornFirstSetup {
+                policy_version,
+                weights,
+            } if policy_version == crate::setup_policy::LEGACY_POLICY_VERSION => weights.validate(),
+            Self::CornFirstUxmalOpening {
+                policy_version,
+                weights,
+            } if policy_version == crate::setup_policy::LEGACY_UXMAL_OPENING_POLICY_VERSION => {
+                weights.validate()
+            }
+            _ => self.validate(),
+        }
+    }
     pub(crate) fn is_rl_evaluation(&self) -> bool {
         self.rl_evaluation_policy_version().is_some()
     }
@@ -357,26 +383,15 @@ impl SeatPolicy {
             Self::Heuristic {
                 policy_version,
                 weights,
-            } if policy_version == POLICY_VERSION
-                || policy_version
-                    == tzolkin_bot::policy::HeuristicRevision::V1.policy_version() =>
-            {
-                weights.validate()
-            }
+            } if policy_version == POLICY_VERSION => weights.validate(),
             Self::CornFirstSetup {
                 policy_version,
                 weights,
-            } if policy_version == crate::setup_policy::POLICY_VERSION
-                || policy_version == crate::setup_policy::LEGACY_POLICY_VERSION =>
-            {
-                weights.validate()
-            }
+            } if policy_version == crate::setup_policy::POLICY_VERSION => weights.validate(),
             Self::CornFirstUxmalOpening {
                 policy_version,
                 weights,
-            } if policy_version == crate::setup_policy::UXMAL_OPENING_POLICY_VERSION
-                || policy_version == crate::setup_policy::LEGACY_UXMAL_OPENING_POLICY_VERSION =>
-            {
+            } if policy_version == crate::setup_policy::UXMAL_OPENING_POLICY_VERSION => {
                 weights.validate()
             }
             Self::ResourceCycle { configuration } => configuration.validate(),
