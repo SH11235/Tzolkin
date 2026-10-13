@@ -5,8 +5,7 @@ use serde::Serialize;
 use crate::dataset::{DatasetSplit, split_for_family};
 use crate::kernel::Kernel;
 use crate::public_policy_cohort::ValidatedBcCohort;
-use crate::public_policy_episode::AppliedActorStep;
-use crate::public_policy_update::{OneStepOutcome, hash};
+use crate::public_policy_update::{NumericActorStep, OneStepOutcome, hash};
 use crate::public_rl_artifact::InitializedPublicRlPolicy;
 use crate::public_state_critic::{
     B1, BV, CONTEXT_CONTRACT, CONTEXT_COUNT, CONTEXT_SCHEMA, HIDDEN, PARAMETER_COUNT,
@@ -201,9 +200,9 @@ pub(crate) struct NumericResidualFit {
 
 // The caller admits the whole sealed cohort before this private numeric loop.
 // Contexts and returns remain inseparable from immutable applied actor steps.
-pub(crate) fn fit_applied<'a>(
+pub(crate) fn fit_applied<S: NumericActorStep>(
     parameters: &[f32],
-    steps: impl Iterator<Item = AppliedActorStep<'a>>,
+    steps: impl Iterator<Item = S>,
     callbacks: usize,
     config: &ResidualFitConfig,
 ) -> Result<NumericResidualFit, String> {

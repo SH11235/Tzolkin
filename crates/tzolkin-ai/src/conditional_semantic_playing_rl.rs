@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use tzolkin_core::observation::Observation;
 use tzolkin_inference::policy::NumericPolicyDistribution;
 
+use crate::conditional_human_rl_update::ConditionalNativeExclusions;
 use crate::dataset::DatasetSplit;
 use crate::features::{FeatureEncoder, PUBLIC_FEATURE_SCHEMA, SEMANTIC_PLAYING_FEATURE_SCHEMA};
 use crate::human_initial_wealth::ContentPin;
@@ -154,50 +155,12 @@ pub struct SemanticPlayingRlOwner {
     identity: SemanticPlayingRlIdentity,
 }
 impl SemanticPlayingRlOwner {
-    pub(crate) fn collection_metadata(
-        &self,
-    ) -> (&SemanticPlayingRlIdentity, &BTreeMap<String, DatasetSplit>) {
-        (&self.identity, &self.origin.table_reservations)
-    }
-
-    /// Only the closed collector may borrow this context. The higher-ranked
-    /// scope cannot return an actor/critic borrow or an unchecked public handle.
-    /// Every outcome attempts the postcheck before a result can be accepted.
-    pub(crate) fn with_checked_collection<R>(
-        &self,
-        external_pins: &[ContentPin],
-        run: impl for<'scope> FnOnce(&SemanticCollectionScope<'scope>) -> Result<R, String>,
-    ) -> Result<R, String> {
-        self.with_checked_collection_episode(external_pins, || {
-            let scope = SemanticCollectionScope {
-                actor: &self.actor,
-                _critic: &self.critic,
-                identity: &self.identity,
-                kernel: Kernel::Scalar.resolve()?,
-            };
-            run(&scope)
-        })
-    }
-
-    pub(crate) fn with_checked_collection_episode<R>(
-        &self,
-        external_pins: &[ContentPin],
-        run: impl FnOnce() -> Result<R, String>,
-    ) -> Result<R, String> {
-        let check = || {
-            self.origin.recheck_sources()?;
-            for pin in external_pins {
-                crate::human_policy_dataset::recheck_absolute_pin(pin)?;
-            }
-            Ok::<_, String>(())
-        };
-        check()?;
-        let result = run();
-        match (result, check()) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) => Err(format!("Semantic source postcheck: {error}")),
-            (Err(error), Err(post)) => Err(format!("{error}; semantic source postcheck: {post}")),
+    pub(crate) fn collection_view(&self) -> SemanticOwnerView<'_> {
+        SemanticOwnerView {
+            origin: &self.origin,
+            actor: &self.actor,
+            critic: &self.critic,
+            parent: self.identity.checksum(),
         }
     }
 
@@ -292,17 +255,121 @@ impl SemanticPlayingRlOwner {
     }
 }
 
+/// An owned, private numerical state obtained only by consuming a fresh owner.
+/// It cannot be exposed as that fresh owner after either parameter vector changes.
+pub(crate) struct SemanticTrainingState {
+    origin: SemanticPlayingRlOrigin,
+    actor: PublicPolicyModel,
+    critic: Vec<f32>,
+    root: SemanticPlayingRlIdentity,
+}
+impl SemanticTrainingState {
+    pub(crate) fn from_fresh(owner: SemanticPlayingRlOwner) -> Result<Self, String> {
+        owner.origin.recheck_sources()?;
+        let current = Self {
+            origin: owner.origin,
+            actor: owner.actor,
+            critic: owner.critic,
+            root: owner.identity,
+        };
+        current.origin.recheck_sources()?;
+        Ok(current)
+    }
+    pub(crate) fn root(&self) -> &SemanticPlayingRlIdentity {
+        &self.root
+    }
+    pub(crate) fn actor_parameters(&self) -> &[f32] {
+        self.actor.parameters()
+    }
+    pub(crate) fn critic_parameters(&self) -> &[f32] {
+        &self.critic
+    }
+    pub(crate) fn view<'a>(&'a self, parent: &'a str) -> SemanticOwnerView<'a> {
+        SemanticOwnerView {
+            origin: &self.origin,
+            actor: &self.actor,
+            critic: &self.critic,
+            parent,
+        }
+    }
+    /// All proposal validation and every-outcome source checks precede this move.
+    pub(crate) fn commit(&mut self, actor: PublicPolicyModel, critic: Vec<f32>) {
+        (self.actor, self.critic) = (actor, critic);
+    }
+}
+
+/// Closed borrowed source: only fresh/current sealed owners can construct it.
+/// Neither models nor a caller predictor can construct a numerical scope.
+pub(crate) struct SemanticOwnerView<'a> {
+    origin: &'a SemanticPlayingRlOrigin,
+    actor: &'a PublicPolicyModel,
+    critic: &'a [f32],
+    parent: &'a str,
+}
+impl SemanticOwnerView<'_> {
+    pub(crate) fn metadata(&self) -> (&str, &BTreeMap<String, DatasetSplit>) {
+        (self.parent, &self.origin.table_reservations)
+    }
+    pub(crate) fn with_checked<R>(
+        &self,
+        external: &ConditionalNativeExclusions,
+        pins: &[ContentPin],
+        run: impl for<'scope> FnOnce(&SemanticCollectionScope<'scope>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.with_checked_episode(external, pins, || {
+            let scope = SemanticCollectionScope {
+                actor: self.actor,
+                critic: self.critic,
+                parent: self.parent,
+                kernel: Kernel::Scalar.resolve()?,
+            };
+            run(&scope)
+        })
+    }
+    pub(crate) fn with_checked_episode<R>(
+        &self,
+        external: &ConditionalNativeExclusions,
+        pins: &[ContentPin],
+        run: impl FnOnce() -> Result<R, String>,
+    ) -> Result<R, String> {
+        let check = || {
+            self.origin.recheck_sources()?;
+            // This typed loader admits up to 32MiB. Do not narrow it through
+            // the generic 16MiB metadata-pin rechecker.
+            external.recheck()?;
+            for pin in pins {
+                crate::human_policy_dataset::recheck_absolute_pin(pin)?;
+            }
+            Ok::<_, String>(())
+        };
+        check()?;
+        let result = run();
+        match (result, check()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(format!("Semantic source postcheck: {error}")),
+            (Err(error), Err(post)) => Err(format!("{error}; semantic source postcheck: {post}")),
+        }
+    }
+}
+
 /// No Clone, serialization, public constructor or model getter. Only the
 /// checked owner scope creates it, and scoring performs no filesystem reads.
 pub(crate) struct SemanticCollectionScope<'a> {
     actor: &'a PublicPolicyModel,
-    _critic: &'a [f32],
-    identity: &'a SemanticPlayingRlIdentity,
+    critic: &'a [f32],
+    parent: &'a str,
     kernel: ResolvedKernel,
 }
 impl SemanticCollectionScope<'_> {
-    pub(crate) fn identity(&self) -> &SemanticPlayingRlIdentity {
-        self.identity
+    pub(crate) fn parent_checksum(&self) -> &str {
+        self.parent
+    }
+    pub(crate) fn actor(&self) -> &PublicPolicyModel {
+        self.actor
+    }
+    pub(crate) fn critic(&self) -> &[f32] {
+        self.critic
     }
     pub(crate) fn distribution(
         &self,
@@ -334,13 +401,13 @@ pub(crate) fn with_collection_numeric_fixture<R>(
     };
     let scope = SemanticCollectionScope {
         actor: &prepared.model().model,
-        _critic: &critic,
-        identity: &identity,
+        critic: &critic,
+        parent: identity.checksum(),
         kernel: Kernel::Scalar.resolve()?,
     };
     run(&scope)
 }
-fn parameter_checksum(domain: &[u8], parameters: &[f32]) -> String {
+pub(crate) fn parameter_checksum(domain: &[u8], parameters: &[f32]) -> String {
     let mut hash = Sha256::new();
     hash.update(domain);
     for value in parameters {

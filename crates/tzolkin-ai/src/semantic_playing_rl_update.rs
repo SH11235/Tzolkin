@@ -1,0 +1,825 @@
+//! Recurrent, in-memory whole-four semantic Playing joint updates.
+//! Ownership follows a successfully loaded fresh origin, not a parameter file.
+//! No journal, resume, export, legacy owner conversion or Adam state is admitted.
+use std::collections::BTreeSet;
+
+use crate::conditional_human_rl_update::{ConditionalFrozenPool, ConditionalNativeExclusions};
+use crate::conditional_semantic_playing_rl::{
+    SemanticCollectionScope, SemanticPlayingRlOwner, SemanticTrainingState,
+};
+use crate::human_policy_dataset::ConditionalFeatureProfile;
+use crate::public_model::PublicPolicyModel;
+use crate::public_native::PreparedPublicPolicy;
+use crate::public_policy_baseline::ResidualFitConfig;
+use crate::public_policy_mixed::{SemanticNumericMember, prepare_numeric_timed_for_profile};
+use crate::public_policy_update::{OneStepConfig, Untimed, hash};
+use crate::public_stochastic::SamplingSeed;
+use crate::public_stochastic_native::CollectionLimits;
+use crate::semantic_playing_rl_collection::{
+    AuditedSemanticPlayingCohort, DeclaredSamplingHistory, SemanticCollectionLedger,
+    SemanticPlayingCollectedGame,
+};
+
+pub const UPDATE_VERSION: &str = "semantic-playing-own-sum-quarter-recurrent-scalar-v1";
+
+/// Descriptive, non-deserializable identity of this session's current state.
+/// Counts belong only to complete admitted updates from its own fresh root.
+#[derive(Clone, Debug)]
+pub struct SemanticPlayingCurrentIdentity {
+    root: String,
+    previous: String,
+    actor: String,
+    critic: String,
+    updates: u64,
+    credit: u64,
+    attempts: u64,
+    next: u64,
+    checksum: String,
+}
+impl SemanticPlayingCurrentIdentity {
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+    pub fn root_checksum(&self) -> &str {
+        &self.root
+    }
+    pub fn immediate_parent_checksum(&self) -> &str {
+        &self.previous
+    }
+    pub fn actor_checksum(&self) -> &str {
+        &self.actor
+    }
+    pub fn critic_checksum(&self) -> &str {
+        &self.critic
+    }
+    pub fn completed_updates(&self) -> u64 {
+        self.updates
+    }
+    pub fn credited_playing_decisions(&self) -> u64 {
+        self.credit
+    }
+    pub fn attempted_whole_four(&self) -> u64 {
+        self.attempts
+    }
+    pub fn next_episode_ordinal(&self) -> u64 {
+        self.next
+    }
+    pub fn policy_version(&self) -> &'static str {
+        UPDATE_VERSION
+    }
+    pub fn feature_schema(&self) -> u32 {
+        crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA
+    }
+    pub fn critic_feature_schema(&self) -> u32 {
+        crate::features::PUBLIC_FEATURE_SCHEMA
+    }
+    pub fn source_authenticated(&self) -> bool {
+        false
+    }
+    pub fn source_qualified(&self) -> bool {
+        false
+    }
+    pub fn verified_native_policy(&self) -> bool {
+        false
+    }
+}
+
+/// A closed outcome, not a checkpoint or a constructor for an owner.
+#[derive(Debug)]
+pub struct SemanticPlayingJointReport {
+    parent: String,
+    next: String,
+    cohort: String,
+    families: [String; 4],
+    counts: [usize; 3],
+    changes: [usize; 2],
+    attempts: usize,
+    next_ordinal: u64,
+    credit: u64,
+    residual_loss: f64,
+    checksum: String,
+}
+impl SemanticPlayingJointReport {
+    pub fn parent_checksum(&self) -> &str {
+        &self.parent
+    }
+    pub fn next_identity_checksum(&self) -> &str {
+        &self.next
+    }
+    pub fn cohort_checksum(&self) -> &str {
+        &self.cohort
+    }
+    pub fn families(&self) -> &[String; 4] {
+        &self.families
+    }
+    /// Playing callbacks, full legal candidate rows, singleton callbacks.
+    pub fn counts(&self) -> [usize; 3] {
+        self.counts
+    }
+    pub fn changed_parameters(&self) -> [usize; 2] {
+        self.changes
+    }
+    pub fn updated(&self) -> bool {
+        self.changes != [0, 0]
+    }
+    pub fn attempted_whole_four(&self) -> usize {
+        self.attempts
+    }
+    pub fn next_episode_ordinal(&self) -> u64 {
+        self.next_ordinal
+    }
+    pub fn credited_playing_decisions(&self) -> u64 {
+        self.credit
+    }
+    pub fn mean_raw_residual_mse(&self) -> f64 {
+        self.residual_loss
+    }
+    pub fn checksum(&self) -> &str {
+        &self.checksum
+    }
+}
+
+/// One fresh root, a recurrent current state and one persistent allocation ledger.
+/// All source checks and both proposals finish before either parameter is moved.
+/// NoChange stops further attempts while retaining all family/stream burns.
+pub struct SemanticPlayingJointSession<'a> {
+    state: SemanticTrainingState,
+    identity: SemanticPlayingCurrentIdentity,
+    ledger: SemanticCollectionLedger<'a>,
+    actor_config: OneStepConfig,
+    critic_config: ResidualFitConfig,
+}
+impl<'a> SemanticPlayingJointSession<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_fresh(
+        owner: SemanticPlayingRlOwner,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+        actor_config: OneStepConfig,
+        critic_config: ResidualFitConfig,
+    ) -> Result<Self, String> {
+        actor_config.validate()?;
+        critic_config.check_callbacks(1)?;
+        let state = SemanticTrainingState::from_fresh(owner)?;
+        let ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
+        let root = state.root().checksum().to_string();
+        let identity = ledger.with_checked(&state.view(&root), |scope| {
+            make_identity(
+                &root,
+                &root,
+                scope.actor().parameters(),
+                scope.critic(),
+                0,
+                0,
+                0,
+                first,
+                "fresh-root",
+                &actor_config,
+                &critic_config,
+            )
+        })?;
+        Ok(Self {
+            state,
+            identity,
+            ledger,
+            actor_config,
+            critic_config,
+        })
+    }
+    pub fn identity(&self) -> Result<&SemanticPlayingCurrentIdentity, String> {
+        self.ledger
+            .recheck(&self.state.view(self.identity.checksum()))?;
+        Ok(&self.identity)
+    }
+    /// Numeric observations only; these slices cannot reconstruct this owner.
+    pub fn actor_parameters(&self) -> Result<&[f32], String> {
+        self.ledger
+            .recheck(&self.state.view(self.identity.checksum()))?;
+        Ok(self.state.actor_parameters())
+    }
+    pub fn critic_parameters(&self) -> Result<&[f32], String> {
+        self.ledger
+            .recheck(&self.state.view(self.identity.checksum()))?;
+        Ok(self.state.critic_parameters())
+    }
+    pub fn attempts(&self) -> usize {
+        self.ledger.attempts()
+    }
+    pub fn next_episode_ordinal(&self) -> u64 {
+        self.ledger.next_episode_ordinal()
+    }
+    pub fn consumed_families(&self) -> &BTreeSet<String> {
+        self.ledger.consumed_families()
+    }
+    pub fn consumed_actor_streams(&self) -> usize {
+        self.ledger.consumed_actor_streams()
+    }
+    pub fn stopped(&self) -> bool {
+        self.ledger.stopped()
+    }
+    pub fn failed_game(&self) -> Option<&SemanticPlayingCollectedGame> {
+        self.ledger.failed_game()
+    }
+
+    pub fn collect_and_update_whole_four(
+        &mut self,
+        seeds: [u32; 4],
+        pool: &ConditionalFrozenPool,
+        prepared_opponent: Option<&PreparedPublicPolicy>,
+        limits: CollectionLimits,
+    ) -> Result<SemanticPlayingJointReport, String> {
+        self.check_headroom(limits)?;
+        let attempt = self
+            .ledger
+            .attempts()
+            .checked_add(1)
+            .ok_or("Semantic attempt overflow")?;
+        let proposal = self.ledger.collect_whole_four_using(
+            &self.state.view(self.identity.checksum()),
+            seeds,
+            pool,
+            prepared_opponent,
+            limits,
+            |scope, cohort| {
+                prepare(
+                    scope,
+                    &self.identity,
+                    &cohort,
+                    &self.actor_config,
+                    &self.critic_config,
+                    attempt,
+                )
+            },
+        )?;
+        let result = self.admit(proposal);
+        if result.is_err() {
+            self.ledger.stop();
+        }
+        result
+    }
+    fn check_headroom(&self, limits: CollectionLimits) -> Result<(), String> {
+        let rows = limits
+            .max_candidate_rows()
+            .checked_mul(4)
+            .ok_or("Semantic joint row headroom overflow")?;
+        let callbacks = limits
+            .max_callbacks()
+            .checked_mul(4)
+            .ok_or("Semantic joint callback headroom overflow")?;
+        if rows > self.actor_config.max_candidate_rows() {
+            return Err("Semantic whole-four prospective rows exceed numerical cap".into());
+        }
+        self.critic_config.check_callbacks(callbacks)
+    }
+    fn admit(&mut self, proposal: JointProposal) -> Result<SemanticPlayingJointReport, String> {
+        if proposal.report.parent != self.identity.checksum()
+            || proposal
+                .report
+                .families
+                .iter()
+                .any(|f| !self.ledger.consumed_families().contains(f))
+            || proposal.identity.previous != self.identity.checksum()
+            || proposal.identity.attempts != self.ledger.attempts() as u64
+            || proposal.identity.next != self.ledger.next_episode_ordinal()
+        {
+            self.ledger.stop();
+            return Err("Semantic joint proposal differs from the current reserved parent".into());
+        }
+        // No proposal can escape the source-postchecked collection continuation.
+        // Final metadata is fallible and must precede the single state commit.
+        let mut report = proposal.report;
+        report.attempts = self.ledger.attempts();
+        report.next_ordinal = self.ledger.next_episode_ordinal();
+        report.next = proposal.identity.checksum().into();
+        report.checksum = hash(
+            b"semantic-playing-joint-report-v1\0",
+            &(
+                (
+                    &report.parent,
+                    &report.next,
+                    &report.cohort,
+                    &report.families,
+                ),
+                (
+                    report.counts,
+                    report.changes,
+                    report.attempts,
+                    report.next_ordinal,
+                    report.credit,
+                ),
+                report.residual_loss,
+            ),
+        )?;
+        self.ledger
+            .recheck(&self.state.view(self.identity.checksum()))?;
+        if let Some((actor, critic)) = proposal.parameters {
+            self.state.commit(actor, critic);
+        } else {
+            self.ledger.stop();
+        }
+        self.identity = proposal.identity;
+        Ok(report)
+    }
+}
+
+struct JointProposal {
+    identity: SemanticPlayingCurrentIdentity,
+    parameters: Option<(PublicPolicyModel, Vec<f32>)>,
+    report: SemanticPlayingJointReport,
+}
+fn prepare(
+    scope: &SemanticCollectionScope<'_>,
+    parent: &SemanticPlayingCurrentIdentity,
+    cohort: &AuditedSemanticPlayingCohort,
+    actor_config: &OneStepConfig,
+    critic_config: &ResidualFitConfig,
+    attempt: usize,
+) -> Result<JointProposal, String> {
+    if scope.parent_checksum() != parent.checksum() || cohort.parent_checksum() != parent.checksum()
+    {
+        return Err("Semantic joint numerical parent mismatch".into());
+    }
+    let episodes = cohort.episodes();
+    if episodes
+        .iter()
+        .enumerate()
+        .any(|(i, e)| e.config().players() != if i < 2 { 3 } else { 4 })
+    {
+        return Err("Semantic joint requires the exact whole-four 3,3,4,4 order".into());
+    }
+    let members = episodes
+        .iter()
+        .map(|episode| {
+            let steps = (0..episode.playing_steps())
+                .map(|i| {
+                    episode
+                        .step(i)
+                        .ok_or("Semantic sealed numerical step missing".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let learner = steps
+                .first()
+                .ok_or("Semantic joint has no learner Playing steps")?
+                .actor();
+            Ok(SemanticNumericMember {
+                learner,
+                players: episode.config().players(),
+                coefficient: 0.25,
+                steps,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let members = members
+        .try_into()
+        .map_err(|_| "Semantic numeric whole-four shape")?;
+    let counts = cohort.numeric_counts()?;
+    let (_, actor, critic) = prepare_numeric_timed_for_profile(
+        ConditionalFeatureProfile::SemanticPlaying4,
+        scope.actor(),
+        scope.critic(),
+        &members,
+        counts,
+        actor_config,
+        critic_config,
+        &mut Untimed,
+    )?;
+    let changes = [actor.numeric.changed_parameters, critic.changed_parameters];
+    let updated = changes != [0, 0];
+    let credit = if updated { counts[0] as u64 } else { 0 };
+    let updates = parent
+        .updates
+        .checked_add(u64::from(updated))
+        .ok_or("Semantic update count overflow")?;
+    let total_credit = parent
+        .credit
+        .checked_add(credit)
+        .ok_or("Semantic Playing credit overflow")?;
+    let cohort_checksum = cohort.seal_checksum()?;
+    let next_ordinal = episodes[3]
+        .config()
+        .sampling_identity()
+        .episode_ordinal()
+        .checked_add(1)
+        .ok_or("Semantic next ordinal overflow")?;
+    let identity = make_identity(
+        &parent.root,
+        parent.checksum(),
+        &actor.parameters,
+        &critic.parameters,
+        updates,
+        total_credit,
+        attempt as u64,
+        next_ordinal,
+        &cohort_checksum,
+        actor_config,
+        critic_config,
+    )?;
+    let report = SemanticPlayingJointReport {
+        parent: parent.checksum().into(),
+        next: String::new(),
+        cohort: cohort_checksum,
+        families: cohort.families().clone(),
+        counts,
+        changes,
+        attempts: 0,
+        next_ordinal: 0,
+        credit,
+        residual_loss: critic.mean_loss,
+        checksum: String::new(),
+    };
+    let parameters = if updated {
+        let model = PublicPolicyModel {
+            parameters: actor.parameters,
+        };
+        model.validate()?;
+        Some((model, critic.parameters))
+    } else {
+        None
+    };
+    Ok(JointProposal {
+        identity,
+        parameters,
+        report,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_identity(
+    root: &str,
+    previous: &str,
+    actor: &[f32],
+    critic: &[f32],
+    updates: u64,
+    credit: u64,
+    attempts: u64,
+    next: u64,
+    cohort: &str,
+    actor_config: &OneStepConfig,
+    critic_config: &ResidualFitConfig,
+) -> Result<SemanticPlayingCurrentIdentity, String> {
+    let actor = crate::conditional_semantic_playing_rl::parameter_checksum(
+        b"semantic-current-actor-bits-v1\0",
+        actor,
+    );
+    let critic = crate::conditional_semantic_playing_rl::parameter_checksum(
+        b"semantic-current-critic-bits-v1\0",
+        critic,
+    );
+    let checksum = hash(
+        b"semantic-playing-current-owned-identity-v1\0",
+        &(
+            (
+                UPDATE_VERSION,
+                crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA,
+                crate::features::PUBLIC_FEATURE_SCHEMA,
+                crate::public_state_critic::CONTEXT_CONTRACT,
+            ),
+            (
+                root, previous, &actor, &critic, updates, credit, attempts, next, cohort,
+            ),
+            (
+                actor_config,
+                critic_config,
+                crate::semantic_playing_rl_collection::TARGET_CONTRACT,
+                "scalar",
+                false,
+                false,
+            ),
+            (
+                crate::public_policy_likelihood::LIKELIHOOD_VERSION,
+                crate::public_policy_likelihood::CORRECTION_VERSION,
+                crate::public_policy_pullback::PULLBACK_VERSION,
+                crate::public_policy_baseline::FIT_VERSION,
+                crate::semantic_playing_rl_collection::SAMPLING_VERSION,
+                crate::public_stochastic::RNG_VERSION,
+            ),
+        ),
+    )?;
+    Ok(SemanticPlayingCurrentIdentity {
+        root: root.into(),
+        previous: previous.into(),
+        actor,
+        critic,
+        updates,
+        credit,
+        attempts,
+        next,
+        checksum,
+    })
+}
+
+/// Extends the existing loader/numeric fixture, with no full-game test added.
+#[cfg(test)]
+pub(crate) fn joint_fixture() {
+    use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
+    use crate::human_initial_wealth::ContentPin;
+    use crate::model::digest;
+    use crate::policy::HeuristicWeights;
+    use serde_json::json;
+    use std::{cell::Cell, fs};
+    mod temp_root {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/temp_root.rs"
+        ));
+    }
+    struct Files(std::path::PathBuf);
+    impl Drop for Files {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let files = Files(temp_root::create("semantic-joint-original-fixture").unwrap());
+    let prepared = loaded_fixture(&files.0);
+    let root_owner = SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap();
+    let fresh = root_owner.identity().unwrap().clone();
+    let excluded = seed_family_id(42);
+    let raw = serde_json::to_vec(
+        &json!({"schema":"tzolkin-conditional-native-exclusions-v1","families":[excluded]}),
+    )
+    .unwrap();
+    let path = files.0.join("external.json");
+    fs::write(&path, &raw).unwrap();
+    let pin = ContentPin {
+        path: path.to_str().unwrap().into(),
+        bytes: raw.len() as u64,
+        sha256: digest(&raw),
+    };
+    let external = ConditionalNativeExclusions::load(
+        &path,
+        &pin,
+        1,
+        &digest(format!("{excluded}\n").as_bytes()),
+    )
+    .unwrap();
+    let history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
+    let mut session = SemanticPlayingJointSession::from_fresh(
+        root_owner,
+        &external,
+        &history,
+        SamplingSeed::new(17),
+        100,
+        0,
+        OneStepConfig::default(),
+        ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fresh.completed_updates(), 0);
+    assert_eq!(session.identity().unwrap().completed_updates(), 0);
+    let mut seeds = (0..100).filter(|s| {
+        *s != 42 && split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Train
+    });
+    let opponent = json!({"kind":"heuristic"});
+    let pool = ConditionalFrozenPool::from_json(&serde_json::to_vec(&json!({
+        "schema":"tzolkin-conditional-human-mixed-frozen-pool-v1", "weights":HeuristicWeights::default(),
+        "rosters":[[null,opponent,opponent],[null,opponent,opponent],
+            [null,opponent,opponent,opponent],[null,opponent,opponent,opponent]]
+    })).unwrap()).unwrap();
+    let limits = CollectionLimits::new(64, 65536, 8 * 1024 * 1024, 1024 * 1024).unwrap();
+    assert!(session.check_headroom(CollectionLimits::default()).is_err());
+    assert_eq!(
+        (session.attempts(), session.consumed_actor_streams()),
+        (0, 0)
+    );
+    let mut credit = 0;
+    for update in 1..=2 {
+        let families = std::array::from_fn(|_| seeds.next().unwrap());
+        let previous = session.identity().unwrap().checksum().to_string();
+        let proposal = session
+            .ledger
+            .collect_fixture_using(
+                &session.state.view(&previous),
+                families,
+                &pool,
+                limits,
+                |scope, cohort| {
+                    assert_eq!(cohort.parent_checksum(), previous);
+                    assert!(
+                        cohort
+                            .episodes()
+                            .iter()
+                            .all(|e| e.learner_setup_choices() == 0)
+                    );
+                    prepare(
+                        scope,
+                        &session.identity,
+                        &cohort,
+                        &session.actor_config,
+                        &session.critic_config,
+                        update,
+                    )
+                },
+                |config| {
+                    let mut state = crate::conditional_human_rl_update::tests::terminal_start(
+                        config.players(),
+                        config.environment_seed(),
+                    );
+                    state.turn.mode = tzolkin_core::TurnMode::None;
+                    state.turn.count = 0;
+                    Ok(state)
+                },
+            )
+            .unwrap();
+        let report = session.admit(proposal).unwrap();
+        assert!(report.updated());
+        assert_eq!(report.parent_checksum(), previous);
+        assert!(report.changed_parameters()[0] > 0);
+        assert!(report.changed_parameters()[1] > 0);
+        credit += report.counts()[0] as u64;
+        let current = session.identity().unwrap();
+        assert_eq!(current.completed_updates(), update as u64);
+        assert_eq!(current.credited_playing_decisions(), credit);
+        assert_eq!(current.root_checksum(), fresh.checksum());
+        assert_eq!(current.immediate_parent_checksum(), previous);
+        assert_eq!(session.next_episode_ordinal(), 100 + 4 * update as u64);
+        assert_eq!(session.consumed_actor_streams(), 14 * update);
+        assert_eq!(session.consumed_families().len(), 4 * update);
+    }
+    // A raw-byte-only mutation after BOTH numerical proposals still drops the
+    // whole result. No actor/critic/current identity mutation can be admitted.
+    let before = session.identity.clone();
+    let actor = session.state.actor_parameters().to_vec();
+    let critic = session.state.critic_parameters().to_vec();
+    let checkpoint_path = prepared.loaded_semantic_playing_sources().unwrap()[0]
+        .path
+        .clone();
+    let checkpoint = fs::read(&checkpoint_path).unwrap();
+    let entered = Cell::new(false);
+    let result = session.ledger.collect_fixture_using(
+        &session.state.view(before.checksum()),
+        std::array::from_fn(|_| seeds.next().unwrap()),
+        &pool,
+        limits,
+        |scope, cohort| {
+            let proposed = prepare(
+                scope,
+                &before,
+                &cohort,
+                &session.actor_config,
+                &session.critic_config,
+                3,
+            )?;
+            entered.set(true);
+            fs::write(&checkpoint_path, [checkpoint.as_slice(), b" "].concat()).unwrap();
+            Ok(proposed)
+        },
+        |config| {
+            Ok(crate::conditional_human_rl_update::tests::terminal_start(
+                config.players(),
+                config.environment_seed(),
+            ))
+        },
+    );
+    assert!(entered.get() && result.is_err());
+    fs::write(&checkpoint_path, checkpoint).unwrap();
+    assert_eq!(session.identity().unwrap().checksum(), before.checksum());
+    assert_eq!(session.state.actor_parameters(), actor);
+    assert_eq!(session.state.critic_parameters(), critic);
+    assert!(session.stopped());
+    assert_eq!(
+        (
+            session.attempts(),
+            session.next_episode_ordinal(),
+            session.consumed_actor_streams()
+        ),
+        (3, 112, 42)
+    );
+}
+
+/// Two one-decision synthetic original records exercise the ACTUAL schema-4
+/// dataset/checkpoint loader. They are not retained human games or source proof.
+#[cfg(test)]
+fn loaded_fixture(
+    root: &std::path::Path,
+) -> crate::human_policy_training::PreparedConditionalHumanPolicy {
+    use crate::human_policy_dataset::{CAPPED_EXTRACTION_LABEL_SCOPE, INPUT_SCHEMA_V8};
+    use crate::human_policy_training::{
+        PreparedConditionalHumanPolicy, SEMANTIC_PLAYING_COLLECTION_SCHEMA,
+        train_semantic_playing_collection_manifest,
+    };
+    use serde_json::{Value, json};
+    use std::fs;
+    use tzolkin_core::observation::{TypedAction, observe};
+    use tzolkin_core::{Phase, apply_move, create_game};
+    fn write(dir: &std::path::Path, name: &str, value: &Value) -> Value {
+        let bytes = serde_json::to_vec(value).unwrap();
+        fs::write(dir.join(name), &bytes).unwrap();
+        json!({"path":name,"bytes":bytes.len(),"sha256":crate::model::digest(&bytes)})
+    }
+    let mut state = create_game(vec!["P0".into(), "P1".into(), "P2".into()], 42, false).unwrap();
+    while state.phase == Phase::Setup {
+        let observation = observe(&state, state.current_player).unwrap();
+        state = apply_move(&state, observation.legal_actions[0].r#move.clone()).unwrap();
+    }
+    let observation = observe(&state, state.current_player).unwrap();
+    let row = observation
+        .legal_actions
+        .iter()
+        .find(|a| {
+            matches!(
+                a.action,
+                TypedAction::Place {
+                    discount: false,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let TypedAction::Place {
+        gear, corn_cost, ..
+    } = row.action
+    else {
+        unreachable!()
+    };
+    let gear = match gear {
+        tzolkin_core::GearId::Palenque => "Palenque",
+        tzolkin_core::GearId::Yaxchilan => "Yaxchilan",
+        tzolkin_core::GearId::Tikal => "Tikal",
+        tzolkin_core::GearId::Uxmal => "Uxmal",
+        tzolkin_core::GearId::ChichenItza => "Chichen Itza",
+    };
+    let caption = format!(
+        "P{}は{gear}の歯車に{corn_cost} を支払ってワーカーを置いた",
+        state.current_player
+    );
+    let mut inputs = Vec::new();
+    for table in ["123", "124"] {
+        let dir = root.join(table);
+        fs::create_dir(&dir).unwrap();
+        let url = format!("https://boardgamearena.com/gamereview?table={table}");
+        let source = write(
+            &dir,
+            "raw.json",
+            &json!({"schema_version":"1.0","source_type":"public_ui_visible_log",
+            "export_scope":"all_observed_log_entries","table_id":table,"source_url":url,"entry_count":1,
+            "metadata":{"table_id":table,"players":[{"text":"P0","url":"https://boardgamearena.com/player?id=101"},
+                {"text":"P1","url":"https://boardgamearena.com/player?id=102"},{"text":"P2","url":"https://boardgamearena.com/player?id=103"}]},
+            "entries":[{"action_id":10,"timestamp_display":"12:00","raw_text":caption}],
+            "dom_entries":[{"action_id":10,"timestamp_display":"12:00","messages":[{"raw_text":caption}]}]}),
+        );
+        let record = write(
+            &dir,
+            "record.json",
+            &json!({"schema":tzolkin_core::public_replay::PUBLIC_REPLAY_SCHEMA,
+            "rulesVersion":tzolkin_core::public_replay::PUBLIC_RULES_VERSION,"catalogHash":tzolkin_core::public_replay::public_catalog_hash(),
+            "market":"unlimited","source":{"reference":url,"actionIds":[]},
+            "initial":tzolkin_core::public_replay::PublicState::from_game_state(&state).unwrap(),
+            "initialCheckpoint":null,"steps":[{"actor":state.current_player,"move":row.r#move,
+                "sourceActionIds":[10],"refills":{},"checkpoint":null}],"terminalCheckpoint":null,"terminalDisplayCheckpoint":null}),
+        );
+        let audit = write(
+            &dir,
+            "audit.json",
+            &json!({"tableId":table,"sourceSha256":source["sha256"],
+            "conditionalMechanicalProfile":{"schema":"tzolkin-bga-declared-mechanical-profile-v1","rules":"basic","market":"unlimited","sourceOptions":"unknown"},
+            "observedOptions":{"tribes":null,"prophecies":null,"additionalBuildings":null,"quickActions":null},
+            "audit":[{"step":1,"actionId":10,"actor":state.current_player,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}]}),
+        );
+        let nominations = write(
+            &dir,
+            "nominations.json",
+            &json!({"schema":"tzolkin-human-player-nomination-v1",
+            "basis":"userNominatedHistoricalArenaTop5","playerIds":["101","102","103"]}),
+        );
+        let reservations = write(
+            &dir,
+            "reservations.json",
+            &json!({"schema":"tzolkin-human-source-table-reservations-v1",
+            "entries":[{"tableId":"123","split":"train","basis":"synthetic fixture"},
+                {"tableId":"124","split":"validation","basis":"synthetic fixture"},
+                {"tableId":"125","split":"test","basis":"unloaded synthetic fixture"}]}),
+        );
+        let manifest = write(
+            &dir,
+            "manifest.json",
+            &json!({"schema":INPUT_SCHEMA_V8,"basis":"ConditionalBasicHumanPolicy",
+            "featureProfile":"semanticPlaying4","labelScope":CAPPED_EXTRACTION_LABEL_SCOPE,"tableId":table,
+            "observedOptions":{"tribes":null,"prophecies":null,"additionalBuildings":null,"quickActions":null},
+            "record":record,"sourceLog":source,"decoderAudit":audit,"nominations":nominations,
+            "reservations":reservations,"reconstructionEvidence":[]}),
+        );
+        inputs.push(json!({"manifestPath":dir.join("manifest.json").to_str().unwrap(),"manifestSha256":manifest["sha256"],
+            "nominationsSha256":nominations["sha256"],"reservationsSha256":reservations["sha256"]}));
+    }
+    let collection = root.join("collection.json");
+    fs::write(
+        &collection,
+        serde_json::to_vec(&json!({"schema":SEMANTIC_PLAYING_COLLECTION_SCHEMA,
+        "config":{"epochs":1,"batchSize":1,"learningRate":0.001,"seed":7},"datasets":inputs}))
+        .unwrap(),
+    )
+    .unwrap();
+    let trained = train_semantic_playing_collection_manifest(&collection).unwrap();
+    let output = root.join("checkpoint");
+    trained
+        .save_new_semantic_playing_directory(&output)
+        .unwrap();
+    PreparedConditionalHumanPolicy::load_semantic_playing(
+        &output.join("checkpoint.json"),
+        &collection,
+    )
+    .unwrap()
+}

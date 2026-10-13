@@ -25,6 +25,107 @@ use crate::public_stochastic::{
 };
 use crate::public_stochastic_native::numerical_target;
 use crate::replay::{RULES_BASELINE, RULES_VERSION, SeatPolicy, catalog_hash};
+use crate::semantic_playing_rl_collection::SemanticPlayingActorStep;
+
+mod numeric_actor_step_sealed {
+    pub trait Sealed {}
+}
+
+/// Numeric access to either sealed legacy applied steps or freshly audited
+/// semantic Playing steps. This never constructs or relabels either record.
+pub(crate) trait NumericActorStep: numeric_actor_step_sealed::Sealed {
+    fn observation(&self) -> &tzolkin_core::observation::Observation;
+    fn actor(&self) -> usize;
+    fn chosen(&self) -> &tzolkin_core::observation::LegalAction;
+    fn chosen_index(&self) -> usize;
+    fn logits_digest(&self) -> &str;
+    fn distribution_digest(&self) -> &str;
+    fn behavior_mass_ticks(&self) -> u64;
+    fn nominal_probability(&self) -> f64;
+    fn behavior_probability(&self) -> f64;
+    fn behavior_logp(&self) -> f64;
+    fn return_target(&self) -> f64;
+}
+
+macro_rules! numeric_actor_step {
+    ($step:ty) => {
+        impl numeric_actor_step_sealed::Sealed for $step {}
+        impl NumericActorStep for $step {
+            fn observation(&self) -> &tzolkin_core::observation::Observation {
+                <$step>::observation(self)
+            }
+            fn actor(&self) -> usize {
+                <$step>::actor(self)
+            }
+            fn chosen(&self) -> &tzolkin_core::observation::LegalAction {
+                <$step>::chosen(self)
+            }
+            fn chosen_index(&self) -> usize {
+                <$step>::chosen_index(self)
+            }
+            fn logits_digest(&self) -> &str {
+                <$step>::logits_digest(self)
+            }
+            fn distribution_digest(&self) -> &str {
+                <$step>::distribution_digest(self)
+            }
+            fn behavior_mass_ticks(&self) -> u64 {
+                <$step>::behavior_mass_ticks(self)
+            }
+            fn nominal_probability(&self) -> f64 {
+                <$step>::nominal_probability(self)
+            }
+            fn behavior_probability(&self) -> f64 {
+                <$step>::behavior_probability(self)
+            }
+            fn behavior_logp(&self) -> f64 {
+                <$step>::behavior_logp(self)
+            }
+            fn return_target(&self) -> f64 {
+                <$step>::return_target(self)
+            }
+        }
+    };
+}
+numeric_actor_step!(AppliedActorStep<'_>);
+numeric_actor_step!(SemanticPlayingActorStep<'_>);
+
+impl<S: NumericActorStep + ?Sized> numeric_actor_step_sealed::Sealed for &S {}
+impl<S: NumericActorStep + ?Sized> NumericActorStep for &S {
+    fn observation(&self) -> &tzolkin_core::observation::Observation {
+        S::observation(self)
+    }
+    fn actor(&self) -> usize {
+        S::actor(self)
+    }
+    fn chosen(&self) -> &tzolkin_core::observation::LegalAction {
+        S::chosen(self)
+    }
+    fn chosen_index(&self) -> usize {
+        S::chosen_index(self)
+    }
+    fn logits_digest(&self) -> &str {
+        S::logits_digest(self)
+    }
+    fn distribution_digest(&self) -> &str {
+        S::distribution_digest(self)
+    }
+    fn behavior_mass_ticks(&self) -> u64 {
+        S::behavior_mass_ticks(self)
+    }
+    fn nominal_probability(&self) -> f64 {
+        S::nominal_probability(self)
+    }
+    fn behavior_probability(&self) -> f64 {
+        S::behavior_probability(self)
+    }
+    fn behavior_logp(&self) -> f64 {
+        S::behavior_logp(self)
+    }
+    fn return_target(&self) -> f64 {
+        S::return_target(self)
+    }
+}
 
 pub const UPDATE_VERSION: &str = "public-fixed-old-one-ascent-f64-to-f32-v1";
 pub(crate) const TASK: &str = "policyOnlyRlOneStep";
@@ -773,10 +874,13 @@ pub(crate) fn accumulate_step_with_baseline_timed<T: PhaseTimer>(
 /// Only selects a closed numeric layout. The applied-step/old likelihood checks
 /// still run in full; this helper grants no source, owner or update authority.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn accumulate_step_with_baseline_timed_for_profile<T: PhaseTimer>(
+pub(crate) fn accumulate_step_with_baseline_timed_for_profile<
+    T: PhaseTimer,
+    S: NumericActorStep,
+>(
     profile: ConditionalFeatureProfile,
     model: &PublicPolicyModel,
-    step: AppliedActorStep<'_>,
+    step: S,
     config: &OneStepConfig,
     own: &mut [f64],
     counts: &mut [usize; 3],
