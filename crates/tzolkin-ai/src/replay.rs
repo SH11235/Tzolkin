@@ -693,6 +693,40 @@ pub(crate) fn play_unrecorded_inference(
     Ok((state, decisions))
 }
 
+/// Output-only actual Feeding events. The local buffer is returned only after
+/// the same simulator completes and validates the entire game successfully.
+pub(crate) struct IndexedFeedingEvent {
+    pub move_index: usize,
+    pub event: FeedingEvent,
+}
+
+pub(crate) fn play_unrecorded_inference_with_feeding(
+    players: usize,
+    seed: u32,
+    mut decide: impl FnMut(usize, &Observation) -> Result<crate::Decision, String>,
+) -> Result<(GameState, usize, Vec<IndexedFeedingEvent>), String> {
+    if !(3..=4).contains(&players) {
+        return Err("Unrecorded inference supports base 3/4p only".into());
+    }
+    let mut events = Vec::new();
+    let mut index = 0;
+    let (state, decisions, _) = play_game_internal_with_feeding(
+        players,
+        seed,
+        GameOptions::default(),
+        false,
+        None,
+        |o| {
+            let decision = decide(index, o)?;
+            index += 1;
+            Ok((decision, None, None))
+        },
+        false,
+        Some(&mut events),
+    )?;
+    Ok((state, decisions, events))
+}
+
 struct GuardReplay {
     sessions: Vec<Option<TradeGuardSession>>,
 }
@@ -775,6 +809,37 @@ fn validate_search_trace(
 fn play_game_internal(
     players: usize,
     seed: u32,
+    options: GameOptions,
+    record: bool,
+    source: Option<ReplaySource>,
+    decide: impl FnMut(
+        &Observation,
+    ) -> Result<
+        (
+            crate::Decision,
+            Option<SearchTrace>,
+            Option<TradeGuardTrace>,
+        ),
+        String,
+    >,
+    check_every_step: bool,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_internal_with_feeding(
+        players,
+        seed,
+        options,
+        record,
+        source,
+        decide,
+        check_every_step,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn play_game_internal_with_feeding(
+    players: usize,
+    seed: u32,
     mut options: GameOptions,
     record: bool,
     source: Option<ReplaySource>,
@@ -789,6 +854,7 @@ fn play_game_internal(
         String,
     >,
     check_every_step: bool,
+    mut feeding_events: Option<&mut Vec<IndexedFeedingEvent>>,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
     if !(2..=5).contains(&players) {
         return Err("Players must be 2..5".into());
@@ -897,7 +963,18 @@ fn play_game_internal(
         } else {
             String::new()
         };
-        state = apply_move(&state, decision.r#move).map_err(|e| format!("Legal-operation failure at decision {decisions} (players={players},seed={seed}): {e}; {chosen:?}"))?;
+        let applied = if let Some(events) = feeding_events.as_mut() {
+            apply_move_with_feeding_events(&state, decision.r#move).map(|(next, actual)| {
+                events.extend(actual.into_iter().map(|event| IndexedFeedingEvent {
+                    move_index: decisions,
+                    event,
+                }));
+                next
+            })
+        } else {
+            apply_move(&state, decision.r#move)
+        };
+        state = applied.map_err(|e| format!("Legal-operation failure at decision {decisions} (players={players},seed={seed}): {e}; {chosen:?}"))?;
         if check_every_step {
             check_state(&state)?;
         }

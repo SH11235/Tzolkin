@@ -49,6 +49,7 @@ pub const APP_PROFILE_ARENA_SCHEMA: &str = "tzolkin-app-profile-validation-arena
 pub const APP_DIAGNOSTIC_PAIRED_SCHEMA: &str = "tzolkin-app-profile-development-paired-arena-v1";
 pub const APP_DIAGNOSTIC_SCHEMA: &str = "tzolkin-app-profile-development-diagnostic-v1";
 pub const APP_DIAGNOSTIC_CONSENT_SCHEMA: &str = "tzolkin-app-development-reanalysis-consent-v1";
+pub const APP_FEEDING_DIAGNOSTIC_SCHEMA: &str = "tzolkin-app-profile-feeding-diagnostic-v1";
 pub const MAX_ROWS_PER_CALLBACK: usize = 1024;
 pub const MAX_REPORT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXCLUDED_FAMILIES: usize = 200_000;
@@ -391,6 +392,131 @@ pub struct AppDiagnosticReport {
 impl AppDiagnosticReport {
     pub fn save_new(&self, path: &std::path::Path) -> Result<(), String> {
         crate::model::write_new_json_bounded(path, self, MAX_REPORT_BYTES)
+    }
+}
+
+/// Output-only values copied from the actual Core Feeding event. Penalties are
+/// observations, not policy inputs or a requirement to avoid early investment.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedingReceipt {
+    pub move_index: usize,
+    pub scheduled_day: i64,
+    pub actual_round: i64,
+    pub player_id: usize,
+    pub workers: i64,
+    pub corn_before: i64,
+    pub feed_workers: i64,
+    pub feed_all: bool,
+    pub feed_discount: i64,
+    pub hunger: bool,
+    pub tribe_extra_corn: i64,
+    pub fed_workers: i64,
+    pub corn_cost: i64,
+    pub unfed_workers: i64,
+    pub penalty: i64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedingSeatPair {
+    pub seat: usize,
+    /// Null means unknown: every event is discarded after an arm/block error.
+    pub candidate: Option<Vec<FeedingReceipt>>,
+    pub reference: Option<Vec<FeedingReceipt>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedingSeedBlock {
+    pub seed: u32,
+    pub players: usize,
+    pub complete: bool,
+    pub pairs: Vec<FeedingSeatPair>,
+}
+
+/// A sibling report leaves all legacy Arena/diagnostic fields and digests
+/// unchanged. Each event is joined by seed, absolute focal seat and arm.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppFeedingDiagnosticReport {
+    pub schema: String,
+    pub configuration_sha256: String,
+    pub diagnostic: AppDiagnosticReport,
+    pub feeding_blocks: Vec<FeedingSeedBlock>,
+}
+impl AppFeedingDiagnosticReport {
+    pub fn save_new(&self, path: &std::path::Path) -> Result<(), String> {
+        crate::model::write_new_json_bounded(path, self, MAX_REPORT_BYTES)
+    }
+}
+
+fn feeding_receipts(
+    players: usize,
+    decisions: usize,
+    events: Vec<replay::IndexedFeedingEvent>,
+) -> Result<Vec<FeedingReceipt>, String> {
+    if !(3..=4).contains(&players) || events.len() != 4 * players {
+        return Err("App feeding receipt requires all four days and absolute players".into());
+    }
+    let mut receipts = Vec::with_capacity(events.len());
+    let mut previous_index = None;
+    for (batch, scheduled_day) in events.chunks_exact(players).zip([8, 14, 21, 27]) {
+        let index = batch[0].move_index;
+        let round = batch[0].event.actual_round;
+        if index >= decisions || previous_index.is_some_and(|previous| previous > index) {
+            return Err("App feeding receipt move index differs from actual decisions".into());
+        }
+        previous_index = Some(index);
+        for (player_id, indexed) in batch.iter().enumerate() {
+            let event = indexed.event;
+            if event.scheduled_day != scheduled_day
+                || event.player_id != player_id
+                || indexed.move_index != index
+                || event.actual_round != round
+            {
+                return Err("App feeding receipt day/player/batch coverage differs".into());
+            }
+            receipts.push(FeedingReceipt {
+                move_index: index,
+                scheduled_day,
+                actual_round: round,
+                player_id,
+                workers: event.workers,
+                corn_before: event.corn_before,
+                feed_workers: event.feed_workers,
+                feed_all: event.feed_all,
+                feed_discount: event.feed_discount,
+                hunger: event.hunger,
+                tribe_extra_corn: event.tribe_extra_corn,
+                fed_workers: event.result.fed_workers,
+                corn_cost: event.result.corn_cost,
+                unfed_workers: event.result.unfed_workers,
+                penalty: event.penalty,
+            });
+        }
+    }
+    Ok(receipts)
+}
+
+fn feeding_block(
+    seed: u32,
+    players: usize,
+    complete: bool,
+    mut pairs: Vec<FeedingSeatPair>,
+) -> FeedingSeedBlock {
+    if !complete {
+        // A later paired arm failure invalidates the entire seed block too.
+        for pair in &mut pairs {
+            pair.candidate = None;
+            pair.reference = None;
+        }
+    }
+    FeedingSeedBlock {
+        seed,
+        players,
+        complete,
+        pairs,
     }
 }
 
@@ -933,6 +1059,77 @@ fn play_arm_with_setup<'a>(
 }
 
 type ArmDecide<'a> = dyn FnMut(usize, &Observation) -> Result<Decision, String> + 'a;
+fn play_arm_with_optional_feeding<'a>(
+    seed: u32,
+    seat: usize,
+    focal: &mut Role<'a>,
+    pool: &mut [Role<'a>],
+    shared_setup: Option<&SharedCornFirstSetupIdentity>,
+    collect: bool,
+) -> (
+    ArmResult,
+    Vec<Option<GuardDiagnostics>>,
+    Option<Vec<FeedingReceipt>>,
+) {
+    if !collect {
+        let (arm, diagnostics) = play_arm_with_setup(seed, seat, focal, pool, shared_setup);
+        return (arm, diagnostics, None);
+    }
+    play_arm_using_with_feeding(
+        seed,
+        seat,
+        focal,
+        pool,
+        shared_setup,
+        |players, seed, decide| {
+            replay::play_unrecorded_inference_with_feeding(players, seed, decide)
+        },
+    )
+}
+
+fn play_arm_using_with_feeding<'a>(
+    seed: u32,
+    seat: usize,
+    focal: &mut Role<'a>,
+    pool: &mut [Role<'a>],
+    shared_setup: Option<&SharedCornFirstSetupIdentity>,
+    play: impl FnOnce(
+        usize,
+        u32,
+        &mut ArmDecide<'_>,
+    ) -> Result<
+        (
+            tzolkin_core::GameState,
+            usize,
+            Vec<replay::IndexedFeedingEvent>,
+        ),
+        String,
+    >,
+) -> (
+    ArmResult,
+    Vec<Option<GuardDiagnostics>>,
+    Option<Vec<FeedingReceipt>>,
+) {
+    let mut receipts = None;
+    let (arm, diagnostics) = play_arm_using_with_setup(
+        seed,
+        seat,
+        focal,
+        pool,
+        shared_setup,
+        |players, seed, decide| {
+            let (state, decisions, actual) = play(players, seed, decide)?;
+            receipts = Some(feeding_receipts(players, decisions, actual)?);
+            Ok((state, decisions))
+        },
+    );
+    // The shared arm also validates the terminal public observation. Discard
+    // even a complete simulator buffer if that later step fails.
+    if arm.error.is_some() {
+        receipts = None;
+    }
+    (arm, diagnostics, receipts)
+}
 #[cfg(test)]
 fn play_arm_using<'a>(
     seed: u32,
@@ -1176,6 +1373,44 @@ pub fn run_app_profile_diagnostic<'a>(
         opponent_pool,
         APP_DIAGNOSTIC_PAIRED_SCHEMA,
     )?;
+    app_diagnostic_report(consent, paired)
+}
+
+/// Explicit, count-neutral Development reanalysis with actual Feeding receipts.
+/// This never feeds diagnostics into a chooser, guard, RNG or training owner.
+pub fn run_app_profile_feeding_diagnostic<'a>(
+    config: &NumericArenaConfig,
+    consent: &AppDiagnosticConsent,
+    candidate: AppProfile,
+    reference: AppOpponent<'a>,
+    opponent_pool: Vec<AppOpponent<'a>>,
+) -> Result<AppFeedingDiagnosticReport, String> {
+    consent.validate_for(config)?;
+    let mut feeding_blocks = Vec::with_capacity(config.seeds.len());
+    let paired = run_app_roles_with_feeding(
+        config,
+        candidate,
+        reference,
+        opponent_pool,
+        APP_DIAGNOSTIC_PAIRED_SCHEMA,
+        Some(&mut feeding_blocks),
+    )?;
+    let diagnostic = app_diagnostic_report(consent, paired)?;
+    let mut hash = Sha256::new();
+    hash.update(b"tzolkin-app-profile-feeding-diagnostic-v1\0");
+    hash.update(diagnostic.configuration_sha256.as_bytes());
+    Ok(AppFeedingDiagnosticReport {
+        schema: APP_FEEDING_DIAGNOSTIC_SCHEMA.into(),
+        configuration_sha256: format!("{:x}", hash.finalize()),
+        diagnostic,
+        feeding_blocks,
+    })
+}
+
+fn app_diagnostic_report(
+    consent: &AppDiagnosticConsent,
+    paired: NumericArenaReport,
+) -> Result<AppDiagnosticReport, String> {
     let mut hash = Sha256::new();
     hash.update(b"tzolkin-app-profile-development-diagnostic-v1\0");
     hash.update(
@@ -1200,6 +1435,17 @@ fn run_app_roles<'a>(
     opponent_pool: Vec<AppOpponent<'a>>,
     schema: &str,
 ) -> Result<NumericArenaReport, String> {
+    run_app_roles_with_feeding(config, candidate, reference, opponent_pool, schema, None)
+}
+
+fn run_app_roles_with_feeding<'a>(
+    config: &NumericArenaConfig,
+    candidate: AppProfile,
+    reference: AppOpponent<'a>,
+    opponent_pool: Vec<AppOpponent<'a>>,
+    schema: &str,
+    feeding: Option<&mut Vec<FeedingSeedBlock>>,
+) -> Result<NumericArenaReport, String> {
     if opponent_pool.len() != config.players {
         return Err("Numeric Arena absolute-seat pool count mismatch".into());
     }
@@ -1223,7 +1469,7 @@ fn run_app_roles<'a>(
             guard_key = Some(key);
         }
     }
-    run_admitted_roles(config, candidate, reference, pool, schema, None)
+    run_admitted_roles_with_feeding(config, candidate, reference, pool, schema, None, feeding)
 }
 
 /// Paired base 3/4p Validation with the same untrained Corn-first Setup selector
@@ -1486,11 +1732,31 @@ fn run_roles_with_setup<'a>(
 }
 fn run_admitted_roles<'a>(
     config: &NumericArenaConfig,
+    candidate: Role<'a>,
+    reference: Role<'a>,
+    pool: Vec<Role<'a>>,
+    schema: &str,
+    shared_setup: Option<SharedCornFirstSetupIdentity>,
+) -> Result<NumericArenaReport, String> {
+    run_admitted_roles_with_feeding(
+        config,
+        candidate,
+        reference,
+        pool,
+        schema,
+        shared_setup,
+        None,
+    )
+}
+
+fn run_admitted_roles_with_feeding<'a>(
+    config: &NumericArenaConfig,
     mut candidate: Role<'a>,
     mut reference: Role<'a>,
     mut pool: Vec<Role<'a>>,
     schema: &str,
     shared_setup: Option<SharedCornFirstSetupIdentity>,
+    mut feeding: Option<&mut Vec<FeedingSeedBlock>>,
 ) -> Result<NumericArenaReport, String> {
     let identities = (
         candidate.identity(),
@@ -1510,43 +1776,55 @@ fn run_admitted_roles<'a>(
     for (index, seed) in config.seeds.iter().enumerate() {
         let mut pairs = Vec::with_capacity(config.players);
         let mut guard_pairs = Vec::with_capacity(config.players);
+        let mut feeding_pairs = feeding.as_ref().map(|_| Vec::with_capacity(config.players));
         for seat in 0..config.players {
             let (c, r) = if (index + seat) % 2 == 0 {
                 (
-                    play_arm_with_setup(
+                    play_arm_with_optional_feeding(
                         *seed,
                         seat,
                         &mut candidate,
                         &mut pool,
                         shared_setup.as_ref(),
+                        feeding.is_some(),
                     ),
-                    play_arm_with_setup(
+                    play_arm_with_optional_feeding(
                         *seed,
                         seat,
                         &mut reference,
                         &mut pool,
                         shared_setup.as_ref(),
+                        feeding.is_some(),
                     ),
                 )
             } else {
-                let reference_result = play_arm_with_setup(
+                let reference_result = play_arm_with_optional_feeding(
                     *seed,
                     seat,
                     &mut reference,
                     &mut pool,
                     shared_setup.as_ref(),
+                    feeding.is_some(),
                 );
                 (
-                    play_arm_with_setup(
+                    play_arm_with_optional_feeding(
                         *seed,
                         seat,
                         &mut candidate,
                         &mut pool,
                         shared_setup.as_ref(),
+                        feeding.is_some(),
                     ),
                     reference_result,
                 )
             };
+            if let Some(feedings) = &mut feeding_pairs {
+                feedings.push(FeedingSeatPair {
+                    seat,
+                    candidate: c.2,
+                    reference: r.2,
+                });
+            }
             pairs.push(SeatPair {
                 seat,
                 candidate: c.0,
@@ -1558,7 +1836,16 @@ fn run_admitted_roles<'a>(
                 reference: r.1,
             });
         }
-        blocks.push(block(*seed, pairs));
+        let completed = block(*seed, pairs);
+        if let (Some(sink), Some(pairs)) = (feeding.as_mut(), feeding_pairs) {
+            sink.push(feeding_block(
+                *seed,
+                config.players,
+                completed.complete,
+                pairs,
+            ));
+        }
+        blocks.push(completed);
         guards.push(GuardBlock {
             seed: *seed,
             pairs: guard_pairs,
@@ -1935,6 +2222,129 @@ pub(super) mod tests {
             },
         };
         config.validate().unwrap();
+        // Synthetic Core DTOs exercise receipt coverage and whole-arm discard
+        // without playing a full game or deriving events from terminal state.
+        let actual_events = |players: usize| {
+            [8, 14, 21, 27]
+                .into_iter()
+                .enumerate()
+                .flat_map(|(batch, day)| {
+                    (0..players).map(move |player_id| replay::IndexedFeedingEvent {
+                        move_index: 2 + 3 * batch,
+                        event: tzolkin_core::FeedingEvent {
+                            scheduled_day: day,
+                            actual_round: day + 1,
+                            player_id,
+                            workers: 4,
+                            corn_before: 1,
+                            feed_workers: 0,
+                            feed_all: false,
+                            feed_discount: 0,
+                            hunger: false,
+                            tribe_extra_corn: 0,
+                            result: tzolkin_core::prophecies::FeedingResult {
+                                fed_workers: 0,
+                                corn_cost: 0,
+                                unfed_workers: 4,
+                            },
+                            penalty: 12,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        for players in [3, 4] {
+            let receipts = feeding_receipts(players, 12, actual_events(players)).unwrap();
+            assert_eq!(receipts.len(), 4 * players);
+            assert_eq!(receipts[0].actual_round, 9);
+            assert_eq!(receipts[0].scheduled_day, 8);
+            assert_eq!((receipts[0].unfed_workers, receipts[0].penalty), (4, 12));
+            // No zero-food-penalty admission rule: actual loss remains visible.
+            for invalid in 0..7 {
+                let mut events = actual_events(players);
+                match invalid {
+                    0 => {
+                        events.pop();
+                    }
+                    1 => events[1].event.player_id = 0,
+                    2 => events[players].event.scheduled_day = 8,
+                    3 => events[1].event.actual_round += 1,
+                    4 => events[1].move_index += 1,
+                    5 => events[0].move_index = 12,
+                    _ => {
+                        for event in &mut events[players..2 * players] {
+                            event.move_index = 1;
+                        }
+                    }
+                }
+                assert!(feeding_receipts(players, 12, events).is_err());
+            }
+            let mut focal = Role::App(AppProfile::FoodAlignedV2);
+            let mut pool = (0..players)
+                .map(|_| Role::App(AppProfile::FoodAlignedV2))
+                .collect::<Vec<_>>();
+            for later_failure in [false, true] {
+                let (arm, _, events) = play_arm_using_with_feeding(
+                    3,
+                    1,
+                    &mut focal,
+                    &mut pool,
+                    None,
+                    |players, seed, _| {
+                        let mut state = tzolkin_core::create_game(
+                            (0..players).map(|i| format!("Seat {i}")).collect(),
+                            seed,
+                            false,
+                        )?;
+                        state.phase = Phase::Finished;
+                        state.final_scores = (0..players)
+                            .map(|player_id| tzolkin_core::FinalScore {
+                                player_id,
+                                points_before_final: 0.0,
+                                resource_points: 0.0,
+                                skull_points: 0.0,
+                                monument_points: 0.0,
+                                total: 0.0,
+                                workers_on_gears: 0,
+                                rank: 1,
+                            })
+                            .collect();
+                        if later_failure {
+                            state.current_player = players;
+                        }
+                        Ok((state, 12, actual_events(players)))
+                    },
+                );
+                assert_eq!(arm.error.is_some(), later_failure);
+                assert_eq!(events.is_none(), later_failure);
+                assert!(arm.unfed_workers.is_none());
+                if !later_failure {
+                    let complete = feeding_block(
+                        3,
+                        players,
+                        true,
+                        vec![FeedingSeatPair {
+                            seat: 1,
+                            candidate: events.clone(),
+                            reference: events.clone(),
+                        }],
+                    );
+                    assert!(complete.complete && complete.pairs[0].candidate.is_some());
+                    let failed = feeding_block(3, players, false, complete.pairs);
+                    assert!(failed.pairs[0].candidate.is_none());
+                    assert!(failed.pairs[0].reference.is_none());
+                }
+            }
+            let (arm, _, receipts) =
+                play_arm_using_with_feeding(3, 1, &mut focal, &mut pool, None, |_, _, _| {
+                    Err("Injected simulator failure after Feeding".into())
+                });
+            assert_eq!(
+                arm.error.as_deref(),
+                Some("Injected simulator failure after Feeding")
+            );
+            assert!(receipts.is_none());
+        }
         let search = PreparedSearch::new(&crate::search::SearchConfig::default()).unwrap();
         for search_in_reference in [true, false] {
             let reference = if search_in_reference {
