@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { normalizeGame } from './bga-import.mjs';
 import { observedBasicUnlimitedOptions, uniqueJson } from './bga-observed-options.mjs';
-import { catalogFingerprint, coreDispatcher } from './bga-replay.mjs';
+import { catalogFingerprint, coreDispatcher, sourceEvents } from './bga-replay.mjs';
 import {
   decodeConditionalPublicGame,
   validateBuildingEquivalenceClass,
@@ -674,21 +674,42 @@ export function projectRetainedBoundary(
   text(capture.renderedReplayControls, 4096, 'retained replay controls');
   text(capture.roundText, 160, 'boundary round text');
   text(capture.prompt, 256, 'boundary prompt');
-  const sourceIndex = game.rawEntries.findIndex((entry) => entry.action_id === actionId);
+  // Use the ordinary decoder's legacy raw/DOM closure, including its terminal
+  // suffix and omission of empty eventless entries, before selecting a boundary.
+  const eventIds = new Set(game.events.map((event) => event.actionId));
+  const sourceEntries = game.rawEntries.filter(
+    (entry) => entry.raw_text !== '' || eventIds.has(entry.action_id),
+  );
+  const normalizedEvents =
+    game.source.adapter === 'bga-public-ui-dom-v1'
+      ? game.events
+      : sourceEvents({ entries: sourceEntries }, game, sourceEntries.at(-1)?.action_id);
+  const sourceIndex = sourceEntries.findIndex((entry) => entry.action_id === actionId);
   if (sourceIndex < 0) fail('Retained boundary action is absent from raw log');
-  const events = game.events.filter((event) => event.actionId === actionId);
-  const priorId = game.rawEntries[sourceIndex - 1]?.action_id;
-  const prior = game.events.filter((event) => event.actionId === priorId);
+  const events = normalizedEvents.filter((event) => event.actionId === actionId);
+  const priorId = sourceEntries[sourceIndex - 1]?.action_id;
+  const prior = normalizedEvents.filter((event) => event.actionId === priorId);
+  const readNodes = new Map();
+  const readVisible = (tree, node) => {
+    unhiddenFragmentNode(tree, node);
+    for (const ancestor of tree.nodes.filter(
+      (item) => item.start <= node.start && item.end >= node.end,
+    ))
+      if (ancestor.attrs.id) {
+        const parent = tree.nodes.find((item) => item.children.includes(ancestor));
+        readNodes.set(ancestor.attrs.id, { node: ancestor, parent });
+      }
+  };
   const board = htmlTree(capture.boardHtml, 'retained boundary board', true);
   const root = byId(board, 'board');
   if (root.tag !== 'div' || outer(board, root) !== capture.boardHtml)
     fail('Detached retained boundary board');
-  unhiddenFragmentNode(board, root);
+  readVisible(board, root);
   const rounds = byId(board, 'rounds_wrap'),
     round = byId(board, 'current_round');
-  if (round.start <= rounds.start || round.end >= rounds.end)
+  if (round.tag !== 'span' || round.start <= rounds.start || round.end >= rounds.end)
     fail('Boundary round counter outside rounds wrapper');
-  unhiddenFragmentNode(board, round);
+  readVisible(board, round);
   const displayedRound = natural(round, 'boundary round', true);
   if (
     nodeText(rounds).trim().replace(/\s+/g, ' ') !==
@@ -697,7 +718,7 @@ export function projectRetainedBoundary(
   )
     fail('Boundary round text mismatch');
   const terminal = capture.prompt.trim() === 'ゲーム終了';
-  // A split food/rotation log is admitted only across adjacent original entries.
+  // A split food/rotation log is admitted only across adjacent normalized source entries.
   // Rotation messages without actor gameplay cannot inherit a more distant food day.
   const split =
     !events.some((event) => event.kind === 'feeding') &&
@@ -718,25 +739,84 @@ export function projectRetainedBoundary(
     events.filter((event) => event.kind === 'gearAdvanced').length !== 1 ||
     envelope.filter((event) => event.kind === 'doubleAdvance').length > 1 ||
     !envelope.some((event) => event.kind === 'feeding') ||
-    envelope.some((event) =>
-      [
-        'place',
-        'gearAction',
-        'technology',
-        'trade',
-        'build',
-        'monument',
-        'beg',
-        'cancellation',
-      ].includes(event.kind),
-    ) ||
     (terminal
       ? displayedRound !== 28 ||
+        rotationDays !== 1 ||
         game.quality.status !== 'normalEnd' ||
         !events.some((event) => event.kind === 'gameEnd')
       : ![8, 14, 21].includes(foodDay) || events.some((event) => event.kind === 'gameEnd'))
   )
     fail('Capture has no matching settled food/terminal source boundary');
+  const rewardCaption =
+    '世代中間報酬: 信仰の段階によって資源を獲得する。(信仰が資源の描かれた段以上で重複して獲得できる)';
+  const rewardIndex = envelope.findIndex((event) => event.rawText === rewardCaption);
+  const rotationIndex = envelope.findIndex((event) => event.kind === 'gearAdvanced');
+  const feedingIndex = envelope.findIndex((event) => event.kind === 'feeding');
+  // These are only closed calendar captions accepted by the ordinary decoder.
+  // This scope check does not replace its actor/payment/score/core receipts.
+  const calendarOnly = (event, index) => {
+    const icons = event.iconResources ?? [];
+    const actor = event.actor;
+    const body =
+      actor === null || actor === undefined ? event.rawText : event.rawText.slice(actor.length);
+    if (event.kind === 'gearAdvanced' || event.kind === 'gameEnd') return icons.length === 0;
+    if (event.kind === 'feeding')
+      return (
+        game.context.players.includes(actor) &&
+        /^はワーカー\d+個で\s*\d+\s*を支払った$/.test(
+          event.rawText.slice(`食料供給日: ${actor}`.length),
+        ) &&
+        same(icons, ['corn'])
+      );
+    if (event.kind === 'firstPlayer')
+      return icons.length === 0 && body === 'がこのラウンドのスタートプレイヤーです';
+    if (event.kind === 'doubleAdvance')
+      return icons.length === 0 && body === 'は歯車を高速化し2段階回した!';
+    if (event.kind === 'resourceGain')
+      return (
+        [8, 21].includes(foodDay) &&
+        rewardIndex > feedingIndex &&
+        index > rewardIndex &&
+        index < rotationIndex
+      );
+    if (event.kind !== 'unparsed') return false;
+    if (game.context.players.includes(actor) && /^は\d+\s*を歯車から獲得した$/.test(body))
+      return same(icons, ['corn']);
+    if (icons.length) return false;
+    if (actor !== null) {
+      if (body === 'は再び歯車を高速化する権利を得た') return true;
+      return (
+        [14, 27].includes(foodDay) &&
+        (/^は(chaac|quetzalcoatl|kukulkan|kukulcan)の信仰が一番高い(?:うちの一人なので、半分の点を獲得した: \d+点|ので、\d+点を獲得した)$/.test(
+          body,
+        ) ||
+          /^は信仰により-?\d+点を獲得した$/.test(body))
+      );
+    }
+    if (event.rawText === rewardCaption) return [8, 21].includes(foodDay) && index > feedingIndex;
+    if (event.rawText === '建物が第2世代になりました') return foodDay === 14;
+    if (
+      game.context.players.some(
+        (name) =>
+          event.rawText.startsWith(`食料供給日: ${name}はワーカー`) &&
+          /^\d+個分の食料が足りないため\d+点失った$/.test(
+            event.rawText.slice(`食料供給日: ${name}はワーカー`.length),
+          ),
+      )
+    )
+      return true;
+    if (
+      game.context.players.some(
+        (name) =>
+          event.rawText ===
+          `スタートプレイヤースペースに置かれているワーカーは${name}の手元に戻った`,
+      )
+    )
+      return index > rotationIndex;
+    return terminal && /^(最終スコア|記念碑: |残り資源: )/.test(event.rawText);
+  };
+  if (!envelope.every(calendarOnly))
+    fail('Unsupported message in settled boundary source envelope');
   const ids = list(control.seatOrder, 4, 'boundary seat order');
   const fragments = list(capture.playerBoards, 4, 'boundary player fragments');
   if (
@@ -787,8 +867,8 @@ export function projectRetainedBoundary(
         )
           fail('Boundary fragment crosses original owner/board scope');
       }
-    unhiddenFragmentNode(panel, owner);
-    unhiddenFragmentNode(row, rowRoot);
+    readVisible(panel, owner);
+    readVisible(row, rowRoot);
     if (
       !rowRoot.attrs.id &&
       rowRoot.attrs.class === 'whiteblock' &&
@@ -800,7 +880,7 @@ export function projectRetainedBoundary(
       (node) => node.tag === 'h3',
       'boundary player heading',
     );
-    unhiddenFragmentNode(row, heading);
+    readVisible(row, heading);
     const label = nodeText(heading).trim(),
       color = styles(heading).color;
     if (
@@ -813,7 +893,7 @@ export function projectRetainedBoundary(
     identities.set(id, { name, color: color.slice(1).toLowerCase() });
     const icon = panel.ids.get(`workers_player_${id}`);
     if (icon) {
-      unhiddenFragmentNode(panel, icon);
+      readVisible(panel, icon);
       if (
         icon.tag !== 'div' ||
         icon.attrs.class !== `worker worker_${color.slice(1).toLowerCase()}` ||
@@ -837,7 +917,7 @@ export function projectRetainedBoundary(
     }
     const counter = (key, signed = false) => {
       const node = byId(panel, key);
-      unhiddenFragmentNode(panel, node);
+      readVisible(panel, node);
       if (node.tag !== 'span' || node.children.some(object)) fail('Malformed boundary counter');
       const value = nodeText(node).trim();
       if (!(signed ? /^-?\d+$/ : /^\d+$/).test(value)) fail('Nonnumeric boundary counter');
@@ -884,11 +964,17 @@ export function projectRetainedBoundary(
   if (workerRoot.tag !== 'div' || !root.children.includes(workerRoot))
     fail('Detached boundary worker layer');
   unhiddenFragmentNode(board, workerRoot);
-  const placed = board.nodes.filter((node) => token(node, 'worker'));
+  const placed = board.nodes.filter(
+    (node) =>
+      token(node, 'worker') ||
+      /^worker_[1-9]\d*$/.test(node.attrs.id ?? '') ||
+      (node.attrs.class ?? '').split(/\s+/).some((value) => /^worker_[a-f0-9]{6}$/.test(value)),
+  );
   if (
     placed.some(
       (node) =>
         node.tag !== 'div' ||
+        !token(node, 'worker') ||
         !/^worker_[1-9]\d*$/.test(node.attrs.id ?? '') ||
         !workerRoot.children.includes(node) ||
         node.children.some((child) => typeof child !== 'string' || child.trim()),
@@ -908,15 +994,40 @@ export function projectRetainedBoundary(
       fail('Unknown/ambiguous boundary worker color');
     if (owner) counts[colors.indexOf(owner.slice(7))]++;
   }
+  const skull = byId(board, 'skull_left');
+  readVisible(board, skull);
+  if (skull.tag !== 'span') fail('Malformed boundary skull counter');
   const geometry = new Map();
   let anonymousRowMetadata = 0;
+  const rejectHiddenGeometry = (item) => {
+    if (
+      (item.computedDisplay != null &&
+        ![
+          'block',
+          'inline',
+          'inline-block',
+          'flex',
+          'inline-flex',
+          'grid',
+          'inline-grid',
+          'flow-root',
+          'contents',
+          'list-item',
+        ].includes(item.computedDisplay)) ||
+      (item.computedVisibility != null && item.computedVisibility !== 'visible')
+    )
+      fail('Hidden/invalid consumed boundary geometry');
+  };
   for (const item of list(capture.retainedDomGeometry, 20000, 'boundary geometry')) {
     if (!object(item) || typeof item.id !== 'string')
       fail('Invalid/duplicate boundary geometry identity');
     const declaresWorker =
       item.parentId === 'workers' ||
       /^worker_[1-9]\d*$/.test(item.id) ||
-      (typeof item.className === 'string' && item.className.split(/\s+/).includes('worker'));
+      (typeof item.className === 'string' &&
+        item.className
+          .split(/\s+/)
+          .some((value) => value === 'worker' || /^worker_[a-f0-9]{6}$/.test(value)));
     // The retained anonymous row wrappers are separately owner-validated above.
     // Their external parent and rect are metadata, never canvas worker evidence.
     if (item.id === '') {
@@ -928,9 +1039,20 @@ export function projectRetainedBoundary(
       )
         fail('Unknown anonymous boundary geometry');
       anonymousRowMetadata++;
+      rejectHiddenGeometry(item);
       continue;
     }
     if (geometry.has(item.id)) fail('Invalid/duplicate boundary geometry identity');
+    const consumed = readNodes.get(item.id);
+    if (consumed) {
+      if (
+        (item.className ?? '') !== (consumed.node.attrs.class ?? '') ||
+        (item.inlineStyle ?? '') !== (consumed.node.attrs.style ?? '') ||
+        (consumed.parent && item.parentId !== (consumed.parent.attrs.id ?? ''))
+      )
+        fail('Detached consumed boundary geometry');
+      rejectHiddenGeometry(item);
+    }
     const panelIcon = panelIcons.get(item.id);
     if (panelIcon) {
       if (
@@ -1013,9 +1135,6 @@ export function projectRetainedBoundary(
         'total workers',
       );
     });
-  const skull = byId(board, 'skull_left');
-  unhiddenFragmentNode(board, skull);
-  if (skull.tag !== 'span') fail('Malformed boundary skull counter');
   const expected = {
     players,
     skullSupply: natural(skull, 'boundary skull supply', true),
@@ -1040,6 +1159,17 @@ export function projectRetainedBoundary(
       displayedRound,
       displayedPlayers,
       totalWorkersObserved: Boolean(completeWorkers),
+      totalWorkersOmissionReason: completeWorkers
+        ? null
+        : [workerRoot, ...placed].some((node) => {
+              const item = geometry.get(node.attrs.id);
+              return (
+                item?.computedDisplay === 'none' ||
+                ['hidden', 'collapse'].includes(item?.computedVisibility)
+              );
+            })
+          ? 'explicit hidden canvas worker geometry'
+          : 'incomplete visible canvas worker geometry',
       completeSourceBoard: false,
       omitted: [
         'foodDays',

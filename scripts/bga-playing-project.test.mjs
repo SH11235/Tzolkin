@@ -582,6 +582,42 @@ test('retained boundary binds original food/rotation scope and separates availab
     assert.equal(Object.hasOwn(projected.witness.expected, 'foodDays'), false);
     assert.equal(Object.hasOwn(projected.witness.expected, 'gears'), false);
   }
+  const modern = boundaryFixture();
+  Object.assign(modern.raw, {
+    ...modern.raw,
+    schema_version: 1,
+    source_type: 'public_ui_dom',
+    export_scope: 'all_rendered_gamereview_log_entries',
+    dom_entry_count: modern.raw.dom_entries.length,
+    metadata: {
+      tableUrl: 'https://boardgamearena.com/table?table=123',
+      playerCount: 4,
+      players: ['A', 'B', 'C', 'D'].map((name) => ({ name })),
+    },
+  });
+  delete modern.raw.table_details_text;
+  modern.raw.dom_entries.forEach((entry) =>
+    entry.messages.forEach((message) => {
+      message.icons = message.icons.map(({ classes }) => ({ class: classes }));
+    }),
+  );
+  modern.raw.entries = modern.raw.dom_entries.map((entry) => ({
+    action_id: entry.action_id,
+    timestamp_display: entry.timestamp_display,
+    raw_text: `行動 ${entry.action_id} :\n${entry.timestamp_display}\n${entry.messages.map((message) => message.raw_text).join('\n')}`,
+  }));
+  const prepared = modern.repin(),
+    control = JSON.parse(prepared[2]);
+  const table = bytes({
+    schema: 'tzolkin-bga-public-table-ui-v1',
+    url: 'https://boardgamearena.com/table?table=123',
+    optionsText: '',
+  });
+  control.table = pin(table);
+  assert.equal(
+    projectRetainedBoundary(prepared[0], prepared[1], bytes(control), table).witness.expected.round,
+    9,
+  );
 });
 
 test('retained boundary omits total workers when complete visible geometry is missing', () => {
@@ -604,6 +640,7 @@ test('retained boundary omits total workers when complete visible geometry is mi
     );
     assert.equal(projected.witness.expected.players[0].resources.corn, 8);
     assert.equal(projected.provenance.displayedPlayers[0].availableWorkers, 1);
+    assert.match(projected.provenance.totalWorkersOmissionReason, /canvas worker geometry/);
   }
   const anonymous = boundaryFixture();
   anonymous.capture.retainedDomGeometry.push(
@@ -648,6 +685,18 @@ test('retained boundary keeps terminal day and integer score displays out of exa
   assert.ok(projected.witness.expected.players.every((player) => !Object.hasOwn(player, 'score')));
   assert.equal(Object.hasOwn(projected, 'terminalCheckpoint'), false);
   assert.equal(projected.provenance.completeNativeReplayQualified, false);
+  const outsideDom = boundaryFixture({ terminal: true });
+  outsideDom.raw.dom_entries.at(-1).messages.pop();
+  assert.equal(projectRetainedBoundary(...outsideDom.repin()).witness.expected.phase, 'finished');
+  const double = boundaryFixture({ terminal: true });
+  const message = {
+    raw_text: 'Aは歯車を高速化し2段階回した!',
+    html: 'Aは歯車を高速化し2段階回した!',
+    icons: [],
+  };
+  double.raw.dom_entries.at(-1).messages.push(message);
+  double.raw.entries.at(-1).raw_text += `\n${message.raw_text}`;
+  assert.throws(() => projectRetainedBoundary(...double.repin()), /matching settled/);
 });
 
 test('retained boundary rejects identity, hidden-counter, ownership and original-source mismatches', () => {
@@ -721,6 +770,50 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
         'workers_player_200',
       );
     },
+    (value) => {
+      value.raw.entries.at(-1).raw_text += '\nAは新しいワーカーを獲得した';
+    },
+    (value) => {
+      value.capture.retainedDomGeometry[0].computedDisplay = 'none';
+    },
+    ...['current_round', 'skull_left', 'player_board_100', 'corn_number_player_100'].map(
+      (id) => (value) => {
+        value.capture.retainedDomGeometry.push({
+          id,
+          className: '',
+          inlineStyle: null,
+          parentId:
+            id === 'current_round'
+              ? 'rounds_wrap'
+              : id === 'skull_left'
+                ? 'board'
+                : id === 'corn_number_player_100'
+                  ? 'player_board_100'
+                  : '',
+          computedVisibility: 'hidden',
+        });
+      },
+    ),
+    (value) => {
+      value.capture.retainedDomGeometry.push({
+        id: 'current_round',
+        className: 'foreign',
+        parentId: 'rounds_wrap',
+      });
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.push({
+        id: 'rounds_wrap',
+        inlineStyle: 'display:none',
+        parentId: 'board',
+      });
+    },
+    ...['', ' class="worker_008000"'].map((attributes) => (value) => {
+      value.capture.boardHtml =
+        value.capture.boardHtml.slice(0, -6) +
+        element('div', attributes ? 'canvasghost' : 'worker_999', '', attributes) +
+        '</div>';
+    }),
   ]) {
     const value = boundaryFixture();
     mutate(value);
@@ -731,15 +824,32 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
   const changed = Buffer.from(prepared[0]);
   changed[0] ^= 1;
   assert.throws(() => projectRetainedBoundary(changed, ...prepared.slice(1)), /pin mismatch/);
-  const split = boundaryFixture({ split: true });
-  split.raw.entries.splice(2, 0, { action_id: 10, raw_text: '', timestamp_display: '12:01:00' });
-  split.raw.dom_entries.splice(2, 0, {
-    action_id: 10,
-    messages: [],
-    timestamp_display: '12:01:00',
-  });
-  split.raw.entry_count++;
-  assert.throws(() => projectRetainedBoundary(...split.repin()));
+  for (const split of [false, true]) {
+    for (const caption of ['Aは新しいワーカーを獲得した', '未知の効果']) {
+      const value = boundaryFixture({ split });
+      value.raw.dom_entries[1].messages.push({ raw_text: caption, html: caption, icons: [] });
+      value.raw.entries[1].raw_text += `\n${caption}`;
+      assert.throws(() => projectRetainedBoundary(...value.repin()), /Unsupported message/);
+    }
+  }
+  const residualPrior = boundaryFixture({ split: true });
+  residualPrior.raw.entries[1].raw_text += '\nAは新しいワーカーを獲得した';
+  assert.throws(
+    () => projectRetainedBoundary(...residualPrior.repin()),
+    /unsupported residual text/,
+  );
+  // Empty eventless entries are omitted by the same source normalization as the decoder.
+  const empty = boundaryFixture({ split: true });
+  empty.capture.moveText = 'Coup #10';
+  empty.raw.entries.at(-1).action_id = 10;
+  empty.raw.dom_entries.at(-1).action_id = 10;
+  empty.raw.entries.splice(2, 0, { action_id: 9, raw_text: '', timestamp_display: '12:01:00' });
+  empty.raw.dom_entries.splice(2, 0, { action_id: 9, messages: [], timestamp_display: '12:01:00' });
+  empty.raw.entry_count++;
+  assert.deepEqual(projectRetainedBoundary(...empty.repin()).provenance.sourceActionIds, [8, 10]);
+  empty.raw.entries[2].raw_text = '未知の効果';
+  empty.raw.dom_entries[2].messages = [{ raw_text: '未知の効果', html: '未知の効果', icons: [] }];
+  assert.throws(() => projectRetainedBoundary(...empty.repin()), /matching settled/);
   for (const tableId of [123, 124]) {
     const legacy = boundaryFixture(),
       retained = legacy.repin(),
