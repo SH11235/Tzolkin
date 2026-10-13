@@ -751,7 +751,8 @@ export function projectRetainedBoundary(
   const trees = [board],
     identities = new Map(),
     displayedPlayers = [],
-    anonymousRows = [];
+    anonymousRows = [],
+    panelIcons = new Map();
   const players = ids.map((id, index) => {
     const item = one(fragments, (item) => item.playerId === id, 'boundary player identity');
     closed(
@@ -776,7 +777,7 @@ export function projectRetainedBoundary(
       for (const node of tree.nodes) {
         const key = node.attrs.id ?? '';
         const other =
-          /^(?:(?:worker|corn|wood|stone|gold|skull)_number_player_|player_(?:board|name|score|buildings|wealthtiles)_|firstplayer_|marker_)(\d+)(?:_|$)/.exec(
+          /^(?:(?:worker|corn|wood|stone|gold|skull)_number_player_|workers_player_|player_(?:board|name|score|buildings|wealthtiles)_|firstplayer_|marker_)(\d+)(?:_|$)/.exec(
             key,
           )?.[1];
         if (
@@ -810,6 +811,22 @@ export function projectRetainedBoundary(
       fail('Malformed retained boundary player heading');
     const name = text(label.slice(0, -1), 128, 'boundary player name');
     identities.set(id, { name, color: color.slice(1).toLowerCase() });
+    const icon = panel.ids.get(`workers_player_${id}`);
+    if (icon) {
+      unhiddenFragmentNode(panel, icon);
+      if (
+        icon.tag !== 'div' ||
+        icon.attrs.class !== `worker worker_${color.slice(1).toLowerCase()}` ||
+        icon.children.length !== 0
+      )
+        fail('Malformed owned boundary panel worker icon');
+      const parent = one(
+        panel.nodes,
+        (node) => node.children.includes(icon),
+        'owned boundary panel worker icon parent',
+      );
+      panelIcons.set(icon.attrs.id, { icon, parent });
+    }
     for (const [key, html] of [
       [`player_buildings_${id}`, item.buildingsHtml],
       [`player_wealthtiles_${id}`, item.wealthTilesHtml],
@@ -914,6 +931,18 @@ export function projectRetainedBoundary(
       continue;
     }
     if (geometry.has(item.id)) fail('Invalid/duplicate boundary geometry identity');
+    const panelIcon = panelIcons.get(item.id);
+    if (panelIcon) {
+      if (
+        item.parentId !== (panelIcon.parent.attrs.id ?? '') ||
+        (item.className ?? '') !== (panelIcon.icon.attrs.class ?? '') ||
+        (item.inlineStyle ?? '') !== (panelIcon.icon.attrs.style ?? '')
+      )
+        fail('Unbound owned boundary panel worker icon geometry');
+      // Counter icons stay panel metadata and never enter canvas worker counts.
+      geometry.set(item.id, item);
+      continue;
+    }
     if (declaresWorker) {
       const node = placed.find((node) => node.attrs.id === item.id);
       if (

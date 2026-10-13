@@ -460,6 +460,9 @@ function boundaryFixture({ split = false, terminal = false } = {}) {
         String(index === 0 ? 1 : index === 1 ? 2 : 3),
       ),
     );
+    player.boardHtml =
+      player.boardHtml.slice(0, -6) +
+      `<div class="board_item"><div id="workers_player_${player.playerId}" class="worker worker_${colors[index]}"></div></div></div>`;
   });
   const placed = [0, 0, 1].map((owner, index) => ({
     id: `worker_${index + 1}`,
@@ -506,6 +509,15 @@ function boundaryFixture({ split = false, terminal = false } = {}) {
       computedVisibility: 'visible',
       rect: { x: 0, y: 900, width: 1000, height: 0 },
     },
+    ...capture.playerBoards.map((player, index) => ({
+      id: `workers_player_${player.playerId}`,
+      className: `worker worker_${colors[index]}`,
+      inlineStyle: null,
+      parentId: '',
+      computedDisplay: 'inline-block',
+      computedVisibility: 'visible',
+      rect: { x: 1100, y: index * 100, width: 20, height: 30 },
+    })),
     ...placed,
   ];
   const feeding = {
@@ -693,6 +705,21 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
         parentId: 'unretained-parent',
         className: '',
       });
+    },
+    (value) => {
+      value.capture.retainedDomGeometry[2].parentId = 'workers';
+    },
+    (value) => {
+      value.capture.retainedDomGeometry[2].className = 'worker worker_abcdef';
+    },
+    (value) => {
+      value.capture.retainedDomGeometry[2].id = 'workers_player_999';
+    },
+    (value) => {
+      value.capture.playerBoards[0].boardHtml = value.capture.playerBoards[0].boardHtml.replace(
+        'workers_player_100',
+        'workers_player_200',
+      );
     },
   ]) {
     const value = boundaryFixture();
