@@ -1100,6 +1100,7 @@ impl Fixture {
 #[test]
 fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel() {
     use tzolkin_ai::conditional_human_rl::{ConditionalRlOwner, SAMPLING_VERSION};
+    use tzolkin_ai::conditional_semantic_playing_rl::SemanticPlayingRlOwner;
     use tzolkin_ai::human_policy_training::{
         COLLECTION_SCHEMA, PreparedConditionalHumanPolicy, train_conditional_datasets,
     };
@@ -1334,6 +1335,135 @@ fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel
     .unwrap();
     assert_eq!(semantic_prepared.reservations()["125"], DatasetSplit::Test);
     assert!(
+        SemanticPlayingRlOwner::from_prepared(&prepared, 11)
+            .err()
+            .unwrap()
+            .contains("schema-4")
+    );
+    let semantic_owner = SemanticPlayingRlOwner::from_prepared(&semantic_prepared, 11).unwrap();
+    let semantic_identity = semantic_owner.identity().unwrap();
+    assert_eq!(
+        semantic_identity.feature_schema(),
+        SEMANTIC_PLAYING_FEATURE_SCHEMA
+    );
+    assert_eq!(
+        semantic_identity.critic_feature_schema(),
+        PUBLIC_FEATURE_SCHEMA
+    );
+    assert_eq!(
+        semantic_identity.critic_context_contract(),
+        tzolkin_ai::public_state_critic::CONTEXT_CONTRACT
+    );
+    assert_eq!(semantic_identity.completed_updates(), 0);
+    assert!(!semantic_identity.source_authenticated());
+    assert!(!semantic_identity.source_qualified());
+    assert!(!semantic_identity.verified_native_policy());
+    assert_eq!(
+        semantic_identity.value_validity(),
+        tzolkin_ai::public_model::ValueValidity::UnavailablePolicyOnly
+    );
+    assert_ne!(
+        semantic_identity.input_contract(),
+        tzolkin_ai::conditional_human_rl::INPUT_CONTRACT
+    );
+    let initial_semantic_checksum = semantic_identity.checksum().to_string();
+    assert_eq!(
+        semantic_owner
+            .actor_parameters()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        semantic_prepared
+            .model()
+            .model
+            .parameters()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    let semantic_origin = semantic_owner.origin().unwrap();
+    assert_eq!(
+        semantic_origin.table_reservations().unwrap(),
+        semantic_prepared.reservations()
+    );
+    assert_eq!(
+        semantic_origin.table_reservations().unwrap()["124"],
+        DatasetSplit::Validation
+    );
+    assert_eq!(
+        semantic_origin.table_reservations().unwrap()["125"],
+        DatasetSplit::Test
+    );
+    assert_eq!(semantic_origin.source_pins().unwrap().len(), 14);
+    assert_eq!(
+        semantic_origin.dataset().unwrap(),
+        semantic_prepared.identity()
+    );
+    assert_eq!(
+        semantic_origin.checksum().unwrap(),
+        semantic_identity.origin_checksum()
+    );
+    let semantic_critic = semantic_owner.critic_parameters().unwrap();
+    assert_eq!(
+        semantic_critic.len(),
+        tzolkin_ai::public_state_critic::PARAMETER_COUNT
+    );
+    assert!(
+        semantic_critic[384 * 32 + 32..]
+            .iter()
+            .all(|v| v.to_bits() == 0)
+    );
+    let other_semantic = SemanticPlayingRlOwner::from_prepared(&semantic_prepared, 12).unwrap();
+    assert_ne!(
+        &semantic_critic[..384 * 32],
+        &other_semantic.critic_parameters().unwrap()[..384 * 32]
+    );
+    assert_ne!(
+        semantic_identity.critic_checksum(),
+        other_semantic.identity().unwrap().critic_checksum()
+    );
+    assert_ne!(
+        semantic_identity.critic_checksum(),
+        owner.identity().critic_checksum()
+    );
+    let semantic_handle = semantic_owner.handle().unwrap();
+    assert_eq!(semantic_handle.backend(), "scalar");
+    assert_eq!(
+        semantic_handle.identity().unwrap().checksum(),
+        initial_semantic_checksum
+    );
+    let semantic_observation = observe(&playing_state(), 0).unwrap();
+    let semantic_logits = semantic_handle.distribution(&semantic_observation).unwrap();
+    let expected_logits = semantic_prepared
+        .distribution_semantic_playing(&semantic_observation)
+        .unwrap();
+    assert_eq!(
+        semantic_logits
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        expected_logits
+            .logits
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        semantic_logits
+            .probabilities
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        expected_logits
+            .probabilities
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert!(semantic_handle.distribution(&observation).is_err()); // Setup is never scored by schema 4.
+    assert!(
         ConditionalRlOwner::from_prepared(&semantic_prepared, 11, SamplingSeed::new(17))
             .err()
             .unwrap()
@@ -1390,6 +1520,37 @@ fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel
             .err()
             .unwrap()
             .contains("non-Test")
+    );
+    // Both a newly requested handle and an already held numeric borrow reject
+    // changed raw custody, even when the parsed JSON is equivalent. The Test
+    // table's reservation file is covered without opening that table's body.
+    for path in [
+        semantic_output.join("checkpoint.json"),
+        semantic_collection,
+        train.root.join("raw.json"),
+        train.root.join("reservations.json"),
+    ] {
+        let original = fs::read(&path).unwrap();
+        let mut changed = original.clone();
+        changed.push(b' ');
+        assert_eq!(
+            serde_json::from_slice::<Value>(&original).unwrap(),
+            serde_json::from_slice::<Value>(&changed).unwrap()
+        );
+        fs::write(&path, changed).unwrap();
+        assert!(SemanticPlayingRlOwner::from_prepared(&semantic_prepared, 11).is_err());
+        assert!(semantic_owner.handle().is_err());
+        assert!(semantic_owner.identity().is_err());
+        assert!(semantic_owner.actor_parameters().is_err());
+        assert!(semantic_owner.critic_parameters().is_err());
+        assert!(semantic_handle.identity().is_err());
+        assert!(semantic_handle.distribution(&semantic_observation).is_err());
+        assert!(semantic_origin.table_reservations().is_err());
+        fs::write(&path, original).unwrap();
+    }
+    assert_eq!(
+        semantic_owner.identity().unwrap().checksum(),
+        initial_semantic_checksum
     );
 }
 

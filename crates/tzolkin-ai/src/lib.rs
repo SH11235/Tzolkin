@@ -6,6 +6,7 @@ pub mod arena;
 pub mod conditional_human_rl;
 pub mod conditional_human_rl_journal;
 pub mod conditional_human_rl_update;
+pub mod conditional_semantic_playing_rl;
 pub mod dataset;
 pub mod experiment;
 pub mod features;
