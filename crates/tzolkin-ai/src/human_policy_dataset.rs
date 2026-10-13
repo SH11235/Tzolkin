@@ -2,7 +2,10 @@
 //! Content bindings do not authenticate a capture or establish its source options.
 //! This producer never constructs native-policy samples or grants training readiness.
 use crate::dataset::DatasetSplit;
-use crate::features::{EncodedCandidate, FEATURE_COUNT, FeatureEncoder, PUBLIC_FEATURE_SCHEMA};
+use crate::features::{
+    EncodedCandidate, FEATURE_COUNT, FeatureEncoder, PUBLIC_FEATURE_SCHEMA,
+    SEMANTIC_PLAYING_FEATURE_SCHEMA,
+};
 use crate::human_initial_wealth::{ContentPin, NOMINATION_SCHEMA, table_family_id};
 use crate::model::{digest, write_new_json_bounded};
 use crate::public_stochastic_record::unique_json;
@@ -48,12 +51,41 @@ pub const OBSERVED_PENDING_CHOICE_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTech
 pub const INPUT_SCHEMA_V7: &str = "tzolkin-conditional-basic-human-policy-source-v7";
 pub const DATASET_SCHEMA_V7: &str = "tzolkin-conditional-basic-human-policy-dataset-v7";
 pub const CAPPED_EXTRACTION_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTechnologyMarketSellPaidAnywhereCornBegObservedMonumentPositiveTempleAndCappedExtractionV7";
+pub const INPUT_SCHEMA_V8: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-source-v8";
+pub const DATASET_SCHEMA_V8: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v8";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
 const MAX_OUTPUT: usize = 128 * 1024 * 1024;
 const MAX_CANDIDATES: usize = 65_536;
 const MAX_EVENTS: usize = 100_000;
+
+/// Closed conditional input layouts, not native policy or source qualification.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ConditionalFeatureProfile {
+    Public2,
+    SemanticPlaying4,
+}
+impl ConditionalFeatureProfile {
+    pub fn schema(self) -> u32 {
+        match self {
+            Self::Public2 => PUBLIC_FEATURE_SCHEMA,
+            Self::SemanticPlaying4 => SEMANTIC_PLAYING_FEATURE_SCHEMA,
+        }
+    }
+    pub(crate) fn encoder(
+        self,
+        observation: &tzolkin_core::observation::Observation,
+    ) -> Result<FeatureEncoder<'_>, String> {
+        match self {
+            Self::Public2 => FeatureEncoder::new_public(observation),
+            Self::SemanticPlaying4 => FeatureEncoder::new_semantic_playing(observation),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub enum InputBasis {
@@ -75,6 +107,8 @@ struct Manifest {
     schema: String,
     #[serde(default, deserialize_with = "explicit_label_scope")]
     label_scope: Option<String>,
+    #[serde(default, deserialize_with = "explicit_feature_profile")]
+    feature_profile: Option<ConditionalFeatureProfile>,
     basis: InputBasis,
     table_id: String,
     observed_options: UnknownSourceOptions,
@@ -91,8 +125,24 @@ fn explicit_label_scope<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<String>, D::Error> {
     String::deserialize(deserializer).map(Some)
 }
+fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ConditionalFeatureProfile>, D::Error> {
+    ConditionalFeatureProfile::deserialize(deserializer).map(Some)
+}
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
+        if self.schema == INPUT_SCHEMA_V8 {
+            if self.feature_profile == Some(ConditionalFeatureProfile::SemanticPlaying4)
+                && self.label_scope.as_deref() == Some(CAPPED_EXTRACTION_LABEL_SCOPE)
+            {
+                return Ok(Some(CAPPED_EXTRACTION_LABEL_SCOPE));
+            }
+            return Err("Semantic Playing manifest profile/label scope mismatch".into());
+        }
+        if self.feature_profile.is_some() {
+            return Err("Legacy Human manifest cannot declare a different feature profile".into());
+        }
         match (self.schema.as_str(), self.label_scope.as_deref()) {
             (INPUT_SCHEMA, None) => Ok(None),
             (INPUT_SCHEMA_V2, Some(FACTORIZED_LABEL_SCOPE)) => Ok(Some(FACTORIZED_LABEL_SCOPE)),
@@ -263,6 +313,41 @@ impl HumanPolicySample {
     pub fn value_target(&self) -> Option<f32> {
         None
     }
+    /// Source label and complete legal order, deliberately independent of feature values.
+    pub(crate) fn source_label_digest(&self) -> Result<String, String> {
+        let bytes = serde_json::to_vec(&(
+            (
+                &self.sample_id,
+                &self.family_id,
+                self.split,
+                &self.table_id,
+                &self.source_actor_id,
+                self.source_action_id,
+                self.source_message_index,
+                self.replay_step_index,
+            ),
+            (
+                self.actor,
+                &self.observation_key,
+                &self.legal_actions,
+                self.chosen,
+                self.source_label_part,
+                &self.paired_sample_id,
+            ),
+            (
+                &self.source_label_support,
+                &self.paid_technology_support,
+                &self.corn_beg_support,
+                &self.observed_pending_choice_support,
+                &self.capped_extraction_support,
+            ),
+        ))
+        .map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_INPUT {
+            return Err("Conditional source label exceeds bounded legal metadata".into());
+        }
+        Ok(digest(&bytes))
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -273,6 +358,15 @@ pub struct HumanPolicyCounts {
     pub candidates: usize,
     pub excluded: BTreeMap<String, usize>,
 }
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureEligibilityComparison {
+    pub training_selection: &'static str,
+    pub public2: HumanPolicyCounts,
+    pub semantic_playing4: HumanPolicyCounts,
+    pub semantic_only_samples: usize,
+    pub common_source_labels_sha256: String,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HumanPolicyReport<'a> {
@@ -281,6 +375,10 @@ pub struct HumanPolicyReport<'a> {
     source_kind: &'static str,
     basis: InputBasis,
     feature_schema: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feature_profile: Option<ConditionalFeatureProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    feature_eligibility: Option<&'a FeatureEligibilityComparison>,
     feature_count: usize,
     rules_version: u32,
     catalog_hash: String,
@@ -317,6 +415,8 @@ pub struct ConditionalHumanPolicyDataset {
     manifest_sha256: String,
     basis: InputBasis,
     label_scope: Option<&'static str>,
+    feature_profile: ConditionalFeatureProfile,
+    feature_eligibility: Option<FeatureEligibilityComparison>,
     observed_options: UnknownSourceOptions,
     pins: Vec<ContentPin>,
     counts: HumanPolicyCounts,
@@ -1803,6 +1903,7 @@ fn corn_beg_sample(
     support: &CornBegSupport,
     identity: (&str, &str, DatasetSplit, &str, u64),
     counts: &mut HumanPolicyCounts,
+    feature_profile: ConditionalFeatureProfile,
     temple_choice: bool,
 ) -> Result<HumanPolicySample, String> {
     let (family, table, split, actor_id, source_id) = identity;
@@ -1814,13 +1915,13 @@ fn corn_beg_sample(
     let id = |part| {
         digest(format!("tzolkin-human-observed-corn-beg-factor-v5\0{family}\0{actor_id}\0{source_id}\0{part}").as_bytes())
     };
-    let encoder = FeatureEncoder::new_public(observation)?;
+    let encoder = feature_profile.encoder(observation)?;
     let candidates = (0..observation.legal_actions.len())
         .map(|i| encoder.encode_legal_tagged(i))
         .collect::<Result<Vec<_>, _>>()?;
-    let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    let selected = candidates[chosen].values_for_schema(feature_profile.schema())?;
     for (i, candidate) in candidates.iter().enumerate() {
-        let values = candidate.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        let values = candidate.values_for_schema(feature_profile.schema())?;
         if values
             .iter()
             .any(|value| !value.is_finite() || value.abs() > 1024.0)
@@ -1874,16 +1975,17 @@ fn paid_technology_sample(
     support: &PaidTechnologySupport,
     dataset: (&str, &str, DatasetSplit, &str, u64),
     counts: &mut HumanPolicyCounts,
+    feature_profile: ConditionalFeatureProfile,
 ) -> Result<HumanPolicySample, String> {
     let (sample_id, paired_sample_id, part) = label;
     let (family, table_id, split, source_actor_id, source_action_id) = dataset;
-    let encoder = FeatureEncoder::new_public(observation)?;
+    let encoder = feature_profile.encoder(observation)?;
     let candidates = (0..observation.legal_actions.len())
         .map(|i| encoder.encode_legal_tagged(i))
         .collect::<Result<Vec<_>, _>>()?;
-    let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    let selected = candidates[chosen].values_for_schema(feature_profile.schema())?;
     for (i, candidate) in candidates.iter().enumerate() {
-        let values = candidate.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        let values = candidate.values_for_schema(feature_profile.schema())?;
         if values
             .iter()
             .any(|value| !value.is_finite() || value.abs() > 1024.0)
@@ -1938,16 +2040,17 @@ fn capped_extraction_sample(
     support: &CappedExtractionSupport,
     dataset: (&str, &str, DatasetSplit, &str, u64),
     counts: &mut HumanPolicyCounts,
+    feature_profile: ConditionalFeatureProfile,
 ) -> Result<HumanPolicySample, String> {
     let (sample_id, paired_sample_id, part) = label;
     let (family, table_id, split, source_actor_id, source_action_id) = dataset;
-    let encoder = FeatureEncoder::new_public(observation)?;
+    let encoder = feature_profile.encoder(observation)?;
     let candidates = (0..observation.legal_actions.len())
         .map(|i| encoder.encode_legal_tagged(i))
         .collect::<Result<Vec<_>, _>>()?;
-    let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    let selected = candidates[chosen].values_for_schema(feature_profile.schema())?;
     for (i, candidate) in candidates.iter().enumerate() {
-        let values = candidate.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        let values = candidate.values_for_schema(feature_profile.schema())?;
         if values
             .iter()
             .any(|value| !value.is_finite() || value.abs() > 1024.0)
@@ -2004,6 +2107,38 @@ impl ConditionalHumanPolicyDataset {
         nominations_sha256: &str,
         reservations_sha256: &str,
     ) -> Result<Self, String> {
+        Self::load_using(
+            path,
+            manifest_sha256,
+            nominations_sha256,
+            reservations_sha256,
+            ConditionalFeatureProfile::Public2,
+        )
+    }
+    /// Reconstruct schema-4 features from original sources, retaining the schema-2
+    /// eligible labels for a representation-only comparison. Newly distinguishable
+    /// labels are counted separately and are not silently added to this Train set.
+    pub fn load_semantic_playing(
+        path: &Path,
+        manifest_sha256: &str,
+        nominations_sha256: &str,
+        reservations_sha256: &str,
+    ) -> Result<Self, String> {
+        Self::load_using(
+            path,
+            manifest_sha256,
+            nominations_sha256,
+            reservations_sha256,
+            ConditionalFeatureProfile::SemanticPlaying4,
+        )
+    }
+    fn load_using(
+        path: &Path,
+        manifest_sha256: &str,
+        nominations_sha256: &str,
+        reservations_sha256: &str,
+        feature_profile: ConditionalFeatureProfile,
+    ) -> Result<Self, String> {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -2022,6 +2157,11 @@ impl ConditionalHumanPolicyDataset {
         let bytes = read_pin(&manifest_pin, Path::new(""))?;
         let manifest: Manifest = parse(&bytes)?;
         manifest.scope()?;
+        if (manifest.schema == INPUT_SCHEMA_V8)
+            != (feature_profile == ConditionalFeatureProfile::SemanticPlaying4)
+        {
+            return Err("Conditional source requires its explicit feature-profile loader".into());
+        }
         if manifest.nominations.sha256 != nominations_sha256
             || manifest.reservations.sha256 != reservations_sha256
             || manifest.reconstruction_evidence.len() > 32
@@ -2030,6 +2170,24 @@ impl ConditionalHumanPolicyDataset {
         }
         decimal(&manifest.table_id)?;
         let base = path.parent().unwrap_or(Path::new("."));
+        if feature_profile == ConditionalFeatureProfile::SemanticPlaying4 {
+            // Read only declared split metadata before any original game payload.
+            // Unloaded zero-row Test reservations remain part of the closure,
+            // but this BC/evaluation producer never opens a Test table body.
+            let reserved: Reservations = parse(&read_pin(&manifest.reservations, base)?)?;
+            if reserved.schema != RESERVATION_SCHEMA
+                || reserved.entries.len() > MAX_EVENTS
+                || !reserved
+                    .entries
+                    .iter()
+                    .any(|entry| entry.table_id == manifest.table_id)
+                || reserved.entries.iter().any(|entry| {
+                    entry.table_id == manifest.table_id && entry.split == DatasetSplit::Test
+                })
+            {
+                return Err("Semantic Playing BC requires a reserved non-Test source table".into());
+            }
+        }
         let pins = [
             manifest.record.clone(),
             manifest.source_log.clone(),
@@ -2059,7 +2217,74 @@ impl ConditionalHumanPolicyDataset {
             nominations: parse(&loaded[3])?,
             reservations: parse(&loaded[4])?,
         };
-        let mut dataset = Self::produce(&manifest, &sources, manifest_sha256, pins.clone())?;
+        let public = Self::produce_using(
+            &manifest,
+            &sources,
+            manifest_sha256,
+            pins.clone(),
+            ConditionalFeatureProfile::Public2,
+        )?;
+        let mut dataset = if feature_profile == ConditionalFeatureProfile::Public2 {
+            public
+        } else {
+            let mut semantic = Self::produce_using(
+                &manifest,
+                &sources,
+                manifest_sha256,
+                pins.clone(),
+                feature_profile,
+            )?;
+            let full_counts = semantic.counts.clone();
+            let mut full = BTreeMap::new();
+            for sample in semantic.samples {
+                if full.insert(sample.sample_id.clone(), sample).is_some() {
+                    return Err("Duplicate semantic source label".into());
+                }
+            }
+            let mut common = Vec::with_capacity(public.samples.len());
+            let mut label_hash = Sha256::new();
+            label_hash.update(b"tzolkin-conditional-common-source-labels-v1\0");
+            for original in &public.samples {
+                let sample = full
+                    .remove(original.sample_id())
+                    .ok_or("Semantic profile cannot retain every schema-2 eligible source label")?;
+                let label = original.source_label_digest()?;
+                if sample.source_label_digest()? != label
+                    || sample.candidates.len() != original.candidates.len()
+                {
+                    return Err("Feature profiles disagree on source label/legal order".into());
+                }
+                // The state prefix and action identity are unchanged; candidate
+                // descriptors are freshly computed, not relabelled float rows.
+                for (old, new) in original.candidates.iter().zip(&sample.candidates) {
+                    if old.values_for_schema(PUBLIC_FEATURE_SCHEMA)?[..417]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .ne(
+                            new.values_for_schema(SEMANTIC_PLAYING_FEATURE_SCHEMA)?[..417]
+                                .iter()
+                                .map(|v| v.to_bits()),
+                        )
+                    {
+                        return Err(
+                            "Semantic encoding changed the public prefix/action identity".into(),
+                        );
+                    }
+                }
+                label_hash.update(label.as_bytes());
+                common.push(sample);
+            }
+            semantic.feature_eligibility = Some(FeatureEligibilityComparison {
+                training_selection: "schema2EligibleCommonSubset",
+                public2: public.counts.clone(),
+                semantic_playing4: full_counts,
+                semantic_only_samples: full.len(),
+                common_source_labels_sha256: format!("{:x}", label_hash.finalize()),
+            });
+            semantic.counts = public.counts;
+            semantic.samples = common;
+            semantic
+        };
         // Re-pin all original leaves after the bounded reconstruction, not merely metadata.
         read_pin(&manifest_pin, Path::new(""))?;
         for pin in &pins {
@@ -2068,11 +2293,12 @@ impl ConditionalHumanPolicyDataset {
         dataset.source_binding = Some((manifest_pin, base.to_path_buf()));
         Ok(dataset)
     }
-    fn produce(
+    fn produce_using(
         manifest: &Manifest,
         sources: &Sources,
         manifest_sha256: &str,
         pins: Vec<ContentPin>,
+        feature_profile: ConditionalFeatureProfile,
     ) -> Result<Self, String> {
         let label_scope = manifest.scope()?;
         let Sources {
@@ -2246,6 +2472,7 @@ impl ConditionalHumanPolicyDataset {
                     &evidence.support,
                     identity,
                     &mut counts,
+                    feature_profile,
                     false,
                 )?);
                 samples.push(corn_beg_sample(
@@ -2254,6 +2481,7 @@ impl ConditionalHumanPolicyDataset {
                     &evidence.support,
                     identity,
                     &mut counts,
+                    feature_profile,
                     true,
                 )?);
                 beg_temple_steps.insert(index + 1);
@@ -2330,6 +2558,7 @@ impl ConditionalHumanPolicyDataset {
                     support,
                     identity,
                     &mut counts,
+                    feature_profile,
                 )?);
                 if let Some((payment_observation, payment_chosen)) = &evidence.payment {
                     if has_payment_choice {
@@ -2353,6 +2582,7 @@ impl ConditionalHumanPolicyDataset {
                             support,
                             identity,
                             &mut counts,
+                            feature_profile,
                         )?);
                     } else {
                         *counts
@@ -2439,6 +2669,7 @@ impl ConditionalHumanPolicyDataset {
                     support,
                     identity,
                     &mut counts,
+                    feature_profile,
                 )?);
                 if has_payment_choice {
                     if !labels.insert((
@@ -2455,6 +2686,7 @@ impl ConditionalHumanPolicyDataset {
                         support,
                         identity,
                         &mut counts,
+                        feature_profile,
                     )?);
                 } else {
                     *counts
@@ -2722,7 +2954,7 @@ impl ConditionalHumanPolicyDataset {
             if !labels.insert((source_id, message_index, part)) {
                 return Err("Source label was consumed twice".into());
             }
-            let encoder = FeatureEncoder::new_public(observation)?;
+            let encoder = feature_profile.encoder(observation)?;
             let candidate_count = counts
                 .candidates
                 .checked_add(observation.legal_actions.len())
@@ -2735,7 +2967,7 @@ impl ConditionalHumanPolicyDataset {
                 .collect::<Result<Vec<_>, _>>()?;
             for candidate in &candidates {
                 if candidate
-                    .values_for_schema(PUBLIC_FEATURE_SCHEMA)?
+                    .values_for_schema(feature_profile.schema())?
                     .iter()
                     .any(|value| !value.is_finite() || value.abs() > 1024.0)
                 {
@@ -2743,11 +2975,11 @@ impl ConditionalHumanPolicyDataset {
                 }
             }
             if factorized || explicit || strategic {
-                let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+                let selected = candidates[chosen].values_for_schema(feature_profile.schema())?;
                 if candidates.iter().enumerate().any(|(i, candidate)| {
                     i != chosen
                         && candidate
-                            .values_for_schema(PUBLIC_FEATURE_SCHEMA)
+                            .values_for_schema(feature_profile.schema())
                             .is_ok_and(|values| values == selected)
                 }) {
                     *counts
@@ -2804,6 +3036,8 @@ impl ConditionalHumanPolicyDataset {
             manifest_sha256: manifest_sha256.into(),
             basis: manifest.basis,
             label_scope,
+            feature_profile,
+            feature_eligibility: None,
             observed_options: manifest.observed_options.clone(),
             pins,
             counts,
@@ -2812,6 +3046,12 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn samples(&self) -> &[HumanPolicySample] {
         &self.samples
+    }
+    pub fn feature_profile(&self) -> ConditionalFeatureProfile {
+        self.feature_profile
+    }
+    pub fn feature_eligibility(&self) -> Option<&FeatureEligibilityComparison> {
+        self.feature_eligibility.as_ref()
     }
     pub fn counts(&self) -> &HumanPolicyCounts {
         &self.counts
@@ -2889,16 +3129,42 @@ impl ConditionalHumanPolicyDataset {
     }
     #[cfg(test)]
     pub(crate) fn training_fixture(table: &str, split: DatasetSplit, chosen: usize) -> Self {
+        Self::training_fixture_using(
+            table,
+            split,
+            chosen,
+            ConditionalFeatureProfile::Public2,
+            false,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn training_fixture_using(
+        table: &str,
+        split: DatasetSplit,
+        chosen: usize,
+        profile: ConditionalFeatureProfile,
+        playing: bool,
+    ) -> Self {
         // Only the private numerical tests can construct these synthetic labels.
-        let state =
+        let mut state =
             tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 42, false).unwrap();
+        if playing {
+            for _ in 0..3 {
+                let observation =
+                    tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+                state =
+                    tzolkin_core::apply_move(&state, observation.legal_actions[0].r#move.clone())
+                        .unwrap();
+            }
+            assert_eq!(state.phase, Phase::Playing);
+        }
         let observation = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
-        let encoder = FeatureEncoder::new_public(&observation).unwrap();
+        let encoder = profile.encoder(&observation).unwrap();
         let candidates = (0..observation.legal_actions.len())
             .map(|i| encoder.encode_legal_tagged(i).unwrap())
             .collect::<Vec<_>>();
         let family = table_family_id(table).unwrap();
-        Self {
+        let mut dataset = Self {
             table_id: table.into(),
             split,
             reservations: BTreeMap::from([(table.into(), split)]),
@@ -2906,7 +3172,9 @@ impl ConditionalHumanPolicyDataset {
             synthetic: true,
             manifest_sha256: digest(table.as_bytes()),
             basis: InputBasis::ConditionalBasicHumanPolicy,
-            label_scope: None,
+            label_scope: playing.then_some(CAPPED_EXTRACTION_LABEL_SCOPE),
+            feature_profile: profile,
+            feature_eligibility: None,
             observed_options: UnknownSourceOptions {
                 tribes: (),
                 prophecies: (),
@@ -2944,7 +3212,17 @@ impl ConditionalHumanPolicyDataset {
                 observed_pending_choice_support: None,
                 capped_extraction_support: None,
             }],
+        };
+        if profile == ConditionalFeatureProfile::SemanticPlaying4 {
+            dataset.feature_eligibility = Some(FeatureEligibilityComparison {
+                training_selection: "schema2EligibleCommonSubset",
+                public2: dataset.counts.clone(),
+                semantic_playing4: dataset.counts.clone(),
+                semantic_only_samples: 0,
+                common_source_labels_sha256: dataset.samples[0].source_label_digest().unwrap(),
+            });
         }
+        dataset
     }
     #[cfg(test)]
     pub(crate) fn factorized_training_fixture(
@@ -2959,7 +3237,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE) {
+            schema: if self.feature_profile == ConditionalFeatureProfile::SemanticPlaying4 {
+                DATASET_SCHEMA_V8
+            } else if self.label_scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE) {
                 DATASET_SCHEMA_V7
             } else if self.label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) {
                 DATASET_SCHEMA_V6
@@ -2977,7 +3257,10 @@ impl ConditionalHumanPolicyDataset {
             task: TASK,
             source_kind: "conditionalBasicHumanPolicy",
             basis: self.basis,
-            feature_schema: PUBLIC_FEATURE_SCHEMA,
+            feature_schema: self.feature_profile.schema(),
+            feature_profile: (self.feature_profile == ConditionalFeatureProfile::SemanticPlaying4)
+                .then_some(self.feature_profile),
+            feature_eligibility: self.feature_eligibility.as_ref(),
             feature_count: FEATURE_COUNT,
             rules_version: PUBLIC_RULES_VERSION,
             catalog_hash: public_catalog_hash(),

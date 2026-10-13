@@ -8,8 +8,8 @@ use tzolkin_core::observation::{Observation, TypedAction};
 use tzolkin_core::{GameMove, Phase, Task};
 
 use crate::features::{
-    EncodedCandidate, FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA, SEMANTIC_SETUP_FEATURE_SCHEMA,
-    SETUP_PAIR_FEATURE_COUNT, SETUP_PAIR_FEATURE_START,
+    EncodedCandidate, FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA, SEMANTIC_PLAYING_FEATURE_SCHEMA,
+    SEMANTIC_SETUP_FEATURE_SCHEMA, SETUP_PAIR_FEATURE_COUNT, SETUP_PAIR_FEATURE_START,
 };
 use crate::kernel::ResolvedKernel;
 
@@ -23,18 +23,20 @@ const BP: usize = WP + HIDDEN;
 const MAX_FEATURE_ABS: f32 = 1024.0;
 const CONTEXT_COLUMNS: usize = 384;
 
-// Only the two explicit numeric borrows below can select a profile. This is
+// Only the explicit numeric borrows below can select these closed profiles. This is
 // numeric layout validation, never model/source ownership or qualification.
 #[derive(Clone, Copy)]
 enum FeatureProfile {
     Public,
     SemanticSetup,
+    SemanticPlaying,
 }
 impl FeatureProfile {
     fn schema(self) -> u32 {
         match self {
             Self::Public => PUBLIC_FEATURE_SCHEMA,
             Self::SemanticSetup => SEMANTIC_SETUP_FEATURE_SCHEMA,
+            Self::SemanticPlaying => SEMANTIC_PLAYING_FEATURE_SCHEMA,
         }
     }
 }
@@ -68,6 +70,13 @@ pub fn validated_semantic_setup_values(
     validated_values_using(row, FeatureProfile::SemanticSetup)
 }
 
+/// Schema-4 Playing layout validation only; no source or training admission.
+pub fn validated_semantic_playing_values(
+    row: &EncodedCandidate,
+) -> Result<&[f32; FEATURE_COUNT], String> {
+    validated_values_using(row, FeatureProfile::SemanticPlaying)
+}
+
 fn validated_values_using(
     row: &EncodedCandidate,
     profile: FeatureProfile,
@@ -96,6 +105,12 @@ fn validated_values_using(
     }
     if matches!(profile, FeatureProfile::SemanticSetup) {
         validate_semantic_pair_values(values)?;
+    }
+    if matches!(profile, FeatureProfile::SemanticPlaying) {
+        if [values[231], values[232], values[233]] != [0.0, 1.0, 0.0] {
+            return Err("Semantic Playing policy cannot score Setup features".into());
+        }
+        crate::features::validate_semantic_playing_values(values)?;
     }
     Ok(values)
 }
@@ -166,6 +181,33 @@ impl<'a> BorrowedSemanticSetupPolicy<'a> {
             numeric: NumericPolicy {
                 parameters,
                 profile: FeatureProfile::SemanticSetup,
+            },
+        })
+    }
+    pub fn predict(
+        &self,
+        kernel: ResolvedKernel,
+        rows: &[EncodedCandidate],
+    ) -> Result<NumericPolicyDistribution, String> {
+        predict_numeric(&self.numeric, kernel, rows)
+    }
+    pub fn logit(&self, row: &EncodedCandidate, kernel: ResolvedKernel) -> Result<f32, String> {
+        self.numeric.logit(row, kernel)
+    }
+}
+/// Explicit schema-4 Playing numeric borrow. It has no artifact or owner authority.
+pub struct BorrowedSemanticPlayingPolicy<'a> {
+    numeric: NumericPolicy<'a>,
+}
+impl<'a> BorrowedSemanticPlayingPolicy<'a> {
+    pub fn from_validated_parameters(parameters: &'a [f32]) -> Result<Self, String> {
+        if parameters.len() != PARAMETER_COUNT {
+            return Err("Invalid public policy parameter shape/finite values".into());
+        }
+        Ok(Self {
+            numeric: NumericPolicy {
+                parameters,
+                profile: FeatureProfile::SemanticPlaying,
             },
         })
     }

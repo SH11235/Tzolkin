@@ -270,6 +270,17 @@ pub(crate) fn predict_numeric(
     BorrowedPolicy::from_validated_parameters(&model.parameters)?.predict(kernel, rows)
 }
 
+pub(crate) fn predict_semantic_playing_numeric(
+    model: &PublicPolicyModel,
+    kernel: ResolvedKernel,
+    rows: &[EncodedCandidate],
+) -> Result<NumericPolicyDistribution, String> {
+    tzolkin_inference::policy::BorrowedSemanticPlayingPolicy::from_validated_parameters(
+        &model.parameters,
+    )?
+    .predict(kernel, rows)
+}
+
 pub(crate) fn validate_contract(o: &Observation) -> Result<(), String> {
     policy::validate_contract(o)
 }

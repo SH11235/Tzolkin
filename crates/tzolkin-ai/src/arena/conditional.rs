@@ -75,6 +75,8 @@ impl<'a> ConditionalPolicy<'a> {
         setup: ConditionalSetup,
         guard: TradeGuardConfig,
     ) -> Result<Self, String> {
+        // This constructor retains the legacy schema-2 policy identity.
+        prepared.model().validate()?;
         let configuration_key = guard.configuration_key()?;
         Ok(Self {
             prepared,

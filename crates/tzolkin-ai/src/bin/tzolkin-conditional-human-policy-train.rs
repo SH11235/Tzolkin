@@ -2,11 +2,26 @@
 use std::path::Path;
 use tzolkin_ai::human_policy_training::{
     ConditionalHumanPolicyCheckpoint, train_collection_manifest,
+    train_semantic_playing_collection_manifest,
 };
 use tzolkin_ai::policy_training::validate_new_output_directory;
 
 fn run() -> Result<(), String> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "--semantic-playing4") {
+        if args.len() != 3 {
+            return Err("Usage: tzolkin-conditional-human-policy-train --semantic-playing4 INPUT.json NEW_OUTPUT_DIR (fresh only)".into());
+        }
+        let output = Path::new(&args[2]);
+        validate_new_output_directory(output)?;
+        let outcome = train_semantic_playing_collection_manifest(Path::new(&args[1]))?;
+        outcome.save_new_semantic_playing_directory(output)?;
+        println!(
+            "{}",
+            serde_json::to_string(&outcome.metrics).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
     if !(2..=3).contains(&args.len()) {
         return Err("Usage: tzolkin-conditional-human-policy-train INPUT.json NEW_OUTPUT_DIR [RESUME_CHECKPOINT.json]".into());
     }
