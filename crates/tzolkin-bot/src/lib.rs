@@ -8,6 +8,7 @@ pub const POLICY_VERSION: &str = "heuristic-v2";
 pub const FOOD_ALIGNED_POLICY_VERSION: &str = "heuristic-food-aligned-v1";
 pub const FOOD_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-food-aligned-v2";
 pub const MONUMENT_ALIGNED_POLICY_VERSION: &str = "heuristic-monument-aligned-v1";
+pub const MONUMENT_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-monument-aligned-v2";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {
@@ -71,6 +72,18 @@ pub fn choose_move_monument_aligned(observation: &Observation) -> Result<Decisio
         &weights,
         MONUMENT_ALIGNED_POLICY_VERSION,
         |action| policy::score_action_monument_aligned(observation, action, &weights),
+    )
+}
+
+/// V2 also counts exact untaxed rewards when previewing an owned Yaxchilan
+/// worker at positions 1..5. Existing App and historical selectors are retained.
+pub fn choose_move_monument_aligned_v2(observation: &Observation) -> Result<Decision, String> {
+    let weights = policy::HeuristicWeights::default();
+    choose_scored(
+        observation,
+        &weights,
+        MONUMENT_ALIGNED_V2_POLICY_VERSION,
+        |action| policy::score_action_monument_aligned_v2(observation, action, &weights),
     )
 }
 
