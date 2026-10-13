@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use tzolkin_ai::dataset::DatasetSplit;
 use tzolkin_ai::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
 use tzolkin_ai::human_policy_dataset::{
-    ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
-    INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5,
-    INPUT_SCHEMA_V6, OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
+    CAPPED_EXTRACTION_LABEL_SCOPE, ConditionalHumanPolicyDataset,
+    EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, INPUT_SCHEMA, INPUT_SCHEMA_V2,
+    INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5, INPUT_SCHEMA_V6, INPUT_SCHEMA_V7,
+    OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
     PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
@@ -482,6 +483,178 @@ impl Fixture {
         fixture.set_messages(messages);
         fixture
     }
+    fn capped_extraction(free: bool) -> Self {
+        use tzolkin_core::observation::ActionSource;
+        use tzolkin_core::{GameMove, Resource, Task, TechnologyId};
+        let mut state = create_game((0..4).map(|i| format!("P{i}")).collect(), 9, false).unwrap();
+        while state.phase == Phase::Setup {
+            let row = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .filter(|row| match &row.action {
+                    TypedAction::ChooseWealth { ids } if state.current_player == 0 => {
+                        ["w07", "w10"].iter().all(|t| ids.iter().any(|id| id == t))
+                    }
+                    TypedAction::ChooseWealth { .. } => true,
+                    _ => false,
+                })
+                .max_by_key(|row| {
+                    let TypedAction::ChooseWealth { ids } = &row.action else {
+                        unreachable!()
+                    };
+                    ids.iter()
+                        .map(|id| {
+                            tzolkin_core::catalog::wealth(id)
+                                .unwrap()
+                                .resources
+                                .get(&Resource::Corn)
+                                .copied()
+                                .unwrap_or(0)
+                        })
+                        .sum::<i64>()
+                })
+                .unwrap();
+            state = apply_move(&state, row.r#move).unwrap();
+        }
+        // Normal wealth/counters and legal play; the free case observes a
+        // synthetic catalog-valid Age-II refill, never an invented pending task.
+        if free {
+            state.age2_deck.retain(|id| id != "b23");
+            state.age2_deck.insert(0, "b23".into());
+        }
+        let initial = PublicState::from_game_state(&state).unwrap();
+        let mut steps = Vec::new();
+        fn append(state: &mut GameState, steps: &mut Vec<Value>, move_: GameMove, source: bool) {
+            let next = apply_move(state, move_.clone()).unwrap();
+            let refills = if state.age != next.age {
+                json!({"age2":next.buildings})
+            } else {
+                json!({"currentAge":state.building_deck[..state.building_deck.len()-next.building_deck.len()]})
+            };
+            steps.push(json!({"actor":state.current_player,"move":move_,"sourceActionIds":if source {vec![10]} else {vec![]},"refills":refills,"checkpoint":null}));
+            *state = next;
+        }
+        let mut traded = 0;
+        let mut free_tikal_placed = false;
+        loop {
+            assert!(
+                steps.len() < 400 && state.round <= 19,
+                "bounded capped extraction prefix"
+            );
+            let actor = state.current_player;
+            let rows = observe(&state, actor).unwrap().legal_actions;
+            if actor == 0
+                && matches!(state.pending.as_ref().map(|p| &p.task), Some(Task::Technology { free: f, .. }) if *f == free)
+                && state.players[0].technologies[&TechnologyId::Extraction] == 3
+            {
+                break;
+            }
+            let row = if let Some(pending) = state.pending.as_ref() {
+                match &pending.task {
+                    Task::Trade if actor == 0 => rows.iter().find(|row| row.action == if traded < 5 {
+                        TypedAction::Trade { resource: Resource::Wood, buy: true }
+                    } else { TypedAction::Skip }),
+                    Task::Technology { .. } if actor == 0 => rows.iter().find(|row| row.action == TypedAction::Technology { technology: TechnologyId::Extraction }),
+                    Task::PayTechnology { amount, .. } if actor == 0 => {
+                        let resources = if *amount == 2 {
+                            if free { [0,0,2,0,0] } else { [0,1,1,0,0] }
+                        } else { [0,3,0,0,0] };
+                        rows.iter().find(|row| row.action == TypedAction::Payment { resources })
+                    }
+                    Task::Build { .. } if actor == 0 && free => rows.iter().find(|row| matches!(&row.action, TypedAction::Build { id, .. } if id == "b23")),
+                    Task::Action { gear: GearId::Uxmal, .. } if actor == 0 && state.round == 3 => rows.iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Uxmal, position: 2, .. })),
+                    Task::Action { gear: GearId::Tikal, .. } if actor == 0 => rows.iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Tikal, position, source: ActionSource::CurrentGear, .. }
+                        if position == if state.round == 5 { 3 } else if free { 2 } else { 1 })),
+                    _ => rows.iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Palenque, position: 1, .. }))
+                        .or_else(|| rows.first()),
+                }
+            } else if let Some(end) = rows.iter().find(|row| matches!(row.action, TypedAction::EndTurn { double_advance: None | Some(false) })) {
+                Some(end)
+            } else if actor == 0 && matches!(state.round, 1 | 2) {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear, .. } if gear == if state.round == 1 { GearId::Uxmal } else { GearId::Tikal }))
+            } else if actor == 0 && state.round == 3 {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Uxmal, position: 2 }))
+            } else if actor == 0 && state.round == 5 {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Tikal, position: 3 }))
+            } else if actor == 0 && !free && state.round == 6 {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: GearId::Tikal, .. }))
+            } else if actor == 0 && !free && state.round == 7 {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Tikal, position: 1 }))
+            } else if actor == 0 && free && state.age == 2 && !free_tikal_placed {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: GearId::Tikal, .. }))
+            } else if actor == 0 && free && state.age == 2 && rows.iter().any(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Tikal, position: 2 })) {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Tikal, position: 2 }))
+            } else {
+                rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Palenque, position } if position > 0))
+                    .or_else(|| rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: GearId::Palenque, .. })))
+                    .or_else(|| rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: GearId::Yaxchilan, .. })))
+                    .or_else(|| rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Yaxchilan, .. })))
+            }.unwrap_or_else(|| panic!("missing capped prefix move: free={free} round={} actor={actor} pending={:?}", state.round, state.pending));
+            if actor == 0 && matches!(row.action, TypedAction::Trade { buy: true, .. }) {
+                traded += 1;
+            }
+            if actor == 0
+                && free
+                && state.age == 2
+                && matches!(
+                    row.action,
+                    TypedAction::Place {
+                        gear: GearId::Tikal,
+                        ..
+                    }
+                )
+            {
+                free_tikal_placed = true;
+            }
+            append(&mut state, &mut steps, row.r#move.clone(), false);
+        }
+        let mut fixture = Self::new();
+        fixture.record["initial"] = json!(initial);
+        fixture.raw["metadata"]["players"] = json!((0..4).map(|i| json!({"text":format!("P{i}"),"url":format!("https://boardgamearena.com/player?id={}",101+i)})).collect::<Vec<_>>());
+        let row = observe(&state, 0)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                row.action
+                    == TypedAction::Technology {
+                        technology: TechnologyId::Extraction,
+                    }
+            })
+            .unwrap();
+        append(&mut state, &mut steps, row.r#move.clone(), true);
+        let mut audit = vec![
+            json!({"step":steps.len(),"actionId":10,"actor":0,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}),
+        ];
+        let mut messages = Vec::new();
+        if !free {
+            let row = observe(&state, 0)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|row| {
+                    row.action
+                        == TypedAction::Payment {
+                            resources: [0, 1, 0, 0, 0],
+                        }
+                })
+                .unwrap();
+            append(&mut state, &mut steps, row.r#move, true);
+            audit.push(json!({"step":steps.len(),"actionId":10,"actor":0,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+            messages.push(json!({"raw_text":"P0は\nを支払った","html":"P0は<div class=\"tz_icon resource_wood\"></div>を支払った","icons":[{"classes":"tz_icon resource_wood"}]}));
+        }
+        for caption in [
+            "P0は収集を1レベル進めた",
+            "収集技術ボーナス: P0は好きな資源2個を得た",
+        ] {
+            messages.push(json!({"raw_text":caption,"html":caption,"icons":[]}));
+        }
+        fixture.record["steps"] = json!(steps);
+        fixture.audit["audit"] = json!(audit);
+        fixture.set_messages(messages);
+        fixture
+    }
     fn set_messages(&mut self, messages: Vec<Value>) {
         self.raw["entries"][0]["raw_text"] = json!(
             messages
@@ -878,7 +1051,9 @@ impl Fixture {
             manifest["labelScope"] = scope;
         }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V6 {
+        let file = if schema == INPUT_SCHEMA_V7 {
+            "manifest-v7.json"
+        } else if schema == INPUT_SCHEMA_V6 {
             "manifest-v6.json"
         } else if schema == INPUT_SCHEMA_V5 {
             "manifest-v5.json"
@@ -1863,6 +2038,157 @@ fn observed_paid_technology_v3_requires_exact_materials_and_preserves_prior_labe
     assert_ne!(
         old.checkpoint.dataset.fingerprint,
         fresh.checkpoint.dataset.fingerprint
+    );
+    let load_capped =
+        |f: &Fixture| f.load_scope(INPUT_SCHEMA_V7, Some(json!(CAPPED_EXTRACTION_LABEL_SCOPE)));
+    for free in [false, true] {
+        let mut f = Fixture::capped_extraction(free);
+        assert!(
+            f.load_scope(
+                INPUT_SCHEMA_V6,
+                Some(json!(OBSERVED_PENDING_CHOICE_LABEL_SCOPE))
+            )
+            .unwrap()
+            .samples()
+            .is_empty()
+        );
+        let dataset = load_capped(&f).unwrap();
+        let report = serde_json::to_value(dataset.report()).unwrap();
+        assert_eq!(dataset.samples().len(), if free { 1 } else { 2 });
+        assert_eq!(
+            report["schema"],
+            "tzolkin-conditional-basic-human-policy-dataset-v7"
+        );
+        assert_eq!(report["sourceQualified"], false);
+        assert_eq!(report["trainingReady"], false);
+        for sample in report["samples"].as_array().unwrap() {
+            assert_eq!(sample["cappedExtractionSupport"]["free"], free);
+            assert_eq!(
+                sample["cappedExtractionSupport"]["unchangedExtractionLevel"],
+                3
+            );
+            assert_eq!(
+                sample["cappedExtractionSupport"]["pendingBonusResources"],
+                2
+            );
+            assert_eq!(
+                sample["cappedExtractionSupport"]["bonusResourceChoicesLabelled"],
+                false
+            );
+            assert!(sample.get("paidTechnologySupport").is_none());
+            assert_eq!(sample["valueTarget"], Value::Null);
+            assert!(sample["legalActions"].as_array().unwrap().len() > 1);
+        }
+        assert_eq!(report["samples"][0]["sourceLabelPart"], "cappedExtraction");
+        if !free {
+            assert_eq!(
+                report["samples"][1]["sourceLabelPart"],
+                "cappedExtractionMaterialPayment"
+            );
+            assert_eq!(
+                report["samples"][0]["pairedSampleId"],
+                report["samples"][1]["sampleId"]
+            );
+        }
+        let original_raw = f.raw.clone();
+        let original_audit = f.audit.clone();
+        for mutation in [
+            "missingBonus",
+            "wrongBonusCount",
+            "bonusMarkup",
+            "foreignBonus",
+            "duplicateBonus",
+            "wrongOrder",
+            "ambiguousAudit",
+            "wrongMaterial",
+        ] {
+            if free && mutation == "wrongMaterial" {
+                continue;
+            }
+            f.raw = original_raw.clone();
+            f.audit = original_audit.clone();
+            let mut messages = f.raw["dom_entries"][0]["messages"]
+                .as_array()
+                .unwrap()
+                .clone();
+            match mutation {
+                "missingBonus" => {
+                    messages.pop();
+                }
+                "wrongBonusCount" => {
+                    let m = messages.last_mut().unwrap();
+                    m["raw_text"] = json!("収集技術ボーナス: P0は好きな資源3個を得た");
+                    m["html"] = m["raw_text"].clone();
+                }
+                "bonusMarkup" => {
+                    messages.last_mut().unwrap()["html"] = json!("<span>hidden bonus</span>");
+                }
+                "foreignBonus" => {
+                    let m = messages.last_mut().unwrap();
+                    m["raw_text"] = json!("収集技術ボーナス: P1は好きな資源2個を得た");
+                    m["html"] = m["raw_text"].clone();
+                }
+                "duplicateBonus" => messages.push(messages.last().unwrap().clone()),
+                "wrongOrder" => messages.reverse(),
+                "ambiguousAudit" => f.audit["audit"][0]["equivalentChoices"] = json!(2),
+                "wrongMaterial" => {
+                    messages[0]["html"] =
+                        json!("P0は<div class=\"tz_icon resource_stone\"></div>を支払った");
+                    messages[0]["icons"][0]["classes"] = json!("tz_icon resource_stone");
+                }
+                _ => unreachable!(),
+            }
+            f.set_messages(messages);
+            if let Ok(d) = load_capped(&f) {
+                assert!(d.samples().is_empty(), "capped free={free}/{mutation}");
+            }
+        }
+    }
+    for old in [
+        Fixture::new(),
+        Fixture::paid_technology(4, 1, [1, 1, 0]),
+        Fixture::pending_choice(true, 4),
+        Fixture::pending_choice(false, 4),
+    ] {
+        let v6 = old
+            .load_scope(
+                INPUT_SCHEMA_V6,
+                Some(json!(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)),
+            )
+            .unwrap();
+        let v7 = load_capped(&old).unwrap();
+        assert_eq!(
+            serde_json::to_vec(v6.samples()).unwrap(),
+            serde_json::to_vec(v7.samples()).unwrap()
+        );
+    }
+    let mut train = Fixture::capped_extraction(false);
+    train.reservations["entries"][0]["split"] = json!("train");
+    let mut validation = Fixture::capped_extraction(true);
+    validation.raw["table_id"] = json!("124");
+    validation.raw["metadata"]["table_id"] = json!("124");
+    validation.raw["source_url"] = json!("https://boardgamearena.com/gamereview?table=124");
+    validation.record["source"]["reference"] = validation.raw["source_url"].clone();
+    validation.audit["tableId"] = json!("124");
+    validation.reservations["entries"][0]["tableId"] = json!("124");
+    let trained = tzolkin_ai::human_policy_training::train_conditional_datasets(
+        &[
+            load_capped(&train).unwrap(),
+            load_capped(&validation).unwrap(),
+        ],
+        &tzolkin_ai::policy_training::PolicyBcConfig {
+            epochs: 1,
+            batch_size: 1,
+            learning_rate: 0.001,
+            seed: 7,
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(trained.checkpoint.dataset.samples, [2, 1, 0]);
+    assert_eq!(
+        trained.checkpoint.dataset.label_scope.as_deref(),
+        Some(CAPPED_EXTRACTION_LABEL_SCOPE)
     );
 }
 

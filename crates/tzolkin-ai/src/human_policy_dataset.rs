@@ -45,6 +45,9 @@ pub const OBSERVED_CORN_BEG_LABEL_SCOPE: &str =
 pub const INPUT_SCHEMA_V6: &str = "tzolkin-conditional-basic-human-policy-source-v6";
 pub const DATASET_SCHEMA_V6: &str = "tzolkin-conditional-basic-human-policy-dataset-v6";
 pub const OBSERVED_PENDING_CHOICE_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTechnologyMarketSellPaidAnywhereCornBegAndObservedMonumentPositiveTempleV6";
+pub const INPUT_SCHEMA_V7: &str = "tzolkin-conditional-basic-human-policy-source-v7";
+pub const DATASET_SCHEMA_V7: &str = "tzolkin-conditional-basic-human-policy-dataset-v7";
+pub const CAPPED_EXTRACTION_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTechnologyMarketSellPaidAnywhereCornBegObservedMonumentPositiveTempleAndCappedExtractionV7";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -104,6 +107,9 @@ impl Manifest {
             }
             (INPUT_SCHEMA_V6, Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)) => {
                 Ok(Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE))
+            }
+            (INPUT_SCHEMA_V7, Some(CAPPED_EXTRACTION_LABEL_SCOPE)) => {
+                Ok(Some(CAPPED_EXTRACTION_LABEL_SCOPE))
             }
             _ => Err("Conditional Human manifest label scope mismatch".into()),
         }
@@ -166,7 +172,26 @@ pub struct HumanPolicySample {
     corn_beg_support: Option<CornBegSupport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     observed_pending_choice_support: Option<ObservedPendingChoiceSupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capped_extraction_support: Option<CappedExtractionSupport>,
 }
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CappedExtractionSupport {
+    observed_operation_id: String,
+    technology_replay_step_index: usize,
+    payment_replay_step_index: Option<usize>,
+    technology_message_index: usize,
+    bonus_message_index: usize,
+    payment_message_indices: Vec<usize>,
+    observed_materials: [i64; 5],
+    free: bool,
+    unchanged_extraction_level: i64,
+    pending_bonus_resources: i64,
+    bonus_resource_choices_labelled: bool,
+    basis: &'static str,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObservedPendingChoiceSupport {
@@ -996,6 +1021,239 @@ fn observed_pending_choice_evidence(
     }))
 }
 
+struct CappedExtractionEvidence {
+    support: CappedExtractionSupport,
+    payment: Option<(tzolkin_core::observation::Observation, usize)>,
+}
+
+fn capped_extraction_evidence(
+    index: usize,
+    sources: &Sources,
+    report: &PublicReplayReport,
+    audit_rows: &[Value],
+    family: &str,
+    source_actor_id: &str,
+) -> Result<Option<CappedExtractionEvidence>, String> {
+    let step = &sources.record.steps[index];
+    let before = &report.frames[index].snapshot.state;
+    let observation = inspect_public(before)?
+        .observation
+        .ok_or("Missing capped technology observation")?;
+    let Some(pending) = before.pending.as_ref() else {
+        return Ok(None);
+    };
+    let Task::Technology {
+        remaining: remaining @ 1..=2,
+        free,
+        mandatory,
+    } = pending.task
+    else {
+        return Ok(None);
+    };
+    if !matches!(before.players.len(), 3 | 4)
+        || observation.legal_actions.len() < 2
+        || before.players[step.actor].technologies[&TechnologyId::Extraction] != 3
+        || step.refills != Default::default()
+    {
+        return Ok(None);
+    }
+    // No other Technology choice in this shared event can borrow its captions.
+    let mut technology_steps = 0;
+    for (i, row) in sources.record.steps.iter().enumerate() {
+        if row.actor != step.actor || !row.source_action_ids.contains(&step.source_action_ids[0]) {
+            continue;
+        }
+        if row.source_action_ids != step.source_action_ids {
+            return Ok(None);
+        }
+        let event = inspect_public(&report.frames[i].snapshot.state)?
+            .observation
+            .ok_or("Missing shared technology observation")?;
+        let matching = event
+            .legal_actions
+            .iter()
+            .filter(|a| a.r#move == row.r#move)
+            .collect::<Vec<_>>();
+        if event.actor != step.actor || matching.len() != 1 {
+            return Ok(None);
+        }
+        if matches!(matching[0].action, TypedAction::Technology { .. }) {
+            technology_steps += 1;
+        }
+    }
+    if technology_steps != 1 {
+        return Ok(None);
+    }
+    let name = &sources.record.initial.players[step.actor].name;
+    let messages = sources.raw["dom_entries"]
+        .as_array()
+        .ok_or("Missing source messages")?
+        .iter()
+        .find(|n| n["action_id"].as_u64() == Some(step.source_action_ids[0]))
+        .and_then(|n| n["messages"].as_array())
+        .ok_or("Missing capped technology source")?;
+    let caption = format!("{name}は収集を1レベル進めた");
+    let bonus = format!("収集技術ボーナス: {name}は好きな資源2個を得た");
+    let mut technology_message_index = None;
+    let mut bonus_message_index = None;
+    let mut payment_message_indices = Vec::new();
+    let mut materials = [0i64; 5];
+    for (i, message) in messages.iter().enumerate() {
+        if plain_caption(message, &caption) {
+            if technology_message_index.replace(i).is_some() {
+                return Ok(None);
+            }
+        } else if plain_caption(message, &bonus) {
+            if bonus_message_index.replace(i).is_some() {
+                return Ok(None);
+            }
+        } else if !free
+            && let Some(vector) =
+                material_caption(message, name, sources.raw["schema_version"] == 1)
+        {
+            for (total, n) in materials.iter_mut().zip(vector) {
+                *total = total.checked_add(n).ok_or("Observed material overflow")?;
+            }
+            payment_message_indices.push(i);
+        } else {
+            return Ok(None);
+        }
+    }
+    let (Some(technology_message_index), Some(bonus_message_index)) =
+        (technology_message_index, bonus_message_index)
+    else {
+        return Ok(None);
+    };
+    if bonus_message_index <= technology_message_index
+        || payment_message_indices
+            .iter()
+            .any(|i| *i >= technology_message_index)
+    {
+        return Ok(None);
+    }
+    let mut continuation = vec![Task::Technology {
+        remaining: remaining - 1,
+        free,
+        mandatory,
+    }];
+    continuation.extend(pending.after.clone());
+    let mut expected_bonus = before.clone();
+    expected_bonus.pending = Some(Pending {
+        title: "資源を選択（残り 2 個）".into(),
+        task: Task::Resource { remaining: 2 },
+        after: continuation.clone(),
+    });
+    let payment = if free {
+        if !payment_message_indices.is_empty() || materials != [0; 5] {
+            return Ok(None);
+        }
+        expected_bonus.log = report.frames[index + 1].snapshot.state.log.clone();
+        if report.frames[index + 1].snapshot.state != expected_bonus {
+            return Ok(None);
+        }
+        None
+    } else {
+        let Some(payment_step) = sources.record.steps.get(index + 1) else {
+            return Ok(None);
+        };
+        if payment_step.actor != step.actor
+            || payment_step.source_action_ids != step.source_action_ids
+            || payment_step.refills != Default::default()
+        {
+            return Ok(None);
+        }
+        let current = &report.frames[index + 1].snapshot.state;
+        let after = &report.frames[index + 2].snapshot.state;
+        let mut expected_payment = before.clone();
+        expected_payment.log = current.log.clone();
+        expected_payment.pending = Some(Pending {
+            title: format!(
+                "{}：資源 1 個を支払う",
+                tzolkin_core::catalog::CATALOG.technology_labels[&TechnologyId::Extraction]
+            ),
+            task: Task::PayTechnology {
+                technology: TechnologyId::Extraction,
+                amount: 1,
+                optional: false,
+            },
+            after: continuation,
+        });
+        if current != &expected_payment
+            || payment_message_indices.is_empty()
+            || materials.iter().sum::<i64>() != 1
+        {
+            return Ok(None);
+        }
+        let payment_observation = inspect_public(current)?
+            .observation
+            .ok_or("Missing capped payment observation")?;
+        let matching = payment_observation
+            .legal_actions
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.r#move == payment_step.r#move)
+            .collect::<Vec<_>>();
+        if payment_observation.actor != step.actor || matching.len() != 1 {
+            return Ok(None);
+        }
+        let (chosen, row) = matching[0];
+        if row.action
+            != (TypedAction::Payment {
+                resources: materials,
+            })
+        {
+            return Ok(None);
+        }
+        let typed = serde_json::to_value(&row.action).map_err(|e| e.to_string())?;
+        let bound = audit_rows
+            .iter()
+            .filter(|a| {
+                a["step"].as_u64() == Some((index + 2) as u64)
+                    && a["actionId"].as_u64() == Some(step.source_action_ids[0])
+                    && a["actor"].as_u64() == Some(step.actor as u64)
+                    && a["action"] == typed
+            })
+            .collect::<Vec<_>>();
+        if bound.len() != 1 || !observed_audit(bound[0]) {
+            return Ok(None);
+        }
+        expected_bonus.log = after.log.clone();
+        for (resource, n) in RESOURCE_IDS.iter().zip(materials) {
+            *expected_bonus.players[step.actor]
+                .resources
+                .get_mut(resource)
+                .ok_or("Missing payment material")? -= n;
+        }
+        if after != &expected_bonus {
+            return Ok(None);
+        }
+        Some((payment_observation, chosen))
+    };
+    Ok(Some(CappedExtractionEvidence {
+        support: CappedExtractionSupport {
+            observed_operation_id: digest(
+                format!(
+                    "tzolkin-human-capped-extraction-operation-v7\0{family}\0{source_actor_id}\0{}",
+                    step.source_action_ids[0]
+                )
+                .as_bytes(),
+            ),
+            technology_replay_step_index: index,
+            payment_replay_step_index: (!free).then_some(index + 1),
+            technology_message_index,
+            bonus_message_index,
+            payment_message_indices,
+            observed_materials: materials,
+            free,
+            unchanged_extraction_level: 3,
+            pending_bonus_resources: 2,
+            bonus_resource_choices_labelled: false,
+            basis: "oneObservedCappedExtractionChoiceWithExactPendingBonusAndOptionalMaterialPayment",
+        },
+        payment,
+    }))
+}
+
 struct PaidTechnologyEvidence {
     support: PaidTechnologySupport,
     payment_observation: tzolkin_core::observation::Observation,
@@ -1599,6 +1857,7 @@ fn corn_beg_sample(
         paid_technology_support: None,
         corn_beg_support: Some(support.clone()),
         observed_pending_choice_support: None,
+        capped_extraction_support: None,
     })
 }
 
@@ -1662,6 +1921,73 @@ fn paid_technology_sample(
         paid_technology_support: Some(support.clone()),
         corn_beg_support: None,
         observed_pending_choice_support: None,
+        capped_extraction_support: None,
+    })
+}
+
+fn capped_extraction_sample(
+    observation: &tzolkin_core::observation::Observation,
+    chosen: usize,
+    label: (String, Option<String>, &'static str),
+    support: &CappedExtractionSupport,
+    dataset: (&str, &str, DatasetSplit, &str, u64),
+    counts: &mut HumanPolicyCounts,
+) -> Result<HumanPolicySample, String> {
+    let (sample_id, paired_sample_id, part) = label;
+    let (family, table_id, split, source_actor_id, source_action_id) = dataset;
+    let encoder = FeatureEncoder::new_public(observation)?;
+    let candidates = (0..observation.legal_actions.len())
+        .map(|i| encoder.encode_legal_tagged(i))
+        .collect::<Result<Vec<_>, _>>()?;
+    let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+    for (i, candidate) in candidates.iter().enumerate() {
+        let values = candidate.values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
+        if values
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 1024.0)
+            || (i != chosen && values == selected)
+        {
+            return Err("Capped extraction features are unbounded or aliased".into());
+        }
+    }
+    counts.candidates = counts
+        .candidates
+        .checked_add(candidates.len())
+        .filter(|n| *n <= MAX_CANDIDATES)
+        .ok_or("Human dataset candidate limit exceeded")?;
+    let technology = part == "cappedExtraction";
+    Ok(HumanPolicySample {
+        sample_id,
+        family_id: family.into(),
+        split,
+        table_id: table_id.into(),
+        source_actor_id: source_actor_id.into(),
+        source_action_id,
+        source_message_index: if technology {
+            support.technology_message_index
+        } else {
+            support.payment_message_indices[0]
+        },
+        replay_step_index: if technology {
+            support.technology_replay_step_index
+        } else {
+            support
+                .payment_replay_step_index
+                .ok_or("Missing capped payment step")?
+        },
+        actor: observation.actor,
+        observation_key: observation.observation_key.clone(),
+        legal_actions: observation.legal_actions.clone(),
+        candidates,
+        chosen,
+        value_target: (),
+        source_label_part: Some(part),
+        paired_sample_id,
+        source_label_support: None,
+        paid_technology_support: None,
+        corn_beg_support: None,
+        observed_pending_choice_support: None,
+        capped_extraction_support: Some(support.clone()),
     })
 }
 
@@ -1867,7 +2193,11 @@ impl ConditionalHumanPolicyDataset {
             }
             if matches!(
                 label_scope,
-                Some(OBSERVED_CORN_BEG_LABEL_SCOPE | OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
+                Some(
+                    OBSERVED_CORN_BEG_LABEL_SCOPE
+                        | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
+                        | CAPPED_EXTRACTION_LABEL_SCOPE
+                )
             ) && matches!(row.action, TypedAction::Beg)
             {
                 let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
@@ -1923,6 +2253,111 @@ impl ConditionalHumanPolicyDataset {
                 beg_temple_steps.insert(index + 1);
                 continue;
             }
+            if label_scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE)
+                && row.action
+                    == (TypedAction::Technology {
+                        technology: TechnologyId::Extraction,
+                    })
+                && report.frames[index].snapshot.state.players[step.actor].technologies
+                    [&TechnologyId::Extraction]
+                    == 3
+            {
+                let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
+                {
+                    capped_extraction_evidence(
+                        index,
+                        sources,
+                        &report,
+                        audit_rows,
+                        &family,
+                        &actor_ids[step.actor],
+                    )?
+                } else {
+                    None
+                };
+                let Some(evidence) = evidence else {
+                    *counts
+                        .excluded
+                        .entry("unobservedCappedExtraction".into())
+                        .or_default() += 1;
+                    continue;
+                };
+                let support = &evidence.support;
+                let technology_id = digest(
+                    format!(
+                        "tzolkin-human-capped-extraction-factor-v7\0{}\0cappedExtraction",
+                        support.observed_operation_id
+                    )
+                    .as_bytes(),
+                );
+                let payment_id = digest(format!("tzolkin-human-capped-extraction-factor-v7\0{}\0cappedExtractionMaterialPayment", support.observed_operation_id).as_bytes());
+                let has_payment_choice = evidence
+                    .payment
+                    .as_ref()
+                    .is_some_and(|(o, _)| o.legal_actions.len() >= 2);
+                let identity = (
+                    family.as_str(),
+                    manifest.table_id.as_str(),
+                    split,
+                    actor_ids[step.actor].as_str(),
+                    source_id,
+                );
+                if !labels.insert((
+                    source_id,
+                    support.technology_message_index,
+                    "cappedExtraction",
+                )) || !labels.insert((
+                    source_id,
+                    support.bonus_message_index,
+                    "cappedExtractionBonusContext",
+                )) {
+                    return Err("Capped extraction source was consumed twice".into());
+                }
+                samples.push(capped_extraction_sample(
+                    observation,
+                    chosen,
+                    (
+                        technology_id.clone(),
+                        has_payment_choice.then(|| payment_id.clone()),
+                        "cappedExtraction",
+                    ),
+                    support,
+                    identity,
+                    &mut counts,
+                )?);
+                if let Some((payment_observation, payment_chosen)) = &evidence.payment {
+                    if has_payment_choice {
+                        if !labels.insert((
+                            source_id,
+                            support.payment_message_indices[0],
+                            "cappedExtractionMaterialPayment",
+                        )) {
+                            return Err(
+                                "Capped extraction material source was consumed twice".into()
+                            );
+                        }
+                        samples.push(capped_extraction_sample(
+                            payment_observation,
+                            *payment_chosen,
+                            (
+                                payment_id,
+                                Some(technology_id),
+                                "cappedExtractionMaterialPayment",
+                            ),
+                            support,
+                            identity,
+                            &mut counts,
+                        )?);
+                    } else {
+                        *counts
+                            .excluded
+                            .entry("forcedPaymentNoChoice".into())
+                            .or_default() += 1;
+                    }
+                    paid_payment_steps.insert(index + 1);
+                }
+                continue;
+            }
             if matches!(
                 label_scope,
                 Some(
@@ -1930,6 +2365,7 @@ impl ConditionalHumanPolicyDataset {
                         | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
                         | OBSERVED_CORN_BEG_LABEL_SCOPE
                         | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
+                        | CAPPED_EXTRACTION_LABEL_SCOPE
                 )
             ) && let TypedAction::Technology { technology } = row.action
             {
@@ -2023,11 +2459,13 @@ impl ConditionalHumanPolicyDataset {
                 paid_payment_steps.insert(index + 1);
                 continue;
             }
-            let strategic = label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
-                && matches!(
-                    row.action,
-                    TypedAction::Monument { .. } | TypedAction::Temple { direction: 1, .. }
-                );
+            let strategic = matches!(
+                label_scope,
+                Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE | CAPPED_EXTRACTION_LABEL_SCOPE)
+            ) && matches!(
+                row.action,
+                TypedAction::Monument { .. } | TypedAction::Temple { direction: 1, .. }
+            );
             let pending_support = if strategic {
                 let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
                 {
@@ -2060,6 +2498,7 @@ impl ConditionalHumanPolicyDataset {
                     EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
                         | OBSERVED_CORN_BEG_LABEL_SCOPE
                         | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
+                        | CAPPED_EXTRACTION_LABEL_SCOPE
                 )
             ) && matches!(
                 row.action,
@@ -2345,6 +2784,7 @@ impl ConditionalHumanPolicyDataset {
                 paid_technology_support: None,
                 corn_beg_support: None,
                 observed_pending_choice_support: pending_support,
+                capped_extraction_support: None,
             });
         }
         counts.samples = samples.len();
@@ -2496,6 +2936,7 @@ impl ConditionalHumanPolicyDataset {
                 paid_technology_support: None,
                 corn_beg_support: None,
                 observed_pending_choice_support: None,
+                capped_extraction_support: None,
             }],
         }
     }
@@ -2512,7 +2953,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE) {
+                DATASET_SCHEMA_V7
+            } else if self.label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) {
                 DATASET_SCHEMA_V6
             } else if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
                 DATASET_SCHEMA_V5
@@ -2534,7 +2977,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE) {
+                "originalVisibleTextAndFinalAppliedStepAuditWithObservedCappedExtractionChoiceAndMaterials"
+            } else if self.label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedMonumentPositiveTempleChoices"
             } else if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedCornBegAndNegativeTempleChoice"
