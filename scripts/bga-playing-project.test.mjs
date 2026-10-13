@@ -12,6 +12,7 @@ import {
   ATLAS_SCHEMA,
   BOUNDARY_CONTROL_SCHEMA,
   BOUNDARY_JUNGLE_TOPS_SCHEMA,
+  BOUNDARY_STARTING_AREA_SCHEMA,
   BOUNDARY_MARKER_CALIBRATION_SCHEMA,
   BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA,
   BOUNDARY_WORKER_CELL_SCHEMA,
@@ -982,6 +983,167 @@ test('retained boundary binds original food/rotation scope and separates availab
   assert.equal(Object.values(observed.witness.expected.gears).flat().filter(Boolean).length, 3);
   assert.equal(observed.witness.expected.gears.chichenItza.length, 13);
   assert.equal(observed.provenance.omitted.includes('gear positions'), false);
+  const startingFixture = ({ n = 4, count = 3, claimed = false } = {}) => {
+    const value = workerFixture(n),
+      container = element(
+        'div',
+        'centralgearcorns',
+        Array.from({ length: count }, (_unused, i) =>
+          element(
+            'div',
+            `centralgearcorn_${i}`,
+            '',
+            ` class="centralgearcorn" style="top: -${20 + i * 10}px; left: ${i * 10}px;"`,
+          ),
+        ).join(''),
+      );
+    value.capture.boardHtml = value.capture.boardHtml.replace(
+      element('div', 'centralgearcorns'),
+      element('div', 'gear_central_wrap', container, ' class="gear_26teeth gear_wrap"'),
+    );
+    const geo = (id, className, inlineStyle, parentId, rect) => ({
+      id,
+      className,
+      inlineStyle,
+      parentId,
+      rect,
+      computedDisplay: 'block',
+      computedVisibility: 'visible',
+    });
+    value.capture.retainedDomGeometry.push(
+      geo('gear_central_wrap', 'gear_26teeth gear_wrap', null, 'board', {
+        x: 200,
+        y: 300,
+        width: 350,
+        height: 350,
+      }),
+      geo('centralgearcorns', '', null, 'gear_central_wrap', {
+        x: 200,
+        y: 650,
+        width: 350,
+        height: 0,
+      }),
+      ...Array.from({ length: count }, (_unused, i) =>
+        geo(
+          `centralgearcorn_${i}`,
+          'centralgearcorn',
+          `top: -${20 + i * 10}px; left: ${i * 10}px;`,
+          'centralgearcorns',
+          { x: 200 + i * 10, y: 630 - i * 10, width: 20, height: 20 },
+        ),
+      ),
+    );
+    if (claimed) {
+      const cell = value.capture.retainedDomGeometry.find(
+          (item) => item.id === 'workerplace_startingPlayer_0',
+        ),
+        worker = value.capture.retainedDomGeometry.find((item) => item.id === 'worker_3');
+      cell.rect = { x: worker.rect.x, y: 205, width: 19, height: 19 };
+      value.capture.retainedDomGeometry.find((item) => item.id === 'workerplace_tikal_2').rect.x =
+        800;
+    }
+    value.repinStarting = () => {
+      const prepared = value.repin(),
+        control = JSON.parse(prepared[2]);
+      control.startingArea = { schema: BOUNDARY_STARTING_AREA_SCHEMA, archiveRelease: 'fixture' };
+      return [prepared[0], prepared[1], bytes(control)];
+    };
+    return value;
+  };
+  for (const [n, count, claimed] of [
+    [4, 3, false],
+    [4, 0, false],
+    [4, 0, true],
+    [3, 1, true],
+  ]) {
+    const value = startingFixture({ n, count, claimed }),
+      plain = projectRetainedBoundary(...value.repin()),
+      projected = projectRetainedBoundary(...value.repinStarting());
+    assert.equal(Object.hasOwn(plain.witness.expected, 'accumulatedCorn'), false);
+    assert.equal(Object.hasOwn(plain.witness.expected, 'firstPlayerClaimed'), false);
+    assert.equal(projected.witness.expected.accumulatedCorn, count);
+    assert.equal(projected.witness.expected.firstPlayerClaimed, claimed ? 1 : null);
+    assert.equal(Object.hasOwn(projected.witness.expected, 'gears'), false);
+    assert.equal(projected.provenance.startingAreaObservation.sourceAuthenticated, false);
+    assert.equal(projected.provenance.completeSourceBoard, false);
+    assert.equal(projected.provenance.humanBcQualified, false);
+    assert.deepEqual(projected.witness.expected.players, plain.witness.expected.players);
+  }
+  for (const mutate of [
+    (v) => {
+      v.capture.boardHtml = v.capture.boardHtml.replace(
+        'id="centralgearcorns"',
+        'id="missing_corns"',
+      );
+    },
+    (v) => {
+      v.capture.retainedDomGeometry = v.capture.retainedDomGeometry.filter(
+        (item) => item.id !== 'centralgearcorns',
+      );
+    },
+    (v) => {
+      v.capture.retainedDomGeometry.find(
+        (item) => item.id === 'centralgearcorns',
+      ).computedVisibility = 'hidden';
+    },
+    (v) => {
+      v.capture.retainedDomGeometry.find((item) => item.id === 'centralgearcorn_0').parentId =
+        'foreign';
+    },
+    (v) => {
+      v.capture.retainedDomGeometry.find((item) => item.id === 'centralgearcorn_0').rect.width = 0;
+    },
+    (v) => {
+      v.capture.retainedDomGeometry.find((item) => item.id === 'centralgearcorn_0').inlineStyle =
+        'top: 0px; left: 0px;';
+    },
+    (v) => {
+      v.capture.retainedDomGeometry.push({
+        ...v.capture.retainedDomGeometry.find((item) => item.id === 'centralgearcorn_0'),
+        id: 'ghost',
+      });
+    },
+    (v) => {
+      v.capture.playerBoards[0].rowHtml = v.capture.playerBoards[0].rowHtml.replace(
+        '</div>',
+        '<div id="centralgearcorn_9" class="centralgearcorn"></div></div>',
+      );
+    },
+    (v) => {
+      v.capture.retainedDomGeometry = v.capture.retainedDomGeometry.filter(
+        (item) => item.id !== 'workerplace_startingPlayer_0',
+      );
+    },
+    (v) => {
+      v.capture.retainedDomGeometry.find((item) => item.id === 'worker_3').computedVisibility =
+        'hidden';
+    },
+    (v) => {
+      v.capture.retainedDomGeometry.find(
+        (item) => item.id === 'workerplace_startingPlayer_0',
+      ).rect = { x: 100, y: 205, width: 19, height: 19 };
+    },
+  ]) {
+    const value = startingFixture();
+    mutate(value);
+    assert.throws(() => projectRetainedBoundary(...value.repinStarting()));
+  }
+  for (const change of [
+    (control) => {
+      control.startingArea.archiveRelease = 'foreign';
+    },
+    (control) => {
+      control.startingArea.schema = 'unknown';
+    },
+    (control) => {
+      control.startingArea.expected = { accumulatedCorn: 3 };
+    },
+  ]) {
+    const prepared = startingFixture().repinStarting(),
+      control = JSON.parse(prepared[2]);
+    change(control);
+    assert.throws(() => projectRetainedBoundary(prepared[0], prepared[1], bytes(control)));
+  }
   assert.equal(observed.provenance.workerPositionObservation.sourceAuthenticated, false);
   assert.equal(observed.provenance.completeSourceBoard, false);
   assert.equal(observed.provenance.humanBcQualified, false);

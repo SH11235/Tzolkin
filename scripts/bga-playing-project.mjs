@@ -23,6 +23,7 @@ export const BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA =
   'tzolkin-bga-retained-boundary-marker-calibration-v2';
 export const BOUNDARY_WORKER_CELL_SCHEMA = 'tzolkin-bga-boundary-worker-cells-v1';
 export const BOUNDARY_JUNGLE_TOPS_SCHEMA = 'tzolkin-bga-boundary-jungle-tops-v1';
+export const BOUNDARY_STARTING_AREA_SCHEMA = 'tzolkin-bga-boundary-starting-area-v1';
 const BOUNDARY_CAPTURE_SCHEMA = 'bga-retained-visible-replay-board-v1';
 const LEGACY_CAPTURE_SCHEMA = 'tzolkin-bga-public-initial-selection-observation-v1';
 const LEGACY_CAPTURE_ADAPTER = 'tzolkin-bga-legacy-initial-capture-adapter-v1';
@@ -680,7 +681,7 @@ export function projectRetainedBoundary(
     control,
     ['schema', 'capture', 'rawLog', 'archiveRelease', 'seatOrder', 'mechanicalProfile'],
     'boundary control',
-    ['table', 'markerCalibration', 'workerPositions', 'jungleTops'],
+    ['table', 'markerCalibration', 'workerPositions', 'jungleTops', 'startingArea'],
   );
   if (control.schema !== BOUNDARY_CONTROL_SCHEMA) fail('Unsupported boundary control');
   const observeWorkerPositions = Object.hasOwn(control, 'workerPositions');
@@ -692,6 +693,16 @@ export function projectRetainedBoundary(
     )
       fail('Unsupported/release-mismatched boundary worker positions');
   }
+  const observeStartingArea = Object.hasOwn(control, 'startingArea');
+  if (observeStartingArea) {
+    closed(control.startingArea, ['schema', 'archiveRelease'], 'boundary starting area');
+    if (
+      control.startingArea.schema !== BOUNDARY_STARTING_AREA_SCHEMA ||
+      control.startingArea.archiveRelease !== control.archiveRelease
+    )
+      fail('Unsupported/release-mismatched boundary starting area');
+  }
+  const observeWorkerCells = observeWorkerPositions || observeStartingArea;
   const observeJungleTops = Object.hasOwn(control, 'jungleTops');
   if (observeJungleTops) {
     closed(
@@ -1200,12 +1211,12 @@ export function projectRetainedBoundary(
       fail('Unknown/ambiguous boundary worker color');
     if (owner) counts[colors.indexOf(owner.slice(7))]++;
   }
-  const workerCells = observeWorkerPositions
+  const workerCells = observeWorkerCells
     ? board.nodes.filter(
         (node) => token(node, 'workerplace') || (node.attrs.id ?? '').startsWith('workerplace_'),
       )
     : [];
-  if (observeWorkerPositions) {
+  if (observeWorkerCells) {
     if (placed.filter((node) => token(node, 'worker_dummy')).length !== (4 - ids.length) * 6)
       fail('Incomplete/excess boundary dummy workers for basic player count');
     const expectedCellIds = [
@@ -1234,6 +1245,54 @@ export function projectRetainedBoundary(
     )
       fail('Incomplete/unknown boundary worker cells');
     workerCells.forEach((node) => readVisible(board, node));
+  }
+  const startingCornNodes = new Map();
+  const cornEvidence = (id, className, parentId = '') =>
+    /^centralgearcorn(?:s|_|$)/i.test(id ?? '') ||
+    /^centralgearcorn(?:s|_|$)/i.test(parentId) ||
+    (className ?? '').split(/\s+/).some((name) => /^centralgearcorn(?:s|_|$)/i.test(name));
+  if (observeStartingArea) {
+    const wrapper = byId(board, 'gear_central_wrap'),
+      container = byId(board, 'centralgearcorns');
+    readVisible(board, wrapper);
+    readVisible(board, container);
+    closed(wrapper.attrs, ['id', 'class'], 'boundary central gear wrapper');
+    closed(container.attrs, ['id'], 'boundary accumulated corn container');
+    if (
+      wrapper.tag !== 'div' ||
+      wrapper.attrs.class !== 'gear_26teeth gear_wrap' ||
+      !root.children.includes(wrapper) ||
+      container.tag !== 'div' ||
+      !wrapper.children.includes(container) ||
+      container.children.some((child) => !object(child) && child.trim())
+    )
+      fail('Malformed/unowned boundary accumulated corn container');
+    startingCornNodes.set(container.attrs.id, { node: container, parentId: wrapper.attrs.id });
+    const corns = container.children.filter(object);
+    integer(corns.length, 0, 27, 'boundary accumulated corn count');
+    for (const [index, corn] of corns.entries()) {
+      readVisible(board, corn);
+      closed(corn.attrs, ['id', 'class', 'style'], 'boundary accumulated corn');
+      const style = styles(corn);
+      closed(style, ['top', 'left'], 'boundary accumulated corn position');
+      pixels(style.top, 'boundary accumulated corn top');
+      pixels(style.left, 'boundary accumulated corn left');
+      if (
+        corn.tag !== 'div' ||
+        corn.attrs.id !== `centralgearcorn_${index}` ||
+        corn.attrs.class !== 'centralgearcorn' ||
+        corn.children.length !== 0
+      )
+        fail('Malformed/unknown boundary accumulated corn');
+      startingCornNodes.set(corn.attrs.id, { node: corn, parentId: container.attrs.id });
+    }
+    for (const tree of trees)
+      for (const node of tree.nodes)
+        if (
+          cornEvidence(node.attrs.id, node.attrs.class) &&
+          startingCornNodes.get(node.attrs.id)?.node !== node
+        )
+          fail('Foreign/unknown boundary accumulated corn node');
   }
   const jungleBoxes = [],
     ownedJungleNodes = new Map();
@@ -1360,6 +1419,16 @@ export function projectRetainedBoundary(
       continue;
     }
     if (geometry.has(item.id)) fail('Invalid/duplicate boundary geometry identity');
+    if (observeStartingArea && cornEvidence(item.id, item.className, item.parentId)) {
+      const owned = startingCornNodes.get(item.id);
+      if (
+        !owned ||
+        item.parentId !== owned.parentId ||
+        (item.className ?? '') !== (owned.node.attrs.class ?? '') ||
+        (item.inlineStyle ?? '') !== (owned.node.attrs.style ?? '')
+      )
+        fail('Unbound boundary accumulated corn geometry');
+    }
     if (
       observeJungleTops &&
       jungleEvidence(item.id, item.className, item.parentId, item.parentId === 'board')
@@ -1429,6 +1498,45 @@ export function projectRetainedBoundary(
       return null;
     return rect;
   };
+  let observedStartingArea = null;
+  if (observeStartingArea) {
+    for (const node of [
+      root,
+      byId(board, 'gear_central_wrap'),
+      ...[...startingCornNodes.values()].map(({ node }) => node),
+    ]) {
+      const item = geometry.get(node.attrs.id);
+      closed(
+        item,
+        [
+          'id',
+          'className',
+          'inlineStyle',
+          'parentId',
+          'computedDisplay',
+          'computedVisibility',
+          'rect',
+        ],
+        'boundary starting-area geometry',
+      );
+      const rect = visibleRect(node);
+      if (
+        rect === null ||
+        rect.width <= 0 ||
+        (node.attrs.id !== 'centralgearcorns' && rect.height <= 0)
+      )
+        fail('Missing/invalid visible boundary starting-area rectangle');
+      closed(rect, ['x', 'y', 'width', 'height'], 'boundary starting-area rectangle');
+      for (const value of Object.values(rect))
+        number(value, -10000000, 10000000, 'boundary starting-area rectangle');
+    }
+    // Absolutely positioned corn icons need not lie in their zero-height container.
+    // The exact source parent and visible rectangles bind them; no coordinates are fitted.
+    observedStartingArea = {
+      accumulatedCorn: startingCornNodes.size - 1,
+      firstPlayerClaimed: null,
+    };
+  }
   let observedJungle = null;
   if (observeJungleTops) {
     const requiredRect = (node) => {
@@ -1612,7 +1720,7 @@ export function projectRetainedBoundary(
       );
     });
   let observedGears = null;
-  if (observeWorkerPositions) {
+  if (observeWorkerCells) {
     if (!completeWorkers) fail('Incomplete visible boundary gear-worker geometry');
     const geometricCells = [...geometry.values()].filter((item) =>
       item.id.startsWith('workerplace_'),
@@ -1650,9 +1758,10 @@ export function projectRetainedBoundary(
         fail('Boundary worker cell outside board');
       return { node, rect };
     });
-    observedGears = Object.fromEntries(
-      GEARS.map((gear) => [gear, Array(gear === 'chichenItza' ? 13 : 10).fill(null)]),
-    );
+    if (observeWorkerPositions)
+      observedGears = Object.fromEntries(
+        GEARS.map((gear) => [gear, Array(gear === 'chichenItza' ? 13 : 10).fill(null)]),
+      );
     const occupied = new Set();
     for (const node of placed) {
       const rect = visibleRect(node);
@@ -1669,22 +1778,25 @@ export function projectRetainedBoundary(
       const id = hits[0].node.attrs.id;
       occupied.add(id);
       const dummy = token(node, 'worker_dummy');
+      const owner = (node.attrs.class ?? '')
+        .split(/\s+/)
+        .find((value) => /^worker_[a-f0-9]{6}$/.test(value));
       if (id === 'workerplace_startingPlayer_0') {
         if (dummy) fail('Dummy worker on starting-player space');
+        if (observedStartingArea !== null)
+          observedStartingArea.firstPlayerClaimed = colors.indexOf(owner.slice(7));
         continue;
       }
       const match = /^workerplace_(palenque|yaxchilan|tikal|uxmal|chichenItza)_(\d+)$/.exec(id);
       if (!dummy && Number(match[2]) > (match[1] === 'chichenItza' ? 10 : 7))
         fail('Boundary real worker beyond basic gear endpoint');
-      const owner = (node.attrs.class ?? '')
-        .split(/\s+/)
-        .find((value) => /^worker_[a-f0-9]{6}$/.test(value));
       // Retained source labels name current spaces, not rotating tooth identities.
       // This consistency projection authenticates neither capture nor source rules.
-      observedGears[match[1]][Number(match[2])] = {
-        playerId: dummy ? -1 : colors.indexOf(owner.slice(7)),
-        dummy,
-      };
+      if (observedGears !== null)
+        observedGears[match[1]][Number(match[2])] = {
+          playerId: dummy ? -1 : colors.indexOf(owner.slice(7)),
+          dummy,
+        };
     }
   }
   const expected = {
@@ -1693,6 +1805,7 @@ export function projectRetainedBoundary(
     phase: terminal ? 'finished' : 'playing',
     ...(observedGears === null ? {} : { gears: observedGears }),
     ...(observedJungle === null ? {} : { jungle: observedJungle }),
+    ...(observedStartingArea === null ? {} : observedStartingArea),
   };
   // The source displays day 28 and integral scores after finalization. Neither
   // is an exact native round/score assertion; preserve those display facts apart.
@@ -1759,6 +1872,17 @@ export function projectRetainedBoundary(
           }
         : {}),
       totalWorkersObserved: Boolean(completeWorkers),
+      ...(observedStartingArea === null
+        ? {}
+        : {
+            startingAreaObservation: {
+              schema: BOUNDARY_STARTING_AREA_SCHEMA,
+              archiveRelease: release,
+              interpretation:
+                'owned visible corn children and unique starting-worker cell; consistency only',
+              sourceAuthenticated: false,
+            },
+          }),
       totalWorkersOmissionReason: completeWorkers
         ? null
         : [workerRoot, ...placed].some((node) => {
