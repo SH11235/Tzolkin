@@ -154,6 +154,53 @@ pub struct SemanticPlayingRlOwner {
     identity: SemanticPlayingRlIdentity,
 }
 impl SemanticPlayingRlOwner {
+    pub(crate) fn collection_metadata(
+        &self,
+    ) -> (&SemanticPlayingRlIdentity, &BTreeMap<String, DatasetSplit>) {
+        (&self.identity, &self.origin.table_reservations)
+    }
+
+    /// Only the closed collector may borrow this context. The higher-ranked
+    /// scope cannot return an actor/critic borrow or an unchecked public handle.
+    /// Every outcome attempts the postcheck before a result can be accepted.
+    pub(crate) fn with_checked_collection<R>(
+        &self,
+        external_pins: &[ContentPin],
+        run: impl for<'scope> FnOnce(&SemanticCollectionScope<'scope>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.with_checked_collection_episode(external_pins, || {
+            let scope = SemanticCollectionScope {
+                actor: &self.actor,
+                _critic: &self.critic,
+                identity: &self.identity,
+                kernel: Kernel::Scalar.resolve()?,
+            };
+            run(&scope)
+        })
+    }
+
+    pub(crate) fn with_checked_collection_episode<R>(
+        &self,
+        external_pins: &[ContentPin],
+        run: impl FnOnce() -> Result<R, String>,
+    ) -> Result<R, String> {
+        let check = || {
+            self.origin.recheck_sources()?;
+            for pin in external_pins {
+                crate::human_policy_dataset::recheck_absolute_pin(pin)?;
+            }
+            Ok::<_, String>(())
+        };
+        check()?;
+        let result = run();
+        match (result, check()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(format!("Semantic source postcheck: {error}")),
+            (Err(error), Err(post)) => Err(format!("{error}; semantic source postcheck: {post}")),
+        }
+    }
+
     pub fn from_prepared(
         prepared: &PreparedConditionalHumanPolicy,
         critic_seed: u64,
@@ -243,6 +290,55 @@ impl SemanticPlayingRlOwner {
             kernel: Kernel::Scalar.resolve()?,
         })
     }
+}
+
+/// No Clone, serialization, public constructor or model getter. Only the
+/// checked owner scope creates it, and scoring performs no filesystem reads.
+pub(crate) struct SemanticCollectionScope<'a> {
+    actor: &'a PublicPolicyModel,
+    _critic: &'a [f32],
+    identity: &'a SemanticPlayingRlIdentity,
+    kernel: ResolvedKernel,
+}
+impl SemanticCollectionScope<'_> {
+    pub(crate) fn identity(&self) -> &SemanticPlayingRlIdentity {
+        self.identity
+    }
+    pub(crate) fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<NumericPolicyDistribution, String> {
+        let encoder = FeatureEncoder::new_semantic_playing(observation)?;
+        let rows = (0..observation.legal_actions.len())
+            .map(|i| encoder.encode_legal_tagged(i))
+            .collect::<Result<Vec<_>, _>>()?;
+        predict_semantic_playing_numeric(self.actor, self.kernel, &rows)
+    }
+}
+
+/// Numeric/Core fixture context only, not an owner or successful-load claim.
+/// Production collection can obtain this borrow only through source checks.
+#[cfg(test)]
+pub(crate) fn with_collection_numeric_fixture<R>(
+    prepared: &PreparedConditionalHumanPolicy,
+    run: impl for<'scope> FnOnce(&SemanticCollectionScope<'scope>) -> Result<R, String>,
+) -> Result<R, String> {
+    prepared.model().validate_semantic_playing()?;
+    let critic = crate::public_policy_baseline::zero_output_parameters(11);
+    let identity = SemanticPlayingRlIdentity {
+        origin_checksum: "synthetic-numeric-unit-only".into(),
+        actor_checksum: parameter_checksum(b"synthetic-actor", prepared.model().model.parameters()),
+        critic_checksum: parameter_checksum(b"synthetic-critic", &critic),
+        critic_seed: 11,
+        checksum: "synthetic-no-source-qualification".into(),
+    };
+    let scope = SemanticCollectionScope {
+        actor: &prepared.model().model,
+        _critic: &critic,
+        identity: &identity,
+        kernel: Kernel::Scalar.resolve()?,
+    };
+    run(&scope)
 }
 fn parameter_checksum(domain: &[u8], parameters: &[f32]) -> String {
     let mut hash = Sha256::new();

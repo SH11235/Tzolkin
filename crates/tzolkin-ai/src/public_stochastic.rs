@@ -457,33 +457,14 @@ impl SessionState {
             return Err("Invalid or stopped sampling session".into());
         }
         let stream = self.streams[actor];
-        let (after, raw) = next_splitmix(stream.state);
-        let u53 = raw >> 11;
-        let index = distribution.chosen(u53)?;
-        let mass = distribution.mass(index)?;
-        let probability = mass as f64 / TICKS as f64;
-        let logp = if mass == TICKS { 0.0 } else { probability.ln() };
-        if !logp.is_finite() || logp > 0.0 {
-            return Err("Non-finite sampling logp".into());
-        }
-        let draws_after = stream.draws.checked_add(1).ok_or("Actor draw overflow")?;
+        let draw = draw_tick53(stream.state, stream.draws, distribution)?;
         // No operation which can fail follows these state mutations.
         self.streams[actor] = ActorStream {
-            state: after,
-            draws: draws_after,
+            state: draw.state_after,
+            draws: draw.draws_after,
         };
         self.accepted += 1;
-        Ok(Draw {
-            index,
-            raw,
-            u53,
-            mass,
-            logp,
-            state_before: stream.state,
-            state_after: after,
-            draws_before: stream.draws,
-            draws_after,
-        })
+        Ok(draw)
     }
     fn sample_with(
         &mut self,
@@ -576,16 +557,45 @@ impl SessionState {
         })
     }
 }
-struct Draw {
-    index: usize,
-    raw: u64,
-    u53: u64,
-    mass: u64,
-    logp: f64,
-    state_before: u64,
-    state_after: u64,
-    draws_before: u64,
-    draws_after: u64,
+pub(crate) struct Draw {
+    pub(crate) index: usize,
+    pub(crate) raw: u64,
+    pub(crate) u53: u64,
+    pub(crate) mass: u64,
+    pub(crate) logp: f64,
+    pub(crate) state_before: u64,
+    pub(crate) state_after: u64,
+    pub(crate) draws_before: u64,
+    pub(crate) draws_after: u64,
+}
+/// Compute a draw without mutating or admitting a policy/session. Callers commit
+/// their owned stream and counters only after this numeric operation succeeds.
+pub(crate) fn draw_tick53(
+    state: u64,
+    draws: u64,
+    distribution: &TickDistribution,
+) -> Result<Draw, String> {
+    let (after, raw) = next_splitmix(state);
+    let u53 = raw >> 11;
+    let index = distribution.chosen(u53)?;
+    let mass = distribution.mass(index)?;
+    let probability = mass as f64 / TICKS as f64;
+    let logp = if mass == TICKS { 0.0 } else { probability.ln() };
+    if !logp.is_finite() || logp > 0.0 {
+        return Err("Non-finite sampling logp".into());
+    }
+    let draws_after = draws.checked_add(1).ok_or("Actor draw overflow")?;
+    Ok(Draw {
+        index,
+        raw,
+        u53,
+        mass,
+        logp,
+        state_before: state,
+        state_after: after,
+        draws_before: draws,
+        draws_after,
+    })
 }
 pub(crate) fn full_logits_digest(logits: &[f32]) -> String {
     let mut hash = Sha256::new();
@@ -617,12 +627,12 @@ pub(crate) fn nominal_weights(logits: &[f32]) -> Result<(Vec<f64>, f64), String>
     Ok((weights, sum))
 }
 
-struct TickDistribution {
+pub(crate) struct TickDistribution {
     nominal: Vec<f64>,
     boundaries: Vec<u64>,
 }
 impl TickDistribution {
-    fn new(logits: &[f32]) -> Result<Self, String> {
+    pub(crate) fn new(logits: &[f32]) -> Result<Self, String> {
         let (weights, sum) = nominal_weights(logits)?;
         let floor = UNIFORM_MIXTURE / logits.len() as f64;
         let mut nominal = Vec::with_capacity(logits.len());
@@ -663,7 +673,7 @@ impl TickDistribution {
             boundaries,
         })
     }
-    fn chosen(&self, u53: u64) -> Result<usize, String> {
+    pub(crate) fn chosen(&self, u53: u64) -> Result<usize, String> {
         if u53 >= TICKS {
             return Err("Sampling draw outside the 53-bit grid".into());
         }
@@ -672,7 +682,7 @@ impl TickDistribution {
             .position(|b| u53 < *b)
             .ok_or_else(|| "Missing final sampling boundary".into())
     }
-    fn mass(&self, index: usize) -> Result<u64, String> {
+    pub(crate) fn mass(&self, index: usize) -> Result<u64, String> {
         let bound = *self.boundaries.get(index).ok_or("Invalid sampled index")?;
         let previous = if index == 0 {
             0
@@ -684,7 +694,13 @@ impl TickDistribution {
             .filter(|m| *m > 0)
             .ok_or_else(|| "Nonpositive sampling mass".into())
     }
-    fn digest(&self) -> String {
+    pub(crate) fn nominal_probability(&self, index: usize) -> Result<f64, String> {
+        self.nominal
+            .get(index)
+            .copied()
+            .ok_or_else(|| "Invalid sampled index".into())
+    }
+    pub(crate) fn digest(&self) -> String {
         let mut hash = Sha256::new();
         hash.update(b"tzolkin-stochastic-tick-distribution-v1\0");
         hash.update((self.boundaries.len() as u64).to_le_bytes());
@@ -1306,6 +1322,18 @@ mod tests {
     fn singleton_uses_one_draw_with_positive_zero_logp() {
         let mut state = SessionState::new(identity(3)).unwrap();
         let d = TickDistribution::new(&[-0.0]).unwrap();
+        let shared = draw_tick53(0, 0, &d).unwrap();
+        assert_eq!(shared.raw, 0xe220a8397b1dcdaf);
+        assert_eq!(shared.state_before, 0);
+        assert_eq!(shared.state_after, 0x9e3779b97f4a7c15);
+        assert_eq!((shared.draws_before, shared.draws_after), (0, 1));
+        assert_eq!(shared.logp.to_bits(), 0.0_f64.to_bits());
+        assert!(draw_tick53(0, u64::MAX, &d).is_err());
+        assert_eq!(
+            d.nominal_probability(0).unwrap().to_bits(),
+            1.0_f64.to_bits()
+        );
+        assert!(d.nominal_probability(1).is_err());
         state.reserve(2, 3, 1).unwrap();
         let draw = state.choose(2, &d).unwrap();
         assert_eq!(draw.index, 0);

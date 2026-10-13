@@ -77,6 +77,7 @@ pub mod resource_cycle_teacher_training;
 pub mod search;
 pub mod search_native;
 pub mod selfplay_batch;
+pub mod semantic_playing_rl_collection;
 pub mod setup_policy;
 pub mod state_mc_dataset;
 pub mod state_mc_training;
