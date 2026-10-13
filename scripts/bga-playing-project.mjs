@@ -1017,15 +1017,16 @@ export function projectRetainedBoundary(
       6,
       'available workers',
     );
+    const scoreDisplay = counter(`player_score_${id}`, true);
     displayedPlayers.push({
       playerId: index,
       sourcePlayerId: id,
       name,
       availableWorkers,
-      scoreDisplay: counter(`player_score_${id}`, true),
+      scoreDisplay,
     });
     trees.push(panel, row);
-    return { id: index, resources };
+    return { id: index, resources, ...(terminal ? {} : { score: scoreDisplay }) };
   });
   const names = [...identities.values()].map((player) => player.name);
   const colors = [...identities.values()].map((player) => player.color);
@@ -1454,7 +1455,7 @@ export function projectRetainedBoundary(
         'card identities',
         'gear positions',
         'covered corn',
-        'exact scores',
+        ...(terminal ? ['exact scores'] : []),
         ...(completeWorkers ? [] : ['total workers']),
       ],
       visibilityVerified: false,
