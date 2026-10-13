@@ -37,12 +37,16 @@ use tzolkin_inference::own_setup_deployment::{
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
 pub const SCHEMA: &str = "tzolkin-numeric-deployment-validation-arena-v1";
+pub const CORN_FIRST_ARENA_SCHEMA: &str = "tzolkin-numeric-corn-first-setup-validation-arena-v1";
+pub const CORN_FIRST_CONDITIONAL_ARENA_SCHEMA: &str =
+    "tzolkin-conditional-human-shared-corn-first-validation-arena-v1";
 pub const RESOURCE_CYCLE_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-development-validation-arena-v1";
 pub const OWN_SETUP_ARENA_SCHEMA: &str = "tzolkin-own-setup-composite-development-arena-v1";
 pub const RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-own-setup-composite-development-arena-v1";
 pub const MAX_ROWS_PER_CALLBACK: usize = 1024;
+pub const MAX_REPORT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXCLUDED_FAMILIES: usize = 200_000;
 const _: () = assert!(MAX_GAME_CALLBACKS == replay::MAX_DECISIONS);
 
@@ -124,6 +128,29 @@ pub struct NumericIdentity {
     pub guard: TradeGuardConfig,
     pub configuration_key: String,
     pub inference_version: String,
+}
+
+/// An explicit all-seat Setup override. Numeric identities still describe the
+/// immutable Playing models; this route grants no producer or learning credit.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SharedCornFirstSetupIdentity {
+    pub policy_version: String,
+    pub heuristic_policy_version: String,
+    pub selector: String,
+    pub scope: String,
+    pub weights: HeuristicWeights,
+}
+impl SharedCornFirstSetupIdentity {
+    fn current() -> Self {
+        Self {
+            policy_version: crate::setup_policy::POLICY_VERSION.into(),
+            heuristic_policy_version: tzolkin_bot::POLICY_VERSION.into(),
+            selector: "directCornThenHeuristicScoreThenFirstLegal".into(),
+            scope: "allAbsoluteSeatsSetupOnly".into(),
+            weights: HeuristicWeights::default(),
+        }
+    }
 }
 
 /// No raw owner constructor or training roster conversion is provided.
@@ -431,6 +458,8 @@ pub struct NumericArenaReport {
     pub candidate: PolicyIdentity,
     pub reference: PolicyIdentity,
     pub opponent_pool: Vec<PolicyIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shared_setup: Option<SharedCornFirstSetupIdentity>,
     pub work_bounds: BorrowedArenaWorkBounds,
     pub blocks: Vec<SeedBlock>,
     pub guards: Vec<GuardBlock>,
@@ -443,6 +472,12 @@ pub struct NumericArenaReport {
     pub catalog_hash: String,
     pub target_arch: String,
     pub target_os: String,
+}
+impl NumericArenaReport {
+    /// Create a bounded report without replacing an existing destination.
+    pub fn save_new(&self, path: &std::path::Path) -> Result<(), String> {
+        crate::model::write_new_json_bounded(path, self, MAX_REPORT_BYTES)
+    }
 }
 
 fn work_bounds(
@@ -506,8 +541,12 @@ fn choose(
     guards: &mut [Option<OwnedGameGuard>],
     conditional_sessions: &mut [Option<GameSession>],
     diagnostics: &mut [Option<GuardDiagnostics>],
-    search: &mut [Option<SearchSummary>],
+    routing: (
+        &mut [Option<SearchSummary>],
+        Option<&SharedCornFirstSetupIdentity>,
+    ),
 ) -> Result<Decision, String> {
+    let (search, shared_setup) = routing;
     for (i, guard) in guards.iter_mut().enumerate() {
         if let Some(guard) = guard {
             let d = diagnostics[i].as_mut().expect("numeric diagnostic");
@@ -525,7 +564,29 @@ fn choose(
         }
     }
     let actor = observation.actor;
-    let decision = if let Some(guard) = guards.get_mut(actor).and_then(Option::as_mut) {
+    let decision = if let Some(setup) = shared_setup.filter(|_| observation.phase == Phase::Setup) {
+        if actor >= roster.len() || observation.legal_actions.len() > MAX_ROWS_PER_CALLBACK {
+            return Err("Shared Corn-first Setup actor or candidate-row cap is invalid".into());
+        }
+        // The numeric guards above receive every callback, but no numeric
+        // prediction or guarded choice is made in this Setup branch.
+        if let Some(d) = diagnostics[actor].as_mut() {
+            d.choices_attempted += 1;
+            d.candidate_rows_attempted += observation.legal_actions.len();
+            if let Some(routes) = d.phase_routes.as_mut() {
+                routes.setup_choices_attempted += 1;
+            }
+        }
+        let result = crate::setup_policy::choose_move_with_weights(observation, &setup.weights)?;
+        if let Some(d) = diagnostics[actor].as_mut() {
+            d.choices_returned += 1;
+            d.candidate_rows_returned += observation.legal_actions.len();
+            if let Some(routes) = d.phase_routes.as_mut() {
+                routes.setup_choices_returned += 1;
+            }
+        }
+        result
+    } else if let Some(guard) = guards.get_mut(actor).and_then(Option::as_mut) {
         if observation.legal_actions.len() > MAX_ROWS_PER_CALLBACK {
             return Err("Numeric Arena candidate-row cap exceeded before prediction".into());
         }
@@ -692,23 +753,44 @@ fn choose(
     Ok(decision)
 }
 
-fn play_arm<'a>(
+fn play_arm_with_setup<'a>(
     seed: u32,
     seat: usize,
     focal: &mut Role<'a>,
     pool: &mut [Role<'a>],
+    shared_setup: Option<&SharedCornFirstSetupIdentity>,
 ) -> (ArmResult, Vec<Option<GuardDiagnostics>>) {
-    play_arm_using(seed, seat, focal, pool, |players, seed, decide| {
-        replay::play_unrecorded_inference(players, seed, decide)
-    })
+    play_arm_using_with_setup(
+        seed,
+        seat,
+        focal,
+        pool,
+        shared_setup,
+        |players, seed, decide| replay::play_unrecorded_inference(players, seed, decide),
+    )
 }
 
 type ArmDecide<'a> = dyn FnMut(usize, &Observation) -> Result<Decision, String> + 'a;
+#[cfg(test)]
 fn play_arm_using<'a>(
     seed: u32,
     seat: usize,
     focal: &mut Role<'a>,
     pool: &mut [Role<'a>],
+    play: impl FnOnce(
+        usize,
+        u32,
+        &mut ArmDecide<'_>,
+    ) -> Result<(tzolkin_core::GameState, usize), String>,
+) -> (ArmResult, Vec<Option<GuardDiagnostics>>) {
+    play_arm_using_with_setup(seed, seat, focal, pool, None, play)
+}
+fn play_arm_using_with_setup<'a>(
+    seed: u32,
+    seat: usize,
+    focal: &mut Role<'a>,
+    pool: &mut [Role<'a>],
+    shared_setup: Option<&SharedCornFirstSetupIdentity>,
     play: impl FnOnce(
         usize,
         u32,
@@ -771,12 +853,15 @@ fn play_arm_using<'a>(
     let mut diagnostics = roster
         .iter()
         .map(|role| match &**role {
-            Role::Numeric(_) | Role::Teacher(_) | Role::SemanticSetupTeacher(_) => {
-                Some(GuardDiagnostics::default())
-            }
+            Role::Numeric(_) => Some(GuardDiagnostics {
+                phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
+                ..GuardDiagnostics::default()
+            }),
+            Role::Teacher(_) | Role::SemanticSetupTeacher(_) => Some(GuardDiagnostics::default()),
             Role::Conditional(_) | Role::ConditionalMixed(_) | Role::ConditionalCountZero(_) => {
                 Some(GuardDiagnostics {
                     conditional: Some(ConditionalDiagnostics::default()),
+                    phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
                     ..GuardDiagnostics::default()
                 })
             }
@@ -803,7 +888,7 @@ fn play_arm_using<'a>(
             &mut guards,
             &mut conditional_sessions,
             &mut diagnostics,
-            &mut search,
+            (&mut search, shared_setup),
         )
     })
     .and_then(|(state, decisions)| {
@@ -881,6 +966,27 @@ pub fn run_validation(
         Role::Numeric(reference),
         opponent_pool,
         SCHEMA,
+    )
+}
+
+/// Paired base 3/4p Validation with the same untrained Corn-first Setup selector
+/// and default weights for every absolute seat in both arms. Playing preserves
+/// each declared numeric/opponent policy, independent per-game guards and the
+/// original all-actor callback/Trade protocol. This does not authenticate model
+/// production or claim fresh Test, training admission or improved strength.
+pub fn run_corn_first_validation(
+    config: &NumericArenaConfig,
+    candidate: NumericPolicy,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'_>>,
+) -> Result<NumericArenaReport, String> {
+    run_roles_with_setup(
+        config,
+        Role::Numeric(candidate),
+        Role::Numeric(reference),
+        opponent_pool,
+        CORN_FIRST_ARENA_SCHEMA,
+        Some(SharedCornFirstSetupIdentity::current()),
     )
 }
 
@@ -1036,6 +1142,26 @@ pub fn run_conditional_validation<'a>(
     )
 }
 
+/// Conditional Human Playing against numeric Playing with the same Corn-first
+/// Setup route at every seat, including the opponent pool. Conditional sessions
+/// and numeric guards receive all callbacks. The conditional model's source
+/// scope and the ordinary conditional/numeric APIs remain unchanged.
+pub fn run_corn_first_conditional_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: ConditionalPolicy<'a>,
+    reference: NumericPolicy,
+    opponent_pool: Vec<Opponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    run_roles_with_setup(
+        config,
+        Role::Conditional(Box::new(candidate)),
+        Role::Numeric(reference),
+        opponent_pool,
+        CORN_FIRST_CONDITIONAL_ARENA_SCHEMA,
+        Some(SharedCornFirstSetupIdentity::current()),
+    )
+}
+
 /// Genuine updated conditional Human actor, predicting both native Setup and
 /// Playing, paired against an immutable numeric reference with the same guard.
 /// This grants no training/source qualification, Ready proof or fresh Test.
@@ -1075,10 +1201,20 @@ pub fn run_conditional_count_zero_validation<'a>(
 
 fn run_roles<'a>(
     config: &NumericArenaConfig,
+    candidate: Role<'a>,
+    reference: Role<'a>,
+    opponent_pool: Vec<Opponent<'a>>,
+    schema: &str,
+) -> Result<NumericArenaReport, String> {
+    run_roles_with_setup(config, candidate, reference, opponent_pool, schema, None)
+}
+fn run_roles_with_setup<'a>(
+    config: &NumericArenaConfig,
     mut candidate: Role<'a>,
     mut reference: Role<'a>,
     opponent_pool: Vec<Opponent<'a>>,
     schema: &str,
+    shared_setup: Option<SharedCornFirstSetupIdentity>,
 ) -> Result<NumericArenaReport, String> {
     config.validate()?;
     if opponent_pool.len() != config.players {
@@ -1094,10 +1230,13 @@ fn run_roles<'a>(
         reference.identity(),
         pool.iter().map(Role::identity).collect::<Vec<_>>(),
     );
-    let configuration_sha256 = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(config, &identities)).map_err(|e| e.to_string())?)
-    );
+    // Omitted routing keeps the original configuration digest bytes exactly.
+    let configured = match shared_setup.as_ref() {
+        Some(setup) => serde_json::to_vec(&(config, &identities, setup)),
+        None => serde_json::to_vec(&(config, &identities)),
+    }
+    .map_err(|e| e.to_string())?;
+    let configuration_sha256 = format!("{:x}", Sha256::digest(configured));
     let work_bounds = work_bounds(config, &pool)?;
     let mut blocks = Vec::with_capacity(config.seeds.len());
     let mut guards = Vec::with_capacity(config.seeds.len());
@@ -1107,13 +1246,37 @@ fn run_roles<'a>(
         for seat in 0..config.players {
             let (c, r) = if (index + seat) % 2 == 0 {
                 (
-                    play_arm(*seed, seat, &mut candidate, &mut pool),
-                    play_arm(*seed, seat, &mut reference, &mut pool),
+                    play_arm_with_setup(
+                        *seed,
+                        seat,
+                        &mut candidate,
+                        &mut pool,
+                        shared_setup.as_ref(),
+                    ),
+                    play_arm_with_setup(
+                        *seed,
+                        seat,
+                        &mut reference,
+                        &mut pool,
+                        shared_setup.as_ref(),
+                    ),
                 )
             } else {
-                let reference_result = play_arm(*seed, seat, &mut reference, &mut pool);
+                let reference_result = play_arm_with_setup(
+                    *seed,
+                    seat,
+                    &mut reference,
+                    &mut pool,
+                    shared_setup.as_ref(),
+                );
                 (
-                    play_arm(*seed, seat, &mut candidate, &mut pool),
+                    play_arm_with_setup(
+                        *seed,
+                        seat,
+                        &mut candidate,
+                        &mut pool,
+                        shared_setup.as_ref(),
+                    ),
                     reference_result,
                 )
             };
@@ -1142,6 +1305,7 @@ fn run_roles<'a>(
         candidate: identities.0,
         reference: identities.1,
         opponent_pool: identities.2,
+        shared_setup,
         work_bounds,
         statistics: summarize(&blocks, config.bootstrap_seed),
         blocks,
@@ -1635,6 +1799,94 @@ pub(super) mod tests {
         let stats = summarize(&[failed], 7);
         assert_eq!((stats.complete_blocks, stats.failed_games), (0, 2));
         assert!(stats.failures_preclude_adoption && !stats.strength_improvement_declared);
+
+        let shared_setup = SharedCornFirstSetupIdentity::current();
+        assert_ne!(CORN_FIRST_ARENA_SCHEMA, SCHEMA);
+        assert_eq!(
+            shared_setup.policy_version,
+            crate::setup_policy::POLICY_VERSION
+        );
+        assert_eq!(shared_setup.weights, HeuristicWeights::default());
+        for players in [3, 4] {
+            let mut focal = Role::Numeric(synthetic_policy());
+            let mut pool = (0..players)
+                .map(|_| Role::Numeric(synthetic_policy()))
+                .collect::<Vec<_>>();
+            let before = serde_json::to_value((
+                focal.identity(),
+                pool.iter().map(Role::identity).collect::<Vec<_>>(),
+            ))
+            .unwrap();
+            // A short prefix crosses the real Setup/Playing boundary. Numeric
+            // argmax on this fixture is first-legal with score zero; the Setup
+            // branch must instead return the actual Corn-first selector result.
+            let (arm, diagnostics) = play_arm_using_with_setup(
+                3,
+                1,
+                &mut focal,
+                &mut pool,
+                Some(&shared_setup),
+                |players, seed, decide| {
+                    let mut state = tzolkin_core::create_game(
+                        (0..players).map(|i| format!("Seat {i}")).collect(),
+                        seed,
+                        false,
+                    )?;
+                    for index in 0..players {
+                        let o = observe(&state, state.current_player)?;
+                        assert_eq!(o.phase, Phase::Setup);
+                        let expected = crate::setup_policy::choose_move_with_weights(
+                            &o,
+                            &HeuristicWeights::default(),
+                        )?;
+                        let actual = decide(index, &o)?;
+                        assert_eq!(actual, expected);
+                        state = tzolkin_core::apply_move(&state, actual.r#move)?;
+                    }
+                    let o = observe(&state, state.current_player)?;
+                    assert_eq!(o.phase, Phase::Playing);
+                    let actual = decide(players, &o)?;
+                    assert_eq!(actual.policy_version, d::GUARDED_DEPLOYMENT_VERSION);
+                    assert_eq!(actual.r#move, o.legal_actions[0].r#move);
+                    assert_eq!(actual.score, 0.0);
+                    state = tzolkin_core::apply_move(&state, actual.r#move)?;
+                    assert_eq!(state.phase, Phase::Playing);
+                    Err("Injected shared-Setup prefix failure".into())
+                },
+            );
+            assert_eq!(
+                arm.error.as_deref(),
+                Some("Injected shared-Setup prefix failure")
+            );
+            assert!(diagnostics.iter().flatten().all(|diagnostic| {
+                diagnostic.notifications_attempted == players + 1
+                    && diagnostic.notifications_returned == players + 1
+                    && diagnostic.applied_choices.is_none()
+            }));
+            let counts = diagnostics.iter().flatten().fold([0; 4], |mut sum, d| {
+                let routes = d.phase_routes.as_ref().unwrap();
+                sum[0] += routes.setup_choices_attempted;
+                sum[1] += routes.setup_choices_returned;
+                sum[2] += routes.playing_choices_attempted;
+                sum[3] += routes.playing_choices_returned;
+                sum
+            });
+            assert_eq!(counts, [players, players, 1, 1]);
+            assert_eq!(
+                serde_json::to_value((
+                    focal.identity(),
+                    pool.iter().map(Role::identity).collect::<Vec<_>>(),
+                ))
+                .unwrap(),
+                before
+            );
+            assert!(matches!(focal, Role::Numeric(ref policy) if policy.loaded.is_some()));
+            assert!(
+                pool.iter().all(|role| {
+                    matches!(role, Role::Numeric(policy) if policy.loaded.is_some())
+                })
+            );
+        }
 
         let frozen = super::super::resource_cycle::ResourceCycleConfig::v5();
         for candidate in [
