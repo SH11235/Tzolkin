@@ -927,6 +927,46 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
     assert!(sampling::checked_range(&wrong, b.prefix, b.next).is_err());
     let pin = json!({"path":"synthetic-pinned-input","bytes":1,"sha256":"1".repeat(64)});
     let exclusions = json!({"file":pin,"count":external.len(),"familyDigest":"2".repeat(64)});
+    let mut later = configs.clone();
+    for (i, c) in later.iter_mut().enumerate() {
+        c.episode_ordinal = format!("{:016x}", b.next + 4 + i as u64);
+    }
+    assert_eq!(
+        sampling::checked_reserved_range(&later, b.prefix, b.next).unwrap(),
+        (external.clone(), b.next + 8)
+    );
+    assert!(sampling::checked_range(&later, b.prefix, b.next).is_err());
+    assert!(sampling::checked_reserved_range(&later, b.prefix, b.next + 5).is_err());
+    assert!(sampling::checked_reserved_range(&later, b.prefix, b.next + 2).is_err());
+    let mut repeated = later.clone();
+    repeated[1] = repeated[0].clone();
+    assert!(sampling::checked_reserved_range(&repeated, b.prefix, b.next).is_err());
+    let mut reserved_pool = pool_wire();
+    reserved_pool["configurations"] = json!(later);
+    let tip = json!({"head":pin,"directory":b.predecessor_directory});
+    let mut reserved_plan = json!({
+        "schema":"tzolkin-current-mixed-campaign-spec-v1",
+        "checkpoint":pin,"datasetManifest":pin,
+        "bootstrap":{"kind":"count1","checkpoint":pin},
+        "originalMixed":{"spec":{
+            "schema":"tzolkin-mixed-saved-one-batch-spec-v1",
+            "actor":OneStepConfig::default(),
+            "critic":ResidualFitConfig::new(1e-4,0.01,100).unwrap(),
+            "residualSeed":17,"maxOutputBytes":33554432,"excludedFamilies":[]},"tip":tip},
+        "initial":{"runSpec":run_spec(),"pool":reserved_pool,"tip":tip},
+        "steps":[],"segmentSpec":{"schema":SEGMENT_SPEC_SCHEMA,
+            "runSpec":run_spec(),"globalContract":b.contract},
+        "amendBudget":false,"pool":reserved_pool,"collections":[reserved_pool],
+        "exclusions":exclusions,"samplingConsumption":pin});
+    let reserved_raw = serde_json::to_vec(&reserved_plan).unwrap();
+    assert!(campaign::sampling_plan_configs(&reserved_raw, &sha(&reserved_raw)).is_err());
+    let (read_configs, _, _) =
+        campaign::reserved_sampling_plan_configs(&reserved_raw, &sha(&reserved_raw)).unwrap();
+    assert_eq!(read_configs, later);
+    reserved_plan["samplingConsumption"] = Value::Null;
+    let original_raw = serde_json::to_vec(&reserved_plan).unwrap();
+    campaign::sampling_plan_configs(&original_raw, &sha(&original_raw)).unwrap();
+    assert!(campaign::reserved_sampling_plan_configs(&original_raw, &sha(&original_raw)).is_err());
     let mut consumed = b.clone();
     consumed.next = next;
     consumed.sampling_consumption = Some(
@@ -1084,6 +1124,13 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
     assert_eq!(v2_progress.external_unavailable.len(), 8);
     assert_eq!(v2_progress.next, next);
     assert_eq!((&v2.parent, &v2.inherited), (&b.parent, &b.inherited));
+    let mut reserved_binding = serde_json::to_value(&v2).unwrap();
+    reserved_binding["samplingConsumption"]["declaration"]["sources"][0]["kind"] =
+        json!("reservedCampaign");
+    let reserved_binding: SegmentBinding = serde_json::from_value(reserved_binding).unwrap();
+    reserved_binding.require_start_bytes(&run_spec()).unwrap();
+    assert_eq!(reserved_binding.parent, v2.parent);
+    assert_eq!(reserved_binding.inherited, v2.inherited);
     let reparsed: sampling::Binding = closed(&v1_raw, HEAD_CAP).unwrap();
     assert_eq!(bytes(&reparsed, HEAD_CAP).unwrap(), v1_raw);
     let mut wrong = v2.clone();

@@ -259,6 +259,24 @@ pub(super) fn sampling_plan_configs(
     if plan.wire.collections.len() > 16 || plan.wire.sampling_consumption.is_some() {
         return Err("Sampling source plan must be a bounded original campaign".into());
     }
+    sampling_configs(plan)
+}
+/// Read-only configuration metadata from an explicitly reserved campaign that
+/// already declares sampling consumption. Neither its pin nor its receipt
+/// authenticates execution, reconstructs an owner, or creates update credit.
+pub(super) fn reserved_sampling_plan_configs(
+    raw: &[u8],
+    digest: &str,
+) -> Result<(Vec<Config>, String, SavedTip), String> {
+    let plan = CurrentMixedCampaignSpec::from_json(raw, digest)?;
+    if plan.wire.collections.len() > 16 || plan.wire.sampling_consumption.is_none() {
+        return Err("Reserved sampling source requires a bounded consumed campaign".into());
+    }
+    sampling_configs(plan)
+}
+fn sampling_configs(
+    plan: CurrentMixedCampaignSpec,
+) -> Result<(Vec<Config>, String, SavedTip), String> {
     let mut configs = Vec::new();
     for value in &plan.wire.collections {
         configs.extend(
