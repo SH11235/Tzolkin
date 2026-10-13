@@ -1169,6 +1169,35 @@ mod tests {
         let mut unsupported = o.clone();
         unsupported.additional_buildings = true;
         assert!(session().on_callback(0, &unsupported).is_err());
+
+        // A shared outer Setup selector notifies this session without asking
+        // it to predict or choose. Playing must still accept the next exact
+        // callback and enforce one choice, retaining its own guard history.
+        let mut state = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        let mut routed = session();
+        for index in 0..3 {
+            let o = observe(&state, state.current_player).unwrap();
+            assert_eq!(o.phase, Phase::Setup);
+            routed.on_callback(index, &o).unwrap();
+            let decision =
+                crate::setup_policy::choose_move_with_weights(&o, &HeuristicWeights::default())
+                    .unwrap();
+            state = apply_move(&state, decision.r#move).unwrap();
+        }
+        let o = observe(&state, state.current_player).unwrap();
+        assert_eq!(o.phase, Phase::Playing);
+        routed.on_callback(3, &o).unwrap();
+        let decision = routed
+            .choose_using(3, &o, |o| {
+                Ok(NumericPolicyDistribution {
+                    logits: vec![0.; o.legal_actions.len()],
+                    probabilities: vec![1. / o.legal_actions.len() as f32; o.legal_actions.len()],
+                })
+            })
+            .unwrap();
+        assert_eq!(decision.decision.policy_version, POLICY_VERSION);
+        assert_eq!(decision.decision.r#move, o.legal_actions[0].r#move);
+        assert!(routed.choose_using(3, &o, |_| unreachable!()).is_err());
     }
     #[test]
     fn conditional_trade_uses_shared_history_and_resets_on_other_actor() {
