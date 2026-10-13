@@ -25,6 +25,7 @@ impl HeuristicRevision {
 enum ScoringProfile {
     Historical(HeuristicRevision),
     FoodAligned,
+    FoodAlignedV2,
 }
 impl From<HeuristicRevision> for ScoringProfile {
     fn from(revision: HeuristicRevision) -> Self {
@@ -89,7 +90,10 @@ fn active(o: &Observation) -> Option<ProphecyId> {
     e.prophecies.get(e.active_prophecy?).copied()
 }
 fn food_requirement(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f64 {
-    if matches!(revision, ScoringProfile::FoodAligned) {
+    if matches!(
+        revision,
+        ScoringProfile::FoodAligned | ScoringProfile::FoodAlignedV2
+    ) {
         let requirement = 2.0
             + f64::from(u8::from(active(o) == Some(ProphecyId::Hunger)))
             + f64::from(u8::from(
@@ -122,9 +126,9 @@ fn corn_target(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f
         ScoringProfile::Historical(HeuristicRevision::V1) => {
             *day >= o.round && !o.food_days.contains(day)
         }
-        ScoringProfile::Historical(HeuristicRevision::V2) | ScoringProfile::FoodAligned => {
-            !o.food_days.contains(day)
-        }
+        ScoringProfile::Historical(HeuristicRevision::V2)
+        | ScoringProfile::FoodAligned
+        | ScoringProfile::FoodAlignedV2 => !o.food_days.contains(day),
     });
     let reserve = match revision {
         ScoringProfile::Historical(HeuristicRevision::V1) => match food.map(|day| day - o.round) {
@@ -132,13 +136,13 @@ fn corn_target(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f
             Some(3..=5) => food_requirement(o, p, revision) * 0.6,
             _ => 2.0,
         },
-        ScoringProfile::Historical(HeuristicRevision::V2) | ScoringProfile::FoodAligned => {
-            match food.map(|day| day - o.round) {
-                Some(..=2) => food_requirement(o, p, revision),
-                Some(3..=5) => food_requirement(o, p, revision) * 0.6,
-                _ => 2.0,
-            }
-        }
+        ScoringProfile::Historical(HeuristicRevision::V2)
+        | ScoringProfile::FoodAligned
+        | ScoringProfile::FoodAlignedV2 => match food.map(|day| day - o.round) {
+            Some(..=2) => food_requirement(o, p, revision),
+            Some(3..=5) => food_requirement(o, p, revision) * 0.6,
+            _ => 2.0,
+        },
     };
     reserve + 3.0
 }
@@ -187,6 +191,7 @@ fn effects_value(
         .into_iter()
         .filter(|d| !o.food_days.contains(d))
         .count() as f64;
+    let mut food_player = matches!(revision, ScoringProfile::FoodAlignedV2).then(|| p.clone());
     effects
         .iter()
         .map(|effect| match effect {
@@ -194,11 +199,32 @@ fn effects_value(
                 .iter()
                 .map(|(r, n)| *n as f64 * value(o, p, *r, w, revision))
                 .sum(),
-            Effect::Feed { workers } => match workers {
-                FeedWorkers::All(_) => food_requirement(o, p, revision) * remaining_food * 0.9,
-                FeedWorkers::Count(n) => *n as f64 * remaining_food * 1.8,
-            },
-            Effect::FeedDiscount { amount } => *amount as f64 * remaining_food * 0.9,
+            Effect::Feed { workers } => {
+                if let Some(player) = food_player.as_mut() {
+                    let before = food_requirement(o, player, revision);
+                    match workers {
+                        FeedWorkers::All(_) => player.feed_all = true,
+                        FeedWorkers::Count(n) => player.feed_workers += n,
+                    }
+                    (before - food_requirement(o, player, revision)) * remaining_food * 0.9
+                } else {
+                    match workers {
+                        FeedWorkers::All(_) => {
+                            food_requirement(o, p, revision) * remaining_food * 0.9
+                        }
+                        FeedWorkers::Count(n) => *n as f64 * remaining_food * 1.8,
+                    }
+                }
+            }
+            Effect::FeedDiscount { amount } => {
+                if let Some(player) = food_player.as_mut() {
+                    let before = food_requirement(o, player, revision);
+                    player.feed_discount += amount;
+                    (before - food_requirement(o, player, revision)) * remaining_food * 0.9
+                } else {
+                    *amount as f64 * remaining_food * 0.9
+                }
+            }
             Effect::Technology { steps, .. } => steps.unwrap_or(1) as f64 * w.technology_step,
             Effect::Temple { steps, .. } => steps.unwrap_or(1) as f64 * w.temple_step,
             Effect::Trade => 1.0,
@@ -214,10 +240,120 @@ fn effects_value(
             }
             Effect::TechnologyExchange => w.technology_step * 2.0,
             Effect::Points { amount } => *amount as f64,
-            Effect::Worker => w.worker * ((27 - o.round) as f64 / 20.0).max(0.15),
+            Effect::Worker => {
+                if let Some(player) = food_player.as_mut() {
+                    player.workers = (player.workers + 1).min(6);
+                }
+                w.worker * ((27 - o.round) as f64 / 20.0).max(0.15)
+            }
             Effect::Action { .. } => 7.0,
         })
         .sum()
+}
+
+fn technology_effect_enabled(
+    o: &Observation,
+    p: &PublicPlayer,
+    technology: TechnologyId,
+    level: i64,
+) -> bool {
+    p.technologies[tech_index(technology)] >= level
+        && !(level == 2 && active(o) == Some(ProphecyId::ForgottenLore))
+}
+
+/// A selected harvest has one resource outcome; unavailable choices never enter
+/// the legal set. Removal and free-choice previews keep their existing estimate.
+fn harvest_resources(
+    o: &Observation,
+    p: &PublicPlayer,
+    kind: HarvestKind,
+    position: i64,
+) -> [i64; 5] {
+    let mut amounts = [0; 5];
+    if !(2..=5).contains(&position) {
+        return amounts;
+    }
+    if kind == HarvestKind::Wood {
+        amounts[1] = (position - 1
+            + i64::from(technology_effect_enabled(o, p, TechnologyId::Extraction, 1))
+            - i64::from(active(o) == Some(ProphecyId::ForestFires)))
+        .max(0);
+    } else {
+        amounts[0] = ([0, 3, 4, 5, 7, 9][position as usize]
+            + i64::from(technology_effect_enabled(
+                o,
+                p,
+                TechnologyId::Agriculture,
+                1,
+            ))
+            + 2 * i64::from(technology_effect_enabled(
+                o,
+                p,
+                TechnologyId::Agriculture,
+                3,
+            ))
+            - i64::from(active(o) == Some(ProphecyId::Drought)))
+        .max(0);
+    }
+    amounts
+}
+
+fn selected_action_resources(
+    o: &Observation,
+    p: &PublicPlayer,
+    gear: GearId,
+    position: i64,
+) -> Option<[i64; 5]> {
+    let mut amounts = [0; 5];
+    match (gear, position) {
+        (GearId::Palenque, 1) => {
+            amounts[0] = 3 + i64::from(technology_effect_enabled(
+                o,
+                p,
+                TechnologyId::Agriculture,
+                2,
+            ));
+        }
+        (GearId::Yaxchilan, 1) => {
+            amounts[1] =
+                1 + i64::from(technology_effect_enabled(o, p, TechnologyId::Extraction, 1));
+        }
+        (GearId::Yaxchilan, 2) => {
+            amounts[0] = 1;
+            amounts[2] =
+                1 + i64::from(technology_effect_enabled(o, p, TechnologyId::Extraction, 2));
+        }
+        (GearId::Yaxchilan, 3) => {
+            amounts[0] = 2;
+            amounts[3] =
+                1 + i64::from(technology_effect_enabled(o, p, TechnologyId::Extraction, 3));
+        }
+        (GearId::Yaxchilan, 4) => {
+            amounts[4] =
+                (1 + i64::from(technology_effect_enabled(o, p, TechnologyId::Theology, 3)))
+                    .min(o.skull_supply)
+                    .max(0);
+        }
+        (GearId::Yaxchilan, 5) => {
+            amounts[0] = 2;
+            amounts[2] =
+                1 + i64::from(technology_effect_enabled(o, p, TechnologyId::Extraction, 2));
+            amounts[3] =
+                1 + i64::from(technology_effect_enabled(o, p, TechnologyId::Extraction, 3));
+        }
+        _ => return None,
+    }
+    // Taxed rewards are selected by a later exact ProphecyGain action. Their
+    // pre-choice preview is deliberately outside this profile's exact subset.
+    if (amounts[3] > 0 && active(o) == Some(ProphecyId::GoldShortage))
+        || (gear == GearId::Yaxchilan
+            && position == 4
+            && active(o) == Some(ProphecyId::Desecration))
+    {
+        None
+    } else {
+        Some(amounts)
+    }
 }
 fn action_value(
     o: &Observation,
@@ -298,6 +434,10 @@ pub fn score_action_for_revision(
 /// Historical scoring and ResourceCycle continue to use their explicit revisions.
 pub fn score_action_food_aligned(o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f64 {
     score_action_for_profile(o, a, w, ScoringProfile::FoodAligned)
+}
+
+pub fn score_action_food_aligned_v2(o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f64 {
+    score_action_for_profile(o, a, w, ScoringProfile::FoodAlignedV2)
 }
 
 fn score_action_for_profile(
@@ -455,7 +595,13 @@ fn score_action_for_profile(
             corn_cost,
             ..
         } => {
-            action_value(o, p, *gear, *position, w, revision)
+            let gain = if matches!(revision, ScoringProfile::FoodAlignedV2) {
+                selected_action_resources(o, p, *gear, *position)
+                    .map(|amounts| amount_value(o, p, &amounts, w, revision))
+            } else {
+                None
+            };
+            gain.unwrap_or_else(|| action_value(o, p, *gear, *position, w, revision))
                 - *corn_cost as f64 * value(o, p, Resource::Corn, w, revision)
         }
         TypedAction::Technology { technology } => {
@@ -538,6 +684,21 @@ fn score_action_for_profile(
                     - value(o, p, *resource, w, revision)
             } else {
                 -1.0
+            }
+        }
+        TypedAction::Harvest { kind, position }
+            if matches!(revision, ScoringProfile::FoodAlignedV2) =>
+        {
+            amount_value(
+                o,
+                p,
+                &harvest_resources(o, p, *kind, *position),
+                w,
+                revision,
+            ) - if *kind == HarvestKind::Burn {
+                w.temple_step
+            } else {
+                0.0
             }
         }
         TypedAction::Harvest { kind, position } => match kind {
@@ -761,6 +922,11 @@ mod tests {
             }
             let aligned = crate::choose_move_food_aligned(&observation).unwrap();
             assert_eq!(aligned.policy_version, crate::FOOD_ALIGNED_POLICY_VERSION);
+            let aligned_v2 = crate::choose_move_food_aligned_v2(&observation).unwrap();
+            assert_eq!(
+                aligned_v2.policy_version,
+                crate::FOOD_ALIGNED_V2_POLICY_VERSION
+            );
             assert!(
                 observation
                     .legal_actions
@@ -787,6 +953,402 @@ mod tests {
                 );
                 assert_ne!(old.r#move, aligned.r#move);
             }
+        }
+        let weights = HeuristicWeights::default();
+        let playing = |prophecy: Option<ProphecyId>| {
+            let mut state =
+                create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+            state.phase = Phase::Playing;
+            state.round = 6;
+            state.players[state.current_player]
+                .resources
+                .insert(Resource::Corn, 100);
+            if let Some(prophecy) = prophecy {
+                state.expansion = Some(ExpansionState {
+                    prophecies: vec![prophecy],
+                    active_prophecy: Some(0),
+                    ..ExpansionState::default()
+                });
+            }
+            state
+        };
+        // Compare selected harvests with the actual core resource transition.
+        for (kind, position, agriculture, extraction, prophecy, amounts) in [
+            (HarvestKind::Corn, 2, 0, 0, None, [4, 0, 0, 0, 0]),
+            (HarvestKind::Corn, 3, 3, 0, None, [8, 0, 0, 0, 0]),
+            (
+                HarvestKind::Corn,
+                5,
+                3,
+                0,
+                Some(ProphecyId::Drought),
+                [11, 0, 0, 0, 0],
+            ),
+            (HarvestKind::Wood, 3, 0, 1, None, [0, 3, 0, 0, 0]),
+            (
+                HarvestKind::Wood,
+                5,
+                0,
+                1,
+                Some(ProphecyId::ForestFires),
+                [0, 4, 0, 0, 0],
+            ),
+            (HarvestKind::EmptyCorn, 3, 2, 0, None, [6, 0, 0, 0, 0]),
+            (HarvestKind::Burn, 3, 3, 0, None, [8, 0, 0, 0, 0]),
+        ] {
+            let mut state = playing(prophecy);
+            let actor = state.current_player;
+            let player = &mut state.players[actor];
+            player
+                .technologies
+                .insert(TechnologyId::Agriculture, agriculture);
+            player
+                .technologies
+                .insert(TechnologyId::Extraction, extraction);
+            state.jungle.insert(
+                position,
+                JungleBox {
+                    corn: if kind == HarvestKind::EmptyCorn { 0 } else { 2 },
+                    wood: if kind == HarvestKind::Corn { 0 } else { 1 },
+                },
+            );
+            state.pending = Some(Pending {
+                title: "Harvest".into(),
+                task: Task::Palenque { position },
+                after: vec![],
+            });
+            let observation = observe(&state, actor).unwrap();
+            let player = &observation.players[actor];
+            let action = TypedAction::Harvest { kind, position };
+            let legal = observation
+                .legal_actions
+                .iter()
+                .find(|row| row.action == action)
+                .unwrap();
+            assert_eq!(
+                harvest_resources(&observation, player, kind, position),
+                amounts
+            );
+            let next = apply_move(&state, legal.r#move.clone()).unwrap();
+            for (resource, amount) in RESOURCE_IDS.into_iter().zip(amounts) {
+                assert_eq!(
+                    next.players[actor].resources[&resource]
+                        - state.players[actor].resources[&resource],
+                    amount
+                );
+            }
+            let expected = amount_value(
+                &observation,
+                player,
+                &amounts,
+                &weights,
+                ScoringProfile::FoodAlignedV2,
+            ) - if kind == HarvestKind::Burn {
+                weights.temple_step
+            } else {
+                0.0
+            };
+            assert_eq!(
+                score_action_food_aligned_v2(&observation, &action, &weights).to_bits(),
+                expected.to_bits()
+            );
+            if kind == HarvestKind::EmptyCorn {
+                assert_eq!(
+                    next.players[actor].corn_tiles,
+                    state.players[actor].corn_tiles
+                );
+                assert_eq!(next.jungle[&position], state.jungle[&position]);
+            }
+            if kind == HarvestKind::Burn {
+                assert!(matches!(
+                    next.pending.as_ref().unwrap().task,
+                    Task::Temple {
+                        remaining: 1,
+                        direction: Some(-1),
+                        ..
+                    }
+                ));
+            }
+        }
+        // Fishing is not a jungle harvest; Forgotten Lore suppresses only level 2.
+        for (gear, position, agriculture, extraction, theology, supply, prophecy, amounts) in [
+            (
+                GearId::Palenque,
+                1,
+                2,
+                0,
+                0,
+                13,
+                Some(ProphecyId::Drought),
+                [4, 0, 0, 0, 0],
+            ),
+            (
+                GearId::Palenque,
+                1,
+                3,
+                0,
+                0,
+                13,
+                Some(ProphecyId::ForgottenLore),
+                [3, 0, 0, 0, 0],
+            ),
+            (GearId::Yaxchilan, 1, 0, 1, 0, 13, None, [0, 2, 0, 0, 0]),
+            (GearId::Yaxchilan, 2, 0, 2, 0, 13, None, [1, 0, 2, 0, 0]),
+            (GearId::Yaxchilan, 3, 0, 3, 0, 13, None, [2, 0, 0, 2, 0]),
+            (GearId::Yaxchilan, 5, 0, 3, 0, 13, None, [2, 0, 2, 2, 0]),
+            (
+                GearId::Yaxchilan,
+                5,
+                0,
+                3,
+                0,
+                13,
+                Some(ProphecyId::ForgottenLore),
+                [2, 0, 1, 2, 0],
+            ),
+            (GearId::Yaxchilan, 4, 0, 0, 3, 1, None, [0, 0, 0, 0, 1]),
+            (GearId::Yaxchilan, 4, 0, 0, 3, 0, None, [0, 0, 0, 0, 0]),
+        ] {
+            let mut state = playing(prophecy);
+            let actor = state.current_player;
+            let player = &mut state.players[actor];
+            player
+                .technologies
+                .insert(TechnologyId::Agriculture, agriculture);
+            player
+                .technologies
+                .insert(TechnologyId::Extraction, extraction);
+            player.technologies.insert(TechnologyId::Theology, theology);
+            state.skull_supply = supply;
+            state.pending = Some(Pending {
+                title: "Action".into(),
+                task: Task::Action {
+                    gear,
+                    position,
+                    free: Some(true),
+                },
+                after: vec![],
+            });
+            let observation = observe(&state, actor).unwrap();
+            let player = &observation.players[actor];
+            let legal = observation.legal_actions.iter().find(|row| matches!(&row.action, TypedAction::UseAction { gear: g, position: pos, corn_cost: 0, .. } if *g == gear && *pos == position)).unwrap();
+            assert_eq!(
+                selected_action_resources(&observation, player, gear, position),
+                Some(amounts)
+            );
+            let next = apply_move(&state, legal.r#move.clone()).unwrap();
+            for (resource, amount) in RESOURCE_IDS.into_iter().zip(amounts) {
+                assert_eq!(
+                    next.players[actor].resources[&resource]
+                        - state.players[actor].resources[&resource],
+                    amount
+                );
+            }
+            assert_eq!(
+                score_action_food_aligned_v2(&observation, &legal.action, &weights).to_bits(),
+                amount_value(
+                    &observation,
+                    player,
+                    &amounts,
+                    &weights,
+                    ScoringProfile::FoodAlignedV2
+                )
+                .to_bits()
+            );
+        }
+        for (balam, cost) in [(false, 2), (true, -1)] {
+            let mut state = playing(None);
+            let actor = state.current_player;
+            state.players[actor]
+                .technologies
+                .insert(TechnologyId::Extraction, 3);
+            state.players[actor].tribe = balam.then_some(TribeId::Balam);
+            state.pending = Some(Pending {
+                title: "Action".into(),
+                task: Task::Action {
+                    gear: GearId::Yaxchilan,
+                    position: 5,
+                    free: None,
+                },
+                after: vec![],
+            });
+            let observation = observe(&state, actor).unwrap();
+            let player = &observation.players[actor];
+            let legal = observation.legal_actions.iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Yaxchilan, position: 3, corn_cost, .. } if corn_cost == cost)).unwrap();
+            let next = apply_move(&state, legal.r#move.clone()).unwrap();
+            assert_eq!(
+                next.players[actor].resources[&Resource::Corn]
+                    - state.players[actor].resources[&Resource::Corn],
+                2 - cost
+            );
+            let expected = amount_value(
+                &observation,
+                player,
+                &[2, 0, 0, 2, 0],
+                &weights,
+                ScoringProfile::FoodAlignedV2,
+            ) - cost as f64
+                * value(
+                    &observation,
+                    player,
+                    Resource::Corn,
+                    &weights,
+                    ScoringProfile::FoodAlignedV2,
+                );
+            assert_eq!(
+                score_action_food_aligned_v2(&observation, &legal.action, &weights).to_bits(),
+                expected.to_bits()
+            );
+        }
+        for prophecy in [ProphecyId::GoldShortage, ProphecyId::Desecration] {
+            let mut state = playing(Some(prophecy));
+            let position = if prophecy == ProphecyId::GoldShortage {
+                5
+            } else {
+                4
+            };
+            state.pending = Some(Pending {
+                title: "Action".into(),
+                task: Task::Action {
+                    gear: GearId::Yaxchilan,
+                    position,
+                    free: Some(true),
+                },
+                after: vec![],
+            });
+            let observation = observe(&state, state.current_player).unwrap();
+            let player = &observation.players[observation.actor];
+            assert_eq!(
+                selected_action_resources(&observation, player, GearId::Yaxchilan, position),
+                None
+            );
+            let action = observation.legal_actions.iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Yaxchilan, position: p, .. } if p == position)).unwrap();
+            assert_eq!(
+                score_action_food_aligned_v2(&observation, &action.action, &weights).to_bits(),
+                score_action_food_aligned(&observation, &action.action, &weights).to_bits()
+            );
+            assert_eq!(
+                selected_action_resources(&observation, player, GearId::Yaxchilan, 6),
+                None
+            );
+        }
+        // Marginal feed effects telescope and stop at the real saturated cost.
+        for (workers, farms, discount, all, hunger, yaluk, effects, saved) in [
+            (
+                3,
+                2,
+                0,
+                false,
+                false,
+                false,
+                vec![Effect::Feed {
+                    workers: FeedWorkers::Count(3),
+                }],
+                2,
+            ),
+            (
+                3,
+                0,
+                2,
+                false,
+                false,
+                false,
+                vec![Effect::FeedDiscount { amount: 1 }],
+                0,
+            ),
+            (
+                5,
+                0,
+                1,
+                false,
+                true,
+                true,
+                vec![Effect::Feed {
+                    workers: FeedWorkers::All(AllWorkers::All),
+                }],
+                10,
+            ),
+            (
+                3,
+                0,
+                0,
+                true,
+                false,
+                false,
+                vec![Effect::Feed {
+                    workers: FeedWorkers::Count(3),
+                }],
+                0,
+            ),
+            (
+                3,
+                0,
+                0,
+                false,
+                false,
+                false,
+                vec![
+                    Effect::Feed {
+                        workers: FeedWorkers::Count(1),
+                    },
+                    Effect::FeedDiscount { amount: 1 },
+                ],
+                4,
+            ),
+            (
+                3,
+                0,
+                0,
+                false,
+                false,
+                false,
+                vec![
+                    Effect::FeedDiscount { amount: 1 },
+                    Effect::Feed {
+                        workers: FeedWorkers::Count(1),
+                    },
+                ],
+                4,
+            ),
+        ] {
+            let mut state = playing(hunger.then_some(ProphecyId::Hunger));
+            let actor = state.current_player;
+            let player = &mut state.players[actor];
+            player.workers = workers;
+            player.feed_workers = farms;
+            player.feed_discount = discount;
+            player.feed_all = all;
+            player.tribe = yaluk.then_some(TribeId::Yaluk);
+            let before = prophecies::feeding(player, hunger, i64::from(yaluk));
+            let mut after_player = player.clone();
+            for effect in &effects {
+                match effect {
+                    Effect::Feed {
+                        workers: FeedWorkers::Count(n),
+                    } => after_player.feed_workers += n,
+                    Effect::Feed {
+                        workers: FeedWorkers::All(_),
+                    } => after_player.feed_all = true,
+                    Effect::FeedDiscount { amount } => after_player.feed_discount += amount,
+                    _ => unreachable!(),
+                }
+            }
+            let after = prophecies::feeding(&after_player, hunger, i64::from(yaluk));
+            assert_eq!(before.corn_cost - after.corn_cost, saved);
+            assert_eq!((before.unfed_workers, after.unfed_workers), (0, 0));
+            let observation = observe(&state, actor).unwrap();
+            let player = &observation.players[actor];
+            assert!(
+                (effects_value(
+                    &observation,
+                    player,
+                    &effects,
+                    &weights,
+                    ScoringProfile::FoodAlignedV2
+                ) - saved as f64 * 4.0 * 0.9)
+                    .abs()
+                    < 1e-12
+            );
         }
     }
 }
