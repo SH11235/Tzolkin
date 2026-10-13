@@ -1443,7 +1443,12 @@ fn observed_market_and_paid_anywhere_v4_require_exact_source_authority() {
             "rollback",
             "queued",
             "ambiguous",
+            "swappedTempleOrder",
+            "unexplainedTempleCaption",
         ] {
+            if monument && matches!(change, "swappedTempleOrder" | "unexplainedTempleCaption") {
+                continue;
+            }
             let mut f = Fixture::pending_choice(monument, 4);
             let mut messages = f.raw["dom_entries"][0]["messages"]
                 .as_array()
@@ -1456,6 +1461,11 @@ fn observed_market_and_paid_anywhere_v4_require_exact_source_authority() {
                     }
                 }
                 "duplicate" => messages.push(messages.last().unwrap().clone()),
+                "swappedTempleOrder" => messages.reverse(),
+                "unexplainedTempleCaption" => messages.push(json!({
+                    "raw_text":"P0はQuetzalcoatlの信仰を1段上げた",
+                    "html":"P0はQuetzalcoatlの信仰を1段上げた", "icons":[]
+                })),
                 "markup" => {
                     messages.last_mut().unwrap()["html"] = json!("<span>hidden choice</span>")
                 }

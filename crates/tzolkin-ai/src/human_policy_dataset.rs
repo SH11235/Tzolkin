@@ -878,7 +878,8 @@ fn observed_pending_choice_evidence(
         return Ok(None);
     }
     let mut chosen_message = None;
-    let mut temple_captions = BTreeSet::new();
+    let mut temple_captions = Vec::new();
+    let mut unique_temple_captions = BTreeSet::new();
     for (i, message) in messages.iter().enumerate() {
         let text = message["raw_text"]
             .as_str()
@@ -897,8 +898,11 @@ fn observed_pending_choice_evidence(
             if chosen_message.replace(i).is_some() {
                 return Ok(None);
             }
-            if kind == "positiveTemple" && !temple_captions.insert(text) {
-                return Ok(None);
+            if kind == "positiveTemple" {
+                if !unique_temple_captions.insert(text) {
+                    return Ok(None);
+                }
+                temple_captions.push(text);
             }
         } else if let Some(vector) =
             material_caption_bounded(message, name, sources.raw["schema_version"] == 1, 4)
@@ -915,9 +919,10 @@ fn observed_pending_choice_evidence(
                 .iter()
                 .any(|label| plain_caption(message, &format!("{name}は{label}の信仰を1段上げた")))
         {
-            if !temple_captions.insert(text) {
+            if !unique_temple_captions.insert(text) {
                 return Ok(None);
             }
+            temple_captions.push(text);
         } else {
             return Ok(None);
         }
@@ -932,6 +937,55 @@ fn observed_pending_choice_evidence(
     } else if !material_indices.is_empty() {
         // A prior payment in the same event needs separate operation support.
         return Ok(None);
+    } else {
+        // A shared event's final board can commute: bind each caption to the
+        // actual same-actor positive Temple decisions in replay order instead.
+        let mut ordered_captions = Vec::new();
+        for (event_index, event_step) in sources.record.steps.iter().enumerate() {
+            if event_step.actor != step.actor
+                || !event_step
+                    .source_action_ids
+                    .contains(&step.source_action_ids[0])
+            {
+                continue;
+            }
+            if event_step.source_action_ids != step.source_action_ids {
+                return Ok(None);
+            }
+            let event_frame = inspect_public(&report.frames[event_index].snapshot.state)?;
+            let event_observation = event_frame
+                .observation
+                .as_ref()
+                .ok_or("Missing shared pending choice observation")?;
+            let matching = event_observation
+                .legal_actions
+                .iter()
+                .filter(|row| row.r#move == event_step.r#move)
+                .collect::<Vec<_>>();
+            if event_observation.actor != step.actor || matching.len() != 1 {
+                return Ok(None);
+            }
+            if let TypedAction::Temple {
+                temple,
+                direction: 1,
+            } = matching[0].action
+            {
+                let label = match temple {
+                    TempleId::Chaac => "Chaac",
+                    TempleId::Quetzalcoatl => "Quetzalcoatl",
+                    TempleId::Kukulkan => "Kukulcan",
+                };
+                ordered_captions.push(format!("{name}は{label}の信仰を1段上げた"));
+            }
+        }
+        if temple_captions.len() != ordered_captions.len()
+            || temple_captions
+                .iter()
+                .zip(&ordered_captions)
+                .any(|(observed, expected)| *observed != expected)
+        {
+            return Ok(None);
+        }
     }
     Ok(Some(ObservedPendingChoiceSupport {
         kind,
