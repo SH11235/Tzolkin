@@ -19,15 +19,15 @@ pub use live::{CurrentMixedLivePlanSpec, current_mixed_live_plan};
 
 const SEAT_CAMPAIGN_SCHEMA: &str = "tzolkin-current-mixed-ready-seat-campaign-v1";
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct InputPin {
-    path: PathBuf,
-    bytes: usize,
-    sha256: String,
+pub(super) struct InputPin {
+    pub(super) path: PathBuf,
+    pub(super) bytes: usize,
+    pub(super) sha256: String,
 }
 impl InputPin {
-    fn read(&self, cap: usize) -> Result<Vec<u8>, String> {
+    pub(super) fn read(&self, cap: usize) -> Result<Vec<u8>, String> {
         if self.bytes == 0 || self.bytes > cap || !checkpoint_digest(&self.sha256) {
             return Err("Campaign input pin shape/cap".into());
         }
@@ -53,9 +53,9 @@ enum Bootstrap {
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SavedTip {
-    head: InputPin,
-    directory: PathBuf,
+pub(super) struct SavedTip {
+    pub(super) head: InputPin,
+    pub(super) directory: PathBuf,
 }
 impl SavedTip {
     fn tip<'s>(&'s self, raw: &'s [u8]) -> CurrentMixedRestoreTip<'s> {
@@ -86,6 +86,11 @@ enum SavedStep {
         spec: Value,
         tip: SavedTip,
     },
+    SamplingConsumption {
+        spec: Value,
+        consumption: InputPin,
+        tip: SavedTip,
+    },
     BudgetAmendment {
         spec: Value,
         tip: SavedTip,
@@ -108,6 +113,7 @@ impl SavedStep {
     fn spec(&self) -> &Value {
         match self {
             Self::Segment { spec, .. }
+            | Self::SamplingConsumption { spec, .. }
             | Self::BudgetAmendment { spec, .. }
             | Self::GuardedPoolFork { spec, .. }
             | Self::SeatRotation { spec, .. } => spec,
@@ -116,6 +122,7 @@ impl SavedStep {
     fn tip(&self) -> &SavedTip {
         match self {
             Self::Segment { tip, .. }
+            | Self::SamplingConsumption { tip, .. }
             | Self::BudgetAmendment { tip, .. }
             | Self::GuardedPoolFork { tip, .. }
             | Self::SeatRotation { tip, .. } => tip,
@@ -123,12 +130,39 @@ impl SavedStep {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Exclusions {
-    file: InputPin,
-    count: usize,
-    family_digest: String,
+pub(super) struct Exclusions {
+    pub(super) file: InputPin,
+    pub(super) count: usize,
+    pub(super) family_digest: String,
+}
+impl Exclusions {
+    pub(super) fn shape(&self) -> Result<(), String> {
+        if self.count > MAX_EXCLUSIONS
+            || !checkpoint_digest(&self.family_digest)
+            || self.file.bytes == 0
+            || self.file.bytes > EXCLUSION_CAP
+            || !checkpoint_digest(&self.file.sha256)
+        {
+            return Err("Campaign external exclusion pin shape".into());
+        }
+        Ok(())
+    }
+    pub(super) fn checked(&self) -> Result<BTreeSet<String>, String> {
+        self.shape()?;
+        let raw = self.file.read(EXCLUSION_CAP)?;
+        let families: Vec<String> = closed(&raw, EXCLUSION_CAP)?;
+        if families.len() != self.count
+            || families.iter().any(|s| !checkpoint_digest(s))
+            || families.windows(2).any(|p| p[0] >= p[1])
+            || hash(b"tzolkin-current-mixed-campaign-exclusions-v1\0", &families)?
+                != self.family_digest
+        {
+            return Err("Campaign full external exclusion declaration differs".into());
+        }
+        Ok(families.into_iter().collect())
+    }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -195,6 +229,8 @@ struct CampaignWire {
     exclusions: Exclusions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seat_campaign: Option<SeatCampaign>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampling_consumption: Option<InputPin>,
 }
 
 /// Checked campaign metadata. It cannot deserialize or construct a policy owner.
@@ -214,6 +250,32 @@ fn run_spec(value: &Value) -> Result<CurrentMixedRunSpec, String> {
 }
 fn segment_spec(value: &Value) -> Result<CurrentMixedSegmentSpec, String> {
     CurrentMixedSegmentSpec::from_json(&encoded(value)?)
+}
+pub(super) fn sampling_plan_configs(
+    raw: &[u8],
+    digest: &str,
+) -> Result<(Vec<Config>, String, SavedTip), String> {
+    let plan = CurrentMixedCampaignSpec::from_json(raw, digest)?;
+    if plan.wire.collections.len() > 16 || plan.wire.sampling_consumption.is_some() {
+        return Err("Sampling source plan must be a bounded original campaign".into());
+    }
+    let mut configs = Vec::new();
+    for value in &plan.wire.collections {
+        configs.extend(
+            collection(value)?
+                .inner
+                .configs()?
+                .each_ref()
+                .map(Config::from_config),
+        );
+    }
+    let tip = plan
+        .wire
+        .steps
+        .last()
+        .map_or(&plan.wire.initial.tip, SavedStep::tip)
+        .clone();
+    Ok((configs, collection(&plan.wire.pool)?.pool_checksum()?, tip))
 }
 impl CurrentMixedCampaignSpec {
     pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
@@ -280,6 +342,15 @@ impl CurrentMixedCampaignSpec {
                 }
                 pool_checksum = rotation.checked_pools(&pool_checksum)?.1.pool_checksum()?;
             }
+        }
+        if wire.sampling_consumption.is_some()
+            && (wire.amend_budget
+                || wire
+                    .seat_campaign
+                    .as_ref()
+                    .is_some_and(|g| g.rotation.is_some()))
+        {
+            return Err("Campaign sampling consumption is exclusive".into());
         }
         if collection(&wire.pool)?.pool_checksum()? != pool_checksum {
             return Err("Campaign fixed pool differs from the saved lineage".into());
@@ -435,6 +506,8 @@ fn metadata_tip(
                 Progress::initial(parent, prefix, next, &consumed.iter().cloned().collect());
             if let Some(binding) = binding {
                 p.base = parent.mixed_update_count();
+                binding.initialize_external(&mut p)?;
+                binding.checksum()?;
                 first_binding = Some(binding.clone());
                 p.segment_start = Some(binding);
             }
@@ -578,6 +651,7 @@ fn successor_metadata(
     next: &MetadataTip,
     fork: bool,
     rotation: bool,
+    consumption: bool,
 ) -> Result<(), String> {
     let binding = next
         .binding
@@ -596,7 +670,24 @@ fn successor_metadata(
         || binding.parent.mixed_update_count() != previous.progress.parent_count()?
         || binding.parent.imported_update_count() != previous.progress.imported
         || binding.prefix != previous.progress.prefix
-        || binding.next != previous.progress.next
+        || binding.next
+            != if consumption {
+                binding
+                    .sampling_consumption
+                    .as_ref()
+                    .ok_or("Campaign sampling binding missing")?
+                    .next()
+            } else {
+                previous.progress.next
+            }
+        || consumption != binding.sampling_consumption.is_some()
+        || (!consumption && binding.external_families() != previous.progress.external_unavailable)
+        || (!consumption
+            && binding.external_unavailable
+                != previous
+                    .binding
+                    .as_ref()
+                    .and_then(|b| b.external_unavailable.clone()))
         || binding.consumed.iter().cloned().collect::<BTreeSet<_>>() != previous.progress.consumed
         || rotation == value["seatRotation"].is_null()
         || if fork {
@@ -613,6 +704,68 @@ fn successor_metadata(
         }
     {
         return Err("Campaign successor ancestry/baseline metadata differs".into());
+    }
+    Ok(())
+}
+
+fn sampling_metadata(
+    previous: &MetadataTip,
+    consumption: &CurrentMixedSamplingConsumptionSpec,
+    own: CurrentMixedOwnDecisionCounters,
+    family_limit: usize,
+) -> Result<(sampling::Binding, sampling::Baseline, u64), String> {
+    let claimed = consumption.predecessor();
+    // This is a preload metadata refusal gate. The native constructor/restore
+    // must still compare the complete parent identity reconstructed from source.
+    if claimed.parent.artifact_checksum() != previous.progress.current_checksum
+        || claimed.parent.mixed_update_count() != previous.progress.parent_count()?
+        || claimed.parent.imported_update_count() != previous.progress.imported
+    {
+        return Err("Campaign sampling predecessor numerical claim differs".into());
+    }
+    let predecessor = sampling::Predecessor {
+        directory: previous.directory.clone(),
+        schema: previous.entry.schema.clone(),
+        root: previous.entry.root.clone(),
+        spec: previous.entry.spec.clone(),
+        head: sha(&previous.raw),
+        sequence: previous.entry.sequence,
+        pool: previous.entry.pool.clone(),
+        parent: claimed.parent.clone(),
+        prefix: previous.progress.prefix,
+        next: previous.progress.next,
+    };
+    consumption.derive(
+        &predecessor,
+        previous.progress.outcome.as_deref(),
+        &previous.progress.consumed,
+        previous
+            .binding
+            .as_ref()
+            .and_then(|b| b.external_unavailable.as_ref()),
+        own_rows(own),
+        family_limit,
+    )
+}
+
+fn require_sampling_metadata(
+    previous: &MetadataTip,
+    next: &MetadataTip,
+    consumption: &CurrentMixedSamplingConsumptionSpec,
+    own: CurrentMixedOwnDecisionCounters,
+    spec: &CurrentMixedSegmentSpec,
+) -> Result<(), String> {
+    let (transition, baseline, cursor) =
+        sampling_metadata(previous, consumption, own, spec.family_limit())?;
+    let binding = next
+        .binding
+        .as_ref()
+        .ok_or("Campaign sampling segment missing")?;
+    if binding.sampling_consumption.as_ref() != Some(&transition)
+        || binding.external_unavailable.as_ref() != Some(&baseline)
+        || binding.next != cursor
+    {
+        return Err("Campaign sampling transition metadata differs".into());
     }
     Ok(())
 }
@@ -669,6 +822,10 @@ struct Preflight {
     configurations: Vec<[Config; 4]>,
     families: Vec<[String; 4]>,
     cumulative_own: CurrentMixedOwnDecisionCounters,
+    consumption: Option<CurrentMixedSamplingConsumptionSpec>,
+    saved_consumptions: Vec<Option<CurrentMixedSamplingConsumptionSpec>>,
+    starting_next: u64,
+    external_baseline: Option<sampling::Baseline>,
 }
 impl CurrentMixedCampaignSpec {
     fn require_seat_baseline(&self, actual: CurrentMixedOwnDecisionCounters) -> Result<(), String> {
@@ -706,6 +863,15 @@ impl CurrentMixedCampaignSpec {
         self.wire.initial.tip.head.read(HEAD_CAP)?;
         for step in &self.wire.steps {
             step.tip().head.read(HEAD_CAP)?;
+            if let SavedStep::SamplingConsumption { consumption, .. } = step {
+                let raw = consumption.read(sampling::CAP)?;
+                CurrentMixedSamplingConsumptionSpec::from_json(&raw, &consumption.sha256)?
+                    .require_inputs()?;
+            }
+        }
+        if let Some(pin) = &self.wire.sampling_consumption {
+            let raw = pin.read(sampling::CAP)?;
+            CurrentMixedSamplingConsumptionSpec::from_json(&raw, &pin.sha256)?.require_inputs()?;
         }
         Ok(())
     }
@@ -753,6 +919,7 @@ impl CurrentMixedCampaignSpec {
         )?;
         let mut cumulative_own = initial.progress.own_decisions;
         let mut steps = Vec::new();
+        let mut saved_consumptions = Vec::new();
         for step in &self.wire.steps {
             if let SavedStep::GuardedPoolFork { new_pool, .. }
             | SavedStep::SeatRotation { new_pool, .. } = step
@@ -765,7 +932,25 @@ impl CurrentMixedCampaignSpec {
                 &metadata,
                 matches!(step, SavedStep::GuardedPoolFork { .. }),
                 matches!(step, SavedStep::SeatRotation { .. }),
+                matches!(step, SavedStep::SamplingConsumption { .. }),
             )?;
+            let saved_consumption = if let SavedStep::SamplingConsumption { consumption, .. } = step
+            {
+                let raw = consumption.read(sampling::CAP)?;
+                let declaration =
+                    CurrentMixedSamplingConsumptionSpec::from_json(&raw, &consumption.sha256)?;
+                require_sampling_metadata(
+                    steps.last().unwrap_or(&initial),
+                    &metadata,
+                    &declaration,
+                    cumulative_own,
+                    &segment_spec(step.spec())?,
+                )?;
+                Some(declaration)
+            } else {
+                None
+            };
+            saved_consumptions.push(saved_consumption);
             if let SavedStep::SeatRotation {
                 old_pool,
                 new_pool,
@@ -783,7 +968,14 @@ impl CurrentMixedCampaignSpec {
                     cumulative_own,
                 )?;
             }
-            if self.wire.seat_campaign.is_some() {
+            if self.wire.seat_campaign.is_some()
+                || self.wire.sampling_consumption.is_some()
+                || self
+                    .wire
+                    .steps
+                    .iter()
+                    .any(|s| matches!(s, SavedStep::SamplingConsumption { .. }))
+            {
                 cumulative_own = cumulative_own.checked_add(metadata.progress.own_decisions)?;
             }
             steps.push(metadata);
@@ -799,22 +991,48 @@ impl CurrentMixedCampaignSpec {
             require_established_seat_contract(latest, &self.wire.segment_spec)?;
         }
         self.require_seat_baseline(cumulative_own)?;
-        let exclusions_raw = self.wire.exclusions.file.read(EXCLUSION_CAP)?;
-        let families: Vec<String> = closed(&exclusions_raw, EXCLUSION_CAP)?;
-        if families.len() != self.wire.exclusions.count
-            || families.len() > MAX_EXCLUSIONS
-            || families.iter().any(|s| !checkpoint_digest(s))
-            || families.windows(2).any(|p| p[0] >= p[1])
-            || hash(b"tzolkin-current-mixed-campaign-exclusions-v1\0", &families)?
-                != self.wire.exclusions.family_digest
+        let exclusions = self.wire.exclusions.checked()?;
+        let mut external_baseline = latest
+            .binding
+            .as_ref()
+            .and_then(|b| b.external_unavailable.clone());
+        if let Some(b) = &external_baseline
+            && !b.require_inputs()?.is_subset(&exclusions)
         {
-            return Err("Campaign full external exclusion declaration differs".into());
+            return Err("Campaign external exclusion declaration must be monotone".into());
         }
-        let exclusions = families.into_iter().collect::<BTreeSet<_>>();
+        let consumption = self
+            .wire
+            .sampling_consumption
+            .as_ref()
+            .map(|pin| {
+                let raw = pin.read(sampling::CAP)?;
+                CurrentMixedSamplingConsumptionSpec::from_json(&raw, &pin.sha256)
+            })
+            .transpose()?;
+        let starting_next = if let Some(c) = &consumption {
+            c.require_exclusions(&self.wire.exclusions)?;
+            let (_, baseline, next) = sampling_metadata(
+                latest,
+                c,
+                cumulative_own,
+                segment_spec(&self.wire.segment_spec)?.family_limit(),
+            )?;
+            external_baseline = Some(baseline);
+            next
+        } else {
+            latest.progress.next
+        };
         let mut used = latest.progress.consumed.clone();
+        used.extend(
+            external_baseline
+                .as_ref()
+                .into_iter()
+                .flat_map(|b| b.families.iter().cloned()),
+        );
         let mut configurations = Vec::new();
         let mut families = Vec::new();
-        let mut next = latest.progress.next;
+        let mut next = starting_next;
         for value in &self.wire.collections {
             let configs = collection(value)?
                 .inner
@@ -859,6 +1077,10 @@ impl CurrentMixedCampaignSpec {
             configurations,
             families,
             cumulative_own,
+            consumption,
+            saved_consumptions,
+            starting_next,
+            external_baseline,
         })
     }
     fn protect_output(&self, output: &Path) -> Result<(), String> {
@@ -1090,7 +1312,8 @@ fn restore_campaign_owner<'a, 's>(
         .iter()
         .zip(&pre.steps)
         .zip(&step_pools)
-        .map(|((saved, metadata), pools)| {
+        .zip(&pre.saved_consumptions)
+        .map(|(((saved, metadata), pools), consumption)| {
             let tip = saved.tip().tip(&metadata.raw);
             let s = segment_spec(saved.spec())?;
             Ok(match saved {
@@ -1116,6 +1339,15 @@ fn restore_campaign_owner<'a, 's>(
                         old_pool,
                         new_pool,
                         shifts: *shifts,
+                        tip,
+                    }
+                }
+                SavedStep::SamplingConsumption { .. } => {
+                    CurrentMixedRestoreStep::SamplingConsumption {
+                        spec: s,
+                        consumption: consumption
+                            .as_ref()
+                            .ok_or("Campaign saved sampling declaration missing")?,
                         tip,
                     }
                 }
@@ -1202,7 +1434,16 @@ pub fn current_mixed_campaign(
     };
     if let Some(child) = &child {
         let previous = pre.steps.last().unwrap_or(&pre.initial);
-        successor_metadata(previous, child, false, child_rotation.is_some())?;
+        successor_metadata(
+            previous,
+            child,
+            false,
+            child_rotation.is_some(),
+            pre.consumption.is_some(),
+        )?;
+        if let Some(c) = &pre.consumption {
+            require_sampling_metadata(previous, child, c, pre.cumulative_own, &child_spec)?;
+        }
         if let Some(rotation) = child_rotation {
             rotation_metadata(
                 previous,
@@ -1305,6 +1546,12 @@ pub fn current_mixed_campaign(
                 shifts: rotation.shifts,
                 tip,
             }
+        } else if let Some(consumption) = &pre.consumption {
+            CurrentMixedRestoreStep::SamplingConsumption {
+                spec: child_spec.clone(),
+                consumption,
+                tip,
+            }
         } else if spec.wire.amend_budget {
             CurrentMixedRestoreStep::BudgetAmendment {
                 spec: child_spec.clone(),
@@ -1329,11 +1576,21 @@ pub fn current_mixed_campaign(
     if session.reserved_families() != &expected_consumed
         || session.progress.prefix != latest.progress.prefix
         || session.progress.next
-            != latest
-                .progress
-                .next
-                .checked_add(4 * completed as u64)
-                .ok_or("Campaign owner stream overflow")?
+            != if child.is_some() {
+                pre.starting_next
+            } else {
+                latest.progress.next
+            }
+            .checked_add(4 * completed as u64)
+            .ok_or("Campaign owner stream overflow")?
+        || session.progress.external_unavailable
+            != if child.is_some() {
+                pre.external_baseline
+                    .as_ref()
+                    .map_or_else(BTreeSet::new, |b| b.families.iter().cloned().collect())
+            } else {
+                latest.progress.external_unavailable.clone()
+            }
         || session.progress.phase != Phase::Ready
         || session.progress.unknown_work
         || session.progress.outcome.as_deref() != Some("updated") && completed > 0
@@ -1366,6 +1623,14 @@ pub fn current_mixed_campaign(
                 old_pool,
                 new_pool,
                 rotation.shifts,
+                &archive,
+            )?
+        } else if let Some(consumption) = &pre.consumption {
+            ready.preflight_sampling_consumption(&child_spec, consumption, &archive)?;
+            CurrentMixedTrainingSession::new_sampling_consumption_segment(
+                ready,
+                child_spec,
+                consumption,
                 &archive,
             )?
         } else if spec.wire.amend_budget {
@@ -1582,6 +1847,7 @@ mod tests {
                 family_digest: "b".repeat(64),
             },
             seat_campaign: None,
+            sampling_consumption: None,
         };
         let legacy = encoded(&wire).unwrap();
         assert!(

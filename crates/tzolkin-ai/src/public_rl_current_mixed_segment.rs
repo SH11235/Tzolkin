@@ -27,6 +27,11 @@ pub struct CurrentMixedSegmentSpec {
     global_contract: GlobalContract,
 }
 impl CurrentMixedSegmentSpec {
+    pub(super) fn family_limit(&self) -> usize {
+        self.run_spec
+            .max_families
+            .min(self.global_contract.max_families)
+    }
     pub fn from_json(raw: &[u8]) -> Result<Self, String> {
         let value = unique_json(raw, SPEC_CAP)?;
         let run_raw = serde_json::to_vec(&value["runSpec"]).map_err(|e| e.to_string())?;
@@ -403,6 +408,10 @@ pub(super) struct SegmentBinding {
     budget_amendment: Option<BudgetAmendmentBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     seat_rotation: Option<SeatRotationBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) sampling_consumption: Option<sampling::Binding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) external_unavailable: Option<sampling::Baseline>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -425,7 +434,76 @@ struct SeatRotationBinding {
     predecessor_own_counters: [[u64; 5]; 4],
 }
 impl SegmentBinding {
-    fn checksum(&self) -> Result<String, String> {
+    pub(super) fn external_families(&self) -> BTreeSet<String> {
+        self.external_unavailable
+            .as_ref()
+            .map_or_else(BTreeSet::new, |b| b.families.iter().cloned().collect())
+    }
+    pub(super) fn initialize_external(&self, p: &mut Progress) -> Result<(), String> {
+        if let Some(b) = &self.external_unavailable {
+            b.shape()?;
+        }
+        p.external_unavailable = self.external_families();
+        Ok(())
+    }
+    fn require_external_inputs(&self) -> Result<(), String> {
+        if let Some(b) = &self.external_unavailable {
+            b.require_inputs()?;
+        }
+        if let Some(b) = &self.sampling_consumption {
+            b.require_inputs()?;
+        }
+        Ok(())
+    }
+    pub(super) fn checksum(&self) -> Result<String, String> {
+        if let Some(b) = &self.external_unavailable {
+            b.shape()?;
+            if self
+                .consumed
+                .iter()
+                .any(|f| b.families.binary_search(f).is_ok())
+                || self
+                    .consumed
+                    .len()
+                    .checked_add(b.families.len())
+                    .is_none_or(|n| n > MAX_FAMILIES)
+            {
+                return Err(
+                    "Current mixed native/external ledgers must remain distinct and bounded".into(),
+                );
+            }
+        }
+        if let Some(c) = &self.sampling_consumption {
+            c.shape()?;
+            if self.pool_fork.is_some()
+                || self.budget_amendment.is_some()
+                || self.seat_rotation.is_some()
+                || self.external_unavailable.is_none()
+            {
+                return Err("Current mixed sampling consumption must be exclusive".into());
+            }
+            c.require_predecessor(&sampling::Predecessor {
+                directory: self.predecessor_directory.clone(),
+                schema: self.predecessor_schema.clone(),
+                root: self.predecessor_root.clone(),
+                spec: self.predecessor_spec.clone(),
+                head: self.predecessor_head.clone(),
+                sequence: self.predecessor_sequence,
+                pool: self.pool.clone(),
+                parent: self.parent.clone(),
+                prefix: self.prefix,
+                next: c.first(),
+            })?;
+            if self.next != c.next() {
+                return Err("Sampling consumption derived end binding differs".into());
+            }
+            if c.families()
+                .iter()
+                .any(|f| !self.external_families().contains(f))
+            {
+                return Err("Sampling consumption missing cumulative external ledger".into());
+            }
+        }
         if let Some(rotation) = &self.seat_rotation {
             require_rotation_shifts(rotation.shifts)?;
             if rotation.schema != SEAT_ROTATION_SCHEMA
@@ -434,6 +512,7 @@ impl SegmentBinding {
                 || rotation.new_pool == rotation.predecessor_pool
                 || self.pool_fork.is_some()
                 || self.budget_amendment.is_some()
+                || self.sampling_consumption.is_some()
             {
                 return Err(
                     "Current mixed seat rotation binding must be exclusive and Updated".into(),
@@ -484,6 +563,7 @@ pub(super) struct SegmentUsage {
     retained_bytes: u64,
 }
 struct ClosedArchive {
+    segment_binding: Option<SegmentBinding>,
     directory: PathBuf,
     spec: CurrentMixedRunSpec,
     journal_schema: &'static str,
@@ -532,7 +612,11 @@ impl SegmentContext {
         })
     }
     pub(super) fn require_archives(&self) -> Result<(), String> {
+        self.binding.require_external_inputs()?;
         for archive in &self.archives {
+            if let Some(binding) = &archive.segment_binding {
+                binding.require_external_inputs()?;
+            }
             restore::require_archive_files(&archive.view())?;
         }
         Ok(())
@@ -540,6 +624,26 @@ impl SegmentContext {
 }
 
 impl ReadyCurrentMixedContinuation<'_> {
+    /// Declares external words unavailable; byte pins are not an execution proof.
+    /// Only the latest genuine Updated owner may produce this exclusive successor.
+    pub fn preflight_sampling_consumption(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        consumption: &CurrentMixedSamplingConsumptionSpec,
+        output: &Path,
+    ) -> Result<(), String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed sampling successor output must be new".into());
+        }
+        self.session.sampling_consumption_binding(
+            spec,
+            consumption,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+        )?;
+        Ok(())
+    }
     /// Preflight an explicit cyclic roster successor after the latest Updated.
     /// `shifts` is [3p, 4p]; every role moves with the learner. This checks no
     /// campaign-wide seat coverage or non-updated baseline. No output is written.
@@ -601,6 +705,55 @@ impl ReadyCurrentMixedContinuation<'_> {
     }
 }
 impl<'a> CurrentMixedTrainingSession<'a> {
+    fn sampling_predecessor(&self) -> Result<sampling::Predecessor, String> {
+        Ok(sampling::Predecessor {
+            directory: self.directory.clone(),
+            schema: self.journal_schema().into(),
+            root: self.root_checksum.clone(),
+            spec: self.spec.checksum()?,
+            head: self
+                .head
+                .as_ref()
+                .ok_or("Sampling consumption predecessor head missing")?
+                .sha256
+                .clone(),
+            sequence: self.sequence,
+            pool: self.pool.clone(),
+            parent: self.handle()?.identity().clone(),
+            prefix: self.progress.prefix,
+            next: self.progress.next,
+        })
+    }
+    fn sampling_consumption_binding(
+        &self,
+        spec: &CurrentMixedSegmentSpec,
+        consumption: &CurrentMixedSamplingConsumptionSpec,
+        directory: &Path,
+        validation: restore::ArchiveValidation,
+    ) -> Result<SegmentBinding, String> {
+        self.progress
+            .require_updated_seat_rotation(self.blocked, self.head.is_some())?;
+        if self.continued.is_none() {
+            return Err("Sampling consumption requires genuine continued owner".into());
+        }
+        let mut b =
+            self.successor_binding(spec, directory, self.pool.clone(), None, validation, false)?;
+        let (transition, baseline, next) = consumption.derive(
+            &self.sampling_predecessor()?,
+            self.progress.outcome.as_deref(),
+            &self.progress.consumed,
+            b.external_unavailable.as_ref(),
+            own_snapshot(self.cumulative_own_decisions()?),
+            spec.run_spec
+                .max_families
+                .min(spec.global_contract.max_families),
+        )?;
+        b.sampling_consumption = Some(transition);
+        b.external_unavailable = Some(baseline);
+        b.next = next;
+        b.require_start_bytes(&spec.run_spec)?;
+        Ok(b)
+    }
     pub(super) fn segment_usage(&self) -> Option<SegmentUsage> {
         self.segment.as_ref().map(|c| {
             let spent = c
@@ -789,7 +942,8 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                 .progress
                 .consumed
                 .len()
-                .checked_add(4)
+                .checked_add(self.progress.external_unavailable.len())
+                .and_then(|n| n.checked_add(4))
                 .is_none_or(|n| n > spec.run_spec.max_families)
             || sum(
                 self.progress.parent_count()?,
@@ -824,6 +978,11 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             pool_fork,
             budget_amendment,
             seat_rotation: None,
+            sampling_consumption: None,
+            external_unavailable: self
+                .segment
+                .as_ref()
+                .and_then(|c| c.binding.external_unavailable.clone()),
         };
         binding.require_start_bytes(&spec.run_spec)?;
         Ok(binding)
@@ -862,9 +1021,12 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         );
         progress.base = binding.parent.mixed_update_count();
         progress.segment_start = Some(binding.clone());
+        binding.initialize_external(&mut progress)?;
         let journal_schema = s.journal_schema();
+        let predecessor_binding = s.segment.as_ref().map(|c| c.binding.clone());
         let mut archives = s.segment.map(|c| c.archives).unwrap_or_default();
         archives.push(ClosedArchive {
+            segment_binding: predecessor_binding,
             directory: s.directory,
             spec: s.spec,
             journal_schema,
@@ -923,6 +1085,22 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             false,
         )?;
         Self::from_predecessor(self, spec, binding, directory)?.restore_entries_in_chain(head_raw)
+    }
+    pub(super) fn restore_chain_sampling_consumption(
+        self,
+        spec: CurrentMixedSegmentSpec,
+        consumption: &CurrentMixedSamplingConsumptionSpec,
+        tip: restore::CurrentMixedRestoreTip<'_>,
+    ) -> Result<Self, String> {
+        let directory = local(tip.directory, false)?;
+        let binding = self.sampling_consumption_binding(
+            &spec,
+            consumption,
+            &directory,
+            restore::ArchiveValidation::AtChainClose,
+        )?;
+        Self::from_predecessor(self, spec, binding, directory)?
+            .restore_entries_in_chain(tip.head_raw)
     }
     pub(super) fn restore_chain_seat_rotation(
         self,
@@ -990,6 +1168,50 @@ impl<'a> CurrentMixedTrainingSession<'a> {
             return Err("Current mixed successor output must be new".into());
         }
         Self::publish_successor(Self::initial_segment(predecessor, spec, directory, false)?)
+    }
+    /// Advances only explicitly declared unavailable sampling words. It does
+    /// not collect, audit or update, and cannot import a serialized owner.
+    pub fn new_sampling_consumption_segment(
+        predecessor: ReadyCurrentMixedContinuation<'a>,
+        spec: CurrentMixedSegmentSpec,
+        consumption: &CurrentMixedSamplingConsumptionSpec,
+        output: &Path,
+    ) -> Result<Self, String> {
+        let directory = local(output, true)?;
+        if directory.exists() {
+            return Err("Current mixed sampling successor output must be new".into());
+        }
+        let binding = predecessor.session.sampling_consumption_binding(
+            &spec,
+            consumption,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+        )?;
+        Self::publish_successor(Self::from_predecessor(
+            predecessor.session,
+            spec,
+            binding,
+            directory,
+        )?)
+    }
+    /// Recreates the transition from the genuine predecessor, then compares the
+    /// full saved child. Declaration hashes themselves never grant ownership.
+    pub fn restore_sampling_consumption_segment(
+        predecessor: ReadyCurrentMixedContinuation<'a>,
+        spec: CurrentMixedSegmentSpec,
+        consumption: &CurrentMixedSamplingConsumptionSpec,
+        tip: restore::CurrentMixedRestoreTip<'_>,
+    ) -> Result<Self, String> {
+        Self::check_latest_head(tip.head_raw, tip.expected_sha256)?;
+        let directory = local(tip.directory, false)?;
+        let binding = predecessor.session.sampling_consumption_binding(
+            &spec,
+            consumption,
+            &directory,
+            restore::ArchiveValidation::Immediate,
+        )?;
+        Self::from_predecessor(predecessor.session, spec, binding, directory)?
+            .restore_entries(tip.head_raw)
     }
     /// Consumes only a genuine latest-Updated Ready owner. Every complete role
     /// rotates by `shifts` [3p, 4p]; the actor, critic and stream are retained.

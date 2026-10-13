@@ -102,6 +102,8 @@ fn binding() -> SegmentBinding {
         pool_fork: None,
         budget_amendment: None,
         seat_rotation: None,
+        sampling_consumption: None,
+        external_unavailable: None,
     }
 }
 fn progress(b: &SegmentBinding) -> Progress {
@@ -112,6 +114,7 @@ fn progress(b: &SegmentBinding) -> Progress {
         &b.consumed.iter().cloned().collect(),
     );
     p.base = b.parent.mixed_update_count();
+    b.initialize_external(&mut p).unwrap();
     p.segment_start = Some(b.clone());
     p
 }
@@ -900,6 +903,94 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
     let old: SegmentBinding = closed(&original, HEAD_CAP).unwrap();
     assert_eq!(old, b);
     assert_eq!(bytes(&old, HEAD_CAP).unwrap(), original);
+    let legacy_value = unique_json(&original, HEAD_CAP).unwrap();
+    assert!(legacy_value.get("samplingConsumption").is_none());
+    assert!(legacy_value.get("externalUnavailable").is_none());
+    // Config metadata alone cannot confer owner authority. It does bind the
+    // exact RNG words whose explicit consumption moves only the cursor/ledger.
+    let mut configs = source::tests::plan()
+        .configurations()
+        .each_ref()
+        .map(Config::from_config);
+    for (i, c) in configs.iter_mut().enumerate() {
+        c.episode_ordinal = format!("{:016x}", b.next + i as u64);
+    }
+    let (external, next) = sampling::checked_range(&configs, b.prefix, b.next).unwrap();
+    assert_eq!(next, b.next + 4);
+    let mut wrong = configs.clone();
+    wrong[1].episode_ordinal = wrong[0].episode_ordinal.clone();
+    assert!(sampling::checked_range(&wrong, b.prefix, b.next).is_err());
+    assert!(sampling::checked_range(&configs, [b.prefix[0] + 1, b.prefix[1]], b.next).is_err());
+    assert!(sampling::checked_range(&configs, b.prefix, u64::MAX - 3).is_err());
+    let mut wrong = configs.clone();
+    wrong[1].environment_seed = wrong[0].environment_seed;
+    assert!(sampling::checked_range(&wrong, b.prefix, b.next).is_err());
+    let pin = json!({"path":"synthetic-pinned-input","bytes":1,"sha256":"1".repeat(64)});
+    let exclusions = json!({"file":pin,"count":external.len(),"familyDigest":"2".repeat(64)});
+    let mut consumed = b.clone();
+    consumed.next = next;
+    consumed.sampling_consumption = Some(
+        serde_json::from_value(json!({
+        "schema":"tzolkin-current-mixed-external-sampling-consumption-v1",
+        "declarationRawSha256":"3".repeat(64),"declaration":{
+            "schema":"tzolkin-current-mixed-external-sampling-consumption-v1",
+            "predecessor":{"directory":b.predecessor_directory,"schema":b.predecessor_schema,
+                "root":b.predecessor_root,"spec":b.predecessor_spec,"head":b.predecessor_head,
+                "sequence":b.predecessor_sequence,"pool":b.pool,"parent":b.parent,
+                "prefix":b.prefix,"next":b.next},
+            "reservationReceipt":pin,"sourcePlan":pin,"exclusions":exclusions},
+        "configurationsDigest":"4".repeat(64),"firstEpisodeOrdinal":b.next,
+        "nextEpisodeOrdinal":next,"unavailableFamilies":external,
+        "predecessorOutcome":"updated","predecessorOwnCounters":([[0;5];4])}))
+        .unwrap(),
+    );
+    consumed.external_unavailable = Some(
+        serde_json::from_value(json!({
+        "schema":"tzolkin-current-mixed-external-unavailable-baseline-v1",
+        "families":external,"consumedSamplingOrdinals":4,"exclusions":exclusions}))
+        .unwrap(),
+    );
+    consumed.require_start_bytes(&run_spec()).unwrap();
+    assert_ne!(consumed.checksum().unwrap(), b.checksum().unwrap());
+    let mut p = progress(&consumed);
+    let counters = (
+        p.parent_count().unwrap(),
+        p.attempts,
+        p.successful,
+        p.work,
+        p.consumed.clone(),
+    );
+    p.apply(&start(&consumed), &run_spec()).unwrap();
+    assert_eq!(
+        (
+            p.parent_count().unwrap(),
+            p.attempts,
+            p.successful,
+            p.work,
+            p.consumed.clone()
+        ),
+        counters
+    );
+    assert_eq!(p.external_unavailable.len(), 4);
+    assert_eq!(p.next, next);
+    assert_eq!(consumed.parent, b.parent);
+    assert_eq!(consumed.inherited, b.inherited);
+    let mut wrong = consumed.clone();
+    wrong.next = b.next;
+    assert!(wrong.checksum().is_err());
+    let mut wrong = consumed.clone();
+    wrong.external_unavailable = None;
+    assert!(wrong.checksum().is_err());
+    let mut wrong = consumed.clone();
+    wrong.budget_amendment = Some(BudgetAmendmentBinding {
+        schema: BUDGET_AMENDMENT_SCHEMA.into(),
+        predecessor_contract_checksum: b.contract_checksum.clone(),
+        ordinal: 1,
+    });
+    assert!(wrong.checksum().is_err());
+    let raw = encoded_sampling_claim(&consumed);
+    assert!(CurrentMixedSamplingConsumptionSpec::from_json(&raw, &"5".repeat(64)).is_err());
+    assert!(CurrentMixedSamplingConsumptionSpec::from_json(&raw, &sha(&raw)).is_err());
     let mut fork = b.clone();
     fork.pool = "1".repeat(64);
     fork.pool_fork = Some(PoolForkBinding {
@@ -976,4 +1067,9 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
         ordinal: 1,
     });
     assert!(combined.require_start_bytes(&run_spec()).is_err());
+}
+
+fn encoded_sampling_claim(binding: &SegmentBinding) -> Vec<u8> {
+    // Fabricated metadata must fail at its nonexistent pinned source boundary.
+    serde_json::to_vec(&serde_json::to_value(binding.sampling_consumption.as_ref().unwrap()).unwrap()["declaration"]).unwrap()
 }

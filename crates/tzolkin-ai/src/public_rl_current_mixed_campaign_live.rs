@@ -43,6 +43,8 @@ struct SegmentPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rotation: Option<CampaignSeatRotation>,
     collections: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampling_consumption: Option<InputPin>,
 }
 struct PlannedSegment {
     wire: SegmentPlan,
@@ -115,6 +117,8 @@ impl CurrentMixedLivePlanSpec {
             let run =
                 run_spec(&serde_json::to_value(&spec).map_err(|e| e.to_string())?["runSpec"])?;
             if plan.schema != SEGMENT_PLAN_SCHEMA
+                || (plan.sampling_consumption.is_some()
+                    && (!segments.is_empty() || plan.rotation.is_some()))
                 || !(1..=MAX_ATTEMPTS as usize).contains(&plan.collections.len())
                 || plan.collections.len() as u64 > run.max_attempts
                 || plan.collections.len() as u64 > run.max_successful_updates
@@ -164,6 +168,7 @@ impl CurrentMixedLivePlanSpec {
                 non_updated_baseline: wire.non_updated_baseline,
                 rotation: first.rotation.clone(),
             }),
+            sampling_consumption: first.sampling_consumption.clone(),
         };
         let first_raw = encoded(&original)?;
         let first = CurrentMixedCampaignSpec::from_json(&first_raw, &sha(&first_raw))?;
@@ -203,6 +208,22 @@ impl CurrentMixedLivePlanSpec {
             aggregate = aggregate
                 .checked_add(pin.bytes)
                 .ok_or("Live plan input overflow")?;
+        }
+        for pin in self
+            .wire
+            .steps
+            .iter()
+            .filter_map(|s| match s {
+                SavedStep::SamplingConsumption { consumption, .. } => Some(consumption),
+                _ => None,
+            })
+            .chain(self.segments[0].wire.sampling_consumption.iter())
+        {
+            let raw = pin.read(sampling::CAP)?;
+            let spec = CurrentMixedSamplingConsumptionSpec::from_json(&raw, &pin.sha256)?;
+            aggregate = aggregate
+                .checked_add(spec.input_bytes()?)
+                .ok_or("Live plan sampling input overflow")?;
         }
         if aggregate > self.wire.max_aggregate_input_bytes {
             return Err("Live plan all input pins exceed aggregate byte cap".into());
@@ -261,6 +282,13 @@ impl CurrentMixedLivePlanSpec {
             return Err("Live plan exceeds actual established segment envelope".into());
         }
         let mut used = latest.progress.consumed.clone();
+        used.extend(
+            original
+                .external_baseline
+                .as_ref()
+                .into_iter()
+                .flat_map(|b| b.families.iter().cloned()),
+        );
         let original_run = run_spec(
             &self
                 .wire
@@ -270,7 +298,7 @@ impl CurrentMixedLivePlanSpec {
                 .spec()["runSpec"],
         )?;
         let mut update_envelope = latest.progress.parent_count()?;
-        let mut next = latest.progress.next;
+        let mut next = original.starting_next;
         let mut configurations = Vec::new();
         let mut families = Vec::new();
         for segment in &self.segments {
@@ -761,7 +789,25 @@ fn checked_prior(
         let previous = metadata
             .last()
             .unwrap_or_else(|| pre.original.steps.last().unwrap_or(&pre.original.initial));
-        successor_metadata(previous, &actual, false, segment.rotation.is_some())?;
+        successor_metadata(
+            previous,
+            &actual,
+            false,
+            segment.rotation.is_some(),
+            segment.sampling_consumption.is_some(),
+        )?;
+        if segment.sampling_consumption.is_some() {
+            require_sampling_metadata(
+                previous,
+                &actual,
+                pre.original
+                    .consumption
+                    .as_ref()
+                    .ok_or("Live plan sampling declaration missing")?,
+                cumulative,
+                &segment_spec(&segment.segment_spec)?,
+            )?;
+        }
         require_established_seat_contract(previous, &segment.segment_spec)?;
         if let Some(rotation) = &segment.rotation {
             rotation_metadata(
@@ -833,7 +879,24 @@ fn require_live_prefix(
         || session.reserved_families() != &expected
         || session.progress.prefix != latest.progress.prefix
         || session.progress.imported != latest.progress.imported
-        || session.progress.next != add(latest.progress.next, 4 * cursor.total_updates as u64)?
+        || session.progress.next
+            != add(
+                if started || cursor.total_updates > 0 {
+                    pre.original.starting_next
+                } else {
+                    latest.progress.next
+                },
+                4 * cursor.total_updates as u64,
+            )?
+        || session.progress.external_unavailable
+            != if started || cursor.total_updates > 0 {
+                pre.original
+                    .external_baseline
+                    .as_ref()
+                    .map_or_else(BTreeSet::new, |b| b.families.iter().cloned().collect())
+            } else {
+                latest.progress.external_unavailable.clone()
+            }
         || session.progress.parent_count() != Ok(expected_count)
         || started
             && (session.pool
@@ -873,6 +936,15 @@ fn start_segment<'a>(
             &old,
             &new,
             rotation.shifts,
+            &segment_directory(output, index),
+        )?
+    } else if let Some(pin) = &wire.sampling_consumption {
+        let raw = pin.read(sampling::CAP)?;
+        let consumption = CurrentMixedSamplingConsumptionSpec::from_json(&raw, &pin.sha256)?;
+        CurrentMixedTrainingSession::new_sampling_consumption_segment(
+            ready,
+            spec,
+            &consumption,
             &segment_directory(output, index),
         )?
     } else {
@@ -1117,6 +1189,16 @@ pub fn current_mixed_live_plan(
                     shifts: rotation.shifts,
                     tip: tip.tip(&m.raw),
                 }
+            } else if plan.segments[i].wire.sampling_consumption.is_some() {
+                CurrentMixedRestoreStep::SamplingConsumption {
+                    spec,
+                    consumption: pre
+                        .original
+                        .consumption
+                        .as_ref()
+                        .ok_or("Live plan restore sampling declaration missing")?,
+                    tip: tip.tip(&m.raw),
+                }
             } else {
                 CurrentMixedRestoreStep::Segment {
                     spec,
@@ -1346,6 +1428,7 @@ pub(super) fn metadata_boundaries(original: &CampaignWire, next_spec: &Value) {
         pool: Value::Null,
         rotation: None,
         collections: vec![Value::Null, Value::Null],
+        sampling_consumption: None,
     };
     let raw = encoded(original).unwrap();
     let plan = CurrentMixedLivePlanSpec {
