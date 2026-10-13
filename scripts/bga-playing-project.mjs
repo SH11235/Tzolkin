@@ -1191,8 +1191,8 @@ export function projectRetainedBoundary(
       )
     : [];
   if (observeWorkerPositions) {
-    if (placed.filter((node) => token(node, 'worker_dummy')).length > (4 - ids.length) * 6)
-      fail('Too many boundary dummy workers for basic player count');
+    if (placed.filter((node) => token(node, 'worker_dummy')).length !== (4 - ids.length) * 6)
+      fail('Incomplete/excess boundary dummy workers for basic player count');
     const expectedCellIds = [
       'workerplace_startingPlayer_0',
       ...GEARS.flatMap((gear) =>
