@@ -731,19 +731,37 @@ fn invocation_name(prefix: usize, suffix: &str) -> String {
     format!("invocation-{prefix:016x}-{suffix}.json")
 }
 fn leaf_name(name: &str) -> Result<(), String> {
+    let folded = name.to_ascii_lowercase();
+    let stem = folded.split('.').next().unwrap_or_default();
+    let device = matches!(stem, "con" | "prn" | "aux" | "nul")
+        || stem.len() == 4
+            && (stem.starts_with("com") || stem.starts_with("lpt"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9');
     if name.is_empty()
-        || name.len() > 128
+        || name.len() > 64
         || !name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-'))
         || matches!(
-            name,
+            folded.as_str(),
             "." | ".." | "archive" | "campaign-spec.json" | "reservation.json"
         )
-        || name.starts_with("invocation-")
-        || name.ends_with(".tmp")
+        || folded.starts_with("invocation-")
+        || folded.ends_with(".tmp")
+        || name.ends_with('.')
+        || device
     {
         return Err("Campaign output requires a distinct simple leaf".into());
+    }
+    Ok(())
+}
+fn output_leaves(report: &str, deployment: Option<&str>) -> Result<(), String> {
+    leaf_name(report)?;
+    if let Some(name) = deployment {
+        leaf_name(name)?;
+        if name.eq_ignore_ascii_case(report) {
+            return Err("Campaign report and deployment leaves alias".into());
+        }
     }
     Ok(())
 }
@@ -816,6 +834,7 @@ pub fn current_mixed_campaign(
     {
         return Err("Campaign command/invocation attempt cap".into());
     }
+    output_leaves(report, deployment)?;
     let began = Instant::now();
     let pre = spec.preflight()?;
     let output = local(output, command == "continue")?;
@@ -861,16 +880,12 @@ pub fn current_mixed_campaign(
         .map(|c| check_prefix(&pre, c, &spec, &archive))
         .transpose()?
         .unwrap_or(0);
-    leaf_name(report)?;
     let report_path = output.join(report);
     if report_path.exists() {
         return Err("Campaign report output must be new".into());
     }
-    if let Some(name) = deployment {
-        leaf_name(name)?;
-        if name == report || output.join(name).exists() {
-            return Err("Campaign deployment output must be new and distinct".into());
-        }
+    if deployment.is_some_and(|name| output.join(name).exists()) {
+        return Err("Campaign deployment output must be new and distinct".into());
     }
     if command == "inspect-tip" {
         publish_mixed_metadata(
@@ -882,6 +897,7 @@ pub fn current_mixed_campaign(
             &bytes(
                 &serde_json::json!({"schema":"tzolkin-current-mixed-campaign-inspection-v1","campaignRawSha256":spec.raw_sha256,
                 "completedPrefixClaims":completed,"declaredCohorts":spec.wire.collections.len(),"numericOwnerAdmission":false,
+                "successfulWrapperPrefixEvaluated":false,"resumeReadinessEvaluated":false,
                 "newReservations":0,"newOriginals":0,"newUpdates":0}),
                 HEAD_CAP,
             )?,
@@ -1158,6 +1174,33 @@ mod tests {
     #[test]
     fn campaign_refuses_unaccounted_updated_suffix_and_forged_return() {
         // Only fabricated metadata: no Game, model, collection or fresh owner.
+        for name in [
+            "run_1.json",
+            "run 1.json",
+            "Report.",
+            "NUL.json",
+            "CON",
+            "prn.txt",
+            "Aux.log",
+            "COM1.json",
+            "Lpt9",
+            "Archive",
+            "Campaign-Spec.JSON",
+            "Reservation.JSON",
+            "Invocation-0000000000000000-close.json",
+            "Report.TMP",
+        ] {
+            assert!(output_leaves(name, None).is_err(), "unsafe leaf {name}");
+            assert!(
+                output_leaves("report.json", Some(name)).is_err(),
+                "unsafe deployment {name}"
+            );
+        }
+        assert!(output_leaves(&"a".repeat(65), None).is_err());
+        assert!(output_leaves("report.json", Some("REPORT.JSON")).is_err());
+        output_leaves("Report-01.json", Some("Deployment-01.JSON")).unwrap();
+        let longest = "a".repeat(64);
+        output_leaves(&longest, None).unwrap();
         let parent = CurrentMixedParentIdentity::InitialMixedV1 {
             policy: source::tests::initial(),
         };
@@ -1194,6 +1237,17 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir(&directory).unwrap();
+        // Exercise both unchanged persistence APIs at the admitted name boundary.
+        publish_mixed_metadata(&directory, &longest, b"metadata boundary").unwrap();
+        assert_eq!(
+            read_pin(
+                &directory,
+                &file_pin(&longest, b"metadata boundary"),
+                HEAD_CAP
+            )
+            .unwrap(),
+            b"metadata boundary"
+        );
         let digest = "a".repeat(64);
         let intent = InvocationIntent {
             schema: "tzolkin-current-mixed-campaign-invocation-intent-v1".into(),
