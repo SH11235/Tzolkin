@@ -1163,7 +1163,15 @@ fn resource_food_tradeoff(
         .find(|day| !o.food_days.contains(day))
         .is_some_and(|day| day <= arrival)
     {
-        resource_base_feeding_penalty(p, after) - resource_base_feeding_penalty(p, before)
+        // A claimed actor receives this corn at EndTurn, before feeding. It
+        // belongs in both food projections, but remains unavailable for pay.
+        let pending_corn = if o.first_player_claimed == Some(o.actor) {
+            o.accumulated_corn
+        } else {
+            0
+        };
+        resource_base_feeding_penalty(p, after.saturating_add(pending_corn))
+            - resource_base_feeding_penalty(p, before.saturating_add(pending_corn))
     } else {
         0.0
     }
@@ -4080,6 +4088,89 @@ mod tests {
             resource_food_tradeoff(&first_observation, player, 4, 4, 8),
             0.0
         );
+
+        // Subsequent Place uses cash only, while both next-food alternatives
+        // receive the already-claimed FirstPlayer corn at EndTurn.
+        for count in [3, 4] {
+            let mut first =
+                create_game((0..count).map(|i| format!("P{i}")).collect(), 17, false).unwrap();
+            first.phase = Phase::Playing;
+            first.round = 7;
+            first.accumulated_corn = 4;
+            let actor = first.current_player;
+            first.players[actor].resources.insert(Resource::Corn, 4);
+            let slots = first.gears.get_mut(&GearId::Palenque).unwrap();
+            slots[0] = Some(GearWorker {
+                player_id: ((actor + 1) % count) as i64,
+                dummy: false,
+            });
+            slots[1] = None;
+            let claimed = apply_move(&first, GameMove::FirstPlayer).unwrap();
+            assert_eq!(claimed.players[actor].resources[&Resource::Corn], 4);
+            let observation = observe(&claimed, actor).unwrap();
+            let player = &observation.players[actor];
+            let placement = observation
+                .legal_actions
+                .iter()
+                .find(|row| {
+                    matches!(
+                        row.action,
+                        TypedAction::Place {
+                            gear: GearId::Palenque,
+                            corn_cost: 2,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert_eq!(resource_food_tradeoff(&observation, player, 4, 2, 8), 0.0);
+            let placed = apply_move(&claimed, placement.r#move.clone()).unwrap();
+            assert_eq!(placed.players[actor].resources[&Resource::Corn], 2);
+            let end = GameMove::EndTurn {
+                double_advance: None,
+            };
+            let baseline = apply_move(&claimed, end.clone()).unwrap();
+            let ended = apply_move(&placed, end).unwrap();
+            assert_eq!(baseline.players[actor].resources[&Resource::Corn], 8);
+            assert_eq!(ended.players[actor].resources[&Resource::Corn], 6);
+            assert_eq!(ended.accumulated_corn, 0);
+            for state in [&baseline, &ended] {
+                let food = prophecies::feeding(&state.players[actor], false, 0);
+                assert_eq!(food.corn_cost, 6);
+                assert_eq!(food.unfed_workers, 0);
+            }
+            for claimant in [None, Some((actor + 1) % count)] {
+                let mut other = observation.clone();
+                other.first_player_claimed = claimant;
+                assert_eq!(resource_food_tradeoff(&other, player, 4, 2, 8), 3.0);
+            }
+            let mut unaffordable = claimed;
+            unaffordable.players[actor]
+                .resources
+                .insert(Resource::Corn, 1);
+            assert!(
+                apply_move(
+                    &unaffordable,
+                    GameMove::Place {
+                        gear: GearId::Palenque
+                    }
+                )
+                .is_err()
+            );
+            assert!(
+                !observe(&unaffordable, actor)
+                    .unwrap()
+                    .legal_actions
+                    .iter()
+                    .any(|row| matches!(
+                        row.action,
+                        TypedAction::Place {
+                            gear: GearId::Palenque,
+                            ..
+                        }
+                    ))
+            );
+        }
 
         state.pending = Some(Pending {
             title: "Trade".into(),
