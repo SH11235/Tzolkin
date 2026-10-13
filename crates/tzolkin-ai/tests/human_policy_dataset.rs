@@ -7,7 +7,8 @@ use tzolkin_ai::features::{FEATURE_COUNT, PUBLIC_FEATURE_SCHEMA};
 use tzolkin_ai::human_policy_dataset::{
     ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
     INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5,
-    OBSERVED_CORN_BEG_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE,
+    INPUT_SCHEMA_V6, OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
+    PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{
@@ -491,6 +492,216 @@ impl Fixture {
         );
         self.raw["dom_entries"][0]["messages"] = json!(messages);
     }
+    fn pending_choice(monument: bool, players: usize) -> Self {
+        use tzolkin_core::observation::ActionSource;
+        use tzolkin_core::{GameMove, GameState, Resource, TempleId};
+        let mut state =
+            create_game((0..players).map(|i| format!("P{i}")).collect(), 18, false).unwrap();
+        while state.phase == Phase::Setup {
+            let choice = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .filter(|row| match &row.action {
+                    TypedAction::ChooseWealth { ids } if state.current_player == 0 => {
+                        ["w16", "w19"]
+                            .iter()
+                            .all(|tile| ids.iter().any(|id| id == tile))
+                    }
+                    TypedAction::ChooseWealth { .. } => true,
+                    _ => false,
+                })
+                .max_by_key(|row| {
+                    let TypedAction::ChooseWealth { ids } = &row.action else {
+                        unreachable!()
+                    };
+                    ids.iter()
+                        .map(|id| {
+                            tzolkin_core::catalog::wealth(id)
+                                .unwrap()
+                                .resources
+                                .get(&Resource::Corn)
+                                .copied()
+                                .unwrap_or(0)
+                        })
+                        .sum::<i64>()
+                })
+                .unwrap();
+            state = apply_move(&state, choice.r#move).unwrap();
+        }
+        // Synthetic observed market, normal wealth effects, and a short legal
+        // prefix ending before the first Food Day. No initial pending task or
+        // resources are fabricated, and no full-game qualification is claimed.
+        state.monuments = ["m04", "m07", "m01", "m02", "m03", "m05"][..players + 2]
+            .iter()
+            .map(|id| (*id).into())
+            .collect();
+        let initial = PublicState::from_game_state(&state).unwrap();
+        let mut steps = Vec::new();
+        let append = |state: &mut GameState, steps: &mut Vec<Value>, move_: GameMove| {
+            steps.push(json!({"actor":state.current_player,"move":move_,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            *state = apply_move(state, move_).unwrap();
+        };
+        let mut target_day = 5;
+        let target_position = if monument { 4 } else { 5 };
+        'prefix: for day in 0..=5 {
+            for actor in 0..players {
+                assert_eq!(state.current_player, actor);
+                let rows = observe(&state, actor).unwrap().legal_actions;
+                let target = actor == 0 && day == target_day;
+                let trade = monument && actor == 0 && day == 2;
+                let row = if target || trade {
+                    rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear, position }
+                        if gear == if trade { GearId::Uxmal } else { GearId::Tikal }
+                        && (trade || position == target_position)))
+                } else if actor == 0 && day < 2 {
+                    let gear = if monument && day == 0 { GearId::Uxmal }
+                        else if day == 0 || monument { GearId::Tikal } else { GearId::Palenque };
+                    rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: g, discount: false, .. } if g == gear))
+                } else {
+                    rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: GearId::Palenque, discount: false, .. }))
+                        .or_else(|| rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Palenque, .. })))
+                        .or_else(|| rows.iter().find(|row| matches!(row.action, TypedAction::Place { gear: GearId::Yaxchilan, discount: false, .. })))
+                        .or_else(|| rows.iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Yaxchilan, .. })))
+                }.unwrap_or_else(|| panic!("missing prefix move: monument={monument} players={players} day={day} actor={actor}"));
+                append(&mut state, &mut steps, row.r#move.clone());
+                if actor == 0
+                    && matches!(
+                        row.action,
+                        TypedAction::Place {
+                            gear: GearId::Tikal,
+                            ..
+                        }
+                    )
+                {
+                    let position = state.gears[&GearId::Tikal]
+                        .iter()
+                        .position(|worker| {
+                            worker
+                                .as_ref()
+                                .is_some_and(|worker| worker.player_id == 0 && !worker.dummy)
+                        })
+                        .unwrap();
+                    target_day = day + (target_position as usize - position);
+                    assert!(target_day <= 5);
+                }
+                if target || trade {
+                    let row = observe(&state, actor).unwrap().legal_actions.into_iter()
+                        .find(|row| matches!(row.action, TypedAction::UseAction { gear, position, source: ActionSource::CurrentGear, .. }
+                            if gear == if trade { GearId::Uxmal } else { GearId::Tikal }
+                            && position == if trade { 2 } else { target_position })).unwrap();
+                    append(&mut state, &mut steps, row.r#move);
+                }
+                if trade {
+                    for action in std::iter::repeat_n(
+                        TypedAction::Trade {
+                            resource: Resource::Wood,
+                            buy: false,
+                        },
+                        2,
+                    )
+                    .chain(std::iter::repeat_n(
+                        TypedAction::Trade {
+                            resource: Resource::Gold,
+                            buy: true,
+                        },
+                        3,
+                    ))
+                    .chain(std::iter::once(TypedAction::Skip))
+                    {
+                        let row = observe(&state, actor)
+                            .unwrap()
+                            .legal_actions
+                            .into_iter()
+                            .find(|row| row.action == action)
+                            .unwrap();
+                        append(&mut state, &mut steps, row.r#move);
+                    }
+                }
+                if target {
+                    if !monument {
+                        let row = observe(&state, actor)
+                            .unwrap()
+                            .legal_actions
+                            .into_iter()
+                            .find(|row| {
+                                row.action
+                                    == TypedAction::Payment {
+                                        resources: [0, 1, 0, 0, 0],
+                                    }
+                            })
+                            .unwrap();
+                        append(&mut state, &mut steps, row.r#move);
+                    }
+                    break 'prefix;
+                }
+                while state.pending.is_some() {
+                    let row = observe(&state, actor).unwrap().legal_actions.remove(0);
+                    append(&mut state, &mut steps, row.r#move);
+                }
+                let row = observe(&state, actor)
+                    .unwrap()
+                    .legal_actions
+                    .into_iter()
+                    .find(|row| {
+                        matches!(
+                            row.action,
+                            TypedAction::EndTurn {
+                                double_advance: None | Some(false)
+                            }
+                        )
+                    })
+                    .unwrap();
+                append(&mut state, &mut steps, row.r#move);
+            }
+        }
+        let mut fixture = Self::new();
+        fixture.record["initial"] = json!(initial);
+        fixture.raw["metadata"]["players"] = json!((0..players).map(|i| json!({"text":format!("P{i}"),"url":format!("https://boardgamearena.com/player?id={}",101+i)})).collect::<Vec<_>>());
+        let mut audits = Vec::new();
+        let mut messages = Vec::new();
+        for temple in [TempleId::Chaac, TempleId::Kukulkan] {
+            let o = observe(&state, 0).unwrap();
+            let row = o.legal_actions.iter().find(|row| if monument {
+                matches!(&row.action, TypedAction::Monument { id, renovation: None, .. } if id == "m04")
+            } else { row.action == TypedAction::Temple { temple, direction: 1 } }).unwrap();
+            assert!(o.legal_actions.len() > 1);
+            steps.push(json!({"actor":0,"move":row.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
+            audits.push(json!({"step":steps.len(),"actionId":10,"actor":0,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+            if let TypedAction::Monument { cost, .. } = &row.action {
+                for (resource, n) in ["wood", "stone", "gold"].into_iter().zip(&cost[1..4]) {
+                    if *n == 0 {
+                        continue;
+                    }
+                    let class = format!("tz_icon resource_{resource}");
+                    let html = format!(
+                        "P0は{}を支払った",
+                        format!("<div class=\"{class}\"></div>").repeat(*n as usize)
+                    );
+                    messages.push(json!({"raw_text":"P0は\nを支払った","html":html,"icons":(0..*n).map(|_|json!({"classes":class})).collect::<Vec<_>>()}));
+                }
+                messages.push(
+                    json!({"raw_text":"P0は記念碑を建てた","html":"P0は記念碑を建てた","icons":[]}),
+                );
+            } else {
+                let name = if temple == TempleId::Chaac {
+                    "Chaac"
+                } else {
+                    "Kukulcan"
+                };
+                let caption = format!("P0は{name}の信仰を1段上げた");
+                messages.push(json!({"raw_text":caption,"html":caption,"icons":[]}));
+            }
+            state = apply_move(&state, row.r#move.clone()).unwrap();
+            if monument {
+                break;
+            }
+        }
+        fixture.record["steps"] = json!(steps);
+        fixture.audit["audit"] = json!(audits);
+        fixture.set_messages(messages);
+        fixture
+    }
     fn explicit_operation(anywhere: bool, resource: tzolkin_core::Resource) -> Self {
         use tzolkin_core::Resource;
         use tzolkin_core::observation::ActionSource;
@@ -667,7 +878,11 @@ impl Fixture {
             manifest["labelScope"] = scope;
         }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V4 {
+        let file = if schema == INPUT_SCHEMA_V6 {
+            "manifest-v6.json"
+        } else if schema == INPUT_SCHEMA_V5 {
+            "manifest-v5.json"
+        } else if schema == INPUT_SCHEMA_V4 {
             "manifest-v4.json"
         } else if schema == INPUT_SCHEMA_V3 {
             "manifest-v3.json"
@@ -1189,6 +1404,143 @@ fn observed_market_and_paid_anywhere_v4_require_exact_source_authority() {
         )
         .is_err()
     );
+    let load_pending = |f: &Fixture| {
+        f.load_scope(
+            INPUT_SCHEMA_V6,
+            Some(json!(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)),
+        )
+    };
+    for monument in [true, false] {
+        let f = Fixture::pending_choice(monument, 4);
+        assert!(load_beg(&f).unwrap().samples().is_empty());
+        let dataset = load_pending(&f).unwrap();
+        assert_eq!(dataset.samples().len(), if monument { 1 } else { 2 });
+        let report = serde_json::to_value(dataset.report()).unwrap();
+        assert_eq!(
+            report["schema"],
+            "tzolkin-conditional-basic-human-policy-dataset-v6"
+        );
+        assert_eq!(report["sourceQualified"], false);
+        assert_eq!(report["trainingReady"], false);
+        for sample in report["samples"].as_array().unwrap() {
+            assert_eq!(
+                sample["sourceLabelPart"],
+                if monument {
+                    "monument"
+                } else {
+                    "positiveTemple"
+                }
+            );
+            assert_eq!(sample["valueTarget"], Value::Null);
+            assert!(sample["legalActions"].as_array().unwrap().len() > 1);
+            assert_eq!(sample["split"], "validation");
+        }
+        for change in [
+            "actor",
+            "duplicate",
+            "markup",
+            "cost",
+            "rollback",
+            "queued",
+            "ambiguous",
+            "swappedTempleOrder",
+            "unexplainedTempleCaption",
+        ] {
+            if monument && matches!(change, "swappedTempleOrder" | "unexplainedTempleCaption") {
+                continue;
+            }
+            let mut f = Fixture::pending_choice(monument, 4);
+            let mut messages = f.raw["dom_entries"][0]["messages"]
+                .as_array()
+                .unwrap()
+                .clone();
+            match change {
+                "actor" => {
+                    for m in &mut messages {
+                        m["raw_text"] = json!(m["raw_text"].as_str().unwrap().replace("P0", "P1"));
+                    }
+                }
+                "duplicate" => messages.push(messages.last().unwrap().clone()),
+                "swappedTempleOrder" => messages.reverse(),
+                "unexplainedTempleCaption" => messages.push(json!({
+                    "raw_text":"P0はQuetzalcoatlの信仰を1段上げた",
+                    "html":"P0はQuetzalcoatlの信仰を1段上げた", "icons":[]
+                })),
+                "markup" => {
+                    messages.last_mut().unwrap()["html"] = json!("<span>hidden choice</span>")
+                }
+                "cost" => {
+                    messages.push(json!({"raw_text":"P0は追加の費用を支払った","html":"unknown"}))
+                }
+                "rollback" => {
+                    for a in f.audit["audit"].as_array_mut().unwrap() {
+                        a["cancellation"] = json!(true);
+                    }
+                }
+                "queued" => {
+                    f.record["initial"]["pending"] = json!({"title":"queued","task":{"type":"temple","remaining":1},"after":[{"type":"resource","remaining":1}]})
+                }
+                "ambiguous" => {
+                    for a in f.audit["audit"].as_array_mut().unwrap() {
+                        a["equivalentChoices"] = json!(2);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            f.set_messages(messages);
+            if let Ok(d) = load_pending(&f) {
+                assert!(d.samples().is_empty(), "{monument}/{change}");
+            }
+        }
+        assert_eq!(
+            load_pending(&Fixture::pending_choice(monument, 3))
+                .unwrap()
+                .samples()
+                .len(),
+            if monument { 1 } else { 2 }
+        );
+    }
+    for f in [
+        Fixture::new(),
+        Fixture::paired_action(2, 1),
+        Fixture::paid_technology(4, 1, [1, 1, 0]),
+        Fixture::explicit_operation(false, Resource::Gold),
+        Fixture::corn_beg(1),
+    ] {
+        assert_eq!(
+            serde_json::to_vec(load_beg(&f).unwrap().samples()).unwrap(),
+            serde_json::to_vec(load_pending(&f).unwrap().samples()).unwrap()
+        );
+    }
+    let mut train = Fixture::pending_choice(true, 3);
+    train.reservations["entries"][0]["split"] = json!("train");
+    let mut validation = Fixture::pending_choice(false, 4);
+    validation.raw["table_id"] = json!("124");
+    validation.raw["metadata"]["table_id"] = json!("124");
+    validation.raw["source_url"] = json!("https://boardgamearena.com/gamereview?table=124");
+    validation.record["source"]["reference"] = validation.raw["source_url"].clone();
+    validation.audit["tableId"] = json!("124");
+    validation.reservations["entries"][0]["tableId"] = json!("124");
+    let inputs = [
+        load_pending(&train).unwrap(),
+        load_pending(&validation).unwrap(),
+    ];
+    let trained = tzolkin_ai::human_policy_training::train_conditional_datasets(
+        &inputs,
+        &tzolkin_ai::policy_training::PolicyBcConfig {
+            epochs: 1,
+            batch_size: 1,
+            learning_rate: 0.001,
+            seed: 7,
+        },
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        trained.checkpoint.dataset.label_scope.as_deref(),
+        Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
+    );
+    assert_eq!(trained.checkpoint.dataset.samples, [1, 2, 0]);
 }
 
 #[test]

@@ -42,6 +42,9 @@ pub const INPUT_SCHEMA_V5: &str = "tzolkin-conditional-basic-human-policy-source
 pub const DATASET_SCHEMA_V5: &str = "tzolkin-conditional-basic-human-policy-dataset-v5";
 pub const OBSERVED_CORN_BEG_LABEL_SCOPE: &str =
     "PrimitivesRemovalPaidTechnologyMarketSellPaidAnywhereAndObservedCornBegV5";
+pub const INPUT_SCHEMA_V6: &str = "tzolkin-conditional-basic-human-policy-source-v6";
+pub const DATASET_SCHEMA_V6: &str = "tzolkin-conditional-basic-human-policy-dataset-v6";
+pub const OBSERVED_PENDING_CHOICE_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTechnologyMarketSellPaidAnywhereCornBegAndObservedMonumentPositiveTempleV6";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -98,6 +101,9 @@ impl Manifest {
             }
             (INPUT_SCHEMA_V5, Some(OBSERVED_CORN_BEG_LABEL_SCOPE)) => {
                 Ok(Some(OBSERVED_CORN_BEG_LABEL_SCOPE))
+            }
+            (INPUT_SCHEMA_V6, Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)) => {
+                Ok(Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE))
             }
             _ => Err("Conditional Human manifest label scope mismatch".into()),
         }
@@ -158,6 +164,17 @@ pub struct HumanPolicySample {
     paid_technology_support: Option<PaidTechnologySupport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     corn_beg_support: Option<CornBegSupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_pending_choice_support: Option<ObservedPendingChoiceSupport>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedPendingChoiceSupport {
+    kind: &'static str,
+    source_message_index: usize,
+    material_message_indices: Vec<usize>,
+    observed_materials: [i64; 5],
+    basis: &'static str,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -613,6 +630,14 @@ fn observed_audit(entry: &Value) -> bool {
 // captured icons are authoritative; an empty array requires exact complete HTML.
 // No cost/holdings-based payment inference.
 fn material_caption(message: &Value, name: &str, current_format: bool) -> Option<[i64; 5]> {
+    material_caption_bounded(message, name, current_format, 3)
+}
+fn material_caption_bounded(
+    message: &Value,
+    name: &str,
+    current_format: bool,
+    icon_limit: usize,
+) -> Option<[i64; 5]> {
     let prefix = format!("{name}は");
     let text = message["raw_text"]
         .as_str()?
@@ -638,7 +663,7 @@ fn material_caption(message: &Value, name: &str, current_format: bool) -> Option
     }
     body = body[digits..].trim_start();
     let icons = message["icons"].as_array()?;
-    if icons.len() > 3 || quantity.is_some_and(|n| n < 1) {
+    if icons.len() > icon_limit || quantity.is_some_and(|n| n < 1) {
         return None;
     }
     if icons.is_empty() {
@@ -646,7 +671,7 @@ fn material_caption(message: &Value, name: &str, current_format: bool) -> Option
         let mut literal = String::new();
         let mut count = 0;
         while !body.is_empty() {
-            if count == 3 {
+            if count == icon_limit {
                 return None;
             }
             let (classes, remaining) = body
@@ -704,6 +729,271 @@ fn material_caption(message: &Value, name: &str, current_format: bool) -> Option
         return None;
     }
     Some(values)
+}
+
+fn plain_caption(message: &Value, caption: &str) -> bool {
+    message["raw_text"].as_str() == Some(caption)
+        && message
+            .get("html")
+            .is_none_or(|html| html.as_str() == Some(caption))
+        && message
+            .get("icons")
+            .is_none_or(|icons| icons.as_array().is_some_and(Vec::is_empty))
+}
+
+// These are explicit pending choices, not automatic rewards with similar text.
+// Cost captions identify a monument only when the entire legal monument mask
+// contains exactly one such material vector; no holdings-based choice inference.
+fn observed_pending_choice_evidence(
+    index: usize,
+    action: &TypedAction,
+    sources: &Sources,
+    report: &PublicReplayReport,
+) -> Result<Option<ObservedPendingChoiceSupport>, String> {
+    let step = &sources.record.steps[index];
+    let before = &report.frames[index].snapshot.state;
+    let after = &report.frames[index + 1].snapshot.state;
+    let frame = inspect_public(before)?;
+    let o = frame
+        .observation
+        .as_ref()
+        .ok_or("Missing pending choice observation")?;
+    let Some(pending) = before.pending.as_ref() else {
+        return Ok(None);
+    };
+    if !matches!(before.players.len(), 3 | 4)
+        || o.legal_actions.len() < 2
+        || step.refills != Default::default()
+        || !pending.after.is_empty()
+    {
+        return Ok(None);
+    }
+    let name = &sources.record.initial.players[step.actor].name;
+    let messages = sources.raw["dom_entries"]
+        .as_array()
+        .ok_or("Missing source messages")?
+        .iter()
+        .find(|node| node["action_id"].as_u64() == Some(step.source_action_ids[0]))
+        .and_then(|node| node["messages"].as_array())
+        .ok_or("Missing pending choice source")?;
+    let mut expected = before.clone();
+    expected.log = after.log.clone();
+    let mut materials = [0i64; 5];
+    let mut material_indices = Vec::new();
+    let (kind, caption) = match action {
+        TypedAction::Monument {
+            id,
+            cost,
+            renovation: None,
+        } => {
+            if !matches!(pending.task, Task::Build { remaining: 1..=2, allow_monument: true, corn_payment: false, .. })
+                || cost[0] != 0 || cost[4] != 0 || cost.iter().any(|n| *n < 0)
+                || o.legal_actions.iter().filter(|row| matches!(&row.action,
+                    TypedAction::Monument { cost: candidate, renovation: None, .. } if candidate == cost)).count() != 1
+            { return Ok(None); }
+            let Some(card) = tzolkin_core::catalog::monument(id) else {
+                return Ok(None);
+            };
+            if RESOURCE_IDS
+                .iter()
+                .zip(cost)
+                .any(|(r, n)| card.cost.get(r).copied().unwrap_or(0) != *n)
+                || before.monuments.iter().filter(|m| *m == id).count() != 1
+            {
+                return Ok(None);
+            }
+            for (r, n) in RESOURCE_IDS.iter().zip(cost) {
+                *expected.players[step.actor]
+                    .resources
+                    .get_mut(r)
+                    .ok_or("Missing material")? -= n;
+            }
+            expected.players[step.actor].monuments.push(id.clone());
+            expected.monuments.retain(|m| m != id);
+            expected.pending = None;
+            ("monument", format!("{name}は記念碑を建てた"))
+        }
+        TypedAction::Temple {
+            temple,
+            direction: 1,
+        } => {
+            let Task::Temple {
+                remaining,
+                distinct,
+                direction,
+                reason,
+            } = &pending.task
+            else {
+                return Ok(None);
+            };
+            if !(1..=2).contains(remaining)
+                || !matches!(direction, None | Some(1))
+                || reason.is_some()
+                || distinct.as_ref().is_some_and(|ids| ids.contains(temple))
+            {
+                return Ok(None);
+            }
+            let level = expected.players[step.actor]
+                .temples
+                .get_mut(temple)
+                .ok_or("Missing temple")?;
+            *level += 1;
+            let maximum = tzolkin_core::catalog::CATALOG.temple_tracks[temple]
+                .points
+                .len() as i64
+                - 2;
+            if *level > maximum {
+                return Ok(None);
+            }
+            if *level == maximum {
+                expected.players[step.actor].double_advance_available = true;
+            }
+            let next_distinct = distinct.clone().map(|mut ids| {
+                ids.push(*temple);
+                ids
+            });
+            expected.pending = (*remaining > 1).then(|| Pending {
+                title: format!("神殿を上がる（残り {} 回）", remaining - 1),
+                task: Task::Temple {
+                    remaining: remaining - 1,
+                    distinct: next_distinct,
+                    direction: *direction,
+                    reason: *reason,
+                },
+                after: vec![],
+            });
+            let label = match temple {
+                TempleId::Chaac => "Chaac",
+                TempleId::Quetzalcoatl => "Quetzalcoatl",
+                TempleId::Kukulkan => "Kukulcan",
+            };
+            (
+                "positiveTemple",
+                format!("{name}は{label}の信仰を1段上げた"),
+            )
+        }
+        _ => return Ok(None),
+    };
+    if &expected != after {
+        return Ok(None);
+    }
+    let mut chosen_message = None;
+    let mut temple_captions = Vec::new();
+    let mut unique_temple_captions = BTreeSet::new();
+    for (i, message) in messages.iter().enumerate() {
+        let text = message["raw_text"]
+            .as_str()
+            .ok_or("Missing pending choice caption")?;
+        let actor = sources
+            .record
+            .initial
+            .players
+            .iter()
+            .filter(|p| text.starts_with(&format!("{}は", p.name)))
+            .max_by_key(|p| p.name.len());
+        if actor.is_none_or(|p| &p.name != name) {
+            return Ok(None);
+        }
+        if plain_caption(message, &caption) {
+            if chosen_message.replace(i).is_some() {
+                return Ok(None);
+            }
+            if kind == "positiveTemple" {
+                if !unique_temple_captions.insert(text) {
+                    return Ok(None);
+                }
+                temple_captions.push(text);
+            }
+        } else if let Some(vector) =
+            material_caption_bounded(message, name, sources.raw["schema_version"] == 1, 4)
+        {
+            if kind == "monument" && chosen_message.is_some() {
+                return Ok(None);
+            }
+            for (total, n) in materials.iter_mut().zip(vector) {
+                *total = total.checked_add(n).ok_or("Observed material overflow")?;
+            }
+            material_indices.push(i);
+        } else if kind == "positiveTemple"
+            && ["Chaac", "Quetzalcoatl", "Kukulcan"]
+                .iter()
+                .any(|label| plain_caption(message, &format!("{name}は{label}の信仰を1段上げた")))
+        {
+            if !unique_temple_captions.insert(text) {
+                return Ok(None);
+            }
+            temple_captions.push(text);
+        } else {
+            return Ok(None);
+        }
+    }
+    let Some(source_message_index) = chosen_message else {
+        return Ok(None);
+    };
+    if let TypedAction::Monument { cost, .. } = action {
+        if material_indices.is_empty() || &materials != cost {
+            return Ok(None);
+        }
+    } else if !material_indices.is_empty() {
+        // A prior payment in the same event needs separate operation support.
+        return Ok(None);
+    } else {
+        // A shared event's final board can commute: bind each caption to the
+        // actual same-actor positive Temple decisions in replay order instead.
+        let mut ordered_captions = Vec::new();
+        for (event_index, event_step) in sources.record.steps.iter().enumerate() {
+            if event_step.actor != step.actor
+                || !event_step
+                    .source_action_ids
+                    .contains(&step.source_action_ids[0])
+            {
+                continue;
+            }
+            if event_step.source_action_ids != step.source_action_ids {
+                return Ok(None);
+            }
+            let event_frame = inspect_public(&report.frames[event_index].snapshot.state)?;
+            let event_observation = event_frame
+                .observation
+                .as_ref()
+                .ok_or("Missing shared pending choice observation")?;
+            let matching = event_observation
+                .legal_actions
+                .iter()
+                .filter(|row| row.r#move == event_step.r#move)
+                .collect::<Vec<_>>();
+            if event_observation.actor != step.actor || matching.len() != 1 {
+                return Ok(None);
+            }
+            if let TypedAction::Temple {
+                temple,
+                direction: 1,
+            } = matching[0].action
+            {
+                let label = match temple {
+                    TempleId::Chaac => "Chaac",
+                    TempleId::Quetzalcoatl => "Quetzalcoatl",
+                    TempleId::Kukulkan => "Kukulcan",
+                };
+                ordered_captions.push(format!("{name}は{label}の信仰を1段上げた"));
+            }
+        }
+        if temple_captions.len() != ordered_captions.len()
+            || temple_captions
+                .iter()
+                .zip(&ordered_captions)
+                .any(|(observed, expected)| *observed != expected)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(ObservedPendingChoiceSupport {
+        kind,
+        source_message_index,
+        material_message_indices: material_indices,
+        observed_materials: materials,
+        basis: "oneObservedExplicitPendingChoiceWithExactStateTransition",
+    }))
 }
 
 struct PaidTechnologyEvidence {
@@ -1308,6 +1598,7 @@ fn corn_beg_sample(
         source_label_support: None,
         paid_technology_support: None,
         corn_beg_support: Some(support.clone()),
+        observed_pending_choice_support: None,
     })
 }
 
@@ -1370,6 +1661,7 @@ fn paid_technology_sample(
         source_label_support: None,
         paid_technology_support: Some(support.clone()),
         corn_beg_support: None,
+        observed_pending_choice_support: None,
     })
 }
 
@@ -1573,8 +1865,10 @@ impl ConditionalHumanPolicyDataset {
             if paid_payment_steps.contains(&index) || beg_temple_steps.contains(&index) {
                 continue;
             }
-            if label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE)
-                && matches!(row.action, TypedAction::Beg)
+            if matches!(
+                label_scope,
+                Some(OBSERVED_CORN_BEG_LABEL_SCOPE | OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
+            ) && matches!(row.action, TypedAction::Beg)
             {
                 let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
                 {
@@ -1635,6 +1929,7 @@ impl ConditionalHumanPolicyDataset {
                     PAID_TECHNOLOGY_LABEL_SCOPE
                         | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
                         | OBSERVED_CORN_BEG_LABEL_SCOPE
+                        | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                 )
             ) && let TypedAction::Technology { technology } = row.action
             {
@@ -1728,6 +2023,29 @@ impl ConditionalHumanPolicyDataset {
                 paid_payment_steps.insert(index + 1);
                 continue;
             }
+            let strategic = label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
+                && matches!(
+                    row.action,
+                    TypedAction::Monument { .. } | TypedAction::Temple { direction: 1, .. }
+                );
+            let pending_support = if strategic {
+                let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
+                {
+                    observed_pending_choice_evidence(index, &row.action, sources, &report)?
+                } else {
+                    None
+                };
+                let Some(evidence) = evidence else {
+                    *counts
+                        .excluded
+                        .entry("unobservedPendingChoice".into())
+                        .or_default() += 1;
+                    continue;
+                };
+                Some(evidence)
+            } else {
+                None
+            };
             let factorized = label_scope.is_some()
                 && matches!(
                     row.action,
@@ -1738,7 +2056,11 @@ impl ConditionalHumanPolicyDataset {
                 );
             let explicit = matches!(
                 label_scope,
-                Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE | OBSERVED_CORN_BEG_LABEL_SCOPE)
+                Some(
+                    EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                        | OBSERVED_CORN_BEG_LABEL_SCOPE
+                        | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
+                )
             ) && matches!(
                 row.action,
                 TypedAction::Trade {
@@ -1752,6 +2074,7 @@ impl ConditionalHumanPolicyDataset {
             );
             let reason = if !factorized
                 && !explicit
+                && !strategic
                 && !matches!(
                     row.action,
                     TypedAction::Place { .. }
@@ -1889,7 +2212,9 @@ impl ConditionalHumanPolicyDataset {
                         .filter(|player| text.starts_with(&format!("{}は", player.name)))
                         .max_by_key(|player| player.name.len());
                     source_actor.is_some_and(|player| &player.name == name)
-                        && if factorized {
+                        && if let Some(support) = &pending_support {
+                            *message_index == support.source_message_index
+                        } else if factorized {
                             removal_action_caption(text, name).is_some_and(|caption| {
                                 matches!(row.action, TypedAction::UseAction { gear, position, corn_cost, .. }
                                     if caption.gear == gear && caption.action_position == position && caption.corn_cost == corn_cost)
@@ -1936,7 +2261,9 @@ impl ConditionalHumanPolicyDataset {
             } else {
                 None
             };
-            let part = if factorized {
+            let part = if let Some(support) = &pending_support {
+                support.kind
+            } else if factorized {
                 "removalAction"
             } else if explicit {
                 if matches!(row.action, TypedAction::Trade { .. }) {
@@ -1970,7 +2297,7 @@ impl ConditionalHumanPolicyDataset {
                     return Err("Conditional Human features exceed finite1024 bound".into());
                 }
             }
-            if factorized || explicit {
+            if factorized || explicit || strategic {
                 let selected = candidates[chosen].values_for_schema(PUBLIC_FEATURE_SCHEMA)?;
                 if candidates.iter().enumerate().any(|(i, candidate)| {
                     i != chosen
@@ -1992,7 +2319,7 @@ impl ConditionalHumanPolicyDataset {
             );
             if factorized {
                 identity.push_str("\0removalAction");
-            } else if explicit {
+            } else if explicit || strategic {
                 identity.push('\0');
                 identity.push_str(part);
             }
@@ -2012,11 +2339,12 @@ impl ConditionalHumanPolicyDataset {
                 candidates,
                 chosen,
                 value_target: (),
-                source_label_part: (factorized || explicit).then_some(part),
+                source_label_part: (factorized || explicit || strategic).then_some(part),
                 paired_sample_id: pair.map(|(id, _, _, _)| id),
                 source_label_support: support,
                 paid_technology_support: None,
                 corn_beg_support: None,
+                observed_pending_choice_support: pending_support,
             });
         }
         counts.samples = samples.len();
@@ -2167,6 +2495,7 @@ impl ConditionalHumanPolicyDataset {
                 source_label_support: None,
                 paid_technology_support: None,
                 corn_beg_support: None,
+                observed_pending_choice_support: None,
             }],
         }
     }
@@ -2183,7 +2512,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) {
+                DATASET_SCHEMA_V6
+            } else if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
                 DATASET_SCHEMA_V5
             } else if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
                 DATASET_SCHEMA_V4
@@ -2203,7 +2534,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) {
+                "originalVisibleTextAndFinalAppliedStepAuditWithObservedMonumentPositiveTempleChoices"
+            } else if self.label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedCornBegAndNegativeTempleChoice"
             } else if self.label_scope == Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedPaidTechnologyMarketSellAndPaidAnywhere"

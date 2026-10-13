@@ -10,7 +10,7 @@ use crate::conditional_human_rl_update::{
 use crate::dataset::DatasetSplit;
 use crate::human_policy_dataset::{
     EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE,
-    PAID_TECHNOLOGY_LABEL_SCOPE,
+    OBSERVED_PENDING_CHOICE_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use crate::human_policy_training::{ConditionalDatasetIdentity, PreparedConditionalHumanPolicy};
 use crate::policy::HeuristicWeights;
@@ -259,7 +259,8 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
         | Some(
             PAID_TECHNOLOGY_LABEL_SCOPE
             | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
-            | OBSERVED_CORN_BEG_LABEL_SCOPE,
+            | OBSERVED_CORN_BEG_LABEL_SCOPE
+            | OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
         ) => {
             matches!(
                 action,
@@ -280,6 +281,7 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
                         PAID_TECHNOLOGY_LABEL_SCOPE
                             | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
                             | OBSERVED_CORN_BEG_LABEL_SCOPE
+                            | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                     )
                 ) && match action {
                     TypedAction::Technology { .. } => true,
@@ -293,7 +295,11 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
                 })
                 || (matches!(
                     label_scope,
-                    Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE | OBSERVED_CORN_BEG_LABEL_SCOPE)
+                    Some(
+                        EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                            | OBSERVED_CORN_BEG_LABEL_SCOPE
+                            | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
+                    )
                 ) && matches!(
                     action,
                     TypedAction::Trade {
@@ -307,10 +313,21 @@ fn teacher_grammar_contains(label_scope: Option<&str>, action: &TypedAction) -> 
                         ..
                     }
                 ))
-                || (label_scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE)
+                || (matches!(
+                    label_scope,
+                    Some(OBSERVED_CORN_BEG_LABEL_SCOPE | OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
+                ) && matches!(
+                    action,
+                    TypedAction::Beg | TypedAction::Temple { direction: -1, .. }
+                ))
+                || (label_scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
                     && matches!(
                         action,
-                        TypedAction::Beg | TypedAction::Temple { direction: -1, .. }
+                        TypedAction::Temple { direction: 1, .. }
+                            | TypedAction::Monument {
+                                renovation: None,
+                                ..
+                            }
                     ))
         }
         Some(_) => false,
@@ -768,6 +785,7 @@ mod tests {
             Some(PAID_TECHNOLOGY_LABEL_SCOPE),
             Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE),
             Some(OBSERVED_CORN_BEG_LABEL_SCOPE),
+            Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE),
         ] {
             for action in [
                 TypedAction::Place {
@@ -821,6 +839,7 @@ mod tests {
                             PAID_TECHNOLOGY_LABEL_SCOPE
                                 | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
                                 | OBSERVED_CORN_BEG_LABEL_SCOPE
+                                | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                         )
                     )
                 );
@@ -847,6 +866,7 @@ mod tests {
                             Some(
                                 EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
                                     | OBSERVED_CORN_BEG_LABEL_SCOPE
+                                    | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                             )
                         ) && !buy
                             && matches!(
@@ -869,13 +889,20 @@ mod tests {
                     ),
                     matches!(
                         scope,
-                        Some(EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE | OBSERVED_CORN_BEG_LABEL_SCOPE)
+                        Some(
+                            EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                                | OBSERVED_CORN_BEG_LABEL_SCOPE
+                                | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
+                        )
                     ) && corn_cost == 1
                 );
             }
             assert_eq!(
                 teacher_grammar_contains(scope, &TypedAction::Beg),
-                scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE)
+                matches!(
+                    scope,
+                    Some(OBSERVED_CORN_BEG_LABEL_SCOPE | OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
+                )
             );
             for direction in [-1, 1] {
                 assert_eq!(
@@ -886,7 +913,24 @@ mod tests {
                             direction
                         }
                     ),
-                    scope == Some(OBSERVED_CORN_BEG_LABEL_SCOPE) && direction == -1
+                    (matches!(
+                        scope,
+                        Some(OBSERVED_CORN_BEG_LABEL_SCOPE | OBSERVED_PENDING_CHOICE_LABEL_SCOPE)
+                    ) && direction == -1)
+                        || (scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) && direction == 1)
+                );
+            }
+            for renovation in [None, Some("synthetic".into())] {
+                assert_eq!(
+                    teacher_grammar_contains(
+                        scope,
+                        &TypedAction::Monument {
+                            id: "synthetic".into(),
+                            cost: [0, 1, 0, 0, 0],
+                            renovation: renovation.clone(),
+                        }
+                    ),
+                    scope == Some(OBSERVED_PENDING_CHOICE_LABEL_SCOPE) && renovation.is_none()
                 );
             }
             assert!(!teacher_grammar_contains(
