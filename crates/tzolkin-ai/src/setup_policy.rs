@@ -1,12 +1,28 @@
 //! Opt-in setup/opening hypotheses; the default heuristic stays unchanged.
 use crate::Decision;
-use crate::policy::{HeuristicWeights, score_action};
+use crate::policy::HeuristicWeights;
+use tzolkin_bot::policy::HeuristicRevision;
 use tzolkin_core::catalog::wealth;
 use tzolkin_core::observation::{LegalAction, Observation, TypedAction};
 use tzolkin_core::{Effect, GameMove, GearId, Phase, Resource, StartingWealth, TurnMode};
 
 pub const POLICY_VERSION: &str = "corn-first-setup-v2";
 pub const UXMAL_OPENING_POLICY_VERSION: &str = "corn-first-uxmal-opening-v2";
+pub const LEGACY_POLICY_VERSION: &str = "corn-first-setup-v1";
+pub const LEGACY_UXMAL_OPENING_POLICY_VERSION: &str = "corn-first-uxmal-opening-v1";
+
+fn policy_version(revision: HeuristicRevision) -> &'static str {
+    match revision {
+        HeuristicRevision::V1 => LEGACY_POLICY_VERSION,
+        HeuristicRevision::V2 => POLICY_VERSION,
+    }
+}
+fn opening_policy_version(revision: HeuristicRevision) -> &'static str {
+    match revision {
+        HeuristicRevision::V1 => LEGACY_UXMAL_OPENING_POLICY_VERSION,
+        HeuristicRevision::V2 => UXMAL_OPENING_POLICY_VERSION,
+    }
+}
 
 fn direct_corn(tile: &StartingWealth) -> i64 {
     tile.resources.get(&Resource::Corn).copied().unwrap_or(0)
@@ -46,8 +62,15 @@ pub fn choose_move_with_weights(
     o: &Observation,
     weights: &HeuristicWeights,
 ) -> Result<Decision, String> {
-    let mut decision = crate::choose_move_with_weights(o, weights)?;
-    decision.policy_version = POLICY_VERSION.into();
+    choose_move_for_revision(o, weights, HeuristicRevision::V2)
+}
+pub(crate) fn choose_move_for_revision(
+    o: &Observation,
+    weights: &HeuristicWeights,
+    revision: HeuristicRevision,
+) -> Result<Decision, String> {
+    let mut decision = tzolkin_bot::choose_move_with_weights_for_revision(o, weights, revision)?;
+    decision.policy_version = policy_version(revision).into();
     if o.phase != Phase::Setup
         || !(3..=4).contains(&o.players.len())
         || o.additional_buildings
@@ -59,7 +82,8 @@ pub fn choose_move_with_weights(
     for legal in &o.legal_actions {
         if let TypedAction::ChooseWealth { ids } = &legal.action {
             let corn = selected_corn(o, ids)?;
-            let score = score_action(o, &legal.action, weights);
+            let score =
+                tzolkin_bot::policy::score_action_for_revision(o, &legal.action, weights, revision);
             if best
                 .as_ref()
                 .is_none_or(|(_, c, s)| corn > *c || (corn == *c && score > *s))
@@ -181,11 +205,19 @@ pub fn choose_uxmal_opening_with_weights(
     o: &Observation,
     weights: &HeuristicWeights,
 ) -> Result<Decision, String> {
-    let mut decision = choose_move_with_weights(o, weights)?;
-    decision.policy_version = UXMAL_OPENING_POLICY_VERSION.into();
+    choose_uxmal_opening_for_revision(o, weights, HeuristicRevision::V2)
+}
+pub(crate) fn choose_uxmal_opening_for_revision(
+    o: &Observation,
+    weights: &HeuristicWeights,
+    revision: HeuristicRevision,
+) -> Result<Decision, String> {
+    let mut decision = choose_move_for_revision(o, weights, revision)?;
+    decision.policy_version = opening_policy_version(revision).into();
     if let Some(action) = first_uxmal_opening(o) {
         decision.r#move = action.r#move.clone();
-        decision.score = score_action(o, &action.action, weights);
+        decision.score =
+            tzolkin_bot::policy::score_action_for_revision(o, &action.action, weights, revision);
     }
     Ok(decision)
 }
@@ -193,6 +225,7 @@ pub fn choose_uxmal_opening_with_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::score_action;
     use crate::replay::{self, ReplaySource, SeatPolicy};
     use tzolkin_core::observation::{observation_key, observe};
     use tzolkin_core::{GameOptions, apply_move, create_game_with_options};
@@ -518,7 +551,111 @@ mod tests {
             let mut expected = crate::choose_move_with_weights(&o, &weights).unwrap();
             expected.policy_version = POLICY_VERSION.into();
             assert_eq!(choose_move_with_weights(&o, &weights).unwrap(), expected);
+            for revision in [HeuristicRevision::V1, HeuristicRevision::V2] {
+                let baseline =
+                    tzolkin_bot::choose_move_with_weights_for_revision(&o, &weights, revision)
+                        .unwrap();
+                let mut expected = baseline.clone();
+                expected.policy_version = policy_version(revision).into();
+                assert_eq!(
+                    choose_move_for_revision(&o, &weights, revision).unwrap(),
+                    expected
+                );
+                let mut expected = baseline;
+                expected.policy_version = opening_policy_version(revision).into();
+                assert_eq!(
+                    choose_uxmal_opening_for_revision(&o, &weights, revision).unwrap(),
+                    expected
+                );
+            }
         }
+        // The old wrappers must execute V1 when the underlying fallback differs,
+        // rather than merely replacing the V2 decision's version string.
+        let mut overdue = setup(3, 17, GameOptions::default());
+        overdue.phase = Phase::Playing;
+        overdue.round = 9;
+        overdue.food_days.clear();
+        overdue.pending = Some(tzolkin_core::Pending {
+            title: "Trade".into(),
+            task: tzolkin_core::Task::Trade,
+            after: vec![],
+        });
+        let player = &mut overdue.players[overdue.current_player];
+        player.workers = 5;
+        player.feed_workers = 0;
+        player.feed_all = false;
+        player.feed_discount = 0;
+        player.resources = [
+            (Resource::Corn, 9),
+            (Resource::Wood, 1),
+            (Resource::Stone, 0),
+            (Resource::Gold, 0),
+            (Resource::Skull, 0),
+        ]
+        .into_iter()
+        .collect();
+        let o = observe(&overdue, overdue.current_player).unwrap();
+        for opening in [false, true] {
+            let choose = if opening {
+                choose_uxmal_opening_for_revision
+            } else {
+                choose_move_for_revision
+            };
+            let v1 = choose(&o, &weights, HeuristicRevision::V1).unwrap();
+            let v2 = choose(&o, &weights, HeuristicRevision::V2).unwrap();
+            assert_eq!(
+                o.legal_actions
+                    .iter()
+                    .find(|row| row.r#move == v1.r#move)
+                    .unwrap()
+                    .action,
+                TypedAction::Skip,
+            );
+            assert_ne!(v1.r#move, v2.r#move);
+            assert_eq!(v1.score.to_bits(), 0.0_f64.to_bits());
+            let policy = if opening {
+                SeatPolicy::CornFirstUxmalOpening {
+                    policy_version: v1.policy_version.clone(),
+                    weights: weights.clone(),
+                }
+            } else {
+                SeatPolicy::CornFirstSetup {
+                    policy_version: v1.policy_version.clone(),
+                    weights: weights.clone(),
+                }
+            };
+            policy.validate().unwrap();
+            let mut wire = serde_json::to_value(&policy).unwrap();
+            wire["policyVersion"] = "unknown-historical-version".into();
+            assert!(
+                serde_json::from_value::<SeatPolicy>(wire)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+            let mut invalid = weights.clone();
+            invalid.worker = f64::NAN;
+            assert!(choose(&o, &invalid, HeuristicRevision::V1).is_err());
+        }
+        let v1 = SeatPolicy::Heuristic {
+            policy_version: HeuristicRevision::V1.policy_version().into(),
+            weights: weights.clone(),
+        };
+        v1.validate().unwrap();
+        let mut wire = serde_json::to_value(&v1).unwrap();
+        wire["policyVersion"] = "heuristic-v0".into();
+        assert!(
+            serde_json::from_value::<SeatPolicy>(wire)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        let mut stale = o;
+        stale.observation_key = "stale".into();
+        assert!(choose_move_for_revision(&stale, &weights, HeuristicRevision::V1).is_err());
+        assert!(
+            choose_uxmal_opening_for_revision(&stale, &weights, HeuristicRevision::V1).is_err()
+        );
     }
 
     #[test]

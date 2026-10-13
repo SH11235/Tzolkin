@@ -357,15 +357,26 @@ impl SeatPolicy {
             Self::Heuristic {
                 policy_version,
                 weights,
-            } if policy_version == POLICY_VERSION => weights.validate(),
+            } if policy_version == POLICY_VERSION
+                || policy_version
+                    == tzolkin_bot::policy::HeuristicRevision::V1.policy_version() =>
+            {
+                weights.validate()
+            }
             Self::CornFirstSetup {
                 policy_version,
                 weights,
-            } if policy_version == crate::setup_policy::POLICY_VERSION => weights.validate(),
+            } if policy_version == crate::setup_policy::POLICY_VERSION
+                || policy_version == crate::setup_policy::LEGACY_POLICY_VERSION =>
+            {
+                weights.validate()
+            }
             Self::CornFirstUxmalOpening {
                 policy_version,
                 weights,
-            } if policy_version == crate::setup_policy::UXMAL_OPENING_POLICY_VERSION => {
+            } if policy_version == crate::setup_policy::UXMAL_OPENING_POLICY_VERSION
+                || policy_version == crate::setup_policy::LEGACY_UXMAL_OPENING_POLICY_VERSION =>
+            {
                 weights.validate()
             }
             Self::ResourceCycle { configuration } => configuration.validate(),
