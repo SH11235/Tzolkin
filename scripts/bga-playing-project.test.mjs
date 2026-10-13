@@ -10,10 +10,12 @@ import test from 'node:test';
 import { decodeConditionalPublicGame, decodePublicGame } from './bga-decode.mjs';
 import {
   ATLAS_SCHEMA,
+  BOUNDARY_CONTROL_SCHEMA,
   CONTROL_SCHEMA,
   LATER_WITNESS_SCHEMA,
   decodeProjectedInitial,
   projectCapturedInitial,
+  projectRetainedBoundary,
   projectPlayingFiles,
 } from './bga-playing-project.mjs';
 
@@ -431,6 +433,259 @@ function fragmentFixture() {
   };
   return value;
 }
+
+function boundaryFixture({ split = false, terminal = false } = {}) {
+  const value = fragmentFixture(),
+    capture = value.capture;
+  const displayedRound = terminal ? 28 : split ? 22 : 9;
+  const actionId = split ? 9 : 8;
+  capture.schema = 'bga-retained-visible-replay-board-v1';
+  capture.capturedAt = '2000-01-01T00:00:00.000Z';
+  capture.moveText = `Coup #${actionId}`;
+  capture.roundText = `経過日 ${displayedRound} / 27`;
+  capture.boardHtml = capture.boardHtml.replace(
+    element('span', 'current_round', '1'),
+    element('span', 'current_round', String(displayedRound)),
+  );
+  capture.renderedReplayControls = 'Next comment';
+  capture.prompt = terminal ? 'ゲーム終了\n' : 'Aはワーカーを置くか取り除くかしてください';
+  const colors = ['008000', 'ff0000', '0000ff', 'ffa500'];
+  capture.playerBoards.forEach((player, index) => {
+    player.rowHtml = player.rowHtml.replace('color:#008000', `color:#${colors[index]}`);
+    player.boardHtml = player.boardHtml.replace(
+      element('span', `worker_number_player_${player.playerId}`, '3'),
+      element(
+        'span',
+        `worker_number_player_${player.playerId}`,
+        String(index === 0 ? 1 : index === 1 ? 2 : 3),
+      ),
+    );
+  });
+  const placed = [0, 0, 1].map((owner, index) => ({
+    id: `worker_${index + 1}`,
+    className: `worker worker_${colors[owner]}`,
+    inlineStyle: `top: 200px; left: ${100 + index * 30}px;`,
+    parentId: 'workers',
+    computedDisplay: 'block',
+    computedVisibility: 'visible',
+    rect: { x: 100 + index * 30, y: 200, width: 20, height: 30 },
+  }));
+  capture.boardHtml =
+    capture.boardHtml.slice(0, -6) +
+    element(
+      'div',
+      'workers',
+      placed
+        .map((worker) =>
+          element(
+            'div',
+            worker.id,
+            '',
+            ` class="${worker.className}" style="${worker.inlineStyle}"`,
+          ),
+        )
+        .join(''),
+    ) +
+    '</div>';
+  capture.retainedDomGeometry = [
+    {
+      id: 'board',
+      className: '',
+      inlineStyle: null,
+      parentId: 'board-container',
+      computedDisplay: 'block',
+      computedVisibility: 'visible',
+      rect: { x: 0, y: 0, width: 1000, height: 900 },
+    },
+    {
+      id: 'workers',
+      className: null,
+      inlineStyle: null,
+      parentId: 'board',
+      computedDisplay: 'block',
+      computedVisibility: 'visible',
+      rect: { x: 0, y: 900, width: 1000, height: 0 },
+    },
+    ...placed,
+  ];
+  const feeding = {
+    raw_text: '食料供給日: Aはワーカー3個で 6\nを支払った',
+    html: '食料供給日: Aはワーカー3個で 6<div class="tz_icon resource_corn"></div>を支払った',
+    icons: [{ classes: 'tz_icon resource_corn' }],
+  };
+  const rotation = { raw_text: '歯車が進んだ', html: '歯車が進んだ', icons: [] };
+  const end = { raw_text: 'ゲーム終了', html: 'ゲーム終了', icons: [] };
+  for (const [id, messages] of split
+    ? [
+        [8, [feeding]],
+        [9, [rotation]],
+      ]
+    : [[8, [feeding, rotation, ...(terminal ? [end] : [])]]]) {
+    value.raw.entries.push({
+      action_id: id,
+      raw_text: messages.map((message) => message.raw_text).join('\n'),
+      timestamp_display: '12:01:00',
+    });
+    value.raw.dom_entries.push({ action_id: id, messages, timestamp_display: '12:01:00' });
+  }
+  value.raw.entry_count = value.raw.entries.length;
+  const repin = () => {
+    const retained = bytes(capture),
+      raw = bytes(value.raw);
+    return [
+      retained,
+      raw,
+      bytes({
+        schema: BOUNDARY_CONTROL_SCHEMA,
+        capture: pin(retained),
+        rawLog: pin(raw),
+        archiveRelease: 'fixture',
+        seatOrder: value.control.seatOrder,
+        mechanicalProfile: value.control.mechanicalProfile,
+      }),
+    ];
+  };
+  return { ...value, repin };
+}
+
+test('retained boundary binds original food/rotation scope and separates available from total workers', () => {
+  for (const split of [false, true]) {
+    const value = boundaryFixture({ split }),
+      projected = projectRetainedBoundary(...value.repin());
+    assert.equal(projected.witness.actionId, split ? 9 : 8);
+    assert.equal(projected.witness.expected.round, split ? 22 : 9);
+    assert.deepEqual(projected.provenance.sourceActionIds, split ? [8, 9] : [8]);
+    assert.equal(projected.provenance.foodDay, split ? 21 : 8);
+    assert.deepEqual(
+      projected.witness.expected.players.map((player) => player.workers),
+      [3, 3, 3, 3],
+    );
+    assert.deepEqual(
+      projected.provenance.displayedPlayers.map((player) => player.availableWorkers),
+      [1, 2, 3, 3],
+    );
+    assert.equal(projected.provenance.completeSourceBoard, false);
+    assert.equal(projected.provenance.humanBcQualified, false);
+    assert.equal(projected.provenance.policyTrainingReady, false);
+    assert.equal(Object.hasOwn(projected.witness.expected, 'foodDays'), false);
+    assert.equal(Object.hasOwn(projected.witness.expected, 'gears'), false);
+  }
+});
+
+test('retained boundary omits total workers when complete visible geometry is missing', () => {
+  for (const mutate of [
+    (value) => value.capture.retainedDomGeometry.shift(),
+    (value) => value.capture.retainedDomGeometry.pop(),
+    (value) => {
+      value.capture.retainedDomGeometry.at(-1).computedVisibility = 'hidden';
+    },
+    (value) => {
+      delete value.capture.retainedDomGeometry.at(-1).computedDisplay;
+    },
+  ]) {
+    const value = boundaryFixture();
+    mutate(value);
+    const projected = projectRetainedBoundary(...value.repin());
+    assert.equal(projected.provenance.totalWorkersObserved, false);
+    assert.ok(
+      projected.witness.expected.players.every((player) => !Object.hasOwn(player, 'workers')),
+    );
+    assert.equal(projected.witness.expected.players[0].resources.corn, 8);
+    assert.equal(projected.provenance.displayedPlayers[0].availableWorkers, 1);
+  }
+  const anonymous = boundaryFixture();
+  anonymous.capture.retainedDomGeometry.push(
+    { id: '', parentId: 'player_board_100' },
+    { id: '', parentId: 'player_board_200' },
+  );
+  assert.equal(projectRetainedBoundary(...anonymous.repin()).provenance.totalWorkersObserved, true);
+  anonymous.capture.retainedDomGeometry.at(-1).parentId = 'workers';
+  assert.throws(
+    () => projectRetainedBoundary(...anonymous.repin()),
+    /Unidentified boundary worker/,
+  );
+});
+
+test('retained boundary keeps terminal day and integer score displays out of exact native assertions', () => {
+  const value = boundaryFixture({ terminal: true });
+  value.capture.tableId = 123;
+  value.capture.playerBoards[0].boardHtml = value.capture.playerBoards[0].boardHtml.replace(
+    element('span', 'player_score_100', '0'),
+    element('span', 'player_score_100', '12'),
+  );
+  const projected = projectRetainedBoundary(...value.repin());
+  assert.equal(projected.provenance.kind, 'terminal');
+  assert.equal(projected.provenance.displayedRound, 28);
+  assert.equal(projected.provenance.displayedPlayers[0].scoreDisplay, 12);
+  assert.equal(projected.witness.expected.phase, 'finished');
+  assert.equal(Object.hasOwn(projected.witness.expected, 'round'), false);
+  assert.ok(projected.witness.expected.players.every((player) => !Object.hasOwn(player, 'score')));
+  assert.equal(Object.hasOwn(projected, 'terminalCheckpoint'), false);
+  assert.equal(projected.provenance.completeNativeReplayQualified, false);
+});
+
+test('retained boundary rejects identity, hidden-counter, ownership and original-source mismatches', () => {
+  for (const mutate of [
+    (value) => {
+      value.capture.sourceUrl = value.capture.sourceUrl.replace('table=123', 'table=124');
+    },
+    (value) => {
+      value.capture.sourceUrl += '&player=100';
+    },
+    (value) => {
+      value.capture.moveText = 'Coup #99';
+    },
+    (value) => {
+      value.capture.completeNativeReplayQualified = true;
+    },
+    (value) => {
+      value.capture.playerBoards[0].boardHtml = value.capture.playerBoards[0].boardHtml.replace(
+        '<div ',
+        '<div hidden ',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace('worker_008000', 'worker_abcdef');
+    },
+    (value) => {
+      value.capture.playerBoards[0].rowHtml = value.capture.playerBoards[0].rowHtml.replace(
+        '<h3',
+        `${element('span', 'corn_number_player_100', '0')}<h3`,
+      );
+    },
+    (value) => {
+      value.raw.dom_entries.at(-1).messages.pop();
+      value.raw.entries.at(-1).raw_text = value.raw.dom_entries
+        .at(-1)
+        .messages.map((message) => message.raw_text)
+        .join('\n');
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.push(structuredClone(value.capture.retainedDomGeometry[0]));
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.at(-1).inlineStyle = 'left: 999px;';
+    },
+  ]) {
+    const value = boundaryFixture();
+    mutate(value);
+    assert.throws(() => projectRetainedBoundary(...value.repin()));
+  }
+  const value = boundaryFixture(),
+    prepared = value.repin();
+  const changed = Buffer.from(prepared[0]);
+  changed[0] ^= 1;
+  assert.throws(() => projectRetainedBoundary(changed, ...prepared.slice(1)), /pin mismatch/);
+  const split = boundaryFixture({ split: true });
+  split.raw.entries.splice(2, 0, { action_id: 10, raw_text: '', timestamp_display: '12:01:00' });
+  split.raw.dom_entries.splice(2, 0, {
+    action_id: 10,
+    messages: [],
+    timestamp_display: '12:01:00',
+  });
+  split.raw.entry_count++;
+  assert.throws(() => projectRetainedBoundary(...split.repin()));
+});
 
 test('legacy nested initial panels project only consistent retained state with unknown options', () => {
   const value = legacyFixture();

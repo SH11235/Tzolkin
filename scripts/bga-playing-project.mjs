@@ -16,6 +16,8 @@ export const PROJECTION_SCHEMA = 'tzolkin-bga-playing-projection-v1';
 export const CONTROL_SCHEMA = 'tzolkin-bga-playing-projection-control-v1';
 export const ATLAS_SCHEMA = 'tzolkin-bga-playing-atlas-v1';
 export const LATER_WITNESS_SCHEMA = 'tzolkin-bga-playing-later-witnesses-v1';
+export const BOUNDARY_CONTROL_SCHEMA = 'tzolkin-bga-retained-boundary-control-v1';
+const BOUNDARY_CAPTURE_SCHEMA = 'bga-retained-visible-replay-board-v1';
 const LEGACY_CAPTURE_SCHEMA = 'tzolkin-bga-public-initial-selection-observation-v1';
 const LEGACY_CAPTURE_ADAPTER = 'tzolkin-bga-legacy-initial-capture-adapter-v1';
 const FRAGMENT_CAPTURE_SCHEMA = 'bga-retained-visible-initial-dom-v1';
@@ -583,6 +585,418 @@ function retainedInitialFragments(capture) {
     skullRemainingHtml: outer(tree, byId(tree, 'skull_left_wrap')),
     buildingsHtml: outer(tree, byId(tree, 'buildings')),
     monumentsHtml: outer(tree, byId(tree, 'monuments')),
+  };
+}
+
+/** Project only independently retained counters at a settled food/terminal boundary.
+ * The returned witness fits the ordinary later-witness collection; its separate
+ * provenance must travel with it. This does not establish full board coverage. */
+export function projectRetainedBoundary(
+  captureBytes,
+  rawLogBytes,
+  controlBytes,
+  tableBytes = null,
+) {
+  const inputs = [
+    captureBytes,
+    rawLogBytes,
+    controlBytes,
+    ...(tableBytes === null ? [] : [tableBytes]),
+  ];
+  if (
+    inputs.some((input) => !Buffer.isBuffer(input)) ||
+    inputs.reduce((total, input) => total + input.length, 0) > 32 * 1024 * 1024
+  )
+    fail('Boundary projection input aggregate byte limit');
+  const control = uniqueJson(controlBytes, MAX_CONTROL_BYTES, 'boundary control');
+  closed(
+    control,
+    ['schema', 'capture', 'rawLog', 'archiveRelease', 'seatOrder', 'mechanicalProfile'],
+    'boundary control',
+    ['table'],
+  );
+  if (control.schema !== BOUNDARY_CONTROL_SCHEMA) fail('Unsupported boundary control');
+  pin(captureBytes, control.capture, MAX_BYTES, 'boundary capture');
+  pin(rawLogBytes, control.rawLog, MAX_BYTES, 'raw log');
+  if (tableBytes !== null) pin(tableBytes, control.table, MAX_BYTES, 'table evidence');
+  else if (control.table !== undefined && control.table !== null)
+    fail('Missing declared table evidence');
+  const capture = uniqueJson(captureBytes, MAX_BYTES, 'boundary capture');
+  const raw = uniqueJson(rawLogBytes, MAX_BYTES, 'raw log');
+  const table = tableBytes === null ? null : uniqueJson(tableBytes, MAX_BYTES, 'table evidence');
+  const mechanicalProfile = profile(control.mechanicalProfile);
+  observedBasicUnlimitedOptions(raw, table);
+  const game = normalizeGame(raw, sha(rawLogBytes), tableBytes);
+  closed(
+    capture,
+    [
+      'schema',
+      'sourceKind',
+      'tableId',
+      'sourceUrl',
+      'capturedAt',
+      'boardHtml',
+      'moveText',
+      'playerBoards',
+      'prompt',
+      'renderedReplayControls',
+      'retainedDomGeometry',
+      'roundText',
+      'completeNativeReplayQualified',
+      'humanBcQualified',
+    ],
+    'retained boundary',
+  );
+  const url = urlIdentity(capture.sourceUrl);
+  const release = /^\/archive\/replay\/([A-Za-z0-9_-]{1,64})\/$/.exec(url.pathname)?.[1];
+  const tableId =
+    typeof capture.tableId === 'number'
+      ? String(integer(capture.tableId, 1, Number.MAX_SAFE_INTEGER, 'boundary table'))
+      : capture.tableId;
+  const move = /^(?:Coup|Move) #([1-9]\d*)$/.exec(capture.moveText ?? '');
+  const actionId = integer(move ? Number(move[1]) : null, 1, 100000, 'boundary move');
+  if (
+    capture.schema !== BOUNDARY_CAPTURE_SCHEMA ||
+    capture.sourceKind !== 'public_ui_dom_only' ||
+    capture.completeNativeReplayQualified !== false ||
+    capture.humanBcQualified !== false ||
+    !release ||
+    release !== control.archiveRelease ||
+    url.searchParams.get('table') !== tableId ||
+    game.tableId !== tableId ||
+    url.searchParams.getAll('player').length !== 1 ||
+    !/^\d+$/.test(url.searchParams.get('player') ?? '')
+  )
+    fail('Retained boundary identity mismatch');
+  text(capture.capturedAt, 64, 'boundary capture time');
+  text(capture.renderedReplayControls, 4096, 'retained replay controls');
+  text(capture.roundText, 160, 'boundary round text');
+  text(capture.prompt, 256, 'boundary prompt');
+  const sourceIndex = game.rawEntries.findIndex((entry) => entry.action_id === actionId);
+  if (sourceIndex < 0) fail('Retained boundary action is absent from raw log');
+  const events = game.events.filter((event) => event.actionId === actionId);
+  const priorId = game.rawEntries[sourceIndex - 1]?.action_id;
+  const prior = game.events.filter((event) => event.actionId === priorId);
+  const board = htmlTree(capture.boardHtml, 'retained boundary board', true);
+  const root = byId(board, 'board');
+  if (root.tag !== 'div' || outer(board, root) !== capture.boardHtml)
+    fail('Detached retained boundary board');
+  unhiddenFragmentNode(board, root);
+  const rounds = byId(board, 'rounds_wrap'),
+    round = byId(board, 'current_round');
+  if (round.start <= rounds.start || round.end >= rounds.end)
+    fail('Boundary round counter outside rounds wrapper');
+  unhiddenFragmentNode(board, round);
+  const displayedRound = natural(round, 'boundary round', true);
+  if (
+    nodeText(rounds).trim().replace(/\s+/g, ' ') !==
+      capture.roundText.trim().replace(/\s+/g, ' ') ||
+    !new RegExp(`^経過日\\s*${displayedRound}\\s*/\\s*27$`).test(capture.roundText.trim())
+  )
+    fail('Boundary round text mismatch');
+  const terminal = capture.prompt.trim() === 'ゲーム終了';
+  // A split food/rotation log is admitted only across adjacent original entries.
+  // Rotation messages without actor gameplay cannot inherit a more distant food day.
+  const split =
+    !events.some((event) => event.kind === 'feeding') &&
+    events.every(
+      (event) =>
+        event.kind === 'gearAdvanced' ||
+        (event.kind === 'unparsed' &&
+          /^スタートプレイヤースペースに置かれているワーカーは.+の手元に戻った$/.test(
+            event.rawText,
+          )),
+    ) &&
+    !prior.some((event) => ['gearAdvanced', 'gameEnd'].includes(event.kind)) &&
+    prior.some((event) => event.kind === 'feeding');
+  const envelope = split ? [...prior, ...events] : events;
+  const rotationDays = envelope.some((event) => event.kind === 'doubleAdvance') ? 2 : 1;
+  const foodDay = terminal ? 27 : displayedRound - rotationDays;
+  if (
+    events.filter((event) => event.kind === 'gearAdvanced').length !== 1 ||
+    envelope.filter((event) => event.kind === 'doubleAdvance').length > 1 ||
+    !envelope.some((event) => event.kind === 'feeding') ||
+    envelope.some((event) =>
+      [
+        'place',
+        'gearAction',
+        'technology',
+        'trade',
+        'build',
+        'monument',
+        'beg',
+        'cancellation',
+      ].includes(event.kind),
+    ) ||
+    (terminal
+      ? displayedRound !== 28 ||
+        game.quality.status !== 'normalEnd' ||
+        !events.some((event) => event.kind === 'gameEnd')
+      : ![8, 14, 21].includes(foodDay) || events.some((event) => event.kind === 'gameEnd'))
+  )
+    fail('Capture has no matching settled food/terminal source boundary');
+  const ids = list(control.seatOrder, 4, 'boundary seat order');
+  const fragments = list(capture.playerBoards, 4, 'boundary player fragments');
+  if (
+    ![3, 4].includes(ids.length) ||
+    fragments.length !== ids.length ||
+    game.context.playerCount !== ids.length ||
+    new Set(ids).size !== ids.length ||
+    ids.some((id) => typeof id !== 'string' || !/^\d+$/.test(id)) ||
+    !ids.includes(url.searchParams.get('player'))
+  )
+    fail('Incomplete retained boundary roster/view');
+  const trees = [board],
+    identities = new Map(),
+    displayedPlayers = [];
+  const players = ids.map((id, index) => {
+    const item = one(fragments, (item) => item.playerId === id, 'boundary player identity');
+    closed(
+      item,
+      ['playerId', 'boardHtml', 'rowHtml', 'buildingsHtml', 'wealthTilesHtml'],
+      'boundary player',
+    );
+    const panel = htmlTree(item.boardHtml, 'boundary player board', true);
+    const owner = byId(panel, `player_board_${id}`);
+    const row = htmlTree(item.rowHtml, 'boundary player row', true),
+      rowRoot = row.nodes[0];
+    if (
+      owner.tag !== 'div' ||
+      outer(panel, owner) !== item.boardHtml ||
+      !rowRoot ||
+      rowRoot.tag !== 'div' ||
+      !token(rowRoot, 'whiteblock') ||
+      outer(row, rowRoot) !== item.rowHtml
+    )
+      fail('Detached retained boundary player fragment');
+    for (const tree of [panel, row])
+      for (const node of tree.nodes) {
+        const key = node.attrs.id ?? '';
+        const other =
+          /^(?:(?:worker|corn|wood|stone|gold|skull)_number_player_|player_(?:board|name|score|buildings|wealthtiles)_|firstplayer_|marker_)(\d+)(?:_|$)/.exec(
+            key,
+          )?.[1];
+        if (
+          (other !== undefined && other !== id) ||
+          (token(node, 'worker') && /^worker_\d+$/.test(key)) ||
+          (node !== owner && /^(?:overall_player_board_|player_board_)/.test(key))
+        )
+          fail('Boundary fragment crosses original owner/board scope');
+      }
+    unhiddenFragmentNode(panel, owner);
+    unhiddenFragmentNode(row, rowRoot);
+    const heading = one(
+      rowRoot.children.filter(object),
+      (node) => node.tag === 'h3',
+      'boundary player heading',
+    );
+    unhiddenFragmentNode(row, heading);
+    const label = nodeText(heading).trim(),
+      color = styles(heading).color;
+    if (
+      heading.children.some(object) ||
+      !label.endsWith(':') ||
+      !/^#[a-f0-9]{6}$/i.test(color ?? '')
+    )
+      fail('Malformed retained boundary player heading');
+    const name = text(label.slice(0, -1), 128, 'boundary player name');
+    identities.set(id, { name, color: color.slice(1).toLowerCase() });
+    for (const [key, html] of [
+      [`player_buildings_${id}`, item.buildingsHtml],
+      [`player_wealthtiles_${id}`, item.wealthTilesHtml],
+    ]) {
+      const node = byId(row, key);
+      if (node.tag !== 'div' || !rowRoot.children.includes(node) || outer(row, node) !== html)
+        fail('Detached retained boundary card fragment');
+    }
+    const counter = (key, signed = false) => {
+      const node = byId(panel, key);
+      unhiddenFragmentNode(panel, node);
+      if (node.tag !== 'span' || node.children.some(object)) fail('Malformed boundary counter');
+      const value = nodeText(node).trim();
+      if (!(signed ? /^-?\d+$/ : /^\d+$/).test(value)) fail('Nonnumeric boundary counter');
+      return integer(Number(value), signed ? -100000 : 0, 100000, 'boundary counter');
+    };
+    const resources = Object.fromEntries(
+      RESOURCES.map((resource) => [resource, counter(`${resource}_number_player_${id}`)]),
+    );
+    const availableWorkers = integer(
+      counter(`worker_number_player_${id}`),
+      0,
+      6,
+      'available workers',
+    );
+    displayedPlayers.push({
+      playerId: index,
+      sourcePlayerId: id,
+      name,
+      availableWorkers,
+      scoreDisplay: counter(`player_score_${id}`, true),
+    });
+    trees.push(panel, row);
+    return { id: index, resources };
+  });
+  const names = [...identities.values()].map((player) => player.name);
+  const colors = [...identities.values()].map((player) => player.color);
+  if (
+    new Set(names).size !== ids.length ||
+    new Set(colors).size !== ids.length ||
+    !same([...names].sort(), [...game.context.players].sort())
+  )
+    fail('Boundary roster differs from raw log');
+  const prompt = capture.prompt.trim(),
+    suffix = 'はワーカーを置くか取り除くかしてください';
+  if (!terminal && !names.some((name) => prompt === name + suffix) && prompt !== `あなた${suffix}`)
+    fail('Boundary prompt is not a settled Playing decision');
+  const nodeIds = new Set();
+  for (const tree of trees)
+    for (const id of tree.ids.keys()) {
+      if (nodeIds.has(id)) fail('Conflicting retained boundary sibling identities');
+      nodeIds.add(id);
+    }
+  const workerRoot = byId(board, 'workers');
+  if (workerRoot.tag !== 'div' || !root.children.includes(workerRoot))
+    fail('Detached boundary worker layer');
+  unhiddenFragmentNode(board, workerRoot);
+  const placed = board.nodes.filter((node) => token(node, 'worker'));
+  if (
+    placed.some(
+      (node) =>
+        node.tag !== 'div' ||
+        !/^worker_[1-9]\d*$/.test(node.attrs.id ?? '') ||
+        !workerRoot.children.includes(node) ||
+        node.children.some((child) => typeof child !== 'string' || child.trim()),
+    ) ||
+    workerRoot.children.some((child) => (object(child) ? !placed.includes(child) : child.trim()))
+  )
+    fail('Unknown retained boundary worker ownership');
+  const counts = Array(ids.length).fill(0);
+  for (const node of placed) {
+    unhiddenFragmentNode(board, node);
+    const classes = (node.attrs.class ?? '').split(/\s+/).filter(Boolean);
+    const owner = classes.find((value) => /^worker_[a-f0-9]{6}$/.test(value));
+    if (
+      classes.length !== 2 ||
+      (owner ? !colors.includes(owner.slice(7)) : !classes.includes('worker_dummy'))
+    )
+      fail('Unknown/ambiguous boundary worker color');
+    if (owner) counts[colors.indexOf(owner.slice(7))]++;
+  }
+  const geometry = new Map();
+  for (const item of list(capture.retainedDomGeometry, 20000, 'boundary geometry')) {
+    if (!object(item) || typeof item.id !== 'string')
+      fail('Invalid/duplicate boundary geometry identity');
+    // Anonymous panel icons are retained metadata, not an addressable worker.
+    if (item.id === '') {
+      if (item.parentId === 'workers') fail('Unidentified boundary worker geometry');
+      continue;
+    }
+    if (geometry.has(item.id)) fail('Invalid/duplicate boundary geometry identity');
+    geometry.set(item.id, item);
+  }
+  const visibleRect = (node) => {
+    const item = geometry.get(node.attrs.id);
+    if (!item) return null;
+    if (
+      (item.className ?? '') !== (node.attrs.class ?? '') ||
+      (item.inlineStyle ?? '') !== (node.attrs.style ?? '')
+    )
+      fail('Detached boundary geometry');
+    const rect = item.rect;
+    if (
+      item.computedDisplay !== 'block' ||
+      item.computedVisibility !== 'visible' ||
+      !object(rect) ||
+      !['x', 'y', 'width', 'height'].every((key) => Number.isFinite(rect[key])) ||
+      rect.width < 0 ||
+      rect.height < 0
+    )
+      return null;
+    return rect;
+  };
+  const boardRect = visibleRect(root),
+    layerRect = visibleRect(workerRoot);
+  const geometricWorkers = [...geometry.values()].filter((item) =>
+    /^worker_[1-9]\d*$/.test(item.id),
+  );
+  const completeWorkers =
+    boardRect?.width > 0 &&
+    boardRect.height > 0 &&
+    layerRect !== null &&
+    geometry.get('workers').parentId === 'board' &&
+    layerRect.x === boardRect.x &&
+    layerRect.width === boardRect.width &&
+    geometricWorkers.length === placed.length &&
+    geometricWorkers.every((item) => placed.some((node) => node.attrs.id === item.id)) &&
+    placed.every((node) => {
+      const rect = visibleRect(node);
+      return (
+        rect !== null &&
+        rect.width > 0 &&
+        rect.height > 0 &&
+        geometry.get(node.attrs.id).parentId === 'workers' &&
+        rect.x >= boardRect.x &&
+        rect.y >= boardRect.y &&
+        rect.x + rect.width <= boardRect.x + boardRect.width &&
+        rect.y + rect.height <= boardRect.y + boardRect.height
+      );
+    });
+  if (completeWorkers)
+    players.forEach((player, index) => {
+      player.workers = integer(
+        displayedPlayers[index].availableWorkers + counts[index],
+        3,
+        6,
+        'total workers',
+      );
+    });
+  const skull = byId(board, 'skull_left');
+  unhiddenFragmentNode(board, skull);
+  if (skull.tag !== 'span') fail('Malformed boundary skull counter');
+  const expected = {
+    players,
+    skullSupply: natural(skull, 'boundary skull supply', true),
+    phase: terminal ? 'finished' : 'playing',
+  };
+  // The source displays day 28 and integral scores after finalization. Neither
+  // is an exact native round/score assertion; preserve those display facts apart.
+  if (!terminal) expected.round = displayedRound;
+  return {
+    witness: { actionId, expected },
+    provenance: {
+      schema: 'tzolkin-bga-retained-boundary-projection-v1',
+      sourceSchema: capture.schema,
+      captureSha256: sha(captureBytes),
+      rawLogSha256: sha(rawLogBytes),
+      tableEvidenceSha256: tableBytes === null ? null : sha(tableBytes),
+      archiveRelease: release,
+      mechanicalProfile,
+      sourceActionIds: split ? [priorId, actionId] : [actionId],
+      foodDay,
+      kind: terminal ? 'terminal' : 'post-food',
+      displayedRound,
+      displayedPlayers,
+      totalWorkersObserved: Boolean(completeWorkers),
+      completeSourceBoard: false,
+      omitted: [
+        'foodDays',
+        'turnOrder',
+        'turnIndex',
+        'markers',
+        'card identities',
+        'gear positions',
+        'covered corn',
+        'exact scores',
+        ...(completeWorkers ? [] : ['total workers']),
+      ],
+      visibilityVerified: false,
+      geometryVerified: false,
+      sourceAuthenticated: false,
+      completeNativeReplayQualified: false,
+      humanBcQualified: false,
+      policyTrainingReady: false,
+      valueTrainingReady: false,
+    },
   };
 }
 
