@@ -14,7 +14,7 @@ pub mod tribes;
 pub mod types;
 pub mod validation;
 pub use engine::{
-    apply_move, available_workers, create_game, create_game_with_options, get_available_moves,
-    get_choices, get_placement_cost, score_monument,
+    FeedingEvent, apply_move, apply_move_with_feeding_events, available_workers, create_game,
+    create_game_with_options, get_available_moves, get_choices, get_placement_cost, score_monument,
 };
 pub use types::*;

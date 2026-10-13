@@ -535,7 +535,11 @@ fn place_worker(s: &mut GameState, gear: GearId, discount: bool) -> Result<(), S
     );
     Ok(())
 }
-fn finish_turn(s: &mut GameState, double_advance: Option<bool>) -> Result<(), String> {
+fn finish_turn(
+    s: &mut GameState,
+    double_advance: Option<bool>,
+    feeding_events: &mut Option<Vec<FeedingEvent>>,
+) -> Result<(), String> {
     let pid = s.current_player;
     if s.turn.count == 0 && !tribes::has(current(s), TribeId::Ahmakiq) {
         return Err("ワーカーを 1 人以上配置するか回収してください。".into());
@@ -566,12 +570,13 @@ fn finish_turn(s: &mut GameState, double_advance: Option<bool>) -> Result<(), St
                 Task::QuickAction { tile },
                 Task::FinishTurn { double_advance },
             ],
+            feeding_events,
         );
         return Ok(());
     }
     refill_buildings(s);
     if s.turn_index == s.turn_order.len() - 1 {
-        finish_round(s)?;
+        finish_round(s, feeding_events)?;
     } else {
         s.turn_index += 1;
         s.current_player = s.turn_order[s.turn_index];
@@ -876,7 +881,11 @@ fn effect_tasks(s: &mut GameState, e: Effect) -> Vec<Task> {
         }],
     }
 }
-fn next_tasks(s: &mut GameState, mut tasks: Vec<Task>) {
+fn next_tasks(
+    s: &mut GameState,
+    mut tasks: Vec<Task>,
+    feeding_events: &mut Option<Vec<FeedingEvent>>,
+) {
     s.pending = None;
     while !tasks.is_empty() {
         let task = tasks.remove(0);
@@ -886,7 +895,7 @@ fn next_tasks(s: &mut GameState, mut tasks: Vec<Task>) {
             fed_workers,
         } = task
         {
-            let mut front = food_day_tasks(s, day, stage, fed_workers);
+            let mut front = food_day_tasks(s, day, stage, fed_workers, feeding_events);
             front.extend(tasks);
             tasks = front;
             continue;
@@ -903,7 +912,7 @@ fn next_tasks(s: &mut GameState, mut tasks: Vec<Task>) {
         }
         if let Task::FinishTurn { double_advance } = task {
             // This task only follows a mandatory quick action. All its choices finish first.
-            if let Err(error) = finish_turn(s, double_advance) {
+            if let Err(error) = finish_turn(s, double_advance, feeding_events) {
                 log(s, error);
             }
             return;
@@ -2167,13 +2176,21 @@ fn parse_part<T: std::str::FromStr>(parts: &[&str], i: usize) -> Result<T, Strin
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| "この選択は現在利用できません。".into())
 }
+// Legality projection has no event sink; simulated feeding never escapes.
 fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
+    choose_pending_with_feeding_events(s, id, &mut None)
+}
+fn choose_pending_with_feeding_events(
+    s: &mut GameState,
+    id: &str,
+    feeding_events: &mut Option<Vec<FeedingEvent>>,
+) -> Result<(), String> {
     let pending = s.pending.clone().ok_or("選択待ちではありません。")?;
     let task = pending.task;
     let after = pending.after;
     let parts: Vec<&str> = id.split(':').collect();
     if id == "skip" {
-        next_tasks(s, after);
+        next_tasks(s, after, feeding_events);
         return Ok(());
     }
     match task {
@@ -2181,19 +2198,19 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
             s.turn.skipped_gear = Some(parse_part(&parts, 1)?);
             s.turn.skipped_position = Some(parse_part(&parts, 2)?);
             s.turn.tribe_ability_used = true;
-            next_tasks(s, after);
+            next_tasks(s, after, feeding_events);
         }
         Task::TechnologyBonus => {
             let technology: TechnologyId = parse_part(&parts, 1)?;
             let tasks = technology_bonus(s, technology);
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::ProphecyGain {
             player_id,
             resources,
         } => {
             prophecies::apply_gain_plan(s, player_id, &resources, parse_part(&parts, 1)?)?;
-            next_tasks(s, after);
+            next_tasks(s, after, feeding_events);
         }
         Task::ProphecyTemple { temple } => {
             let costs = prophecies::temple_costs(s, temple);
@@ -2204,7 +2221,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                 false,
             )?;
             raise_unpaid(s, temple);
-            next_tasks(s, after);
+            next_tasks(s, after, feeding_events);
         }
         Task::ChooseTribe
         | Task::QuickAction { .. }
@@ -2248,7 +2265,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
             } else {
                 execute_action(s, target_gear, pos)?
             };
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::Technology {
             remaining,
@@ -2278,7 +2295,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                 }
             };
             tasks.push(following);
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::PayTechnology {
             technology, amount, ..
@@ -2288,7 +2305,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
             let cost = payments.get(i).ok_or("この選択は現在利用できません。")?;
             pay(s, cost, false)?;
             let tasks = advance_technology_unpaid(s, technology, 1);
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::PayResource { amount } => {
             let i: usize = parse_part(&parts, 1)?;
@@ -2298,7 +2315,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                 payments.get(i).ok_or("この選択は現在利用できません。")?,
                 false,
             )?;
-            next_tasks(s, after);
+            next_tasks(s, after, feeding_events);
         }
         Task::Temple {
             remaining,
@@ -2336,7 +2353,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                 direction,
                 reason,
             });
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::Resource { remaining } => {
             let r: Resource = parse_part(&parts, 1)?;
@@ -2344,7 +2361,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
             tasks.push(Task::Resource {
                 remaining: remaining - 1,
             });
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::Build {
             remaining,
@@ -2371,7 +2388,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                         monument(&o.monument_id).ok_or("記念碑が不正です。")?.name
                     ),
                 );
-                next_tasks(s, after);
+                next_tasks(s, after, feeding_events);
                 return Ok(());
             }
             let o = build_options(s, remaining, corn_payment, architecture_available)
@@ -2430,6 +2447,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                     ],
                     after,
                 ),
+                feeding_events,
             );
         }
         Task::BuildMonument => {
@@ -2449,7 +2467,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                     monument(&o.monument_id).ok_or("記念碑が不正です。")?.name
                 ),
             );
-            next_tasks(s, after);
+            next_tasks(s, after, feeding_events);
         }
         Task::TechnologyExchange => {
             let lowered: TechnologyId = parse_part(&parts, 1)?;
@@ -2460,7 +2478,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                     tasks.extend(advance_technology(s, t, 1));
                 }
             }
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::Trade => {
             let r: Resource = parse_part(&parts, 1)?;
@@ -2472,14 +2490,14 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                 pay(s, &resources(&[(r, 1)]), false)?;
                 gain(s, &resources(&[(Resource::Corn, rate(r))]));
             }
-            next_tasks(s, prepend(vec![Task::Trade], after));
+            next_tasks(s, prepend(vec![Task::Trade], after), feeding_events);
         }
         Task::AnyAction { cost, .. } => {
             pay(s, &resources(&[(Resource::Corn, cost.unwrap_or(0))]), false)?;
             let gear: GearId = parse_part(&parts, 1)?;
             let pos: i64 = parse_part(&parts, 2)?;
             let tasks = execute_action(s, gear, pos)?;
-            next_tasks(s, prepend(tasks, after));
+            next_tasks(s, prepend(tasks, after), feeding_events);
         }
         Task::Palenque { position } => {
             if id == "wood" {
@@ -2543,12 +2561,13 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
                     },
                     after,
                 ),
+                feeding_events,
             );
         }
         Task::Theology { .. } => {
             let r: Resource = parse_part(&parts, 1)?;
             pay(s, &resources(&[(r, 1)]), false)?;
-            next_tasks(s, prepend(vec![temple_task(1)], after));
+            next_tasks(s, prepend(vec![temple_task(1)], after), feeding_events);
         }
         Task::Rotation => rotate(s, parse_part(&parts, 1)?)?,
         Task::Effects { .. } => return Err("この選択は現在利用できません。".into()),
@@ -2561,6 +2580,7 @@ fn food_day_tasks(
     day: i64,
     stage: FoodDayStage,
     fed_workers: Vec<i64>,
+    feeding_events: &mut Option<Vec<FeedingEvent>>,
 ) -> Vec<Task> {
     match stage {
         FoodDayStage::Buildings => {
@@ -2606,9 +2626,40 @@ fn food_day_tasks(
                 let p = &mut s.players[pid];
                 let extra = i64::from(tribes::has(p, TribeId::Yaluk));
                 let result = prophecies::feeding(p, hunger, extra);
+                // Only the opt-in collector reads these before-payment inputs.
+                // None allocates no event storage and legality previews use None.
+                let inputs = feeding_events.as_ref().map(|_| {
+                    (
+                        p.workers,
+                        p.resources[&Resource::Corn],
+                        p.feed_workers,
+                        p.feed_all,
+                        p.feed_discount,
+                    )
+                });
                 *p.resources.get_mut(&Resource::Corn).unwrap() -= result.corn_cost;
                 let penalty = result.unfed_workers * if extra > 0 { 5 } else { 3 };
                 p.score -= penalty as f64;
+                if let (
+                    Some(events),
+                    Some((workers, corn_before, feed_workers, feed_all, feed_discount)),
+                ) = (feeding_events.as_mut(), inputs)
+                {
+                    events.push(FeedingEvent {
+                        scheduled_day: day,
+                        actual_round: s.round,
+                        player_id: pid,
+                        workers,
+                        corn_before,
+                        feed_workers,
+                        feed_all,
+                        feed_discount,
+                        hunger,
+                        tribe_extra_corn: extra,
+                        result,
+                        penalty,
+                    });
+                }
                 fed_workers.push(result.fed_workers);
                 let text = format!(
                     "食糧の日：{} はコーン {} を支払い{}",
@@ -2781,7 +2832,10 @@ fn rotate(s: &mut GameState, days: i64) -> Result<(), String> {
     );
     Ok(())
 }
-fn finish_round(s: &mut GameState) -> Result<(), String> {
+fn finish_round(
+    s: &mut GameState,
+    feeding_events: &mut Option<Vec<FeedingEvent>>,
+) -> Result<(), String> {
     if let Some(day) = [8, 14, 21, 27]
         .into_iter()
         .find(|d| s.round >= *d && !s.food_days.contains(d))
@@ -2793,12 +2847,13 @@ fn finish_round(s: &mut GameState) -> Result<(), String> {
                 stage: FoodDayStage::Buildings,
                 fed_workers: vec![],
             }],
+            feeding_events,
         );
         return Ok(());
     }
     if let Some(claimed) = s.first_player_claimed {
         s.current_player = claimed;
-        next_tasks(s, vec![Task::Rotation]);
+        next_tasks(s, vec![Task::Rotation], feeding_events);
         Ok(())
     } else {
         rotate(s, 1)
@@ -2833,7 +2888,46 @@ pub(crate) fn pity_placement(s: &GameState, gear: Option<GearId>) -> bool {
     p.resources[&Resource::Corn] < lowest
         && gear.is_none_or(|g| get_placement_cost(s, &g.to_string()) == Some(lowest))
 }
+/// A feeding result applied in this move, before later temple rewards or rotation.
+/// Player IDs are absolute. This Rust-only event is not part of saved-game JSON.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeedingEvent {
+    pub scheduled_day: i64,
+    pub actual_round: i64,
+    pub player_id: usize,
+    pub workers: i64,
+    pub corn_before: i64,
+    pub feed_workers: i64,
+    pub feed_all: bool,
+    pub feed_discount: i64,
+    pub hunger: bool,
+    pub tribe_extra_corn: i64,
+    pub result: prophecies::FeedingResult,
+    /// Positive points actually deducted for unfed workers, before other scoring.
+    pub penalty: i64,
+}
+
 pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> {
+    apply_move_internal(input, mv, &mut None)
+}
+
+/// Apply the same rules, returning only feeding stages executed by this move.
+/// Deferred rewards emit no event until feeding runs. Failed moves discard all
+/// local events and retain the unchanged input, just like ordinary apply_move.
+pub fn apply_move_with_feeding_events(
+    input: &GameState,
+    mv: GameMove,
+) -> Result<(GameState, Vec<FeedingEvent>), String> {
+    let mut events = Some(Vec::new());
+    let state = apply_move_internal(input, mv, &mut events)?;
+    Ok((state, events.unwrap()))
+}
+
+fn apply_move_internal(
+    input: &GameState,
+    mv: GameMove,
+    feeding_events: &mut Option<Vec<FeedingEvent>>,
+) -> Result<GameState, String> {
     let mut s = input.clone();
     if s.phase == Phase::Finished {
         return Err("ゲームは終了しています。".into());
@@ -2884,9 +2978,9 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
                     reason: None,
                 });
             }
-            next_tasks(&mut s, tasks);
+            next_tasks(&mut s, tasks, feeding_events);
         } else if s.pending.is_some() {
-            choose_pending(&mut s, &choice_id)?;
+            choose_pending_with_feeding_events(&mut s, &choice_id, feeding_events)?;
         } else {
             return Err("選択待ちではありません。".into());
         }
@@ -2952,7 +3046,7 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
             let parts: Vec<&str> = ability.split(':').collect();
             match parts[0] {
                 "discount" => place_worker(&mut s, parse_part(&parts, 1)?, true)?,
-                "skipSpace" => next_tasks(&mut s, vec![Task::TribeSkipSpace]),
+                "skipSpace" => next_tasks(&mut s, vec![Task::TribeSkipSpace], feeding_events),
                 "sell" => {
                     let resource: Resource = parse_part(&parts, 1)?;
                     pay(&mut s, &resources(&[(resource, 1)]), false)?;
@@ -3018,6 +3112,7 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
                     position,
                     free: None,
                 }],
+                feeding_events,
             );
         }
         GameMove::Beg => {
@@ -3043,9 +3138,12 @@ pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> 
                     direction: Some(-1),
                     reason: Some(TempleReason::Beg),
                 }],
+                feeding_events,
             );
         }
-        GameMove::EndTurn { double_advance } => finish_turn(&mut s, double_advance)?,
+        GameMove::EndTurn { double_advance } => {
+            finish_turn(&mut s, double_advance, feeding_events)?
+        }
         GameMove::Choose { .. } => return Err("操作が不正です。".into()),
     }
     if !preserves_quick_action(&s) {
@@ -3554,6 +3652,195 @@ mod tests {
             .is_err()
         );
         assert_eq!(state, original);
+        assert!(
+            apply_move_with_feeding_events(
+                &state,
+                GameMove::Place {
+                    gear: GearId::Tikal
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(state, original);
+
+        // Independent literal feeding results; these are individual moves,
+        // not a played game or an after-state estimate of a feeding event.
+        for count in [3, 4] {
+            for (day, actual_round, hunger) in [
+                (8, 9, false),
+                (14, 14, true),
+                (21, 21, false),
+                (27, 27, true),
+            ] {
+                let mut state = create_game_with_options(
+                    (0..count).map(|pid| format!("P{pid}")).collect(),
+                    17,
+                    GameOptions {
+                        prophecies: true,
+                        ..GameOptions::default()
+                    },
+                )
+                .unwrap();
+                state.phase = Phase::Playing;
+                state.round = actual_round;
+                state.age = if day > 14 { 2 } else { 1 };
+                state.food_days = [8, 14, 21, 27]
+                    .into_iter()
+                    .filter(|old| *old < day)
+                    .collect();
+                state.turn_order = (0..count).collect();
+                state.turn_index = count - 1;
+                state.current_player = count - 1;
+                state.turn.count = 1;
+                let expansion = state.expansion.as_mut().unwrap();
+                expansion.prophecies = vec![ProphecyId::Hunger];
+                expansion.active_prophecy = hunger.then_some(0);
+                let settings = [
+                    (3, 3, 0, false, 0, false),
+                    (5, 4, 2, false, 1, false),
+                    (6, 0, 0, true, 0, false),
+                    (4, 2, 1, false, 1, true),
+                ];
+                for (player, &(workers, corn, farms, all, discount, yaluk)) in
+                    state.players.iter_mut().zip(&settings)
+                {
+                    player.workers = workers;
+                    player.resources.insert(Resource::Corn, corn);
+                    player.feed_workers = farms;
+                    player.feed_all = all;
+                    player.feed_discount = discount;
+                    player.tribe = yaluk.then_some(TribeId::Yaluk);
+                    player.buildings.clear();
+                }
+                let original = state.clone();
+                let mv = GameMove::EndTurn {
+                    double_advance: None,
+                };
+                let ordinary = apply_move(&state, mv.clone()).unwrap();
+                let (observed, events) = apply_move_with_feeding_events(&state, mv).unwrap();
+                assert_eq!(observed, ordinary);
+                assert_eq!(
+                    serde_json::to_vec(&observed).unwrap(),
+                    serde_json::to_vec(&ordinary).unwrap()
+                );
+                assert_eq!(state, original);
+                assert_eq!(events.len(), count);
+                let expected = if hunger {
+                    [(1, 3, 2, 6), (4, 4, 1, 3), (0, 0, 6, 18), (1, 1, 3, 15)]
+                } else {
+                    [(1, 2, 2, 6), (5, 3, 0, 0), (6, 0, 0, 0), (2, 2, 2, 10)]
+                };
+                for (pid, event) in events.iter().enumerate() {
+                    let (fed, cost, unfed, penalty) = expected[pid];
+                    let (workers, corn, farms, all, discount, yaluk) = settings[pid];
+                    assert_eq!(
+                        *event,
+                        FeedingEvent {
+                            scheduled_day: day,
+                            actual_round,
+                            player_id: pid,
+                            workers,
+                            corn_before: corn,
+                            feed_workers: farms,
+                            feed_all: all,
+                            feed_discount: discount,
+                            hunger,
+                            tribe_extra_corn: i64::from(yaluk),
+                            result: prophecies::FeedingResult {
+                                fed_workers: fed,
+                                corn_cost: cost,
+                                unfed_workers: unfed
+                            },
+                            penalty,
+                        }
+                    );
+                    assert_eq!(
+                        observed.players[pid].resources[&Resource::Corn],
+                        corn - cost
+                    );
+                }
+                // The collector remains local even if feeding ran before a later
+                // move-level rejection. No state or partial events are returned.
+                let mut rejected = state.clone();
+                rejected.first_player_claimed = Some(0);
+                let before = rejected.clone();
+                let mv = GameMove::EndTurn {
+                    double_advance: Some(false),
+                };
+                assert_eq!(
+                    apply_move_with_feeding_events(&rejected, mv.clone()).unwrap_err(),
+                    apply_move(&rejected, mv).unwrap_err()
+                );
+                assert_eq!(rejected, before);
+            }
+
+            // Taxed recurring rewards defer the feeding stage. Choice legality
+            // previews can finish it, but must not enter the actual event sink.
+            let mut state = create_game_with_options(
+                (0..count).map(|pid| format!("P{pid}")).collect(),
+                17,
+                GameOptions {
+                    prophecies: true,
+                    additional_buildings: true,
+                    ..GameOptions::default()
+                },
+            )
+            .unwrap();
+            state.phase = Phase::Playing;
+            state.round = 14;
+            state.food_days = vec![8];
+            state.turn_order = (0..count).collect();
+            state.turn_index = count - 1;
+            state.current_player = count - 1;
+            state.turn.count = 1;
+            let expansion = state.expansion.as_mut().unwrap();
+            expansion.prophecies = vec![ProphecyId::GoldShortage];
+            expansion.active_prophecy = Some(0);
+            state.players[0].buildings = vec!["b35".into()];
+            for player in &mut state.players {
+                player.resources.insert(Resource::Corn, 7);
+            }
+            let mv = GameMove::EndTurn {
+                double_advance: None,
+            };
+            let ordinary = apply_move(&state, mv.clone()).unwrap();
+            let (pending, events) = apply_move_with_feeding_events(&state, mv).unwrap();
+            assert_eq!(pending, ordinary);
+            assert!(events.is_empty());
+            assert_eq!(pending.current_player, 0);
+            assert!(matches!(
+                pending.pending.as_ref().unwrap().task,
+                Task::ProphecyGain { .. }
+            ));
+            let original = pending.clone();
+            assert!(!get_choices(&pending).is_empty());
+            assert_eq!(pending, original);
+            let mv = GameMove::Choose {
+                choice_id: "prophecyGain:1".into(),
+            };
+            let ordinary = apply_move(&pending, mv.clone()).unwrap();
+            let (fed, events) = apply_move_with_feeding_events(&pending, mv).unwrap();
+            assert_eq!(fed, ordinary);
+            assert_eq!(pending, original);
+            assert_eq!(events.len(), count);
+            for (pid, event) in events.iter().enumerate() {
+                assert_eq!(
+                    (event.scheduled_day, event.actual_round, event.player_id),
+                    (14, 14, pid)
+                );
+                assert_eq!(event.corn_before, if pid == 0 { 6 } else { 7 });
+                assert_eq!(
+                    event.result,
+                    prophecies::FeedingResult {
+                        fed_workers: 3,
+                        corn_cost: 6,
+                        unfed_workers: 0
+                    }
+                );
+                assert_eq!(event.penalty, 0);
+            }
+            assert_eq!(fed.players[0].resources[&Resource::Gold], 1);
+        }
     }
 
     #[test]
