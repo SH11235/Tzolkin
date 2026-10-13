@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tzolkin_core::catalog::{CATALOG, building, monument, wealth};
+use tzolkin_core::engine::{MonumentMetrics, score_monument_metrics};
 use tzolkin_core::observation::{HarvestKind, Observation, PublicPlayer, TypedAction};
 use tzolkin_core::prophecies::ProphecyId;
 use tzolkin_core::tribes::TribeId;
@@ -26,6 +27,7 @@ enum ScoringProfile {
     Historical(HeuristicRevision),
     FoodAligned,
     FoodAlignedV2,
+    MonumentAligned,
 }
 impl From<HeuristicRevision> for ScoringProfile {
     fn from(revision: HeuristicRevision) -> Self {
@@ -92,7 +94,9 @@ fn active(o: &Observation) -> Option<ProphecyId> {
 fn food_requirement(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f64 {
     if matches!(
         revision,
-        ScoringProfile::FoodAligned | ScoringProfile::FoodAlignedV2
+        ScoringProfile::FoodAligned
+            | ScoringProfile::FoodAlignedV2
+            | ScoringProfile::MonumentAligned
     ) {
         let requirement = 2.0
             + f64::from(u8::from(active(o) == Some(ProphecyId::Hunger)))
@@ -128,7 +132,8 @@ fn corn_target(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f
         }
         ScoringProfile::Historical(HeuristicRevision::V2)
         | ScoringProfile::FoodAligned
-        | ScoringProfile::FoodAlignedV2 => !o.food_days.contains(day),
+        | ScoringProfile::FoodAlignedV2
+        | ScoringProfile::MonumentAligned => !o.food_days.contains(day),
     });
     let reserve = match revision {
         ScoringProfile::Historical(HeuristicRevision::V1) => match food.map(|day| day - o.round) {
@@ -138,7 +143,8 @@ fn corn_target(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f
         },
         ScoringProfile::Historical(HeuristicRevision::V2)
         | ScoringProfile::FoodAligned
-        | ScoringProfile::FoodAlignedV2 => match food.map(|day| day - o.round) {
+        | ScoringProfile::FoodAlignedV2
+        | ScoringProfile::MonumentAligned => match food.map(|day| day - o.round) {
             Some(..=2) => food_requirement(o, p, revision),
             Some(3..=5) => food_requirement(o, p, revision) * 0.6,
             _ => 2.0,
@@ -191,7 +197,11 @@ fn effects_value(
         .into_iter()
         .filter(|d| !o.food_days.contains(d))
         .count() as f64;
-    let mut food_player = matches!(revision, ScoringProfile::FoodAlignedV2).then(|| p.clone());
+    let mut food_player = matches!(
+        revision,
+        ScoringProfile::FoodAlignedV2 | ScoringProfile::MonumentAligned
+    )
+    .then(|| p.clone());
     effects
         .iter()
         .map(|effect| match effect {
@@ -355,6 +365,156 @@ fn selected_action_resources(
         Some(amounts)
     }
 }
+fn monument_metrics(o: &Observation, p: &PublicPlayer) -> Option<MonumentMetrics> {
+    if o.phase != Phase::Playing
+        || p.technologies.iter().any(|level| !(0..=3).contains(level))
+        || TEMPLE_IDS
+            .iter()
+            .zip(p.temples)
+            .any(|(temple, level)| !(-1..=CATALOG.temple_tracks[temple].max).contains(&level))
+        || !(3..=6).contains(&p.workers)
+        || p.corn_tiles < 0
+        || p.wood_tiles < 0
+        || p.buildings.iter().any(|id| building(id).is_none())
+        || o.players.iter().any(|player| {
+            player.building_skulls < 0 || player.monuments.iter().any(|id| monument(id).is_none())
+        })
+        || o.skull_spaces
+            .iter()
+            .flatten()
+            .any(|owner| *owner >= o.players.len())
+    {
+        return None;
+    }
+    let owned: std::collections::BTreeSet<_> = o
+        .players
+        .iter()
+        .flat_map(|player| &player.monuments)
+        .collect();
+    let all_monuments = o
+        .players
+        .iter()
+        .map(|player| player.monuments.len())
+        .sum::<usize>();
+    if owned.len() != all_monuments {
+        return None;
+    }
+    Some(MonumentMetrics {
+        categories: MonumentMetrics::count_categories(&p.buildings, &p.monuments),
+        constructions: p.buildings.len() + p.monuments.len(),
+        corn_tiles: p.corn_tiles,
+        wood_tiles: p.wood_tiles,
+        technologies: p.technologies,
+        workers: p.workers,
+        temples: p.temples,
+        player_count: o.players.len(),
+        all_monuments,
+        all_skulls: o.skull_spaces.iter().flatten().count() as i64
+            + o.players
+                .iter()
+                .map(|player| player.building_skulls)
+                .sum::<i64>(),
+    })
+}
+
+struct MonumentEstimate {
+    current_points: f64,
+    renovation_loss: f64,
+}
+
+fn category_index(category: BuildingCategory) -> Option<usize> {
+    match category {
+        BuildingCategory::Graveyard => Some(0),
+        BuildingCategory::Municipal => Some(1),
+        BuildingCategory::Shrine => Some(2),
+        BuildingCategory::Farm => None,
+    }
+}
+
+fn current_monument_estimate(
+    o: &Observation,
+    p: &PublicPlayer,
+    id: &str,
+    renovation: Option<&str>,
+    w: &HeuristicWeights,
+) -> Option<MonumentEstimate> {
+    let candidate = monument(id)?;
+    if !o.monuments.iter().any(|offered| offered == id)
+        || o.players
+            .iter()
+            .any(|player| player.monuments.iter().any(|owned| owned == id))
+    {
+        return None;
+    }
+    let before = monument_metrics(o, p)?;
+    let mut after = before;
+    after.constructions += 1;
+    after.all_monuments += 1;
+    if let Some(index) = category_index(candidate.category) {
+        after.categories[index] += 1;
+    }
+    let mut renovation_loss = 0.0;
+    if let Some(id) = renovation {
+        let removed = building(id)?;
+        if !p.buildings.iter().any(|owned| owned == id)
+            || !removed
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Renovation))
+        {
+            return None;
+        }
+        after.constructions = after.constructions.checked_sub(1)?;
+        if let Some(index) = category_index(removed.category) {
+            after.categories[index] = after.categories[index].checked_sub(1)?;
+        }
+        let mut without = p.clone();
+        for effect in &removed.effects {
+            match effect {
+                Effect::Feed {
+                    workers: FeedWorkers::Count(n),
+                } => without.feed_workers -= n,
+                Effect::FeedDiscount { amount } => without.feed_discount -= amount,
+                Effect::FoodReward { .. } | Effect::FoodRewardSwitch => {
+                    renovation_loss += effects_value(
+                        o,
+                        p,
+                        std::slice::from_ref(effect),
+                        w,
+                        ScoringProfile::MonumentAligned,
+                    );
+                }
+                // Past resources, VP and technology are retained by the core.
+                _ => {}
+            }
+        }
+        if without.feed_workers < 0 || without.feed_discount < 0 {
+            return None;
+        }
+        let remaining_food = [8, 14, 21, 27]
+            .into_iter()
+            .filter(|day| !o.food_days.contains(day))
+            .count() as f64;
+        renovation_loss += (food_requirement(o, &without, ScoringProfile::MonumentAligned)
+            - food_requirement(o, p, ScoringProfile::MonumentAligned))
+            * remaining_food
+            * 0.9;
+    }
+    // Exact current-state terminal-equivalent points, not immediate VP or a
+    // forecast. Existing monuments can also change when this one is built.
+    let current_points = score_monument_metrics(&after, id)
+        + p.monuments
+            .iter()
+            .map(|owned| {
+                score_monument_metrics(&after, owned) - score_monument_metrics(&before, owned)
+            })
+            .sum::<f64>();
+    Some(MonumentEstimate {
+        current_points,
+        renovation_loss,
+    })
+}
+
 fn action_value(
     o: &Observation,
     p: &PublicPlayer,
@@ -438,6 +598,14 @@ pub fn score_action_food_aligned(o: &Observation, a: &TypedAction, w: &Heuristic
 
 pub fn score_action_food_aligned_v2(o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f64 {
     score_action_for_profile(o, a, w, ScoringProfile::FoodAlignedV2)
+}
+
+pub fn score_action_monument_aligned(
+    o: &Observation,
+    a: &TypedAction,
+    w: &HeuristicWeights,
+) -> f64 {
+    score_action_for_profile(o, a, w, ScoringProfile::MonumentAligned)
 }
 
 fn score_action_for_profile(
@@ -595,7 +763,10 @@ fn score_action_for_profile(
             corn_cost,
             ..
         } => {
-            let gain = if matches!(revision, ScoringProfile::FoodAlignedV2) {
+            let gain = if matches!(
+                revision,
+                ScoringProfile::FoodAlignedV2 | ScoringProfile::MonumentAligned
+            ) {
                 selected_action_resources(o, p, *gear, *position)
                     .map(|amounts| amount_value(o, p, &amounts, w, revision))
             } else {
@@ -663,6 +834,19 @@ fn score_action_for_profile(
                         .unwrap_or(0.0)
             })
             .unwrap_or(-100.0),
+        TypedAction::Monument {
+            id,
+            cost,
+            renovation,
+        } if matches!(revision, ScoringProfile::MonumentAligned) => {
+            current_monument_estimate(o, p, id, renovation.as_deref(), w)
+                .map(|estimate| {
+                    estimate.current_points
+                        - amount_value(o, p, cost, w, revision)
+                        - estimate.renovation_loss
+                })
+                .unwrap_or(-100.0)
+        }
         TypedAction::Monument { id, cost, .. } => monument(id)
             .map(|_| 12.0 + p.buildings.len() as f64 * 0.5 - amount_value(o, p, cost, w, revision))
             .unwrap_or(-100.0),
@@ -687,7 +871,10 @@ fn score_action_for_profile(
             }
         }
         TypedAction::Harvest { kind, position }
-            if matches!(revision, ScoringProfile::FoodAlignedV2) =>
+            if matches!(
+                revision,
+                ScoringProfile::FoodAlignedV2 | ScoringProfile::MonumentAligned
+            ) =>
         {
             amount_value(
                 o,
@@ -1348,6 +1535,192 @@ mod tests {
                 ) - saved as f64 * 4.0 * 0.9)
                     .abs()
                     < 1e-12
+            );
+        }
+
+        // Literal pre-existing rule results guard the shared 13-key kernel;
+        // score_monument delegating to it alone would not be an independent oracle.
+        for count in [3, 4] {
+            let mut state =
+                create_game((0..count).map(|i| format!("P{i}")).collect(), 17, false).unwrap();
+            state.phase = Phase::Playing;
+            state.round = 6;
+            let actor = state.current_player;
+            let opponent = (actor + 1) % count;
+            state.players[opponent].monuments = vec!["m10".into()];
+            state.players[opponent].building_skulls = 2;
+            state.skull_spaces[1] = Some(actor);
+            state.skull_spaces[2] = Some(opponent);
+            let p = &mut state.players[actor];
+            p.resources = RESOURCE_IDS
+                .map(|resource| (resource, 100))
+                .into_iter()
+                .collect();
+            p.buildings = ["b06", "b09", "b13"].map(str::to_string).into();
+            p.monuments = ["m01", "m02", "m05"].map(str::to_string).into();
+            p.workers = 5;
+            p.corn_tiles = 2;
+            p.wood_tiles = 3;
+            p.building_skulls = 1;
+            p.technologies = TECHNOLOGY_IDS.into_iter().zip([3, 3, 2, 1]).collect();
+            p.temples = TEMPLE_IDS.into_iter().zip([2, 3, -1]).collect();
+            state.monuments = vec!["m06".into()];
+            state.pending = Some(Pending {
+                title: "Monument".into(),
+                task: Task::BuildMonument,
+                after: vec![],
+            });
+            let observation = observe(&state, actor).unwrap();
+            let metrics = monument_metrics(&observation, &observation.players[actor]).unwrap();
+            let expected = [
+                16,
+                12,
+                8,
+                12,
+                4 * (8 - count) as i64,
+                4,
+                20,
+                27,
+                12,
+                4,
+                5,
+                9,
+                15,
+            ];
+            for (m, expected) in CATALOG.monuments.iter().zip(expected) {
+                assert_eq!(score_monument_metrics(&metrics, &m.id), expected as f64);
+                assert_eq!(
+                    score_monument(&state, &state.players[actor], &m.id),
+                    expected as f64
+                );
+            }
+            assert_eq!(
+                score_monument(&state, &state.players[actor], "unknown"),
+                0.0
+            );
+            assert_eq!(
+                crate::choose_move_monument_aligned(&observation)
+                    .unwrap()
+                    .policy_version,
+                crate::MONUMENT_ALIGNED_POLICY_VERSION
+            );
+            // Purchase tests include existing category/constructions/allMonuments
+            // changes and both kinds of recurring renovation reward.
+            for (renovation, extra_points, lost) in [
+                (None, 10.0, 0.0),
+                (Some("b34"), 4.0, 14.0),
+                (Some("b33"), 8.0, 8.4),
+            ] {
+                let mut state = state.clone();
+                if let Some(id) = renovation {
+                    state.players[actor].buildings.push(id.into());
+                }
+                let observation = observe(&state, actor).unwrap();
+                let player = &observation.players[actor];
+                let legal = observation.legal_actions.iter().find(|row| matches!(&row.action, TypedAction::Monument { id, renovation: selected, .. } if id == "m06" && selected.as_deref() == renovation)).unwrap();
+                let TypedAction::Monument { id, cost, .. } = &legal.action else {
+                    unreachable!()
+                };
+                let estimate =
+                    current_monument_estimate(&observation, player, id, renovation, &weights)
+                        .unwrap();
+                assert_eq!(estimate.current_points, extra_points + (8 - count) as f64);
+                assert!((estimate.renovation_loss - lost).abs() < 1e-12);
+                let next = apply_move(&state, legal.r#move.clone()).unwrap();
+                let total = |s: &GameState| {
+                    s.players[actor]
+                        .monuments
+                        .iter()
+                        .map(|id| score_monument(s, &s.players[actor], id))
+                        .sum::<f64>()
+                };
+                assert_eq!(estimate.current_points, total(&next) - total(&state));
+                assert_eq!(next.players[actor].score, state.players[actor].score);
+                for (resource, cost) in RESOURCE_IDS.into_iter().zip(*cost) {
+                    assert_eq!(
+                        state.players[actor].resources[&resource]
+                            - next.players[actor].resources[&resource],
+                        cost
+                    );
+                }
+                let expected_score = estimate.current_points
+                    - amount_value(
+                        &observation,
+                        player,
+                        cost,
+                        &weights,
+                        ScoringProfile::MonumentAligned,
+                    )
+                    - lost;
+                assert!(
+                    (score_action_monument_aligned(&observation, &legal.action, &weights)
+                        - expected_score)
+                        .abs()
+                        < 1e-12
+                );
+                let old = 12.0 + player.buildings.len() as f64 * 0.5
+                    - amount_value(
+                        &observation,
+                        player,
+                        cost,
+                        &weights,
+                        ScoringProfile::FoodAlignedV2,
+                    );
+                assert_eq!(
+                    score_action_food_aligned_v2(&observation, &legal.action, &weights).to_bits(),
+                    old.to_bits()
+                );
+                for action in &observation.legal_actions {
+                    if !matches!(action.action, TypedAction::Monument { .. }) {
+                        assert_eq!(
+                            score_action_monument_aligned(&observation, &action.action, &weights)
+                                .to_bits(),
+                            score_action_food_aligned_v2(&observation, &action.action, &weights)
+                                .to_bits()
+                        );
+                    }
+                }
+            }
+            for (id, points) in [("m01", 4.0), ("m02", 2.0), ("m05", (8 - count) as f64)] {
+                let mut empty = state.clone();
+                for player in &mut empty.players {
+                    player.monuments.clear();
+                    player.buildings.clear();
+                }
+                empty.monuments = vec![id.into()];
+                let observation = observe(&empty, actor).unwrap();
+                let estimate = current_monument_estimate(
+                    &observation,
+                    &observation.players[actor],
+                    id,
+                    None,
+                    &weights,
+                )
+                .unwrap();
+                assert_eq!(estimate.current_points, points);
+                assert_eq!(estimate.renovation_loss, 0.0);
+            }
+            let mut invalid = observation.clone();
+            invalid.players[actor].temples[0] = 99;
+            assert!(
+                current_monument_estimate(&invalid, &invalid.players[actor], "m06", None, &weights)
+                    .is_none()
+            );
+            invalid = observation.clone();
+            invalid.players[actor].monuments.push("unknown".into());
+            assert!(
+                current_monument_estimate(&invalid, &invalid.players[actor], "m06", None, &weights)
+                    .is_none()
+            );
+            assert!(
+                current_monument_estimate(
+                    &observation,
+                    &observation.players[actor],
+                    "m06",
+                    Some("b09"),
+                    &weights
+                )
+                .is_none()
             );
         }
     }

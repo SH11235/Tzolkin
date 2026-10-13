@@ -11,12 +11,14 @@ const calls = vi.hoisted(() => ({
   heuristic: vi.fn(),
   foodAligned: vi.fn(),
   foodAlignedV2: vi.fn(),
+  monumentAligned: vi.fn(),
 }));
 vi.mock('../../generated/wasm/tzolkin_wasm.js', () => ({
   default: async () => {},
   dispatch_cpu: calls.heuristic,
   dispatch_cpu_food_aligned: calls.foodAligned,
   dispatch_cpu_food_aligned_v2: calls.foodAlignedV2,
+  dispatch_cpu_monument_aligned: calls.monumentAligned,
   CpuDeployment: class {
     constructor() {
       calls.load();
@@ -101,15 +103,16 @@ it('uses only the guarded NN route, notifies other seats and loads the immutable
   expect(failed.error).toContain('NNモデル');
   expect(calls.guarded).toHaveBeenCalledTimes(2);
   expect(calls.heuristic).not.toHaveBeenCalled();
-  calls.foodAlignedV2.mockReturnValue('{"policyVersion":"heuristic-food-aligned-v2"}');
+  calls.monumentAligned.mockReturnValue('{"policyVersion":"heuristic-monument-aligned-v1"}');
   const standard = await send({
     mode: 'heuristic',
     modelChecksum: null,
     gameId: null,
     callbackIndex: null,
   });
-  expect(standard.decision).toEqual({ policyVersion: 'heuristic-food-aligned-v2' });
-  expect(calls.foodAlignedV2).toHaveBeenCalledWith('{"actor":0}');
+  expect(standard.decision).toEqual({ policyVersion: 'heuristic-monument-aligned-v1' });
+  expect(calls.monumentAligned).toHaveBeenCalledWith('{"actor":0}');
+  expect(calls.foodAlignedV2).not.toHaveBeenCalled();
   expect(calls.foodAligned).not.toHaveBeenCalled();
   expect(calls.heuristic).not.toHaveBeenCalled();
 });

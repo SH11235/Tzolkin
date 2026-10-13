@@ -3287,64 +3287,95 @@ pub fn get_available_moves(s: &GameState) -> Vec<Choice> {
     }
     out
 }
-pub fn score_monument(s: &GameState, p: &Player, id: &str) -> f64 {
+/// Current public quantities used by monument scoring, without hidden state or
+/// projected future growth. Category counts are graveyard, municipal, shrine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonumentMetrics {
+    pub categories: [usize; 3],
+    pub constructions: usize,
+    pub corn_tiles: i64,
+    pub wood_tiles: i64,
+    pub technologies: [i64; 4],
+    pub workers: i64,
+    pub temples: [i64; 3],
+    pub player_count: usize,
+    pub all_monuments: usize,
+    pub all_skulls: i64,
+}
+impl MonumentMetrics {
+    pub fn count_categories(buildings: &[String], monuments: &[String]) -> [usize; 3] {
+        [
+            BuildingCategory::Graveyard,
+            BuildingCategory::Municipal,
+            BuildingCategory::Shrine,
+        ]
+        .map(|category| {
+            buildings
+                .iter()
+                .filter(|id| building(id).is_some_and(|b| b.category == category))
+                .count()
+                + monuments
+                    .iter()
+                    .filter(|id| monument(id).is_some_and(|m| m.category == category))
+                    .count()
+        })
+    }
+}
+/// The same scoring kernel used at game end. Inputs must represent a valid
+/// current state; this Rust-only value does not change the saved-game wire.
+pub fn score_monument_metrics(metrics: &MonumentMetrics, id: &str) -> f64 {
     let Some(m) = monument(id) else {
         return 0.0;
     };
-    let category_count = |category| {
-        p.buildings
-            .iter()
-            .filter(|id| building(id).is_some_and(|b| b.category == category))
-            .count()
-            + p.monuments
-                .iter()
-                .filter(|id| monument(id).is_some_and(|m| m.category == category))
-                .count()
-    };
     let value = match m.score_key.as_str() {
-        "graveyards" => category_count(BuildingCategory::Graveyard) as i64 * 4,
-        "constructions" => (p.buildings.len() + p.monuments.len()) as i64 * 2,
-        "cornTiles" => p.corn_tiles * 4,
-        "woodTiles" => p.wood_tiles * 4,
-        "allMonuments" => {
-            s.players.iter().map(|p| p.monuments.len()).sum::<usize>() as i64
-                * (8 - s.players.len()) as i64
-        }
-        "municipals" => category_count(BuildingCategory::Municipal) as i64 * 4,
-        "maxTechnologies" => [0, 9, 20, 33, 33][TECHNOLOGY_IDS
+        "graveyards" => metrics.categories[0] as i64 * 4,
+        "constructions" => metrics.constructions as i64 * 2,
+        "cornTiles" => metrics.corn_tiles * 4,
+        "woodTiles" => metrics.wood_tiles * 4,
+        "allMonuments" => metrics.all_monuments as i64 * (8 - metrics.player_count) as i64,
+        "municipals" => metrics.categories[1] as i64 * 4,
+        "maxTechnologies" => [0, 9, 20, 33, 33][metrics
+            .technologies
             .iter()
-            .filter(|t| p.technologies[t] == 3)
+            .filter(|level| **level == 3)
             .count()],
-        "technologyLevels" => {
-            TECHNOLOGY_IDS
-                .iter()
-                .map(|t| p.technologies[t])
-                .sum::<i64>()
-                * 3
-        }
-        "workers" => (p.workers - 3) * 6,
-        "shrines" => category_count(BuildingCategory::Shrine) as i64 * 4,
+        "technologyLevels" => metrics.technologies.iter().sum::<i64>() * 3,
+        "workers" => (metrics.workers - 3) * 6,
+        "shrines" => metrics.categories[2] as i64 * 4,
         "templePoints" => TEMPLE_IDS
             .iter()
-            .map(|t| CATALOG.temple_tracks[t].points[(p.temples[t] + 1) as usize])
+            .zip(metrics.temples)
+            .map(|(temple, level)| CATALOG.temple_tracks[temple].points[(level + 1) as usize])
             .sum::<i64>(),
-        "highestTemple" => {
-            TEMPLE_IDS
-                .iter()
-                .map(|t| p.temples[t])
-                .max()
-                .unwrap_or(0)
-                .max(0)
-                * 3
-        }
-        "allSkulls" => {
-            (s.skull_spaces.iter().filter(|x| x.is_some()).count() as i64
-                + s.players.iter().map(|p| p.building_skulls).sum::<i64>())
-                * 3
-        }
+        "highestTemple" => metrics.temples.into_iter().max().unwrap_or(0).max(0) * 3,
+        "allSkulls" => metrics.all_skulls * 3,
         _ => 0,
     };
     value as f64
+}
+pub fn score_monument(s: &GameState, p: &Player, id: &str) -> f64 {
+    if monument(id).is_none() {
+        return 0.0;
+    }
+    score_monument_metrics(
+        &MonumentMetrics {
+            categories: MonumentMetrics::count_categories(&p.buildings, &p.monuments),
+            constructions: p.buildings.len() + p.monuments.len(),
+            corn_tiles: p.corn_tiles,
+            wood_tiles: p.wood_tiles,
+            technologies: TECHNOLOGY_IDS.map(|technology| p.technologies[&technology]),
+            workers: p.workers,
+            temples: TEMPLE_IDS.map(|temple| p.temples[&temple]),
+            player_count: s.players.len(),
+            all_monuments: s.players.iter().map(|player| player.monuments.len()).sum(),
+            all_skulls: s.skull_spaces.iter().filter(|x| x.is_some()).count() as i64
+                + s.players
+                    .iter()
+                    .map(|player| player.building_skulls)
+                    .sum::<i64>(),
+        },
+        id,
+    )
 }
 fn finalize(s: &mut GameState) {
     s.phase = Phase::Finished;
