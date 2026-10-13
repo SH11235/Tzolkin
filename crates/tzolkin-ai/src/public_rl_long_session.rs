@@ -360,6 +360,98 @@ struct Checkpoint {
     progress: Progress,
 }
 
+/// Metadata-only external-consumption input. This checks the original closed
+/// Reserve DTO and fixed config contract; it does not restore/authenticate an
+/// owner or establish that the remaining journal was executed.
+pub(crate) fn sampling_reservation_configs(
+    raw: &[u8],
+    spec: &LongRunSpec,
+    root_sha256: &str,
+    root_bytes: usize,
+) -> Result<([Config; 4], u64, u64), String> {
+    spec.validate()?;
+    let entry: Checkpoint = closed(raw, MAX_CHECKPOINT_BYTES)?;
+    let Event::Reserve {
+        configs,
+        plan,
+        cursor,
+    } = &entry.event
+    else {
+        return Err("External Long input must be an original Reserve checkpoint".into());
+    };
+    let p = &entry.progress;
+    let first = configs[0]
+        .checked_config()?
+        .sampling_identity()
+        .episode_ordinal();
+    let limits = spec.collection_limits()?;
+    let expected = configs
+        .each_ref()
+        .map(|c| {
+            NativeStochasticConfig::new(
+                c.players,
+                c.environment_seed,
+                SamplingStreamIdentity::new(
+                    SamplingSeed::new(spec.sampling_seed),
+                    c.checked_config()?.sampling_identity().episode_ordinal(),
+                    spec.replicate_ordinal,
+                    c.players,
+                )?,
+                limits,
+            )
+            .map(|c| Config::from_config(&c))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, String>>()?;
+    if entry.schema != "tzolkin-rl-long-checkpoint-v2"
+        || !entry.root.valid(OWNER_BYTES)
+        || entry.root.name != "bootstrap.json"
+        || entry.root.sha256 != root_sha256
+        || entry.root.bytes != root_bytes
+        || entry.spec_checksum != spec.checksum()?
+        || entry.sequence < 2
+        || entry.sequence > spec.max_journal_entries
+        || !checkpoint_digest(&entry.previous)
+        || !checkpoint_digest(plan)
+        || configs.as_ref().as_slice() != expected
+        || first.checked_add(4) != Some(p.next_ordinal)
+        || *cursor != p.cursor
+        || *cursor > spec.end_seed()
+        || p.reservations == 0
+        || p.reservations > spec.max_batches
+        || p.owner.count == 0
+        || p.owner.count > spec.max_updates
+        || !p.owner.file.valid(OWNER_BYTES)
+        || !checkpoint_digest(&p.owner.artifact)
+        || !checkpoint_digest(&p.owner.lineage)
+        || p.last_outcome.is_some()
+        || p.last_error.is_some()
+        || configs.iter().enumerate().any(|(i, c)| {
+            c.players != if i < 2 { 3 } else { 4 }
+                || c.episode_ordinal != format!("{:016x}", first + i as u64)
+                || (c.environment_seed as u64) < spec.environment_seed_start as u64
+                || c.environment_seed as u64 >= *cursor
+                || split_for_family(&seed_family_id(c.environment_seed)) != Ok(DatasetSplit::Train)
+                || spec
+                    .excluded_families
+                    .binary_search(&seed_family_id(c.environment_seed))
+                    .is_ok()
+        })
+        || p.pending.as_ref()
+            != Some(&Batch {
+                configs: configs.as_ref().clone(),
+                plan: plan.clone(),
+                parent: p.owner.artifact.clone(),
+                parent_count: p.owner.count,
+                members: std::array::from_fn(|_| Member::default()),
+                gradient_unknown: false,
+            })
+    {
+        return Err("External Long Reserve metadata/config binding differs".into());
+    }
+    Ok((configs.as_ref().clone(), entry.sequence, p.reservations))
+}
+
 enum Current {
     Count1(Box<UpdatedPublicRlPolicy>),
     Long(Box<LongRlPolicy>),
