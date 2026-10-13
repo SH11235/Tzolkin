@@ -22,6 +22,7 @@ export const BOUNDARY_MARKER_CALIBRATION_SCHEMA =
 export const BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA =
   'tzolkin-bga-retained-boundary-marker-calibration-v2';
 export const BOUNDARY_WORKER_CELL_SCHEMA = 'tzolkin-bga-boundary-worker-cells-v1';
+export const BOUNDARY_JUNGLE_TOPS_SCHEMA = 'tzolkin-bga-boundary-jungle-tops-v1';
 const BOUNDARY_CAPTURE_SCHEMA = 'bga-retained-visible-replay-board-v1';
 const LEGACY_CAPTURE_SCHEMA = 'tzolkin-bga-public-initial-selection-observation-v1';
 const LEGACY_CAPTURE_ADAPTER = 'tzolkin-bga-legacy-initial-capture-adapter-v1';
@@ -679,7 +680,7 @@ export function projectRetainedBoundary(
     control,
     ['schema', 'capture', 'rawLog', 'archiveRelease', 'seatOrder', 'mechanicalProfile'],
     'boundary control',
-    ['table', 'markerCalibration', 'workerPositions'],
+    ['table', 'markerCalibration', 'workerPositions', 'jungleTops'],
   );
   if (control.schema !== BOUNDARY_CONTROL_SCHEMA) fail('Unsupported boundary control');
   const observeWorkerPositions = Object.hasOwn(control, 'workerPositions');
@@ -690,6 +691,20 @@ export function projectRetainedBoundary(
       control.workerPositions.archiveRelease !== control.archiveRelease
     )
       fail('Unsupported/release-mismatched boundary worker positions');
+  }
+  const observeJungleTops = Object.hasOwn(control, 'jungleTops');
+  if (observeJungleTops) {
+    closed(
+      control.jungleTops,
+      ['schema', 'archiveRelease', 'stackMechanics'],
+      'boundary jungle tops',
+    );
+    if (
+      control.jungleTops.schema !== BOUNDARY_JUNGLE_TOPS_SCHEMA ||
+      control.jungleTops.archiveRelease !== control.archiveRelease ||
+      control.jungleTops.stackMechanics !== 'basic-corn-under-wood-v1'
+    )
+      fail('Unsupported/release-mismatched boundary jungle tops');
   }
   pin(captureBytes, control.capture, MAX_BYTES, 'boundary capture');
   pin(rawLogBytes, control.rawLog, MAX_BYTES, 'raw log');
@@ -1220,6 +1235,86 @@ export function projectRetainedBoundary(
       fail('Incomplete/unknown boundary worker cells');
     workerCells.forEach((node) => readVisible(board, node));
   }
+  const jungleBoxes = [],
+    ownedJungleNodes = new Map();
+  const jungleEvidence = (id, className, parentId = '', includePlayerTiles = false) => {
+    if (className != null && typeof className !== 'string') fail('Invalid boundary jungle class');
+    const classes = (className ?? '').split(/\s+/);
+    return (
+      /^jungle_/i.test(id ?? '') ||
+      /^jungle_/i.test(parentId) ||
+      classes.some((name) => /^(?:jungle|board_tile)$/i.test(name)) ||
+      ((includePlayerTiles || !classes.includes('player_tile')) &&
+        classes.some((name) => /^(?:corn_tile|wood_tile)$/i.test(name)))
+    );
+  };
+  if (observeJungleTops) {
+    const corners = [
+      null,
+      ['bottom', 'right'],
+      ['bottom', 'left'],
+      ['top', 'right'],
+      ['top', 'left'],
+    ];
+    for (const box of [2, 3, 4, 5]) {
+      const container = byId(board, `jungle_${box}`);
+      readVisible(board, container);
+      closed(container.attrs, ['id', 'class'], 'boundary jungle container');
+      if (
+        container.tag !== 'div' ||
+        container.attrs.class !== 'jungle' ||
+        !root.children.includes(container)
+      )
+        fail('Malformed/unowned boundary jungle container');
+      const tiles = container.children.filter(object);
+      if (container.children.some((child) => !object(child) && child.trim()))
+        fail('Unknown boundary jungle child');
+      ownedJungleNodes.set(container.attrs.id, { node: container, parentId: 'board' });
+      let exposedCornTops = 0,
+        woodTops = 0;
+      const seenCorners = new Set();
+      for (const tile of tiles) {
+        readVisible(board, tile);
+        closed(tile.attrs, ['id', 'class', 'style'], 'boundary jungle tile');
+        const match = new RegExp(`^jungle_${box}_tile_([1-4])$`).exec(tile.attrs.id),
+          classes = tile.attrs.class.split(/\s+/).filter(Boolean),
+          kind = classes.includes('corn_tile') ? 'corn_tile' : 'wood_tile';
+        if (
+          tile.tag !== 'div' ||
+          tile.children.length !== 0 ||
+          !match ||
+          classes.length !== 3 ||
+          new Set(classes).size !== 3 ||
+          !classes.includes('tile') ||
+          !classes.includes('board_tile') ||
+          !classes.includes(kind)
+        )
+          fail('Malformed/unknown boundary jungle top tile');
+        const corner = corners[Number(match[1])],
+          style = styles(tile);
+        closed(style, corner, 'boundary jungle tile corner');
+        if (
+          corner.some((key) => pixels(style[key], 'boundary jungle tile corner') !== 0) ||
+          seenCorners.has(corner.join('/'))
+        )
+          fail('Duplicate/unknown boundary jungle tile corner');
+        seenCorners.add(corner.join('/'));
+        if (kind === 'corn_tile') exposedCornTops++;
+        else woodTops++;
+        ownedJungleNodes.set(tile.attrs.id, { node: tile, parentId: container.attrs.id });
+      }
+      if (tiles.length > ids.length || (box === 2 && woodTops !== 0))
+        fail('Boundary jungle tops exceed basic player-count/wood bounds');
+      jungleBoxes.push({ box, container, tiles, exposedCornTops, woodTops });
+    }
+    for (const tree of trees)
+      for (const node of tree.nodes)
+        if (
+          jungleEvidence(node.attrs.id, node.attrs.class, '', tree === board) &&
+          !ownedJungleNodes.has(node.attrs.id)
+        )
+          fail('Foreign/unknown retained boundary jungle node');
+  }
   const skull = byId(board, 'skull_left');
   readVisible(board, skull);
   if (skull.tag !== 'span') fail('Malformed boundary skull counter');
@@ -1265,6 +1360,19 @@ export function projectRetainedBoundary(
       continue;
     }
     if (geometry.has(item.id)) fail('Invalid/duplicate boundary geometry identity');
+    if (
+      observeJungleTops &&
+      jungleEvidence(item.id, item.className, item.parentId, item.parentId === 'board')
+    ) {
+      const owned = ownedJungleNodes.get(item.id);
+      if (
+        !owned ||
+        item.parentId !== owned.parentId ||
+        (item.className ?? '') !== (owned.node.attrs.class ?? '') ||
+        (item.inlineStyle ?? '') !== (owned.node.attrs.style ?? '')
+      )
+        fail('Unbound boundary jungle geometry');
+    }
     const consumed = readNodes.get(item.id);
     if (consumed) {
       if (
@@ -1321,6 +1429,63 @@ export function projectRetainedBoundary(
       return null;
     return rect;
   };
+  let observedJungle = null;
+  if (observeJungleTops) {
+    const requiredRect = (node) => {
+      const item = geometry.get(node.attrs.id);
+      if (!item) fail('Missing visible boundary jungle geometry');
+      closed(
+        item,
+        [
+          'id',
+          'className',
+          'inlineStyle',
+          'parentId',
+          'computedDisplay',
+          'computedVisibility',
+          'rect',
+        ],
+        'boundary jungle geometry',
+      );
+      const rect = visibleRect(node);
+      if (rect === null || rect.width <= 0 || rect.height <= 0)
+        fail('Invalid visible boundary jungle rectangle');
+      closed(rect, ['x', 'y', 'width', 'height'], 'boundary jungle rectangle');
+      for (const key of ['x', 'y', 'width', 'height'])
+        number(rect[key], -10000000, 10000000, 'boundary jungle rectangle');
+      return rect;
+    };
+    const boardRect = requiredRect(root);
+    observedJungle = Object.fromEntries(
+      jungleBoxes.map(({ box, container, tiles, exposedCornTops, woodTops }) => {
+        const containerRect = requiredRect(container),
+          centerX = containerRect.x + containerRect.width / 2,
+          centerY = containerRect.y + containerRect.height / 2;
+        // Rotation can put a direct child's bounding-box edge outside the board.
+        // Source ownership and its center bind the container, without fitting coordinates.
+        if (
+          centerX < boardRect.x ||
+          centerX > boardRect.x + boardRect.width ||
+          centerY < boardRect.y ||
+          centerY > boardRect.y + boardRect.height
+        )
+          fail('Boundary jungle container center outside board');
+        for (const tile of tiles) {
+          const rect = requiredRect(tile);
+          if (
+            rect.x < containerRect.x ||
+            rect.y < containerRect.y ||
+            rect.x + rect.width > containerRect.x + containerRect.width ||
+            rect.y + rect.height > containerRect.y + containerRect.height
+          )
+            fail('Boundary jungle top outside owned container');
+        }
+        // A visible wood cover represents one remaining corn stack only under
+        // the explicitly declared basic mechanics; the covered layer is not observed.
+        return [box, { corn: exposedCornTops + woodTops, wood: woodTops }];
+      }),
+    );
+  }
   if (markerPositions?.mode === 'labeled-cell') {
     const requiredRect = (node) => {
       const item = geometry.get(node.attrs.id);
@@ -1520,6 +1685,7 @@ export function projectRetainedBoundary(
     skullSupply: natural(skull, 'boundary skull supply', true),
     phase: terminal ? 'finished' : 'playing',
     ...(observedGears === null ? {} : { gears: observedGears }),
+    ...(observedJungle === null ? {} : { jungle: observedJungle }),
   };
   // The source displays day 28 and integral scores after finalization. Neither
   // is an exact native round/score assertion; preserve those display facts apart.
@@ -1556,6 +1722,24 @@ export function projectRetainedBoundary(
       kind: terminal ? 'terminal' : 'post-food',
       displayedRound,
       displayedPlayers,
+      ...(observedJungle === null
+        ? {}
+        : {
+            jungleObservation: {
+              schema: BOUNDARY_JUNGLE_TOPS_SCHEMA,
+              archiveRelease: release,
+              stackMechanics: control.jungleTops.stackMechanics,
+              visibleTops: Object.fromEntries(
+                jungleBoxes.map(({ box, exposedCornTops, woodTops }) => [
+                  box,
+                  { exposedCornTops, woodTops },
+                ]),
+              ),
+              conditionalDerivedCounts: structuredClone(observedJungle),
+              coveredLayersObserved: false,
+              sourceAuthenticated: false,
+            },
+          }),
       ...(observeWorkerPositions
         ? {
             workerPositionObservation: {
