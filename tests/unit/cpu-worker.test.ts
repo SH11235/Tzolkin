@@ -41,7 +41,7 @@ const observation: Observation = {
 const decision: CpuDecision = {
   actor: 1,
   observationKey: 'expected',
-  policyVersion: 'heuristic-monument-aligned-v1',
+  policyVersion: 'heuristic-monument-aligned-v2',
   move: { type: 'endTurn' },
 };
 const model: CpuModelMetadata = {
@@ -522,6 +522,11 @@ describe('CPU Worker request lifecycle', () => {
     const previousHarvest = chooseCpu(observation, new AbortController().signal);
     FakeWorker.instances.at(-1)!.reply({ ...decision, policyVersion: 'heuristic-food-aligned-v2' });
     await expect(previousHarvest).rejects.toThrow('不正な結果');
+    const previousMonument = chooseCpu(observation, new AbortController().signal);
+    FakeWorker.instances
+      .at(-1)!
+      .reply({ ...decision, policyVersion: 'heuristic-monument-aligned-v1' });
+    await expect(previousMonument).rejects.toThrow('不正な結果');
   });
 
   it('terminates a cancelled operation and starts a fresh Worker for the next request', async () => {

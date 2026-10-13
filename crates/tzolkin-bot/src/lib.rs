@@ -150,6 +150,10 @@ pub fn dispatch_cpu_monument_aligned(request: &str) -> Result<String, String> {
     dispatch_with(request, choose_move_monument_aligned)
 }
 
+pub fn dispatch_cpu_monument_aligned_v2(request: &str) -> Result<String, String> {
+    dispatch_with(request, choose_move_monument_aligned_v2)
+}
+
 fn dispatch_with(
     request: &str,
     choose: fn(&Observation) -> Result<Decision, String>,
