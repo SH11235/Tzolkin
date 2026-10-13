@@ -2,9 +2,9 @@
 //! Numeric identities and external exclusions do not authenticate a producer,
 //! recreate an owner, or grant training, fresh Test, or strength authority.
 use super::conditional::{
-    ConditionalCountZeroArenaIdentity, ConditionalCountZeroArenaPolicy, ConditionalDiagnostics,
-    ConditionalIdentity, ConditionalMixedArenaIdentity, ConditionalMixedArenaPolicy,
-    ConditionalPolicy, GameSession,
+    ConditionalChoiceDiagnostics, ConditionalCountZeroArenaIdentity,
+    ConditionalCountZeroArenaPolicy, ConditionalDiagnostics, ConditionalIdentity,
+    ConditionalMixedArenaIdentity, ConditionalMixedArenaPolicy, ConditionalPolicy, GameSession,
 };
 use super::phase_routed::{
     PhaseRouteDiagnostics, PhaseRoutedDevelopmentIdentity, PhaseRoutedDevelopmentPolicy,
@@ -610,7 +610,7 @@ fn choose(
                 _ => unreachable!("Own Setup guard returned an unsupported phase"),
             }
         }
-        if let Some(trade) = result.trade {
+        if let Some(trade) = result.trade.as_ref() {
             d.forced_exits += usize::from(trade.overridden);
             d.repeat_exits += usize::from(trade.overridden && trade.repeat_seen);
             d.budget_exits += usize::from(trade.overridden && trade.budget_reached);
@@ -693,6 +693,25 @@ fn choose(
                     _ => unreachable!("conditional session requires a conditional role"),
                 };
                 conditional.outside_teacher_grammar_choices += usize::from(!in_origin_grammar);
+                if let Some(contexts) = conditional.choice_contexts.as_mut() {
+                    let Role::Conditional(policy) = role else {
+                        return Err(
+                            "Choice contexts require the opted-in conditional BC role".into()
+                        );
+                    };
+                    let effective = observation
+                        .legal_actions
+                        .iter()
+                        .position(|row| row.r#move == result.decision.r#move)
+                        .expect("conditional session returned a legal row");
+                    contexts.record(
+                        observation,
+                        result.requested_index,
+                        effective,
+                        result.trade.as_ref(),
+                        |action| policy.teacher_grammar_contains(action),
+                    )?;
+                }
             }
         }
         result.decision
@@ -860,7 +879,17 @@ fn play_arm_using_with_setup<'a>(
             Role::Teacher(_) | Role::SemanticSetupTeacher(_) => Some(GuardDiagnostics::default()),
             Role::Conditional(_) | Role::ConditionalMixed(_) | Role::ConditionalCountZero(_) => {
                 Some(GuardDiagnostics {
-                    conditional: Some(ConditionalDiagnostics::default()),
+                    conditional: Some(ConditionalDiagnostics {
+                        choice_contexts: match &**role {
+                            Role::Conditional(policy)
+                                if policy.identity().choice_diagnostics.is_some() =>
+                            {
+                                Some(ConditionalChoiceDiagnostics::new())
+                            }
+                            _ => None,
+                        },
+                        ..ConditionalDiagnostics::default()
+                    }),
                     phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
                     ..GuardDiagnostics::default()
                 })

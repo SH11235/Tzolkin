@@ -60,6 +60,8 @@ pub struct ConditionalIdentity {
     pub source_qualified: bool,
     pub verified_native_policy: bool,
     pub value_validity: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice_diagnostics: Option<&'static str>,
 }
 
 /// Borrowed immutable conditional storage; no native artifact or owner conversion.
@@ -94,11 +96,17 @@ impl<'a> ConditionalPolicy<'a> {
                 verified_native_policy: false,
                 value_validity: serde_json::to_value(prepared.model().value_validity)
                     .map_err(|e| e.to_string())?,
+                choice_diagnostics: None,
             },
         })
     }
     pub fn identity(&self) -> &ConditionalIdentity {
         &self.identity
+    }
+    /// Opt in to bounded context counts without changing choices or teacher scope.
+    pub fn with_choice_diagnostics(mut self) -> Self {
+        self.identity.choice_diagnostics = Some(CHOICE_DIAGNOSTICS_SCHEMA);
+        self
     }
     pub(super) fn teacher_grammar_contains(&self, action: &TypedAction) -> bool {
         teacher_grammar_contains(self.prepared.identity().label_scope.as_deref(), action)
@@ -361,11 +369,212 @@ pub struct ConditionalDiagnostics {
     /// For a mixed RL actor this still refers to its original BC teacher grammar,
     /// not the action categories it subsequently encountered during RL.
     pub outside_teacher_grammar_choices: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choice_contexts: Option<ConditionalChoiceDiagnostics>,
+}
+
+pub const CHOICE_DIAGNOSTICS_SCHEMA: &str = "tzolkin-conditional-returned-choice-context-counts-v1";
+const MAX_CHOICE_CONTEXTS: usize = 256;
+const ROUND_BINS: [[u8; 2]; 4] = [[1, 7], [8, 14], [15, 21], [22, 27]];
+const ACTION_KINDS: [&str; 27] = [
+    "place",
+    "remove",
+    "firstPlayer",
+    "beg",
+    "quickAction",
+    "endTurn",
+    "chooseTribe",
+    "chooseWealth",
+    "skip",
+    "selectSpace",
+    "technologyBonus",
+    "prophecyGain",
+    "prophecyTemple",
+    "useAction",
+    "technology",
+    "payment",
+    "temple",
+    "resource",
+    "build",
+    "monument",
+    "technologyExchange",
+    "trade",
+    "harvest",
+    "offering",
+    "rotate",
+    "tribeSell",
+    "tribeSkipSpace",
+];
+
+fn action_kind(action: &TypedAction) -> usize {
+    match action {
+        TypedAction::Place { .. } => 0,
+        TypedAction::Remove { .. } => 1,
+        TypedAction::FirstPlayer { .. } => 2,
+        TypedAction::Beg => 3,
+        TypedAction::QuickAction { .. } => 4,
+        TypedAction::EndTurn { .. } => 5,
+        TypedAction::ChooseTribe { .. } => 6,
+        TypedAction::ChooseWealth { .. } => 7,
+        TypedAction::Skip => 8,
+        TypedAction::SelectSpace { .. } => 9,
+        TypedAction::TechnologyBonus { .. } => 10,
+        TypedAction::ProphecyGain { .. } => 11,
+        TypedAction::ProphecyTemple { .. } => 12,
+        TypedAction::UseAction { .. } => 13,
+        TypedAction::Technology { .. } => 14,
+        TypedAction::Payment { .. } => 15,
+        TypedAction::Temple { .. } => 16,
+        TypedAction::Resource { .. } => 17,
+        TypedAction::Build { .. } => 18,
+        TypedAction::Monument { .. } => 19,
+        TypedAction::TechnologyExchange { .. } => 20,
+        TypedAction::Trade { .. } => 21,
+        TypedAction::Harvest { .. } => 22,
+        TypedAction::Offering { .. } => 23,
+        TypedAction::Rotate { .. } => 24,
+        TypedAction::TribeSell { .. } => 25,
+        TypedAction::TribeSkipSpace => 26,
+    }
+}
+
+/// Categories only. These counts establish neither positive Train coverage nor OOD.
+/// Choices returned before core apply are counted; successful apply is not inferred.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalChoiceDiagnostics {
+    schema: &'static str,
+    max_contexts: usize,
+    max_choices: usize,
+    round_bins: [[u8; 2]; 4],
+    choices: usize,
+    overflow_choices: usize,
+    requested_outside_teacher_grammar_choices: usize,
+    effective_outside_teacher_grammar_choices: usize,
+    contexts: Vec<ChoiceContextCounts>,
+    #[serde(skip)]
+    indices: BTreeMap<(u8, u32, usize, usize, bool, bool), usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChoiceContextCounts {
+    round_bin: u8,
+    legal_kinds: Vec<&'static str>,
+    requested_kind: &'static str,
+    effective_kind: &'static str,
+    requested_outside_teacher_grammar: bool,
+    effective_outside_teacher_grammar: bool,
+    choices: usize,
+    guard_overrides: usize,
+    repeated_trade_exits: usize,
+    trade_budget_exits: usize,
+}
+
+impl ConditionalChoiceDiagnostics {
+    pub(super) fn new() -> Self {
+        Self {
+            schema: CHOICE_DIAGNOSTICS_SCHEMA,
+            max_contexts: MAX_CHOICE_CONTEXTS,
+            max_choices: MAX_GAME_CALLBACKS,
+            round_bins: ROUND_BINS,
+            choices: 0,
+            overflow_choices: 0,
+            requested_outside_teacher_grammar_choices: 0,
+            effective_outside_teacher_grammar_choices: 0,
+            contexts: Vec::new(),
+            indices: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn record(
+        &mut self,
+        observation: &Observation,
+        requested: usize,
+        effective: usize,
+        trade: Option<&GuardedTradeTrace>,
+        in_grammar: impl Fn(&TypedAction) -> bool,
+    ) -> Result<(), String> {
+        if observation.phase != Phase::Playing
+            || !(1..=27).contains(&observation.round)
+            || observation.legal_actions.is_empty()
+            || observation.legal_actions.len() > super::numeric::MAX_ROWS_PER_CALLBACK
+            || self.choices >= MAX_GAME_CALLBACKS
+        {
+            return Err("Conditional choice context exceeds fixed Playing bounds".into());
+        }
+        let requested = &observation
+            .legal_actions
+            .get(requested)
+            .ok_or("Requested conditional diagnostic row is not legal")?
+            .action;
+        let effective = &observation
+            .legal_actions
+            .get(effective)
+            .ok_or("Effective conditional diagnostic row is not legal")?
+            .action;
+        let requested_kind = action_kind(requested);
+        let effective_kind = action_kind(effective);
+        let requested_outside = !in_grammar(requested);
+        let effective_outside = !in_grammar(effective);
+        let mask = observation
+            .legal_actions
+            .iter()
+            .fold(0u32, |mask, row| mask | (1 << action_kind(&row.action)));
+        let round_bin = ((observation.round - 1) / 7) as u8;
+        let key = (
+            round_bin,
+            mask,
+            requested_kind,
+            effective_kind,
+            requested_outside,
+            effective_outside,
+        );
+        self.choices += 1;
+        self.requested_outside_teacher_grammar_choices += usize::from(requested_outside);
+        self.effective_outside_teacher_grammar_choices += usize::from(effective_outside);
+        let index = if let Some(index) = self.indices.get(&key) {
+            *index
+        } else if self.contexts.len() < MAX_CHOICE_CONTEXTS {
+            let index = self.contexts.len();
+            self.indices.insert(key, index);
+            self.contexts.push(ChoiceContextCounts {
+                round_bin,
+                legal_kinds: ACTION_KINDS
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, kind)| (mask & (1 << i) != 0).then_some(*kind))
+                    .collect(),
+                requested_kind: ACTION_KINDS[requested_kind],
+                effective_kind: ACTION_KINDS[effective_kind],
+                requested_outside_teacher_grammar: requested_outside,
+                effective_outside_teacher_grammar: effective_outside,
+                choices: 0,
+                guard_overrides: 0,
+                repeated_trade_exits: 0,
+                trade_budget_exits: 0,
+            });
+            index
+        } else {
+            // Keep totals exact without allocating another context or changing the move.
+            self.overflow_choices += 1;
+            return Ok(());
+        };
+        let counts = &mut self.contexts[index];
+        counts.choices += 1;
+        if let Some(trade) = trade {
+            counts.guard_overrides += usize::from(trade.overridden);
+            counts.repeated_trade_exits += usize::from(trade.overridden && trade.repeat_seen);
+            counts.trade_budget_exits += usize::from(trade.overridden && trade.budget_reached);
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct ConditionalDecision {
     pub decision: Decision,
     pub trade: Option<GuardedTradeTrace>,
+    pub requested_index: usize,
 }
 
 // Keep the legacy public Setup composition separate from all-phase actor inference.
@@ -635,6 +844,7 @@ impl GameSession {
                     score: scores[effective],
                 },
                 trade,
+                requested_index: raw,
             })
         })();
         if result.is_err() {
@@ -1236,6 +1446,16 @@ mod tests {
             game.on_callback(0, &o).unwrap();
             let first = game.choose_using(0, &o, predict).unwrap();
             assert_eq!(first.decision.r#move, o.legal_actions[0].r#move);
+            let mut contexts = ConditionalChoiceDiagnostics::new();
+            contexts
+                .record(
+                    &o,
+                    first.requested_index,
+                    0,
+                    first.trade.as_ref(),
+                    |action| teacher_grammar_contains(Some(CAPPED_EXTRACTION_LABEL_SCOPE), action),
+                )
+                .unwrap();
             assert!(!first.trade.unwrap().overridden);
             game.on_callback(1, &o).unwrap();
             let repeated = game.choose_using(1, &o, predict).unwrap();
@@ -1243,6 +1463,44 @@ mod tests {
                 repeated.decision.r#move,
                 o.legal_actions[skip_index(&o).unwrap()].r#move
             );
+            contexts
+                .record(
+                    &o,
+                    repeated.requested_index,
+                    skip_index(&o).unwrap(),
+                    repeated.trade.as_ref(),
+                    |action| teacher_grammar_contains(Some(CAPPED_EXTRACTION_LABEL_SCOPE), action),
+                )
+                .unwrap();
+            assert_eq!(contexts.choices, 2);
+            assert_eq!(
+                contexts
+                    .contexts
+                    .iter()
+                    .map(|row| row.choices)
+                    .sum::<usize>(),
+                2
+            );
+            let forced = contexts
+                .contexts
+                .iter()
+                .find(|row| row.guard_overrides == 1)
+                .unwrap();
+            assert_eq!(forced.requested_kind, "trade");
+            assert_eq!(forced.effective_kind, "skip");
+            assert_eq!(forced.repeated_trade_exits, 1);
+            assert_eq!(forced.round_bin, 0);
+            assert!(forced.legal_kinds.contains(&"trade") && forced.legal_kinds.contains(&"skip"));
+            assert!(forced.effective_outside_teacher_grammar);
+            let mut invalid = o.clone();
+            invalid.round = 28;
+            assert!(contexts.record(&invalid, 0, 0, None, |_| false).is_err());
+            assert!(
+                contexts
+                    .record(&o, o.legal_actions.len(), 0, None, |_| false)
+                    .is_err()
+            );
+            assert_eq!(contexts.choices, 2);
             assert!(repeated.trade.unwrap().repeat_seen);
             game.on_callback(2, &o).unwrap();
             assert!(
