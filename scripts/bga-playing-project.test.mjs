@@ -383,6 +383,55 @@ function legacyFixture() {
   return value;
 }
 
+function fragmentFixture() {
+  const value = fixture(4);
+  const modern = value.capture;
+  value.capture = {
+    schema: 'bga-retained-visible-initial-dom-v1',
+    sourceKind: 'public_ui_dom_only',
+    tableId: modern.tableId,
+    sourceUrl: modern.url,
+    moveText: '7',
+    roundText: '1',
+    prompt: modern.header,
+    boardHtml:
+      modern.boardGeometry.html
+        .slice(0, -6)
+        .replace(
+          element('span', 'current_round', '1'),
+          element('div', 'rounds_wrap', `経過日 ${element('span', 'current_round', '1')} / 27`),
+        ) +
+      modern.buildingsHtml +
+      modern.monumentsHtml +
+      element('div', 'centralgearcorns') +
+      '</div>',
+    playerBoards: value.control.seatOrder.map((id, index) => {
+      const wealthTilesHtml = modern.selectedPlayerTiles[index].html;
+      const buildingsHtml = element('div', `player_buildings_${id}`);
+      return {
+        playerId: id,
+        boardHtml: element(
+          'div',
+          `player_board_${id}`,
+          element('span', `player_score_${id}`, '0') +
+            modern.publicCounters
+              .filter((node) => node.id.endsWith(`_${id}`))
+              .map((node) => node.html)
+              .join('') +
+            element('div', `firstplayer_${id}`, index === 0 ? element('div', 'firstplayer') : ''),
+        ),
+        rowHtml: `<div class="whiteblock"><h3 style="color:#008000">${'ABCD'[index]}:</h3>${buildingsHtml}${wealthTilesHtml}</div>`,
+        buildingsHtml,
+        wealthTilesHtml,
+      };
+    }),
+    renderedReplayControls: [],
+    completeNativeReplayQualified: false,
+    humanBcQualified: false,
+  };
+  return value;
+}
+
 test('legacy nested initial panels project only consistent retained state with unknown options', () => {
   const value = legacyFixture();
   const projected = projectCapturedInitial(...inputs(value));
@@ -409,6 +458,28 @@ test('legacy nested initial panels project only consistent retained state with u
     'valueTrainingReady',
   ])
     assert.equal(projected.provenance[field], false);
+  const fragments = projectCapturedInitial(...inputs(fragmentFixture()));
+  assert.deepEqual(fragments.record.initial, projected.record.initial);
+  const observed = fragments.witness.initialExpected;
+  assert.deepEqual(fragments.record.initialCheckpoint.expected, observed);
+  assert.deepEqual(fragments.record.initialCheckpoint.source.actionIds, [7]);
+  assert.deepEqual(observed.players[0].resources, projected.record.initial.players[0].resources);
+  assert.deepEqual(observed.players[0].wealth, ['w01', 'w02']);
+  assert.equal(observed.players[0].temples.quetzalcoatl, 2);
+  assert.deepEqual(observed.jungle, {
+    2: { corn: 4 },
+    3: { wood: 4 },
+    4: { wood: 4 },
+    5: { wood: 4 },
+  });
+  assert.deepEqual(observed.monuments, fragments.record.initial.monuments);
+  for (const field of ['age', 'foodDays', 'turnOrder', 'turnIndex', 'buildings'])
+    assert.equal(Object.hasOwn(observed, field), false);
+  assert.equal(fragments.provenance.captureAdapter.visibilityVerified, false);
+  assert.equal(fragments.provenance.captureAdapter.geometryVerified, false);
+  assert.equal(fragments.provenance.initialObservation.completeSourceBoard, false);
+  assert.equal(fragments.provenance.policyTrainingReady, false);
+  assert.equal(fragments.provenance.sourceOptions.additionalBuildings, null);
 });
 
 test('legacy panels refuse conflicting duplicates, missing state and foreign identities', () => {
@@ -517,6 +588,289 @@ test('legacy panels refuse conflicting duplicates, missing state and foreign ide
     const value = legacyFixture();
     mutate(value);
     assert.throws(() => projectCapturedInitial(...inputs(value)), pattern, label);
+  }
+  for (const [label, mutate, pattern] of [
+    [
+      'detached selected fragment',
+      (v) => {
+        v.capture.playerBoards[0].wealthTilesHtml += ' ';
+      },
+      /Detached\/nonempty/,
+    ],
+    [
+      'nested foreign owner',
+      (v) => {
+        const p = v.capture.playerBoards[0];
+        const corn = element('span', 'corn_number_player_100', '8');
+        p.boardHtml = p.boardHtml.replace(corn, element('div', 'player_board_999', corn));
+      },
+      /crosses owner identity/,
+    ],
+    [
+      'duplicate across retained siblings',
+      (v) => {
+        const p = v.capture.playerBoards[0];
+        p.rowHtml = p.rowHtml.replace(
+          '<h3',
+          `${element('span', 'corn_number_player_100', '8')}<h3`,
+        );
+      },
+      /Conflicting retained sibling/,
+    ],
+    [
+      'hidden row ancestor',
+      (v) => {
+        const p = v.capture.playerBoards[0];
+        p.rowHtml = p.rowHtml.replace(
+          'class="whiteblock"',
+          'class="whiteblock" style="DISPLAY: none ! IMPORTANT"',
+        );
+      },
+      /Hidden retained/,
+    ],
+    [
+      'placed worker',
+      (v) => {
+        v.capture.boardHtml =
+          v.capture.boardHtml.slice(0, -6) +
+          element('div', 'worker_99', '', ' class="worker"') +
+          '</div>';
+      },
+      /lack placed-worker geometry/,
+    ],
+    [
+      'wrong source table',
+      (v) => {
+        v.capture.sourceUrl = v.capture.sourceUrl.replace('table=123', 'table=124');
+      },
+      /identity\/boundary/,
+    ],
+    [
+      'false qualification',
+      (v) => {
+        v.capture.completeNativeReplayQualified = true;
+      },
+      /identity\/boundary/,
+    ],
+    [
+      'missing first-player corn observation',
+      (v) => {
+        v.capture.boardHtml = v.capture.boardHtml.replace(element('div', 'centralgearcorns'), '');
+      },
+      /Missing retained DOM node/,
+    ],
+    [
+      'malformed score node',
+      (v) => {
+        const p = v.capture.playerBoards[0];
+        p.boardHtml = p.boardHtml.replace(
+          element('span', 'player_score_100', '0'),
+          element('div', 'player_score_100', '0'),
+        );
+      },
+      /Malformed retained score/,
+    ],
+    [
+      'unknown option inserted',
+      (v) => {
+        v.capture.additionalBuildings = false;
+      },
+      /missing\/unknown field/,
+    ],
+  ]) {
+    const value = fragmentFixture();
+    mutate(value);
+    assert.throws(() => projectCapturedInitial(...inputs(value)), pattern, label);
+  }
+  for (const market of ['buildings', 'monuments']) {
+    for (const attributes of [
+      ' hidden',
+      ' inert',
+      ' popover',
+      ' popover="manual"',
+      ' style="opacity:0%"',
+      ' style="opacity:-1"',
+      ' style="opacity:-5%"',
+    ]) {
+      const value = fragmentFixture();
+      const html = fixture(4).capture[`${market}Html`];
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        html,
+        `<div${attributes}>${html}</div>`,
+      );
+      assert.throws(
+        () => projectCapturedInitial(...inputs(value)),
+        /Hidden retained/,
+        `${market} with hidden outer wrapper ${attributes}`,
+      );
+    }
+  }
+  for (const [tag, attributes] of [
+    ['datalist', ''],
+    ['dialog', ''],
+    ['details', ''],
+    ['details', ' open'],
+    ['div', ' popover'],
+    ['meter', ''],
+    ['progress', ''],
+    ['rp', ''],
+    ['svg', ''],
+    ['math', ''],
+    ['head', ''],
+  ]) {
+    const market = fragmentFixture();
+    const marketHtml = fixture(4).capture.monumentsHtml;
+    market.capture.boardHtml = market.capture.boardHtml.replace(
+      marketHtml,
+      `<${tag}${attributes}>${marketHtml}</${tag}>`,
+    );
+    assert.throws(
+      () => projectCapturedInitial(...inputs(market)),
+      /Hidden retained|unsupported retained initial fragment container/,
+      `${tag} market wrapper ${attributes}`,
+    );
+    const counter = fragmentFixture();
+    const counterHtml = element('span', 'corn_number_player_100', '8');
+    counter.capture.playerBoards[0].boardHtml = counter.capture.playerBoards[0].boardHtml.replace(
+      counterHtml,
+      `<${tag}${attributes}>${counterHtml}</${tag}>`,
+    );
+    assert.throws(
+      () => projectCapturedInitial(...inputs(counter)),
+      /Hidden retained|unsupported retained initial fragment container/,
+      `${tag} counter wrapper ${attributes}`,
+    );
+  }
+  for (const style of [
+    'display:none/**/',
+    String.raw`d\isplay:none`,
+    'display:none{}',
+    'display:none@layer',
+    '--d:none;display:var(--d)',
+    '--c:hidden;content-visibility:var(--c)',
+    'all:initial',
+  ]) {
+    const value = fragmentFixture();
+    const html = fixture(4).capture.monumentsHtml;
+    value.capture.boardHtml = value.capture.boardHtml.replace(
+      html,
+      `<div style="${style}">${html}</div>`,
+    );
+    assert.throws(
+      () => projectCapturedInitial(...inputs(value)),
+      /Unsupported retained initial fragment style/,
+      'ambiguous fragment CSS declarations',
+    );
+  }
+  for (const style of [
+    'display:var(--d,none)',
+    'display:inherit',
+    'visibility:var(--v,hidden)',
+    'visibility:inherit',
+    'content-visibility:var(--c,hidden)',
+    'content-visibility:inherit',
+    'content-visibility:auto',
+  ]) {
+    const value = fragmentFixture();
+    const html = fixture(4).capture.monumentsHtml;
+    value.capture.boardHtml = value.capture.boardHtml.replace(
+      html,
+      `<div style="${style}">${html}</div>`,
+    );
+    assert.throws(
+      () => projectCapturedInitial(...inputs(value)),
+      /Unsupported retained initial fragment visibility/,
+      `unsupported fragment visibility ${style}`,
+    );
+  }
+  for (const field of ['boardHtml', 'rowHtml']) {
+    const value = fragmentFixture();
+    const owner = field === 'boardHtml' ? value.capture : value.capture.playerBoards[0];
+    owner[field] = owner[field].replace('</div>', '<style>#monuments{display:none}</style></div>');
+    assert.throws(
+      () => projectCapturedInitial(...inputs(value)),
+      /unsupported retained initial fragment container/,
+      `retained stylesheet in ${field}`,
+    );
+  }
+  for (const opacity of ['calc(0)', 'var(--hidden)', 'inherit', 'initial', '1e999', '0x0']) {
+    const value = fragmentFixture();
+    const html = fixture(4).capture.monumentsHtml;
+    value.capture.boardHtml = value.capture.boardHtml.replace(
+      html,
+      `<div style="opacity:${opacity}">${html}</div>`,
+    );
+    assert.throws(
+      () => projectCapturedInitial(...inputs(value)),
+      /Unsupported retained initial fragment opacity/,
+      `unsupported fragment opacity ${opacity}`,
+    );
+  }
+  for (const style of [
+    'opacity:.5',
+    'opacity:50%',
+    'opacity:1e-1',
+    'display:block;visibility:visible;content-visibility:visible',
+  ]) {
+    const value = fragmentFixture();
+    const html = fixture(4).capture.monumentsHtml;
+    value.capture.boardHtml = value.capture.boardHtml.replace(
+      html,
+      `<div style="${style}">${html}</div>`,
+    );
+    assert.deepEqual(
+      projectCapturedInitial(...inputs(value)).record.initial,
+      projectCapturedInitial(...inputs(fragmentFixture())).record.initial,
+    );
+  }
+  const modern = fixture(4).capture;
+  for (const html of [
+    modern.templeMarkers[0].html,
+    modern.technologyMarkers[0].html,
+    modern.gears[0].html,
+    element('div', 'centralgearcorns'),
+  ]) {
+    const value = fragmentFixture();
+    value.capture.boardHtml = value.capture.boardHtml.replace(html, '');
+    value.capture.playerBoards[0].rowHtml = value.capture.playerBoards[0].rowHtml.replace(
+      '<h3',
+      `${html}<h3`,
+    );
+    assert.throws(
+      () => projectCapturedInitial(...inputs(value)),
+      /outside original board fragment|Missing retained DOM node/,
+      'board field supplied only by a player row',
+    );
+  }
+  const misplacedRound = fragmentFixture();
+  misplacedRound.capture.boardHtml = misplacedRound.capture.boardHtml.replace(
+    element('div', 'rounds_wrap', `経過日 ${element('span', 'current_round', '1')} / 27`),
+    element('div', 'rounds_wrap', '経過日 / 27') + element('span', 'current_round', '1'),
+  );
+  assert.throws(
+    () => projectCapturedInitial(...inputs(misplacedRound)),
+    /outside retained rounds wrapper/,
+  );
+  for (const [id, scalar, board] of [
+    ['corn_number_player_100', '8', false],
+    ['worker_number_player_100', '3', false],
+    ['player_score_100', '0', false],
+    ['current_round', '1', true],
+    ['skull_left', '13', true],
+  ]) {
+    for (const attributes of [' hidden', ' inert']) {
+      const value = fragmentFixture();
+      const target = board ? value.capture : value.capture.playerBoards[0];
+      target.boardHtml = target.boardHtml.replace(
+        element('span', id, scalar),
+        element('span', id, `<span${attributes}>${scalar}</span>`),
+      );
+      assert.throws(
+        () => projectCapturedInitial(...inputs(value)),
+        /nonscalar DOM counter|Hidden retained/,
+        `${id} with hidden numeric descendant ${attributes}`,
+      );
+    }
   }
 });
 function currentUi(value) {
@@ -641,6 +995,33 @@ test('pinned later collection reaches ordinary decoder checkpoints without chang
 
   const unused = withLaterWitnesses(value, [{ actionId: 8, buildings: ['b04'] }]);
   assert.match(decode(unused.repin()).decoded.manifest.blocked.reason, /Unused buildings witness/);
+
+  const fragments = fragmentFixture();
+  const fragmentInputs = inputs(fragments);
+  const observation = projectCapturedInitial(...fragmentInputs);
+  let seenInitialCheckpoint;
+  const fragmentDecoded = decodeProjectedInitial(...fragmentInputs, (request) => {
+    assert.equal(request.operation, 'publicReplay');
+    seenInitialCheckpoint = request.replay.initialCheckpoint;
+    return {
+      frames: [
+        {
+          snapshot: { state: request.replay.initial },
+          observation: { actor: 0, pendingTask: null, legalActions: [] },
+        },
+      ],
+      verifiedSteps: 0,
+      checkpointsVerified: 1,
+      sourceCoverage: { initial: false, foodDays: [], terminal: false, complete: false },
+    };
+  });
+  assert.deepEqual(seenInitialCheckpoint, observation.record.initialCheckpoint);
+  assert.deepEqual(
+    fragmentDecoded.decoded.record.initialCheckpoint.expected,
+    observation.witness.initialExpected,
+  );
+  assert.equal(fragmentDecoded.decoded.manifest.sourceCoverage.complete, false);
+  assert.equal(fragmentDecoded.decoded.manifest.trainingReady, false);
 });
 
 test('later collection refuses mismatched input bindings and invalid observations before core dispatch', () => {

@@ -18,6 +18,8 @@ export const ATLAS_SCHEMA = 'tzolkin-bga-playing-atlas-v1';
 export const LATER_WITNESS_SCHEMA = 'tzolkin-bga-playing-later-witnesses-v1';
 const LEGACY_CAPTURE_SCHEMA = 'tzolkin-bga-public-initial-selection-observation-v1';
 const LEGACY_CAPTURE_ADAPTER = 'tzolkin-bga-legacy-initial-capture-adapter-v1';
+const FRAGMENT_CAPTURE_SCHEMA = 'bga-retained-visible-initial-dom-v1';
+const FRAGMENT_CAPTURE_ADAPTER = 'tzolkin-bga-retained-initial-fragment-adapter-v1';
 const CAPTURE_SCHEMAS = new Set([
   'tzolkin-bga-public-playing-initial-board-witness-v1',
   'tzolkin-bga-public-setup-complete-playing-board-v1',
@@ -130,7 +132,7 @@ function entities(value) {
 
 // Retained outerHTML only: no execution, selectors, network or computed styles.
 // Browser-produced balanced markup is required; duplicate IDs/attributes fail closed.
-function htmlTree(source, label) {
+function htmlTree(source, label, fragmentOnly = false) {
   text(source, MAX_BYTES, label);
   const root = { tag: '#root', attrs: {}, children: [], start: 0, end: source.length };
   const stack = [root],
@@ -156,6 +158,8 @@ function htmlTree(source, label) {
     const match = /^<(\/)?([A-Za-z][A-Za-z0-9:-]*)/.exec(source.slice(at));
     if (!match) fail(`${label}: unsupported markup`);
     const tag = match[2].toLowerCase();
+    if (fragmentOnly && ['style', 'svg', 'math', 'head'].includes(tag))
+      fail(`${label}: unsupported retained initial fragment container`);
     if (
       [
         'iframe',
@@ -248,19 +252,78 @@ function byId(tree, id) {
   if (!node) fail(`Missing retained DOM node ${id}`);
   return node;
 }
-function retained(tree, items, predicate, label) {
+function retained(tree, items, predicate, label, domOnly = false) {
   const expected = tree.nodes.filter(predicate);
   list(items, 100, label);
   if (items.length !== expected.length) fail(`${label}: incomplete retained node list`);
   const seen = new Set();
   for (const item of items) {
-    if (!object(item) || item.visible !== true || seen.has(item.id))
+    if (!object(item) || (!domOnly && item.visible !== true) || seen.has(item.id))
       fail(`${label}: invisible/duplicate node`);
     seen.add(item.id);
     const node = byId(tree, item.id);
     if (!predicate(node) || item.html !== outer(tree, node)) fail(`${label}: detached HTML`);
+    if (domOnly) unhiddenFragmentNode(tree, node);
   }
   return expected;
+}
+
+function unhiddenFragmentNode(tree, node) {
+  for (const ancestor of tree.nodes.filter(
+    (item) => item.start <= node.start && item.end >= node.end,
+  )) {
+    if (/\/\*|\\|[{}@]/.test(ancestor.attrs.style ?? ''))
+      fail('Unsupported retained initial fragment style');
+    const css = styles(ancestor);
+    if (Object.keys(css).some((key) => key === 'all' || key.startsWith('--')))
+      fail('Unsupported retained initial fragment style');
+    const value = (key) =>
+      (css[key] ?? '')
+        .replace(/\s*!\s*important\s*$/i, '')
+        .trim()
+        .toLowerCase();
+    const supported = {
+      display: [
+        'none',
+        'block',
+        'inline',
+        'inline-block',
+        'flex',
+        'inline-flex',
+        'grid',
+        'inline-grid',
+        'flow-root',
+        'contents',
+        'list-item',
+      ],
+      visibility: ['visible', 'hidden', 'collapse'],
+      'content-visibility': ['visible', 'hidden'],
+    };
+    for (const [property, keywords] of Object.entries(supported))
+      if (value(property) !== '' && !keywords.includes(value(property)))
+        fail('Unsupported retained initial fragment visibility');
+    const opacityText = value('opacity');
+    const opacity = Number(opacityText.replace(/%$/, ''));
+    if (
+      opacityText !== '' &&
+      (!/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?%?$/i.test(opacityText) ||
+        !Number.isFinite(opacity))
+    )
+      fail('Unsupported retained initial fragment opacity');
+    if (
+      ['datalist', 'details', 'meter', 'progress', 'rp'].includes(ancestor.tag) ||
+      (ancestor.tag === 'dialog' && !Object.hasOwn(ancestor.attrs, 'open')) ||
+      Object.hasOwn(ancestor.attrs, 'popover') ||
+      Object.hasOwn(ancestor.attrs, 'hidden') ||
+      Object.hasOwn(ancestor.attrs, 'inert') ||
+      ancestor.attrs['aria-hidden']?.trim().toLowerCase() === 'true' ||
+      value('display') === 'none' ||
+      ['hidden', 'collapse'].includes(value('visibility')) ||
+      value('content-visibility') === 'hidden' ||
+      (opacityText !== '' && opacity <= 0)
+    )
+      fail('Hidden retained initial fragment node');
+  }
 }
 function styles(node) {
   const result = Object.create(null);
@@ -285,7 +348,8 @@ function sprite(node) {
   if (!match) fail('Missing/unsupported sprite position');
   return [pixels(match[1], 'sprite x'), pixels(match[2], 'sprite y')];
 }
-function natural(node, label) {
+function natural(node, label, plain = false) {
+  if (plain && node.children.some(object)) fail(`${label}: nonscalar DOM counter`);
   const value = nodeText(node).trim();
   if (!/^\d+$/.test(value)) fail(`${label}: nonnumeric DOM counter`);
   return integer(Number(value), 0, 100000, label);
@@ -315,6 +379,211 @@ function profile(value) {
   )
     fail('Unsupported mechanical profile');
   return structuredClone(value);
+}
+
+function retainedInitialFragments(capture) {
+  closed(
+    capture,
+    [
+      'schema',
+      'sourceKind',
+      'tableId',
+      'sourceUrl',
+      'moveText',
+      'roundText',
+      'prompt',
+      'boardHtml',
+      'playerBoards',
+      'renderedReplayControls',
+      'completeNativeReplayQualified',
+      'humanBcQualified',
+    ],
+    'retained initial fragments',
+  );
+  const url = urlIdentity(capture.sourceUrl);
+  if (
+    capture.sourceKind !== 'public_ui_dom_only' ||
+    capture.completeNativeReplayQualified !== false ||
+    capture.humanBcQualified !== false ||
+    url.searchParams.get('table') !== capture.tableId ||
+    !/^[1-9]\d*$/.test(capture.moveText) ||
+    capture.roundText !== '1'
+  )
+    fail('Retained initial fragment identity/boundary mismatch');
+  for (const control of list(capture.renderedReplayControls, 3, 'replay controls')) {
+    closed(control, ['id', 'html'], 'replay control');
+    if (!['archive_restart', 'archive_next', 'archive_end_game'].includes(control.id))
+      fail('Unknown retained replay control');
+    text(control.html, 4096, 'replay control HTML');
+  }
+  const board = htmlTree(capture.boardHtml, 'retained board', true);
+  if (
+    byId(board, 'board').tag !== 'div' ||
+    outer(board, byId(board, 'board')) !== capture.boardHtml
+  )
+    fail('Detached retained board fragment');
+  unhiddenFragmentNode(board, byId(board, 'board'));
+  for (const id of [
+    'rounds_wrap',
+    'current_round',
+    'skull_left_wrap',
+    'skull_left',
+    'buildings',
+    'monuments',
+    'centralgearcorns',
+    'workerplace_startingPlayer_0',
+    ...[2, 3, 4, 5].map((box) => `jungle_${box}`),
+  ])
+    byId(board, id);
+  const rounds = byId(board, 'rounds_wrap');
+  const round = byId(board, 'current_round');
+  if (round.start <= rounds.start || round.end >= rounds.end)
+    fail('Round counter outside retained rounds wrapper');
+  for (const node of board.nodes.filter(
+    (node) => node.start >= rounds.start && node.end <= rounds.end,
+  ))
+    unhiddenFragmentNode(board, node);
+  const identities = new Map(),
+    panels = [],
+    rows = [],
+    selected = [];
+  for (const item of list(capture.playerBoards, 4, 'retained player fragments')) {
+    closed(
+      item,
+      ['playerId', 'boardHtml', 'rowHtml', 'buildingsHtml', 'wealthTilesHtml'],
+      'player fragments',
+    );
+    const id = item.playerId;
+    if (typeof id !== 'string' || !/^\d+$/.test(id) || identities.has(id))
+      fail('Duplicate/invalid retained player identity');
+    const panel = htmlTree(item.boardHtml, 'retained player board', true);
+    const owner = byId(panel, `player_board_${id}`);
+    if (owner.tag !== 'div' || outer(panel, owner) !== item.boardHtml)
+      fail('Detached retained player board');
+    if (byId(panel, `player_score_${id}`).tag !== 'span') fail('Malformed retained score counter');
+    const row = htmlTree(item.rowHtml, 'retained player row', true);
+    const root = row.nodes[0];
+    if (
+      !root ||
+      root.tag !== 'div' ||
+      !token(root, 'whiteblock') ||
+      outer(row, root) !== item.rowHtml
+    )
+      fail('Detached retained player row');
+    for (const [tree, own] of [
+      [panel, owner],
+      [row, root],
+    ]) {
+      unhiddenFragmentNode(tree, own);
+      for (const node of tree.nodes) {
+        const key = node.attrs.id ?? '';
+        const other =
+          /^(?:(?:worker|corn|wood|stone|gold|skull)_number_player_|player_(?:board|name|score|buildings|wealthtiles)_|firstplayer_|marker_)(\d+)(?:_|$)/.exec(
+            key,
+          )?.[1];
+        if (
+          (other !== undefined && other !== id) ||
+          (node !== owner && /^(?:overall_player_board_|player_board_)/.test(key))
+        )
+          fail('Retained player fragment crosses owner identity');
+      }
+    }
+    const heading = one(
+      root.children.filter(object),
+      (node) => node.tag === 'h3',
+      'retained player heading',
+    );
+    unhiddenFragmentNode(row, heading);
+    if (heading.children.some(object)) fail('Malformed retained player heading');
+    const label = nodeText(heading).trim();
+    if (!label.endsWith(':')) fail('Malformed retained player heading');
+    identities.set(id, {
+      name: text(label.slice(0, -1), 128, 'player name'),
+      color: styles(heading).color,
+    });
+    const wealth = byId(row, `player_wealthtiles_${id}`);
+    const buildings = byId(row, `player_buildings_${id}`);
+    if (
+      wealth.tag !== 'div' ||
+      buildings.tag !== 'div' ||
+      !root.children.includes(wealth) ||
+      !root.children.includes(buildings) ||
+      outer(row, wealth) !== item.wealthTilesHtml ||
+      outer(row, buildings) !== item.buildingsHtml ||
+      buildings.children.some((child) => typeof child !== 'string' || child.trim())
+    )
+      fail('Detached/nonempty retained player cards');
+    unhiddenFragmentNode(row, buildings);
+    panels.push(item.boardHtml);
+    rows.push(item.rowHtml);
+    selected.push({ id: wealth.attrs.id, html: item.wealthTilesHtml });
+  }
+  if (![3, 4].includes(identities.size) || !identities.has(url.searchParams.get('player')))
+    fail('Incomplete retained roster/view identity');
+  const gameAreaHtml = capture.boardHtml + rows.join('');
+  const playerBoardsHtml = panels.join('');
+  const tree = htmlTree(gameAreaHtml, 'retained game fragments', true);
+  const boards = htmlTree(playerBoardsHtml, 'retained counter fragments', true);
+  if ([...tree.ids.keys()].some((id) => boards.ids.has(id)))
+    fail('Conflicting retained sibling node identities');
+  const boardRoot = byId(tree, 'board');
+  for (const node of tree.nodes) {
+    const boardField =
+      /^(?:rounds_wrap$|current_round$|skull_left(?:_wrap)?$|buildings$|monuments$|centralgearcorns$|jungle_|workerplace_|gear_|skullplace_|marker_\d+_(?:temple|technology)_)/.test(
+        node.attrs.id ?? '',
+      ) || ['workerplace', 'board_tile', 'construction'].some((kind) => token(node, kind));
+    if (boardField && (node.start <= boardRoot.start || node.end >= boardRoot.end))
+      fail('Retained board field outside original board fragment');
+  }
+  if (tree.nodes.some((node) => token(node, 'worker')))
+    fail('Retained fragments lack placed-worker geometry');
+  const nodes = (source, predicate, tag) =>
+    source.nodes.filter(predicate).map((node) => {
+      if (node.tag !== tag) fail('Malformed retained initial field node');
+      return { id: node.attrs.id, html: outer(source, node) };
+    });
+  return {
+    ...capture,
+    url: capture.sourceUrl,
+    viewPlayerId: url.searchParams.get('player'),
+    move: `Move #${capture.moveText}`,
+    header: capture.prompt,
+    roundsText: nodeText(rounds).trim().replace(/\s+/g, ' '),
+    gameAreaHtml,
+    playerBoardsHtml,
+    identities,
+    offerNodesRemaining: tree.nodes.filter(
+      (node) =>
+        token(node, 'wealth_tile') &&
+        !selected.some((item) => {
+          const panel = byId(tree, item.id);
+          return node.start > panel.start && node.end < panel.end;
+        }),
+    ).length,
+    publicCounters: nodes(
+      boards,
+      (node) => /^(worker|corn|wood|stone|gold|skull)_number_player_\d+$/.test(node.attrs.id ?? ''),
+      'span',
+    ),
+    selectedPlayerTiles: selected,
+    templeMarkers: nodes(tree, (node) => /^marker_\d+_temple_/.test(node.attrs.id ?? ''), 'div'),
+    technologyMarkers: nodes(
+      tree,
+      (node) => /^marker_\d+_technology_/.test(node.attrs.id ?? ''),
+      'div',
+    ),
+    gears: nodes(
+      tree,
+      (node) =>
+        /^gear_(central|palenque|yaxchilan|tikal|uxmal|chichenItza)$/.test(node.attrs.id ?? ''),
+      'img',
+    ),
+    gearWorkerNodes: [],
+    skullSpaces: nodes(tree, (node) => /^skullplace_\d+$/.test(node.attrs.id ?? ''), 'div'),
+    skullRemainingHtml: outer(tree, byId(tree, 'skull_left_wrap')),
+    buildingsHtml: outer(tree, byId(tree, 'buildings')),
+    monumentsHtml: outer(tree, byId(tree, 'monuments')),
+  };
 }
 
 // This older capture retained nested sidebar panels rather than one board and
@@ -650,7 +919,7 @@ function dimensions(rect, label) {
     number(rect[key], key === 'x' || key === 'y' ? -100000 : 1, 100000, label);
   return rect;
 }
-function dummyProjection(capture, tree, atlas, n) {
+function dummyProjection(capture, tree, atlas, n, domOnly = false) {
   const gears = Object.fromEntries(
     GEARS.map((gear) => [gear, Array(gear === 'chichenItza' ? 13 : 10).fill(null)]),
   );
@@ -659,6 +928,7 @@ function dummyProjection(capture, tree, atlas, n) {
     capture.gearWorkerNodes,
     (node) => token(node, 'worker'),
     'gear workers',
+    domOnly,
   );
   if (
     nodes.length !== (4 - n) * 6 ||
@@ -673,6 +943,7 @@ function dummyProjection(capture, tree, atlas, n) {
   ];
   if (places.length !== expectedIds.length || expectedIds.some((id) => !placeIds.has(id)))
     fail('Initial worker spaces incomplete');
+  if (domOnly) places.forEach((node) => unhiddenFragmentNode(tree, node));
   if (!nodes.length) return gears;
   const geometry = atlas.geometry;
   if (geometry === null) fail('Missing calibrated dummy geometry');
@@ -770,7 +1041,9 @@ export function projectCapturedInitial(
   observedBasicUnlimitedOptions(raw, table);
   const mechanicalProfile = profile(control.mechanicalProfile);
   const legacy = capture.schema === LEGACY_CAPTURE_SCHEMA;
+  const fragments = capture.schema === FRAGMENT_CAPTURE_SCHEMA;
   if (legacy) capture = legacyInitialCapture(capture);
+  else if (fragments) capture = retainedInitialFragments(capture);
   else if (!CAPTURE_SCHEMAS.has(capture.schema)) fail('Unsupported Playing capture schema');
   const url = urlIdentity(capture.url);
   const release = /^\/archive\/replay\/([A-Za-z0-9_-]{1,64})\/$/.exec(url.pathname)?.[1];
@@ -793,8 +1066,8 @@ export function projectCapturedInitial(
     !game.rawEntries.some((entry) => entry.action_id === actionId)
   )
     fail('Raw log/capture boundary mismatch');
-  const tree = htmlTree(capture.gameAreaHtml, 'game area');
-  const boards = htmlTree(capture.playerBoardsHtml, 'player boards');
+  const tree = htmlTree(capture.gameAreaHtml, 'game area', fragments);
+  const boards = htmlTree(capture.playerBoardsHtml, 'player boards', fragments);
   const atlas = atlasFrom(calibration, release, control.capture.sha256);
   if (
     capture.offerNodesRemaining !== 0 ||
@@ -805,17 +1078,20 @@ export function projectCapturedInitial(
   )
     fail('Starting offers remain active');
   if (
-    natural(byId(tree, 'current_round'), 'round') !== 1 ||
+    natural(byId(tree, 'current_round'), 'round', fragments) !== 1 ||
     !/^経過日\s+1\s*\/\s*27$/.test(capture.roundsText ?? '')
   )
     fail('Capture is not day one');
+  if (fragments) unhiddenFragmentNode(tree, byId(tree, 'current_round'));
   const playerNodes = boards.nodes.filter((node) =>
-    /^overall_player_board_\d+$/.test(node.attrs.id ?? ''),
+    (fragments ? /^player_board_\d+$/ : /^overall_player_board_\d+$/).test(node.attrs.id ?? ''),
   );
   const n = playerNodes.length;
   if (![3, 4].includes(n) || game.context.playerCount !== n)
     fail('Only complete three/four-player captures are supported');
-  const sourceIds = playerNodes.map((node) => node.attrs.id.slice('overall_player_board_'.length));
+  const sourceIds = playerNodes.map((node) =>
+    node.attrs.id.slice((fragments ? 'player_board_' : 'overall_player_board_').length),
+  );
   list(control.seatOrder, 4, 'seat order');
   if (
     control.seatOrder.length !== n ||
@@ -849,24 +1125,28 @@ export function projectCapturedInitial(
     capture.publicCounters,
     (node) => /^(worker|corn|wood|stone|gold|skull)_number_player_\d+$/.test(node.attrs.id ?? ''),
     'public counters',
+    fragments,
   );
   retained(
     tree,
     capture.selectedPlayerTiles,
     (node) => /^player_wealthtiles_\d+$/.test(node.attrs.id ?? ''),
     'selected wealth panels',
+    fragments,
   );
   retained(
     tree,
     capture.templeMarkers,
     (node) => /^marker_\d+_temple_/.test(node.attrs.id ?? ''),
     'temple markers',
+    fragments,
   );
   retained(
     tree,
     capture.technologyMarkers,
     (node) => /^marker_\d+_technology_/.test(node.attrs.id ?? ''),
     'technology markers',
+    fragments,
   );
   if (
     capture.publicCounters.length !== n * 6 ||
@@ -878,14 +1158,20 @@ export function projectCapturedInitial(
     fail('Incomplete player setup fields');
   const usedWealth = new Set();
   const players = control.seatOrder.map((id, index) => {
-    const nameNode = byId(boards, `player_name_${id}`);
-    const link = one(
-      nameNode.children.filter(object),
-      (node) => node.tag === 'a',
-      'player name link',
-    );
-    const name = text(nodeText(link).trim(), 128, 'player name');
-    const color = styles(link).color;
+    let identity = fragments ? capture.identities.get(id) : null;
+    if (!fragments) {
+      const nameNode = byId(boards, `player_name_${id}`);
+      const link = one(
+        nameNode.children.filter(object),
+        (node) => node.tag === 'a',
+        'player name link',
+      );
+      identity = {
+        name: text(nodeText(link).trim(), 128, 'player name'),
+        color: styles(link).color,
+      };
+    }
+    const { name, color } = identity;
     if (!/^#[a-f0-9]{6}$/i.test(color ?? '')) fail('Unknown player color');
     const wealthPanel = byId(tree, `player_wealthtiles_${id}`);
     const tiles = wealthPanel.children.filter(object);
@@ -904,10 +1190,10 @@ export function projectCapturedInitial(
     const resources = Object.fromEntries(
       RESOURCES.map((resource) => [
         resource,
-        natural(byId(boards, `${resource}_number_player_${id}`), 'resource'),
+        natural(byId(boards, `${resource}_number_player_${id}`), 'resource', fragments),
       ]),
     );
-    const workers = natural(byId(boards, `worker_number_player_${id}`), 'workers');
+    const workers = natural(byId(boards, `worker_number_player_${id}`), 'workers', fragments);
     const temples = Object.fromEntries(
       TEMPLES.map((temple) => [
         temple,
@@ -925,12 +1211,16 @@ export function projectCapturedInitial(
       ]),
     );
     const effects = wealthEffects(wealth);
+    if (fragments) {
+      unhiddenFragmentNode(boards, byId(boards, `player_score_${id}`));
+      tiles.forEach((node) => unhiddenFragmentNode(tree, node));
+    }
     if (
       !same(resources, effects.resources) ||
       !same(temples, effects.temples) ||
       !same(technologies, effects.technologies) ||
       workers !== effects.workers ||
-      natural(byId(boards, `player_score_${id}`), 'score') !== 0
+      natural(byId(boards, `player_score_${id}`), 'score', fragments) !== 0
     )
       fail('Selected artwork does not match initial counters/markers');
     return {
@@ -962,6 +1252,7 @@ export function projectCapturedInitial(
   )
     fail('Captured names differ from raw log roster');
   const firstToken = byId(boards, 'firstplayer');
+  if (fragments) unhiddenFragmentNode(boards, firstToken);
   const firstParent = one(
     boards.nodes,
     (node) => node.children.includes(firstToken),
@@ -983,13 +1274,14 @@ export function projectCapturedInitial(
     (node) =>
       /^gear_(central|palenque|yaxchilan|tikal|uxmal|chichenItza)$/.test(node.attrs.id ?? ''),
     'unrotated gears',
+    fragments,
   );
   if (
     capture.gears.length !== 6 ||
     capture.gears.some((item) => styles(byId(tree, item.id)).transform !== 'rotate(0deg)')
   )
     fail('Initial gears are missing/rotated');
-  const gears = dummyProjection(capture, tree, atlas, n);
+  const gears = dummyProjection(capture, tree, atlas, n, fragments);
   const jungle = {};
   for (let box = 2; box <= 5; box++) {
     const tiles = byId(tree, `jungle_${box}`).children.filter(object);
@@ -1003,6 +1295,7 @@ export function projectCapturedInitial(
       )
     )
       fail('Initial jungle tiles incomplete');
+    if (fragments) tiles.forEach((node) => unhiddenFragmentNode(tree, node));
     jungle[box] = { corn: n, wood: box === 2 ? 0 : n };
   }
   const skulls = retained(
@@ -1010,6 +1303,7 @@ export function projectCapturedInitial(
     capture.skullSpaces,
     (node) => /^skullplace_\d+$/.test(node.attrs.id ?? ''),
     'skull spaces',
+    fragments,
   );
   if (
     skulls.length !== 9 ||
@@ -1019,7 +1313,8 @@ export function projectCapturedInitial(
     fail('Skull spaces incomplete/occupied');
   if (capture.skullRemainingHtml !== outer(tree, byId(tree, 'skull_left_wrap')))
     fail('Detached skull supply HTML');
-  const skullSupply = natural(byId(tree, 'skull_left'), 'skull supply');
+  const skullSupply = natural(byId(tree, 'skull_left'), 'skull supply', fragments);
+  if (fragments) unhiddenFragmentNode(tree, byId(tree, 'skull_left'));
   if (skullSupply + players.reduce((sum, player) => sum + player.resources.skull, 0) !== 13)
     fail('Initial skull conservation mismatch');
   const construction = (kind, html, containerId, count) => {
@@ -1029,6 +1324,7 @@ export function projectCapturedInitial(
     const pattern = kind === 'building' ? /^building_age_1_(\d+)$/ : /^monument_(\d+)$/;
     if (nodes.length !== count || nodes.some((node) => !pattern.test(node.attrs.id ?? '')))
       fail(`Incomplete ${kind} market`);
+    if (fragments) nodes.forEach((node) => unhiddenFragmentNode(tree, byId(tree, node.attrs.id)));
     nodes.sort((a, b) => Number(pattern.exec(a.attrs.id)[1]) - Number(pattern.exec(b.attrs.id)[1]));
     const used = new Set();
     return nodes.map((node) => {
@@ -1070,6 +1366,49 @@ export function projectCapturedInitial(
     finalScores: [],
     hidden: { seed: 'unknown', setupOffers: 'unknown', deckOrder: 'unknown' },
   };
+  let initialExpected = null;
+  if (fragments) {
+    for (const id of ['workerplace_startingPlayer_0', 'centralgearcorns']) {
+      const node = byId(tree, id);
+      unhiddenFragmentNode(tree, node);
+      if (node.children.some((child) => typeof child !== 'string' || child.trim()))
+        fail('Retained initial starting area is nonempty');
+    }
+    // Select only fields checked against retained nodes. Covered corn, seat
+    // order, age and food history remain mechanical declarations, not witnesses.
+    initialExpected = {
+      round: 1,
+      currentPlayer: firstPlayer,
+      firstPlayer,
+      players: players.map(({ id, resources, score, workers, temples, technologies, wealth }) => ({
+        id,
+        resources,
+        score,
+        workers,
+        temples,
+        technologies,
+        wealth,
+        buildings: [],
+        monuments: [],
+      })),
+      gears,
+      jungle: Object.fromEntries(
+        [2, 3, 4, 5].map((box) => [box, { [box === 2 ? 'corn' : 'wood']: n }]),
+      ),
+      skullSupply,
+      skullSpaces: Array(10).fill(null),
+      firstPlayerClaimed: null,
+      accumulatedCorn: 0,
+      monuments,
+    };
+    const market = htmlTree(capture.buildingsHtml, 'retained building identities');
+    if (
+      market.nodes
+        .filter((node) => token(node, 'construction'))
+        .every((node) => faceId(atlas, 'building', node).length === 1)
+    )
+      initialExpected.buildings = buildings;
+  }
   const witness = {
     schema: WITNESS_SCHEMA,
     tableId: game.tableId,
@@ -1077,6 +1416,7 @@ export function projectCapturedInitial(
     catalogHash: catalogFingerprint(catalogBytes),
     initialActionId: actionId,
     initial: structuredClone(initial),
+    ...(initialExpected === null ? {} : { initialExpected: structuredClone(initialExpected) }),
     witnesses:
       laterWitnessBytes === null
         ? []
@@ -1104,7 +1444,13 @@ export function projectCapturedInitial(
     market: 'unlimited',
     source: { reference: game.source.reference, actionIds: [actionId] },
     initial,
-    initialCheckpoint: null,
+    initialCheckpoint:
+      initialExpected === null
+        ? null
+        : {
+            source: { reference: game.source.reference, actionIds: [actionId] },
+            expected: structuredClone(initialExpected),
+          },
     steps: [],
     terminalCheckpoint: null,
   };
@@ -1121,6 +1467,38 @@ export function projectCapturedInitial(
               sourceSchema: LEGACY_CAPTURE_SCHEMA,
               visibilityVerified: false,
               geometryVerified: false,
+            },
+          }
+        : {}),
+      ...(fragments
+        ? {
+            captureAdapter: {
+              schema: FRAGMENT_CAPTURE_ADAPTER,
+              sourceSchema: FRAGMENT_CAPTURE_SCHEMA,
+              visibilityVerified: false,
+              geometryVerified: false,
+            },
+            initialObservation: {
+              kind: 'partial-retained-dom',
+              playerCounters: 'playerBoards[].boardHtml: exact owner spans and score',
+              playerCards:
+                'playerBoards[].rowHtml: exact selected and empty acquired-card fragments',
+              playerIdentity:
+                'playerBoards[].rowHtml: own direct h3 text/color; IDs bind the sibling board',
+              markersAndFaces:
+                'boardHtml/rowHtml: exact nodes interpreted by the separately pinned atlas',
+              startingArea: 'boardHtml: empty workerplace_startingPlayer_0 and centralgearcorns',
+              omitted: [
+                'age',
+                'foodDays',
+                'turnOrder',
+                'turnIndex',
+                'covered corn under wood',
+                ...(initialExpected.buildings === undefined
+                  ? ['ambiguous physical building identities']
+                  : []),
+              ],
+              completeSourceBoard: false,
             },
           }
         : {}),
