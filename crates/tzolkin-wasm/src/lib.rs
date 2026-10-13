@@ -198,6 +198,12 @@ pub fn dispatch_cpu(observation: &str) -> Result<String, JsError> {
     tzolkin_bot::dispatch_cpu(observation).map_err(|error| JsError::new(&error))
 }
 
+/// Current standard App CPU, with explicitly versioned core-aligned food costs.
+#[wasm_bindgen]
+pub fn dispatch_cpu_food_aligned(observation: &str) -> Result<String, JsError> {
+    tzolkin_bot::dispatch_cpu_food_aligned(observation).map_err(|error| JsError::new(&error))
+}
+
 /// Immutable numeric-only model storage. Loading does not establish training
 /// ownership or source authenticity; the Worker owns this instance until reset.
 #[wasm_bindgen]

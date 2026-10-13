@@ -1,4 +1,7 @@
-import init, { CpuDeployment, dispatch_cpu } from '../../generated/wasm/tzolkin_wasm.js';
+import init, {
+  CpuDeployment,
+  dispatch_cpu_food_aligned,
+} from '../../generated/wasm/tzolkin_wasm.js';
 import type { CpuRequest } from './cpu';
 
 let ready: Promise<unknown> | undefined;
@@ -104,7 +107,7 @@ self.addEventListener('message', (event: MessageEvent<CpuRequest>) => {
       } else if (mode === 'nn') throw new Error('NN choice requires its game callback');
       let decision: unknown;
       if (mode === 'heuristic' && expectedChecksum === null) {
-        decision = JSON.parse(dispatch_cpu(observationJson));
+        decision = JSON.parse(dispatch_cpu_food_aligned(observationJson));
       } else if (mode === 'nn') {
         decision = JSON.parse(
           model!.choose_guarded(expectedGame!, callbackIndex!, observationJson, expectedChecksum!),

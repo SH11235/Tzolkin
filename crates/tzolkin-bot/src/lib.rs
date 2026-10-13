@@ -5,6 +5,7 @@ use tzolkin_core::GameMove;
 use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, observation_key};
 
 pub const POLICY_VERSION: &str = "heuristic-v2";
+pub const FOOD_ALIGNED_POLICY_VERSION: &str = "heuristic-food-aligned-v1";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {
@@ -31,6 +32,29 @@ pub fn choose_move_with_weights_for_revision(
     weights: &policy::HeuristicWeights,
     revision: policy::HeuristicRevision,
 ) -> Result<Decision, String> {
+    choose_scored(observation, weights, revision.policy_version(), |action| {
+        policy::score_action_for_revision(observation, action, weights, revision)
+    })
+}
+
+/// Current App food estimates follow the core's full-feeding cost. Historical
+/// selectors keep their original versions, scoring and legal-order tie breaks.
+pub fn choose_move_food_aligned(observation: &Observation) -> Result<Decision, String> {
+    let weights = policy::HeuristicWeights::default();
+    choose_scored(
+        observation,
+        &weights,
+        FOOD_ALIGNED_POLICY_VERSION,
+        |action| policy::score_action_food_aligned(observation, action, &weights),
+    )
+}
+
+fn choose_scored(
+    observation: &Observation,
+    weights: &policy::HeuristicWeights,
+    policy_version: &str,
+    score_action: impl Fn(&tzolkin_core::observation::TypedAction) -> f64,
+) -> Result<Decision, String> {
     weights.validate()?;
     if observation.schema != OBSERVATION_SCHEMA || observation.move_schema != MOVE_SCHEMA {
         return Err("Unsupported observation or move schema".into());
@@ -54,8 +78,7 @@ pub fn choose_move_with_weights_for_revision(
     }
     let mut best = None;
     for action in &observation.legal_actions {
-        let score =
-            policy::score_action_for_revision(observation, &action.action, weights, revision);
+        let score = score_action(&action.action);
         if !score.is_finite() {
             return Err("Non-finite policy score".into());
         }
@@ -67,13 +90,24 @@ pub fn choose_move_with_weights_for_revision(
     Ok(Decision {
         actor: observation.actor,
         observation_key: key,
-        policy_version: revision.policy_version().into(),
+        policy_version: policy_version.into(),
         r#move: action.r#move.clone(),
         score,
     })
 }
 /// This endpoint accepts only the redacted observation, including the complete legal set.
 pub fn dispatch_cpu(request: &str) -> Result<String, String> {
+    dispatch_with(request, choose_move)
+}
+
+pub fn dispatch_cpu_food_aligned(request: &str) -> Result<String, String> {
+    dispatch_with(request, choose_move_food_aligned)
+}
+
+fn dispatch_with(
+    request: &str,
+    choose: fn(&Observation) -> Result<Decision, String>,
+) -> Result<String, String> {
     let observation: Observation = serde_json::from_str(request).map_err(|e| e.to_string())?;
-    serde_json::to_string(&choose_move(&observation)?).map_err(|e| e.to_string())
+    serde_json::to_string(&choose(&observation)?).map_err(|e| e.to_string())
 }

@@ -21,6 +21,17 @@ impl HeuristicRevision {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ScoringProfile {
+    Historical(HeuristicRevision),
+    FoodAligned,
+}
+impl From<HeuristicRevision> for ScoringProfile {
+    fn from(revision: HeuristicRevision) -> Self {
+        Self::Historical(revision)
+    }
+}
+
 /// Fixed hypotheses for the untrained baseline, independent of runtime speed measurements.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -77,7 +88,22 @@ fn active(o: &Observation) -> Option<ProphecyId> {
     let e = o.expansion.as_ref()?;
     e.prophecies.get(e.active_prophecy?).copied()
 }
-fn food_requirement(o: &Observation, p: &PublicPlayer) -> f64 {
+fn food_requirement(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f64 {
+    if matches!(revision, ScoringProfile::FoodAligned) {
+        let requirement = 2.0
+            + f64::from(u8::from(active(o) == Some(ProphecyId::Hunger)))
+            + f64::from(u8::from(
+                p.tribe.or(o.private.selected_tribe) == Some(TribeId::Yaluk),
+            ));
+        let discounted = if p.feed_all {
+            p.workers
+        } else {
+            p.feed_workers.min(p.workers)
+        } as f64;
+        let cheap = (requirement - p.feed_discount as f64 - 2.0).max(0.0);
+        let normal = (requirement - p.feed_discount as f64).max(0.0);
+        return discounted * cheap + (p.workers as f64 - discounted) * normal;
+    }
     if p.feed_all {
         return 0.0;
     }
@@ -91,22 +117,28 @@ fn food_requirement(o: &Observation, p: &PublicPlayer) -> f64 {
     (paying * (if hungry { 3.0 } else { 2.0 }) - p.feed_discount as f64 + p.workers as f64 * extra)
         .max(0.0)
 }
-fn corn_target(o: &Observation, p: &PublicPlayer, revision: HeuristicRevision) -> f64 {
+fn corn_target(o: &Observation, p: &PublicPlayer, revision: ScoringProfile) -> f64 {
     let food = [8, 14, 21, 27].into_iter().find(|day| match revision {
-        HeuristicRevision::V1 => *day >= o.round && !o.food_days.contains(day),
-        HeuristicRevision::V2 => !o.food_days.contains(day),
+        ScoringProfile::Historical(HeuristicRevision::V1) => {
+            *day >= o.round && !o.food_days.contains(day)
+        }
+        ScoringProfile::Historical(HeuristicRevision::V2) | ScoringProfile::FoodAligned => {
+            !o.food_days.contains(day)
+        }
     });
     let reserve = match revision {
-        HeuristicRevision::V1 => match food.map(|day| day - o.round) {
-            Some(0..=2) => food_requirement(o, p),
-            Some(3..=5) => food_requirement(o, p) * 0.6,
+        ScoringProfile::Historical(HeuristicRevision::V1) => match food.map(|day| day - o.round) {
+            Some(0..=2) => food_requirement(o, p, revision),
+            Some(3..=5) => food_requirement(o, p, revision) * 0.6,
             _ => 2.0,
         },
-        HeuristicRevision::V2 => match food.map(|day| day - o.round) {
-            Some(..=2) => food_requirement(o, p),
-            Some(3..=5) => food_requirement(o, p) * 0.6,
-            _ => 2.0,
-        },
+        ScoringProfile::Historical(HeuristicRevision::V2) | ScoringProfile::FoodAligned => {
+            match food.map(|day| day - o.round) {
+                Some(..=2) => food_requirement(o, p, revision),
+                Some(3..=5) => food_requirement(o, p, revision) * 0.6,
+                _ => 2.0,
+            }
+        }
     };
     reserve + 3.0
 }
@@ -115,7 +147,7 @@ fn value(
     p: &PublicPlayer,
     r: Resource,
     w: &HeuristicWeights,
-    revision: HeuristicRevision,
+    revision: ScoringProfile,
 ) -> f64 {
     match r {
         Resource::Corn => {
@@ -136,7 +168,7 @@ fn amount_value(
     p: &PublicPlayer,
     amounts: &[i64; 5],
     w: &HeuristicWeights,
-    revision: HeuristicRevision,
+    revision: ScoringProfile,
 ) -> f64 {
     RESOURCE_IDS
         .into_iter()
@@ -149,7 +181,7 @@ fn effects_value(
     p: &PublicPlayer,
     effects: &[Effect],
     w: &HeuristicWeights,
-    revision: HeuristicRevision,
+    revision: ScoringProfile,
 ) -> f64 {
     let remaining_food = [8, 14, 21, 27]
         .into_iter()
@@ -163,7 +195,7 @@ fn effects_value(
                 .map(|(r, n)| *n as f64 * value(o, p, *r, w, revision))
                 .sum(),
             Effect::Feed { workers } => match workers {
-                FeedWorkers::All(_) => food_requirement(o, p) * remaining_food * 0.9,
+                FeedWorkers::All(_) => food_requirement(o, p, revision) * remaining_food * 0.9,
                 FeedWorkers::Count(n) => *n as f64 * remaining_food * 1.8,
             },
             Effect::FeedDiscount { amount } => *amount as f64 * remaining_food * 0.9,
@@ -193,7 +225,7 @@ fn action_value(
     gear: GearId,
     position: i64,
     w: &HeuristicWeights,
-    revision: HeuristicRevision,
+    revision: ScoringProfile,
 ) -> f64 {
     let pos = position.min(if gear == GearId::ChichenItza { 9 } else { 5 });
     match gear {
@@ -258,6 +290,21 @@ pub fn score_action_for_revision(
     a: &TypedAction,
     w: &HeuristicWeights,
     revision: HeuristicRevision,
+) -> f64 {
+    score_action_for_profile(o, a, w, revision.into())
+}
+
+/// The current food-cost profile preserves V2 timing, weights and legal order.
+/// Historical scoring and ResourceCycle continue to use their explicit revisions.
+pub fn score_action_food_aligned(o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f64 {
+    score_action_for_profile(o, a, w, ScoringProfile::FoodAligned)
+}
+
+fn score_action_for_profile(
+    o: &Observation,
+    a: &TypedAction,
+    w: &HeuristicWeights,
+    revision: ScoringProfile,
 ) -> f64 {
     let p = &o.players[o.actor];
     match a {
@@ -571,7 +618,7 @@ mod tests {
             let observation = observe(&state, state.current_player).unwrap();
             let player = &observation.players[observation.actor];
             assert_eq!(
-                corn_target(&observation, player, HeuristicRevision::V2),
+                corn_target(&observation, player, HeuristicRevision::V2.into()),
                 target
             );
             let weights = HeuristicWeights::default();
@@ -581,7 +628,7 @@ mod tests {
                     player,
                     Resource::Corn,
                     &weights,
-                    HeuristicRevision::V2
+                    HeuristicRevision::V2.into()
                 ),
                 if sell {
                     weights.corn_when_short
@@ -625,7 +672,7 @@ mod tests {
             assert_eq!(legacy.policy_version, "heuristic-v1");
             if round == 9 && observation.food_days.is_empty() {
                 assert_eq!(
-                    corn_target(&observation, player, HeuristicRevision::V1),
+                    corn_target(&observation, player, HeuristicRevision::V1.into()),
                     9.0
                 );
                 assert_eq!(
@@ -660,6 +707,85 @@ mod tests {
                         .to_bits(),
                     );
                 }
+            }
+        }
+        for (workers, farms, discount, all, hunger, yaluk, needed, historical) in [
+            (6, 0, 1, false, false, false, 6, 11),
+            (3, 1, 0, false, false, false, 4, 4),
+            (3, 1, 2, false, true, false, 2, 4),
+            (5, 6, 1, false, true, true, 5, 4),
+            (5, 0, 1, true, true, true, 5, 0),
+            (3, 0, 0, true, true, false, 3, 0),
+            (3, 7, 2, false, false, false, 0, 0),
+        ] {
+            let mut state =
+                create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+            state.phase = Phase::Playing;
+            state.round = 6;
+            state.pending = Some(Pending {
+                title: "Trade".into(),
+                task: Task::Trade,
+                after: vec![],
+            });
+            if hunger {
+                state.expansion = Some(ExpansionState {
+                    prophecies: vec![ProphecyId::Hunger],
+                    active_prophecy: Some(0),
+                    ..ExpansionState::default()
+                });
+            }
+            let player = &mut state.players[state.current_player];
+            player.workers = workers;
+            player.feed_workers = farms;
+            player.feed_discount = discount;
+            player.feed_all = all;
+            player.tribe = yaluk.then_some(TribeId::Yaluk);
+            player.resources.insert(Resource::Corn, 9);
+            player.resources.insert(Resource::Wood, 1);
+            let mut fully_funded = player.clone();
+            fully_funded.resources.insert(Resource::Corn, 100);
+            let actual = prophecies::feeding(&fully_funded, hunger, i64::from(yaluk));
+            assert_eq!(actual.corn_cost, needed);
+            assert_eq!(actual.unfed_workers, 0);
+            let observation = observe(&state, state.current_player).unwrap();
+            let player = &observation.players[observation.actor];
+            assert_eq!(
+                food_requirement(&observation, player, ScoringProfile::FoodAligned),
+                needed as f64,
+            );
+            for revision in [HeuristicRevision::V1, HeuristicRevision::V2] {
+                assert_eq!(
+                    food_requirement(&observation, player, revision.into()),
+                    historical as f64,
+                );
+            }
+            let aligned = crate::choose_move_food_aligned(&observation).unwrap();
+            assert_eq!(aligned.policy_version, crate::FOOD_ALIGNED_POLICY_VERSION);
+            assert!(
+                observation
+                    .legal_actions
+                    .iter()
+                    .any(|a| a.r#move == aligned.r#move)
+            );
+            let old = crate::choose_move(&observation).unwrap();
+            assert_eq!(old.policy_version, "heuristic-v2");
+            assert_eq!(
+                old,
+                crate::choose_move_with_weights_for_revision(
+                    &observation,
+                    &HeuristicWeights::default(),
+                    HeuristicRevision::V2,
+                )
+                .unwrap(),
+            );
+            if workers == 6 {
+                assert_eq!(
+                    aligned.r#move,
+                    GameMove::Choose {
+                        choice_id: "skip".into()
+                    }
+                );
+                assert_ne!(old.r#move, aligned.r#move);
             }
         }
     }
