@@ -248,6 +248,12 @@ impl HumanPolicySample {
     pub fn chosen(&self) -> usize {
         self.chosen
     }
+    pub(crate) fn chosen_action(&self) -> Result<&TypedAction, String> {
+        self.legal_actions
+            .get(self.chosen)
+            .map(|row| &row.action)
+            .ok_or_else(|| "Conditional chosen action is outside its legal list".into())
+    }
     pub fn split(&self) -> DatasetSplit {
         self.split
     }
