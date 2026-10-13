@@ -22,6 +22,15 @@ pub fn choose_move_with_weights(
     observation: &Observation,
     weights: &policy::HeuristicWeights,
 ) -> Result<Decision, String> {
+    choose_move_with_weights_for_revision(observation, weights, policy::HeuristicRevision::V2)
+}
+/// Historical selection executes its scoring revision, retaining validation,
+/// finite scores and the first maximum in original legal order.
+pub fn choose_move_with_weights_for_revision(
+    observation: &Observation,
+    weights: &policy::HeuristicWeights,
+    revision: policy::HeuristicRevision,
+) -> Result<Decision, String> {
     weights.validate()?;
     if observation.schema != OBSERVATION_SCHEMA || observation.move_schema != MOVE_SCHEMA {
         return Err("Unsupported observation or move schema".into());
@@ -45,7 +54,8 @@ pub fn choose_move_with_weights(
     }
     let mut best = None;
     for action in &observation.legal_actions {
-        let score = policy::score_action(observation, &action.action, weights);
+        let score =
+            policy::score_action_for_revision(observation, &action.action, weights, revision);
         if !score.is_finite() {
             return Err("Non-finite policy score".into());
         }
@@ -57,7 +67,7 @@ pub fn choose_move_with_weights(
     Ok(Decision {
         actor: observation.actor,
         observation_key: key,
-        policy_version: POLICY_VERSION.into(),
+        policy_version: revision.policy_version().into(),
         r#move: action.r#move.clone(),
         score,
     })
