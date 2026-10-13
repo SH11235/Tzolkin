@@ -9,10 +9,12 @@ const calls = vi.hoisted(() => ({
   pure: vi.fn(),
   free: vi.fn(),
   heuristic: vi.fn(),
+  foodAligned: vi.fn(),
 }));
 vi.mock('../../generated/wasm/tzolkin_wasm.js', () => ({
   default: async () => {},
   dispatch_cpu: calls.heuristic,
+  dispatch_cpu_food_aligned: calls.foodAligned,
   CpuDeployment: class {
     constructor() {
       calls.load();
@@ -96,5 +98,15 @@ it('uses only the guarded NN route, notifies other seats and loads the immutable
   const failed = await send({ operation: 'choose', gameId: 'game-two', callbackIndex: 0 });
   expect(failed.error).toContain('NNモデル');
   expect(calls.guarded).toHaveBeenCalledTimes(2);
+  expect(calls.heuristic).not.toHaveBeenCalled();
+  calls.foodAligned.mockReturnValue('{"policyVersion":"heuristic-food-aligned-v1"}');
+  const standard = await send({
+    mode: 'heuristic',
+    modelChecksum: null,
+    gameId: null,
+    callbackIndex: null,
+  });
+  expect(standard.decision).toEqual({ policyVersion: 'heuristic-food-aligned-v1' });
+  expect(calls.foodAligned).toHaveBeenCalledWith('{"actor":0}');
   expect(calls.heuristic).not.toHaveBeenCalled();
 });
