@@ -13,6 +13,7 @@ import {
   BOUNDARY_CONTROL_SCHEMA,
   BOUNDARY_MARKER_CALIBRATION_SCHEMA,
   BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA,
+  BOUNDARY_WORKER_CELL_SCHEMA,
   CONTROL_SCHEMA,
   LATER_WITNESS_SCHEMA,
   decodeProjectedInitial,
@@ -793,6 +794,131 @@ test('retained boundary binds original food/rotation scope and separates availab
       assert.match(projected.provenance.markerObservation.interpretation, /consistency only/);
     }
   }
+  const workerFixture = () => {
+    const value = boundaryFixture();
+    const cells = [
+      'workerplace_startingPlayer_0',
+      ...GEARS.flatMap((gear) =>
+        Array.from(
+          { length: gear === 'chichenItza' ? 13 : 10 },
+          (_unused, index) => `workerplace_${gear}_${index}`,
+        ),
+      ),
+    ].map((id, index) => ({
+      id,
+      className: 'workerplace',
+      inlineStyle: null,
+      parentId: 'board',
+      computedDisplay: 'block',
+      computedVisibility: 'visible',
+      rect: {
+        x: 500 + (index % 10) * 25,
+        y: 400 + Math.floor(index / 10) * 25,
+        width: 19,
+        height: 19,
+      },
+    }));
+    for (const [index, id] of [
+      'workerplace_palenque_1',
+      'workerplace_yaxchilan_5',
+      'workerplace_tikal_2',
+    ].entries())
+      cells.find((cell) => cell.id === id).rect = {
+        x: 100 + index * 30,
+        y: 205,
+        width: 19,
+        height: 19,
+      };
+    value.capture.retainedDomGeometry.push(...cells);
+    value.repinWorkers = () => {
+      const prepared = value.repin(),
+        control = JSON.parse(prepared[2]);
+      control.workerPositions = { schema: BOUNDARY_WORKER_CELL_SCHEMA, archiveRelease: 'fixture' };
+      return [prepared[0], prepared[1], bytes(control)];
+    };
+    return value;
+  };
+  const positions = workerFixture(),
+    beforeOptIn = projectRetainedBoundary(...positions.repin()),
+    observed = projectRetainedBoundary(...positions.repinWorkers());
+  assert.equal(Object.hasOwn(beforeOptIn.witness.expected, 'gears'), false);
+  assert.deepEqual(observed.witness.expected.gears.palenque[1], { playerId: 0, dummy: false });
+  assert.deepEqual(observed.witness.expected.gears.yaxchilan[5], { playerId: 0, dummy: false });
+  assert.deepEqual(observed.witness.expected.gears.tikal[2], { playerId: 1, dummy: false });
+  assert.equal(Object.values(observed.witness.expected.gears).flat().filter(Boolean).length, 3);
+  assert.equal(observed.witness.expected.gears.chichenItza.length, 13);
+  assert.equal(observed.provenance.omitted.includes('gear positions'), false);
+  assert.equal(observed.provenance.workerPositionObservation.sourceAuthenticated, false);
+  assert.equal(observed.provenance.completeSourceBoard, false);
+  assert.equal(observed.provenance.humanBcQualified, false);
+  for (const mutate of [
+    (value) =>
+      value.capture.retainedDomGeometry.splice(
+        value.capture.retainedDomGeometry.findIndex((g) => g.id === 'workerplace_tikal_2'),
+        1,
+      ),
+    (value) => {
+      value.capture.retainedDomGeometry.find(
+        (g) => g.id === 'workerplace_tikal_2',
+      ).computedVisibility = 'hidden';
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.find((g) => g.id === 'workerplace_tikal_2').parentId =
+        'foreign';
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.find((g) => g.id === 'workerplace_tikal_2').rect.x = -1;
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.find((g) => g.id === 'workerplace_tikal_3').rect =
+        structuredClone(
+          value.capture.retainedDomGeometry.find((g) => g.id === 'workerplace_tikal_2').rect,
+        );
+    },
+    (value) => {
+      value.capture.retainedDomGeometry.find((g) => g.id === 'worker_2').rect = structuredClone(
+        value.capture.retainedDomGeometry.find((g) => g.id === 'worker_1').rect,
+      );
+    },
+    (value) => {
+      const cells = value.capture.retainedDomGeometry;
+      [
+        cells.find((g) => g.id === 'workerplace_tikal_2').rect,
+        cells.find((g) => g.id === 'workerplace_tikal_8').rect,
+      ] = [
+        cells.find((g) => g.id === 'workerplace_tikal_8').rect,
+        cells.find((g) => g.id === 'workerplace_tikal_2').rect,
+      ];
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'id="workerplace_tikal_2" class="workerplace"',
+        'id="workerplace_tikal_2" class="workerplace" style="opacity:0%"',
+      );
+    },
+    (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.replace(
+        'worker worker_ff0000',
+        'worker worker_dummy',
+      );
+      value.capture.retainedDomGeometry.find((g) => g.id === 'worker_3').className =
+        'worker worker_dummy';
+    },
+  ]) {
+    const value = workerFixture();
+    mutate(value);
+    assert.throws(
+      () => projectRetainedBoundary(...value.repinWorkers()),
+      /boundary|Hidden retained/i,
+    );
+  }
+  const wrongRelease = positions.repinWorkers(),
+    workerControl = JSON.parse(wrongRelease[2]);
+  workerControl.workerPositions.archiveRelease = 'foreign';
+  assert.throws(
+    () => projectRetainedBoundary(wrongRelease[0], wrongRelease[1], bytes(workerControl)),
+    /release-mismatched/,
+  );
   const modern = boundaryFixture();
   Object.assign(modern.raw, {
     ...modern.raw,

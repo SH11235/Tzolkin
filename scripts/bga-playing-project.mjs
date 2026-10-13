@@ -21,6 +21,7 @@ export const BOUNDARY_MARKER_CALIBRATION_SCHEMA =
   'tzolkin-bga-retained-boundary-marker-calibration-v1';
 export const BOUNDARY_MARKER_CELL_CALIBRATION_SCHEMA =
   'tzolkin-bga-retained-boundary-marker-calibration-v2';
+export const BOUNDARY_WORKER_CELL_SCHEMA = 'tzolkin-bga-boundary-worker-cells-v1';
 const BOUNDARY_CAPTURE_SCHEMA = 'bga-retained-visible-replay-board-v1';
 const LEGACY_CAPTURE_SCHEMA = 'tzolkin-bga-public-initial-selection-observation-v1';
 const LEGACY_CAPTURE_ADAPTER = 'tzolkin-bga-legacy-initial-capture-adapter-v1';
@@ -678,9 +679,18 @@ export function projectRetainedBoundary(
     control,
     ['schema', 'capture', 'rawLog', 'archiveRelease', 'seatOrder', 'mechanicalProfile'],
     'boundary control',
-    ['table', 'markerCalibration'],
+    ['table', 'markerCalibration', 'workerPositions'],
   );
   if (control.schema !== BOUNDARY_CONTROL_SCHEMA) fail('Unsupported boundary control');
+  const observeWorkerPositions = Object.hasOwn(control, 'workerPositions');
+  if (observeWorkerPositions) {
+    closed(control.workerPositions, ['schema', 'archiveRelease'], 'boundary worker positions');
+    if (
+      control.workerPositions.schema !== BOUNDARY_WORKER_CELL_SCHEMA ||
+      control.workerPositions.archiveRelease !== control.archiveRelease
+    )
+      fail('Unsupported/release-mismatched boundary worker positions');
+  }
   pin(captureBytes, control.capture, MAX_BYTES, 'boundary capture');
   pin(rawLogBytes, control.rawLog, MAX_BYTES, 'raw log');
   if (tableBytes !== null) pin(tableBytes, control.table, MAX_BYTES, 'table evidence');
@@ -1175,6 +1185,36 @@ export function projectRetainedBoundary(
       fail('Unknown/ambiguous boundary worker color');
     if (owner) counts[colors.indexOf(owner.slice(7))]++;
   }
+  const workerCells = observeWorkerPositions
+    ? board.nodes.filter(
+        (node) => token(node, 'workerplace') || (node.attrs.id ?? '').startsWith('workerplace_'),
+      )
+    : [];
+  if (observeWorkerPositions) {
+    if (placed.filter((node) => token(node, 'worker_dummy')).length > (4 - ids.length) * 6)
+      fail('Too many boundary dummy workers for basic player count');
+    const expectedCellIds = [
+      'workerplace_startingPlayer_0',
+      ...GEARS.flatMap((gear) =>
+        Array.from(
+          { length: gear === 'chichenItza' ? 13 : 10 },
+          (_unused, index) => `workerplace_${gear}_${index}`,
+        ),
+      ),
+    ];
+    if (
+      workerCells.length !== expectedCellIds.length ||
+      expectedCellIds.some((id) => !workerCells.some((node) => node.attrs.id === id)) ||
+      workerCells.some(
+        (node) =>
+          node.tag !== 'div' ||
+          node.attrs.class !== 'workerplace' ||
+          node.children.some((child) => typeof child !== 'string' || child.trim()),
+      )
+    )
+      fail('Incomplete/unknown boundary worker cells');
+    workerCells.forEach((node) => readVisible(board, node));
+  }
   const skull = byId(board, 'skull_left');
   readVisible(board, skull);
   if (skull.tag !== 'span') fail('Malformed boundary skull counter');
@@ -1394,10 +1434,87 @@ export function projectRetainedBoundary(
         'total workers',
       );
     });
+  let observedGears = null;
+  if (observeWorkerPositions) {
+    if (!completeWorkers) fail('Incomplete visible boundary gear-worker geometry');
+    const geometricCells = [...geometry.values()].filter((item) =>
+      item.id.startsWith('workerplace_'),
+    );
+    if (
+      geometricCells.length !== workerCells.length ||
+      geometricCells.some((item) => !workerCells.some((node) => node.attrs.id === item.id))
+    )
+      fail('Unbound boundary worker cell geometry');
+    const cells = workerCells.map((node) => {
+      const item = geometry.get(node.attrs.id);
+      closed(
+        item,
+        [
+          'id',
+          'className',
+          'inlineStyle',
+          'parentId',
+          'computedDisplay',
+          'computedVisibility',
+          'rect',
+        ],
+        'boundary worker cell geometry',
+      );
+      const rect = visibleRect(node);
+      if (rect === null) fail('Missing/hidden boundary worker cell geometry');
+      closed(rect, ['x', 'y', 'width', 'height'], 'boundary worker cell rectangle');
+      dimensions(rect, 'boundary worker cell rectangle');
+      if (
+        rect.x < boardRect.x ||
+        rect.y < boardRect.y ||
+        rect.x + rect.width > boardRect.x + boardRect.width ||
+        rect.y + rect.height > boardRect.y + boardRect.height
+      )
+        fail('Boundary worker cell outside board');
+      return { node, rect };
+    });
+    observedGears = Object.fromEntries(
+      GEARS.map((gear) => [gear, Array(gear === 'chichenItza' ? 13 : 10).fill(null)]),
+    );
+    const occupied = new Set();
+    for (const node of placed) {
+      const rect = visibleRect(node);
+      const center = { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+      const hits = cells.filter(
+        (cell) =>
+          center.x > cell.rect.x &&
+          center.x < cell.rect.x + cell.rect.width &&
+          center.y > cell.rect.y &&
+          center.y < cell.rect.y + cell.rect.height,
+      );
+      if (hits.length !== 1 || occupied.has(hits[0].node.attrs.id))
+        fail('Ambiguous/duplicate boundary worker cell occupancy');
+      const id = hits[0].node.attrs.id;
+      occupied.add(id);
+      const dummy = token(node, 'worker_dummy');
+      if (id === 'workerplace_startingPlayer_0') {
+        if (dummy) fail('Dummy worker on starting-player space');
+        continue;
+      }
+      const match = /^workerplace_(palenque|yaxchilan|tikal|uxmal|chichenItza)_(\d+)$/.exec(id);
+      if (!dummy && Number(match[2]) > (match[1] === 'chichenItza' ? 10 : 7))
+        fail('Boundary real worker beyond basic gear endpoint');
+      const owner = (node.attrs.class ?? '')
+        .split(/\s+/)
+        .find((value) => /^worker_[a-f0-9]{6}$/.test(value));
+      // Retained source labels name current spaces, not rotating tooth identities.
+      // This consistency projection authenticates neither capture nor source rules.
+      observedGears[match[1]][Number(match[2])] = {
+        playerId: dummy ? -1 : colors.indexOf(owner.slice(7)),
+        dummy,
+      };
+    }
+  }
   const expected = {
     players,
     skullSupply: natural(skull, 'boundary skull supply', true),
     phase: terminal ? 'finished' : 'playing',
+    ...(observedGears === null ? {} : { gears: observedGears }),
   };
   // The source displays day 28 and integral scores after finalization. Neither
   // is an exact native round/score assertion; preserve those display facts apart.
@@ -1434,6 +1551,17 @@ export function projectRetainedBoundary(
       kind: terminal ? 'terminal' : 'post-food',
       displayedRound,
       displayedPlayers,
+      ...(observeWorkerPositions
+        ? {
+            workerPositionObservation: {
+              schema: BOUNDARY_WORKER_CELL_SCHEMA,
+              archiveRelease: release,
+              interpretation:
+                'owned retained worker centers inside source-labeled current cells; consistency only',
+              sourceAuthenticated: false,
+            },
+          }
+        : {}),
       totalWorkersObserved: Boolean(completeWorkers),
       totalWorkersOmissionReason: completeWorkers
         ? null
@@ -1453,7 +1581,7 @@ export function projectRetainedBoundary(
         'turnIndex',
         ...(markerPositions === null ? ['markers'] : []),
         'card identities',
-        'gear positions',
+        ...(observedGears === null ? ['gear positions'] : []),
         'covered corn',
         ...(terminal ? ['exact scores'] : []),
         ...(completeWorkers ? [] : ['total workers']),
