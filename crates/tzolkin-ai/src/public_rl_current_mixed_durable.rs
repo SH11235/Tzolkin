@@ -46,6 +46,10 @@ pub use segment::{
     StoppedCurrentMixedForkSource,
 };
 
+#[path = "public_rl_current_mixed_campaign.rs"]
+mod campaign;
+pub use campaign::{CurrentMixedCampaignSpec, current_mixed_campaign};
+
 pub const SPEC_SCHEMA: &str = "tzolkin-current-mixed-durable-spec-v2";
 pub const JOURNAL_SCHEMA: &str = "tzolkin-current-mixed-durable-journal-v2";
 pub const COMPRESSED_SPEC_SCHEMA: &str = "tzolkin-current-mixed-durable-spec-v3";

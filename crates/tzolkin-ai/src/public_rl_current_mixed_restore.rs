@@ -593,7 +593,7 @@ fn require_archive_entry(
     Ok(())
 }
 
-fn require_archive_layout(archive: &ArchiveView<'_>) -> Result<(), String> {
+pub(super) fn require_archive_layout(archive: &ArchiveView<'_>) -> Result<(), String> {
     let mut expected = vec!["run-spec.json".into()];
     expected.extend((1..=archive.sequence).map(|n| format!("head-{n:016x}.json")));
     expected.extend(archive.references.keys().map(|n| format!("batch-{n:016x}")));
