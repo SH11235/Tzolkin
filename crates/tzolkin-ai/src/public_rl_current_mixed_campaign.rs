@@ -223,6 +223,12 @@ impl CurrentMixedCampaignSpec {
         {
             return Err("Campaign schema/finite segment/cohort limits".into());
         }
+        if wire.seat_campaign.is_some()
+            && (wire.steps.is_empty()
+                || matches!(wire.steps.first(), Some(SavedStep::SeatRotation { .. })))
+        {
+            return Err("Campaign seat guard requires an established global contract".into());
+        }
         run_spec(&wire.initial.run_spec)?;
         MixedOneBatchSpec::from_json(&encoded(&wire.original_mixed.spec)?)?;
         if let Bootstrap::Paired { spec, .. } = &wire.bootstrap {
@@ -581,6 +587,21 @@ fn successor_metadata(
     }
     Ok(())
 }
+fn require_established_seat_contract(
+    previous: &MetadataTip,
+    child_spec: &Value,
+) -> Result<(), String> {
+    let binding = previous
+        .binding
+        .as_ref()
+        .ok_or("Campaign seat guard requires an established global contract")?;
+    let previous = serde_json::to_value(binding).map_err(|e| e.to_string())?;
+    let child = serde_json::to_value(segment_spec(child_spec)?).map_err(|e| e.to_string())?;
+    if previous["contract"] != child["globalContract"] {
+        return Err("Campaign seat guard changes the established global contract".into());
+    }
+    Ok(())
+}
 fn rotation_metadata(
     previous: &MetadataTip,
     next: &MetadataTip,
@@ -723,6 +744,7 @@ impl CurrentMixedCampaignSpec {
                 ..
             } = step
             {
+                require_established_seat_contract(steps.last().unwrap_or(&initial), step.spec())?;
                 rotation_metadata(
                     steps.last().unwrap_or(&initial),
                     &metadata,
@@ -743,6 +765,9 @@ impl CurrentMixedCampaignSpec {
             || latest.progress.outcome.as_deref() != Some("updated")
         {
             return Err("Campaign predecessor must be the resolved updated Ready tip".into());
+        }
+        if self.wire.seat_campaign.is_some() {
+            require_established_seat_contract(latest, &self.wire.segment_spec)?;
         }
         self.require_seat_baseline(cumulative_own)?;
         let exclusions_raw = self.wire.exclusions.file.read(EXCLUSION_CAP)?;
@@ -1536,6 +1561,28 @@ mod tests {
             .require_baseline(inherited)
             .unwrap();
         assert_ne!(sha(&opted_in), sha(&legacy));
+        wire.collections.push(Value::Null);
+        let empty_lineage = encoded(&wire).unwrap();
+        assert!(
+            CurrentMixedCampaignSpec::from_json(&empty_lineage, &sha(&empty_lineage))
+                .err()
+                .unwrap()
+                .contains("established global contract")
+        ); // Refused before any input file, reservation, or model can be touched.
+        wire.steps.push(SavedStep::SeatRotation {
+            spec: Value::Null,
+            old_pool: Value::Null,
+            new_pool: Value::Null,
+            shifts: [1, 2],
+            tip: tip.clone(),
+        });
+        let first_rotation = encoded(&wire).unwrap();
+        assert!(
+            CurrentMixedCampaignSpec::from_json(&first_rotation, &sha(&first_rotation))
+                .err()
+                .unwrap()
+                .contains("established global contract")
+        );
         let step = SavedStep::SeatRotation {
             spec: Value::Null,
             old_pool: Value::Null,
@@ -1590,7 +1637,7 @@ mod tests {
             &BTreeSet::new(),
         );
         progress.attempts = 1;
-        let child = MetadataTip {
+        let mut child = MetadataTip {
             raw: Vec::new(),
             progress,
             reservations: Vec::new(),
@@ -1607,6 +1654,55 @@ mod tests {
             },
             directory: PathBuf::new(),
         };
+        assert!(
+            require_established_seat_contract(&child, &Value::Null)
+                .unwrap_err()
+                .contains("established global contract")
+        );
+        let global_contract = serde_json::json!({
+            "schema":"tzolkin-current-mixed-global-contract-v1",
+            "maxSegments":24,"maxAttempts":1000,"maxSuccessfulUpdates":1000,
+            "maxFamilies":4096,"maxCallbacks":1000000,"maxCandidateRows":1000000000,
+            "maxSearchSteps":100000,"maxDeclaredWorkBytes":1099511627776u64,
+            "maxLogicalRecordBytes":1099511627776u64,"maxStoredRecordBytes":1073741824,
+            "maxMetadataBytes":33554432,"maxTemporaryBytes":268435456,"maxDiskBytes":2147483648u64
+        });
+        let mut next_spec = serde_json::json!({
+            "schema":"tzolkin-current-mixed-segment-spec-v1",
+            "runSpec":{
+                "schema":SPEC_SCHEMA,"actor":OneStepConfig::default(),
+                "critic":ResidualFitConfig::new(1e-4,0.01,100).unwrap(),
+                "maxAttempts":64,"maxSuccessfulUpdates":64,"maxFamilies":4096,
+                "maxJournalEntries":1345,"maxMetadataBytes":33554432,"maxOutputBytes":1073741824,
+                "maxCallbacks":1000,"maxCandidateRows":1000000,"maxSearchSteps":10
+            },
+            "globalContract":global_contract
+        });
+        // This fabricated binding proves only the metadata refusal comparison.
+        child.binding = Some(
+            serde_json::from_value(serde_json::json!({
+                "chainRoot":"a".repeat(64),"index":1,"predecessorDirectory":"synthetic",
+                "predecessorSchema":JOURNAL_SCHEMA,"predecessorRoot":"a".repeat(64),
+                "predecessorSpec":"b".repeat(64),"predecessorHead":"c".repeat(64),
+                "predecessorSequence":1,"pool":"d".repeat(64),"parent":parent,
+                "prefix":[0,0],"next":0,"consumed":[],
+                "inherited":{"attempts":0,"successfulUpdates":0,
+                    "reservedWork":{"callbacks":0,"rows":0,"search":0,"bytes":0},
+                    "logicalRecordBytes":0,"storedRecordBytes":0,"metadataBytes":0},
+                "contract":global_contract,"contractChecksum":"e".repeat(64)
+            }))
+            .unwrap(),
+        );
+        require_established_seat_contract(&child, &next_spec).unwrap();
+        next_spec["globalContract"]["protectedDirectories"] = serde_json::json!([]);
+        require_established_seat_contract(&child, &next_spec).unwrap(); // Normalized default is unchanged.
+        next_spec["globalContract"]["maxAttempts"] = serde_json::json!(1001);
+        assert!(
+            require_established_seat_contract(&child, &next_spec)
+                .unwrap_err()
+                .contains("changes the established global contract")
+        );
+        child.binding = None;
         let directory = std::env::temp_dir().join(format!(
             "tzolkin-campaign-metadata-{}-{}",
             std::process::id(),
