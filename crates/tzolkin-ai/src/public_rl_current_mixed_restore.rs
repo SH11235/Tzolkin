@@ -283,9 +283,9 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     r.parent.require_current(&s.handle()?)?;
                     let raw = read_pin(&s.batch(r.attempt), &r.collection_spec, SPEC_CAP)?;
                     let collection = CurrentMixedCollectionSpec::from_json(&raw)?;
-                    let expected = s.plan(&collection)?;
                     let saved =
                         unique_json(&read_pin(&s.batch(r.attempt), &r.plan, HEAD_CAP)?, HEAD_CAP)?;
+                    let expected = s.plan_for_saved(&collection, &saved)?;
                     if saved != expected.receipt()
                         || r.plan_checksum != expected.checksum()
                         || r.families != *expected.rollout_families()

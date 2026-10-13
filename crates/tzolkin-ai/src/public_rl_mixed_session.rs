@@ -7,8 +7,9 @@ use crate::public_policy_paired_long::PairedRlParent;
 use crate::public_rl_mixed_cohort::{PlannedMixedRlCohort, ValidatedMixedRlCohort};
 use crate::public_rl_mixed_episode::ValidatedMixedRlEpisode;
 use crate::public_rl_mixed_native::{
-    FrozenMixedRoster, MixedRlLearner, MixedRlSource, RECORD_SCHEMA, SOURCE_KIND,
-    audit_mixed_rl_record_bytes, collect_mixed_rl_native, encode_mixed_rl_record,
+    AuditedMixedRlGame, FrozenMixedRoster, MixedRlLearner, MixedRlSource, RECORD_SCHEMA,
+    SOURCE_KIND, SavedRosterProfile, audit_mixed_rl_record_bytes, collect_mixed_rl_native,
+    encode_mixed_rl_record,
 };
 use crate::public_rl_paired_session::read_bounded;
 use crate::public_stochastic_native::NativeStochasticConfig;
@@ -292,10 +293,27 @@ pub struct MixedRlCollectionSession<'a> {
     parent: PairedRlParent<'a>,
     search: PreparedSearch,
     protected_directory: Option<&'a Path>,
+    restored_plan: Option<serde_json::Value>,
 }
 impl<'a> MixedRlCollectionSession<'a> {
     pub(crate) fn training_plan(&self) -> Result<PlannedMixedRlCohort, String> {
-        self.plan(&self.rosters()?)
+        let plan = self.plan(&self.rosters()?)?;
+        self.require_restored_plan(&plan)?;
+        Ok(plan)
+    }
+    /// Only the genuine journal restore calls this with its pinned AdoptSaved
+    /// plan. Public collection/adoption constructors retain the current profile.
+    pub(crate) fn for_restored_plan(mut self, plan: &serde_json::Value) -> Result<Self, String> {
+        self.restored_plan = Some(plan.clone());
+        self.training_plan()?;
+        Ok(self)
+    }
+    fn require_restored_plan(&self, actual: &PlannedMixedRlCohort) -> Result<(), String> {
+        if let Some(expected) = &self.restored_plan {
+            SavedRosterProfile::from_plan(expected)?
+                .require_full_plan(&actual.receipt(), expected)?;
+        }
+        Ok(())
     }
     fn new(
         spec: MixedRlCollectionSpec,
@@ -311,48 +329,57 @@ impl<'a> MixedRlCollectionSession<'a> {
             search,
             spec,
             protected_directory,
+            restored_plan: None,
         })
     }
     fn rosters(&self) -> Result<[FrozenMixedRoster<'_>; 4], String> {
+        let profile = self
+            .restored_plan
+            .as_ref()
+            .map(SavedRosterProfile::from_plan)
+            .transpose()?;
         self.spec
             .wire
             .rosters
             .iter()
-            .map(|seats| {
-                FrozenMixedRoster::new(
-                    seats
-                        .iter()
-                        .map(|s| {
-                            s.as_ref().map(|p| match p {
-                                OpponentSpec::Heuristic => {
-                                    BorrowedArenaPolicy::Heuristic(&self.spec.wire.weights)
-                                }
-                                OpponentSpec::CornFirstSetup => {
-                                    BorrowedArenaPolicy::CornFirstSetup(&self.spec.wire.weights)
-                                }
-                                OpponentSpec::CornFirstUxmalOpening => {
-                                    BorrowedArenaPolicy::CornFirstUxmalOpening(
-                                        &self.spec.wire.weights,
-                                    )
-                                }
-                                OpponentSpec::ResourceCycle { configuration } => {
-                                    BorrowedArenaPolicy::ResourceCycle(configuration)
-                                }
-                                OpponentSpec::PreparedBc => {
-                                    BorrowedArenaPolicy::PublicBc(self.prepared)
-                                }
-                                OpponentSpec::PreparedBcTradeGuard { guard } => {
-                                    BorrowedArenaPolicy::PublicBcTradeGuard(self.prepared, guard)
-                                }
-                                OpponentSpec::ParentArgmax => match self.parent {
-                                    PairedRlParent::Count1(p) => BorrowedArenaPolicy::Count1(p),
-                                    PairedRlParent::Paired(p) => BorrowedArenaPolicy::Paired(p),
-                                },
-                                OpponentSpec::Search => BorrowedArenaPolicy::Search(&self.search),
-                            })
+            .enumerate()
+            .map(|(member, seats)| {
+                let seats = seats
+                    .iter()
+                    .map(|s| {
+                        s.as_ref().map(|p| match p {
+                            OpponentSpec::Heuristic => {
+                                BorrowedArenaPolicy::Heuristic(&self.spec.wire.weights)
+                            }
+                            OpponentSpec::CornFirstSetup => {
+                                BorrowedArenaPolicy::CornFirstSetup(&self.spec.wire.weights)
+                            }
+                            OpponentSpec::CornFirstUxmalOpening => {
+                                BorrowedArenaPolicy::CornFirstUxmalOpening(&self.spec.wire.weights)
+                            }
+                            OpponentSpec::ResourceCycle { configuration } => {
+                                BorrowedArenaPolicy::ResourceCycle(configuration)
+                            }
+                            OpponentSpec::PreparedBc => {
+                                BorrowedArenaPolicy::PublicBc(self.prepared)
+                            }
+                            OpponentSpec::PreparedBcTradeGuard { guard } => {
+                                BorrowedArenaPolicy::PublicBcTradeGuard(self.prepared, guard)
+                            }
+                            OpponentSpec::ParentArgmax => match self.parent {
+                                PairedRlParent::Count1(p) => BorrowedArenaPolicy::Count1(p),
+                                PairedRlParent::Paired(p) => BorrowedArenaPolicy::Paired(p),
+                            },
+                            OpponentSpec::Search => BorrowedArenaPolicy::Search(&self.search),
                         })
-                        .collect(),
-                )
+                    })
+                    .collect();
+                match &profile {
+                    Some(profile) => {
+                        FrozenMixedRoster::for_saved_plan(seats, None, profile, member)
+                    }
+                    None => FrozenMixedRoster::new(seats),
+                }
             })
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
@@ -365,6 +392,9 @@ impl<'a> MixedRlCollectionSession<'a> {
     /// unresolved/Unknown attempt if killed before its returned receipt. Every
     /// fixed member is retained, including failed prefixes; no success subset.
     pub fn collect_new(self, output: &Path) -> Result<MixedRlCollectionReport, String> {
+        if self.restored_plan.is_some() {
+            return Err("Restored historical source is saved-only; new collection refused".into());
+        }
         require_imported_output(self.protected_directory, output)?;
         let rosters = self.rosters()?;
         let plan = self.plan(&rosters)?;
@@ -432,15 +462,7 @@ impl<'a> MixedRlCollectionSession<'a> {
             let began = Instant::now();
             let result =
                 audit_mixed_rl_record_bytes(bytes, &self.learner, roster).and_then(|game| {
-                    let m = &receipt.records[member];
-                    if game.complete() != m.complete
-                        || game.observed_callbacks() != m.observed_callbacks
-                        || game.learner_callbacks() != m.learner_callbacks
-                        || game.learner_candidate_rows() != m.learner_candidate_rows
-                        || game.opponent_attempts() != m.opponent_attempts
-                    {
-                        return Err("Mixed fresh source counters differ from saved return".into());
-                    }
+                    receipt.records[member].require_audited_counters(&game)?;
                     ValidatedMixedRlEpisode::from_audited(game)
                 });
             writer.save(&format!("audit-returned-{member}.json"),&serde_json::json!({"schema":"tzolkin-mixed-rl-audit-returned-v1","member":member,"passed":result.is_ok(),"error":result.as_ref().err(),"seconds":began.elapsed().as_secs_f64()}))?;
@@ -456,6 +478,34 @@ impl<'a> MixedRlCollectionSession<'a> {
         )?;
         writer.save("cohort.json", &cohort.receipt())?;
         Ok(cohort)
+    }
+    /// Journal-bound restoration may verify execution without an output or any
+    /// consumable episode/cohort capability. Ordinary public audit stays V2.
+    pub(crate) fn reaudit_restored_read_only(
+        &self,
+        source: &Path,
+        collection_raw: &[u8],
+        expected_sha256: &str,
+        expected_inventory: &serde_json::Value,
+    ) -> Result<(), String> {
+        if self.restored_plan.is_none()
+            || self.verify_saved(source, collection_raw, expected_sha256)? != *expected_inventory
+        {
+            return Err(
+                "Read-only re-audit requires the restored journal's complete source".into(),
+            );
+        }
+        let saved = self.saved_inputs(source, collection_raw, expected_sha256)?;
+        for (member, (bytes, roster)) in saved.raw.iter().zip(&saved.rosters).enumerate() {
+            let game = audit_mixed_rl_record_bytes(bytes, &self.learner, roster)?;
+            saved.receipt.records[member].require_audited_counters(&game)?;
+        }
+        if collection_inventory(source, self.spec.wire.max_output_bytes)? != saved.before
+            || self.verify_saved(source, collection_raw, expected_sha256)? != *expected_inventory
+        {
+            return Err("Read-only re-audit source changed during verification".into());
+        }
+        Ok(())
     }
     pub(crate) fn verify_saved(
         &self,
@@ -500,6 +550,7 @@ impl<'a> MixedRlCollectionSession<'a> {
         }
         let rosters = self.rosters()?;
         let plan = self.plan(&rosters)?;
+        self.require_restored_plan(&plan)?;
         let saved_plan = read_pin(source, &receipt.plan, RECEIPT_CAP)?;
         if unique_json(&saved_plan, RECEIPT_CAP)? != plan.receipt() {
             return Err("Mixed saved full plan differs from genuine current source".into());
@@ -679,6 +730,19 @@ struct MemberReport {
     learner_candidate_rows: usize,
     opponent_attempts: usize,
     seconds: f64,
+}
+impl MemberReport {
+    fn require_audited_counters(&self, game: &AuditedMixedRlGame) -> Result<(), String> {
+        if game.complete() != self.complete
+            || game.observed_callbacks() != self.observed_callbacks
+            || game.learner_callbacks() != self.learner_callbacks
+            || game.learner_candidate_rows() != self.learner_candidate_rows
+            || game.opponent_attempts() != self.opponent_attempts
+        {
+            return Err("Mixed fresh source counters differ from saved return".into());
+        }
+        Ok(())
+    }
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
