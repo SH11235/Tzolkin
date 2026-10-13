@@ -101,6 +101,7 @@ fn binding() -> SegmentBinding {
         contract,
         pool_fork: None,
         budget_amendment: None,
+        seat_rotation: None,
     }
 }
 fn progress(b: &SegmentBinding) -> Progress {
@@ -119,6 +120,18 @@ fn start(b: &SegmentBinding) -> Event {
         run_spec: file_pin("run-spec.json", &bytes(&run_spec(), SPEC_CAP).unwrap()),
         binding: Box::new(b.clone()),
     }
+}
+fn pool_wire() -> Value {
+    let plan = source::tests::plan();
+    let h = json!({"kind":"heuristic"});
+    let bc = json!({"kind":"preparedBc"});
+    json!({"schema":crate::public_rl_current_mixed_session::SPEC_SCHEMA,
+        "catalogHash":crate::replay::catalog_hash(),
+        "configurations":plan.headers.each_ref().map(|v|&v.config),
+        "rosters":[[null,bc,h],[h,null,bc],[null,h,h,bc],[h,h,bc,null]],
+        "weights":crate::policy::HeuristicWeights::default(),
+        "search":crate::search::SearchConfig::default(),
+        "maxOutputBytes":4*MAX_RECORD_BYTES+2*1024*1024})
 }
 
 #[test]
@@ -150,6 +163,19 @@ fn restore_chain_checks_every_external_tip_and_bounds_the_whole_request() {
         },
         tip: tip(),
     };
+    let pool =
+        CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&pool_wire()).unwrap()).unwrap();
+    steps[2] = restore::CurrentMixedRestoreStep::SeatRotation {
+        spec: CurrentMixedSegmentSpec {
+            schema: SEGMENT_SPEC_SCHEMA.into(),
+            run_spec: run_spec(),
+            global_contract: contract(&run_spec(), inherited()),
+        },
+        old_pool: &pool,
+        new_pool: &pool,
+        shifts: [1, 2],
+        tip: tip(),
+    };
     restore::check_chain_tips(&tip(), &steps).unwrap();
     steps.push(step());
     assert!(restore::check_chain_tips(&tip(), &steps).is_err());
@@ -166,6 +192,17 @@ fn restore_chain_checks_every_external_tip_and_bounds_the_whole_request() {
         tip.expected_sha256 = &wrong;
     }
     assert!(restore::check_chain_tips(&tip(), &steps).is_err());
+    if let restore::CurrentMixedRestoreStep::Segment { tip, .. } = &mut steps[1] {
+        tip.expected_sha256 = &digest;
+    }
+    if let restore::CurrentMixedRestoreStep::SeatRotation { tip, .. } = &mut steps[2] {
+        tip.expected_sha256 = &wrong;
+    }
+    assert!(restore::check_chain_tips(&tip(), &steps).is_err());
+    if let restore::CurrentMixedRestoreStep::SeatRotation { tip, .. } = &mut steps[2] {
+        tip.expected_sha256 = &digest;
+    }
+    restore::check_chain_tips(&tip(), &steps).unwrap();
     let mut initial = tip();
     initial.head_raw = b"changed";
     assert!(restore::check_chain_tips(&initial, &[]).is_err());
@@ -326,27 +363,45 @@ fn budget_amendment_start_binds_version_checksum_ordinal_and_ready_phase() {
     let mut p = progress(&amended);
     p.apply(&start(&amended), &run_spec()).unwrap();
     assert!(p.require_ready_continuation(false, true).is_err());
+    assert!(p.require_updated_seat_rotation(false, true).is_err());
     let (_, _, template) = super::super::tests::reserved();
-    let r = super::super::tests::later_reservation(&p, &template);
-    p.apply(
-        &Event::ReserveWhole4 {
-            reservation: Box::new(r),
-        },
-        &run_spec(),
-    )
-    .unwrap();
-    super::super::tests::gradient(&mut p, &run_spec());
-    p.apply(
-        &Event::Resolve {
-            resolution: Resolution::NoChange {
+    for updated in [true, false] {
+        let r = super::super::tests::later_reservation(&p, &template);
+        p.apply(
+            &Event::ReserveWhole4 {
+                reservation: Box::new(r),
+            },
+            &run_spec(),
+        )
+        .unwrap();
+        assert!(p.require_updated_seat_rotation(false, true).is_err());
+        super::super::tests::gradient(&mut p, &run_spec());
+        let resolution = if updated {
+            Resolution::Updated {
+                report: file_pin("report.json", b"report"),
+                artifact: file_pin("artifact.json", b"artifact"),
+                report_checksum: "b".repeat(64),
+                artifact_checksum: "c".repeat(64),
+            }
+        } else {
+            Resolution::NoChange {
                 report: file_pin("report.json", b"report"),
                 report_checksum: "b".repeat(64),
-            },
-        },
-        &run_spec(),
-    )
-    .unwrap();
-    p.require_ready_continuation(false, true).unwrap();
+            }
+        };
+        p.apply(&Event::Resolve { resolution }, &run_spec())
+            .unwrap();
+        p.require_ready_continuation(false, true).unwrap();
+        assert_eq!(
+            p.require_updated_seat_rotation(false, true).is_ok(),
+            updated
+        );
+        assert!(p.require_updated_seat_rotation(true, true).is_err());
+        assert!(p.require_updated_seat_rotation(false, false).is_err());
+        p.unknown_work = true;
+        assert!(p.require_updated_seat_rotation(false, true).is_err());
+        p.unknown_work = false;
+    }
     assert!(p.require_ready_continuation(true, true).is_err());
     assert!(p.require_ready_continuation(false, false).is_err());
     let r = super::super::tests::later_reservation(&p, &template);
@@ -358,6 +413,7 @@ fn budget_amendment_start_binds_version_checksum_ordinal_and_ready_phase() {
     )
     .unwrap();
     assert!(p.require_ready_continuation(false, true).is_err());
+    assert!(p.require_updated_seat_rotation(false, true).is_err());
 }
 
 #[test]
@@ -647,6 +703,7 @@ fn stopped_pool_fork_requires_known_final_failure_and_keeps_all_charges() {
     .unwrap();
     p.require_stopped_pool_fork(true, true).unwrap();
     assert!(p.require_ready_continuation(true, true).is_err());
+    assert!(p.require_updated_seat_rotation(true, true).is_err());
     let spent = inherited().with_progress(&p, 1024, 512, 256).unwrap();
     assert_eq!((spent.attempts, spent.successful_updates), (51, 49));
     assert_eq!(spent.reserved_work.callbacks, 492);
@@ -723,16 +780,8 @@ fn stopped_pool_fork_requires_known_final_failure_and_keeps_all_charges() {
 
 #[test]
 fn stopped_pool_fork_allows_only_explicit_guarded_bc_replacement() {
-    let plan = source::tests::plan();
-    let h = json!({"kind":"heuristic"});
     let bc = json!({"kind":"preparedBc"});
-    let wire = json!({"schema":crate::public_rl_current_mixed_session::SPEC_SCHEMA,
-        "catalogHash":crate::replay::catalog_hash(),
-        "configurations":plan.headers.each_ref().map(|v|&v.config),
-        "rosters":[[null,bc,h],[h,null,bc],[null,h,h,bc],[h,h,bc,null]],
-        "weights":crate::policy::HeuristicWeights::default(),
-        "search":crate::search::SearchConfig::default(),
-        "maxOutputBytes":4*MAX_RECORD_BYTES+2*1024*1024});
+    let wire = pool_wire();
     let parse =
         |v: &Value| CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(v).unwrap()).unwrap();
     let old = parse(&wire);
@@ -763,9 +812,70 @@ fn stopped_pool_fork_allows_only_explicit_guarded_bc_replacement() {
     let mut wrong = replacement.clone();
     wrong["rosters"][0][1] = bc;
     assert!(require_guarded_pool_replacement(&old, &parse(&wrong), &checksum).is_err());
-    let mut wrong = replacement;
+    let mut wrong = replacement.clone();
     wrong["rosters"][0][2] = json!({"kind":"parentArgmax"});
     assert!(require_guarded_pool_replacement(&old, &parse(&wrong), &checksum).is_err());
+
+    // A Ready rotation preserves every role, including its complete guard,
+    // instead of using the known-Failed guarded replacement rule above.
+    let base = parse(&replacement);
+    let base_checksum = base.pool_checksum().unwrap();
+    let rotate = |shifts: [u8; 2]| {
+        let mut value = replacement.clone();
+        for roster in value["rosters"].as_array_mut().unwrap() {
+            let seats = roster.as_array_mut().unwrap();
+            let shift = shifts[if seats.len() == 3 { 0 } else { 1 }] as usize;
+            seats.rotate_right(shift);
+        }
+        value
+    };
+    for three in 0..3 {
+        for four in 0..4 {
+            if [three, four] == [0, 0] {
+                continue;
+            }
+            let rotated = parse(&rotate([three, four]));
+            assert_eq!(
+                require_cyclic_seat_rotation(&base, &rotated, &base_checksum, [three, four])
+                    .unwrap(),
+                rotated.pool_checksum().unwrap()
+            );
+        }
+    }
+    for shifts in [[0, 0], [3, 0], [0, 4], [255, 1]] {
+        assert!(require_cyclic_seat_rotation(&base, &base, &base_checksum, shifts).is_err());
+    }
+    let shifted = rotate([1, 2]);
+    let rotated = parse(&shifted);
+    assert!(require_cyclic_seat_rotation(&base, &base, &base_checksum, [1, 2]).is_err());
+    assert!(require_cyclic_seat_rotation(&base, &rotated, &checksum, [1, 2]).is_err());
+    assert!(require_cyclic_seat_rotation(&base, &rotated, &base_checksum, [2, 2]).is_err());
+    for (section, key, value) in [
+        ("weights", "cornBase", json!(999.0)),
+        ("search", "samplingSalt", json!(999)),
+    ] {
+        let mut wrong = shifted.clone();
+        wrong[section][key] = value;
+        assert!(
+            require_cyclic_seat_rotation(&base, &parse(&wrong), &base_checksum, [1, 2]).is_err()
+        );
+    }
+    let mut wrong = shifted.clone();
+    wrong["rosters"][0].as_array_mut().unwrap().swap(0, 1);
+    assert!(require_cyclic_seat_rotation(&base, &parse(&wrong), &base_checksum, [1, 2]).is_err());
+    let mut wrong = shifted.clone();
+    wrong["rosters"][0][2]["guard"]["maxTradesPerEpisode"] = json!(63);
+    assert!(require_cyclic_seat_rotation(&base, &parse(&wrong), &base_checksum, [1, 2]).is_err());
+    let mut wrong = shifted.clone();
+    wrong["rosters"][0][0] = json!({"kind":"parentArgmax"});
+    assert!(require_cyclic_seat_rotation(&base, &parse(&wrong), &base_checksum, [1, 2]).is_err());
+    let mut wrong = shifted.clone();
+    wrong["rosters"][0][2] = Value::Null;
+    assert!(CurrentMixedCollectionSpec::from_json(&serde_json::to_vec(&wrong).unwrap()).is_err());
+    let mut wrong = shifted;
+    wrong["rosters"].as_array_mut().unwrap().swap(0, 2);
+    wrong["configurations"].as_array_mut().unwrap().swap(0, 2);
+    assert!(require_cyclic_seat_rotation(&base, &parse(&wrong), &base_checksum, [1, 2]).is_err());
 }
 
 #[test]
@@ -781,6 +891,11 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
         !String::from_utf8(original.clone())
             .unwrap()
             .contains("budgetAmendment")
+    );
+    assert!(
+        !String::from_utf8(original.clone())
+            .unwrap()
+            .contains("seatRotation")
     );
     let old: SegmentBinding = closed(&original, HEAD_CAP).unwrap();
     assert_eq!(old, b);
@@ -811,4 +926,54 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
             .is_err()
     );
     assert_ne!(fork.checksum().unwrap(), changed.checksum().unwrap());
+
+    let mut rotated = b.clone();
+    rotated.pool = "1".repeat(64);
+    rotated.seat_rotation = Some(SeatRotationBinding {
+        schema: SEAT_ROTATION_SCHEMA.into(),
+        predecessor_pool: b.pool.clone(),
+        new_pool: rotated.pool.clone(),
+        shifts: [1, 2],
+        predecessor_outcome: "updated".into(),
+        predecessor_own_counters: [[49, 0, 196, 196, 196], [0; 5], [1, 1, 0, 0, 0], [0; 5]],
+    });
+    rotated.require_start_bytes(&run_spec()).unwrap();
+    assert_ne!(rotated.checksum().unwrap(), b.checksum().unwrap());
+    let expected = progress(&rotated);
+    expected.check(&start(&rotated), &run_spec()).unwrap();
+    assert!(expected.check(&start(&b), &run_spec()).is_err());
+    for (field, value) in [
+        ("schema", json!("unknown")),
+        ("predecessorPool", json!("2".repeat(64))),
+        ("newPool", json!("2".repeat(64))),
+        ("shifts", json!([2, 2])),
+        ("predecessorOutcome", json!("noChange")),
+        (
+            "predecessorOwnCounters",
+            json!([
+                [49, 0, 196, 196, 196],
+                [0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0],
+                [0, 0, 0, 0, 0]
+            ]),
+        ),
+    ] {
+        let mut changed = serde_json::to_value(&rotated).unwrap();
+        changed["seatRotation"][field] = value;
+        let changed: SegmentBinding = serde_json::from_value(changed).unwrap();
+        assert!(
+            expected.check(&start(&changed), &run_spec()).is_err(),
+            "{field}"
+        );
+    }
+    let mut combined = rotated.clone();
+    combined.pool_fork = fork.pool_fork;
+    assert!(combined.require_start_bytes(&run_spec()).is_err());
+    let mut combined = rotated;
+    combined.budget_amendment = Some(BudgetAmendmentBinding {
+        schema: BUDGET_AMENDMENT_SCHEMA.into(),
+        predecessor_contract_checksum: b.contract_checksum,
+        ordinal: 1,
+    });
+    assert!(combined.require_start_bytes(&run_spec()).is_err());
 }
