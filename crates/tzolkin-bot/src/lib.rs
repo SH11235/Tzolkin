@@ -204,6 +204,10 @@ pub fn dispatch_cpu_resource_aligned_v2(request: &str) -> Result<String, String>
     dispatch_with(request, choose_move_resource_aligned_v2)
 }
 
+pub fn dispatch_cpu_resource_aligned_v3(request: &str) -> Result<String, String> {
+    dispatch_with(request, choose_move_resource_aligned_v3)
+}
+
 fn dispatch_with(
     request: &str,
     choose: fn(&Observation) -> Result<Decision, String>,

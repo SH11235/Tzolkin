@@ -1415,7 +1415,7 @@ impl<'a> ResourceForecast<'a> {
             };
             let first = gross - fee as f64 * self.corn_value;
             initial = initial.max(first);
-            // This fixed seven-day cadence is a conservative forecast, not a
+            // This fixed seven-day cadence is a bounded forecast, not a
             // legal-cycle or future-occupancy assertion. Initial use may be day27;
             // only additional uses stop at day26. Day27 materials remain usable.
             let repeatable = matches!(
@@ -4155,7 +4155,8 @@ mod tests {
         assert_eq!(player.available_workers, 0);
         assert_eq!(lifetime.opportunities.iter().flatten().count(), 6);
         assert!(lifetime.prospective.iter().all(Option::is_none));
-        assert_eq!(lifetime.potential(&before), 39.0); // All six initial harvests.
+        // Six initial harvests plus three repeat deltas.
+        assert_eq!(lifetime.potential(&before), 39.0);
         state.jungle.clear();
         let observation = observe(&state, actor).unwrap();
         let player = &observation.players[actor];
