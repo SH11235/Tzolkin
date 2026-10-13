@@ -1040,6 +1040,7 @@ fn pool_fork_binding_is_distinct_while_legacy_absence_keeps_wire_bytes() {
     let mut gap = overlap.clone();
     gap.retain(|c| c.episode_ordinal != format!("{:016x}", b.next + 1));
     assert!(sampling::covered_range(&gap, b.prefix, b.next).is_err());
+    assert!(sampling::covered_range(&configs, b.prefix, b.next + 2).is_err());
     assert!(sampling::covered_range(&overlap, [b.prefix[0], b.prefix[1] + 1], b.next).is_err());
     assert!(sampling::covered_range(&overlap, b.prefix, u64::MAX).is_err());
     let mut bad = overlap;

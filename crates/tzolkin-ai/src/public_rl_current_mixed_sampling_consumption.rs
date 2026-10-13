@@ -413,8 +413,9 @@ impl Binding {
             || self.predecessor_outcome != "updated"
             || self.first_episode_ordinal != self.declaration.predecessor().next
             || (v2
-                && (extent.is_none_or(|n| n == 0 || n > V2_MAX_CONFIGURATIONS as u64)
-                    || self.native_intersection.is_none()))
+                && (extent.is_none_or(|n| {
+                    n == 0 || n > V2_MAX_CONFIGURATIONS as u64 || !n.is_multiple_of(4)
+                }) || self.native_intersection.is_none()))
             || (!v2
                 && (extent != Some(self.unavailable_families.len() as u64)
                     || self.native_intersection.is_some()
@@ -663,6 +664,11 @@ impl ExternalSource {
                         .checked_config()?
                         .sampling_identity()
                         .episode_ordinal();
+                    if first < predecessor.next
+                        && first.checked_add(4).is_none_or(|n| predecessor.next < n)
+                    {
+                        return Err("V2 Long Reserve group straddles exact predecessor".into());
+                    }
                     if sequence <= previous_sequence
                         || reservation != previous_reservation + 1
                         || next.is_some_and(|n| n != first)
@@ -724,7 +730,10 @@ pub(super) fn covered_range(
         .and_then(|n| n.checked_add(1))
         .filter(|n| n.checked_add(4).is_some())
         .ok_or("V2 sampling empty suffix/overflow")?;
-    if next.checked_sub(first) != Some(coverage.len() as u64) || coverage.first() != Some(&first) {
+    if next.checked_sub(first) != Some(coverage.len() as u64)
+        || !coverage.len().is_multiple_of(4)
+        || coverage.first() != Some(&first)
+    {
         return Err("V2 sampling covered union must be gap-free from exact predecessor".into());
     }
     Ok((families.into_iter().collect(), next))
