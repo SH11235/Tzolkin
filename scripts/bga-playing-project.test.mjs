@@ -889,6 +889,47 @@ test('retained boundary binds original food/rotation scope and separates availab
   assert.equal(observed.provenance.workerPositionObservation.sourceAuthenticated, false);
   assert.equal(observed.provenance.completeSourceBoard, false);
   assert.equal(observed.provenance.humanBcQualified, false);
+  const setCellClass = (value, id, className) => {
+    value.capture.boardHtml = value.capture.boardHtml.replace(
+      `id="${id}" class="workerplace"`,
+      `id="${id}" class="${className}"`,
+    );
+    value.capture.retainedDomGeometry.find((item) => item.id === id).className = className;
+  };
+  const activePositions = workerFixture();
+  for (const id of [
+    'workerplace_startingPlayer_0',
+    ...GEARS.map((gear) => `workerplace_${gear}_0`),
+  ])
+    setCellClass(activePositions, id, 'workerplace active');
+  const activeBeforeOptIn = projectRetainedBoundary(...activePositions.repin()),
+    activeObserved = projectRetainedBoundary(...activePositions.repinWorkers());
+  assert.deepEqual(activeBeforeOptIn.witness.expected, beforeOptIn.witness.expected);
+  assert.equal(Object.hasOwn(activeBeforeOptIn.witness.expected, 'gears'), false);
+  assert.deepEqual(activeObserved.witness.expected, observed.witness.expected);
+  assert.equal(activeObserved.provenance.workerPositionObservation.sourceAuthenticated, false);
+  for (const className of [
+    'workerplace active active',
+    'workerplace workerplace',
+    'workerplace unknown',
+    'active',
+  ]) {
+    const value = workerFixture();
+    setCellClass(value, 'workerplace_palenque_0', className);
+    assert.throws(
+      () => projectRetainedBoundary(...value.repinWorkers()),
+      /Incomplete\/unknown boundary worker cells/,
+    );
+  }
+  const detachedActive = workerFixture();
+  setCellClass(detachedActive, 'workerplace_palenque_0', 'workerplace active');
+  detachedActive.capture.retainedDomGeometry.find(
+    (item) => item.id === 'workerplace_palenque_0',
+  ).className = 'workerplace';
+  assert.throws(
+    () => projectRetainedBoundary(...detachedActive.repinWorkers()),
+    /Detached consumed boundary geometry/,
+  );
   const threePlayers = workerFixture(3),
     threeObserved = projectRetainedBoundary(...threePlayers.repinWorkers());
   assert.equal(threeObserved.witness.expected.players.length, 3);
