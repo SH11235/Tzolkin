@@ -823,30 +823,100 @@ fn resource_technology_offered(
     can_skip: bool,
     w: &HeuristicWeights,
 ) -> Option<f64> {
+    resource_joint_offer(
+        p,
+        ResourceTechnologySettings {
+            technology,
+            free,
+            steps,
+            can_skip,
+        },
+        |state, technology, free, tail| {
+            resource_technology_step(o, state, technology, free, tail, w)
+        },
+        |state, payment, technology| {
+            let mut remaining = state.clone();
+            for (held, spent) in remaining.resources.iter_mut().zip(payment) {
+                *held -= spent;
+            }
+            remaining.technologies[tech_index(technology)] =
+                (remaining.technologies[tech_index(technology)] + 1).min(3);
+            remaining
+        },
+    )
+    .map(|offer| offer.value)
+}
+
+#[derive(Clone, Copy)]
+struct ResourceTechnologyOffer {
+    value: f64,
+    material_count: i64,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceTechnologySettings {
+    technology: TechnologyId,
+    free: bool,
+    steps: usize,
+    can_skip: bool,
+}
+
+// The V1 wrapper supplies no prospective worker. V2 uses the same bounded
+// four-by-four joint kernel, including one half-tail and negative prefixes.
+fn resource_joint_offer<S>(
+    state: &S,
+    settings: ResourceTechnologySettings,
+    step: impl Fn(&S, TechnologyId, bool, bool) -> Option<(f64, [i64; 5])>,
+    advance: impl Fn(&S, [i64; 5], TechnologyId) -> S,
+) -> Option<ResourceTechnologyOffer> {
+    let ResourceTechnologySettings {
+        technology,
+        free,
+        steps,
+        can_skip,
+    } = settings;
     if !(1..=2).contains(&steps) {
         return None;
     }
-    let (first, payment) = resource_technology_step(o, p, technology, free, steps == 1, w)?;
+    let (first, payment) = step(state, technology, free, steps == 1)?;
+    let first_count = payment[1..4].iter().sum();
     if steps == 1 {
-        return Some(first);
+        return Some(ResourceTechnologyOffer {
+            value: first,
+            material_count: first_count,
+        });
     }
-    let mut remaining = p.clone();
-    for (held, spent) in remaining.resources.iter_mut().zip(payment) {
-        *held -= spent;
-    }
-    remaining.technologies[tech_index(technology)] =
-        (remaining.technologies[tech_index(technology)] + 1).min(3);
+    let remaining = advance(state, payment, technology);
     // Two offered advances may have a negative prefix. Enumerate the four
     // feasible continuations, charging their recomputed costs (free stays free).
     // Only the final offered advance receives the paid half-tail hypothesis.
     // Final-bonus resource gains are not pre-spent to fund the continuation.
-    let mut continuation = can_skip.then_some(0.0);
+    let mut continuation = can_skip.then_some(ResourceTechnologyOffer {
+        value: 0.0,
+        material_count: 0,
+    });
     for next in TECHNOLOGY_IDS {
-        if let Some((net, _)) = resource_technology_step(o, &remaining, next, free, true, w) {
-            continuation = Some(continuation.map_or(net, |best: f64| best.max(net)));
+        if let Some((net, paid)) = step(&remaining, next, free, true) {
+            continuation = Some(continuation.map_or(
+                ResourceTechnologyOffer {
+                    value: net,
+                    material_count: paid[1..4].iter().sum(),
+                },
+                |best| ResourceTechnologyOffer {
+                    value: best.value.max(net),
+                    material_count: if net > best.value {
+                        paid[1..4].iter().sum()
+                    } else {
+                        best.material_count
+                    },
+                },
+            ));
         }
     }
-    continuation.map(|next| first + next)
+    continuation.map(|next| ResourceTechnologyOffer {
+        value: first + next.value,
+        material_count: first_count + next.material_count,
+    })
 }
 
 fn resource_technology_preview(
@@ -999,6 +1069,842 @@ pub fn score_action_resource_aligned(
         }
         _ => fallback(),
     }
+}
+
+const RESOURCE_VP_TO_UTILITY: f64 = 1.0;
+const RESOURCE_GOAL_MAX: i64 = 12;
+
+#[derive(Clone, Copy, Default)]
+struct ResourceMarketGoal {
+    materials: [i64; 3],
+    value: f64,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceForecastState {
+    resources: [i64; 5],
+    technologies: [i64; 4],
+}
+impl From<&PublicPlayer> for ResourceForecastState {
+    fn from(p: &PublicPlayer) -> Self {
+        Self {
+            resources: p.resources,
+            technologies: p.technologies,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ResourceHarvestOpportunity {
+    gear: GearId,
+    position: i64,
+    newly_placed: bool,
+}
+
+// Fixed numeric opportunities avoid changing targets between technology steps.
+// Each worker contributes one best feasible harvest, not multiple future uses.
+struct ResourceForecast<'a> {
+    observation: &'a Observation,
+    player: &'a PublicPlayer,
+    weights: &'a HeuristicWeights,
+    corn_value: f64,
+    opportunities: [Option<ResourceHarvestOpportunity>; 3],
+}
+
+fn resource_route_slot(o: &Observation, gear: GearId) -> Option<usize> {
+    o.gears
+        .get(&gear)?
+        .iter()
+        .take(if gear == GearId::ChichenItza { 11 } else { 8 })
+        .enumerate()
+        .find(|(position, worker)| {
+            worker.is_none()
+                && !(o.turn.skipped_gear == Some(gear)
+                    && o.turn.skipped_position == Some(*position as i64))
+        })
+        .map(|(position, _)| position)
+}
+
+fn resource_wealth(resources: &[i64; 5]) -> Option<i64> {
+    resources[1..4]
+        .iter()
+        .zip([2_i64, 3, 4])
+        .try_fold(resources[0], |sum, (held, price)| {
+            sum.checked_add(held.checked_mul(price)?)
+        })
+}
+
+fn resource_base_feeding_penalty(p: &PublicPlayer, corn: i64) -> f64 {
+    let cheap = if p.feed_all {
+        p.workers
+    } else {
+        p.feed_workers.min(p.workers)
+    }
+    .max(0);
+    let paying = p.workers - cheap;
+    let price = (2 - p.feed_discount).max(0);
+    let fed = if price == 0 {
+        paying
+    } else {
+        (corn.max(0) / price).min(paying)
+    };
+    ((paying - fed) * 3) as f64 * RESOURCE_VP_TO_UTILITY
+}
+
+fn resource_food_tradeoff(
+    o: &Observation,
+    p: &PublicPlayer,
+    before: i64,
+    after: i64,
+    arrival: i64,
+) -> f64 {
+    if [8, 14, 21, 27]
+        .into_iter()
+        .find(|day| !o.food_days.contains(day))
+        .is_some_and(|day| day <= arrival)
+    {
+        resource_base_feeding_penalty(p, after) - resource_base_feeding_penalty(p, before)
+    } else {
+        0.0
+    }
+}
+
+impl<'a> ResourceForecast<'a> {
+    fn new(
+        o: &'a Observation,
+        p: &'a PublicPlayer,
+        w: &'a HeuristicWeights,
+        can_place: bool,
+    ) -> Self {
+        let mut opportunities = [None; 3];
+        let mut count = 0;
+        for gear in [GearId::Yaxchilan, GearId::Palenque] {
+            if let Some(slots) = o.gears.get(&gear) {
+                for (position, worker) in slots.iter().take(8).enumerate() {
+                    if count < opportunities.len()
+                        && worker.as_ref().is_some_and(|worker| {
+                            !worker.dummy && worker.player_id == o.actor as i64
+                        })
+                    {
+                        opportunities[count] = Some(ResourceHarvestOpportunity {
+                            gear,
+                            position: position as i64,
+                            newly_placed: false,
+                        });
+                        count += 1;
+                    }
+                }
+            }
+        }
+        // One prospective Yax worker gives intrinsic harvest value even before
+        // an owned Yax worker exists. Nominal placement cost must fit W; mercy,
+        // future occupancy and double advances are not predicted.
+        if count < opportunities.len()
+            && can_place
+            && let Some(position) = resource_route_slot(o, GearId::Yaxchilan)
+            && resource_wealth(&p.resources).is_some_and(|wealth| wealth >= position as i64)
+            && o.round < 27
+            && position < 7
+        {
+            opportunities[count] = Some(ResourceHarvestOpportunity {
+                gear: GearId::Yaxchilan,
+                position: position as i64,
+                newly_placed: true,
+            });
+        }
+        Self {
+            observation: o,
+            player: p,
+            weights: w,
+            corn_value: value(o, p, Resource::Corn, w, ScoringProfile::MonumentAligned),
+            opportunities,
+        }
+    }
+
+    fn amount_value(&self, amounts: &[i64; 5]) -> f64 {
+        amounts[0] as f64 * self.corn_value
+            + amounts[1..4]
+                .iter()
+                .zip(self.weights.material_values)
+                .map(|(n, value)| *n as f64 * value)
+                .sum::<f64>()
+            + amounts[4] as f64 * 7.0
+    }
+
+    fn harvest(&self, state: &ResourceForecastState, gear: GearId, position: i64) -> Option<f64> {
+        let extraction = state.technologies[tech_index(TechnologyId::Extraction)];
+        let agriculture = state.technologies[tech_index(TechnologyId::Agriculture)];
+        let theology = state.technologies[tech_index(TechnologyId::Theology)];
+        let mut amounts = [0; 5];
+        match (gear, position) {
+            (GearId::Palenque, 1) => amounts[0] = 3 + i64::from(agriculture >= 2),
+            (GearId::Palenque, 2..=5) => {
+                let jungle = self.observation.jungle.get(&position)?;
+                let corn = ([0, 3, 4, 5, 7, 9][position as usize]
+                    + i64::from(agriculture >= 1)
+                    + 2 * i64::from(agriculture >= 3)) as f64
+                    * self.corn_value;
+                let can_corn = jungle.corn > jungle.wood;
+                let mut best: f64 = 0.0;
+                if can_corn || agriculture >= 2 {
+                    best = corn;
+                }
+                if position >= 3 && jungle.wood > 0 {
+                    best = best.max(
+                        (position - 1 + i64::from(extraction >= 1)) as f64
+                            * self.weights.material_values[0],
+                    );
+                    if jungle.corn > 0 && self.player.temples.iter().any(|level| *level > -1) {
+                        best = best.max(corn - self.weights.temple_step);
+                    }
+                }
+                return Some(best);
+            }
+            (GearId::Yaxchilan, 1) => amounts[1] = 1 + i64::from(extraction >= 1),
+            (GearId::Yaxchilan, 2) => {
+                amounts[0] = 1;
+                amounts[2] = 1 + i64::from(extraction >= 2);
+            }
+            (GearId::Yaxchilan, 3) => {
+                amounts[0] = 2;
+                amounts[3] = 1 + i64::from(extraction >= 3);
+            }
+            (GearId::Yaxchilan, 4) => {
+                amounts[4] = (1 + i64::from(theology >= 3))
+                    .min(self.observation.skull_supply)
+                    .max(0)
+            }
+            (GearId::Yaxchilan, 5) => {
+                amounts[0] = 2;
+                amounts[2] = 1 + i64::from(extraction >= 2);
+                amounts[3] = 1 + i64::from(extraction >= 3);
+            }
+            _ => return None,
+        }
+        Some(self.amount_value(&amounts))
+    }
+
+    fn potential(&self, state: &ResourceForecastState) -> f64 {
+        self.opportunities
+            .iter()
+            .flatten()
+            .map(|opportunity| {
+                (1..=5)
+                    .filter_map(|target| {
+                        let wait = (target - opportunity.position)
+                            .max(i64::from(opportunity.newly_placed));
+                        let arrival = opportunity.position + wait;
+                        if self.observation.round + wait > 27 || arrival > 7 {
+                            return None;
+                        }
+                        let fee = if arrival >= 6 { 0 } else { arrival - target };
+                        // Fixed per-observation feasibility and currency make successive
+                        // potential differences telescope, even if the best endpoint changes.
+                        if fee > self.player.resources[0] {
+                            return None;
+                        }
+                        self.harvest(state, opportunity.gear, target).map(|gross| {
+                            ((gross - fee as f64 * self.corn_value) / (1 + wait) as f64).max(0.0)
+                        })
+                    })
+                    .fold(0.0, f64::max)
+            })
+            .sum()
+    }
+
+    fn payment(&self, state: &ResourceForecastState, amount: i64) -> Option<[i64; 5]> {
+        let mut order = [1, 2, 3];
+        order.sort_by(|a, b| {
+            self.weights.material_values[*a - 1].total_cmp(&self.weights.material_values[*b - 1])
+        });
+        let mut payment = [0; 5];
+        let mut remaining = amount;
+        for index in order {
+            payment[index] = state.resources[index].min(remaining);
+            remaining -= payment[index];
+        }
+        (remaining == 0).then_some(payment)
+    }
+
+    fn advance(
+        state: &ResourceForecastState,
+        payment: [i64; 5],
+        technology: TechnologyId,
+    ) -> ResourceForecastState {
+        let mut next = *state;
+        for (held, spent) in next.resources.iter_mut().zip(payment) {
+            *held -= spent;
+        }
+        let index = tech_index(technology);
+        next.technologies[index] = (next.technologies[index] + 1).min(3);
+        next
+    }
+
+    fn gross(&self, state: &ResourceForecastState, technology: TechnologyId) -> f64 {
+        if state.technologies[tech_index(technology)] < 3 {
+            return self.potential(&Self::advance(state, [0; 5], technology))
+                - self.potential(state);
+        }
+        match technology {
+            TechnologyId::Agriculture => {
+                if TEMPLE_IDS
+                    .iter()
+                    .any(|t| self.player.temples[temple_index(*t)] < CATALOG.temple_tracks[t].max)
+                {
+                    self.weights.temple_step
+                } else {
+                    0.0
+                }
+            }
+            TechnologyId::Extraction => {
+                2.0 * self.weights.material_values.into_iter().fold(0.0, f64::max)
+            }
+            TechnologyId::Architecture => 3.0,
+            TechnologyId::Theology => {
+                if self.observation.skull_supply > 0 {
+                    7.0
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    fn step(
+        &self,
+        state: &ResourceForecastState,
+        technology: TechnologyId,
+        free: bool,
+        tail: bool,
+    ) -> Option<(f64, [i64; 5])> {
+        let level = state.technologies[tech_index(technology)];
+        let cost = if free {
+            0
+        } else if level == 3 {
+            1
+        } else {
+            level + 1
+        };
+        let payment = self.payment(state, cost)?;
+        let mut net = self.gross(state, technology) - self.amount_value(&payment);
+        if tail && level < 3 {
+            let next = Self::advance(state, payment, technology);
+            let next_cost = if next.technologies[tech_index(technology)] == 3 {
+                1
+            } else {
+                level + 2
+            };
+            if let Some(paid) = self.payment(&next, next_cost) {
+                net += 0.5 * (self.gross(&next, technology) - self.amount_value(&paid)).max(0.0);
+            }
+        }
+        Some((net, payment))
+    }
+
+    fn offer(
+        &self,
+        state: &ResourceForecastState,
+        technology: TechnologyId,
+        free: bool,
+        steps: usize,
+        can_skip: bool,
+    ) -> Option<ResourceTechnologyOffer> {
+        resource_joint_offer(
+            state,
+            ResourceTechnologySettings {
+                technology,
+                free,
+                steps,
+                can_skip,
+            },
+            |state, technology, free, tail| self.step(state, technology, free, tail),
+            Self::advance,
+        )
+    }
+}
+
+// Nominal basic placement and backward-action costs at the visible snapshot.
+// Timing assumes one normal advance. No future congestion/mercy is certified.
+fn resource_route_access(
+    o: &Observation,
+    p: &PublicPlayer,
+    gear: GearId,
+    target: i64,
+    can_place: bool,
+) -> Option<i64> {
+    let owned = o
+        .gears
+        .get(&gear)
+        .into_iter()
+        .flat_map(|slots| slots.iter().take(8).enumerate())
+        .filter_map(|(position, worker)| {
+            if !worker
+                .as_ref()
+                .is_some_and(|worker| !worker.dummy && worker.player_id == o.actor as i64)
+            {
+                return None;
+            }
+            let wait = (target - position as i64).max(0);
+            (o.round + wait <= 27).then_some(if position >= 6 {
+                0
+            } else {
+                (position as i64 - target).max(0)
+            })
+        })
+        .min();
+    let prospective = can_place
+        .then(|| resource_route_slot(o, gear))
+        .flatten()
+        .and_then(|position| {
+            let wait = (target - position as i64).max(1);
+            let arrival = position as i64 + wait;
+            (o.round + wait <= 27 && arrival <= 7)
+                .then_some(position as i64 + if arrival >= 6 { 0 } else { arrival - target })
+        });
+    owned
+        .into_iter()
+        .chain(prospective)
+        .min()
+        .filter(|cost| resource_wealth(&p.resources).is_some_and(|wealth| *cost <= wealth))
+}
+
+fn resource_market_goal(
+    o: &Observation,
+    p: &PublicPlayer,
+    w: &HeuristicWeights,
+    can_place: bool,
+) -> ResourceMarketGoal {
+    let Some(wealth) = resource_wealth(&p.resources) else {
+        return ResourceMarketGoal::default();
+    };
+    let mut reference = p.clone();
+    let canonical_materials = (wealth / 2).min(6);
+    reference.resources = [
+        wealth - 2 * canonical_materials,
+        canonical_materials,
+        0,
+        0,
+        p.resources[4],
+    ];
+    let mut fixed = w.clone();
+    fixed.corn_when_short = fixed.corn_base;
+    let forecast = ResourceForecast::new(o, &reference, &fixed, can_place);
+    let state = ResourceForecastState::from(&reference);
+    let mut best = ResourceMarketGoal::default();
+    for steps in [1, 2] {
+        let Some(access_cost) = resource_route_access(
+            o,
+            p,
+            GearId::Tikal,
+            if steps == 1 { 1 } else { 3 },
+            can_place,
+        ) else {
+            continue;
+        };
+        for technology in TECHNOLOGY_IDS {
+            if let Some(offer) = forecast.offer(&state, technology, false, steps, true) {
+                let q = offer.material_count;
+                if !(1..=6).contains(&q) || wealth < 2 * q + access_cost {
+                    continue;
+                }
+                let net = offer.value
+                    - access_cost as f64 * fixed.corn_base
+                    - resource_food_tradeoff(o, p, wealth, wealth - 2 * q - access_cost, 27);
+                if net > best.value {
+                    // Wood is a deterministic cheap payment preference, not a rule.
+                    best = ResourceMarketGoal {
+                        materials: [q, 0, 0],
+                        value: net,
+                    };
+                }
+            }
+        }
+    }
+    if p.technologies[tech_index(TechnologyId::Architecture)] == 0
+        && let Some(access_cost) = resource_route_access(o, p, GearId::Tikal, 2, can_place)
+    {
+        for id in &o.buildings {
+            let Some(card) = building(id) else {
+                continue;
+            };
+            let target = MATERIALS.map(|r| card.cost.get(&r).copied().unwrap_or(0));
+            if target.iter().any(|n| *n < 0) || target.iter().sum::<i64>() > RESOURCE_GOAL_MAX {
+                continue;
+            }
+            let price = target
+                .iter()
+                .zip([2, 3, 4])
+                .map(|(n, price)| n * price)
+                .sum::<i64>();
+            if price == 0 || price + access_cost > wealth {
+                continue;
+            }
+            let cost = [0, target[0], target[1], target[2], 0];
+            let net = effects_value(
+                o,
+                &reference,
+                &card.effects,
+                &fixed,
+                ScoringProfile::MonumentAligned,
+            ) - amount_value(
+                o,
+                &reference,
+                &cost,
+                &fixed,
+                ScoringProfile::MonumentAligned,
+            ) - access_cost as f64 * fixed.corn_base
+                - resource_food_tradeoff(o, p, wealth, wealth - price - access_cost, 27);
+            if net > best.value {
+                best = ResourceMarketGoal {
+                    materials: target,
+                    value: net,
+                };
+            }
+        }
+    }
+    best
+}
+
+fn resource_market_progress(
+    o: &Observation,
+    p: &PublicPlayer,
+    resources: &[i64; 5],
+    goal: ResourceMarketGoal,
+) -> (i64, i64, i64) {
+    let missing = std::array::from_fn::<_, 3, _>(|i| (goal.materials[i] - resources[i + 1]).max(0));
+    let d = missing.iter().sum();
+    let cost: i64 = missing
+        .iter()
+        .zip([2, 3, 4])
+        .map(|(n, price)| n * price)
+        .sum();
+    let food = if [8, 14, 21, 27]
+        .into_iter()
+        .any(|day| !o.food_days.contains(&day))
+    {
+        food_requirement(o, p, ScoringProfile::MonumentAligned) as i64
+    } else {
+        0
+    };
+    (
+        (cost - resources[0]).max(0),
+        d,
+        (food - resources[0]).max(0),
+    )
+}
+
+// Printed-card subset only; no future refill, renovation or discount is
+// manufactured. Architecture's other build choices keep their old hypothesis.
+fn resource_visible_build_value(o: &Observation, p: &PublicPlayer, w: &HeuristicWeights) -> f64 {
+    if p.technologies[tech_index(TechnologyId::Architecture)] != 0 {
+        return action_value(o, p, GearId::Tikal, 2, w, ScoringProfile::MonumentAligned);
+    }
+    o.buildings
+        .iter()
+        .filter_map(|id| {
+            let card = building(id)?;
+            let cost = RESOURCE_IDS.map(|r| card.cost.get(&r).copied().unwrap_or(0));
+            if cost
+                .iter()
+                .zip(p.resources)
+                .any(|(cost, held)| *cost < 0 || *cost > held)
+            {
+                return None;
+            }
+            Some(
+                effects_value(o, p, &card.effects, w, ScoringProfile::MonumentAligned)
+                    - amount_value(o, p, &cost, w, ScoringProfile::MonumentAligned),
+            )
+        })
+        .fold(0.0, f64::max)
+}
+
+fn resource_skull_value(
+    o: &Observation,
+    p: &PublicPlayer,
+    position: i64,
+    w: &HeuristicWeights,
+) -> f64 {
+    if p.resources[4] <= 0 || o.skull_spaces.get(position as usize) != Some(&None) {
+        return 0.0;
+    }
+    // Retain the existing temple/material utility hypothesis, but account for
+    // the actual visible skull slot and the one skull consumed by the core.
+    (action_value(
+        o,
+        p,
+        GearId::ChichenItza,
+        position,
+        w,
+        ScoringProfile::MonumentAligned,
+    ) - 7.0)
+        .max(0.0)
+}
+
+pub(crate) struct ResourceRouteContext {
+    supported: bool,
+    endpoint: [[f64; 6]; 5],
+    technology: [f64; 4],
+    market_goal: ResourceMarketGoal,
+}
+impl ResourceRouteContext {
+    pub(crate) fn new(o: &Observation, w: &HeuristicWeights) -> Self {
+        let p = &o.players[o.actor];
+        let supported = o.phase == Phase::Playing
+            && (3..=4).contains(&o.players.len())
+            && o.expansion.is_none()
+            && o.private.selected_tribe.is_none()
+            && o.players.iter().all(|player| player.tribe.is_none())
+            && p.technologies.iter().all(|level| (0..=3).contains(level))
+            && (3..=6).contains(&p.workers)
+            && (0..=p.workers).contains(&p.available_workers)
+            && (0..=p.workers).contains(&p.feed_workers)
+            && (0..=2).contains(&p.feed_discount)
+            && p.resources.iter().all(|n| *n >= 0)
+            && resource_wealth(&p.resources).is_some_and(|wealth| wealth <= 1_000_000);
+        let mut context = Self {
+            supported,
+            endpoint: [[0.0; 6]; 5],
+            technology: [0.0; 4],
+            market_goal: ResourceMarketGoal::default(),
+        };
+        if !supported {
+            return context;
+        }
+        let can_place = p.available_workers > 0
+            || (o.pending_task.is_none()
+                && o.legal_actions
+                    .iter()
+                    .any(|a| matches!(a.action, TypedAction::Remove { .. })));
+        let forecast = ResourceForecast::new(o, p, w, can_place);
+        let state = ResourceForecastState::from(p);
+        context.market_goal = resource_market_goal(o, p, w, can_place);
+        for (index, gear) in GEAR_IDS.into_iter().enumerate() {
+            for position in 1..=5 {
+                context.endpoint[index][position] =
+                    if let Some(payoff) = forecast.harvest(&state, gear, position as i64) {
+                        payoff
+                    } else if gear == GearId::Tikal && matches!(position, 1 | 3) {
+                        TECHNOLOGY_IDS
+                            .into_iter()
+                            .filter_map(|technology| {
+                                forecast
+                                    .offer(
+                                        &state,
+                                        technology,
+                                        false,
+                                        if position == 3 { 2 } else { 1 },
+                                        true,
+                                    )
+                                    .map(|offer| offer.value)
+                            })
+                            .fold(0.0, f64::max)
+                    } else if gear == GearId::Tikal && position == 2 {
+                        resource_visible_build_value(o, p, w)
+                    } else if gear == GearId::Uxmal && position == 2 {
+                        context
+                            .market_goal
+                            .value
+                            .max(resource_market_preview(o, p, w))
+                    } else {
+                        action_value(
+                            o,
+                            p,
+                            gear,
+                            position as i64,
+                            w,
+                            ScoringProfile::MonumentAligned,
+                        )
+                    };
+            }
+        }
+        if let Some(Task::Technology {
+            free,
+            remaining,
+            mandatory,
+        }) = &o.pending_task
+            && (1..=2).contains(remaining)
+        {
+            context.technology = TECHNOLOGY_IDS.map(|technology| {
+                forecast
+                    .offer(
+                        &state,
+                        technology,
+                        *free,
+                        *remaining as usize,
+                        !free && !mandatory,
+                    )
+                    .map_or(-100.0, |offer| offer.value)
+            });
+        }
+        context
+    }
+
+    fn endpoint(&self, gear: GearId, position: i64) -> f64 {
+        self.endpoint[GEAR_IDS.iter().position(|g| *g == gear).unwrap()][position as usize]
+    }
+
+    fn later_value(
+        &self,
+        o: &Observation,
+        gear: GearId,
+        position: i64,
+        newly_placed: bool,
+        corn_value: f64,
+        w: &HeuristicWeights,
+    ) -> (f64, i64) {
+        let p = &o.players[o.actor];
+        (1..=if gear == GearId::ChichenItza { 9 } else { 5 })
+            .filter_map(|target| {
+                let wait = (target - position).max(i64::from(newly_placed));
+                let arrival = position + wait;
+                if wait <= 0
+                    || o.round + wait > 27
+                    || arrival > if gear == GearId::ChichenItza { 10 } else { 7 }
+                {
+                    return None;
+                }
+                let cost = if arrival >= if gear == GearId::ChichenItza { 10 } else { 6 } {
+                    0
+                } else {
+                    arrival - target
+                };
+                let payoff = if gear == GearId::ChichenItza {
+                    resource_skull_value(o, p, target, w)
+                } else {
+                    self.endpoint(gear, target)
+                };
+                (cost <= p.resources[0]).then(|| {
+                    (
+                        (payoff - cost as f64 * corn_value) / (1 + wait) as f64,
+                        o.round + wait,
+                    )
+                })
+            })
+            .fold(
+                (0.0, o.round),
+                |best, next| if next.0 > best.0 { next } else { best },
+            )
+    }
+
+    pub(crate) fn score(&self, o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f64 {
+        if !self.supported {
+            return score_action_resource_aligned(o, a, w);
+        }
+        let p = &o.players[o.actor];
+        let corn_value = value(o, p, Resource::Corn, w, ScoringProfile::MonumentAligned);
+        // Existing Points/monument scores already use one point = one utility.
+        // Equal turn anchors cancel action-class priors; economics stays in the
+        // same default material/corn utility, not a global rescaling or mask.
+        let anchor = 13.0 + 0.3 * o.turn.count as f64;
+        match a {
+            TypedAction::Place {
+                gear, corn_cost, ..
+            } => {
+                let Some(position) = resource_route_slot(o, *gear) else {
+                    return score_action_resource_aligned(o, a, w);
+                };
+                let (future, arrival) =
+                    self.later_value(o, *gear, position as i64, true, corn_value, w);
+                anchor + future
+                    - *corn_cost as f64 * corn_value
+                    - resource_food_tradeoff(
+                        o,
+                        p,
+                        p.resources[0],
+                        p.resources[0] - *corn_cost,
+                        arrival,
+                    )
+            }
+            TypedAction::Remove { gear, position }
+                if *gear != GearId::ChichenItza && (1..=5).contains(position) =>
+            {
+                let now = (1..=*position)
+                    .filter_map(|target| {
+                        let cost = position - target;
+                        (cost <= p.resources[0])
+                            .then(|| self.endpoint(*gear, target) - cost as f64 * corn_value)
+                    })
+                    .fold(0.0, f64::max);
+                anchor + now
+                    - self
+                        .later_value(o, *gear, *position, false, corn_value, w)
+                        .0
+            }
+            TypedAction::Remove { position: 0, .. } => anchor - 20.0,
+            TypedAction::Remove { gear, position } => {
+                anchor + action_value(o, p, *gear, *position, w, ScoringProfile::MonumentAligned)
+            }
+            TypedAction::FirstPlayer { corn_cost } => {
+                anchor + (o.accumulated_corn - *corn_cost) as f64 * corn_value
+                    - resource_food_tradeoff(
+                        o,
+                        p,
+                        p.resources[0],
+                        p.resources[0] - *corn_cost,
+                        o.round + 1,
+                    )
+            }
+            TypedAction::Beg => anchor + (3 - p.resources[0]) as f64 * corn_value - w.temple_step,
+            TypedAction::EndTurn { .. } => anchor,
+            TypedAction::Technology { technology }
+                if matches!(
+                    o.pending_task,
+                    Some(Task::Technology {
+                        remaining: 1..=2,
+                        ..
+                    })
+                ) =>
+            {
+                self.technology[tech_index(*technology)]
+            }
+            TypedAction::UseAction {
+                gear,
+                position,
+                corn_cost,
+                ..
+            } if (1..=5).contains(position)
+                && (*gear == GearId::Tikal || *gear == GearId::Uxmal) =>
+            {
+                self.endpoint(*gear, *position) - *corn_cost as f64 * corn_value
+            }
+            TypedAction::Trade { resource, buy }
+                if MATERIALS.contains(resource) && matches!(o.pending_task, Some(Task::Trade)) =>
+            {
+                let mut after = p.resources;
+                let index = resource_index(*resource);
+                if *buy {
+                    after[0] -= (index + 1) as i64;
+                    after[index] += 1;
+                } else {
+                    after[0] += (index + 1) as i64;
+                    after[index] -= 1;
+                }
+                if after.iter().any(|n| *n < 0) {
+                    return -1.0;
+                }
+                let before = resource_market_progress(o, p, &p.resources, self.market_goal);
+                let next = resource_market_progress(o, p, &after, self.market_goal);
+                if next >= before {
+                    return -1.0;
+                }
+                // Strict integer E,D,F descent while W/goal are fixed. Buying
+                // may worsen F; once D=0, surplus food sales can still progress.
+                let rank = |(e, d, f)| (e * (RESOURCE_GOAL_MAX + 1) + d) * 13 + f;
+                (rank(before) - rank(next)) as f64
+            }
+            _ => score_action_resource_aligned(o, a, w),
+        }
+    }
+}
+
+/// Bounded routes and fixed market objectives; historical versions stay explicit.
+pub fn score_action_resource_aligned_v2(
+    o: &Observation,
+    a: &TypedAction,
+    w: &HeuristicWeights,
+) -> f64 {
+    ResourceRouteContext::new(o, w).score(o, a, w)
 }
 
 fn score_action_for_profile(
@@ -2843,5 +3749,164 @@ mod tests {
                 .is_none()
             );
         }
+        // V2 compares complete harvest alternatives; Agriculture2 does not
+        // receive the whole EmptyCorn payoff when wood/burn was already usable.
+        let mut state = playing(None);
+        state.round = 27;
+        state.pending = None;
+        let actor = state.current_player;
+        state.players[actor]
+            .technologies
+            .insert(TechnologyId::Agriculture, 1);
+        state.jungle.insert(3, JungleBox { corn: 1, wood: 1 });
+        state.gears.get_mut(&GearId::Palenque).unwrap()[3] = Some(GearWorker {
+            player_id: actor as i64,
+            dummy: false,
+        });
+        let observation = observe(&state, actor).unwrap();
+        let player = &observation.players[actor];
+        let forecast = ResourceForecast::new(&observation, player, &weights, false);
+        let before = ResourceForecastState::from(player);
+        let after = ResourceForecast::advance(&before, [0; 5], TechnologyId::Agriculture);
+        assert_eq!(forecast.harvest(&before, GearId::Palenque, 3), Some(4.0));
+        assert!((forecast.harvest(&after, GearId::Palenque, 3).unwrap() - 4.2).abs() < 1e-12);
+        assert!((forecast.gross(&before, TechnologyId::Agriculture) - 0.2).abs() < 1e-12);
+
+        // A literal negative-prefix two-step payoff at three real unique slots.
+        // Changing the best endpoint must not count the worker a second time.
+        let mut state = playing(None);
+        state.round = 27;
+        state.pending = None;
+        let actor = state.current_player;
+        state.players[actor].resources.insert(Resource::Wood, 3);
+        for position in [2, 3, 4] {
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[position] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+        }
+        let observation = observe(&state, actor).unwrap();
+        let player = &observation.players[actor];
+        let joint_weights = HeuristicWeights {
+            material_values: [1.0, 4.0, 1.0],
+            ..weights.clone()
+        };
+        let forecast = ResourceForecast::new(&observation, player, &joint_weights, false);
+        let before = ResourceForecastState::from(player);
+        let middle = ResourceForecast::advance(&before, [0, 1, 0, 0, 0], TechnologyId::Extraction);
+        let after = ResourceForecast::advance(&middle, [0, 2, 0, 0, 0], TechnologyId::Extraction);
+        assert!((forecast.potential(&before) - 15.7).abs() < 1e-12);
+        assert!((forecast.potential(&after) - 24.0).abs() < 1e-12);
+        assert_eq!(
+            forecast
+                .step(&before, TechnologyId::Extraction, false, false)
+                .unwrap()
+                .0,
+            -1.0
+        );
+        let offered = forecast
+            .offer(&before, TechnologyId::Extraction, false, 2, true)
+            .unwrap();
+        assert!((offered.value - 5.3).abs() < 1e-12);
+        assert_eq!(offered.material_count, 3);
+
+        let mut state = playing(None);
+        state.pending = None;
+        let actor = state.current_player;
+        state.players[actor].resources.insert(Resource::Corn, 20);
+        let observation = observe(&state, actor).unwrap();
+        let context = ResourceRouteContext::new(&observation, &weights);
+        let mut no_build = observation.clone();
+        no_build.buildings.clear();
+        assert_eq!(
+            resource_visible_build_value(&no_build, &no_build.players[actor], &weights),
+            0.0
+        );
+        assert_eq!(
+            resource_skull_value(&observation, &observation.players[actor], 1, &weights),
+            0.0
+        );
+        let placement = observation
+            .legal_actions
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::Place {
+                        gear: GearId::Yaxchilan,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(
+            context.score(&observation, &placement.action, &weights)
+                > context.score(
+                    &observation,
+                    &TypedAction::EndTurn {
+                        double_advance: None
+                    },
+                    &weights
+                )
+        );
+        let decision = crate::choose_move_resource_aligned_v2(&observation).unwrap();
+        assert_eq!(
+            decision.policy_version,
+            crate::RESOURCE_ALIGNED_V2_POLICY_VERSION
+        );
+        let encoded = serde_json::to_string(&observation).unwrap();
+        let dispatched: crate::Decision =
+            serde_json::from_str(&crate::dispatch_cpu_resource_aligned_v2(&encoded).unwrap())
+                .unwrap();
+        assert_eq!(dispatched, decision);
+        let mut malformed = observation.clone();
+        malformed.actor = malformed.players.len();
+        assert!(crate::choose_move_resource_aligned_v2(&malformed).is_err());
+        assert!(
+            crate::dispatch_cpu_resource_aligned_v2(&serde_json::to_string(&malformed).unwrap())
+                .is_err()
+        );
+
+        state.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        state.players[actor].resources = RESOURCE_IDS.into_iter().zip([2, 0, 0, 3, 0]).collect();
+        let observation = observe(&state, actor).unwrap();
+        let player = &observation.players[actor];
+        let mut context = ResourceRouteContext::new(&observation, &weights);
+        context.market_goal = ResourceMarketGoal {
+            materials: [2, 1, 0],
+            value: 1.0,
+        };
+        let buy = TypedAction::Trade {
+            resource: Resource::Wood,
+            buy: true,
+        };
+        assert!(context.score(&observation, &buy, &weights) > 0.0); // F may worsen; no reserve ban.
+        let held = [0, 1, 0, 3, 0];
+        assert_eq!(resource_wealth(&held), resource_wealth(&player.resources));
+        assert!(
+            resource_market_progress(&observation, player, &held, context.market_goal)
+                < resource_market_progress(
+                    &observation,
+                    player,
+                    &player.resources,
+                    context.market_goal
+                )
+        );
+        let complete = [0, 2, 1, 2, 0];
+        let sale = [4, 2, 1, 1, 0];
+        assert!(
+            resource_market_progress(&observation, player, &sale, context.market_goal)
+                < resource_market_progress(&observation, player, &complete, context.market_goal)
+        );
+        let goal = resource_market_goal(&observation, player, &weights, true);
+        let mut sold = player.clone();
+        sold.resources = [6, 0, 0, 2, 0];
+        let goal_after = resource_market_goal(&observation, &sold, &weights, true);
+        assert_eq!(goal.materials, goal_after.materials);
+        assert_eq!(goal.value.to_bits(), goal_after.value.to_bits());
     }
 }

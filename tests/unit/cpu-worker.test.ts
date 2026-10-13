@@ -41,7 +41,7 @@ const observation: Observation = {
 const decision: CpuDecision = {
   actor: 1,
   observationKey: 'expected',
-  policyVersion: 'heuristic-monument-aligned-v2',
+  policyVersion: 'heuristic-resource-aligned-v2',
   move: { type: 'endTurn' },
 };
 const model: CpuModelMetadata = {

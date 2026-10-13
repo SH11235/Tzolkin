@@ -10,6 +10,7 @@ pub const FOOD_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-food-aligned-v2";
 pub const MONUMENT_ALIGNED_POLICY_VERSION: &str = "heuristic-monument-aligned-v1";
 pub const MONUMENT_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-monument-aligned-v2";
 pub const RESOURCE_ALIGNED_POLICY_VERSION: &str = "heuristic-resource-aligned-v1";
+pub const RESOURCE_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-resource-aligned-v2";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {
@@ -99,6 +100,22 @@ pub fn choose_move_resource_aligned(observation: &Observation) -> Result<Decisio
     )
 }
 
+/// Current App resource routes use a shared bounded observation context.
+pub fn choose_move_resource_aligned_v2(observation: &Observation) -> Result<Decision, String> {
+    let weights = policy::HeuristicWeights::default();
+    let context = std::cell::OnceCell::new();
+    choose_scored(
+        observation,
+        &weights,
+        RESOURCE_ALIGNED_V2_POLICY_VERSION,
+        |action| {
+            context
+                .get_or_init(|| policy::ResourceRouteContext::new(observation, &weights))
+                .score(observation, action, &weights)
+        },
+    )
+}
+
 fn choose_scored(
     observation: &Observation,
     weights: &policy::HeuristicWeights,
@@ -164,6 +181,10 @@ pub fn dispatch_cpu_monument_aligned(request: &str) -> Result<String, String> {
 
 pub fn dispatch_cpu_monument_aligned_v2(request: &str) -> Result<String, String> {
     dispatch_with(request, choose_move_monument_aligned_v2)
+}
+
+pub fn dispatch_cpu_resource_aligned_v2(request: &str) -> Result<String, String> {
+    dispatch_with(request, choose_move_resource_aligned_v2)
 }
 
 fn dispatch_with(
