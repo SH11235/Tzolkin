@@ -9,6 +9,7 @@ pub const FOOD_ALIGNED_POLICY_VERSION: &str = "heuristic-food-aligned-v1";
 pub const FOOD_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-food-aligned-v2";
 pub const MONUMENT_ALIGNED_POLICY_VERSION: &str = "heuristic-monument-aligned-v1";
 pub const MONUMENT_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-monument-aligned-v2";
+pub const RESOURCE_ALIGNED_POLICY_VERSION: &str = "heuristic-resource-aligned-v1";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {
@@ -84,6 +85,17 @@ pub fn choose_move_monument_aligned_v2(observation: &Observation) -> Result<Deci
         &weights,
         MONUMENT_ALIGNED_V2_POLICY_VERSION,
         |action| policy::score_action_monument_aligned_v2(observation, action, &weights),
+    )
+}
+
+/// Explicit, unactivated resource-investment hypothesis; old choosers stay frozen.
+pub fn choose_move_resource_aligned(observation: &Observation) -> Result<Decision, String> {
+    let weights = policy::HeuristicWeights::default();
+    choose_scored(
+        observation,
+        &weights,
+        RESOURCE_ALIGNED_POLICY_VERSION,
+        |action| policy::score_action_resource_aligned(observation, action, &weights),
     )
 }
 

@@ -642,6 +642,365 @@ pub fn score_action_monument_aligned_v2(
         + if o.round >= 25 { 15.0 } else { 0.0 }
 }
 
+fn material_payment(p: &PublicPlayer, amount: i64, w: &HeuristicWeights) -> Option<[i64; 5]> {
+    let mut order = [1, 2, 3];
+    order.sort_by(|a, b| w.material_values[*a - 1].total_cmp(&w.material_values[*b - 1]));
+    let mut payment = [0; 5];
+    let mut remaining = amount;
+    for index in order {
+        payment[index] = p.resources[index].max(0).min(remaining);
+        remaining -= payment[index];
+    }
+    (remaining == 0).then_some(payment)
+}
+
+fn harvest_available(
+    o: &Observation,
+    p: &PublicPlayer,
+    gear: GearId,
+    position: i64,
+) -> Option<[i64; 5]> {
+    if gear != GearId::Palenque || position == 1 {
+        return selected_action_resources(o, p, gear, position);
+    }
+    let jungle = o.jungle.get(&position)?;
+    let corn = if jungle.corn > jungle.wood {
+        HarvestKind::Corn
+    } else if p.technologies[tech_index(TechnologyId::Agriculture)] >= 2 {
+        HarvestKind::EmptyCorn
+    } else {
+        return None;
+    };
+    Some(harvest_resources(o, p, corn, position))
+}
+
+// This is a bounded opportunity hypothesis, not a simulated future state.
+// Each currently owned worker contributes at most one supported harvest by
+// day27 (still a playable day), assuming one normal advance per day; only the
+// largest three contributions count. No double advance is predicted.
+// Current jungle availability is held fixed; no future tile/worker is invented.
+fn resource_harvest_delta(
+    o: &Observation,
+    p: &PublicPlayer,
+    next: &PublicPlayer,
+    w: &HeuristicWeights,
+) -> f64 {
+    let mut gains = Vec::new();
+    for gear in [GearId::Palenque, GearId::Yaxchilan] {
+        let Some(slots) = o.gears.get(&gear) else {
+            continue;
+        };
+        for (position, worker) in slots.iter().take(6).enumerate() {
+            if !worker
+                .as_ref()
+                .is_some_and(|worker| !worker.dummy && worker.player_id == o.actor as i64)
+            {
+                continue;
+            }
+            let mut best: f64 = 0.0;
+            for target in (position as i64).max(1)..=5 {
+                if o.round + target - position as i64 > 27 {
+                    continue;
+                }
+                let before = harvest_available(o, p, gear, target).unwrap_or([0; 5]);
+                let after = harvest_available(o, next, gear, target).unwrap_or([0; 5]);
+                let delta = std::array::from_fn(|i| after[i] - before[i]);
+                best = best.max(amount_value(
+                    o,
+                    p,
+                    &delta,
+                    w,
+                    ScoringProfile::MonumentAligned,
+                ));
+                if gear == GearId::Palenque && target >= 3 {
+                    // Wood is an alternative to corn, never an additional harvest.
+                    let jungle = o.jungle.get(&target);
+                    if jungle.is_some_and(|jungle| jungle.wood > 0) {
+                        let before = harvest_resources(o, p, HarvestKind::Wood, target);
+                        let after = harvest_resources(o, next, HarvestKind::Wood, target);
+                        let delta = std::array::from_fn(|i| after[i] - before[i]);
+                        best = best.max(amount_value(
+                            o,
+                            p,
+                            &delta,
+                            w,
+                            ScoringProfile::MonumentAligned,
+                        ));
+                    }
+                }
+            }
+            gains.push(best);
+        }
+    }
+    gains.sort_by(|a, b| b.total_cmp(a));
+    gains.into_iter().take(3).sum()
+}
+
+fn resource_technology_gross(
+    o: &Observation,
+    p: &PublicPlayer,
+    technology: TechnologyId,
+    w: &HeuristicWeights,
+) -> f64 {
+    let level = p.technologies[tech_index(technology)];
+    if level < 3 {
+        let mut next = p.clone();
+        next.technologies[tech_index(technology)] += 1;
+        return resource_harvest_delta(o, p, &next, w);
+    }
+    // Core repeats the final bonus at level3. The bonus quantities are exact;
+    // the value of a future material/temple selection is still heuristic.
+    match technology {
+        TechnologyId::Agriculture => {
+            if TEMPLE_IDS
+                .iter()
+                .any(|t| p.temples[temple_index(*t)] < CATALOG.temple_tracks[t].max)
+            {
+                w.temple_step
+            } else {
+                0.0
+            }
+        }
+        TechnologyId::Extraction => 2.0 * w.material_values.into_iter().fold(0.0, f64::max),
+        TechnologyId::Architecture => 3.0,
+        TechnologyId::Theology => {
+            if o.skull_supply > 0 {
+                7.0
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+fn resource_technology_step(
+    o: &Observation,
+    p: &PublicPlayer,
+    technology: TechnologyId,
+    free: bool,
+    follow_up: bool,
+    w: &HeuristicWeights,
+) -> Option<(f64, [i64; 5])> {
+    let level = p.technologies[tech_index(technology)];
+    let cost = if free {
+        0
+    } else if level == 3 {
+        1
+    } else {
+        level + 1
+    };
+    let payment = material_payment(p, cost, w)?;
+    let gross = resource_technology_gross(o, p, technology, w);
+    let mut net = gross - amount_value(o, p, &payment, w, ScoringProfile::MonumentAligned);
+    if follow_up && level < 3 {
+        let mut next = p.clone();
+        next.technologies[tech_index(technology)] += 1;
+        for (held, spent) in next.resources.iter_mut().zip(payment) {
+            *held -= spent;
+        }
+        let next_cost = if next.technologies[tech_index(technology)] == 3 {
+            1
+        } else {
+            level + 2
+        };
+        if let Some(next_payment) = material_payment(&next, next_cost, w) {
+            // Half of one positive, paid follow-up is a frozen option-value
+            // hypothesis. No recursive lookahead or free future step is assumed.
+            let follow = resource_technology_gross(o, &next, technology, w)
+                - amount_value(o, &next, &next_payment, w, ScoringProfile::MonumentAligned);
+            net += 0.5 * follow.max(0.0);
+        }
+    }
+    Some((net, payment))
+}
+
+fn resource_technology_offered(
+    o: &Observation,
+    p: &PublicPlayer,
+    technology: TechnologyId,
+    free: bool,
+    steps: usize,
+    can_skip: bool,
+    w: &HeuristicWeights,
+) -> Option<f64> {
+    if !(1..=2).contains(&steps) {
+        return None;
+    }
+    let (first, payment) = resource_technology_step(o, p, technology, free, steps == 1, w)?;
+    if steps == 1 {
+        return Some(first);
+    }
+    let mut remaining = p.clone();
+    for (held, spent) in remaining.resources.iter_mut().zip(payment) {
+        *held -= spent;
+    }
+    remaining.technologies[tech_index(technology)] =
+        (remaining.technologies[tech_index(technology)] + 1).min(3);
+    // Two offered advances may have a negative prefix. Enumerate the four
+    // feasible continuations, charging their recomputed costs (free stays free).
+    // Only the final offered advance receives the paid half-tail hypothesis.
+    // Final-bonus resource gains are not pre-spent to fund the continuation.
+    let mut continuation = can_skip.then_some(0.0);
+    for next in TECHNOLOGY_IDS {
+        if let Some((net, _)) = resource_technology_step(o, &remaining, next, free, true, w) {
+            continuation = Some(continuation.map_or(net, |best: f64| best.max(net)));
+        }
+    }
+    continuation.map(|next| first + next)
+}
+
+fn resource_technology_preview(
+    o: &Observation,
+    p: &PublicPlayer,
+    steps: usize,
+    w: &HeuristicWeights,
+) -> f64 {
+    // Tikal1/3 offer one/two paid optional steps, including immediate Skip.
+    // At most four first choices times four continuations, without rollout.
+    TECHNOLOGY_IDS.into_iter().fold(0.0, |best: f64, first| {
+        resource_technology_offered(o, p, first, false, steps, true, w)
+            .map_or(best, |value| best.max(value))
+    })
+}
+
+fn resource_market_shortfall(o: &Observation, p: &PublicPlayer) -> f64 {
+    if [8, 14, 21, 27]
+        .into_iter()
+        .any(|day| !o.food_days.contains(&day))
+    {
+        (food_requirement(o, p, ScoringProfile::MonumentAligned) - p.resources[0] as f64).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn resource_sale_value(shortfall: f64, index: usize, w: &HeuristicWeights) -> f64 {
+    let corn = [0.0, 2.0, 3.0, 4.0][index];
+    shortfall.min(corn) * w.corn_when_short + (corn - shortfall).max(0.0) * w.corn_base
+        - w.material_values[index - 1]
+}
+
+fn resource_market_preview(o: &Observation, p: &PublicPlayer, w: &HeuristicWeights) -> f64 {
+    let mut shortfall = resource_market_shortfall(o, p);
+    let mut order = [1, 2, 3];
+    order.sort_by(|a, b| {
+        (w.material_values[*a - 1] / (*a + 1) as f64)
+            .total_cmp(&(w.material_values[*b - 1] / (*b + 1) as f64))
+    });
+    let mut total = 0.0;
+    for index in order {
+        // Full basegame feeding needs at most12corn. Only sales needed for
+        // that finite target are considered, not an unbounded trade rollout.
+        let count = p.resources[index]
+            .max(0)
+            .min((shortfall / (index + 1) as f64).ceil() as i64);
+        for _ in 0..count.min(6) {
+            let gain = resource_sale_value(shortfall, index, w);
+            if shortfall <= 0.0 || gain <= 0.0 {
+                break;
+            }
+            total += gain;
+            shortfall = (shortfall - (index + 1) as f64).max(0.0);
+        }
+    }
+    total
+}
+
+/// An additive, unactivated basegame resource-investment hypothesis.
+/// Quantities, cost and mandatory payment are distinct from the bounded harvest
+/// forecast and half-step option value. No legal move or early-food loss is masked.
+pub fn score_action_resource_aligned(
+    o: &Observation,
+    a: &TypedAction,
+    w: &HeuristicWeights,
+) -> f64 {
+    let fallback = || score_action_monument_aligned_v2(o, a, w);
+    let p = &o.players[o.actor];
+    if o.phase != Phase::Playing
+        || o.expansion.is_some()
+        || o.private.selected_tribe.is_some()
+        || o.players.iter().any(|p| p.tribe.is_some())
+        || p.technologies.iter().any(|level| !(0..=3).contains(level))
+    {
+        return fallback();
+    }
+    match a {
+        TypedAction::Technology { technology } => {
+            let Some(Task::Technology {
+                free,
+                remaining,
+                mandatory,
+            }) = &o.pending_task
+            else {
+                return fallback();
+            };
+            if !(1..=2).contains(remaining) {
+                return fallback();
+            }
+            resource_technology_offered(
+                o,
+                p,
+                *technology,
+                *free,
+                *remaining as usize,
+                !*free && !*mandatory,
+                w,
+            )
+            .unwrap_or(-100.0)
+        }
+        TypedAction::Remove { gear, position }
+            if (*gear == GearId::Tikal && matches!(position, 1 | 3))
+                || (*gear == GearId::Uxmal && *position == 2) =>
+        {
+            if !o
+                .gears
+                .get(gear)
+                .and_then(|slots| slots.get(*position as usize))
+                .and_then(Option::as_ref)
+                .is_some_and(|worker| !worker.dummy && worker.player_id == o.actor as i64)
+            {
+                return fallback();
+            }
+            let gain = if *gear == GearId::Tikal {
+                resource_technology_preview(o, p, if *position == 3 { 2 } else { 1 }, w)
+            } else {
+                resource_market_preview(o, p, w)
+            };
+            10.0 + gain + if o.round >= 25 { 15.0 } else { 0.0 }
+        }
+        TypedAction::UseAction {
+            gear,
+            position,
+            corn_cost,
+            ..
+        } if (*gear == GearId::Tikal && matches!(position, 1 | 3))
+            || (*gear == GearId::Uxmal && *position == 2) =>
+        {
+            let gain = if *gear == GearId::Tikal {
+                resource_technology_preview(o, p, if *position == 3 { 2 } else { 1 }, w)
+            } else {
+                let mut paid = p.clone();
+                paid.resources[0] -= *corn_cost;
+                resource_market_preview(o, &paid, w)
+            };
+            gain - *corn_cost as f64
+                * value(o, p, Resource::Corn, w, ScoringProfile::MonumentAligned)
+        }
+        TypedAction::Trade {
+            resource,
+            buy: false,
+        } if MATERIALS.contains(resource) => {
+            let shortfall = resource_market_shortfall(o, p);
+            if shortfall > 0.0 {
+                resource_sale_value(shortfall, resource_index(*resource), w)
+            } else {
+                -1.0
+            }
+        }
+        _ => fallback(),
+    }
+}
+
 fn score_action_for_profile(
     o: &Observation,
     a: &TypedAction,
@@ -1599,6 +1958,585 @@ mod tests {
                 score_action_monument_aligned_v2(&observation, &action, &weights).to_bits(),
                 score_action_monument_aligned(&observation, &action, &weights).to_bits()
             );
+        }
+
+        // ResourceAlignedV1 separates the real material obligation from its
+        // bounded investment hypothesis. Core, not the scorer, is the oracle.
+        for free in [false, true] {
+            for (level, paid_cost, old_score) in
+                [(0, 1, 6.0_f64), (1, 2, 5.5), (2, 3, 5.0), (3, 1, 4.5)]
+            {
+                let mut state = playing(None);
+                let actor = state.current_player;
+                state.players[actor]
+                    .technologies
+                    .insert(TechnologyId::Extraction, level);
+                for (resource, held) in [
+                    (Resource::Wood, 1),
+                    (Resource::Stone, 1),
+                    (Resource::Gold, 2),
+                ] {
+                    state.players[actor].resources.insert(resource, held);
+                }
+                state.pending = Some(Pending {
+                    title: "Technology".into(),
+                    task: Task::Technology {
+                        remaining: 1,
+                        free,
+                        mandatory: false,
+                    },
+                    after: vec![],
+                });
+                let observation = observe(&state, actor).unwrap();
+                let action = observation
+                    .legal_actions
+                    .iter()
+                    .find(|row| {
+                        row.action
+                            == TypedAction::Technology {
+                                technology: TechnologyId::Extraction,
+                            }
+                    })
+                    .unwrap();
+                let (_, predicted_payment) = resource_technology_step(
+                    &observation,
+                    &observation.players[actor],
+                    TechnologyId::Extraction,
+                    free,
+                    true,
+                    &weights,
+                )
+                .unwrap();
+                let cost = if free { 0 } else { paid_cost };
+                assert_eq!(predicted_payment.iter().sum::<i64>(), cost);
+                for old in [
+                    score_action(&observation, &action.action, &weights),
+                    score_action_for_revision(
+                        &observation,
+                        &action.action,
+                        &weights,
+                        HeuristicRevision::V1,
+                    ),
+                    score_action_food_aligned(&observation, &action.action, &weights),
+                    score_action_food_aligned_v2(&observation, &action.action, &weights),
+                    score_action_monument_aligned(&observation, &action.action, &weights),
+                    score_action_monument_aligned_v2(&observation, &action.action, &weights),
+                ] {
+                    assert_eq!(old.to_bits(), old_score.to_bits());
+                }
+                let mut next = apply_move(&state, action.r#move.clone()).unwrap();
+                if !free {
+                    assert_eq!(
+                        next.players[actor].technologies[&TechnologyId::Extraction],
+                        level
+                    );
+                    assert!(
+                        matches!(next.pending.as_ref().unwrap().task, Task::PayTechnology { amount, optional: false, .. } if amount == cost)
+                    );
+                    let payment = observe(&next, actor).unwrap();
+                    assert!(
+                        !payment
+                            .legal_actions
+                            .iter()
+                            .any(|row| row.action == TypedAction::Skip)
+                    );
+                    let selected = payment
+                        .legal_actions
+                        .iter()
+                        .min_by(|a, b| {
+                            score_action(&payment, &b.action, &weights)
+                                .total_cmp(&score_action(&payment, &a.action, &weights))
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        selected.action,
+                        TypedAction::Payment {
+                            resources: predicted_payment
+                        }
+                    );
+                    next = apply_move(&next, selected.r#move.clone()).unwrap();
+                } else {
+                    assert!(
+                        !observation
+                            .legal_actions
+                            .iter()
+                            .any(|row| row.action == TypedAction::Skip)
+                    );
+                }
+                assert_eq!(
+                    next.players[actor].technologies[&TechnologyId::Extraction],
+                    (level + 1).min(3)
+                );
+                for (resource, paid) in RESOURCE_IDS.into_iter().zip(predicted_payment) {
+                    assert_eq!(
+                        state.players[actor].resources[&resource]
+                            - next.players[actor].resources[&resource],
+                        paid
+                    );
+                }
+                if level == 3 {
+                    assert!(matches!(
+                        next.pending.as_ref().unwrap().task,
+                        Task::Resource { remaining: 2 }
+                    ));
+                }
+                if level == 0 && !free {
+                    assert!(
+                        score_action_resource_aligned(&observation, &action.action, &weights)
+                            < score_action_resource_aligned(
+                                &observation,
+                                &TypedAction::Skip,
+                                &weights
+                            )
+                    );
+                }
+            }
+        }
+        // Zero materials leaves only Skip for paid technology, while a free
+        // choice values a genuinely owned harvest worker above irrelevant tech.
+        for free in [false, true] {
+            let mut state = playing(None);
+            let actor = state.current_player;
+            for resource in MATERIALS {
+                state.players[actor].resources.insert(resource, 0);
+            }
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[1] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+            state.pending = Some(Pending {
+                title: "Technology".into(),
+                task: Task::Technology {
+                    remaining: 1,
+                    free,
+                    mandatory: false,
+                },
+                after: vec![],
+            });
+            let observation = observe(&state, actor).unwrap();
+            let decision = crate::choose_move_resource_aligned(&observation).unwrap();
+            assert_eq!(
+                decision.policy_version,
+                crate::RESOURCE_ALIGNED_POLICY_VERSION
+            );
+            let selected = observation
+                .legal_actions
+                .iter()
+                .find(|row| row.r#move == decision.r#move)
+                .unwrap();
+            if free {
+                assert_eq!(
+                    selected.action,
+                    TypedAction::Technology {
+                        technology: TechnologyId::Extraction
+                    }
+                );
+                assert!(
+                    score_action_resource_aligned(&observation, &selected.action, &weights)
+                        > score_action_resource_aligned(
+                            &observation,
+                            &TypedAction::Technology {
+                                technology: TechnologyId::Architecture
+                            },
+                            &weights
+                        )
+                );
+            } else {
+                assert_eq!(observation.legal_actions.len(), 1);
+                assert_eq!(selected.action, TypedAction::Skip);
+            }
+        }
+        // A legal four-worker Tikal3 removal exposes a two-step investment with
+        // a negative first step. Its combined value must agree with the pending
+        // choice; rejecting the prefix would lose the affordable second step.
+        let mut investment = create_game(
+            vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            17,
+            false,
+        )
+        .unwrap();
+        investment.phase = Phase::Playing;
+        investment.round = 6;
+        investment.pending = None;
+        let actor = investment.current_player;
+        investment.players[actor].workers = 4;
+        for resource in RESOURCE_IDS {
+            investment.players[actor].resources.insert(resource, 0);
+        }
+        investment.players[actor]
+            .resources
+            .insert(Resource::Corn, 100);
+        investment.players[actor]
+            .resources
+            .insert(Resource::Wood, 3);
+        for (gear, position) in [
+            (GearId::Yaxchilan, 2),
+            (GearId::Yaxchilan, 3),
+            (GearId::Yaxchilan, 4),
+            (GearId::Tikal, 3),
+        ] {
+            investment.gears.get_mut(&gear).unwrap()[position] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+        }
+        assert_eq!(
+            observe(&investment, actor).unwrap().players[actor].available_workers,
+            0
+        );
+        investment = apply_move(
+            &investment,
+            GameMove::Remove {
+                gear: GearId::Tikal,
+                position: 3,
+            },
+        )
+        .unwrap();
+        let access = observe(&investment, actor).unwrap();
+        assert_eq!(access.players[actor].available_workers, 1);
+        let selected = access
+            .legal_actions
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::UseAction {
+                        gear: GearId::Tikal,
+                        position: 3,
+                        corn_cost: 0,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let offered_value = score_action_resource_aligned(&access, &selected.action, &weights);
+        assert!((offered_value - 2.1).abs() < 1e-12);
+        investment = apply_move(&investment, selected.r#move.clone()).unwrap();
+        assert!(matches!(
+            investment.pending.as_ref().unwrap().task,
+            Task::Technology {
+                remaining: 2,
+                free: false,
+                mandatory: false
+            }
+        ));
+
+        // Core confirms the extra stone at Extraction2. Three independently
+        // owned workers can reach that legal action within the bounded forecast;
+        // the forecast is not a claim that those future harvests occurred.
+        for level in [1, 2] {
+            let mut oracle = investment.clone();
+            oracle.pending = None;
+            oracle.players[actor]
+                .technologies
+                .insert(TechnologyId::Extraction, level);
+            oracle.gears.get_mut(&GearId::Yaxchilan).unwrap()[4] = None;
+            oracle.gears.get_mut(&GearId::Yaxchilan).unwrap()[5] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+            let removed = apply_move(
+                &oracle,
+                GameMove::Remove {
+                    gear: GearId::Yaxchilan,
+                    position: 5,
+                },
+            )
+            .unwrap();
+            let observation = observe(&removed, actor).unwrap();
+            let selected = observation
+                .legal_actions
+                .iter()
+                .find(|row| {
+                    matches!(
+                        row.action,
+                        TypedAction::UseAction {
+                            gear: GearId::Yaxchilan,
+                            position: 5,
+                            corn_cost: 0,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let harvested = apply_move(&removed, selected.r#move.clone()).unwrap();
+            assert_eq!(
+                harvested.players[actor].resources[&Resource::Stone]
+                    - oracle.players[actor].resources[&Resource::Stone],
+                level
+            );
+        }
+        let paid = observe(&investment, actor).unwrap();
+        assert_eq!(
+            resource_technology_step(
+                &paid,
+                &paid.players[actor],
+                TechnologyId::Extraction,
+                false,
+                false,
+                &weights
+            )
+            .unwrap()
+            .0,
+            -2.0
+        );
+        for free in [false, true] {
+            let mut state = investment.clone();
+            if free {
+                state.players[actor].resources.insert(Resource::Wood, 0);
+                // The existing injected-task fixture also checks the free
+                // two-advance contract, without inventing a paid Tikal discount.
+                state.pending.as_mut().unwrap().task = Task::Technology {
+                    remaining: 2,
+                    free: true,
+                    mandatory: false,
+                };
+            }
+            for (step, expected) in [
+                (1, if free { 8.1 } else { 2.1 }),
+                (2, if free { 8.1 } else { 4.1 }),
+            ] {
+                let observation = observe(&state, actor).unwrap();
+                let decision = crate::choose_move_resource_aligned(&observation).unwrap();
+                let selected = observation
+                    .legal_actions
+                    .iter()
+                    .find(|row| row.r#move == decision.r#move)
+                    .unwrap();
+                assert_eq!(
+                    selected.action,
+                    TypedAction::Technology {
+                        technology: TechnologyId::Extraction,
+                    }
+                );
+                let score = score_action_resource_aligned(&observation, &selected.action, &weights);
+                assert!((score - expected).abs() < 1e-12);
+                if !free && step == 1 {
+                    assert_eq!(score.to_bits(), offered_value.to_bits());
+                }
+                state = apply_move(&state, selected.r#move.clone()).unwrap();
+                if !free {
+                    assert!(matches!(state.pending.as_ref().unwrap().task,
+                        Task::PayTechnology { amount, optional: false, .. } if amount == step));
+                    let payment = observe(&state, actor).unwrap();
+                    let selected = payment
+                        .legal_actions
+                        .iter()
+                        .find(|row| {
+                            row.action
+                                == TypedAction::Payment {
+                                    resources: [0, step, 0, 0, 0],
+                                }
+                        })
+                        .unwrap();
+                    state = apply_move(&state, selected.r#move.clone()).unwrap();
+                }
+                assert_eq!(
+                    state.players[actor].technologies[&TechnologyId::Extraction],
+                    step
+                );
+            }
+            assert_eq!(state.players[actor].resources[&Resource::Wood], 0);
+        }
+        let mut stopped = investment.clone();
+        stopped.players[actor].resources.insert(Resource::Wood, 1);
+        let observation = observe(&stopped, actor).unwrap();
+        let decision = crate::choose_move_resource_aligned(&observation).unwrap();
+        assert_eq!(
+            observation
+                .legal_actions
+                .iter()
+                .find(|row| row.r#move == decision.r#move)
+                .unwrap()
+                .action,
+            TypedAction::Skip
+        );
+
+        // Tikal3 offers exactly two advances. Each selected step has its own
+        // recomputed mandatory payment; a backward action also pays corn once.
+        for (position, steps) in [(1, 1), (3, 2)] {
+            let mut state = playing(None);
+            state.pending = None;
+            let actor = state.current_player;
+            state.players[actor].resources.insert(Resource::Wood, 6);
+            state.players[actor]
+                .technologies
+                .insert(TechnologyId::Architecture, 0);
+            state.gears.get_mut(&GearId::Tikal).unwrap()[position] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+            state = apply_move(
+                &state,
+                GameMove::Remove {
+                    gear: GearId::Tikal,
+                    position: position as i64,
+                },
+            )
+            .unwrap();
+            let observation = observe(&state, actor).unwrap();
+            let selected = observation.legal_actions.iter().find(|row| matches!(row.action, TypedAction::UseAction { gear: GearId::Tikal, position: p, corn_cost: 0, .. } if p == position as i64)).unwrap();
+            if position == 3 {
+                let backward = observation
+                    .legal_actions
+                    .iter()
+                    .find(|row| {
+                        matches!(
+                            row.action,
+                            TypedAction::UseAction {
+                                gear: GearId::Tikal,
+                                position: 1,
+                                corn_cost: 2,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap();
+                let moved = apply_move(&state, backward.r#move.clone()).unwrap();
+                assert_eq!(
+                    state.players[actor].resources[&Resource::Corn]
+                        - moved.players[actor].resources[&Resource::Corn],
+                    2
+                );
+                assert_eq!(
+                    score_action_resource_aligned(&observation, &backward.action, &weights)
+                        .to_bits(),
+                    (-2.0 * weights.corn_base).to_bits()
+                );
+            }
+            state = apply_move(&state, selected.r#move.clone()).unwrap();
+            assert!(
+                matches!(state.pending.as_ref().unwrap().task, Task::Technology { remaining, free: false, .. } if remaining == steps)
+            );
+            for cost in 1..=steps {
+                let before = state.players[actor].resources[&Resource::Wood];
+                let observation = observe(&state, actor).unwrap();
+                let selected = observation
+                    .legal_actions
+                    .iter()
+                    .find(|row| {
+                        row.action
+                            == TypedAction::Technology {
+                                technology: TechnologyId::Architecture,
+                            }
+                    })
+                    .unwrap();
+                state = apply_move(&state, selected.r#move.clone()).unwrap();
+                assert!(
+                    matches!(state.pending.as_ref().unwrap().task, Task::PayTechnology { amount, optional: false, .. } if amount == cost)
+                );
+                let observation = observe(&state, actor).unwrap();
+                let selected = observation
+                    .legal_actions
+                    .iter()
+                    .find(|row| {
+                        row.action
+                            == TypedAction::Payment {
+                                resources: [0, cost, 0, 0, 0],
+                            }
+                    })
+                    .unwrap();
+                state = apply_move(&state, selected.r#move.clone()).unwrap();
+                assert_eq!(
+                    before - state.players[actor].resources[&Resource::Wood],
+                    cost
+                );
+            }
+            assert_eq!(
+                state.players[actor].technologies[&TechnologyId::Architecture],
+                steps
+            );
+        }
+        // Market access itself yields nothing; every source-legal sale reduces
+        // materials and buys remain negative. The full next-food target ends it.
+        let mut state = playing(None);
+        state.pending = None;
+        state.round = 2;
+        let actor = state.current_player;
+        state.players[actor].workers = 5;
+        for resource in RESOURCE_IDS {
+            state.players[actor].resources.insert(resource, 0);
+        }
+        state.players[actor].resources.insert(Resource::Wood, 6);
+        state.gears.get_mut(&GearId::Uxmal).unwrap()[2] = Some(GearWorker {
+            player_id: actor as i64,
+            dummy: false,
+        });
+        state = apply_move(
+            &state,
+            GameMove::Remove {
+                gear: GearId::Uxmal,
+                position: 2,
+            },
+        )
+        .unwrap();
+        let observation = observe(&state, actor).unwrap();
+        let selected = observation
+            .legal_actions
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::UseAction {
+                        gear: GearId::Uxmal,
+                        position: 2,
+                        corn_cost: 0,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        state = apply_move(&state, selected.r#move.clone()).unwrap();
+        assert_eq!(state.players[actor].resources[&Resource::Corn], 0);
+        assert_eq!(state.players[actor].resources[&Resource::Wood], 6);
+        for sold in 0..=5 {
+            let observation = observe(&state, actor).unwrap();
+            let decision = crate::choose_move_resource_aligned(&observation).unwrap();
+            let selected = observation
+                .legal_actions
+                .iter()
+                .find(|row| row.r#move == decision.r#move)
+                .unwrap();
+            for row in &observation.legal_actions {
+                if matches!(row.action, TypedAction::Trade { buy: true, .. }) {
+                    assert_eq!(
+                        score_action_resource_aligned(&observation, &row.action, &weights)
+                            .to_bits(),
+                        (-10.0_f64).to_bits()
+                    );
+                }
+            }
+            assert_eq!(state.players[actor].resources[&Resource::Corn], sold * 2);
+            assert_eq!(state.players[actor].resources[&Resource::Wood], 6 - sold);
+            if sold == 5 {
+                assert_eq!(selected.action, TypedAction::Skip);
+                break;
+            }
+            assert_eq!(
+                selected.action,
+                TypedAction::Trade {
+                    resource: Resource::Wood,
+                    buy: false
+                }
+            );
+            state = apply_move(&state, selected.r#move.clone()).unwrap();
+        }
+        let mut prophecy = playing(Some(ProphecyId::TeacherShortage));
+        prophecy.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        let prophecy = observe(&prophecy, prophecy.current_player).unwrap();
+        let mut tribe = observe(&state, actor).unwrap();
+        tribe.players[actor].tribe = Some(TribeId::Itzamna);
+        for outside in [prophecy, tribe] {
+            for row in &outside.legal_actions {
+                assert_eq!(
+                    score_action_resource_aligned(&outside, &row.action, &weights).to_bits(),
+                    score_action_monument_aligned_v2(&outside, &row.action, &weights).to_bits()
+                );
+            }
         }
 
         // Marginal feed effects telescope and stop at the real saturated cost.
