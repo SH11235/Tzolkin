@@ -479,6 +479,9 @@ impl<'a> Role<'a> {
     fn from_app_opponent(opponent: AppOpponent<'a>) -> Result<Self, String> {
         match opponent {
             AppOpponent::App(profile) => Ok(Self::App(profile)),
+            AppOpponent::Existing(Opponent::Search(_)) => {
+                Err("App Arena does not admit Search roles".into())
+            }
             AppOpponent::Existing(opponent) => Self::from_opponent(opponent),
         }
     }
@@ -1932,6 +1935,28 @@ pub(super) mod tests {
             },
         };
         config.validate().unwrap();
+        let search = PreparedSearch::new(&crate::search::SearchConfig::default()).unwrap();
+        for search_in_reference in [true, false] {
+            let reference = if search_in_reference {
+                AppOpponent::Existing(Opponent::Search(&search))
+            } else {
+                AppOpponent::App(AppProfile::FoodAlignedV2)
+            };
+            let pool = (0..config.players)
+                .map(|seat| {
+                    if !search_in_reference && seat == 0 {
+                        AppOpponent::Existing(Opponent::Search(&search))
+                    } else {
+                        AppOpponent::App(AppProfile::FoodAlignedV2)
+                    }
+                })
+                .collect();
+            assert_eq!(
+                run_app_profile_validation(&config, AppProfile::FoodAlignedV2, reference, pool)
+                    .unwrap_err(),
+                "App Arena does not admit Search roles"
+            );
+        }
         assert!(serde_json::from_value::<AppProfile>(json!("nativeV2")).is_err());
         assert!(serde_json::from_value::<AppProfile>(json!("monumentAlignedV2")).is_err());
         let mut reanalysis = config.clone();
@@ -1946,6 +1971,20 @@ pub(super) mod tests {
         let mut no_additional_holdout = consent.clone();
         no_additional_holdout.protected_holdout_family_ids.clear();
         no_additional_holdout.validate_for(&reanalysis).unwrap();
+        assert_eq!(seed_partition(10), Ok(DatasetSplit::Test));
+        // A valid declaration reaches the separate pool gate. Invalid
+        // declarations below must fail at consent, not this later gate.
+        assert_eq!(
+            run_app_profile_diagnostic(
+                &reanalysis,
+                &consent,
+                AppProfile::FoodAlignedV2,
+                AppOpponent::App(AppProfile::FoodAlignedV2),
+                vec![],
+            )
+            .unwrap_err(),
+            "Numeric Arena absolute-seat pool count mismatch"
+        );
         // Ordinary Validation still rejects this spent family. Diagnostic
         // never removes it or gains access to Test/protected holdouts.
         assert!(reanalysis.validate().is_err());
@@ -1953,19 +1992,39 @@ pub(super) mod tests {
         for mutate in 0..6 {
             let mut refused = consent.clone();
             let mut configured = reanalysis.clone();
-            match mutate {
-                0 => refused.protected_holdout_family_ids.push(family_id(3)),
-                1 => refused.protected_holdout_family_ids.push(family_id(0)),
-                2 => refused.exposed_development_family_ids.push(family_id(3)),
-                3 => configured.external_exclusions.excluded_family_ids.clear(),
+            let expected_error = match mutate {
+                0 => {
+                    refused.protected_holdout_family_ids.push(family_id(3));
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
+                }
+                1 => {
+                    refused.protected_holdout_family_ids.push(family_id(0));
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
+                }
+                2 => {
+                    refused.exposed_development_family_ids.push(family_id(3));
+                    "App diagnostic rejects invalid or repeated family metadata"
+                }
+                3 => {
+                    configured.external_exclusions.excluded_family_ids.clear();
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
+                }
                 4 => {
                     configured.seeds = vec![10];
                     refused.exposed_development_family_ids = vec![family_id(10)];
                     refused.protected_holdout_family_ids.clear();
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
                 }
-                _ => refused.evidence_sha256 = "not-a-digest".into(),
-            }
-            assert!(
+                _ => {
+                    refused.evidence_sha256 = "not-a-digest".into();
+                    "App diagnostic requires bounded explicit Development consent"
+                }
+            };
+            assert_eq!(
+                refused.validate_for(&configured).unwrap_err(),
+                expected_error
+            );
+            assert_eq!(
                 run_app_profile_diagnostic(
                     &configured,
                     &refused,
@@ -1973,7 +2032,8 @@ pub(super) mod tests {
                     AppOpponent::App(AppProfile::FoodAlignedV2),
                     vec![],
                 )
-                .is_err()
+                .unwrap_err(),
+                expected_error
             );
         }
         for seeds in [vec![0], vec![10], vec![3, 3]] {

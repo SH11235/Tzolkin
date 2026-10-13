@@ -68,9 +68,9 @@ struct CommandConfig {
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 enum AppRoleInput {
     AppProfile { profile: AppProfile },
-    NativeV2,
-    CornFirstSetupV2,
-    ResourceCycleV5,
+    NativeV2 {},
+    CornFirstSetupV2 {},
+    ResourceCycleV5 {},
     Numeric { deployment: DeploymentInput },
 }
 impl AppRoleInput {
@@ -81,9 +81,9 @@ impl AppRoleInput {
     ) -> Result<AppOpponent<'a>, String> {
         Ok(match self {
             Self::AppProfile { profile } => AppOpponent::App(profile),
-            Self::NativeV2 => AppOpponent::Existing(Opponent::Heuristic(weights)),
-            Self::CornFirstSetupV2 => AppOpponent::Existing(Opponent::CornFirstSetup(weights)),
-            Self::ResourceCycleV5 => {
+            Self::NativeV2 {} => AppOpponent::Existing(Opponent::Heuristic(weights)),
+            Self::CornFirstSetupV2 {} => AppOpponent::Existing(Opponent::CornFirstSetup(weights)),
+            Self::ResourceCycleV5 {} => {
                 AppOpponent::Existing(Opponent::ResourceCycle(ResourceCycleConfig::v5()))
             }
             Self::Numeric { deployment } => {
