@@ -147,7 +147,7 @@ impl ConditionalNativeExclusions {
     pub fn descriptor(&self) -> &NativeExclusionDescriptor {
         &self.descriptor
     }
-    fn recheck(&self) -> Result<(), String> {
+    pub(crate) fn recheck(&self) -> Result<(), String> {
         let checked = Self::load(
             Path::new(&self.descriptor.pin.path),
             &self.descriptor.pin,
@@ -158,6 +158,12 @@ impl ConditionalNativeExclusions {
             return Err("External family closure changed".into());
         }
         Ok(())
+    }
+    pub(crate) fn contains_family(&self, family: &str) -> bool {
+        self.families.contains(family)
+    }
+    pub(crate) fn content_pin(&self) -> &ContentPin {
+        &self.descriptor.pin
     }
 }
 // The declared union uses sorted UTF-8 lines, including the final LF. Its
@@ -233,7 +239,7 @@ impl ConditionalFrozenPool {
         )?;
         Ok(Self { wire, checksum })
     }
-    fn freeze<'a>(
+    pub(crate) fn freeze<'a>(
         &'a self,
         prepared: Option<&'a PreparedPublicPolicy>,
     ) -> Result<[ConditionalFrozenMixRoster<'a>; 4], String> {
@@ -328,11 +334,14 @@ impl<'a> ConditionalFrozenMixRoster<'a> {
             .and_then(Option::as_ref)
             .ok_or_else(|| "Missing conditional opponent".into())
     }
-    fn contains_family(&self, family: &str) -> bool {
+    pub(crate) fn contains_family(&self, family: &str) -> bool {
         self.opponents
             .iter()
             .flatten()
             .any(|p| p.contains_family(family))
+    }
+    pub(crate) fn checksum(&self) -> &str {
+        &self.checksum
     }
 }
 

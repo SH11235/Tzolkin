@@ -1487,6 +1487,147 @@ fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel
             .distribution_semantic_playing(&observe(&playing_state(), 0).unwrap())
             .is_ok()
     );
+    use tzolkin_ai::conditional_human_rl_update::{
+        ConditionalFrozenPool, ConditionalNativeExclusions,
+    };
+    use tzolkin_ai::human_initial_wealth::ContentPin;
+    use tzolkin_ai::public_stochastic_native::CollectionLimits;
+    use tzolkin_ai::semantic_playing_rl_collection::{
+        DeclaredSamplingHistory, DeclaredSamplingRange, SemanticCallbackRole,
+        SemanticPlayingCollectionSession,
+    };
+    let excluded = tzolkin_ai::dataset::seed_family_id(42);
+    let exclusion_path = train.root.join("native-exclusions.json");
+    let exclusion_bytes = serde_json::to_vec(
+        &json!({"schema":"tzolkin-conditional-native-exclusions-v1","families":[excluded]}),
+    )
+    .unwrap();
+    fs::write(&exclusion_path, &exclusion_bytes).unwrap();
+    let exclusion_pin = ContentPin {
+        path: exclusion_path.to_str().unwrap().into(),
+        bytes: exclusion_bytes.len() as u64,
+        sha256: sha(&exclusion_bytes),
+    };
+    let external = ConditionalNativeExclusions::load(
+        &exclusion_path,
+        &exclusion_pin,
+        1,
+        &sha(format!("{excluded}\n").as_bytes()),
+    )
+    .unwrap();
+    let evidence_path = train.root.join("synthetic-sampling-history.txt");
+    let evidence = b"synthetic fixture declares no previous streams";
+    fs::write(&evidence_path, evidence).unwrap();
+    let evidence_pin = ContentPin {
+        path: evidence_path.to_str().unwrap().into(),
+        bytes: evidence.len() as u64,
+        sha256: sha(evidence),
+    };
+    let history =
+        DeclaredSamplingHistory::declare_complete(vec![], vec![evidence_pin.clone()]).unwrap();
+    let range = DeclaredSamplingRange::new(SamplingSeed::new(17), 0, 3, 0, 0, 4).unwrap();
+    assert!(
+        DeclaredSamplingHistory::declare_complete(
+            vec![range.clone(), range.clone()],
+            vec![evidence_pin.clone()]
+        )
+        .is_err()
+    );
+    let consumed =
+        DeclaredSamplingHistory::declare_complete(vec![range], vec![evidence_pin.clone()]).unwrap();
+    let seeds: [u32; 4] = (0u32..256)
+        .filter(|&seed| {
+            let family = tzolkin_ai::dataset::seed_family_id(seed);
+            family != excluded
+                && tzolkin_ai::dataset::split_for_family(&family).unwrap() == DatasetSplit::Train
+        })
+        .take(4)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let opponent = json!({"kind":"heuristic"});
+    let pool=ConditionalFrozenPool::from_json(&serde_json::to_vec(&json!({"schema":"tzolkin-conditional-human-mixed-frozen-pool-v1",
+        "weights":tzolkin_ai::policy::HeuristicWeights::default(),"rosters":[[null,opponent,opponent],[null,opponent,opponent],[null,opponent,opponent,opponent],[null,opponent,opponent,opponent]]})).unwrap()).unwrap();
+    let limits = CollectionLimits::new(1, 4096, 1024 * 1024, 65536).unwrap();
+    let mut blocked = SemanticPlayingCollectionSession::new(
+        &semantic_owner,
+        &external,
+        &consumed,
+        SamplingSeed::new(17),
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(
+        blocked
+            .collect_whole_four(seeds, &pool, None, limits)
+            .is_err()
+    );
+    assert_eq!(
+        (blocked.attempts(), blocked.consumed_families().len()),
+        (0, 0)
+    );
+    let mut collected = SemanticPlayingCollectionSession::new(
+        &semantic_owner,
+        &external,
+        &history,
+        SamplingSeed::new(17),
+        0,
+        0,
+    )
+    .unwrap();
+    assert!(
+        collected
+            .collect_whole_four(seeds, &pool, None, limits)
+            .is_err()
+    );
+    assert_eq!(
+        (
+            collected.attempts(),
+            collected.next_episode_ordinal(),
+            collected.consumed_families().len(),
+            collected.consumed_actor_streams()
+        ),
+        (1, 4, 4, 14)
+    );
+    assert!(collected.stopped());
+    let failure = collected.failed_game().unwrap();
+    assert_eq!(
+        failure.callback_role(0),
+        Some(SemanticCallbackRole::LearnerSetup)
+    );
+    assert_eq!(
+        (
+            failure.observed_callbacks(),
+            failure.applied_choices(),
+            failure.playing_samples()
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(*failure.actor_draws(), [0; 4]);
+    assert!(
+        collected
+            .collect_whole_four(seeds, &pool, None, limits)
+            .is_err()
+    );
+    assert_eq!(semantic_owner.identity().unwrap().completed_updates(), 0);
+    fs::write(&evidence_path, [evidence.as_slice(), b" "].concat()).unwrap();
+    let mut changed_history = SemanticPlayingCollectionSession::new(
+        &semantic_owner,
+        &external,
+        &history,
+        SamplingSeed::new(17),
+        4,
+        0,
+    )
+    .unwrap();
+    assert!(
+        changed_history
+            .collect_whole_four(seeds, &pool, None, limits)
+            .is_err()
+    );
+    assert_eq!(changed_history.attempts(), 0);
+    fs::write(&evidence_path, evidence).unwrap();
     let public_validation = train.root.join("public-validation.json");
     let semantic_validation = train.root.join("semantic-validation.json");
     let public_manifest = validation.root.join("manifest.json");
@@ -1538,6 +1679,21 @@ fn conditional_rl_load_seals_raw_inputs_and_samples_setup_without_native_relabel
             serde_json::from_slice::<Value>(&changed).unwrap()
         );
         fs::write(&path, changed).unwrap();
+        let mut changed_source = SemanticPlayingCollectionSession::new(
+            &semantic_owner,
+            &external,
+            &history,
+            SamplingSeed::new(17),
+            4,
+            0,
+        )
+        .unwrap();
+        assert!(
+            changed_source
+                .collect_whole_four(seeds, &pool, None, limits)
+                .is_err()
+        );
+        assert_eq!(changed_source.attempts(), 0);
         assert!(SemanticPlayingRlOwner::from_prepared(&semantic_prepared, 11).is_err());
         assert!(semantic_owner.handle().is_err());
         assert!(semantic_owner.identity().is_err());
