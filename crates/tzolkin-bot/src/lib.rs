@@ -7,6 +7,7 @@ use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, ob
 pub const POLICY_VERSION: &str = "heuristic-v2";
 pub const FOOD_ALIGNED_POLICY_VERSION: &str = "heuristic-food-aligned-v1";
 pub const FOOD_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-food-aligned-v2";
+pub const MONUMENT_ALIGNED_POLICY_VERSION: &str = "heuristic-monument-aligned-v1";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {
@@ -50,7 +51,7 @@ pub fn choose_move_food_aligned(observation: &Observation) -> Result<Decision, S
     )
 }
 
-/// Current App estimates selected harvests and capped marginal food savings.
+/// V2 estimates selected harvests and capped marginal food savings.
 pub fn choose_move_food_aligned_v2(observation: &Observation) -> Result<Decision, String> {
     let weights = policy::HeuristicWeights::default();
     choose_scored(
@@ -58,6 +59,18 @@ pub fn choose_move_food_aligned_v2(observation: &Observation) -> Result<Decision
         &weights,
         FOOD_ALIGNED_V2_POLICY_VERSION,
         |action| policy::score_action_food_aligned_v2(observation, action, &weights),
+    )
+}
+
+/// Current App also values current monument points and separately estimates
+/// recurring effects lost to renovation, without forecasting future growth.
+pub fn choose_move_monument_aligned(observation: &Observation) -> Result<Decision, String> {
+    let weights = policy::HeuristicWeights::default();
+    choose_scored(
+        observation,
+        &weights,
+        MONUMENT_ALIGNED_POLICY_VERSION,
+        |action| policy::score_action_monument_aligned(observation, action, &weights),
     )
 }
 
@@ -118,6 +131,10 @@ pub fn dispatch_cpu_food_aligned(request: &str) -> Result<String, String> {
 
 pub fn dispatch_cpu_food_aligned_v2(request: &str) -> Result<String, String> {
     dispatch_with(request, choose_move_food_aligned_v2)
+}
+
+pub fn dispatch_cpu_monument_aligned(request: &str) -> Result<String, String> {
+    dispatch_with(request, choose_move_monument_aligned)
 }
 
 fn dispatch_with(
