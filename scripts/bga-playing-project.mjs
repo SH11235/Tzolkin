@@ -833,6 +833,14 @@ export function projectRetainedBoundary(
     displayedPlayers = [],
     anonymousRows = [],
     panelIcons = new Map();
+  const workerEvidence = (id, className) =>
+    /^worker_\d+$/.test(id ?? '') ||
+    (className ?? '')
+      .split(/\s+/)
+      .some(
+        (value) =>
+          value === 'worker' || value === 'worker_dummy' || /^worker_[a-f0-9]{6}$/i.test(value),
+      );
   const players = ids.map((id, index) => {
     const item = one(fragments, (item) => item.playerId === id, 'boundary player identity');
     closed(
@@ -862,7 +870,8 @@ export function projectRetainedBoundary(
           )?.[1];
         if (
           (other !== undefined && other !== id) ||
-          (token(node, 'worker') && /^worker_\d+$/.test(key)) ||
+          (workerEvidence(key, node.attrs.class) &&
+            !(tree === panel && key === `workers_player_${id}`)) ||
           (node !== owner && /^(?:overall_player_board_|player_board_)/.test(key))
         )
           fail('Boundary fragment crosses original owner/board scope');
@@ -964,12 +973,7 @@ export function projectRetainedBoundary(
   if (workerRoot.tag !== 'div' || !root.children.includes(workerRoot))
     fail('Detached boundary worker layer');
   unhiddenFragmentNode(board, workerRoot);
-  const placed = board.nodes.filter(
-    (node) =>
-      token(node, 'worker') ||
-      /^worker_[1-9]\d*$/.test(node.attrs.id ?? '') ||
-      (node.attrs.class ?? '').split(/\s+/).some((value) => /^worker_[a-f0-9]{6}$/.test(value)),
-  );
+  const placed = board.nodes.filter((node) => workerEvidence(node.attrs.id, node.attrs.class));
   if (
     placed.some(
       (node) =>
@@ -1023,11 +1027,7 @@ export function projectRetainedBoundary(
       fail('Invalid/duplicate boundary geometry identity');
     const declaresWorker =
       item.parentId === 'workers' ||
-      /^worker_[1-9]\d*$/.test(item.id) ||
-      (typeof item.className === 'string' &&
-        item.className
-          .split(/\s+/)
-          .some((value) => value === 'worker' || /^worker_[a-f0-9]{6}$/.test(value)));
+      workerEvidence(item.id, typeof item.className === 'string' ? item.className : '');
     // The retained anonymous row wrappers are separately owner-validated above.
     // Their external parent and rect are metadata, never canvas worker evidence.
     if (item.id === '') {

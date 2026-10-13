@@ -814,6 +814,34 @@ test('retained boundary rejects identity, hidden-counter, ownership and original
         element('div', attributes ? 'canvasghost' : 'worker_999', '', attributes) +
         '</div>';
     }),
+    ...['boardHtml', 'rowHtml'].flatMap((field) =>
+      [
+        element('div', 'worker_999'),
+        '<div class="worker worker_ff0000"></div>',
+        element('div', 'ghost', '', ' class="worker_008000"'),
+        element('div', 'ghost', '', ' class="worker_dummy"'),
+        element('div', 'ghost', '', ' class="worker_ABCDEF"'),
+      ].map((html) => (value) => {
+        const fragment = value.capture.playerBoards[0];
+        fragment[field] = fragment[field].slice(0, -6) + html + '</div>';
+      }),
+    ),
+    ...[
+      element('div', 'worker_0'),
+      element('div', 'worker_007'),
+      element('div', 'ghost', '', ' class="worker_ABCDEF"'),
+      element('div', 'ghost', '', ' class="worker_dummy"'),
+    ].map((html) => (value) => {
+      value.capture.boardHtml = value.capture.boardHtml.slice(0, -6) + html + '</div>';
+    }),
+    ...[
+      { id: 'worker_0', className: '' },
+      { id: 'worker_007', className: '' },
+      { id: 'ghost', className: 'worker_ABCDEF' },
+      { id: 'ghost', className: 'worker_dummy' },
+    ].map((geometry) => (value) => {
+      value.capture.retainedDomGeometry.push({ ...geometry, parentId: 'board' });
+    }),
   ]) {
     const value = boundaryFixture();
     mutate(value);
