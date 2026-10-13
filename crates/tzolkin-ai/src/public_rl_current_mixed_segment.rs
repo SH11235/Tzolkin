@@ -309,7 +309,7 @@ fn require_rotation_shifts(shifts: [u8; 2]) -> Result<(), String> {
     }
     Ok(())
 }
-fn require_cyclic_seat_rotation(
+pub(super) fn require_cyclic_seat_rotation(
     old: &CurrentMixedCollectionSpec,
     new: &CurrentMixedCollectionSpec,
     old_checksum: &str,
