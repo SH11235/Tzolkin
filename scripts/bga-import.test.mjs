@@ -122,6 +122,106 @@ test('adapts current public DOM wire without replacing original entries or inven
   assert.equal(unknown.context.marketOption, null);
   assert.equal(unknown.quality.status, 'unknown');
   assert.equal(unknown.quality.terminalLogObserved, true);
+  for (const statusText of ['ゲーム終了', 'Game ended', 'Game finished']) {
+    const table = JSON.parse(currentTable());
+    table.resultText = 'ゲーム結果';
+    table.statusText = statusText;
+    table.completedObserved = true;
+    const tableBytes = Buffer.from(JSON.stringify(table));
+    const ended = normalizeGame(raw, 'checksum', tableBytes);
+    assert.equal(ended.quality.status, 'normalEnd');
+    assert.equal(ended.source.tableEvidence.reference, table.url);
+    assert.equal(ended.source.tableEvidence.sha256.length, 64);
+    assert.equal(ended.quality.verifiedComplete, false);
+    assert.equal(ended.quality.policyTrainingReady, false);
+    assert.equal(ended.quality.valueTrainingReady, false);
+    assert.equal(ended.context.extensionOptions, null);
+    assert.equal(JSON.parse(tableBytes).resultText, 'ゲーム結果');
+    assert.deepEqual(ended.rawEntries, raw.entries);
+  }
+  for (const [statusText, expected] of [
+    ['Abandoned table', 'abandoned'],
+    ['Table was abandoned', 'abandoned'],
+    ['Game conceded', 'forfeit'],
+  ]) {
+    const table = { ...JSON.parse(currentTable()), statusText, resultText: 'ゲーム結果' };
+    assert.equal(
+      normalizeGame(raw, 'checksum', Buffer.from(JSON.stringify(table))).quality.status,
+      expected,
+    );
+  }
+  for (const statusText of [
+    '',
+    42,
+    'Game in progress',
+    'ゲーム進行中',
+    'Game ended\nAbandoned table',
+    'x'.repeat(129),
+  ]) {
+    const table = JSON.parse(currentTable());
+    table.statusText = statusText;
+    assert.throws(
+      () => normalizeGame(raw, 'checksum', Buffer.from(JSON.stringify(table))),
+      /status text/,
+    );
+  }
+  for (const [statusText, resultText] of [
+    ['Game ended', '放棄されたテーブル'],
+    ['Game ended', 'Game conceded'],
+    ['Abandoned table', 'ゲーム終了'],
+    ['Game conceded', 'Abandoned table'],
+  ]) {
+    const table = JSON.parse(currentTable());
+    Object.assign(table, { statusText, resultText });
+    assert.throws(
+      () => normalizeGame(raw, 'checksum', Buffer.from(JSON.stringify(table))),
+      /Contradictory/,
+    );
+  }
+  const endedTable = {
+    ...JSON.parse(currentTable()),
+    statusText: 'ゲーム終了',
+    resultText: 'ゲーム結果',
+  };
+  for (const completedObserved of [false, 'true']) {
+    assert.throws(
+      () =>
+        normalizeGame(
+          raw,
+          'checksum',
+          Buffer.from(JSON.stringify({ ...endedTable, completedObserved })),
+        ),
+      /Contradictory/,
+    );
+  }
+  const conflictingHistory = structuredClone(raw);
+  conflictingHistory.metadata.historyRowText = 'Abandoned table';
+  assert.throws(
+    () => normalizeGame(conflictingHistory, 'checksum', Buffer.from(JSON.stringify(endedTable))),
+    /Contradictory/,
+  );
+  const conflictingStatus = structuredClone(raw);
+  conflictingStatus.metadata.statusText = 'Abandoned table';
+  assert.throws(
+    () => normalizeGame(conflictingStatus, 'checksum', Buffer.from(JSON.stringify(endedTable))),
+    /Contradictory/,
+  );
+  const wrongStatusTable = { ...endedTable, url: 'https://boardgamearena.com/table?table=999' };
+  assert.throws(
+    () => normalizeGame(raw, 'checksum', Buffer.from(JSON.stringify(wrongStatusTable))),
+    /Table evidence/,
+  );
+  const noTerminal = structuredClone(raw);
+  noTerminal.dom_entries.at(-1).messages.pop();
+  noTerminal.entries.at(-1).raw_text =
+    `行動 ${noTerminal.entries.at(-1).action_id} :\n${noTerminal.entries.at(-1).timestamp_display}\n${noTerminal.dom_entries
+      .at(-1)
+      .messages.map((m) => m.raw_text)
+      .join('\n')}`;
+  assert.equal(
+    normalizeGame(noTerminal, 'checksum', Buffer.from(JSON.stringify(endedTable))).quality.status,
+    'unknown',
+  );
   for (const text of [' ', 'unrelated visible text']) {
     const table = JSON.parse(currentTable());
     table.resultText = text;
