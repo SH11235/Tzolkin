@@ -121,10 +121,14 @@ pub fn paired_gear(gear: GearId) -> Option<GearId> {
     }
 }
 pub fn technology_cost(p: &Player, t: TechnologyId) -> i64 {
-    let level = p.technologies[&t];
+    technology_step_cost(p.technologies[&t], has(p, TribeId::Itzamna))
+}
+/// One advancement's material requirement; a capped bonus still costs one.
+/// This nominal amount excludes expansion surcharges and the payment choice.
+pub fn technology_step_cost(level: i64, discounted: bool) -> i64 {
     if level == 3 {
         1
     } else {
-        level + 1 - i64::from(has(p, TribeId::Itzamna))
+        level + 1 - i64::from(discounted)
     }
 }
