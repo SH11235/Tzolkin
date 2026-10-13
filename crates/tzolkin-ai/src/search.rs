@@ -2,7 +2,10 @@
 //! Each candidate uses the same sampled worlds; only whole completed blocks
 //! contribute scores. This is an uncalibrated score-margin planner, not MCTS,
 //! an omniscient policy, or a demonstrated strength improvement.
-use crate::{Decision, policy::HeuristicWeights};
+use crate::{
+    Decision,
+    policy::{HeuristicRevision, HeuristicWeights},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tzolkin_core::catalog::CATALOG;
@@ -52,6 +55,12 @@ impl SearchConfig {
     /// Freeze every behavioral input, including catalog, fixed rollout weights,
     /// objective, leaf/sampling versions and budgets. No authority metadata is used.
     pub fn configuration_key(&self) -> Result<String, String> {
+        self.configuration_key_for_revision(HeuristicRevision::V2)
+    }
+    pub(crate) fn configuration_key_for_revision(
+        &self,
+        revision: HeuristicRevision,
+    ) -> Result<String, String> {
         self.validate()?;
         let bytes = serde_json::to_vec(&(
             SEARCH_POLICY_VERSION,
@@ -60,7 +69,7 @@ impl SearchConfig {
             crate::replay::RULES_BASELINE,
             LEAF_VERSION,
             SAMPLING_VERSION,
-            crate::POLICY_VERSION,
+            revision.policy_version(),
             HeuristicWeights::default(),
             crate::replay::catalog_hash(),
             self,
@@ -158,12 +167,20 @@ pub fn choose_move(o: &Observation, config: &SearchConfig) -> Result<SearchOutco
 pub struct PreparedSearch {
     config: SearchConfig,
     configuration_key: String,
+    revision: HeuristicRevision,
 }
 impl PreparedSearch {
     pub fn new(config: &SearchConfig) -> Result<Self, String> {
+        Self::for_revision(config, HeuristicRevision::V2)
+    }
+    pub(crate) fn for_revision(
+        config: &SearchConfig,
+        revision: HeuristicRevision,
+    ) -> Result<Self, String> {
         Ok(Self {
-            configuration_key: config.configuration_key()?,
+            configuration_key: config.configuration_key_for_revision(revision)?,
             config: config.clone(),
+            revision,
         })
     }
     pub fn config(&self) -> &SearchConfig {
@@ -173,7 +190,24 @@ impl PreparedSearch {
         &self.configuration_key
     }
     pub fn choose(&self, o: &Observation) -> Result<SearchOutcome, String> {
-        choose_prepared(o, &self.config, &self.configuration_key, crate::choose_move)
+        match self.revision {
+            HeuristicRevision::V2 => {
+                choose_prepared(o, &self.config, &self.configuration_key, crate::choose_move)
+            }
+            HeuristicRevision::V1 => choose_prepared_for_revision(
+                o,
+                &self.config,
+                &self.configuration_key,
+                self.revision,
+                |o| {
+                    tzolkin_bot::choose_move_with_weights_for_revision(
+                        o,
+                        &HeuristicWeights::default(),
+                        HeuristicRevision::V1,
+                    )
+                },
+            ),
+        }
     }
 }
 
@@ -212,14 +246,69 @@ fn choose_prepared<F>(
 where
     F: FnMut(&Observation) -> Result<Decision, String>,
 {
-    choose_prepared_with(o, config, configuration_key, rollout_policy, simulate::<F>)
+    choose_prepared_for_revision(
+        o,
+        config,
+        configuration_key,
+        HeuristicRevision::V2,
+        rollout_policy,
+    )
+}
+fn choose_prepared_for_revision<F>(
+    o: &Observation,
+    config: &SearchConfig,
+    configuration_key: &str,
+    revision: HeuristicRevision,
+    rollout_policy: F,
+) -> Result<SearchOutcome, String>
+where
+    F: FnMut(&Observation) -> Result<Decision, String>,
+{
+    choose_prepared_with_for_revision(
+        o,
+        config,
+        configuration_key,
+        revision,
+        rollout_policy,
+        simulate::<F>,
+    )
 }
 // Static function-item dispatch in production; the historical loop is injected
-// only by unit tests, with no runtime policy/configuration switch.
+// only by unit tests. The closed revision changes the heuristic delegate only.
+#[cfg(test)]
 fn choose_prepared_with<F, S>(
     o: &Observation,
     config: &SearchConfig,
     configuration_key: &str,
+    rollout_policy: F,
+    simulation: S,
+) -> Result<SearchOutcome, String>
+where
+    F: FnMut(&Observation) -> Result<Decision, String>,
+    S: FnMut(
+        RolloutWorld,
+        GameMove,
+        usize,
+        i64,
+        &SearchConfig,
+        &mut SearchStats,
+        &mut F,
+    ) -> Result<Sample, DiscardReason>,
+{
+    choose_prepared_with_for_revision(
+        o,
+        config,
+        configuration_key,
+        HeuristicRevision::V2,
+        rollout_policy,
+        simulation,
+    )
+}
+fn choose_prepared_with_for_revision<F, S>(
+    o: &Observation,
+    config: &SearchConfig,
+    configuration_key: &str,
+    revision: HeuristicRevision,
     mut rollout_policy: F,
     mut simulation: S,
 ) -> Result<SearchOutcome, String>
@@ -241,7 +330,7 @@ where
         // Fallback consumes only the supplied observation, too. Feature shape
         // checks protect the fixed heuristic's indexing on malformed inputs.
         crate::features::FeatureEncoder::new(o)?;
-        let decision = fallback_decision(o)?;
+        let decision = fallback_decision(o, revision)?;
         return Ok(SearchOutcome {
             decision,
             status: SearchStatus::Fallback { reason },
@@ -253,7 +342,7 @@ where
         });
     }
     let root = RolloutRoot::from_observation(o)?;
-    let baseline = fallback_decision(o)?;
+    let baseline = fallback_decision(o, revision)?;
     let mut stats = SearchStats::default();
     let mut candidates: Vec<_> = (0..o.legal_actions.len())
         .map(|legal_index| CandidateResult {
@@ -381,8 +470,15 @@ where
     })
 }
 
-fn fallback_decision(o: &Observation) -> Result<Decision, String> {
-    let mut decision = crate::choose_move(o)?;
+fn fallback_decision(o: &Observation, revision: HeuristicRevision) -> Result<Decision, String> {
+    let mut decision = match revision {
+        HeuristicRevision::V2 => crate::choose_move(o)?,
+        HeuristicRevision::V1 => tzolkin_bot::choose_move_with_weights_for_revision(
+            o,
+            &HeuristicWeights::default(),
+            revision,
+        )?,
+    };
     decision.policy_version = SEARCH_POLICY_VERSION.into();
     Ok(decision)
 }
@@ -583,6 +679,29 @@ mod tests {
             margin(&[f64::NAN, 1.0], 0),
             Err(DiscardReason::NonFiniteScore)
         );
+        let config = SearchConfig {
+            worlds_per_action: 1,
+            horizon_days: 1,
+            max_rollout_steps: 1,
+            max_total_steps: 1,
+            min_completed_worlds: 1,
+            sampling_salt: 0,
+        };
+        // Fixed historical producer key; no model, world or decision is run.
+        let old = PreparedSearch::for_revision(&config, HeuristicRevision::V1).unwrap();
+        assert_eq!(
+            old.configuration_key(),
+            "c40b96c933a0145678602a2820b6ca2200818424f3c80bea67f9b332708a42e3"
+        );
+        assert_ne!(old.configuration_key(), config.configuration_key().unwrap());
+        let mut provenance = crate::search_native::provenance(&old);
+        assert!(provenance.validate().is_err());
+        provenance.validate_historical_restore().unwrap();
+        let crate::replay::SeatPolicy::Search { config, .. } = &mut provenance else {
+            unreachable!()
+        };
+        config.sampling_salt = 1;
+        assert!(provenance.validate_historical_restore().is_err());
     }
     #[test]
     fn rollout_policy_gets_only_each_actors_observation_including_rotation_actor() {

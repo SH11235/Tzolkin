@@ -67,6 +67,15 @@ impl<'a> FrozenMixedRoster<'a> {
         }
     }
     pub fn new(seats: Vec<Option<BorrowedArenaPolicy<'a>>>) -> Result<Self, String> {
+        Self::new_with_profile(seats, None)
+    }
+    fn new_with_profile(
+        seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
+        saved: Option<(
+            &[Option<FrozenOpponentIdentity>],
+            crate::policy::HeuristicRevision,
+        )>,
+    ) -> Result<Self, String> {
         learner_slot(&seats)?;
         if seats.iter().flatten().any(|p| {
             matches!(
@@ -80,11 +89,26 @@ impl<'a> FrozenMixedRoster<'a> {
                 "Mixed owner requires a distinct native source codec; v1 roster refused".into(),
             );
         }
-        Self::freeze(seats, b"tzolkin-frozen-mixed-roster-v1\0", ROSTER_CONTRACT)
+        Self::freeze(
+            seats,
+            b"tzolkin-frozen-mixed-roster-v1\0",
+            ROSTER_CONTRACT,
+            saved,
+        )
     }
     pub(crate) fn for_current(
         seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
         parent: &crate::public_rl_current_mixed_source::CurrentMixedParentIdentity,
+    ) -> Result<Self, String> {
+        Self::current_with_profile(seats, parent, None)
+    }
+    fn current_with_profile(
+        seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
+        parent: &crate::public_rl_current_mixed_source::CurrentMixedParentIdentity,
+        saved: Option<(
+            &[Option<FrozenOpponentIdentity>],
+            crate::policy::HeuristicRevision,
+        )>,
     ) -> Result<Self, String> {
         parent.validate()?;
         for p in seats.iter().flatten() {
@@ -112,17 +136,53 @@ impl<'a> FrozenMixedRoster<'a> {
             seats,
             b"tzolkin-frozen-current-mixed-roster-v2\0",
             crate::public_rl_current_mixed_source::ROSTER_CONTRACT,
+            saved,
         )
+    }
+    pub(crate) fn for_saved_plan(
+        seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
+        parent: Option<&crate::public_rl_current_mixed_source::CurrentMixedParentIdentity>,
+        profile: &SavedRosterProfile,
+        member: usize,
+    ) -> Result<Self, String> {
+        let expected = profile
+            .opponents
+            .get(member)
+            .ok_or("Saved roster member shape")?;
+        let saved = Some((expected.as_slice(), profile.revision));
+        match parent {
+            Some(parent) => Self::current_with_profile(seats, parent, saved),
+            None => Self::new_with_profile(seats, saved),
+        }
     }
     fn freeze(
         seats: Vec<Option<BorrowedArenaPolicy<'a>>>,
         domain: &[u8],
         contract: &str,
+        saved: Option<(
+            &[Option<FrozenOpponentIdentity>],
+            crate::policy::HeuristicRevision,
+        )>,
     ) -> Result<Self, String> {
         let learner_seat = learner_slot(&seats)?;
+        if saved.is_some_and(|(expected, _)| {
+            expected.len() != seats.len()
+                || expected
+                    .iter()
+                    .enumerate()
+                    .any(|(i, p)| p.is_none() != (i == learner_seat))
+        }) {
+            return Err("Saved roster absolute learner/seat shape differs".into());
+        }
         let opponents = seats
             .into_iter()
-            .map(|p| p.map(FrozenReactiveOpponent::new).transpose())
+            .map(|p| {
+                p.map(|p| match saved {
+                    Some((_, revision)) => FrozenReactiveOpponent::for_saved_revision(p, revision),
+                    None => FrozenReactiveOpponent::new(p),
+                })
+                .transpose()
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let descriptions = opponents
             .iter()
@@ -137,6 +197,9 @@ impl<'a> FrozenMixedRoster<'a> {
                 })
             })
             .collect::<Vec<_>>();
+        if saved.is_some_and(|(expected, _)| descriptions.as_slice() != expected) {
+            return Err("Saved full opponent identities differ from declared executables".into());
+        }
         let checksum = hash(domain, &(contract, learner_seat, &descriptions))?;
         Ok(Self {
             learner_seat,
@@ -356,6 +419,116 @@ pub(crate) struct FrozenOpponentIdentity {
     dataset_fingerprint: Option<String>,
     model_version: Option<String>,
 }
+/// A closed projection used solely while reconstructing an externally pinned
+/// saved full plan. It carries no executable policy, learner, credit or owner.
+pub(crate) struct SavedRosterProfile {
+    revision: crate::policy::HeuristicRevision,
+    opponents: [Vec<Option<FrozenOpponentIdentity>>; 4],
+}
+impl SavedRosterProfile {
+    pub(crate) fn from_plan(plan: &serde_json::Value) -> Result<Self, String> {
+        use crate::policy::HeuristicRevision;
+        use crate::replay::SeatPolicy;
+        let headers = plan
+            .get("headers")
+            .and_then(serde_json::Value::as_array)
+            .filter(|v| v.len() == 4)
+            .ok_or("Saved full plan header shape")?;
+        let opponents: [Vec<Option<FrozenOpponentIdentity>>; 4] = headers
+            .iter()
+            .map(|h| {
+                serde_json::from_value(
+                    h.get("basePolicy")
+                        .and_then(|p| p.get("opponents"))
+                        .ok_or("Saved full plan opponents missing")?
+                        .clone(),
+                )
+                .map_err(|e| e.to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .try_into()
+            .map_err(|_| "Saved four roster shape")?;
+        let mut selected = None;
+        let mut resource_cycle = false;
+        for seats in &opponents {
+            learner_slot(seats)?;
+            for p in seats.iter().flatten() {
+                let revision = match &p.provenance {
+                    SeatPolicy::Heuristic { policy_version, .. } => {
+                        Some(match policy_version.as_str() {
+                            "heuristic-v1" => HeuristicRevision::V1,
+                            crate::POLICY_VERSION => HeuristicRevision::V2,
+                            _ => return Err("Unsupported saved heuristic revision".into()),
+                        })
+                    }
+                    SeatPolicy::CornFirstSetup { policy_version, .. } => {
+                        Some(match policy_version.as_str() {
+                            crate::setup_policy::LEGACY_POLICY_VERSION => HeuristicRevision::V1,
+                            crate::setup_policy::POLICY_VERSION => HeuristicRevision::V2,
+                            _ => return Err("Unsupported saved Setup revision".into()),
+                        })
+                    }
+                    SeatPolicy::CornFirstUxmalOpening { policy_version, .. } => {
+                        Some(match policy_version.as_str() {
+                            crate::setup_policy::LEGACY_UXMAL_OPENING_POLICY_VERSION => {
+                                HeuristicRevision::V1
+                            }
+                            crate::setup_policy::UXMAL_OPENING_POLICY_VERSION => {
+                                HeuristicRevision::V2
+                            }
+                            _ => return Err("Unsupported saved Uxmal revision".into()),
+                        })
+                    }
+                    SeatPolicy::Search {
+                        config,
+                        configuration_key,
+                        ..
+                    } => Some(if *configuration_key == config.configuration_key()? {
+                        HeuristicRevision::V2
+                    } else if *configuration_key
+                        == config.configuration_key_for_revision(HeuristicRevision::V1)?
+                    {
+                        HeuristicRevision::V1
+                    } else {
+                        return Err("Unsupported saved Search delegate key".into());
+                    }),
+                    SeatPolicy::ResourceCycle { .. } => {
+                        resource_cycle = true;
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(revision) = revision {
+                    if selected.is_some_and(|old| old != revision) {
+                        return Err("Saved full plan mixes heuristic producer revisions".into());
+                    }
+                    selected = Some(revision);
+                }
+            }
+        }
+        let revision = selected.unwrap_or(HeuristicRevision::V2);
+        if revision == HeuristicRevision::V1 && resource_cycle {
+            return Err("Historical ResourceCycle producer is unsupported".into());
+        }
+        Ok(Self {
+            revision,
+            opponents,
+        })
+    }
+    pub(crate) fn require_full_plan(
+        &self,
+        actual: &serde_json::Value,
+        expected: &serde_json::Value,
+    ) -> Result<(), String> {
+        if actual != expected {
+            return Err("Saved full plan differs from genuine historical reconstruction".into());
+        }
+        for p in self.opponents.iter().flatten().flatten() {
+            p.provenance.validate_historical_restore()?;
+        }
+        Ok(())
+    }
+}
 #[cfg(test)]
 impl FrozenOpponentIdentity {
     pub(crate) fn test_heuristic() -> Self {
@@ -517,5 +690,63 @@ mod tests {
             crate::replay::SeatPolicy::ResourceCycle { configuration: actual }
                 if actual == &configuration
         ));
+        let legacy = |policy| {
+            Some(FrozenOpponentIdentity {
+                provenance: policy,
+                dataset_fingerprint: None,
+                model_version: None,
+            })
+        };
+        let old3 = vec![
+            None,
+            legacy(crate::replay::SeatPolicy::Heuristic {
+                policy_version: "heuristic-v1".into(),
+                weights: w.clone(),
+            }),
+            legacy(crate::replay::SeatPolicy::CornFirstSetup {
+                policy_version: crate::setup_policy::LEGACY_POLICY_VERSION.into(),
+                weights: w.clone(),
+            }),
+        ];
+        let mut old4 = old3.clone();
+        old4.push(legacy(crate::replay::SeatPolicy::CornFirstUxmalOpening {
+            policy_version: crate::setup_policy::LEGACY_UXMAL_OPENING_POLICY_VERSION.into(),
+            weights: w.clone(),
+        }));
+        // This is a roster projection, not a fabricated owner/full-plan receipt.
+        let projection = serde_json::json!({"headers": [
+            {"basePolicy":{"opponents":old3}}, {"basePolicy":{"opponents":old3}},
+            {"basePolicy":{"opponents":old4}}, {"basePolicy":{"opponents":old4}},
+        ]});
+        let profile = SavedRosterProfile::from_plan(&projection).unwrap();
+        let declared = || {
+            vec![
+                None,
+                Some(BorrowedArenaPolicy::Heuristic(&w)),
+                Some(BorrowedArenaPolicy::CornFirstSetup(&w)),
+            ]
+        };
+        let historical = FrozenMixedRoster::for_saved_plan(declared(), None, &profile, 0).unwrap();
+        assert_eq!(historical.descriptions(), old3.as_slice());
+        assert_ne!(
+            historical.checksum(),
+            FrozenMixedRoster::new(declared()).unwrap().checksum()
+        );
+        let mut mismatch = projection.clone();
+        mismatch["headers"][0]["basePolicy"]["opponents"][1]["provenance"]["weights"]["worker"] =
+            8.0.into();
+        let mismatch = SavedRosterProfile::from_plan(&mismatch).unwrap();
+        assert!(FrozenMixedRoster::for_saved_plan(declared(), None, &mismatch, 0).is_err());
+        let mut mixed = projection.clone();
+        mixed["headers"][0]["basePolicy"]["opponents"][1]["provenance"]["policyVersion"] =
+            crate::POLICY_VERSION.into();
+        assert!(SavedRosterProfile::from_plan(&mixed).is_err());
+        let mut changed_outer = projection.clone();
+        changed_outer["unrecognizedClaim"] = true.into();
+        assert!(
+            profile
+                .require_full_plan(&projection, &changed_outer)
+                .is_err()
+        );
     }
 }

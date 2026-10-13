@@ -165,9 +165,7 @@ pub enum SeatPolicy {
 impl SeatPolicy {
     /// Only saved-plan restoration may use this closed historical vocabulary.
     /// A recognized description is not an executable policy or owner admission.
-    // The restoration consumer is the following source unit; ordinary source
-    // validators deliberately keep calling `validate` below.
-    #[allow(dead_code)]
+    // Ordinary source validators deliberately keep calling `validate` below.
     pub(crate) fn validate_historical_restore(&self) -> Result<(), String> {
         match self {
             Self::Heuristic {
@@ -185,6 +183,18 @@ impl SeatPolicy {
                 weights,
             } if policy_version == crate::setup_policy::LEGACY_UXMAL_OPENING_POLICY_VERSION => {
                 weights.validate()
+            }
+            Self::Search {
+                policy_version,
+                config,
+                configuration_key,
+            } if policy_version == SEARCH_POLICY_VERSION
+                && *configuration_key
+                    == config.configuration_key_for_revision(
+                        tzolkin_bot::policy::HeuristicRevision::V1,
+                    )? =>
+            {
+                Ok(())
             }
             _ => self.validate(),
         }

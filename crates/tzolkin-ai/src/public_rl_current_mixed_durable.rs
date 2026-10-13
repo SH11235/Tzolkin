@@ -17,7 +17,7 @@ use crate::public_rl_current_mixed_session::{
 use crate::public_rl_current_mixed_source::{
     self as source, CurrentMixedParentIdentity, PlannedCurrentMixedCohort,
 };
-use crate::public_rl_mixed_native::FrozenMixedRoster;
+use crate::public_rl_mixed_native::{FrozenMixedRoster, SavedRosterProfile};
 use crate::public_rl_mixed_session::{FilePin, OpponentSpec, read_pin};
 use crate::public_rl_paired_session::{
     local, publish_mixed_metadata, publish_mixed_stored_record, read_bounded,
@@ -1757,61 +1757,90 @@ impl<'a> CurrentMixedTrainingSession<'a> {
         &'s self,
         spec: &'s CurrentMixedCollectionSpec,
     ) -> Result<[FrozenMixedRoster<'s>; 4], String> {
+        self.rosters_with_profile(spec, None)
+    }
+    fn rosters_with_profile<'s>(
+        &'s self,
+        spec: &'s CurrentMixedCollectionSpec,
+        profile: Option<&SavedRosterProfile>,
+    ) -> Result<[FrozenMixedRoster<'s>; 4], String> {
         let parent = self.handle()?;
         spec.inner
             .wire
             .rosters
             .iter()
-            .map(|seats| {
-                FrozenMixedRoster::for_current(
-                    seats
-                        .iter()
-                        .map(|p| {
-                            p.as_ref().map(|p| match p {
-                                OpponentSpec::Heuristic => {
-                                    BorrowedArenaPolicy::Heuristic(&spec.inner.wire.weights)
-                                }
-                                OpponentSpec::CornFirstSetup => {
-                                    BorrowedArenaPolicy::CornFirstSetup(&spec.inner.wire.weights)
-                                }
-                                OpponentSpec::CornFirstUxmalOpening => {
-                                    BorrowedArenaPolicy::CornFirstUxmalOpening(
-                                        &spec.inner.wire.weights,
-                                    )
-                                }
-                                OpponentSpec::ResourceCycle { configuration } => {
-                                    BorrowedArenaPolicy::ResourceCycle(configuration)
-                                }
-                                OpponentSpec::PreparedBc => {
-                                    BorrowedArenaPolicy::PublicBc(self.prepared)
-                                }
-                                OpponentSpec::PreparedBcTradeGuard { guard } => {
-                                    BorrowedArenaPolicy::PublicBcTradeGuard(self.prepared, guard)
-                                }
-                                OpponentSpec::Search => BorrowedArenaPolicy::Search(&self.search),
-                                OpponentSpec::ParentArgmax => match &self.continued {
-                                    Some(o) => BorrowedArenaPolicy::ContinuedMixed(o),
-                                    None => BorrowedArenaPolicy::Mixed(
-                                        self.root.initial_owner().expect("genuine initial owner"),
-                                    ),
-                                },
-                            })
+            .enumerate()
+            .map(|(member, seats)| {
+                let seats = seats
+                    .iter()
+                    .map(|p| {
+                        p.as_ref().map(|p| match p {
+                            OpponentSpec::Heuristic => {
+                                BorrowedArenaPolicy::Heuristic(&spec.inner.wire.weights)
+                            }
+                            OpponentSpec::CornFirstSetup => {
+                                BorrowedArenaPolicy::CornFirstSetup(&spec.inner.wire.weights)
+                            }
+                            OpponentSpec::CornFirstUxmalOpening => {
+                                BorrowedArenaPolicy::CornFirstUxmalOpening(&spec.inner.wire.weights)
+                            }
+                            OpponentSpec::ResourceCycle { configuration } => {
+                                BorrowedArenaPolicy::ResourceCycle(configuration)
+                            }
+                            OpponentSpec::PreparedBc => {
+                                BorrowedArenaPolicy::PublicBc(self.prepared)
+                            }
+                            OpponentSpec::PreparedBcTradeGuard { guard } => {
+                                BorrowedArenaPolicy::PublicBcTradeGuard(self.prepared, guard)
+                            }
+                            OpponentSpec::Search => BorrowedArenaPolicy::Search(&self.search),
+                            OpponentSpec::ParentArgmax => match &self.continued {
+                                Some(o) => BorrowedArenaPolicy::ContinuedMixed(o),
+                                None => BorrowedArenaPolicy::Mixed(
+                                    self.root.initial_owner().expect("genuine initial owner"),
+                                ),
+                            },
                         })
-                        .collect(),
-                    parent.identity(),
-                )
+                    })
+                    .collect();
+                match profile {
+                    Some(profile) => FrozenMixedRoster::for_saved_plan(
+                        seats,
+                        Some(parent.identity()),
+                        profile,
+                        member,
+                    ),
+                    None => FrozenMixedRoster::for_current(seats, parent.identity()),
+                }
             })
             .collect::<Result<Vec<_>, _>>()?
             .try_into()
             .map_err(|_| "Current mixed roster shape".into())
     }
     fn plan(&self, spec: &CurrentMixedCollectionSpec) -> Result<PlannedCurrentMixedCohort, String> {
+        self.plan_with_profile(spec, None)
+    }
+    fn plan_for_saved(
+        &self,
+        spec: &CurrentMixedCollectionSpec,
+        expected: &serde_json::Value,
+    ) -> Result<PlannedCurrentMixedCohort, String> {
+        let profile = SavedRosterProfile::from_plan(expected)?;
+        let plan = self.plan_with_profile(spec, Some(&profile))?;
+        profile.require_full_plan(&plan.receipt(), expected)?;
+        Ok(plan)
+    }
+    fn plan_with_profile(
+        &self,
+        spec: &CurrentMixedCollectionSpec,
+        profile: Option<&SavedRosterProfile>,
+    ) -> Result<PlannedCurrentMixedCohort, String> {
         if spec.pool_checksum()? != self.pool {
             return Err("Current mixed immutable pool/rosters changed".into());
         }
         let handle = self.handle()?;
         let configs = spec.inner.configs()?;
-        let rosters = self.rosters(spec)?;
+        let rosters = self.rosters_with_profile(spec, profile)?;
         let headers = configs
             .iter()
             .zip(&rosters)

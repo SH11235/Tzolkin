@@ -317,6 +317,18 @@ pub struct MixedOneBatchSession<'a> {
     sequence: u64,
     tip: String,
     owner: Option<MixedJointOwner>,
+    restored_source: Option<RestoredSourceBinding>,
+}
+// Constructed only after the entire externally pinned original journal has
+// restored successfully. No wire description can import this capability.
+struct RestoredSourceBinding {
+    spec: MixedRlCollectionSpec,
+    plan: serde_json::Value,
+    directory: PathBuf,
+    receipt: Pin,
+    inventory: serde_json::Value,
+    heads: Vec<Pin>,
+    pins: Vec<(Pin, usize)>,
 }
 impl<'a> MixedOneBatchSession<'a> {
     fn initial(
@@ -363,6 +375,7 @@ impl<'a> MixedOneBatchSession<'a> {
             sequence: 0,
             tip: String::new(),
             owner: None,
+            restored_source: None,
         })
     }
     pub fn from_imported(
@@ -823,13 +836,14 @@ impl<'a> MixedOneBatchSession<'a> {
             require_output_outside_directory(protected, directory)?;
         }
         let mut s = Self::initial(parent, prepared, spec, local(directory, false)?)?;
-        let stored_spec: MixedOneBatchSpec = closed(
-            &read_bounded(&s.directory.join("training-spec.json"), MAX_SPEC_BYTES)?,
-            MAX_SPEC_BYTES,
-        )?;
+        let spec_raw = read_bounded(&s.directory.join("training-spec.json"), MAX_SPEC_BYTES)?;
+        let stored_spec: MixedOneBatchSpec = closed(&spec_raw, MAX_SPEC_BYTES)?;
         if hash(b"tzolkin-mixed-one-batch-spec-v1\0", &stored_spec)? != s.spec_checksum()? {
             return Err("Mixed full stored spec differs".into());
         }
+        let mut source_binding = None;
+        let mut heads = Vec::with_capacity(supplied.sequence as usize);
+        let mut pins = vec![(pin("training-spec.json", &spec_raw), MAX_SPEC_BYTES)];
         for sequence in 1..=supplied.sequence {
             let raw = read_bounded(
                 &s.directory.join(format!("head-{sequence}.json")),
@@ -856,6 +870,8 @@ impl<'a> MixedOneBatchSession<'a> {
                     receipt,
                 } => {
                     require_output_outside_directory(source_directory, &s.directory)?;
+                    pins.push((spec.clone(), MAX_SPEC_BYTES));
+                    pins.push((receipt.clone(), MAX_SPEC_BYTES));
                     let spec = MixedRlCollectionSpec::from_json(&read_pin(
                         &s.directory,
                         spec,
@@ -864,7 +880,10 @@ impl<'a> MixedOneBatchSession<'a> {
                     )?)?;
                     let source_raw =
                         read_pin(&s.directory, receipt, "source-receipt.json", MAX_SPEC_BYTES)?;
-                    let session = s.parent.collection_session(spec, s.prepared)?;
+                    let session = s
+                        .parent
+                        .collection_session(spec.clone(), s.prepared)?
+                        .for_restored_plan(plan)?;
                     if session.training_plan()?.receipt() != *plan
                         || session.verify_saved(source_directory, &source_raw, &receipt.sha256)?
                             != *source_inventory
@@ -873,6 +892,15 @@ impl<'a> MixedOneBatchSession<'a> {
                             "Mixed restored source plan or full saved raw inventory differs".into(),
                         );
                     }
+                    source_binding = Some(RestoredSourceBinding {
+                        spec,
+                        plan: plan.clone(),
+                        directory: source_directory.clone(),
+                        receipt: receipt.clone(),
+                        inventory: source_inventory.clone(),
+                        heads: Vec::new(),
+                        pins: Vec::new(),
+                    });
                 }
                 Event::AuditReturn { cohort, inventory } => {
                     if audit_inventory(&s.directory)? != *inventory {
@@ -886,6 +914,7 @@ impl<'a> MixedOneBatchSession<'a> {
                         &v,
                         s.progress.plan.as_ref().ok_or("Mixed audit missing plan")?,
                     )?;
+                    pins.extend(inventory.iter().cloned().map(|p| (p, MAX_SPEC_BYTES)));
                 }
                 Event::Resolve {
                     outcome,
@@ -933,9 +962,14 @@ impl<'a> MixedOneBatchSession<'a> {
                             public_policy_mixed::parent_model(&s.parent),
                             &s.residual,
                         )?);
+                        pins.push((p.clone(), ARTIFACT_BYTES));
                     } else if r.changed_parameters() != [0, 0] {
                         return Err("Mixed NoChange report contains an update".into());
                     }
+                    pins.push((
+                        report.as_ref().ok_or("Mixed missing report")?.clone(),
+                        MAX_HEAD_BYTES,
+                    ));
                 }
                 _ => {}
             }
@@ -945,6 +979,7 @@ impl<'a> MixedOneBatchSession<'a> {
             }
             s.sequence = sequence;
             s.tip = sha(&raw);
+            heads.push(pin(&format!("head-{sequence}.json"), &raw));
         }
         if s.tip != expected_sha256
             || read_bounded(
@@ -956,7 +991,54 @@ impl<'a> MixedOneBatchSession<'a> {
         }
         s.require_current_inventory()?;
         s.usage()?;
+        if let Some(mut binding) = source_binding {
+            binding.heads = heads;
+            binding.pins = pins;
+            s.restored_source = Some(binding);
+        }
         Ok(s)
+    }
+    /// Freshly verify the original saved callbacks/actions through this genuine
+    /// restored journal. This writes nothing and returns no learning capability,
+    /// owner, credit or invitation to recollect an already spent family.
+    pub fn reaudit_restored_source(&self) -> Result<(), String> {
+        let binding = self
+            .restored_source
+            .as_ref()
+            .ok_or("Read-only source re-audit requires an actual journal restore")?;
+        self.require_reaudit_binding(binding)?;
+        let raw = read_pin(
+            &self.directory,
+            &binding.receipt,
+            "source-receipt.json",
+            MAX_SPEC_BYTES,
+        )?;
+        self.parent
+            .collection_session(binding.spec.clone(), self.prepared)?
+            .for_restored_plan(&binding.plan)?
+            .reaudit_restored_read_only(
+                &binding.directory,
+                &raw,
+                &binding.receipt.sha256,
+                &binding.inventory,
+            )?;
+        self.require_reaudit_binding(binding)
+    }
+    fn require_reaudit_binding(&self, binding: &RestoredSourceBinding) -> Result<(), String> {
+        if binding.heads.len() as u64 != self.sequence
+            || binding.heads.last().map(|p| p.sha256.as_str()) != Some(self.tip.as_str())
+        {
+            return Err("Restored source re-audit latest journal binding differs".into());
+        }
+        for head in &binding.heads {
+            read_pin(&self.directory, head, &head.name, MAX_HEAD_BYTES)?;
+        }
+        for (p, cap) in &binding.pins {
+            read_pin(&self.directory, p, &p.name, *cap)?;
+        }
+        self.require_current_inventory()?;
+        self.usage()?;
+        Ok(())
     }
     fn require_current_inventory(&self) -> Result<(), String> {
         let mut n = 0;

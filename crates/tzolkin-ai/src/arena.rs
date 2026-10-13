@@ -431,9 +431,13 @@ enum PolicyChooser<'a> {
     },
     PublicLearned(Box<PublicPolicyHandle<'a>>),
     Search(&'a PreparedSearch),
+    HistoricalSearch(PreparedSearch),
     Heuristic(&'a HeuristicWeights),
+    HistoricalHeuristic(&'a HeuristicWeights),
     CornFirstSetup(&'a HeuristicWeights),
+    HistoricalCornFirstSetup(&'a HeuristicWeights),
     CornFirstUxmalOpening(&'a HeuristicWeights),
+    HistoricalCornFirstUxmalOpening(&'a HeuristicWeights),
     ResourceCycle(&'a resource_cycle::ResourceCycleConfig),
     Learned(LoadedPolicy<'a>),
 }
@@ -458,6 +462,52 @@ enum FrozenFamilies<'a> {
     Continued(&'a std::collections::BTreeSet<String>),
 }
 impl<'a> FrozenReactiveOpponent<'a> {
+    /// Private saved-plan reconstruction only. The caller must compare the full
+    /// generated identity and plan before any historical callback is executed.
+    pub(crate) fn for_saved_revision(
+        policy: BorrowedArenaPolicy<'a>,
+        revision: crate::policy::HeuristicRevision,
+    ) -> Result<Self, String> {
+        let mut frozen = Self::new(policy)?;
+        if revision == crate::policy::HeuristicRevision::V2 {
+            return Ok(frozen);
+        }
+        let (chooser, provenance) = match policy {
+            BorrowedArenaPolicy::Heuristic(weights) => (
+                PolicyChooser::HistoricalHeuristic(weights),
+                SeatPolicy::Heuristic {
+                    policy_version: revision.policy_version().into(),
+                    weights: weights.clone(),
+                },
+            ),
+            BorrowedArenaPolicy::CornFirstSetup(weights) => (
+                PolicyChooser::HistoricalCornFirstSetup(weights),
+                SeatPolicy::CornFirstSetup {
+                    policy_version: crate::setup_policy::LEGACY_POLICY_VERSION.into(),
+                    weights: weights.clone(),
+                },
+            ),
+            BorrowedArenaPolicy::CornFirstUxmalOpening(weights) => (
+                PolicyChooser::HistoricalCornFirstUxmalOpening(weights),
+                SeatPolicy::CornFirstUxmalOpening {
+                    policy_version: crate::setup_policy::LEGACY_UXMAL_OPENING_POLICY_VERSION.into(),
+                    weights: weights.clone(),
+                },
+            ),
+            BorrowedArenaPolicy::Search(policy) => {
+                let search = PreparedSearch::for_revision(policy.config(), revision)?;
+                let provenance = crate::search_native::provenance(&search);
+                (PolicyChooser::HistoricalSearch(search), provenance)
+            }
+            BorrowedArenaPolicy::ResourceCycle(_) => {
+                return Err("Historical ResourceCycle delegate is not supported".into());
+            }
+            _ => return Ok(frozen),
+        };
+        frozen.handle.chooser = chooser;
+        frozen.handle.description.provenance = provenance;
+        Ok(frozen)
+    }
     #[cfg(test)]
     pub(crate) fn synthetic_bc(
         model: &'a crate::public_model::PublicPolicyArtifact,
@@ -918,15 +968,42 @@ impl<'a> PolicyHandle<'a> {
             }
             PolicyChooser::PublicLearned(policy) => Ok((policy.choose_move(observation)?, None)),
             PolicyChooser::Search(policy) => crate::search_native::decide(policy, observation),
+            PolicyChooser::HistoricalSearch(policy) => {
+                crate::search_native::decide(policy, observation)
+            }
             PolicyChooser::Heuristic(weights) => {
                 Ok((choose_move_with_weights(observation, weights)?, None))
             }
+            PolicyChooser::HistoricalHeuristic(weights) => Ok((
+                tzolkin_bot::choose_move_with_weights_for_revision(
+                    observation,
+                    weights,
+                    crate::policy::HeuristicRevision::V1,
+                )?,
+                None,
+            )),
             PolicyChooser::CornFirstSetup(weights) => Ok((
                 crate::setup_policy::choose_move_with_weights(observation, weights)?,
                 None,
             )),
+            PolicyChooser::HistoricalCornFirstSetup(weights) => Ok((
+                crate::setup_policy::choose_move_for_revision(
+                    observation,
+                    weights,
+                    crate::policy::HeuristicRevision::V1,
+                )?,
+                None,
+            )),
             PolicyChooser::CornFirstUxmalOpening(weights) => Ok((
                 crate::setup_policy::choose_uxmal_opening_with_weights(observation, weights)?,
+                None,
+            )),
+            PolicyChooser::HistoricalCornFirstUxmalOpening(weights) => Ok((
+                crate::setup_policy::choose_uxmal_opening_for_revision(
+                    observation,
+                    weights,
+                    crate::policy::HeuristicRevision::V1,
+                )?,
                 None,
             )),
             PolicyChooser::ResourceCycle(configuration) => Ok((
