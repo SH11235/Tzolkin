@@ -45,6 +45,10 @@ pub const RESOURCE_CYCLE_ARENA_SCHEMA: &str =
 pub const OWN_SETUP_ARENA_SCHEMA: &str = "tzolkin-own-setup-composite-development-arena-v1";
 pub const RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-own-setup-composite-development-arena-v1";
+pub const APP_PROFILE_ARENA_SCHEMA: &str = "tzolkin-app-profile-validation-arena-v1";
+pub const APP_DIAGNOSTIC_PAIRED_SCHEMA: &str = "tzolkin-app-profile-development-paired-arena-v1";
+pub const APP_DIAGNOSTIC_SCHEMA: &str = "tzolkin-app-profile-development-diagnostic-v1";
+pub const APP_DIAGNOSTIC_CONSENT_SCHEMA: &str = "tzolkin-app-development-reanalysis-consent-v1";
 pub const MAX_ROWS_PER_CALLBACK: usize = 1024;
 pub const MAX_REPORT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXCLUDED_FAMILIES: usize = 200_000;
@@ -274,6 +278,122 @@ pub enum Opponent<'a> {
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
 
+/// The actual App selectors, with frozen default weights in both phases.
+/// No caller-supplied version string or training roster conversion is accepted.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AppProfile {
+    FoodAlignedV2,
+    MonumentAlignedV1,
+}
+impl AppProfile {
+    pub fn policy_version(self) -> &'static str {
+        match self {
+            Self::FoodAlignedV2 => tzolkin_bot::FOOD_ALIGNED_V2_POLICY_VERSION,
+            Self::MonumentAlignedV1 => tzolkin_bot::MONUMENT_ALIGNED_POLICY_VERSION,
+        }
+    }
+    fn choose_move(self, observation: &Observation) -> Result<Decision, String> {
+        match self {
+            Self::FoodAlignedV2 => tzolkin_bot::choose_move_food_aligned_v2(observation),
+            Self::MonumentAlignedV1 => tzolkin_bot::choose_move_monument_aligned(observation),
+        }
+    }
+}
+
+/// App profiles are reachable only through the explicit App Arena routes.
+/// Ordinary Numeric Arena opponents and training SeatPolicy remain unchanged.
+pub enum AppOpponent<'a> {
+    App(AppProfile),
+    Existing(Opponent<'a>),
+}
+
+/// Caller-declared permission to reanalyse a bounded, already exposed set.
+/// The digest binds the declaration; it does not authenticate its history or
+/// the completeness of the external exclusions or protected holdout list.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AppDiagnosticConsent {
+    pub schema: String,
+    pub evidence_sha256: String,
+    pub exposed_development_family_ids: Vec<String>,
+    /// Additional protected families, if any, declared by the caller. Empty
+    /// does not waive the unconditional source Test-partition refusal.
+    pub protected_holdout_family_ids: Vec<String>,
+}
+impl AppDiagnosticConsent {
+    /// Full exclusions stay intact. Reanalysis requires an exact allowlist;
+    /// Test families and every declared protected holdout are always refused.
+    pub fn validate_for(&self, config: &NumericArenaConfig) -> Result<(), String> {
+        if config.schema != SCHEMA
+            || !(3..=4).contains(&config.players)
+            || config.seeds.is_empty()
+            || config.seeds.len() > 64
+            || !digest(&config.external_exclusions.evidence_sha256)
+            || self.schema != APP_DIAGNOSTIC_CONSENT_SCHEMA
+            || !digest(&self.evidence_sha256)
+        {
+            return Err("App diagnostic requires bounded explicit Development consent".into());
+        }
+        fn families(ids: &[String], cap: usize) -> Result<BTreeSet<&String>, String> {
+            let set = ids.iter().collect::<BTreeSet<_>>();
+            if ids.len() > cap || set.len() != ids.len() || set.iter().any(|id| !digest(id)) {
+                return Err("App diagnostic rejects invalid or repeated family metadata".into());
+            }
+            Ok(set)
+        }
+        let excluded = families(
+            &config.external_exclusions.excluded_family_ids,
+            MAX_EXCLUDED_FAMILIES,
+        )?;
+        let allowed = families(&self.exposed_development_family_ids, 64)?;
+        let protected = families(&self.protected_holdout_family_ids, MAX_EXCLUDED_FAMILIES)?;
+        if !allowed.is_subset(&excluded)
+            || !protected.is_subset(&excluded)
+            || !allowed.is_disjoint(&protected)
+            || allowed.iter().any(|id| {
+                !matches!(
+                    crate::dataset::split_for_family(id),
+                    Ok(DatasetSplit::Train | DatasetSplit::Validation)
+                )
+            })
+        {
+            return Err(
+                "App diagnostic allowlist or protected holdout differs from exclusions".into(),
+            );
+        }
+        let selected = config
+            .seeds
+            .iter()
+            .map(|seed| family_id(*seed))
+            .collect::<BTreeSet<_>>();
+        if selected.len() != config.seeds.len()
+            || selected.iter().collect::<BTreeSet<_>>() != allowed
+        {
+            return Err("App diagnostic requires exactly the distinct exposed allowlist".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppDiagnosticReport {
+    pub schema: String,
+    pub configuration_sha256: String,
+    pub consent: AppDiagnosticConsent,
+    pub paired: NumericArenaReport,
+    pub count_neutral: bool,
+    pub fresh_test_claimed: bool,
+    pub training_credit_granted: bool,
+    pub adoption_granted: bool,
+}
+impl AppDiagnosticReport {
+    pub fn save_new(&self, path: &std::path::Path) -> Result<(), String> {
+        crate::model::write_new_json_bounded(path, self, MAX_REPORT_BYTES)
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(
     tag = "kind",
@@ -289,6 +409,12 @@ pub enum PolicyIdentity {
     },
     ResourceCycle {
         configuration: super::resource_cycle::ResourceCycleConfig,
+    },
+    AppProfile {
+        profile: AppProfile,
+        policy_version: String,
+        weights: HeuristicWeights,
+        scope: String,
     },
     ConditionalHumanHybrid {
         identity: Box<ConditionalIdentity>,
@@ -323,6 +449,7 @@ enum Role<'a> {
     PhaseRouted(Box<PhaseRoutedDevelopmentPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
+    App(AppProfile),
 }
 impl<'a> Role<'a> {
     fn from_semantic_setup_reference(reference: SemanticSetupTeacherReference<'a>) -> Self {
@@ -348,6 +475,15 @@ impl<'a> Role<'a> {
             Opponent::Search(policy) => BorrowedArenaPolicy::Search(policy),
         };
         Ok(Self::Reactive(PolicyHandle::borrowed(reactive, &[])?.0))
+    }
+    fn from_app_opponent(opponent: AppOpponent<'a>) -> Result<Self, String> {
+        match opponent {
+            AppOpponent::App(profile) => Ok(Self::App(profile)),
+            AppOpponent::Existing(Opponent::Search(_)) => {
+                Err("App Arena does not admit Search roles".into())
+            }
+            AppOpponent::Existing(opponent) => Self::from_opponent(opponent),
+        }
     }
     fn identity(&self) -> PolicyIdentity {
         match self {
@@ -386,6 +522,12 @@ impl<'a> Role<'a> {
             },
             Self::ResourceCycle(configuration) => PolicyIdentity::ResourceCycle {
                 configuration: configuration.clone(),
+            },
+            Self::App(profile) => PolicyIdentity::AppProfile {
+                profile: *profile,
+                policy_version: profile.policy_version().into(),
+                weights: HeuristicWeights::default(),
+                scope: "setupAndPlaying".into(),
             },
         }
     }
@@ -725,6 +867,7 @@ fn choose(
                 super::resource_cycle::choose_move(observation, configuration)?,
                 None,
             ),
+            Role::App(profile) => (profile.choose_move(observation)?, None),
             Role::Numeric(_) => return Err("Numeric Arena missing game guard".into()),
             Role::OwnSetup(_) => return Err("Own Setup Arena missing game guard".into()),
             Role::Conditional(_) => return Err("Conditional Arena missing game session".into()),
@@ -998,6 +1141,91 @@ pub fn run_validation(
     )
 }
 
+/// Paired Validation of the actual App chooser in both Setup and Playing.
+/// Each absolute seat is explicit, with independent numeric guard histories.
+pub fn run_app_profile_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: AppProfile,
+    reference: AppOpponent<'a>,
+    opponent_pool: Vec<AppOpponent<'a>>,
+) -> Result<NumericArenaReport, String> {
+    config.validate()?;
+    run_app_roles(
+        config,
+        candidate,
+        reference,
+        opponent_pool,
+        APP_PROFILE_ARENA_SCHEMA,
+    )
+}
+
+/// Count-neutral reanalysis of caller-declared exposed Development families.
+/// This route cannot grant fresh Test, training credit or adoption authority.
+pub fn run_app_profile_diagnostic<'a>(
+    config: &NumericArenaConfig,
+    consent: &AppDiagnosticConsent,
+    candidate: AppProfile,
+    reference: AppOpponent<'a>,
+    opponent_pool: Vec<AppOpponent<'a>>,
+) -> Result<AppDiagnosticReport, String> {
+    consent.validate_for(config)?;
+    let paired = run_app_roles(
+        config,
+        candidate,
+        reference,
+        opponent_pool,
+        APP_DIAGNOSTIC_PAIRED_SCHEMA,
+    )?;
+    let mut hash = Sha256::new();
+    hash.update(b"tzolkin-app-profile-development-diagnostic-v1\0");
+    hash.update(
+        serde_json::to_vec(&(consent, &paired.configuration_sha256)).map_err(|e| e.to_string())?,
+    );
+    Ok(AppDiagnosticReport {
+        schema: APP_DIAGNOSTIC_SCHEMA.into(),
+        configuration_sha256: format!("{:x}", hash.finalize()),
+        consent: consent.clone(),
+        paired,
+        count_neutral: true,
+        fresh_test_claimed: false,
+        training_credit_granted: false,
+        adoption_granted: false,
+    })
+}
+
+fn run_app_roles<'a>(
+    config: &NumericArenaConfig,
+    candidate: AppProfile,
+    reference: AppOpponent<'a>,
+    opponent_pool: Vec<AppOpponent<'a>>,
+    schema: &str,
+) -> Result<NumericArenaReport, String> {
+    if opponent_pool.len() != config.players {
+        return Err("Numeric Arena absolute-seat pool count mismatch".into());
+    }
+    let candidate = Role::App(candidate);
+    let reference = Role::from_app_opponent(reference)?;
+    let pool = opponent_pool
+        .into_iter()
+        .map(Role::from_app_opponent)
+        .collect::<Result<Vec<_>, _>>()?;
+    // Unguarded App/native roles have no history. Every numeric role still
+    // receives all actors' callbacks and must use the same fixed guard.
+    let mut guard_key = None;
+    for role in std::iter::once(&candidate)
+        .chain(std::iter::once(&reference))
+        .chain(pool.iter())
+    {
+        if let Some(key) = role.guard_key() {
+            if guard_key.is_some_and(|expected| expected != key) {
+                return Err("Numeric Arena requires one fixed shared guard configuration".into());
+            }
+            guard_key = Some(key);
+        }
+    }
+    run_admitted_roles(config, candidate, reference, pool, schema, None)
+}
+
 /// Paired base 3/4p Validation with the same untrained Corn-first Setup selector
 /// and default weights for every absolute seat in both arms. Playing preserves
 /// each declared numeric/opponent policy, independent per-game guards and the
@@ -1239,8 +1467,8 @@ fn run_roles<'a>(
 }
 fn run_roles_with_setup<'a>(
     config: &NumericArenaConfig,
-    mut candidate: Role<'a>,
-    mut reference: Role<'a>,
+    candidate: Role<'a>,
+    reference: Role<'a>,
     opponent_pool: Vec<Opponent<'a>>,
     schema: &str,
     shared_setup: Option<SharedCornFirstSetupIdentity>,
@@ -1249,11 +1477,21 @@ fn run_roles_with_setup<'a>(
     if opponent_pool.len() != config.players {
         return Err("Numeric Arena absolute-seat pool count mismatch".into());
     }
-    let mut pool = opponent_pool
+    let pool = opponent_pool
         .into_iter()
         .map(Role::from_opponent)
         .collect::<Result<Vec<_>, _>>()?;
     shared_guard(&candidate, &reference, &pool)?;
+    run_admitted_roles(config, candidate, reference, pool, schema, shared_setup)
+}
+fn run_admitted_roles<'a>(
+    config: &NumericArenaConfig,
+    mut candidate: Role<'a>,
+    mut reference: Role<'a>,
+    mut pool: Vec<Role<'a>>,
+    schema: &str,
+    shared_setup: Option<SharedCornFirstSetupIdentity>,
+) -> Result<NumericArenaReport, String> {
     let identities = (
         candidate.identity(),
         reference.identity(),
@@ -1697,6 +1935,107 @@ pub(super) mod tests {
             },
         };
         config.validate().unwrap();
+        let search = PreparedSearch::new(&crate::search::SearchConfig::default()).unwrap();
+        for search_in_reference in [true, false] {
+            let reference = if search_in_reference {
+                AppOpponent::Existing(Opponent::Search(&search))
+            } else {
+                AppOpponent::App(AppProfile::FoodAlignedV2)
+            };
+            let pool = (0..config.players)
+                .map(|seat| {
+                    if !search_in_reference && seat == 0 {
+                        AppOpponent::Existing(Opponent::Search(&search))
+                    } else {
+                        AppOpponent::App(AppProfile::FoodAlignedV2)
+                    }
+                })
+                .collect();
+            assert_eq!(
+                run_app_profile_validation(&config, AppProfile::FoodAlignedV2, reference, pool)
+                    .unwrap_err(),
+                "App Arena does not admit Search roles"
+            );
+        }
+        assert!(serde_json::from_value::<AppProfile>(json!("nativeV2")).is_err());
+        assert!(serde_json::from_value::<AppProfile>(json!("monumentAlignedV2")).is_err());
+        let mut reanalysis = config.clone();
+        reanalysis.external_exclusions.excluded_family_ids = vec![family_id(3), family_id(10)];
+        let consent = AppDiagnosticConsent {
+            schema: APP_DIAGNOSTIC_CONSENT_SCHEMA.into(),
+            evidence_sha256: "c".repeat(64),
+            exposed_development_family_ids: vec![family_id(3)],
+            protected_holdout_family_ids: vec![family_id(10)],
+        };
+        consent.validate_for(&reanalysis).unwrap();
+        let mut no_additional_holdout = consent.clone();
+        no_additional_holdout.protected_holdout_family_ids.clear();
+        no_additional_holdout.validate_for(&reanalysis).unwrap();
+        assert_eq!(seed_partition(10), Ok(DatasetSplit::Test));
+        // A valid declaration reaches the separate pool gate. Invalid
+        // declarations below must fail at consent, not this later gate.
+        assert_eq!(
+            run_app_profile_diagnostic(
+                &reanalysis,
+                &consent,
+                AppProfile::FoodAlignedV2,
+                AppOpponent::App(AppProfile::FoodAlignedV2),
+                vec![],
+            )
+            .unwrap_err(),
+            "Numeric Arena absolute-seat pool count mismatch"
+        );
+        // Ordinary Validation still rejects this spent family. Diagnostic
+        // never removes it or gains access to Test/protected holdouts.
+        assert!(reanalysis.validate().is_err());
+        assert_eq!(reanalysis.external_exclusions.excluded_family_ids.len(), 2);
+        for mutate in 0..6 {
+            let mut refused = consent.clone();
+            let mut configured = reanalysis.clone();
+            let expected_error = match mutate {
+                0 => {
+                    refused.protected_holdout_family_ids.push(family_id(3));
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
+                }
+                1 => {
+                    refused.protected_holdout_family_ids.push(family_id(0));
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
+                }
+                2 => {
+                    refused.exposed_development_family_ids.push(family_id(3));
+                    "App diagnostic rejects invalid or repeated family metadata"
+                }
+                3 => {
+                    configured.external_exclusions.excluded_family_ids.clear();
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
+                }
+                4 => {
+                    configured.seeds = vec![10];
+                    refused.exposed_development_family_ids = vec![family_id(10)];
+                    refused.protected_holdout_family_ids.clear();
+                    "App diagnostic allowlist or protected holdout differs from exclusions"
+                }
+                _ => {
+                    refused.evidence_sha256 = "not-a-digest".into();
+                    "App diagnostic requires bounded explicit Development consent"
+                }
+            };
+            assert_eq!(
+                refused.validate_for(&configured).unwrap_err(),
+                expected_error
+            );
+            assert_eq!(
+                run_app_profile_diagnostic(
+                    &configured,
+                    &refused,
+                    AppProfile::FoodAlignedV2,
+                    AppOpponent::App(AppProfile::FoodAlignedV2),
+                    vec![],
+                )
+                .unwrap_err(),
+                expected_error
+            );
+        }
         for seeds in [vec![0], vec![10], vec![3, 3]] {
             let mut invalid = config.clone();
             invalid.seeds = seeds;
@@ -1830,6 +2169,46 @@ pub(super) mod tests {
         assert!(stats.failures_preclude_adoption && !stats.strength_improvement_declared);
 
         let shared_setup = SharedCornFirstSetupIdentity::current();
+        let assert_app_parity = |observation: &Observation| -> Result<(), String> {
+            for profile in [AppProfile::FoodAlignedV2, AppProfile::MonumentAlignedV1] {
+                let expected = match profile {
+                    AppProfile::FoodAlignedV2 => {
+                        tzolkin_bot::choose_move_food_aligned_v2(observation)?
+                    }
+                    AppProfile::MonumentAlignedV1 => {
+                        tzolkin_bot::choose_move_monument_aligned(observation)?
+                    }
+                };
+                let mut roles = (0..observation.players.len())
+                    .map(|_| Role::App(profile))
+                    .collect::<Vec<_>>();
+                let identity = serde_json::to_value(roles[0].identity()).unwrap();
+                assert_eq!(identity["profile"], serde_json::to_value(profile).unwrap());
+                assert_eq!(identity["policyVersion"], profile.policy_version());
+                assert_eq!(
+                    identity["weights"],
+                    serde_json::to_value(HeuristicWeights::default()).unwrap()
+                );
+                let roster = roles.iter_mut().collect::<Vec<_>>();
+                let mut guards = (0..roster.len()).map(|_| None).collect::<Vec<_>>();
+                let mut sessions = (0..roster.len()).map(|_| None).collect::<Vec<_>>();
+                let mut diagnostics = vec![None; roster.len()];
+                let mut search = (0..roster.len()).map(|_| None).collect::<Vec<_>>();
+                let actual = choose(
+                    0,
+                    observation,
+                    &roster,
+                    &mut guards,
+                    &mut sessions,
+                    &mut diagnostics,
+                    (&mut search, None),
+                )?;
+                assert_eq!(actual, expected);
+                assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+                assert_ne!(actual.policy_version, tzolkin_bot::POLICY_VERSION);
+            }
+            Ok(())
+        };
         assert_ne!(CORN_FIRST_ARENA_SCHEMA, SCHEMA);
         assert_eq!(
             shared_setup.policy_version,
@@ -1864,6 +2243,7 @@ pub(super) mod tests {
                     for index in 0..players {
                         let o = observe(&state, state.current_player)?;
                         assert_eq!(o.phase, Phase::Setup);
+                        assert_app_parity(&o)?;
                         let expected = crate::setup_policy::choose_move_with_weights(
                             &o,
                             &HeuristicWeights::default(),
@@ -1874,6 +2254,7 @@ pub(super) mod tests {
                     }
                     let o = observe(&state, state.current_player)?;
                     assert_eq!(o.phase, Phase::Playing);
+                    assert_app_parity(&o)?;
                     let actual = decide(players, &o)?;
                     assert_eq!(actual.policy_version, d::GUARDED_DEPLOYMENT_VERSION);
                     assert_eq!(actual.r#move, o.legal_actions[0].r#move);
