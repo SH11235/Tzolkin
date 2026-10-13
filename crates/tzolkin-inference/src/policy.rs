@@ -438,6 +438,29 @@ mod prefix_tests {
                 let old_rows = (0..o.legal_actions.len())
                     .map(|i| old_encoder.encode_legal_tagged(i).unwrap())
                     .collect::<Vec<_>>();
+                if phase == Phase::Playing {
+                    let playing =
+                        crate::features::FeatureEncoder::new_semantic_playing(&o).unwrap();
+                    let playing_rows = (0..o.legal_actions.len())
+                        .map(|i| playing.encode_legal_tagged(i).unwrap())
+                        .collect::<Vec<_>>();
+                    assert!(
+                        old.predict(
+                            crate::kernel::Kernel::Scalar.resolve().unwrap(),
+                            &playing_rows
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        semantic
+                            .predict(
+                                crate::kernel::Kernel::Scalar.resolve().unwrap(),
+                                &playing_rows
+                            )
+                            .is_err()
+                    );
+                    assert!(playing.public_state_prefix().is_err());
+                }
                 assert!(
                     old.predict(crate::kernel::Kernel::Scalar.resolve().unwrap(), &rows)
                         .is_err()

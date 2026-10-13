@@ -7,10 +7,18 @@ use tzolkin_core::observation::{
 };
 use tzolkin_core::*;
 
+#[path = "playing_semantics.rs"]
+mod playing_semantics;
+pub use playing_semantics::{
+    PLAYING_SEMANTIC_FEATURE_COUNT, PLAYING_SEMANTIC_FEATURE_START, PlayingSemanticFeature,
+};
+
 pub const FEATURE_SCHEMA: u32 = 1;
 pub const PUBLIC_FEATURE_SCHEMA: u32 = 2;
 /// Opt-in base 3-4p Setup semantics; existing dataset/model contracts remain schema 2.
 pub const SEMANTIC_SETUP_FEATURE_SCHEMA: u32 = 3;
+/// Opt-in operation descriptors for base 3-4p Playing, without model/source admission.
+pub const SEMANTIC_PLAYING_FEATURE_SCHEMA: u32 = 4;
 pub const FEATURE_COUNT: usize = 512;
 pub const MAX_LEGAL_ACTIONS: usize = 4096;
 /// Schema 3, ChooseWealth only: raw pair resources (RESOURCE_IDS order), worker,
@@ -112,6 +120,20 @@ pub fn encode_public_action(
     encoder.encode_legal_tagged(index)
 }
 
+/// Schema 4 cannot enter an existing schema-1/2/3 model or untagged encoder API.
+pub fn encode_semantic_playing_action(
+    o: &Observation,
+    action: &TypedAction,
+) -> Result<EncodedCandidate, String> {
+    let encoder = FeatureEncoder::new_semantic_playing(o)?;
+    let index = o
+        .legal_actions
+        .iter()
+        .position(|a| a.action == *action)
+        .ok_or("Non-legal feature action")?;
+    encoder.encode_legal_tagged(index)
+}
+
 /// Schema and values are inseparable at this boundary. There is no untagged
 /// conversion, Deref, or Deserialize implementation; consumers must name their
 /// supported schema before borrowing the array.
@@ -174,6 +196,18 @@ impl<'a> FeatureEncoder<'a> {
         encoder.feature_schema = SEMANTIC_SETUP_FEATURE_SCHEMA;
         Ok(encoder)
     }
+    /// Explicit schema-4 descriptors; the schema-2 state prefix and columns 384..417
+    /// are unchanged. Columns 417..512 have common operation meanings: the old
+    /// candidate hash and cross-terms are replaced, with explicit catalog identities.
+    /// Descriptors stop at the named operation, not its automatic
+    /// continuation, hidden replenishment, complete next state or future payoff.
+    pub fn new_semantic_playing(observation: &'a Observation) -> Result<Self, String> {
+        crate::policy::validate_contract(observation)?;
+        let mut encoder = Self::new_public(observation)?;
+        playing_semantics::validate_observation(observation)?;
+        encoder.feature_schema = SEMANTIC_PLAYING_FEATURE_SCHEMA;
+        Ok(encoder)
+    }
     pub fn new_with_schema(observation: &'a Observation, schema: u32) -> Result<Self, String> {
         if ![FEATURE_SCHEMA, PUBLIC_FEATURE_SCHEMA].contains(&schema) {
             return Err("Unsupported feature schema".into());
@@ -232,7 +266,9 @@ impl<'a> FeatureEncoder<'a> {
             .get(index)
             .ok_or("Invalid legal feature index")?
             .action;
-        let mut values = candidate_features(self.observation, action, self.context)?;
+        let semantic_playing = self.feature_schema == SEMANTIC_PLAYING_FEATURE_SCHEMA;
+        let mut values =
+            candidate_features(self.observation, action, self.context, semantic_playing)?;
         if self.feature_schema == SEMANTIC_SETUP_FEATURE_SCHEMA
             && let TypedAction::ChooseWealth { ids } = action
         {
@@ -253,8 +289,20 @@ impl<'a> FeatureEncoder<'a> {
             values[SETUP_PAIR_FEATURE_START..SETUP_PAIR_FEATURE_START + SETUP_PAIR_FEATURE_COUNT]
                 .copy_from_slice(&pair);
         }
+        if self.feature_schema == SEMANTIC_PLAYING_FEATURE_SCHEMA {
+            values[PLAYING_SEMANTIC_FEATURE_START..]
+                .copy_from_slice(&playing_semantics::encode(self.observation, action)?);
+            validate_semantic_playing_values(&values)?;
+        }
         Ok(values)
     }
+}
+
+/// Numeric layout guard for a schema-4 consumer, not a constructor or source audit.
+pub(crate) fn validate_semantic_playing_values(
+    values: &[f32; FEATURE_COUNT],
+) -> Result<(), String> {
+    playing_semantics::validate_values(values)
 }
 
 fn setup_pair_quantities(
@@ -556,6 +604,7 @@ fn candidate_features(
     o: &Observation,
     action: &TypedAction,
     mut out: [f32; FEATURE_COUNT],
+    semantic_playing: bool,
 ) -> Result<[f32; FEATURE_COUNT], String> {
     let n = o.players.len();
     let canonical_action = match action {
@@ -577,13 +626,15 @@ fn candidate_features(
         }
         _ => std::borrow::Cow::Borrowed(action),
     };
-    hashed_value(
-        &mut out,
-        443,
-        480,
-        hash(1, b"candidate"),
-        &serde_json::to_value(canonical_action.as_ref()).map_err(|e| e.to_string())?,
-    );
+    if !semantic_playing {
+        hashed_value(
+            &mut out,
+            443,
+            480,
+            hash(1, b"candidate"),
+            &serde_json::to_value(canonical_action.as_ref()).map_err(|e| e.to_string())?,
+        );
+    }
     let mut cost = [0i64; 5];
     let mut gain = [0i64; 5];
     let mut gear = None;
@@ -743,6 +794,11 @@ fn candidate_features(
         out[411 + gear_index(g)] = 1.0;
     }
     out[416] = scaled(position as f64, 13.0);
+    if semantic_playing {
+        // Schema 4 supplies its own common block; no discarded hash/interaction
+        // calculation is needed. Old schemas take the original path below.
+        return Ok(out);
+    }
     for i in 0..5 {
         out[417 + i] = scaled(cost[i] as f64, 8.0);
         out[422 + i] = scaled(gain[i] as f64, 8.0);
@@ -814,6 +870,335 @@ mod setup_tests {
         ] {
             changed.effects = vec![effect];
             assert!(setup_pair_quantities([known, &changed]).is_err());
+        }
+
+        use PlayingSemanticFeature as F;
+        for players in [3, 4] {
+            let mut state = create_game(
+                (0..players).map(|i| format!("Seat {i}")).collect(),
+                17,
+                false,
+            )
+            .unwrap();
+            let setup = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+            assert!(FeatureEncoder::new_semantic_playing(&setup).is_err());
+            while state.phase == Phase::Setup {
+                let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+                state = apply_move(&state, o.legal_actions[0].r#move.clone()).unwrap();
+            }
+            let actor = state.current_player;
+            state.players[actor].workers = 6;
+            state.players[actor].resources = RESOURCE_IDS.into_iter().map(|r| (r, 20)).collect();
+            state.players[actor].technologies =
+                TECHNOLOGY_IDS.into_iter().map(|t| (t, 3)).collect();
+            state.players[actor].temples = TEMPLE_IDS.into_iter().map(|t| (t, 0)).collect();
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[5] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+            let describe = |s: &GameState, find: &dyn Fn(&TypedAction) -> bool| {
+                let o = tzolkin_core::observation::observe(s, s.current_player).unwrap();
+                let legal = o
+                    .legal_actions
+                    .iter()
+                    .find(|row| find(&row.action))
+                    .unwrap();
+                let row = encode_semantic_playing_action(&o, &legal.action).unwrap();
+                let values = *row
+                    .values_for_schema(SEMANTIC_PLAYING_FEATURE_SCHEMA)
+                    .unwrap();
+                let old = encode_public_action(&o, &legal.action).unwrap();
+                let old_values = old.values_for_schema(PUBLIC_FEATURE_SCHEMA).unwrap();
+                assert!(
+                    values[..417]
+                        .iter()
+                        .zip(&old_values[..417])
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+                let schema3 = FeatureEncoder::new_semantic_setup(&o)
+                    .unwrap()
+                    .encode_legal_tagged(
+                        o.legal_actions
+                            .iter()
+                            .position(|row| row.action == legal.action)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                assert!(
+                    schema3
+                        .values_for_schema(SEMANTIC_SETUP_FEATURE_SCHEMA)
+                        .unwrap()
+                        .iter()
+                        .zip(old_values)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+                assert!(row.values_for_schema(PUBLIC_FEATURE_SCHEMA).is_err());
+                assert!(
+                    FeatureEncoder::new_with_schema(&o, SEMANTIC_PLAYING_FEATURE_SCHEMA).is_err()
+                );
+                assert!(
+                    FeatureEncoder::new_semantic_playing(&o)
+                        .unwrap()
+                        .encode_legal(0)
+                        .is_err()
+                );
+                (values, legal.r#move.clone())
+            };
+            let mut first = state.clone();
+            first.accumulated_corn = 4;
+            let (claim, mv) = describe(&first, &|a| matches!(a, TypedAction::FirstPlayer { .. }));
+            assert_eq!(claim[F::PendingFirstPlayerCorn.index()], 4.0);
+            assert_eq!(claim[F::GainCorn.index()], 0.0);
+            let claimed = apply_move(&first, mv).unwrap();
+            assert_eq!(claimed.accumulated_corn, 4);
+            assert_eq!(
+                claimed.players[actor].resources[&Resource::Corn],
+                first.players[actor].resources[&Resource::Corn] - claim[F::CostCorn.index()] as i64
+            );
+            let (place, mv) = describe(&claimed, &|a| matches!(a, TypedAction::Place { .. }));
+            assert_eq!(place[F::GainCorn.index()], 0.0);
+            let placed = apply_move(&claimed, mv).unwrap();
+            assert_eq!(placed.accumulated_corn, 4);
+            assert_eq!(
+                placed.players[actor].resources[&Resource::Corn],
+                claimed.players[actor].resources[&Resource::Corn]
+                    - place[F::CostCorn.index()] as i64
+            );
+            let (end, mv) = describe(&placed, &|a| matches!(a, TypedAction::EndTurn { .. }));
+            assert_eq!(end[F::PendingFirstPlayerCorn.index()], 0.0);
+            assert_eq!(end[F::GainCorn.index()], 4.0);
+            let ended = apply_move(&placed, mv).unwrap();
+            assert_eq!(ended.accumulated_corn, 0);
+            assert_eq!(
+                ended.players[actor].resources[&Resource::Corn],
+                placed.players[actor].resources[&Resource::Corn] + 4
+            );
+            let mut rotation = state.clone();
+            rotation.pending = Some(Pending {
+                title: "Rotation".into(),
+                task: Task::Rotation,
+                after: vec![],
+            });
+            let (rotate, _) =
+                describe(&rotation, &|a| matches!(a, TypedAction::Rotate { days: 1 }));
+            assert_eq!(rotate[F::TaskRemaining.index()], 0.0);
+            assert!(rotate[416] > 0.0);
+            let (remove, mv) = describe(&state, &|a| {
+                matches!(
+                    a,
+                    TypedAction::Remove {
+                        gear: GearId::Yaxchilan,
+                        position: 5
+                    }
+                )
+            });
+            assert_eq!(remove[F::WorkerReleased.index()], 1.0);
+            assert_eq!(
+                &remove[F::GainCorn.index()..F::GainCorn.index() + 5],
+                &[0.0; 5]
+            );
+            let removed = apply_move(&state, mv).unwrap();
+            assert_eq!(
+                removed.players[actor].resources,
+                state.players[actor].resources
+            );
+            let (selected, mv) = describe(&removed, &|a| {
+                matches!(
+                    a,
+                    TypedAction::UseAction {
+                        gear: GearId::Yaxchilan,
+                        position: 5,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(
+                &selected[F::GainCorn.index()..F::GainCorn.index() + 5],
+                &[2.0, 0.0, 2.0, 2.0, 0.0]
+            );
+            let received = apply_move(&removed, mv).unwrap();
+            for (r, gain) in RESOURCE_IDS.into_iter().zip([2, 0, 2, 2, 0]) {
+                assert_eq!(
+                    received.players[actor].resources[&r] - removed.players[actor].resources[&r],
+                    gain
+                );
+            }
+
+            let mut tech = state.clone();
+            tech.players[actor]
+                .technologies
+                .insert(TechnologyId::Extraction, 2);
+            tech.pending = Some(Pending {
+                title: "Technology".into(),
+                task: Task::Technology {
+                    remaining: 2,
+                    free: false,
+                    mandatory: false,
+                },
+                after: vec![],
+            });
+            let (choice, mv) = describe(&tech, &|a| {
+                matches!(
+                    a,
+                    TypedAction::Technology {
+                        technology: TechnologyId::Extraction
+                    }
+                )
+            });
+            assert_eq!(choice[F::MaterialPaymentRequired.index()], 3.0);
+            assert_eq!(choice[F::TechnologyCurrent.index()], 2.0);
+            assert_eq!(choice[F::TechnologyTarget.index()], 3.0);
+            assert_eq!(
+                &choice[F::TechnologyDeltaAgriculture.index()
+                    ..F::TechnologyDeltaAgriculture.index() + 4],
+                &[0.0; 4]
+            );
+            let pay = apply_move(&tech, mv).unwrap();
+            assert_eq!(
+                pay.players[actor].technologies[&TechnologyId::Extraction],
+                2
+            );
+            let (payment, mv) = describe(&pay, &|a| matches!(a, TypedAction::Payment { .. }));
+            assert_eq!(payment[F::TechnologyDeltaAgriculture.index() + 1], 1.0);
+            assert_eq!(
+                apply_move(&pay, mv).unwrap().players[actor].technologies
+                    [&TechnologyId::Extraction],
+                3
+            );
+            tech.players[actor]
+                .technologies
+                .insert(TechnologyId::Extraction, 3);
+            tech.pending.as_mut().unwrap().task = Task::Technology {
+                remaining: 1,
+                free: true,
+                mandatory: false,
+            };
+            let (bonus, mv) = describe(&tech, &|a| {
+                matches!(
+                    a,
+                    TypedAction::Technology {
+                        technology: TechnologyId::Extraction
+                    }
+                )
+            });
+            assert_eq!(bonus[F::CappedTechnologyBonus.index()], 1.0);
+            assert_eq!(bonus[F::ResourceChoice.index()], 2.0);
+            assert_eq!(
+                apply_move(&tech, mv).unwrap().pending.unwrap().task,
+                Task::Resource { remaining: 2 }
+            );
+
+            let mut harvest = state.clone();
+            harvest.pending = Some(Pending {
+                title: "Harvest".into(),
+                task: Task::Palenque { position: 3 },
+                after: vec![],
+            });
+            harvest.jungle.insert(3, JungleBox { corn: 2, wood: 1 });
+            let (corn, mv) = describe(&harvest, &|a| {
+                matches!(
+                    a,
+                    TypedAction::Harvest {
+                        kind: tzolkin_core::observation::HarvestKind::Corn,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(corn[F::GainCorn.index()], 8.0);
+            assert_eq!(corn[F::CornTilesConsumed.index()], 1.0);
+            let after = apply_move(&harvest, mv).unwrap();
+            assert_eq!(
+                after.players[actor].resources[&Resource::Corn]
+                    - harvest.players[actor].resources[&Resource::Corn],
+                8
+            );
+            let (burn, mv) = describe(&harvest, &|a| {
+                matches!(
+                    a,
+                    TypedAction::Harvest {
+                        kind: tzolkin_core::observation::HarvestKind::Burn,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(burn[F::WoodTilesConsumed.index()], 1.0);
+            assert_eq!(burn[F::WoodTilesAdded.index()], 0.0);
+            assert_eq!(burn[F::TempleDownChoice.index()], 1.0);
+            let burned = apply_move(&harvest, mv).unwrap();
+            assert_eq!(
+                burned.players[actor].wood_tiles,
+                harvest.players[actor].wood_tiles
+            );
+            assert!(matches!(
+                burned.pending.unwrap().task,
+                Task::Temple {
+                    direction: Some(-1),
+                    ..
+                }
+            ));
+            harvest.jungle.insert(3, JungleBox { corn: 1, wood: 1 });
+            let (empty, _) = describe(&harvest, &|a| {
+                matches!(
+                    a,
+                    TypedAction::Harvest {
+                        kind: tzolkin_core::observation::HarvestKind::EmptyCorn,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(empty[F::GainCorn.index()], 8.0);
+            assert_eq!(empty[F::CornTilesConsumed.index()], 0.0);
+
+            let mut build = state.clone();
+            build.buildings = vec!["b01".into(), "b23".into()];
+            build.monuments = vec!["m01".into()];
+            build.pending = Some(Pending {
+                title: "Build".into(),
+                task: Task::Build {
+                    remaining: 2,
+                    allow_monument: true,
+                    corn_payment: false,
+                    architecture_available: None,
+                    mandatory: false,
+                },
+                after: vec![],
+            });
+            let (farm, mv) = describe(
+                &build,
+                &|a| matches!(a, TypedAction::Build { id, architecture: true, .. } if id == "b01"),
+            );
+            assert_eq!(farm[F::CatalogFedWorkers.index()], 1.0);
+            assert_eq!(farm[F::GainCorn.index()], 1.0);
+            assert_eq!(farm[F::ImmediatePoints.index()], 2.0);
+            let built = apply_move(&build, mv).unwrap();
+            assert_eq!(
+                built.players[actor].feed_workers - build.players[actor].feed_workers,
+                1
+            );
+            let (unresolved, _) = describe(
+                &build,
+                &|a| matches!(a, TypedAction::Build { id, .. } if id == "b23"),
+            );
+            assert_eq!(unresolved[F::TechnologyChoice.index()], 1.0);
+            assert_eq!(
+                &unresolved[F::TechnologyDeltaAgriculture.index()
+                    ..F::TechnologyDeltaAgriculture.index() + 4],
+                &[0.0; 4]
+            );
+            let (monument, _) = describe(
+                &build,
+                &|a| matches!(a, TypedAction::Monument { id, .. } if id == "m01"),
+            );
+            assert_eq!(monument[F::ImmediatePoints.index()], 0.0);
+            assert_eq!(
+                &monument[F::MonumentIdentity.index()..F::MonumentIdentity.index() + 13],
+                &[
+                    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                ]
+            );
+            let mut bad = monument;
+            bad[F::MonumentIdentity.index() + 1] = 1.0;
+            assert!(validate_semantic_playing_values(&bad).is_err());
         }
     }
 }

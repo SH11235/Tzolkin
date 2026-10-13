@@ -8,6 +8,37 @@ use std::collections::{BTreeMap, BTreeSet};
 pub fn max_position(gear: GearId) -> i64 {
     if gear == GearId::ChichenItza { 10 } else { 7 }
 }
+/// Nominal fishing Corn, before any expansion gain tax. Public inputs only.
+pub fn palenque_fishing_quantity(agriculture_two_enabled: bool) -> i64 {
+    3 + i64::from(agriculture_two_enabled)
+}
+/// Nominal selected corn harvest, before expansion harvest adjustments/gain tax.
+pub fn palenque_corn_quantity(position: i64, agriculture: i64) -> Option<i64> {
+    let base = *[0, 3, 4, 5, 7, 9].get(usize::try_from(position).ok()?)?;
+    Some(base + i64::from(agriculture >= 1) + if agriculture >= 3 { 2 } else { 0 })
+}
+/// Nominal selected wood harvest, before expansion harvest adjustments/gain tax.
+pub fn palenque_wood_quantity(position: i64, extraction_one_enabled: bool) -> i64 {
+    position - 1 + i64::from(extraction_one_enabled)
+}
+/// Nominal Yaxchilan grants. Bonuses are Wood/Stone/Gold/Skull, respectively;
+/// the caller applies expansion enablement and the ordinary Skull supply cap.
+pub fn yaxchilan_resource_quantities(position: i64, bonuses: [bool; 4]) -> Option<[i64; 5]> {
+    Some(match position {
+        1 => [0, 1 + i64::from(bonuses[0]), 0, 0, 0],
+        2 => [1, 0, 1 + i64::from(bonuses[1]), 0, 0],
+        3 => [2, 0, 0, 1 + i64::from(bonuses[2]), 0],
+        4 => [0, 0, 0, 0, 1 + i64::from(bonuses[3])],
+        5 => [
+            2,
+            0,
+            1 + i64::from(bonuses[1]),
+            1 + i64::from(bonuses[2]),
+            0,
+        ],
+        _ => return None,
+    })
+}
 fn resource_label(r: Resource) -> &'static str {
     match r {
         Resource::Corn => "コーン",
@@ -2033,7 +2064,7 @@ fn execute_action(s: &mut GameState, g: GearId, pos: i64) -> Result<Vec<Task>, S
                 s,
                 &resources(&[(
                     Resource::Corn,
-                    3 + i64::from(prophecies::technology_effect_enabled(
+                    palenque_fishing_quantity(prophecies::technology_effect_enabled(
                         s,
                         s.current_player,
                         TechnologyId::Agriculture,
@@ -2047,56 +2078,32 @@ fn execute_action(s: &mut GameState, g: GearId, pos: i64) -> Result<Vec<Task>, S
     }
     if g == GearId::Yaxchilan {
         let ex = current(s).technologies[&TechnologyId::Extraction];
-        let tasks = match pos {
-            1 => gain(s, &resources(&[(Resource::Wood, 1 + i64::from(ex >= 1))])),
-            2 => gain(
+        let quantities = yaxchilan_resource_quantities(
+            pos,
+            [
+                ex >= 1,
+                prophecies::technology_effect_enabled(
+                    s,
+                    s.current_player,
+                    TechnologyId::Extraction,
+                    2,
+                ),
+                ex >= 3,
+                current(s).technologies[&TechnologyId::Theology] >= 3,
+            ],
+        );
+        return Ok(if let Some(quantities) = quantities {
+            gain(
                 s,
-                &resources(&[
-                    (
-                        Resource::Stone,
-                        1 + i64::from(prophecies::technology_effect_enabled(
-                            s,
-                            s.current_player,
-                            TechnologyId::Extraction,
-                            2,
-                        )),
-                    ),
-                    (Resource::Corn, 1),
-                ]),
-            ),
-            3 => gain(
-                s,
-                &resources(&[
-                    (Resource::Gold, 1 + i64::from(ex >= 3)),
-                    (Resource::Corn, 2),
-                ]),
-            ),
-            4 => gain(
-                s,
-                &resources(&[(
-                    Resource::Skull,
-                    1 + i64::from(current(s).technologies[&TechnologyId::Theology] >= 3),
-                )]),
-            ),
-            5 => gain(
-                s,
-                &resources(&[
-                    (
-                        Resource::Stone,
-                        1 + i64::from(prophecies::technology_effect_enabled(
-                            s,
-                            s.current_player,
-                            TechnologyId::Extraction,
-                            2,
-                        )),
-                    ),
-                    (Resource::Gold, 1 + i64::from(ex >= 3)),
-                    (Resource::Corn, 2),
-                ]),
-            ),
-            _ => vec![],
-        };
-        return Ok(tasks);
+                &RESOURCE_IDS
+                    .into_iter()
+                    .zip(quantities)
+                    .filter(|(_, n)| *n != 0)
+                    .collect(),
+            )
+        } else {
+            vec![]
+        });
     }
     if g == GearId::Tikal {
         return Ok(match pos {
@@ -2510,9 +2517,10 @@ fn choose_pending_with_feeding_events(
                     s,
                     &resources(&[(
                         Resource::Wood,
-                        (position - 1
-                            + i64::from(current(s).technologies[&TechnologyId::Extraction] >= 1)
-                            + prophecies::harvest_adjustment(s, Resource::Wood, position))
+                        (palenque_wood_quantity(
+                            position,
+                            current(s).technologies[&TechnologyId::Extraction] >= 1,
+                        ) + prophecies::harvest_adjustment(s, Resource::Wood, position))
                         .max(0),
                     )]),
                 );
@@ -2530,19 +2538,15 @@ fn choose_pending_with_feeding_events(
                         .ok_or("収穫場所が不正です。")?
                         .wood -= 1;
                 }
-                let base = *[0, 3, 4, 5, 7, 9]
-                    .get(position as usize)
-                    .ok_or("収穫場所が不正です。")?;
                 let agriculture = current(s).technologies[&TechnologyId::Agriculture];
-                let bonus = i64::from(agriculture >= 1) + if agriculture >= 3 { 2 } else { 0 };
+                let quantity =
+                    palenque_corn_quantity(position, agriculture).ok_or("収穫場所が不正です。")?;
                 gain(
                     s,
                     &resources(&[(
                         Resource::Corn,
-                        (base
-                            + bonus
-                            + prophecies::harvest_adjustment(s, Resource::Corn, position))
-                        .max(0),
+                        (quantity + prophecies::harvest_adjustment(s, Resource::Corn, position))
+                            .max(0),
                     )]),
                 );
             }
