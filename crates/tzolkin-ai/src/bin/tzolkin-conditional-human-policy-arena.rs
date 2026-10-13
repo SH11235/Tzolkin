@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path};
-use tzolkin_ai::arena::conditional::{ConditionalPolicy, ConditionalSetup};
+use tzolkin_ai::arena::conditional::{
+    CHOICE_DIAGNOSTICS_SCHEMA, ConditionalPolicy, ConditionalSetup,
+};
 use tzolkin_ai::arena::numeric::{
     ExternalExclusions, NumericArenaConfig, NumericPolicy, Opponent, SCHEMA,
     run_corn_first_conditional_validation,
@@ -23,6 +25,7 @@ const MAX_INPUT: usize = 16 * 1024 * 1024;
 const MAX_REPORT: usize = 32 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT: usize = 128 * 1024 * 1024;
 const MAX_SEEDS: usize = 64;
+const MAX_DIAGNOSTIC_SEEDS: usize = 4;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -31,6 +34,8 @@ struct Input {
     seeds: Vec<u32>,
     bootstrap_seed: u64,
     external_exclusions: ExternalExclusions,
+    #[serde(default)]
+    choice_diagnostics: bool,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,6 +140,9 @@ fn run() -> Result<(), String> {
             "Conditional Arena requires its closed schema and at most 64 Validation seeds".into(),
         );
     }
+    if input.choice_diagnostics && input.seeds.len() > MAX_DIAGNOSTIC_SEEDS {
+        return Err("Conditional choice diagnostics require at most 4 Validation seeds".into());
+    }
     let mut configs = [3, 4].map(|players| NumericArenaConfig {
         schema: SCHEMA.into(),
         players,
@@ -197,6 +205,11 @@ fn run() -> Result<(), String> {
             recheck(&pins, &actors)?;
             let candidate =
                 ConditionalPolicy::new(actor, ConditionalSetup::CornFirst, guard.clone())?;
+            let candidate = if input.choice_diagnostics {
+                candidate.with_choice_diagnostics()
+            } else {
+                candidate
+            };
             let reference =
                 NumericPolicy::new(LoadedDeployment::load(&numeric_bytes)?, guard.clone())?;
             let pool = (0..config.players)
@@ -215,7 +228,7 @@ fn run() -> Result<(), String> {
         }
     }
     recheck(&pins, &actors)?;
-    let summary = serde_json::json!({
+    let mut summary = serde_json::json!({
         "schema": "tzolkin-conditional-human-paired-arena-cli-v1", "complete": true,
         "inputs": pins, "originIdentities": [actors[0].identity(), actors[1].identity()],
         "checkpointChecksums": [actors[0].checkpoint_checksum(), actors[1].checkpoint_checksum()],
@@ -226,6 +239,9 @@ fn run() -> Result<(), String> {
         "verifiedNativePolicy": false, "trainingAdmissionGranted": false,
         "valueValidity": "unavailablePolicyOnly"
     });
+    if input.choice_diagnostics {
+        summary["choiceDiagnostics"] = serde_json::json!(CHOICE_DIAGNOSTICS_SCHEMA);
+    }
     write_new(&output.join("summary.json"), &summary, &mut total)?;
     println!(
         "Completed conditional Arena: 4 comparisons, {} games; Development Validation only",
