@@ -538,7 +538,7 @@ fn place_worker(s: &mut GameState, gear: GearId, discount: bool) -> Result<(), S
 fn finish_turn(
     s: &mut GameState,
     double_advance: Option<bool>,
-    feeding_events: &mut Option<Vec<FeedingEvent>>,
+    feeding_events: &mut Option<FeedingCollector>,
 ) -> Result<(), String> {
     let pid = s.current_player;
     if s.turn.count == 0 && !tribes::has(current(s), TribeId::Ahmakiq) {
@@ -884,7 +884,7 @@ fn effect_tasks(s: &mut GameState, e: Effect) -> Vec<Task> {
 fn next_tasks(
     s: &mut GameState,
     mut tasks: Vec<Task>,
-    feeding_events: &mut Option<Vec<FeedingEvent>>,
+    feeding_events: &mut Option<FeedingCollector>,
 ) {
     s.pending = None;
     while !tasks.is_empty() {
@@ -2183,7 +2183,7 @@ fn choose_pending(s: &mut GameState, id: &str) -> Result<(), String> {
 fn choose_pending_with_feeding_events(
     s: &mut GameState,
     id: &str,
-    feeding_events: &mut Option<Vec<FeedingEvent>>,
+    feeding_events: &mut Option<FeedingCollector>,
 ) -> Result<(), String> {
     let pending = s.pending.clone().ok_or("選択待ちではありません。")?;
     let task = pending.task;
@@ -2580,7 +2580,7 @@ fn food_day_tasks(
     day: i64,
     stage: FoodDayStage,
     fed_workers: Vec<i64>,
-    feeding_events: &mut Option<Vec<FeedingEvent>>,
+    feeding_events: &mut Option<FeedingCollector>,
 ) -> Vec<Task> {
     match stage {
         FoodDayStage::Buildings => {
@@ -2645,7 +2645,7 @@ fn food_day_tasks(
                     Some((workers, corn_before, feed_workers, feed_all, feed_discount)),
                 ) = (feeding_events.as_mut(), inputs)
                 {
-                    events.push(FeedingEvent {
+                    let event = FeedingEvent {
                         scheduled_day: day,
                         actual_round: s.round,
                         player_id: pid,
@@ -2658,7 +2658,16 @@ fn food_day_tasks(
                         tribe_extra_corn: extra,
                         result,
                         penalty,
-                    });
+                    };
+                    match events {
+                        FeedingCollector::Events(events) => events.push(event),
+                        FeedingCollector::Technologies(events) => {
+                            events.push(FeedingTechnologySnapshot {
+                                event,
+                                technologies: TECHNOLOGY_IDS.map(|t| p.technologies[&t]),
+                            });
+                        }
+                    }
                 }
                 fed_workers.push(result.fed_workers);
                 let text = format!(
@@ -2834,7 +2843,7 @@ fn rotate(s: &mut GameState, days: i64) -> Result<(), String> {
 }
 fn finish_round(
     s: &mut GameState,
-    feeding_events: &mut Option<Vec<FeedingEvent>>,
+    feeding_events: &mut Option<FeedingCollector>,
 ) -> Result<(), String> {
     if let Some(day) = [8, 14, 21, 27]
         .into_iter()
@@ -2907,6 +2916,19 @@ pub struct FeedingEvent {
     pub penalty: i64,
 }
 
+/// Technologies at the actual Feeding stage, before later rewards or rotation.
+/// This optional Rust-only sibling does not change FeedingEvent or saved state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FeedingTechnologySnapshot {
+    pub event: FeedingEvent,
+    pub technologies: [i64; 4],
+}
+
+enum FeedingCollector {
+    Events(Vec<FeedingEvent>),
+    Technologies(Vec<FeedingTechnologySnapshot>),
+}
+
 pub fn apply_move(input: &GameState, mv: GameMove) -> Result<GameState, String> {
     apply_move_internal(input, mv, &mut None)
 }
@@ -2918,15 +2940,32 @@ pub fn apply_move_with_feeding_events(
     input: &GameState,
     mv: GameMove,
 ) -> Result<(GameState, Vec<FeedingEvent>), String> {
-    let mut events = Some(Vec::new());
+    let mut events = Some(FeedingCollector::Events(Vec::new()));
     let state = apply_move_internal(input, mv, &mut events)?;
-    Ok((state, events.unwrap()))
+    let Some(FeedingCollector::Events(events)) = events else {
+        unreachable!("the selected collector variant is unchanged")
+    };
+    Ok((state, events))
+}
+
+/// The same move kernel with an explicit technology snapshot collector. Failed
+/// moves discard the local snapshots; ordinary apply_move allocates no collector.
+pub fn apply_move_with_feeding_technologies(
+    input: &GameState,
+    mv: GameMove,
+) -> Result<(GameState, Vec<FeedingTechnologySnapshot>), String> {
+    let mut events = Some(FeedingCollector::Technologies(Vec::new()));
+    let state = apply_move_internal(input, mv, &mut events)?;
+    let Some(FeedingCollector::Technologies(events)) = events else {
+        unreachable!("the selected collector variant is unchanged")
+    };
+    Ok((state, events))
 }
 
 fn apply_move_internal(
     input: &GameState,
     mv: GameMove,
-    feeding_events: &mut Option<Vec<FeedingEvent>>,
+    feeding_events: &mut Option<FeedingCollector>,
 ) -> Result<GameState, String> {
     let mut s = input.clone();
     if s.phase == Phase::Finished {
@@ -3711,13 +3750,34 @@ mod tests {
                     player.feed_discount = discount;
                     player.tribe = yaluk.then_some(TribeId::Yaluk);
                     player.buildings.clear();
+                    for (i, technology) in TECHNOLOGY_IDS.into_iter().enumerate() {
+                        player
+                            .technologies
+                            .insert(technology, ((player.id + i) % 4) as i64);
+                    }
                 }
                 let original = state.clone();
                 let mv = GameMove::EndTurn {
                     double_advance: None,
                 };
                 let ordinary = apply_move(&state, mv.clone()).unwrap();
-                let (observed, events) = apply_move_with_feeding_events(&state, mv).unwrap();
+                let (observed, events) =
+                    apply_move_with_feeding_events(&state, mv.clone()).unwrap();
+                let (with_technologies, snapshots) =
+                    apply_move_with_feeding_technologies(&state, mv).unwrap();
+                assert_eq!(with_technologies, ordinary);
+                assert_eq!(
+                    serde_json::to_vec(&with_technologies).unwrap(),
+                    serde_json::to_vec(&ordinary).unwrap()
+                );
+                assert_eq!(snapshots.len(), count);
+                for (pid, snapshot) in snapshots.iter().enumerate() {
+                    assert_eq!(snapshot.event, events[pid]);
+                    assert_eq!(
+                        snapshot.technologies,
+                        std::array::from_fn(|i| ((pid + i) % 4) as i64)
+                    );
+                }
                 assert_eq!(observed, ordinary);
                 assert_eq!(
                     serde_json::to_vec(&observed).unwrap(),
@@ -3767,6 +3827,10 @@ mod tests {
                 let mv = GameMove::EndTurn {
                     double_advance: Some(false),
                 };
+                assert_eq!(
+                    apply_move_with_feeding_technologies(&rejected, mv.clone()).unwrap_err(),
+                    apply_move(&rejected, mv.clone()).unwrap_err()
+                );
                 assert_eq!(
                     apply_move_with_feeding_events(&rejected, mv.clone()).unwrap_err(),
                     apply_move(&rejected, mv).unwrap_err()

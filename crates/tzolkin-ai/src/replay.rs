@@ -7,7 +7,7 @@ use crate::search_native::SearchTrace;
 use crate::{POLICY_VERSION, choose_move, policy::HeuristicWeights};
 use serde::{Deserialize, Serialize};
 use tzolkin_core::observation::{
-    LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, fingerprint, observe,
+    LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, TypedAction, fingerprint, observe,
 };
 use tzolkin_core::validation::validate_game_state;
 use tzolkin_core::*;
@@ -700,6 +700,207 @@ pub(crate) struct IndexedFeedingEvent {
     pub event: FeedingEvent,
 }
 
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedInvestmentCounters {
+    pub player_id: usize,
+    pub paid_technology: [u64; 4],
+    pub paid_tikal1: [u64; 4],
+    pub paid_tikal3: [u64; 4],
+    pub paid_unknown_origin: [u64; 4],
+    pub free_technology_choices: [u64; 4],
+    pub technology_level_increments: [i64; 4],
+    pub capped_technology_actions: [u64; 4],
+    pub uxmal3_actions: u64,
+    pub uxmal3_worker_increments: i64,
+    pub uxmal2_entries: u64,
+    pub trade_buys: [u64; 3],
+    pub trade_sells: [u64; 3],
+    pub uxmal2_buys: [u64; 3],
+    pub uxmal2_sells: [u64; 3],
+    pub unknown_origin_buys: [u64; 3],
+    pub unknown_origin_sells: [u64; 3],
+    pub yaxchilan5_actions: u64,
+    /// Net actual held-resource change, including any backward-action corn fee.
+    pub yaxchilan5_resource_delta: [i64; 5],
+}
+
+#[derive(Clone, Copy)]
+enum TechnologyOrigin {
+    Tikal1,
+    Tikal3,
+}
+#[derive(Default)]
+struct InvestmentContext {
+    technology: Option<TechnologyOrigin>,
+    uxmal_trade: bool,
+}
+pub(crate) struct IndexedFeedingTechnology {
+    pub move_index: usize,
+    pub snapshot: FeedingTechnologySnapshot,
+}
+pub(crate) struct AppliedGameInvestments {
+    pub players: Vec<AppliedInvestmentCounters>,
+    pub feeding: Vec<IndexedFeedingTechnology>,
+    contexts: Vec<InvestmentContext>,
+}
+impl AppliedGameInvestments {
+    pub(crate) fn new(players: usize) -> Self {
+        Self {
+            players: (0..players)
+                .map(|player_id| AppliedInvestmentCounters {
+                    player_id,
+                    ..AppliedInvestmentCounters::default()
+                })
+                .collect(),
+            feeding: Vec::new(),
+            contexts: (0..players).map(|_| InvestmentContext::default()).collect(),
+        }
+    }
+
+    // Called only after exact legal-move matching and a successful Core apply.
+    // Context follows the actual pending chain, never a presumed strategy.
+    pub(crate) fn record_applied(
+        &mut self,
+        before: &GameState,
+        after: &GameState,
+        chosen: &TypedAction,
+    ) {
+        if before.phase != Phase::Playing {
+            return;
+        }
+        let actor = before.current_player;
+        let previous = &before.players[actor];
+        let next = &after.players[actor];
+        let counts = &mut self.players[actor];
+        let context = &mut self.contexts[actor];
+        for (i, technology) in TECHNOLOGY_IDS.into_iter().enumerate() {
+            counts.technology_level_increments[i] +=
+                (next.technologies[&technology] - previous.technologies[&technology]).max(0);
+        }
+        let resolved = match (chosen, before.pending.as_ref().map(|p| &p.task)) {
+            (TypedAction::Payment { .. }, Some(Task::PayTechnology { technology, .. })) => {
+                Some((*technology, false))
+            }
+            (TypedAction::Technology { technology }, Some(Task::Technology { free: true, .. })) => {
+                Some((*technology, true))
+            }
+            _ => None,
+        };
+        if let Some((technology, free)) = resolved {
+            let i = TECHNOLOGY_IDS
+                .iter()
+                .position(|t| *t == technology)
+                .unwrap();
+            if free {
+                counts.free_technology_choices[i] += 1;
+            } else {
+                counts.paid_technology[i] += 1;
+                match context.technology {
+                    Some(TechnologyOrigin::Tikal1) => counts.paid_tikal1[i] += 1,
+                    Some(TechnologyOrigin::Tikal3) => counts.paid_tikal3[i] += 1,
+                    None => counts.paid_unknown_origin[i] += 1,
+                }
+            }
+            if previous.technologies[&technology] == 3 {
+                counts.capped_technology_actions[i] += 1;
+            }
+        }
+        if let TypedAction::UseAction { gear, position, .. } = chosen {
+            context.technology = match (*gear, *position) {
+                (GearId::Tikal, 1) => Some(TechnologyOrigin::Tikal1),
+                (GearId::Tikal, 3) => Some(TechnologyOrigin::Tikal3),
+                _ => None,
+            };
+            context.uxmal_trade = *gear == GearId::Uxmal && *position == 2;
+            if *gear == GearId::Uxmal && *position == 3 {
+                counts.uxmal3_actions += 1;
+                counts.uxmal3_worker_increments += next.workers - previous.workers;
+            }
+            if context.uxmal_trade {
+                counts.uxmal2_entries += 1;
+            }
+            if *gear == GearId::Yaxchilan && *position == 5 {
+                counts.yaxchilan5_actions += 1;
+                for (i, resource) in RESOURCE_IDS.into_iter().enumerate() {
+                    counts.yaxchilan5_resource_delta[i] +=
+                        next.resources[&resource] - previous.resources[&resource];
+                }
+            }
+        }
+        if let TypedAction::Trade { resource, buy } = chosen
+            && let Some(i) = MATERIALS.iter().position(|r| r == resource)
+        {
+            let (all, known, unknown) = if *buy {
+                (
+                    &mut counts.trade_buys,
+                    &mut counts.uxmal2_buys,
+                    &mut counts.unknown_origin_buys,
+                )
+            } else {
+                (
+                    &mut counts.trade_sells,
+                    &mut counts.uxmal2_sells,
+                    &mut counts.unknown_origin_sells,
+                )
+            };
+            all[i] += 1;
+            if context.uxmal_trade {
+                known[i] += 1;
+            } else {
+                unknown[i] += 1;
+            }
+        }
+        let pending = after.pending.as_ref();
+        let same_actor = after.current_player == actor;
+        let has_task = |predicate: fn(&Task) -> bool| {
+            same_actor
+                && pending.is_some_and(|p| predicate(&p.task) || p.after.iter().any(predicate))
+        };
+        if !has_task(|t| {
+            matches!(
+                t,
+                Task::Technology { remaining: 1.., .. } | Task::PayTechnology { .. }
+            )
+        }) {
+            context.technology = None;
+        }
+        if !has_task(|t| matches!(t, Task::Trade)) {
+            context.uxmal_trade = false;
+        }
+    }
+}
+
+/// Output-only applied counters and exact Feeding snapshots, discarded if the
+/// full game fails. This route creates no replay source or training authority.
+pub(crate) fn play_unrecorded_inference_with_investments(
+    players: usize,
+    seed: u32,
+    mut decide: impl FnMut(usize, &Observation) -> Result<crate::Decision, String>,
+) -> Result<(GameState, usize, AppliedGameInvestments), String> {
+    if !(3..=4).contains(&players) {
+        return Err("Unrecorded inference supports base 3/4p only".into());
+    }
+    let mut actual = AppliedGameInvestments::new(players);
+    let mut index = 0;
+    let (state, decisions, _) = play_game_internal_with_diagnostics(
+        players,
+        seed,
+        GameOptions::default(),
+        false,
+        None,
+        |o| {
+            let decision = decide(index, o)?;
+            index += 1;
+            Ok((decision, None, None))
+        },
+        false,
+        None,
+        Some(&mut actual),
+    )?;
+    Ok((state, decisions, actual))
+}
+
 pub(crate) fn play_unrecorded_inference_with_feeding(
     players: usize,
     seed: u32,
@@ -840,6 +1041,39 @@ fn play_game_internal(
 fn play_game_internal_with_feeding(
     players: usize,
     seed: u32,
+    options: GameOptions,
+    record: bool,
+    source: Option<ReplaySource>,
+    decide: impl FnMut(
+        &Observation,
+    ) -> Result<
+        (
+            crate::Decision,
+            Option<SearchTrace>,
+            Option<TradeGuardTrace>,
+        ),
+        String,
+    >,
+    check_every_step: bool,
+    feeding_events: Option<&mut Vec<IndexedFeedingEvent>>,
+) -> Result<(GameState, usize, Option<GameReplay>), String> {
+    play_game_internal_with_diagnostics(
+        players,
+        seed,
+        options,
+        record,
+        source,
+        decide,
+        check_every_step,
+        feeding_events,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn play_game_internal_with_diagnostics(
+    players: usize,
+    seed: u32,
     mut options: GameOptions,
     record: bool,
     source: Option<ReplaySource>,
@@ -855,6 +1089,7 @@ fn play_game_internal_with_feeding(
     >,
     check_every_step: bool,
     mut feeding_events: Option<&mut Vec<IndexedFeedingEvent>>,
+    mut investments: Option<&mut AppliedGameInvestments>,
 ) -> Result<(GameState, usize, Option<GameReplay>), String> {
     if !(2..=5).contains(&players) {
         return Err("Players must be 2..5".into());
@@ -963,7 +1198,20 @@ fn play_game_internal_with_feeding(
         } else {
             String::new()
         };
-        let applied = if let Some(events) = feeding_events.as_mut() {
+        let applied = if let Some(actual) = investments.as_mut() {
+            apply_move_with_feeding_technologies(&state, decision.r#move).map(
+                |(next, snapshots)| {
+                    actual.record_applied(&state, &next, &chosen.action);
+                    actual.feeding.extend(snapshots.into_iter().map(|snapshot| {
+                        IndexedFeedingTechnology {
+                            move_index: decisions,
+                            snapshot,
+                        }
+                    }));
+                    next
+                },
+            )
+        } else if let Some(events) = feeding_events.as_mut() {
             apply_move_with_feeding_events(&state, decision.r#move).map(|(next, actual)| {
                 events.extend(actual.into_iter().map(|event| IndexedFeedingEvent {
                     move_index: decisions,

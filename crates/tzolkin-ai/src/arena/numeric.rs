@@ -50,6 +50,8 @@ pub const APP_DIAGNOSTIC_PAIRED_SCHEMA: &str = "tzolkin-app-profile-development-
 pub const APP_DIAGNOSTIC_SCHEMA: &str = "tzolkin-app-profile-development-diagnostic-v1";
 pub const APP_DIAGNOSTIC_CONSENT_SCHEMA: &str = "tzolkin-app-development-reanalysis-consent-v1";
 pub const APP_FEEDING_DIAGNOSTIC_SCHEMA: &str = "tzolkin-app-profile-feeding-diagnostic-v1";
+pub const APP_INVESTMENT_DIAGNOSTIC_SCHEMA: &str =
+    "tzolkin-app-profile-applied-investment-diagnostic-v1";
 pub const MAX_ROWS_PER_CALLBACK: usize = 1024;
 pub const MAX_REPORT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXCLUDED_FAMILIES: usize = 200_000;
@@ -454,6 +456,124 @@ pub struct AppFeedingDiagnosticReport {
 impl AppFeedingDiagnosticReport {
     pub fn save_new(&self, path: &std::path::Path) -> Result<(), String> {
         crate::model::write_new_json_bounded(path, self, MAX_REPORT_BYTES)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedingTechnologyReceipt {
+    pub feeding: FeedingReceipt,
+    pub technologies: [i64; 4],
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppliedInvestmentReceipt {
+    pub players: Vec<replay::AppliedInvestmentCounters>,
+    pub feeding: Vec<FeedingTechnologyReceipt>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvestmentSeatPair {
+    pub seat: usize,
+    pub candidate: Option<AppliedInvestmentReceipt>,
+    pub reference: Option<AppliedInvestmentReceipt>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvestmentSeedBlock {
+    pub seed: u32,
+    pub players: usize,
+    pub complete: bool,
+    pub pairs: Vec<InvestmentSeatPair>,
+}
+
+/// Explicit output-only sibling; ordinary and feeding report wire/digests stay
+/// unchanged. Failed arms or later paired-arm failures discard this seed block.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppInvestmentDiagnosticReport {
+    pub schema: String,
+    pub configuration_sha256: String,
+    pub diagnostic: AppDiagnosticReport,
+    pub investment_blocks: Vec<InvestmentSeedBlock>,
+}
+impl AppInvestmentDiagnosticReport {
+    pub fn save_new(&self, path: &std::path::Path) -> Result<(), String> {
+        crate::model::write_new_json_bounded(path, self, MAX_REPORT_BYTES)
+    }
+}
+
+fn investment_receipt(
+    players: usize,
+    decisions: usize,
+    actual: replay::AppliedGameInvestments,
+) -> Result<AppliedInvestmentReceipt, String> {
+    if actual.players.len() != players
+        || actual
+            .players
+            .iter()
+            .enumerate()
+            .any(|(pid, c)| c.player_id != pid)
+    {
+        return Err("Applied investment counters require all absolute players".into());
+    }
+    let technologies = actual
+        .feeding
+        .iter()
+        .map(|event| event.snapshot.technologies)
+        .collect::<Vec<_>>();
+    if technologies
+        .iter()
+        .flatten()
+        .any(|level| !(0..=3).contains(level))
+    {
+        return Err("Applied feeding technologies outside basic track range".into());
+    }
+    let feeding = feeding_receipts(
+        players,
+        decisions,
+        actual
+            .feeding
+            .into_iter()
+            .map(|event| replay::IndexedFeedingEvent {
+                move_index: event.move_index,
+                event: event.snapshot.event,
+            })
+            .collect(),
+    )?
+    .into_iter()
+    .zip(technologies)
+    .map(|(feeding, technologies)| FeedingTechnologyReceipt {
+        feeding,
+        technologies,
+    })
+    .collect();
+    Ok(AppliedInvestmentReceipt {
+        players: actual.players,
+        feeding,
+    })
+}
+
+fn investment_block(
+    seed: u32,
+    players: usize,
+    complete: bool,
+    mut pairs: Vec<InvestmentSeatPair>,
+) -> InvestmentSeedBlock {
+    if !complete {
+        for pair in &mut pairs {
+            pair.candidate = None;
+            pair.reference = None;
+        }
+    }
+    InvestmentSeedBlock {
+        seed,
+        players,
+        complete,
+        pairs,
     }
 }
 
@@ -1065,23 +1185,48 @@ fn play_arm_with_setup<'a>(
 }
 
 type ArmDecide<'a> = dyn FnMut(usize, &Observation) -> Result<Decision, String> + 'a;
-fn play_arm_with_optional_feeding<'a>(
+type DiagnosticArm = (
+    ArmResult,
+    Vec<Option<GuardDiagnostics>>,
+    Option<Vec<FeedingReceipt>>,
+    Option<AppliedInvestmentReceipt>,
+);
+
+#[allow(clippy::too_many_arguments)]
+fn play_arm_with_diagnostics<'a>(
     seed: u32,
     seat: usize,
     focal: &mut Role<'a>,
     pool: &mut [Role<'a>],
     shared_setup: Option<&SharedCornFirstSetupIdentity>,
     collect: bool,
-) -> (
-    ArmResult,
-    Vec<Option<GuardDiagnostics>>,
-    Option<Vec<FeedingReceipt>>,
-) {
+    investments: bool,
+) -> DiagnosticArm {
+    if investments {
+        let mut receipt = None;
+        let (arm, guards) = play_arm_using_with_setup(
+            seed,
+            seat,
+            focal,
+            pool,
+            shared_setup,
+            |players, seed, decide| {
+                let (state, decisions, actual) =
+                    replay::play_unrecorded_inference_with_investments(players, seed, decide)?;
+                receipt = Some(investment_receipt(players, decisions, actual)?);
+                Ok((state, decisions))
+            },
+        );
+        if arm.error.is_some() {
+            receipt = None;
+        }
+        return (arm, guards, None, receipt);
+    }
     if !collect {
         let (arm, diagnostics) = play_arm_with_setup(seed, seat, focal, pool, shared_setup);
-        return (arm, diagnostics, None);
+        return (arm, diagnostics, None, None);
     }
-    play_arm_using_with_feeding(
+    let (arm, guards, feeding) = play_arm_using_with_feeding(
         seed,
         seat,
         focal,
@@ -1090,7 +1235,8 @@ fn play_arm_with_optional_feeding<'a>(
         |players, seed, decide| {
             replay::play_unrecorded_inference_with_feeding(players, seed, decide)
         },
-    )
+    );
+    (arm, guards, feeding, None)
 }
 
 fn play_arm_using_with_feeding<'a>(
@@ -1413,6 +1559,38 @@ pub fn run_app_profile_feeding_diagnostic<'a>(
     })
 }
 
+/// Count-neutral reanalysis of successful applied investments. Early feeding
+/// penalties are observations, never failure labels or policy/training inputs.
+pub fn run_app_profile_investment_diagnostic<'a>(
+    config: &NumericArenaConfig,
+    consent: &AppDiagnosticConsent,
+    candidate: AppProfile,
+    reference: AppOpponent<'a>,
+    opponent_pool: Vec<AppOpponent<'a>>,
+) -> Result<AppInvestmentDiagnosticReport, String> {
+    consent.validate_for(config)?;
+    let mut investment_blocks = Vec::with_capacity(config.seeds.len());
+    let paired = run_app_roles_with_diagnostics(
+        config,
+        candidate,
+        reference,
+        opponent_pool,
+        APP_DIAGNOSTIC_PAIRED_SCHEMA,
+        None,
+        Some(&mut investment_blocks),
+    )?;
+    let diagnostic = app_diagnostic_report(consent, paired)?;
+    let mut hash = Sha256::new();
+    hash.update(b"tzolkin-app-profile-applied-investment-diagnostic-v1\0");
+    hash.update(diagnostic.configuration_sha256.as_bytes());
+    Ok(AppInvestmentDiagnosticReport {
+        schema: APP_INVESTMENT_DIAGNOSTIC_SCHEMA.into(),
+        configuration_sha256: format!("{:x}", hash.finalize()),
+        diagnostic,
+        investment_blocks,
+    })
+}
+
 fn app_diagnostic_report(
     consent: &AppDiagnosticConsent,
     paired: NumericArenaReport,
@@ -1452,6 +1630,26 @@ fn run_app_roles_with_feeding<'a>(
     schema: &str,
     feeding: Option<&mut Vec<FeedingSeedBlock>>,
 ) -> Result<NumericArenaReport, String> {
+    run_app_roles_with_diagnostics(
+        config,
+        candidate,
+        reference,
+        opponent_pool,
+        schema,
+        feeding,
+        None,
+    )
+}
+
+fn run_app_roles_with_diagnostics<'a>(
+    config: &NumericArenaConfig,
+    candidate: AppProfile,
+    reference: AppOpponent<'a>,
+    opponent_pool: Vec<AppOpponent<'a>>,
+    schema: &str,
+    feeding: Option<&mut Vec<FeedingSeedBlock>>,
+    investments: Option<&mut Vec<InvestmentSeedBlock>>,
+) -> Result<NumericArenaReport, String> {
     if opponent_pool.len() != config.players {
         return Err("Numeric Arena absolute-seat pool count mismatch".into());
     }
@@ -1475,7 +1673,16 @@ fn run_app_roles_with_feeding<'a>(
             guard_key = Some(key);
         }
     }
-    run_admitted_roles_with_feeding(config, candidate, reference, pool, schema, None, feeding)
+    run_admitted_roles_with_diagnostics(
+        config,
+        candidate,
+        reference,
+        pool,
+        schema,
+        None,
+        feeding,
+        investments,
+    )
 }
 
 /// Paired base 3/4p Validation with the same untrained Corn-first Setup selector
@@ -1757,12 +1964,35 @@ fn run_admitted_roles<'a>(
 
 fn run_admitted_roles_with_feeding<'a>(
     config: &NumericArenaConfig,
+    candidate: Role<'a>,
+    reference: Role<'a>,
+    pool: Vec<Role<'a>>,
+    schema: &str,
+    shared_setup: Option<SharedCornFirstSetupIdentity>,
+    feeding: Option<&mut Vec<FeedingSeedBlock>>,
+) -> Result<NumericArenaReport, String> {
+    run_admitted_roles_with_diagnostics(
+        config,
+        candidate,
+        reference,
+        pool,
+        schema,
+        shared_setup,
+        feeding,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_admitted_roles_with_diagnostics<'a>(
+    config: &NumericArenaConfig,
     mut candidate: Role<'a>,
     mut reference: Role<'a>,
     mut pool: Vec<Role<'a>>,
     schema: &str,
     shared_setup: Option<SharedCornFirstSetupIdentity>,
     mut feeding: Option<&mut Vec<FeedingSeedBlock>>,
+    mut investments: Option<&mut Vec<InvestmentSeedBlock>>,
 ) -> Result<NumericArenaReport, String> {
     let identities = (
         candidate.identity(),
@@ -1783,43 +2013,50 @@ fn run_admitted_roles_with_feeding<'a>(
         let mut pairs = Vec::with_capacity(config.players);
         let mut guard_pairs = Vec::with_capacity(config.players);
         let mut feeding_pairs = feeding.as_ref().map(|_| Vec::with_capacity(config.players));
+        let mut investment_pairs = investments
+            .as_ref()
+            .map(|_| Vec::with_capacity(config.players));
         for seat in 0..config.players {
             let (c, r) = if (index + seat) % 2 == 0 {
                 (
-                    play_arm_with_optional_feeding(
+                    play_arm_with_diagnostics(
                         *seed,
                         seat,
                         &mut candidate,
                         &mut pool,
                         shared_setup.as_ref(),
                         feeding.is_some(),
+                        investments.is_some(),
                     ),
-                    play_arm_with_optional_feeding(
+                    play_arm_with_diagnostics(
                         *seed,
                         seat,
                         &mut reference,
                         &mut pool,
                         shared_setup.as_ref(),
                         feeding.is_some(),
+                        investments.is_some(),
                     ),
                 )
             } else {
-                let reference_result = play_arm_with_optional_feeding(
+                let reference_result = play_arm_with_diagnostics(
                     *seed,
                     seat,
                     &mut reference,
                     &mut pool,
                     shared_setup.as_ref(),
                     feeding.is_some(),
+                    investments.is_some(),
                 );
                 (
-                    play_arm_with_optional_feeding(
+                    play_arm_with_diagnostics(
                         *seed,
                         seat,
                         &mut candidate,
                         &mut pool,
                         shared_setup.as_ref(),
                         feeding.is_some(),
+                        investments.is_some(),
                     ),
                     reference_result,
                 )
@@ -1829,6 +2066,13 @@ fn run_admitted_roles_with_feeding<'a>(
                     seat,
                     candidate: c.2,
                     reference: r.2,
+                });
+            }
+            if let Some(actual) = &mut investment_pairs {
+                actual.push(InvestmentSeatPair {
+                    seat,
+                    candidate: c.3,
+                    reference: r.3,
                 });
             }
             pairs.push(SeatPair {
@@ -1845,6 +2089,14 @@ fn run_admitted_roles_with_feeding<'a>(
         let completed = block(*seed, pairs);
         if let (Some(sink), Some(pairs)) = (feeding.as_mut(), feeding_pairs) {
             sink.push(feeding_block(
+                *seed,
+                config.players,
+                completed.complete,
+                pairs,
+            ));
+        }
+        if let (Some(sink), Some(pairs)) = (investments.as_mut(), investment_pairs) {
+            sink.push(investment_block(
                 *seed,
                 config.players,
                 completed.complete,
@@ -2209,6 +2461,229 @@ pub(super) mod tests {
 
     #[test]
     fn numeric_validation_preflight_and_failed_arm_discard_only_game_history() {
+        // Small actual Core operations, not a played campaign. Selecting a
+        // paid technology is not itself a paid resolution; origin follows the
+        // actual Tikal chain, and unknown chains stay unknown.
+        let mut state =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        state.phase = Phase::Playing;
+        state.turn.count = 1;
+        let actor = state.current_player;
+        state.players[actor]
+            .resources
+            .insert(tzolkin_core::Resource::Corn, 30);
+        state.players[actor]
+            .resources
+            .insert(tzolkin_core::Resource::Wood, 20);
+        let mut applied = replay::AppliedGameInvestments::new(3);
+        let apply =
+            |state: &mut tzolkin_core::GameState,
+             actual: &mut replay::AppliedGameInvestments,
+             wanted: &dyn Fn(&tzolkin_core::observation::TypedAction) -> bool| {
+                let observation = observe(state, state.current_player).unwrap();
+                let chosen = observation
+                    .legal_actions
+                    .iter()
+                    .find(|row| wanted(&row.action))
+                    .unwrap();
+                let next = tzolkin_core::apply_move(state, chosen.r#move.clone()).unwrap();
+                actual.record_applied(state, &next, &chosen.action);
+                *state = next;
+            };
+        let pending_action = |gear, position| tzolkin_core::Pending {
+            title: "Actual action".into(),
+            task: tzolkin_core::Task::Action {
+                gear,
+                position,
+                free: None,
+            },
+            after: vec![],
+        };
+        state.pending = Some(pending_action(tzolkin_core::GearId::Tikal, 3));
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::UseAction {
+                    gear: tzolkin_core::GearId::Tikal,
+                    position: 3,
+                    ..
+                }
+            )
+        });
+        for amount in [1, 2] {
+            apply(&mut state, &mut applied, &|a| {
+                matches!(
+                    a,
+                    tzolkin_core::observation::TypedAction::Technology {
+                        technology: tzolkin_core::TechnologyId::Extraction
+                    }
+                )
+            });
+            assert_eq!(
+                applied.players[actor].paid_technology[1],
+                (amount - 1) as u64
+            );
+            apply(
+                &mut state,
+                &mut applied,
+                &|a| matches!(a, tzolkin_core::observation::TypedAction::Payment { resources } if resources[1] == amount),
+            );
+        }
+        assert_eq!(applied.players[actor].paid_tikal3[1], 2);
+        assert_eq!(applied.players[actor].technology_level_increments[1], 2);
+        state.pending = Some(tzolkin_core::Pending {
+            title: "Free".into(),
+            task: tzolkin_core::Task::Technology {
+                free: true,
+                remaining: 1,
+                mandatory: false,
+            },
+            after: vec![],
+        });
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::Technology {
+                    technology: tzolkin_core::TechnologyId::Extraction
+                }
+            )
+        });
+        assert_eq!(applied.players[actor].free_technology_choices[1], 1);
+        state.pending = Some(pending_action(tzolkin_core::GearId::Tikal, 1));
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::UseAction {
+                    gear: tzolkin_core::GearId::Tikal,
+                    position: 1,
+                    ..
+                }
+            )
+        });
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::Technology {
+                    technology: tzolkin_core::TechnologyId::Extraction
+                }
+            )
+        });
+        apply(
+            &mut state,
+            &mut applied,
+            &|a| matches!(a, tzolkin_core::observation::TypedAction::Payment { resources } if resources[1] == 1),
+        );
+        assert_eq!(applied.players[actor].paid_tikal1[1], 1);
+        assert_eq!(applied.players[actor].capped_technology_actions[1], 1);
+        assert_eq!(applied.players[actor].technology_level_increments[1], 3);
+        for _ in 0..2 {
+            apply(&mut state, &mut applied, &|a| {
+                matches!(
+                    a,
+                    tzolkin_core::observation::TypedAction::Resource {
+                        resource: tzolkin_core::Resource::Wood
+                    }
+                )
+            });
+        }
+        state.pending = Some(tzolkin_core::Pending {
+            title: "Unknown origin".into(),
+            task: tzolkin_core::Task::Technology {
+                free: false,
+                remaining: 1,
+                mandatory: false,
+            },
+            after: vec![],
+        });
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::Technology {
+                    technology: tzolkin_core::TechnologyId::Agriculture
+                }
+            )
+        });
+        apply(
+            &mut state,
+            &mut applied,
+            &|a| matches!(a, tzolkin_core::observation::TypedAction::Payment { resources } if resources[1] == 1),
+        );
+        assert_eq!(applied.players[actor].paid_unknown_origin[0], 1);
+        state.players[actor].workers = 5;
+        for _ in 0..2 {
+            state.pending = Some(pending_action(tzolkin_core::GearId::Uxmal, 3));
+            apply(&mut state, &mut applied, &|a| {
+                matches!(
+                    a,
+                    tzolkin_core::observation::TypedAction::UseAction {
+                        gear: tzolkin_core::GearId::Uxmal,
+                        position: 3,
+                        ..
+                    }
+                )
+            });
+        }
+        assert_eq!(applied.players[actor].uxmal3_actions, 2);
+        assert_eq!(applied.players[actor].uxmal3_worker_increments, 1);
+        state.pending = Some(pending_action(tzolkin_core::GearId::Uxmal, 2));
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::UseAction {
+                    gear: tzolkin_core::GearId::Uxmal,
+                    position: 2,
+                    ..
+                }
+            )
+        });
+        for buy in [true, false] {
+            apply(
+                &mut state,
+                &mut applied,
+                &|a| matches!(a, tzolkin_core::observation::TypedAction::Trade { resource: tzolkin_core::Resource::Wood, buy: b } if *b == buy),
+            );
+        }
+        assert_eq!(applied.players[actor].uxmal2_entries, 1);
+        assert_eq!(applied.players[actor].uxmal2_buys, [1, 0, 0]);
+        assert_eq!(applied.players[actor].uxmal2_sells, [1, 0, 0]);
+        apply(&mut state, &mut applied, &|a| {
+            matches!(a, tzolkin_core::observation::TypedAction::Skip)
+        });
+        state.pending = Some(tzolkin_core::Pending {
+            title: "Unknown trade".into(),
+            task: tzolkin_core::Task::Trade,
+            after: vec![],
+        });
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::Trade {
+                    resource: tzolkin_core::Resource::Stone,
+                    buy: true
+                }
+            )
+        });
+        assert_eq!(applied.players[actor].unknown_origin_buys, [0, 1, 0]);
+        apply(&mut state, &mut applied, &|a| {
+            matches!(a, tzolkin_core::observation::TypedAction::Skip)
+        });
+        state.pending = Some(pending_action(tzolkin_core::GearId::Yaxchilan, 5));
+        apply(&mut state, &mut applied, &|a| {
+            matches!(
+                a,
+                tzolkin_core::observation::TypedAction::UseAction {
+                    gear: tzolkin_core::GearId::Yaxchilan,
+                    position: 5,
+                    ..
+                }
+            )
+        });
+        assert_eq!(applied.players[actor].yaxchilan5_actions, 1);
+        assert_eq!(
+            applied.players[actor].yaxchilan5_resource_delta,
+            [2, 0, 2, 2, 0]
+        );
+
         let numeric_reference = Role::from_semantic_setup_reference(
             SemanticSetupTeacherReference::GuardedNumeric(Box::new(synthetic_policy())),
         );
@@ -2339,6 +2814,38 @@ pub(super) mod tests {
                     let failed = feeding_block(3, players, false, complete.pairs);
                     assert!(failed.pairs[0].candidate.is_none());
                     assert!(failed.pairs[0].reference.is_none());
+                    let mut investments = replay::AppliedGameInvestments::new(players);
+                    investments.feeding = actual_events(players)
+                        .into_iter()
+                        .map(|event| replay::IndexedFeedingTechnology {
+                            move_index: event.move_index,
+                            snapshot: tzolkin_core::FeedingTechnologySnapshot {
+                                event: event.event,
+                                technologies: [1, 2, 3, 0],
+                            },
+                        })
+                        .collect();
+                    let receipt = investment_receipt(players, 12, investments).unwrap();
+                    assert_eq!(receipt.feeding.len(), 4 * players);
+                    assert!(
+                        receipt
+                            .feeding
+                            .iter()
+                            .all(|r| r.technologies == [1, 2, 3, 0])
+                    );
+                    let failed = investment_block(
+                        3,
+                        players,
+                        false,
+                        vec![InvestmentSeatPair {
+                            seat: 1,
+                            candidate: Some(receipt.clone()),
+                            reference: Some(receipt),
+                        }],
+                    );
+                    assert!(
+                        failed.pairs[0].candidate.is_none() && failed.pairs[0].reference.is_none()
+                    );
                 }
             }
             let (arm, _, receipts) =
