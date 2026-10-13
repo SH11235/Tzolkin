@@ -21,6 +21,7 @@ use crate::public_model::{
     validate_contract,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
@@ -157,6 +158,9 @@ impl ConditionalDatasetIdentity {
         Ok(digest(&bounded_json(&identity)?))
     }
     fn validate(&self) -> Result<(), String> {
+        self.validate_partition(false)
+    }
+    fn validate_partition(&self, validation_only: bool) -> Result<(), String> {
         if self.task != TASK
             || self.input_contract != INPUT_CONTRACT
             || self.label_scope.as_deref().is_some_and(|scope| {
@@ -176,7 +180,11 @@ impl ConditionalDatasetIdentity {
             || self.verified_native_policy
             || self.tables.is_empty()
             || self.tables.len() > MAX_TABLES
-            || self.samples[0] == 0
+            || if validation_only {
+                self.samples[0] != 0 || self.candidates[0] != 0
+            } else {
+                self.samples[0] == 0
+            }
             || self.samples[1] == 0
             || self.samples[2] != 0
             || self.candidates[2] != 0
@@ -221,6 +229,12 @@ impl ConditionalDatasetIdentity {
     }
 }
 fn audit(datasets: &[ConditionalHumanPolicyDataset]) -> Result<ConditionalDatasetIdentity, String> {
+    audit_partition(datasets, false)
+}
+fn audit_partition(
+    datasets: &[ConditionalHumanPolicyDataset],
+    validation_only: bool,
+) -> Result<ConditionalDatasetIdentity, String> {
     if datasets.is_empty() || datasets.len() > MAX_TABLES {
         return Err("Conditional collection table bound exceeded".into());
     }
@@ -253,6 +267,9 @@ fn audit(datasets: &[ConditionalHumanPolicyDataset]) -> Result<ConditionalDatase
         // Test is neither evaluated nor used for selection by this training entry point.
         if dataset.split() == DatasetSplit::Test {
             return Err("Test tables are excluded from conditional training and selection".into());
+        }
+        if validation_only && dataset.split() != DatasetSplit::Validation {
+            return Err("Shared evaluation requires Validation-only tables".into());
         }
         dataset.recheck_sources()?;
         for (table, split) in dataset.reservations() {
@@ -320,7 +337,7 @@ fn audit(datasets: &[ConditionalHumanPolicyDataset]) -> Result<ConditionalDatase
     }
     identity.tables.sort_by(|a, b| a.table_id.cmp(&b.table_id));
     identity.fingerprint = identity.expected_fingerprint()?;
-    identity.validate()?;
+    identity.validate_partition(validation_only)?;
     Ok(identity)
 }
 /// Conditional provenance is separate from the native public-policy artifact wire format.
@@ -584,6 +601,223 @@ fn seal_loaded_sources(pins: Vec<ContentPin>) -> Result<Vec<ContentPin>, String>
         }
     }
     Ok(unique.into_values().collect())
+}
+
+pub const VALIDATION_COMPARISON_SCHEMA: &str = "tzolkin-conditional-human-shared-validation-v1";
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidationActorReport {
+    checkpoint_checksum: String,
+    model_checksum: String,
+    origin: ConditionalDatasetIdentity,
+    config: PolicyBcConfig,
+    backend: &'static str,
+    all_rows: PolicyLossReport,
+    multi_candidate_rows: Option<PolicyLossReport>,
+}
+
+/// Policy-only agreement on one shared sealed Validation partition. This is
+/// neither native admission nor a win-rate, value or strength measurement.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalValidationComparison {
+    schema: &'static str,
+    task: &'static str,
+    input_contract: &'static str,
+    validation_collection: Option<ContentPin>,
+    validation_fingerprint: String,
+    validation_tables: Vec<ConditionalTableIdentity>,
+    validation_label_scope: Option<String>,
+    ordered_samples_sha256: String,
+    samples: usize,
+    candidates: usize,
+    single_candidate_samples: usize,
+    action_counts: BTreeMap<String, usize>,
+    candidate_count_samples: BTreeMap<usize, usize>,
+    actors: [ValidationActorReport; 2],
+    source_authenticated: bool,
+    source_qualified: bool,
+    verified_native_policy: bool,
+    value_validity: ValueValidity,
+    strength_measured: bool,
+}
+impl ConditionalValidationComparison {
+    pub fn samples(&self) -> usize {
+        self.samples
+    }
+    pub fn candidates(&self) -> usize {
+        self.candidates
+    }
+    pub fn save_new_directory(&self, directory: &Path) -> Result<(), String> {
+        validate_new_output_directory(directory)?;
+        bounded_json(self)?;
+        fs::create_dir(directory).map_err(|e| e.to_string())?;
+        publish(&directory.join("report.json"), self)
+    }
+}
+
+fn recheck_prepared_origin(policy: &PreparedConditionalHumanPolicy) -> Result<(), String> {
+    for pin in policy.loaded_sources()? {
+        crate::human_policy_dataset::recheck_absolute_pin(pin)?;
+    }
+    Ok(())
+}
+
+/// Each actor must first load its own original checkpoint and collection.
+/// The evaluation collection is independently loaded and must be Validation
+/// reserved by both origins, with no overlap with either origin's Train families.
+pub fn compare_validation_collection(
+    actors: [&PreparedConditionalHumanPolicy; 2],
+    validation_collection: &Path,
+) -> Result<ConditionalValidationComparison, String> {
+    for actor in actors {
+        recheck_prepared_origin(actor)?;
+    }
+    let (input, collection_pin): (CollectionInput, _) =
+        read_local_json_pinned(validation_collection)?;
+    let (input, datasets) = load_collection_input(validation_collection, input)?;
+    let mut comparison = compare_validation_datasets(actors, &datasets)?;
+    if read_local_json::<CollectionInput>(validation_collection)? != input {
+        return Err("Conditional Validation collection changed during evaluation".into());
+    }
+    crate::human_policy_dataset::recheck_absolute_pin(&collection_pin)?;
+    for dataset in &datasets {
+        dataset.recheck_sources()?;
+    }
+    for actor in actors {
+        recheck_prepared_origin(actor)?;
+    }
+    comparison.validation_collection = Some(collection_pin);
+    Ok(comparison)
+}
+
+fn compare_validation_datasets(
+    actors: [&PreparedConditionalHumanPolicy; 2],
+    datasets: &[ConditionalHumanPolicyDataset],
+) -> Result<ConditionalValidationComparison, String> {
+    let identity = audit_partition(datasets, true)?;
+    let mut reservations = BTreeMap::new();
+    let mut train_families = BTreeSet::new();
+    for actor in actors {
+        for (table, split) in actor.reservations() {
+            if reservations
+                .insert(table, *split)
+                .is_some_and(|previous| previous != *split)
+            {
+                return Err("Conditional actor origins disagree on split reservations".into());
+            }
+            if *split == DatasetSplit::Train {
+                train_families.insert(table_family_id(table)?);
+            }
+        }
+        train_families.extend(
+            actor
+                .identity()
+                .tables
+                .iter()
+                .filter(|table| table.split == DatasetSplit::Train)
+                .map(|table| table.family_id.clone()),
+        );
+    }
+    for dataset in datasets {
+        for actor in actors {
+            if actor.reservations().get(dataset.table_id()) != Some(&DatasetSplit::Validation) {
+                return Err("Shared Validation table is not reserved by both actor origins".into());
+            }
+        }
+        if train_families.contains(&table_family_id(dataset.table_id())?) {
+            return Err("Shared Validation overlaps an actor's Train family".into());
+        }
+        for (table, split) in dataset.reservations() {
+            if reservations
+                .insert(table, *split)
+                .is_some_and(|previous| previous != *split)
+            {
+                return Err("Shared Validation conflicts with origin split reservations".into());
+            }
+        }
+    }
+    let mut ordered = datasets.iter().collect::<Vec<_>>();
+    ordered.sort_by(|a, b| a.table_id().cmp(b.table_id()));
+    let samples = ordered
+        .iter()
+        .flat_map(|dataset| dataset.samples())
+        .collect::<Vec<_>>();
+    let multiple = samples
+        .iter()
+        .copied()
+        .filter(|sample| sample.candidates().len() > 1)
+        .collect::<Vec<_>>();
+    let mut hasher = Sha256::new();
+    let mut action_counts = BTreeMap::new();
+    let mut candidate_count_samples = BTreeMap::new();
+    hasher.update(b"tzolkin-conditional-human-shared-validation-ordered-public512-v1\0");
+    for sample in &samples {
+        let action = serde_json::to_value(sample.chosen_action()?).map_err(|e| e.to_string())?;
+        let kind = action["type"]
+            .as_str()
+            .ok_or("Missing conditional chosen action type")?;
+        *action_counts.entry(kind.to_owned()).or_default() += 1;
+        *candidate_count_samples
+            .entry(sample.candidates().len())
+            .or_default() += 1;
+        let id = sample.sample_id().as_bytes();
+        hasher.update((id.len() as u64).to_le_bytes());
+        hasher.update(id);
+        hasher.update((sample.chosen() as u64).to_le_bytes());
+        hasher.update((sample.candidates().len() as u64).to_le_bytes());
+        for row in sample.candidates() {
+            for value in row.values_for_schema(PUBLIC_FEATURE_SCHEMA)? {
+                hasher.update(value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    let actor_reports = actors
+        .map(|actor| {
+            let mut scratch = Scratch::default();
+            Ok(ValidationActorReport {
+                checkpoint_checksum: actor.checkpoint_checksum().into(),
+                model_checksum: actor.model().checksum.clone(),
+                origin: actor.identity().clone(),
+                config: actor.checkpoint.config.clone(),
+                backend: actor.backend(),
+                all_rows: evaluate(&samples, &actor.model().model, &mut scratch)?,
+                multi_candidate_rows: if multiple.is_empty() {
+                    None
+                } else {
+                    Some(evaluate(&multiple, &actor.model().model, &mut scratch)?)
+                },
+            })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, String>>()?
+        .try_into()
+        .map_err(|_| "Shared Validation actor pair shape")?;
+    if audit_partition(datasets, true)? != identity {
+        return Err("Shared Validation sources changed during evaluation".into());
+    }
+    Ok(ConditionalValidationComparison {
+        schema: VALIDATION_COMPARISON_SCHEMA,
+        task: TASK,
+        input_contract: INPUT_CONTRACT,
+        validation_collection: None,
+        validation_fingerprint: identity.fingerprint,
+        validation_tables: identity.tables,
+        validation_label_scope: identity.label_scope,
+        ordered_samples_sha256: format!("{:x}", hasher.finalize()),
+        samples: samples.len(),
+        candidates: identity.candidates[1],
+        single_candidate_samples: samples.len() - multiple.len(),
+        action_counts,
+        candidate_count_samples,
+        actors: actor_reports,
+        source_authenticated: false,
+        source_qualified: false,
+        verified_native_policy: false,
+        value_validity: ValueValidity::UnavailablePolicyOnly,
+        strength_measured: false,
+    })
 }
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -899,6 +1133,59 @@ mod tests {
             0,
         ));
         assert!(PreparedConditionalHumanPolicy::new(outcome.checkpoint.clone(), &test).is_err());
+        let left =
+            PreparedConditionalHumanPolicy::new(outcome.checkpoint.clone(), &datasets).unwrap();
+        let mut right =
+            PreparedConditionalHumanPolicy::new(outcome.checkpoint.clone(), &datasets).unwrap();
+        let heldout = vec![ConditionalHumanPolicyDataset::training_fixture(
+            "124",
+            DatasetSplit::Validation,
+            1,
+        )];
+        let before = left.checkpoint.clone();
+        let comparison = compare_validation_datasets([&left, &right], &heldout).unwrap();
+        assert_eq!(comparison.samples, 1);
+        assert_eq!(comparison.candidates, heldout[0].counts().candidates);
+        assert_eq!(
+            comparison.actors[0].all_rows,
+            outcome.metrics.final_validation
+        );
+        assert_eq!(comparison.actors[0].all_rows, comparison.actors[1].all_rows);
+        assert_eq!(comparison.single_candidate_samples, 0);
+        assert_eq!(comparison.action_counts.values().sum::<usize>(), 1);
+        assert_eq!(
+            comparison.candidate_count_samples.values().sum::<usize>(),
+            1
+        );
+        assert!(!comparison.source_qualified && !comparison.strength_measured);
+        assert_eq!(left.checkpoint, before);
+        assert!(
+            compare_validation_collection([&left, &right], Path::new("unbound-validation.json"))
+                .is_err()
+        );
+        right.reservations.insert("124".into(), DatasetSplit::Train);
+        assert!(compare_validation_datasets([&left, &right], &heldout).is_err());
+        assert!(compare_validation_datasets([&right, &left], &heldout).is_err());
+        right
+            .reservations
+            .insert("124".into(), DatasetSplit::Validation);
+        for split in [DatasetSplit::Train, DatasetSplit::Test] {
+            let prohibited = vec![ConditionalHumanPolicyDataset::training_fixture(
+                "124", split, 1,
+            )];
+            assert!(compare_validation_datasets([&left, &right], &prohibited).is_err());
+        }
+        let undeclared = vec![ConditionalHumanPolicyDataset::training_fixture(
+            "125",
+            DatasetSplit::Validation,
+            1,
+        )];
+        assert!(compare_validation_datasets([&left, &right], &undeclared).is_err());
+        let duplicate = vec![
+            ConditionalHumanPolicyDataset::training_fixture("124", DatasetSplit::Validation, 1),
+            ConditionalHumanPolicyDataset::training_fixture("124", DatasetSplit::Validation, 1),
+        ];
+        assert!(compare_validation_datasets([&left, &right], &duplicate).is_err());
         let mut wrong = outcome.checkpoint;
         wrong.metrics.final_validation.policy_loss += 0.5;
         wrong.checksum = wrong.expected_checksum().unwrap();
