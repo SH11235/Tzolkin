@@ -1102,13 +1102,16 @@ struct ResourceHarvestOpportunity {
 }
 
 // Fixed numeric opportunities avoid changing targets between technology steps.
-// Each worker contributes one best feasible harvest, not multiple future uses.
+// V2 retains one discounted harvest. V3 uses a bounded lifetime scenario,
+// with one exclusive prospective worker and at most three repeating workers.
 struct ResourceForecast<'a> {
     observation: &'a Observation,
     player: &'a PublicPlayer,
     weights: &'a HeuristicWeights,
     corn_value: f64,
-    opportunities: [Option<ResourceHarvestOpportunity>; 3],
+    opportunities: [Option<ResourceHarvestOpportunity>; 6],
+    prospective: [Option<ResourceHarvestOpportunity>; 2],
+    lifetime: bool,
 }
 
 fn resource_route_slot(o: &Observation, gear: GearId) -> Option<usize> {
@@ -1225,7 +1228,82 @@ impl<'a> ResourceForecast<'a> {
             player: p,
             weights: w,
             corn_value: value(o, p, Resource::Corn, w, ScoringProfile::MonumentAligned),
+            opportunities: [
+                opportunities[0],
+                opportunities[1],
+                opportunities[2],
+                None,
+                None,
+                None,
+            ],
+            prospective: [None; 2],
+            lifetime: false,
+        }
+    }
+
+    fn new_v3(o: &'a Observation, p: &'a PublicPlayer, w: &'a HeuristicWeights) -> Self {
+        let mut opportunities = [None; 6];
+        let mut count = 0;
+        for gear in [GearId::Yaxchilan, GearId::Palenque] {
+            if let Some(slots) = o.gears.get(&gear) {
+                for (position, worker) in slots.iter().take(8).enumerate() {
+                    if count < opportunities.len()
+                        && worker.as_ref().is_some_and(|worker| {
+                            !worker.dummy && worker.player_id == o.actor as i64
+                        })
+                    {
+                        opportunities[count] = Some(ResourceHarvestOpportunity {
+                            gear,
+                            position: position as i64,
+                            newly_placed: false,
+                        });
+                        count += 1;
+                    }
+                }
+            }
+        }
+        let mut prospective = [None; 2];
+        // Availability already excludes workers on every gear and FirstPlayer.
+        // Removing an existing worker is not a second, prospective worker.
+        if p.available_workers > 0 && count < p.workers as usize && o.round < 27 {
+            for (index, gear) in [GearId::Yaxchilan, GearId::Palenque]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(position) = resource_route_slot(o, gear)
+                    && position < 7
+                    && resource_wealth(&p.resources).is_some_and(|wealth| wealth >= position as i64)
+                {
+                    prospective[index] = Some(ResourceHarvestOpportunity {
+                        gear,
+                        position: position as i64,
+                        newly_placed: true,
+                    });
+                }
+            }
+        }
+        Self {
+            observation: o,
+            player: p,
+            weights: w,
+            corn_value: value(o, p, Resource::Corn, w, ScoringProfile::MonumentAligned),
             opportunities,
+            prospective,
+            lifetime: true,
+        }
+    }
+
+    fn for_revision(
+        o: &'a Observation,
+        p: &'a PublicPlayer,
+        w: &'a HeuristicWeights,
+        can_place: bool,
+        lifetime: bool,
+    ) -> Self {
+        if lifetime {
+            Self::new_v3(o, p, w)
+        } else {
+            Self::new(o, p, w, can_place)
         }
     }
 
@@ -1240,6 +1318,16 @@ impl<'a> ResourceForecast<'a> {
     }
 
     fn harvest(&self, state: &ResourceForecastState, gear: GearId, position: i64) -> Option<f64> {
+        self.harvest_with_corn_value(state, gear, position, self.corn_value)
+    }
+
+    fn harvest_with_corn_value(
+        &self,
+        state: &ResourceForecastState,
+        gear: GearId,
+        position: i64,
+        corn_value: f64,
+    ) -> Option<f64> {
         let extraction = state.technologies[tech_index(TechnologyId::Extraction)];
         let agriculture = state.technologies[tech_index(TechnologyId::Agriculture)];
         let theology = state.technologies[tech_index(TechnologyId::Theology)];
@@ -1251,7 +1339,7 @@ impl<'a> ResourceForecast<'a> {
                 let corn = ([0, 3, 4, 5, 7, 9][position as usize]
                     + i64::from(agriculture >= 1)
                     + 2 * i64::from(agriculture >= 3)) as f64
-                    * self.corn_value;
+                    * corn_value;
                 let can_corn = jungle.corn > jungle.wood;
                 let mut best: f64 = 0.0;
                 if can_corn || agriculture >= 2 {
@@ -1289,10 +1377,111 @@ impl<'a> ResourceForecast<'a> {
             }
             _ => return None,
         }
-        Some(self.amount_value(&amounts))
+        Some(
+            amounts[0] as f64 * corn_value
+                + amounts[1..4]
+                    .iter()
+                    .zip(self.weights.material_values)
+                    .map(|(n, value)| *n as f64 * value)
+                    .sum::<f64>()
+                + amounts[4] as f64 * 7.0,
+        )
+    }
+
+    fn lifetime_values(
+        &self,
+        state: &ResourceForecastState,
+        opportunity: ResourceHarvestOpportunity,
+    ) -> (f64, f64) {
+        let mut initial: f64 = 0.0;
+        let mut lifetime: f64 = 0.0;
+        for target in 1..=5 {
+            let wait = (target - opportunity.position).max(i64::from(opportunity.newly_placed));
+            let arrival_position = opportunity.position + wait;
+            let arrival_day = self.observation.round + wait;
+            if arrival_day > 27 || arrival_position > 7 {
+                continue;
+            }
+            let fee = if arrival_position >= 6 {
+                0
+            } else {
+                arrival_position - target
+            };
+            if fee > self.player.resources[0] {
+                continue;
+            }
+            let Some(gross) = self.harvest(state, opportunity.gear, target) else {
+                continue;
+            };
+            let first = gross - fee as f64 * self.corn_value;
+            initial = initial.max(first);
+            // This fixed seven-day cadence is a conservative forecast, not a
+            // legal-cycle or future-occupancy assertion. Initial use may be day27;
+            // only additional uses stop at day26. Day27 materials remain usable.
+            let repeatable = matches!(
+                (opportunity.gear, target),
+                (GearId::Yaxchilan, 1 | 2 | 3 | 5) | (GearId::Palenque, 1)
+            );
+            let repeats = if repeatable {
+                (1..=2)
+                    .filter(|cycle| arrival_day + 7 * cycle <= 26)
+                    .count()
+            } else {
+                0
+            };
+            let extra = if repeats > 0 {
+                // One nominal corn re-placement fee per additional use. Future
+                // corn uses the fixed base currency; no future cash test is made.
+                let net = self
+                    .harvest_with_corn_value(
+                        state,
+                        opportunity.gear,
+                        target,
+                        self.weights.corn_base,
+                    )
+                    .unwrap()
+                    - self.weights.corn_base;
+                repeats as f64 * net.max(0.0)
+            } else {
+                0.0
+            };
+            lifetime = lifetime.max(first + extra);
+        }
+        (initial, lifetime)
+    }
+
+    fn lifetime_potential(&self, state: &ResourceForecastState) -> f64 {
+        let mut initial = 0.0;
+        let mut extra = [0.0; 6];
+        let mut count = 0;
+        for opportunity in self.opportunities.iter().flatten() {
+            let (first, lifetime) = self.lifetime_values(state, *opportunity);
+            initial += first;
+            extra[count] = (lifetime - first).max(0.0);
+            count += 1;
+        }
+        if count < extra.len() {
+            let mut first: f64 = 0.0;
+            let mut lifetime: f64 = 0.0;
+            for opportunity in self.prospective.iter().flatten() {
+                let values = self.lifetime_values(state, *opportunity);
+                first = first.max(values.0);
+                lifetime = lifetime.max(values.1);
+            }
+            // Each maximum chooses one of the same fixed two gear branches.
+            // Without repeats it is the best initial branch; with repeats it
+            // is one best complete branch, never Yax plus Palenque workers.
+            initial += first;
+            extra[count] = (lifetime - first).max(0.0);
+        }
+        extra.sort_by(|a, b| b.total_cmp(a));
+        initial + extra[..3].iter().sum::<f64>()
     }
 
     fn potential(&self, state: &ResourceForecastState) -> f64 {
+        if self.lifetime {
+            return self.lifetime_potential(state);
+        }
         self.opportunities
             .iter()
             .flatten()
@@ -1482,6 +1671,16 @@ fn resource_market_goal(
     w: &HeuristicWeights,
     can_place: bool,
 ) -> ResourceMarketGoal {
+    resource_market_goal_for_revision(o, p, w, can_place, false)
+}
+
+fn resource_market_goal_for_revision(
+    o: &Observation,
+    p: &PublicPlayer,
+    w: &HeuristicWeights,
+    can_place: bool,
+    lifetime: bool,
+) -> ResourceMarketGoal {
     let Some(wealth) = resource_wealth(&p.resources) else {
         return ResourceMarketGoal::default();
     };
@@ -1496,7 +1695,7 @@ fn resource_market_goal(
     ];
     let mut fixed = w.clone();
     fixed.corn_when_short = fixed.corn_base;
-    let forecast = ResourceForecast::new(o, &reference, &fixed, can_place);
+    let forecast = ResourceForecast::for_revision(o, &reference, &fixed, can_place, lifetime);
     let state = ResourceForecastState::from(&reference);
     let mut best = ResourceMarketGoal::default();
     for steps in [1, 2] {
@@ -1657,6 +1856,14 @@ pub(crate) struct ResourceRouteContext {
 }
 impl ResourceRouteContext {
     pub(crate) fn new(o: &Observation, w: &HeuristicWeights) -> Self {
+        Self::for_revision(o, w, false)
+    }
+
+    pub(crate) fn new_v3(o: &Observation, w: &HeuristicWeights) -> Self {
+        Self::for_revision(o, w, true)
+    }
+
+    fn for_revision(o: &Observation, w: &HeuristicWeights, lifetime: bool) -> Self {
         let p = &o.players[o.actor];
         let supported = o.phase == Phase::Playing
             && (3..=4).contains(&o.players.len())
@@ -1684,9 +1891,13 @@ impl ResourceRouteContext {
                 && o.legal_actions
                     .iter()
                     .any(|a| matches!(a.action, TypedAction::Remove { .. })));
-        let forecast = ResourceForecast::new(o, p, w, can_place);
+        let forecast = ResourceForecast::for_revision(o, p, w, can_place, lifetime);
         let state = ResourceForecastState::from(p);
-        context.market_goal = resource_market_goal(o, p, w, can_place);
+        context.market_goal = if lifetime {
+            resource_market_goal_for_revision(o, p, w, can_place, true)
+        } else {
+            resource_market_goal(o, p, w, can_place)
+        };
         for (index, gear) in GEAR_IDS.into_iter().enumerate() {
             for position in 1..=5 {
                 context.endpoint[index][position] =
@@ -1931,6 +2142,15 @@ pub fn score_action_resource_aligned_v2(
     w: &HeuristicWeights,
 ) -> f64 {
     ResourceRouteContext::new(o, w).score(o, a, w)
+}
+
+/// Explicit lifetime investment hypothesis; route waiting discounts and V2 stay frozen.
+pub fn score_action_resource_aligned_v3(
+    o: &Observation,
+    a: &TypedAction,
+    w: &HeuristicWeights,
+) -> f64 {
+    ResourceRouteContext::new_v3(o, w).score(o, a, w)
 }
 
 fn score_action_for_profile(
@@ -2604,6 +2824,7 @@ mod tests {
                 Some(ProphecyId::ForgottenLore),
                 [3, 0, 0, 0, 0],
             ),
+            (GearId::Yaxchilan, 1, 0, 0, 0, 13, None, [0, 1, 0, 0, 0]),
             (GearId::Yaxchilan, 1, 0, 1, 0, 13, None, [0, 2, 0, 0, 0]),
             (GearId::Yaxchilan, 2, 0, 2, 0, 13, None, [1, 0, 2, 0, 0]),
             (GearId::Yaxchilan, 3, 0, 3, 0, 13, None, [2, 0, 0, 2, 0]),
@@ -3836,6 +4057,134 @@ mod tests {
         assert!((offered.value - 5.3).abs() < 1e-12);
         assert_eq!(offered.material_count, 3);
 
+        // The V3 lifetime potential keeps the same negative-prefix joint offer
+        // on day27, where only the initial use fits. Payment does not change
+        // the frozen opportunity set or currency between the two steps.
+        let lifetime = ResourceForecast::new_v3(&observation, player, &joint_weights);
+        assert_eq!(
+            lifetime.potential(&before).to_bits(),
+            forecast.potential(&before).to_bits()
+        );
+        assert!(
+            (lifetime
+                .offer(&before, TechnologyId::Extraction, false, 2, true)
+                .unwrap()
+                .value
+                - 5.3)
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            ((lifetime.potential(&middle) - lifetime.potential(&before))
+                + (lifetime.potential(&after) - lifetime.potential(&middle))
+                - (lifetime.potential(&after) - lifetime.potential(&before)))
+            .abs()
+                < 1e-12
+        );
+
+        // Core above establishes one extra wood at Extraction1. Calendar and
+        // cumulative amounts below are explicit forecast arithmetic, not a
+        // claim that future placements, income or food payments will occur.
+        let lifetime_weights = HeuristicWeights {
+            material_values: [2.0, 0.0, 0.0],
+            corn_base: 1.0,
+            corn_when_short: 1.0,
+            ..weights.clone()
+        };
+        for (day, additional_wood_value) in [(12, 6.0), (13, 4.0), (20, 2.0), (27, 2.0)] {
+            let mut state = playing(None);
+            state.round = day;
+            state.pending = None;
+            state.skull_supply = 0;
+            let actor = state.current_player;
+            for slots in state.gears.values_mut() {
+                slots.fill(None);
+            }
+            state.gears.get_mut(&GearId::Yaxchilan).unwrap()[1] = Some(GearWorker {
+                player_id: actor as i64,
+                dummy: false,
+            });
+            let observation = observe(&state, actor).unwrap();
+            let player = &observation.players[actor];
+            let before = ResourceForecastState::from(player);
+            let after = ResourceForecast::advance(&before, [0; 5], TechnologyId::Extraction);
+            let lifetime = ResourceForecast::new_v3(&observation, player, &lifetime_weights);
+            let owned = lifetime.opportunities[0].unwrap();
+            let first = lifetime.lifetime_values(&before, owned);
+            let next = lifetime.lifetime_values(&after, owned);
+            assert_eq!(first.0, 2.0);
+            assert_eq!(next.0, 4.0);
+            assert_eq!(next.1 - first.1, additional_wood_value);
+        }
+
+        let mut state = playing(None);
+        state.round = 1;
+        state.pending = None;
+        state.skull_supply = 0;
+        let actor = state.current_player;
+        state.players[actor].workers = 6;
+        state.jungle.insert(5, JungleBox { corn: 3, wood: 0 });
+        for slots in state.gears.values_mut() {
+            slots.fill(None);
+        }
+        for gear in [GearId::Yaxchilan, GearId::Palenque] {
+            for position in 0..3 {
+                state.gears.get_mut(&gear).unwrap()[position] = Some(GearWorker {
+                    player_id: actor as i64,
+                    dummy: false,
+                });
+            }
+        }
+        state.gears.get_mut(&GearId::Yaxchilan).unwrap()[6] = Some(GearWorker {
+            player_id: actor as i64,
+            dummy: true,
+        });
+        let scalar = HeuristicWeights {
+            material_values: [0.0; 3],
+            ..lifetime_weights.clone()
+        };
+        let observation = observe(&state, actor).unwrap();
+        let player = &observation.players[actor];
+        let before = ResourceForecastState::from(player);
+        let legacy = ResourceForecast::new(&observation, player, &scalar, true);
+        assert_eq!(
+            legacy.potential(&before).to_bits(),
+            (0.5_f64 + 2.0 / 3.0 + 1.0).to_bits()
+        );
+        let lifetime = ResourceForecast::new_v3(&observation, player, &scalar);
+        assert_eq!(player.available_workers, 0);
+        assert_eq!(lifetime.opportunities.iter().flatten().count(), 6);
+        assert!(lifetime.prospective.iter().all(Option::is_none));
+        assert_eq!(lifetime.potential(&before), 39.0); // All six initial harvests.
+        state.jungle.clear();
+        let observation = observe(&state, actor).unwrap();
+        let player = &observation.players[actor];
+        let lifetime = ResourceForecast::new_v3(&observation, player, &scalar);
+        assert_eq!(
+            lifetime.potential(&ResourceForecastState::from(player)),
+            26.0
+        ); // Best three extra deltas; Palenque2 pays one backward corn.
+        for slots in state.gears.values_mut() {
+            slots.fill(None);
+        }
+        let observation = observe(&state, actor).unwrap();
+        let player = &observation.players[actor];
+        let lifetime = ResourceForecast::new_v3(&observation, player, &scalar);
+        assert_eq!(lifetime.prospective.iter().flatten().count(), 2);
+        assert_eq!(
+            lifetime.potential(&ResourceForecastState::from(player)),
+            7.0
+        ); // One Palenque branch, not Palenque plus Yax.
+        assert_eq!(
+            crate::choose_move_resource_aligned_v3(&observation)
+                .unwrap()
+                .policy_version,
+            crate::RESOURCE_ALIGNED_V3_POLICY_VERSION
+        );
+        let mut malformed = observation.clone();
+        malformed.actor = malformed.players.len();
+        assert!(crate::choose_move_resource_aligned_v3(&malformed).is_err());
+
         let mut state = playing(None);
         state.pending = None;
         let actor = state.current_player;
@@ -4213,5 +4562,14 @@ mod tests {
         let goal_after = resource_market_goal(&observation, &sold, &weights, true);
         assert_eq!(goal.materials, goal_after.materials);
         assert_eq!(goal.value.to_bits(), goal_after.value.to_bits());
+        let lifetime_goal =
+            resource_market_goal_for_revision(&observation, player, &weights, true, true);
+        let lifetime_goal_after =
+            resource_market_goal_for_revision(&observation, &sold, &weights, true, true);
+        assert_eq!(lifetime_goal.materials, lifetime_goal_after.materials);
+        assert_eq!(
+            lifetime_goal.value.to_bits(),
+            lifetime_goal_after.value.to_bits()
+        );
     }
 }
