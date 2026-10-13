@@ -443,10 +443,10 @@ impl<'a> CurrentMixedTrainingSession<'a> {
                     {
                         return Err("Saved current mixed joint artifact/report differs".into());
                     }
-                    promotion = Some(
-                        mixed::ContinuedMixedProposal::restored(saved, &s.handle()?)?
-                            .stage(&s.handle()?)?,
-                    );
+                    let parent = s.handle()?;
+                    promotion = Some(mixed::ContinuedMixedProposal::restored_stage(
+                        saved, &parent,
+                    )?);
                     s.add_reference(attempt, report)?;
                     s.add_reference(attempt, artifact)?;
                     owner_pins = Some((s.batch(attempt), report.clone(), artifact.clone()));

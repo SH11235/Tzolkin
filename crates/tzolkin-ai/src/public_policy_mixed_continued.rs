@@ -587,6 +587,18 @@ impl ContinuedMixedProposal {
             outcome: ProposalOutcome::Updated(artifact),
         })
     }
+    /// Cold restoration consumes the saved artifact straight into staging, so
+    /// the same immutable parent checks need only run at the stage boundary.
+    /// Durable Resolve still supplies the separate owner-admission authority.
+    pub(crate) fn restored_stage(
+        artifact: ContinuedMixedArtifact,
+        parent: &CurrentMixedPolicyHandle<'_>,
+    ) -> Result<PreparedContinuedPromotion, String> {
+        Self {
+            outcome: ProposalOutcome::Updated(artifact),
+        }
+        .stage(parent)
+    }
     pub(crate) fn restored_no_change(
         report: ContinuedMixedReport,
         parent: &CurrentMixedPolicyHandle<'_>,
@@ -817,5 +829,139 @@ mod tests {
             )
             .is_err()
         );
+
+        // Synthetic content exercises staging only, not journal authority or a
+        // native update. Configurations are metadata; no Game is constructed.
+        let plan = source::tests::plan();
+        let seeds = (0..200)
+            .filter(|&s| {
+                split_for_family(&crate::dataset::seed_family_id(s)).unwrap() == DatasetSplit::Train
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        let root = MixedRootReference {
+            original_root_checksum: "a".repeat(64),
+            first_mixed_checksum: initial.artifact_checksum().into(),
+            root_init_checksum: "b".repeat(64),
+            imported_update_count: 1,
+            residual_seed: 7,
+            bc_source: serde_json::from_value(serde_json::json!({
+                "kind":"publicLearned", "policyVersion":public_model::POLICY_VERSION,
+                "modelVersion":public_model::MODEL_VERSION,
+                "trainingVersion":crate::policy_training::TRAINING_VERSION,
+                "featureSchema":crate::features::PUBLIC_FEATURE_SCHEMA,
+                "inputContract":public_model::INPUT_CONTRACT,"task":"policyOnlyBc",
+                "valueValidity":"unavailablePolicyOnly","modelChecksum":"c".repeat(64),
+                "trainingCheckpointChecksum":"d".repeat(64),"datasetFingerprint":"e".repeat(64),
+                "inferenceBackend":"scalar"
+            }))
+            .unwrap(),
+        };
+        let make = |identity: &CurrentMixedParentIdentity, offset, actor, residual, delta| {
+            let configurations = std::array::from_fn(|i| {
+                let mut c =
+                    crate::public_stochastic_record::Config::from_config(&plan.configurations()[i]);
+                c.environment_seed = seeds[offset + i];
+                c
+            });
+            let mut report = ContinuedMixedReport {
+                contract: contract(),
+                root: root.clone(),
+                parent: identity.clone(),
+                proposed_mixed_update_count: next_count(identity).unwrap(),
+                plan_checksum: "f".repeat(64),
+                cohort_checksum: "a".repeat(64),
+                episode_checksums: std::array::from_fn(|_| "b".repeat(64)),
+                learner_seats: [1; 4],
+                families: configurations
+                    .each_ref()
+                    .map(|c| crate::dataset::seed_family_id(c.environment_seed)),
+                configurations,
+                roster_checksums: std::array::from_fn(|_| "c".repeat(64)),
+                counts: [4, 8, 0],
+                observed_callbacks: 4,
+                actor_config: serde_json::to_value(OneStepConfig::default()).unwrap(),
+                critic_config: serde_json::to_value(
+                    ResidualFitConfig::new(0.001, 0.01, 4).unwrap(),
+                )
+                .unwrap(),
+                deltas: Deltas::default(),
+                numeric: serde_json::from_value(serde_json::json!({
+                    "rawGradientL2":0.0,"rawGradientMaxAbs":0.0,
+                    "actualDeltaL2":delta,"actualDeltaMaxAbs":delta,"changedParameters":1
+                }))
+                .unwrap(),
+                critic_changed_parameters: 1,
+                mean_raw_residual_mse: 0.0,
+                checksum: String::new(),
+            };
+            report.checksum = report.expected_checksum().unwrap();
+            let mut artifact = ContinuedMixedArtifact {
+                schema: ARTIFACT_SCHEMA.into(),
+                imported_update_count: 1,
+                mixed_update_count: report.proposed_mixed_update_count,
+                report,
+                actor,
+                residual_parameters: residual,
+                checksum: String::new(),
+            };
+            artifact.checksum = artifact.expected_checksum().unwrap();
+            artifact
+        };
+        let mut parameters = vec![0.0; public_model::PARAMETER_COUNT];
+        parameters[public_model::BP] = 0.001;
+        let mut residual = vec![0.0; crate::public_state_critic::PARAMETER_COUNT];
+        residual[0] = 0.002;
+        let artifact = make(&old, 0, PublicPolicyModel { parameters }, residual, 0.001);
+        let families = artifact.report.families.iter().cloned().collect();
+        let synthetic = ContinuedMixedOwner { artifact, families };
+        let handle = CurrentMixedPolicyHandle::from_continued(&synthetic).unwrap();
+        let mut actor = synthetic.actor_model().clone();
+        actor.parameters[public_model::BP] = 0.002;
+        let mut residual = synthetic.residual_parameters().to_vec();
+        residual[0] = 0.004;
+        let (_, delta, _) =
+            rounded_delta(handle.actor_model().parameters(), actor.parameters(), 0.01).unwrap();
+        let artifact = make(handle.identity(), 4, actor, residual, delta);
+        let raw = serde_json::to_vec(&artifact).unwrap();
+        let decode = || serde_json::from_slice::<ContinuedMixedArtifact>(&raw).unwrap();
+        let old_stage = ContinuedMixedProposal::restored(decode(), &handle)
+            .unwrap()
+            .stage(&handle)
+            .unwrap();
+        let new_stage = ContinuedMixedProposal::restored_stage(decode(), &handle).unwrap();
+        assert_eq!(
+            serde_json::to_vec(old_stage.artifact()).unwrap(),
+            serde_json::to_vec(new_stage.artifact()).unwrap()
+        );
+        assert!(old_stage.initial_families.is_none() && new_stage.initial_families.is_none());
+        for corruption in 0..3 {
+            let mut artifact = decode();
+            match corruption {
+                0 => artifact.checksum = "f".repeat(64),
+                1 => {
+                    artifact.actor.parameters[public_model::BP] = 0.003;
+                    artifact.checksum = artifact.expected_checksum().unwrap();
+                }
+                _ => {
+                    artifact.report.configurations[0].environment_seed = seeds[0];
+                    artifact.report.families[0] = crate::dataset::seed_family_id(seeds[0]);
+                    artifact.report.checksum = artifact.report.expected_checksum().unwrap();
+                    artifact.checksum = artifact.expected_checksum().unwrap();
+                }
+            }
+            let raw = serde_json::to_vec(&artifact).unwrap();
+            let old_error =
+                ContinuedMixedProposal::restored(serde_json::from_slice(&raw).unwrap(), &handle)
+                    .err()
+                    .unwrap();
+            let new_error = ContinuedMixedProposal::restored_stage(
+                serde_json::from_slice(&raw).unwrap(),
+                &handle,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(old_error, new_error);
+        }
     }
 }
