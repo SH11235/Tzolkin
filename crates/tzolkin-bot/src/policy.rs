@@ -1789,7 +1789,17 @@ impl ResourceRouteContext {
 
     pub(crate) fn score(&self, o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f64 {
         if !self.supported {
-            return score_action_resource_aligned(o, a, w);
+            // Base 3/4-player Setup keeps the explicit resource wealth chooser.
+            // Other unsupported contexts retain the former App default.
+            if o.phase == Phase::Setup
+                && (3..=4).contains(&o.players.len())
+                && o.expansion.is_none()
+                && o.private.selected_tribe.is_none()
+                && o.players.iter().all(|player| player.tribe.is_none())
+            {
+                return score_action_resource_aligned(o, a, w);
+            }
+            return score_action_monument_aligned_v2(o, a, w);
         }
         let p = &o.players[o.actor];
         let corn_value = value(o, p, Resource::Corn, w, ScoringProfile::MonumentAligned);
@@ -1817,13 +1827,19 @@ impl ResourceRouteContext {
                     )
             }
             TypedAction::Remove { gear, position }
-                if *gear != GearId::ChichenItza && (1..=5).contains(position) =>
+                if (1..=if *gear == GearId::ChichenItza { 9 } else { 5 }).contains(position) =>
             {
                 let now = (1..=*position)
                     .filter_map(|target| {
                         let cost = position - target;
-                        (cost <= p.resources[0])
-                            .then(|| self.endpoint(*gear, target) - cost as f64 * corn_value)
+                        (cost <= p.resources[0]).then(|| {
+                            let payoff = if *gear == GearId::ChichenItza {
+                                resource_skull_value(o, p, target, w)
+                            } else {
+                                self.endpoint(*gear, target)
+                            };
+                            payoff - cost as f64 * corn_value
+                        })
                     })
                     .fold(0.0, f64::max);
                 anchor + now
@@ -1833,6 +1849,8 @@ impl ResourceRouteContext {
             }
             TypedAction::Remove { position: 0, .. } => anchor - 20.0,
             TypedAction::Remove { gear, position } => {
+                // Chichen position10 and other free-choice positions keep
+                // their historical approximation rather than a new rollout.
                 anchor + action_value(o, p, *gear, *position, w, ScoringProfile::MonumentAligned)
             }
             TypedAction::FirstPlayer { corn_cost } => {
@@ -3866,6 +3884,147 @@ mod tests {
             crate::dispatch_cpu_resource_aligned_v2(&serde_json::to_string(&malformed).unwrap())
                 .is_err()
         );
+
+        // Current Chichen1..9 uses the same visible, consumed-skull payoff
+        // as waiting, and only payable backward actions enter its maximum.
+        let skull_weights = HeuristicWeights {
+            corn_base: 1.0,
+            corn_when_short: 1.0,
+            ..weights.clone()
+        };
+        let mut skull = playing(None);
+        skull.pending = None;
+        skull.round = 27;
+        let actor = skull.current_player;
+        skull.players[actor].resources.insert(Resource::Skull, 1);
+        skull.players[actor].resources.insert(Resource::Corn, 0);
+        skull.gears.get_mut(&GearId::ChichenItza).unwrap()[9] = Some(GearWorker {
+            player_id: actor as i64,
+            dummy: false,
+        });
+        let remove = TypedAction::Remove {
+            gear: GearId::ChichenItza,
+            position: 9,
+        };
+        for (held, occupied, corn, net) in [
+            (0, false, 0, 0.0),
+            (1, false, 0, 13.0),
+            (1, true, 0, 0.0),
+            (1, true, 1, 10.0),
+        ] {
+            skull.players[actor].resources.insert(Resource::Skull, held);
+            skull.players[actor].resources.insert(Resource::Corn, corn);
+            skull.skull_spaces[9] = occupied.then_some((actor + 1) % 3);
+            let observation = observe(&skull, actor).unwrap();
+            assert_eq!(
+                score_action_resource_aligned_v2(&observation, &remove, &skull_weights),
+                13.0 + net
+            );
+        }
+        let removed = apply_move(
+            &skull,
+            GameMove::Remove {
+                gear: GearId::ChichenItza,
+                position: 9,
+            },
+        )
+        .unwrap();
+        let pending = observe(&removed, actor).unwrap();
+        let backward = pending
+            .legal_actions
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::UseAction {
+                        gear: GearId::ChichenItza,
+                        position: 8,
+                        corn_cost: 1,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let paid = apply_move(&removed, backward.r#move.clone()).unwrap();
+        assert_eq!(paid.players[actor].resources[&Resource::Corn], 0);
+        assert_eq!(paid.players[actor].resources[&Resource::Skull], 0);
+        assert_eq!(paid.skull_spaces[8], Some(actor));
+        assert_eq!(paid.players[actor].score - skull.players[actor].score, 11.0);
+        skull.round = 26;
+        skull.players[actor].resources.insert(Resource::Skull, 1);
+        skull.skull_spaces[9] = None;
+        let observation = observe(&skull, actor).unwrap();
+        let near = TypedAction::Remove {
+            gear: GearId::ChichenItza,
+            position: 2,
+        };
+        // Current2 net2 minus future3 net3 discounted by two, not raw reward9.
+        assert_eq!(
+            score_action_resource_aligned_v2(&observation, &near, &skull_weights),
+            13.5
+        );
+        let mut hidden = observation.clone();
+        hidden.skull_spaces.clear();
+        assert_eq!(
+            score_action_resource_aligned_v2(&hidden, &near, &skull_weights),
+            13.0
+        );
+        let free_choice = TypedAction::Remove {
+            gear: GearId::ChichenItza,
+            position: 10,
+        };
+        assert_eq!(
+            score_action_resource_aligned_v2(&observation, &free_choice, &skull_weights),
+            33.0
+        ); // Position10 deliberately retains the reward-only legacy approximation.
+
+        // Unsupported App contexts keep MonumentV2; base3/4 Setup keeps the
+        // explicit resource wealth path. None of the old endpoints is changed.
+        for count in [2, 3, 4, 5] {
+            let setup =
+                create_game((0..count).map(|i| format!("P{i}")).collect(), 17, false).unwrap();
+            let observation = observe(&setup, setup.current_player).unwrap();
+            for row in &observation.legal_actions {
+                let expected = if (3..=4).contains(&count) {
+                    score_action_resource_aligned(&observation, &row.action, &weights)
+                } else {
+                    score_action_monument_aligned_v2(&observation, &row.action, &weights)
+                };
+                assert_eq!(
+                    score_action_resource_aligned_v2(&observation, &row.action, &weights).to_bits(),
+                    expected.to_bits()
+                );
+            }
+            let mut unsupported = setup;
+            unsupported.phase = Phase::Playing;
+            unsupported.pending = Some(Pending {
+                title: "Technology".into(),
+                task: Task::Technology {
+                    remaining: 1,
+                    free: true,
+                    mandatory: false,
+                },
+                after: vec![],
+            });
+            if (3..=4).contains(&count) {
+                unsupported.players[unsupported.current_player].tribe = Some(TribeId::Yaluk);
+            }
+            let observation = observe(&unsupported, unsupported.current_player).unwrap();
+            for row in &observation.legal_actions {
+                assert_eq!(
+                    score_action_resource_aligned_v2(&observation, &row.action, &weights).to_bits(),
+                    score_action_monument_aligned_v2(&observation, &row.action, &weights).to_bits()
+                );
+            }
+        }
+        let expansion = playing(Some(ProphecyId::Hunger));
+        let observation = observe(&expansion, expansion.current_player).unwrap();
+        for row in &observation.legal_actions {
+            assert_eq!(
+                score_action_resource_aligned_v2(&observation, &row.action, &weights).to_bits(),
+                score_action_monument_aligned_v2(&observation, &row.action, &weights).to_bits()
+            );
+        }
 
         // First-player corn arrives at EndTurn before any feeding stage.
         // Baseline hunger is permitted; the placement must not invent more.
