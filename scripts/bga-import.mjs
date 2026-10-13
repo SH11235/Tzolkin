@@ -22,6 +22,25 @@ const increment = (counts, key) => {
   counts[key] = (counts[key] ?? 0) + 1;
 };
 
+function visibleTableStatus(text) {
+  if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > 128)
+    throw new Error('Invalid visible table status text');
+  const status = new Map([
+    ['ゲーム終了', 'normalEnd'],
+    ['Game ended', 'normalEnd'],
+    ['Game finished', 'normalEnd'],
+    ['放棄されたテーブル', 'abandoned'],
+    ['Abandoned table', 'abandoned'],
+    ['Table abandoned', 'abandoned'],
+    ['Table was abandoned', 'abandoned'],
+    ['投了', 'forfeit'],
+    ['Conceded', 'forfeit'],
+    ['Game conceded', 'forfeit'],
+  ]).get(text.trim());
+  if (!status) throw new Error('Unsupported visible table status text');
+  return status;
+}
+
 // Only explicit text patterns are interpreted. Raw text and icon classes remain the evidence.
 export function parseMessage(message, players, { englishTerminal = false } = {}) {
   const raw = message.raw_text;
@@ -312,6 +331,7 @@ function publicUiDomView(raw, tableEvidenceBytes) {
   }
   let table_details_text = '';
   let tableEvidence;
+  let tableStatus = null;
   let terminationText = raw.metadata.historyRowText ?? null;
   if (terminationText != null && typeof terminationText !== 'string')
     throw new Error('Invalid current UI history row text');
@@ -327,6 +347,16 @@ function publicUiDomView(raw, tableEvidenceBytes) {
       throw new Error('Table evidence schema/identity/options mismatch');
     table_details_text = `ゲーム構成\n${table.optionsText}`;
     tableEvidence = { reference: table.url, sha256: hash(tableEvidenceBytes) };
+    if (table.statusText != null) {
+      tableStatus = visibleTableStatus(table.statusText);
+      if (
+        (table.completedObserved != null && typeof table.completedObserved !== 'boolean') ||
+        table.completedObserved === false ||
+        (raw.metadata.statusText != null &&
+          visibleTableStatus(raw.metadata.statusText) !== tableStatus)
+      )
+        throw new Error('Contradictory visible table completion status');
+    }
     if (table.resultText != null) {
       if (typeof table.resultText !== 'string') throw new Error('Invalid visible result text');
       terminationText =
@@ -351,6 +381,7 @@ function publicUiDomView(raw, tableEvidenceBytes) {
       table_details_text,
     },
     tableEvidence,
+    tableStatus,
     terminationText,
   };
 }
@@ -379,15 +410,26 @@ export function normalizeGame(original, sourceSha256, tableEvidenceBytes = null)
   }
   const cancellationCount = events.filter((e) => e.kind === 'cancellation').length;
   const terminationText = adapted ? adapted.terminationText : raw.metadata.history_text;
-  const abandoned =
+  const textAbandoned =
     terminationText?.includes('放棄されたテーブル') ||
     (adapted &&
       /^\s*(?:Abandoned table|Table (?:was )?abandoned)\s*$/im.test(terminationText ?? ''));
-  const forfeit =
+  const textForfeit =
     terminationText?.includes('投了') ||
     (adapted && /^\s*(?:Conceded|Game conceded)\s*$/im.test(terminationText ?? ''));
-  const normalEndEvidence =
+  const textNormalEnd =
     !adapted || /^\s*(?:ゲーム終了|Game ended|Game finished)\s*$/im.test(terminationText ?? '');
+  const tableStatus = adapted?.tableStatus;
+  if (
+    tableStatus &&
+    ((textAbandoned && tableStatus !== 'abandoned') ||
+      (textForfeit && tableStatus !== 'forfeit') ||
+      (textNormalEnd && tableStatus !== 'normalEnd'))
+  )
+    throw new Error('Contradictory visible termination evidence');
+  const abandoned = textAbandoned || tableStatus === 'abandoned';
+  const forfeit = textForfeit || tableStatus === 'forfeit';
+  const normalEndEvidence = textNormalEnd || tableStatus === 'normalEnd';
   const status = abandoned
     ? 'abandoned'
     : forfeit
