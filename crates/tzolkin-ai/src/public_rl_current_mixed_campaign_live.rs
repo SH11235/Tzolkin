@@ -9,7 +9,8 @@ const CALL_CAP: usize = 64 * 1024;
 const INPUT_CAP: usize = 128 * 1024 * 1024;
 // Publication and readback share the existing paired regular-file ceiling.
 const RESERVATION_CAP: usize = MAX_RECORD_BYTES;
-const WRAPPER_CAP: u64 = 128 * 1024 * 1024;
+// Aggregate wrapper metadata only; native archives and per-file caps are separate.
+const WRAPPER_CAP: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_LIVE_UPDATES: usize = 1000;
 const MAX_LIVE_SEGMENTS: usize = 24;
 
@@ -1521,6 +1522,43 @@ pub(super) fn metadata_boundaries(original: &CampaignWire, next_spec: &Value) {
     assert!(
         bounded
             .require_wrapper_headroom(paused, used + 1, None, true, false)
+            .is_err()
+    );
+    // The complete declared ceiling fits 1000 closed one-update invocations,
+    // a maximum-sized plan/reservation and one export, without new model work.
+    bounded.total = MAX_LIVE_UPDATES;
+    bounded.raw.resize(CAMPAIGN_CAP, 0);
+    bounded.wire.max_wrapper_bytes = WRAPPER_CAP;
+    bounded
+        .require_wrapper_headroom(Cursor::initial(), 0, Some(RESERVATION_CAP), true, false)
+        .unwrap();
+    bounded.wire.max_wrapper_bytes = 1_756_889_088;
+    bounded
+        .require_wrapper_headroom(Cursor::initial(), 0, Some(RESERVATION_CAP), true, false)
+        .unwrap();
+    assert!(
+        bounded
+            .require_wrapper_headroom(Cursor::initial(), 1, Some(RESERVATION_CAP), true, false)
+            .is_err()
+    );
+    let final_update = Cursor {
+        segment: 15,
+        updates_in_segment: 39,
+        total_updates: 999,
+    };
+    let used = wrapper_records_bytes(999).unwrap() + (CAMPAIGN_CAP + RESERVATION_CAP) as u64;
+    bounded
+        .require_wrapper_headroom(final_update, used, None, true, false)
+        .unwrap();
+    assert!(
+        bounded
+            .require_wrapper_headroom(final_update, used + 1, None, true, false)
+            .is_err()
+    );
+    bounded.wire.max_wrapper_bytes = 128 * 1024 * 1024;
+    assert!(
+        bounded
+            .require_wrapper_headroom(Cursor::initial(), 0, Some(RESERVATION_CAP), true, false)
             .is_err()
     );
     // Wrapper capacity fails before publishing a new file.
