@@ -1205,12 +1205,17 @@ export function projectRetainedBoundary(
     if (
       workerCells.length !== expectedCellIds.length ||
       expectedCellIds.some((id) => !workerCells.some((node) => node.attrs.id === id)) ||
-      workerCells.some(
-        (node) =>
+      workerCells.some((node) => {
+        const classes = (node.attrs.class ?? '').split(/\s+/).filter(Boolean);
+        // Active is retained presentation metadata, not state or legality evidence.
+        return (
           node.tag !== 'div' ||
-          node.attrs.class !== 'workerplace' ||
-          node.children.some((child) => typeof child !== 'string' || child.trim()),
-      )
+          !classes.includes('workerplace') ||
+          classes.some((value) => value !== 'workerplace' && value !== 'active') ||
+          new Set(classes).size !== classes.length ||
+          node.children.some((child) => typeof child !== 'string' || child.trim())
+        );
+      })
     )
       fail('Incomplete/unknown boundary worker cells');
     workerCells.forEach((node) => readVisible(board, node));
