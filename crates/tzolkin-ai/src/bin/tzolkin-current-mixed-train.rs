@@ -2,11 +2,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use tzolkin_ai::public_rl_current_mixed_durable::{
-    CurrentMixedCampaignSpec, current_mixed_campaign,
+    CurrentMixedCampaignSpec, CurrentMixedLivePlanSpec, current_mixed_campaign,
+    current_mixed_live_plan,
 };
 use tzolkin_ai::public_rl_paired_session::read_bounded;
 
-const HELP: &str = "tzolkin-current-mixed-train continue --spec FILE --expected-sha256 LOWERCASE64HEX --output NEW_DIRECTORY --report NEW_LEAF [--max-new-attempts 1..64] [--deployment NEW_LEAF]\n\
+const HELP: &str = "tzolkin-current-mixed-train live-continue|live-resume|live-inspect --spec FILE --expected-sha256 LOWERCASE64HEX --output DIRECTORY --report NEW_LEAF [--head FILE --head-sha256 LOWERCASE64HEX] [--max-new-updates 1..1000] [--deployment NEW_LEAF]\n\
+Live spec: tzolkin-current-mixed-live-plan-spec-v1. Each separately pinned segment uses tzolkin-current-mixed-live-segment-plan-v1 with unchanged native local limits and the established global contract. The entire finite future Train/stream schedule is permanently reserved before one genuine qualification/cold restore. Live owner transfers only after Updated, with unchanged historical non-updated counters and full physical archive checks. Native update mathematics and old wire remain unchanged. Cooperative pauses occur after Updated and before next Start. Resume requires exact closed wrapper/native prefixes; an external host must independently observe actual process closure. No model checkpoints or caller receipts mint owner authority. Total live-plan bounds are 1000 updates/24 declared segments and the actual inherited contract can be stricter. Each plan declares an aggregate wrapper ceiling at most 2 GiB. Existing wrapper/log bytes, all remaining closed-return records, plan/reservation and any requested deployment must fit before model work; native archive and per-file limits remain separate. Report timings are separately bounded per call.\n\
+tzolkin-current-mixed-train continue --spec FILE --expected-sha256 LOWERCASE64HEX --output NEW_DIRECTORY --report NEW_LEAF [--max-new-attempts 1..64] [--deployment NEW_LEAF]\n\
 tzolkin-current-mixed-train resume|inspect-tip --spec FILE --expected-sha256 LOWERCASE64HEX --output DIRECTORY --head FILE --head-sha256 LOWERCASE64HEX --report NEW_LEAF [--max-new-attempts 1..64] [--deployment NEW_LEAF]\n\
 Spec: tzolkin-current-mixed-campaign-spec-v1. It pins the original qualified BC checkpoint/dataset manifest, genuine Count1 or paired bootstrap, original first-mixed archive, complete durable ancestry, fixed pool, next segment contract, all 1..64 whole-four collection specs and the complete external exclusion declaration. Numerical inference JSON is not an owner.\n\
 Optional seatCampaign uses tzolkin-current-mixed-ready-seat-campaign-v1, exact cumulative nonUpdatedBaseline rows [NoChange,Failed,Abandoned], each [cohorts,cohortsWithoutCounts,callbacks,candidateRows,singletons], and optional rotation {oldPool,newPool,shifts}. Shifts [3p,4p] cyclically move every complete role; latest Updated is required, without simultaneous budget amendment. Saved seatRotation ancestry pins both pools, shifts and the latest tip. Ordinary guarded chunks keep the same baseline too: inherited failures remain counted and any new non-updated work stops the campaign. Seat coverage and the entire multi-segment reservation require an explicit caller plan; this API makes no generic all-seat claim.\n\
@@ -17,8 +20,10 @@ Use one writer and an external finite wall/disk watchdog. Published invocation c
 
 fn arguments(args: &[String]) -> Result<(&str, BTreeMap<&str, &str>), String> {
     let command = args.first().ok_or("Missing command")?.as_str();
-    if !matches!(command, "continue" | "resume" | "inspect-tip")
-        || !(args.len() - 1).is_multiple_of(2)
+    if !matches!(
+        command,
+        "continue" | "resume" | "inspect-tip" | "live-continue" | "live-resume" | "live-inspect"
+    ) || !(args.len() - 1).is_multiple_of(2)
     {
         return Err("Expected continue/resume/inspect-tip and flag-value pairs".into());
     }
@@ -34,6 +39,7 @@ fn arguments(args: &[String]) -> Result<(&str, BTreeMap<&str, &str>), String> {
                 | "--head-sha256"
                 | "--report"
                 | "--max-new-attempts"
+                | "--max-new-updates"
                 | "--deployment"
         ) || pair[1].is_empty()
             || flags.insert(name, pair[1].as_str()).is_some()
@@ -46,15 +52,23 @@ fn arguments(args: &[String]) -> Result<(&str, BTreeMap<&str, &str>), String> {
             return Err(format!("Missing {name}"));
         }
     }
-    if command == "continue" {
+    let live = command.starts_with("live-");
+    if live && flags.contains_key("--max-new-attempts")
+        || !live && flags.contains_key("--max-new-updates")
+    {
+        return Err("Invocation limit flag belongs to the other campaign mode".into());
+    }
+    if matches!(command, "continue" | "live-continue") {
         if flags.contains_key("--head") || flags.contains_key("--head-sha256") {
             return Err("Continue forbids child head flags".into());
         }
     } else if !flags.contains_key("--head") || !flags.contains_key("--head-sha256") {
         return Err("Resume/inspect-tip requires pinned latest child head".into());
     }
-    if command == "inspect-tip"
-        && (flags.contains_key("--deployment") || flags.contains_key("--max-new-attempts"))
+    if matches!(command, "inspect-tip" | "live-inspect")
+        && (flags.contains_key("--deployment")
+            || flags.contains_key("--max-new-attempts")
+            || flags.contains_key("--max-new-updates"))
     {
         return Err("Inspect-tip forbids model/deployment/attempt flags".into());
     }
@@ -63,6 +77,25 @@ fn arguments(args: &[String]) -> Result<(&str, BTreeMap<&str, &str>), String> {
 fn run(args: &[String]) -> Result<i32, String> {
     let (command, flags) = arguments(args)?;
     let raw = read_bounded(Path::new(flags["--spec"]), 1024 * 1024)?;
+    if command.starts_with("live-") {
+        let spec = CurrentMixedLivePlanSpec::from_json(&raw, flags["--expected-sha256"])?;
+        let updates = flags
+            .get("--max-new-updates")
+            .map(|s| s.parse::<usize>().map_err(|e| e.to_string()))
+            .transpose()?
+            .unwrap_or(spec.max_invocation_updates());
+        return current_mixed_live_plan(
+            spec,
+            command,
+            Path::new(flags["--output"]),
+            flags
+                .get("--head")
+                .map(|path| (Path::new(path), flags["--head-sha256"])),
+            updates,
+            flags["--report"],
+            flags.get("--deployment").copied(),
+        );
+    }
     let spec = CurrentMixedCampaignSpec::from_json(&raw, flags["--expected-sha256"])?;
     let attempts = flags
         .get("--max-new-attempts")
