@@ -738,6 +738,17 @@ impl PreparedConditionalHumanPolicy {
             .ok_or_else(|| "Conditional boundary pins require successful source load".into())
     }
 
+    /// Dedicated schema-4 raw custody; this does not open legacy RL getters.
+    pub(crate) fn loaded_semantic_playing_sources(&self) -> Result<&[ContentPin], String> {
+        if self.feature_profile != ConditionalFeatureProfile::SemanticPlaying4 {
+            return Err("Semantic Playing origin requires schema-4 preparation".into());
+        }
+        self.loaded_sources
+            .as_deref()
+            .filter(|pins| !pins.is_empty())
+            .ok_or_else(|| "Semantic Playing origin requires successful source load".into())
+    }
+
     /// Recheck the immutable pins captured by a successful original source load.
     /// This is content consistency, not source authentication or native admission.
     pub fn recheck_sources(&self) -> Result<(), String> {
@@ -1708,6 +1719,18 @@ mod tests {
             ConditionalFeatureProfile::SemanticPlaying4,
         )
         .unwrap();
+        assert_eq!(
+            prepared.loaded_semantic_playing_sources().err().as_deref(),
+            Some("Semantic Playing origin requires successful source load")
+        );
+        assert_eq!(
+            crate::conditional_semantic_playing_rl::SemanticPlayingRlOwner::from_prepared(
+                &prepared, 11,
+            )
+            .err()
+            .as_deref(),
+            Some("Semantic Playing origin requires successful source load")
+        );
         let playing = playing_observation();
         assert!(prepared.distribution(&playing).is_err());
         assert_eq!(
