@@ -1,4 +1,4 @@
-//! A fixed-pool, externally reserved campaign over the genuine durable owner.
+//! An externally reserved fixed-pool segment over the genuine durable owner.
 //! The campaign layer adds no optimizer, record, artifact or owner wire format.
 use super::*;
 use crate::kernel::Kernel;
@@ -13,6 +13,7 @@ const CAMPAIGN_CAP: usize = 1024 * 1024;
 const EXCLUSION_CAP: usize = 16 * 1024 * 1024;
 const MAX_EXCLUSIONS: usize = 200_000;
 const PREFLIGHT_CAP: usize = 256 * 1024 * 1024;
+const SEAT_CAMPAIGN_SCHEMA: &str = "tzolkin-current-mixed-ready-seat-campaign-v1";
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -91,20 +92,29 @@ enum SavedStep {
         new_pool: Value,
         tip: SavedTip,
     },
+    SeatRotation {
+        spec: Value,
+        old_pool: Value,
+        new_pool: Value,
+        shifts: [u8; 2],
+        tip: SavedTip,
+    },
 }
 impl SavedStep {
     fn spec(&self) -> &Value {
         match self {
             Self::Segment { spec, .. }
             | Self::BudgetAmendment { spec, .. }
-            | Self::GuardedPoolFork { spec, .. } => spec,
+            | Self::GuardedPoolFork { spec, .. }
+            | Self::SeatRotation { spec, .. } => spec,
         }
     }
     fn tip(&self) -> &SavedTip {
         match self {
             Self::Segment { tip, .. }
             | Self::BudgetAmendment { tip, .. }
-            | Self::GuardedPoolFork { tip, .. } => tip,
+            | Self::GuardedPoolFork { tip, .. }
+            | Self::SeatRotation { tip, .. } => tip,
         }
     }
 }
@@ -115,6 +125,54 @@ struct Exclusions {
     file: InputPin,
     count: usize,
     family_digest: String,
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CampaignSeatRotation {
+    old_pool: Value,
+    new_pool: Value,
+    shifts: [u8; 2],
+}
+impl CampaignSeatRotation {
+    fn checked_pools(
+        &self,
+        predecessor_pool: &str,
+    ) -> Result<(CurrentMixedCollectionSpec, CurrentMixedCollectionSpec), String> {
+        let old = collection(&self.old_pool)?;
+        let new = collection(&self.new_pool)?;
+        segment::require_cyclic_seat_rotation(&old, &new, predecessor_pool, self.shifts)?;
+        Ok((old, new))
+    }
+}
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SeatCampaign {
+    schema: String,
+    // NoChange/Failed/Abandoned: cohorts, missing counts, callbacks, rows, singletons.
+    // This fixed host baseline includes historical failures; it is not owner authority.
+    non_updated_baseline: [[u64; 5]; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rotation: Option<CampaignSeatRotation>,
+}
+impl SeatCampaign {
+    fn require_baseline(&self, actual: CurrentMixedOwnDecisionCounters) -> Result<(), String> {
+        if self.schema != SEAT_CAMPAIGN_SCHEMA || own_rows(actual)[1..] != self.non_updated_baseline
+        {
+            return Err("Campaign cumulative non-updated baseline differs".into());
+        }
+        Ok(())
+    }
+}
+fn own_rows(c: CurrentMixedOwnDecisionCounters) -> [[u64; 5]; 4] {
+    [c.updated, c.no_change, c.failed, c.abandoned].map(|v| {
+        [
+            v.cohorts,
+            v.cohorts_without_counts,
+            v.own.callbacks,
+            v.own.candidate_rows,
+            v.own.singletons,
+        ]
+    })
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -131,6 +189,8 @@ struct CampaignWire {
     pool: Value,
     collections: Vec<Value>,
     exclusions: Exclusions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seat_campaign: Option<SeatCampaign>,
 }
 
 /// Checked campaign metadata. It cannot deserialize or construct a policy owner.
@@ -163,6 +223,12 @@ impl CurrentMixedCampaignSpec {
         {
             return Err("Campaign schema/finite segment/cohort limits".into());
         }
+        if wire.seat_campaign.is_some()
+            && (wire.steps.is_empty()
+                || matches!(wire.steps.first(), Some(SavedStep::SeatRotation { .. })))
+        {
+            return Err("Campaign seat guard requires an established global contract".into());
+        }
         run_spec(&wire.initial.run_spec)?;
         MixedOneBatchSpec::from_json(&encoded(&wire.original_mixed.spec)?)?;
         if let Bootstrap::Paired { spec, .. } = &wire.bootstrap {
@@ -172,14 +238,43 @@ impl CurrentMixedCampaignSpec {
         let mut pool_checksum = initial_pool.pool_checksum()?;
         for step in &wire.steps {
             segment_spec(step.spec())?;
-            if let SavedStep::GuardedPoolFork {
-                old_pool, new_pool, ..
-            } = step
-            {
-                if collection(old_pool)?.pool_checksum()? != pool_checksum {
-                    return Err("Campaign saved fork old pool differs".into());
+            match step {
+                SavedStep::GuardedPoolFork {
+                    old_pool, new_pool, ..
+                } => {
+                    if collection(old_pool)?.pool_checksum()? != pool_checksum {
+                        return Err("Campaign saved fork old pool differs".into());
+                    }
+                    pool_checksum = collection(new_pool)?.pool_checksum()?;
                 }
-                pool_checksum = collection(new_pool)?.pool_checksum()?;
+                SavedStep::SeatRotation {
+                    old_pool,
+                    new_pool,
+                    shifts,
+                    ..
+                } => {
+                    if wire.seat_campaign.is_none() {
+                        return Err("Campaign saved rotation requires its cumulative guard".into());
+                    }
+                    pool_checksum = segment::require_cyclic_seat_rotation(
+                        &collection(old_pool)?,
+                        &collection(new_pool)?,
+                        &pool_checksum,
+                        *shifts,
+                    )?;
+                }
+                _ => (),
+            }
+        }
+        if let Some(guard) = &wire.seat_campaign {
+            if guard.schema != SEAT_CAMPAIGN_SCHEMA {
+                return Err("Campaign seat guard schema differs".into());
+            }
+            if let Some(rotation) = &guard.rotation {
+                if wire.amend_budget {
+                    return Err("Campaign rotation and budget amendment are exclusive".into());
+                }
+                pool_checksum = rotation.checked_pools(&pool_checksum)?.1.pool_checksum()?;
             }
         }
         if collection(&wire.pool)?.pool_checksum()? != pool_checksum {
@@ -453,6 +548,7 @@ fn successor_metadata(
     previous: &MetadataTip,
     next: &MetadataTip,
     fork: bool,
+    rotation: bool,
 ) -> Result<(), String> {
     let binding = next
         .binding
@@ -473,6 +569,7 @@ fn successor_metadata(
         || binding.prefix != previous.progress.prefix
         || binding.next != previous.progress.next
         || binding.consumed.iter().cloned().collect::<BTreeSet<_>>() != previous.progress.consumed
+        || rotation == value["seatRotation"].is_null()
         || if fork {
             previous.progress.phase != Phase::Stopped
                 || previous.progress.unknown_work
@@ -490,6 +587,51 @@ fn successor_metadata(
     }
     Ok(())
 }
+fn require_established_seat_contract(
+    previous: &MetadataTip,
+    child_spec: &Value,
+) -> Result<(), String> {
+    let binding = previous
+        .binding
+        .as_ref()
+        .ok_or("Campaign seat guard requires an established global contract")?;
+    let previous = serde_json::to_value(binding).map_err(|e| e.to_string())?;
+    let child = serde_json::to_value(segment_spec(child_spec)?).map_err(|e| e.to_string())?;
+    if previous["contract"] != child["globalContract"] {
+        return Err("Campaign seat guard changes the established global contract".into());
+    }
+    Ok(())
+}
+fn rotation_metadata(
+    previous: &MetadataTip,
+    next: &MetadataTip,
+    old_pool: &str,
+    new_pool: &str,
+    shifts: [u8; 2],
+    cumulative_own: CurrentMixedOwnDecisionCounters,
+) -> Result<(), String> {
+    let binding = next
+        .binding
+        .as_ref()
+        .ok_or("Campaign native rotation binding missing")?;
+    let value = serde_json::to_value(binding).map_err(|e| e.to_string())?;
+    if previous.progress.outcome.as_deref() != Some("updated")
+        || previous.entry.pool != old_pool
+        || next.entry.pool != new_pool
+        || value["pool"] != new_pool
+        || value["seatRotation"]
+            != serde_json::json!({
+                "schema":"tzolkin-current-mixed-ready-seat-rotation-v1",
+                "predecessorPool":old_pool,"newPool":new_pool,"shifts":shifts,
+                "predecessorOutcome":"updated","predecessorOwnCounters":own_rows(cumulative_own)
+            })
+        || !value["poolFork"].is_null()
+        || !value["budgetAmendment"].is_null()
+    {
+        return Err("Campaign native seat rotation metadata differs".into());
+    }
+    Ok(())
+}
 
 struct Preflight {
     initial: MetadataTip,
@@ -497,8 +639,24 @@ struct Preflight {
     exclusions: BTreeSet<String>,
     configurations: Vec<[Config; 4]>,
     families: Vec<[String; 4]>,
+    cumulative_own: CurrentMixedOwnDecisionCounters,
 }
 impl CurrentMixedCampaignSpec {
+    fn require_seat_baseline(&self, actual: CurrentMixedOwnDecisionCounters) -> Result<(), String> {
+        if let Some(guard) = &self.wire.seat_campaign {
+            guard.require_baseline(actual)?;
+        }
+        Ok(())
+    }
+    fn require_live_seat_baseline(
+        &self,
+        session: &CurrentMixedTrainingSession<'_>,
+    ) -> Result<(), String> {
+        if let Some(guard) = &self.wire.seat_campaign {
+            guard.require_baseline(session.cumulative_own_decisions()?)?;
+        }
+        Ok(())
+    }
     fn require_input_pins(&self) -> Result<(), String> {
         self.wire.checkpoint.read(16 * 1024 * 1024)?;
         self.wire.dataset_manifest.read(16 * 1024 * 1024)?;
@@ -564,9 +722,12 @@ impl CurrentMixedCampaignSpec {
             &pool,
             false,
         )?;
+        let mut cumulative_own = initial.progress.own_decisions;
         let mut steps = Vec::new();
         for step in &self.wire.steps {
-            if let SavedStep::GuardedPoolFork { new_pool, .. } = step {
+            if let SavedStep::GuardedPoolFork { new_pool, .. }
+            | SavedStep::SeatRotation { new_pool, .. } = step
+            {
                 pool = collection(new_pool)?.pool_checksum()?;
             }
             let metadata = metadata_tip(step.tip(), step.spec(), &pool, true)?;
@@ -574,7 +735,28 @@ impl CurrentMixedCampaignSpec {
                 steps.last().unwrap_or(&initial),
                 &metadata,
                 matches!(step, SavedStep::GuardedPoolFork { .. }),
+                matches!(step, SavedStep::SeatRotation { .. }),
             )?;
+            if let SavedStep::SeatRotation {
+                old_pool,
+                new_pool,
+                shifts,
+                ..
+            } = step
+            {
+                require_established_seat_contract(steps.last().unwrap_or(&initial), step.spec())?;
+                rotation_metadata(
+                    steps.last().unwrap_or(&initial),
+                    &metadata,
+                    &collection(old_pool)?.pool_checksum()?,
+                    &collection(new_pool)?.pool_checksum()?,
+                    *shifts,
+                    cumulative_own,
+                )?;
+            }
+            if self.wire.seat_campaign.is_some() {
+                cumulative_own = cumulative_own.checked_add(metadata.progress.own_decisions)?;
+            }
             steps.push(metadata);
         }
         let latest = steps.last().unwrap_or(&initial);
@@ -584,6 +766,10 @@ impl CurrentMixedCampaignSpec {
         {
             return Err("Campaign predecessor must be the resolved updated Ready tip".into());
         }
+        if self.wire.seat_campaign.is_some() {
+            require_established_seat_contract(latest, &self.wire.segment_spec)?;
+        }
+        self.require_seat_baseline(cumulative_own)?;
         let exclusions_raw = self.wire.exclusions.file.read(EXCLUSION_CAP)?;
         let families: Vec<String> = closed(&exclusions_raw, EXCLUSION_CAP)?;
         if families.len() != self.wire.exclusions.count
@@ -643,6 +829,7 @@ impl CurrentMixedCampaignSpec {
             exclusions,
             configurations,
             families,
+            cumulative_own,
         })
     }
     fn protect_output(&self, output: &Path) -> Result<(), String> {
@@ -843,6 +1030,16 @@ pub fn current_mixed_campaign(
     let expected_reservation = spec.reservation(&pre)?;
     let child_spec = segment_spec(&spec.wire.segment_spec)?;
     let pool = collection(&spec.wire.pool)?;
+    let child_rotation = spec
+        .wire
+        .seat_campaign
+        .as_ref()
+        .and_then(|guard| guard.rotation.as_ref());
+    let child_pools = child_rotation
+        .map(|rotation| {
+            rotation.checked_pools(&pre.steps.last().unwrap_or(&pre.initial).entry.pool)
+        })
+        .transpose()?;
     let child = if command == "continue" {
         if head.is_some() || output.exists() {
             return Err("Campaign continue output must be new and has no child head".into());
@@ -873,7 +1070,24 @@ pub fn current_mixed_campaign(
         )?)
     };
     if let Some(child) = &child {
-        successor_metadata(pre.steps.last().unwrap_or(&pre.initial), child, false)?;
+        let previous = pre.steps.last().unwrap_or(&pre.initial);
+        successor_metadata(previous, child, false, child_rotation.is_some())?;
+        if let Some(rotation) = child_rotation {
+            rotation_metadata(
+                previous,
+                child,
+                &previous.entry.pool,
+                &pool.pool_checksum()?,
+                rotation.shifts,
+                pre.cumulative_own,
+            )?;
+        }
+        if spec.wire.seat_campaign.is_some() {
+            spec.require_seat_baseline(
+                pre.cumulative_own
+                    .checked_add(child.progress.own_decisions)?,
+            )?;
+        }
     }
     let completed = child
         .as_ref()
@@ -972,12 +1186,15 @@ pub fn current_mixed_campaign(
         &original.tip.directory,
     )?;
     let initial_pool = collection(&spec.wire.initial.pool)?;
-    let fork_pools = spec
+    let step_pools = spec
         .wire
         .steps
         .iter()
         .map(|step| match step {
             SavedStep::GuardedPoolFork {
+                old_pool, new_pool, ..
+            }
+            | SavedStep::SeatRotation {
                 old_pool, new_pool, ..
             } => Ok(Some((collection(old_pool)?, collection(new_pool)?))),
             _ => Ok(None),
@@ -988,7 +1205,7 @@ pub fn current_mixed_campaign(
         .steps
         .iter()
         .zip(&pre.steps)
-        .zip(&fork_pools)
+        .zip(&step_pools)
         .map(|((saved, metadata), pools)| {
             let tip = saved.tip().tip(&metadata.raw);
             let s = segment_spec(saved.spec())?;
@@ -1007,6 +1224,17 @@ pub fn current_mixed_campaign(
                         tip,
                     }
                 }
+                SavedStep::SeatRotation { shifts, .. } => {
+                    let (old_pool, new_pool) =
+                        pools.as_ref().ok_or("Campaign rotation pool missing")?;
+                    CurrentMixedRestoreStep::SeatRotation {
+                        spec: s,
+                        old_pool,
+                        new_pool,
+                        shifts: *shifts,
+                        tip,
+                    }
+                }
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -1017,7 +1245,18 @@ pub fn current_mixed_campaign(
             expected_sha256: digest,
             directory: &archive,
         };
-        steps.push(if spec.wire.amend_budget {
+        steps.push(if let Some(rotation) = child_rotation {
+            let (old_pool, new_pool) = child_pools
+                .as_ref()
+                .ok_or("Campaign child rotation pool missing")?;
+            CurrentMixedRestoreStep::SeatRotation {
+                spec: child_spec.clone(),
+                old_pool,
+                new_pool,
+                shifts: rotation.shifts,
+                tip,
+            }
+        } else if spec.wire.amend_budget {
             CurrentMixedRestoreStep::BudgetAmendment {
                 spec: child_spec.clone(),
                 tip,
@@ -1066,9 +1305,29 @@ pub fn current_mixed_campaign(
     {
         return Err("Campaign genuine restored owner differs from the reserved prefix".into());
     }
+    spec.require_live_seat_baseline(&session)?;
     if command == "continue" {
         let ready = session.into_ready_continuation()?;
-        session = if spec.wire.amend_budget {
+        session = if let Some(rotation) = child_rotation {
+            let (old_pool, new_pool) = child_pools
+                .as_ref()
+                .ok_or("Campaign child rotation pool missing")?;
+            ready.preflight_seat_rotation(
+                &child_spec,
+                old_pool,
+                new_pool,
+                rotation.shifts,
+                &archive,
+            )?;
+            CurrentMixedTrainingSession::new_seat_rotation_segment(
+                ready,
+                child_spec,
+                old_pool,
+                new_pool,
+                rotation.shifts,
+                &archive,
+            )?
+        } else if spec.wire.amend_budget {
             CurrentMixedTrainingSession::new_segment_with_budget_amendment(
                 ready, child_spec, &archive,
             )?
@@ -1090,6 +1349,11 @@ pub fn current_mixed_campaign(
         match session.update_whole_four_profiled(collection(value)?, &mut timing) {
             Ok(status) => {
                 timings.push(timing);
+                if let Err(error) = spec.require_live_seat_baseline(&session) {
+                    stop = "nonUpdatedBaselineChanged";
+                    failure = Some(bounded_error(&error));
+                    break;
+                }
                 if status.phase != Phase::Ready
                     || status.unknown_work_possible
                     || status.outcome.as_deref() != Some("updated")
@@ -1133,15 +1397,28 @@ pub fn current_mixed_campaign(
             publish_mixed_metadata(&output, name, &raw)?;
         }
     }
-    let report_raw = bytes(
-        &serde_json::json!({"schema":"tzolkin-current-mixed-campaign-report-v1","command":command,
+    let mut report_value = serde_json::json!({"schema":"tzolkin-current-mixed-campaign-report-v1","command":command,
         "campaignRawSha256":spec.raw_sha256,"allDeclaredFamiliesRemainSpent":true,"declaredCohorts":spec.wire.collections.len(),
         "prefixCohortsBefore":completed,"nativeCallsThisInvocation":timings.len(),"complete":complete,"stopReason":stop,"error":failure,
         "qualification":{"calls":1,"seconds":qualification_seconds},"restoreSeconds":restore_seconds,
         "invocationWallSeconds":began.elapsed().as_secs_f64(),"status":status,"attemptTimings":timings,
-        "phaseDecisionTimingAvailable":false,"freshTestAdmission":false,"strengthOrAdoptionAdmission":false}),
-        HEAD_CAP,
-    )?;
+        "phaseDecisionTimingAvailable":false,"freshTestAdmission":false,"strengthOrAdoptionAdmission":false});
+    if let Some(guard) = &spec.wire.seat_campaign {
+        let actual = own_rows(session.cumulative_own_decisions()?);
+        let transition = match (child_rotation, &child_pools) {
+            (Some(rotation), Some((old, new))) => serde_json::json!({
+                "oldPoolChecksum":old.pool_checksum()?,"newPoolChecksum":new.pool_checksum()?,
+                "shifts":rotation.shifts
+            }),
+            _ => Value::Null,
+        };
+        report_value["seatCampaign"] = serde_json::json!({
+            "schema":guard.schema,"expectedNonUpdatedBaseline":guard.non_updated_baseline,
+            "actualCumulativeOwnCounters":actual,"baselinePreserved":actual[1..]==guard.non_updated_baseline,
+            "rotation":transition
+        });
+    }
+    let report_raw = bytes(&report_value, HEAD_CAP)?;
     publish_mixed_metadata(&output, report, &report_raw)?;
     publish_mixed_metadata(
         &output,
@@ -1174,6 +1451,155 @@ mod tests {
     #[test]
     fn campaign_refuses_unaccounted_updated_suffix_and_forged_return() {
         // Only fabricated metadata: no Game, model, collection or fresh owner.
+        let mut inherited = CurrentMixedOwnDecisionCounters::default();
+        inherited.failed.cohorts = 1;
+        inherited.failed.own.callbacks = 11;
+        let mut guard = SeatCampaign {
+            schema: SEAT_CAMPAIGN_SCHEMA.into(),
+            non_updated_baseline: own_rows(inherited)[1..].try_into().unwrap(),
+            rotation: None,
+        };
+        guard.require_baseline(inherited).unwrap(); // Historical Failed is retained.
+        let guard_raw = encoded(&guard).unwrap();
+        let checked: SeatCampaign = closed(&guard_raw, CAMPAIGN_CAP).unwrap();
+        checked.require_baseline(inherited).unwrap();
+        assert!(unique_json(&guard_raw, CAMPAIGN_CAP).unwrap()["rotation"].is_null());
+        for row in 1..4 {
+            for column in 0..5 {
+                let mut changed = own_rows(inherited);
+                changed[row][column] += 1;
+                guard.non_updated_baseline = changed[1..].try_into().unwrap();
+                assert!(guard.require_baseline(inherited).is_err());
+            }
+        }
+        guard.non_updated_baseline = own_rows(inherited)[1..].try_into().unwrap();
+        for bucket in 0..3 {
+            let mut changed = inherited;
+            match bucket {
+                0 => changed.no_change.cohorts += 1,
+                1 => changed.failed.cohorts += 1,
+                _ => changed.abandoned.cohorts += 1,
+            }
+            assert!(guard.require_baseline(changed).is_err());
+        }
+        let mut updated = inherited;
+        updated.updated.cohorts = 2;
+        updated.updated.own.callbacks = 100;
+        guard.require_baseline(updated).unwrap(); // Only new Updated work is allowed.
+        guard.schema.push('x');
+        assert!(guard.require_baseline(inherited).is_err());
+        guard.schema = SEAT_CAMPAIGN_SCHEMA.into();
+        let mut overflow = inherited;
+        overflow.failed.own.callbacks = u64::MAX;
+        assert!(overflow.checked_add(inherited).is_err());
+        guard.non_updated_baseline = own_rows(overflow)[1..].try_into().unwrap();
+        let exact: SeatCampaign = closed(&encoded(&guard).unwrap(), CAMPAIGN_CAP).unwrap();
+        exact.require_baseline(overflow).unwrap(); // No JSON f64/u64 round-trip.
+        guard.non_updated_baseline = own_rows(inherited)[1..].try_into().unwrap();
+        let mut malformed = unique_json(&encoded(&guard).unwrap(), CAMPAIGN_CAP).unwrap();
+        malformed["nonUpdatedBaseline"][0][0] = serde_json::json!(0.5);
+        assert!(closed::<SeatCampaign>(&encoded(&malformed).unwrap(), CAMPAIGN_CAP).is_err());
+        malformed["nonUpdatedBaseline"] = serde_json::json!([[0, 0, 0, 0, 0], [0, 0, 0, 0, 0]]);
+        assert!(closed::<SeatCampaign>(&encoded(&malformed).unwrap(), CAMPAIGN_CAP).is_err());
+        let duplicate = format!(
+            "{{\"schema\":\"{SEAT_CAMPAIGN_SCHEMA}\",\"schema\":\"{SEAT_CAMPAIGN_SCHEMA}\",\"nonUpdatedBaseline\":[[0,0,0,0,0],[0,0,0,0,0],[0,0,0,0,0]]}}"
+        );
+        assert!(closed::<SeatCampaign>(duplicate.as_bytes(), CAMPAIGN_CAP).is_err());
+        let pin = InputPin {
+            path: "synthetic.json".into(),
+            bytes: 1,
+            sha256: "a".repeat(64),
+        };
+        let tip = SavedTip {
+            head: pin.clone(),
+            directory: "synthetic".into(),
+        };
+        let mut wire = CampaignWire {
+            schema: CAMPAIGN_SCHEMA.into(),
+            checkpoint: pin.clone(),
+            dataset_manifest: pin.clone(),
+            bootstrap: Bootstrap::Count1 {
+                checkpoint: pin.clone(),
+            },
+            original_mixed: OriginalMixed {
+                spec: Value::Null,
+                tip: tip.clone(),
+            },
+            initial: InitialDurable {
+                run_spec: Value::Null,
+                pool: Value::Null,
+                tip: tip.clone(),
+            },
+            steps: Vec::new(),
+            segment_spec: Value::Null,
+            amend_budget: false,
+            pool: Value::Null,
+            collections: Vec::new(),
+            exclusions: Exclusions {
+                file: pin,
+                count: 0,
+                family_digest: "b".repeat(64),
+            },
+            seat_campaign: None,
+        };
+        let legacy = encoded(&wire).unwrap();
+        assert!(
+            unique_json(&legacy, CAMPAIGN_CAP)
+                .unwrap()
+                .get("seatCampaign")
+                .is_none()
+        );
+        let legacy_roundtrip: CampaignWire = closed(&legacy, CAMPAIGN_CAP).unwrap();
+        assert_eq!(encoded(&legacy_roundtrip).unwrap(), legacy);
+        wire.seat_campaign = Some(guard);
+        let opted_in = encoded(&wire).unwrap();
+        let checked: CampaignWire = closed(&opted_in, CAMPAIGN_CAP).unwrap();
+        checked
+            .seat_campaign
+            .as_ref()
+            .unwrap()
+            .require_baseline(inherited)
+            .unwrap();
+        assert_ne!(sha(&opted_in), sha(&legacy));
+        wire.collections.push(Value::Null);
+        let empty_lineage = encoded(&wire).unwrap();
+        assert!(
+            CurrentMixedCampaignSpec::from_json(&empty_lineage, &sha(&empty_lineage))
+                .err()
+                .unwrap()
+                .contains("established global contract")
+        ); // Refused before any input file, reservation, or model can be touched.
+        wire.steps.push(SavedStep::SeatRotation {
+            spec: Value::Null,
+            old_pool: Value::Null,
+            new_pool: Value::Null,
+            shifts: [1, 2],
+            tip: tip.clone(),
+        });
+        let first_rotation = encoded(&wire).unwrap();
+        assert!(
+            CurrentMixedCampaignSpec::from_json(&first_rotation, &sha(&first_rotation))
+                .err()
+                .unwrap()
+                .contains("established global contract")
+        );
+        let step = SavedStep::SeatRotation {
+            spec: Value::Null,
+            old_pool: Value::Null,
+            new_pool: Value::Null,
+            shifts: [1, 2],
+            tip,
+        };
+        let step_raw = encoded(&step).unwrap();
+        let step: SavedStep = closed(&step_raw, CAMPAIGN_CAP).unwrap();
+        assert_eq!(step.spec(), &Value::Null);
+        assert_eq!(step.tip().head.sha256, "a".repeat(64));
+        let mut malformed = unique_json(&step_raw, CAMPAIGN_CAP).unwrap();
+        malformed["shifts"] = serde_json::json!([1, 2, 0]);
+        assert!(closed::<SavedStep>(&encoded(&malformed).unwrap(), CAMPAIGN_CAP).is_err());
+        malformed["shifts"] = serde_json::json!([1, 2]);
+        malformed["numericOwner"] = serde_json::json!({});
+        assert!(closed::<SavedStep>(&encoded(&malformed).unwrap(), CAMPAIGN_CAP).is_err());
         for name in [
             "run_1.json",
             "run 1.json",
@@ -1211,7 +1637,7 @@ mod tests {
             &BTreeSet::new(),
         );
         progress.attempts = 1;
-        let child = MetadataTip {
+        let mut child = MetadataTip {
             raw: Vec::new(),
             progress,
             reservations: Vec::new(),
@@ -1228,6 +1654,55 @@ mod tests {
             },
             directory: PathBuf::new(),
         };
+        assert!(
+            require_established_seat_contract(&child, &Value::Null)
+                .unwrap_err()
+                .contains("established global contract")
+        );
+        let global_contract = serde_json::json!({
+            "schema":"tzolkin-current-mixed-global-contract-v1",
+            "maxSegments":24,"maxAttempts":1000,"maxSuccessfulUpdates":1000,
+            "maxFamilies":4096,"maxCallbacks":1000000,"maxCandidateRows":1000000000,
+            "maxSearchSteps":100000,"maxDeclaredWorkBytes":1099511627776u64,
+            "maxLogicalRecordBytes":1099511627776u64,"maxStoredRecordBytes":1073741824,
+            "maxMetadataBytes":33554432,"maxTemporaryBytes":268435456,"maxDiskBytes":2147483648u64
+        });
+        let mut next_spec = serde_json::json!({
+            "schema":"tzolkin-current-mixed-segment-spec-v1",
+            "runSpec":{
+                "schema":SPEC_SCHEMA,"actor":OneStepConfig::default(),
+                "critic":ResidualFitConfig::new(1e-4,0.01,100).unwrap(),
+                "maxAttempts":64,"maxSuccessfulUpdates":64,"maxFamilies":4096,
+                "maxJournalEntries":1345,"maxMetadataBytes":33554432,"maxOutputBytes":1073741824,
+                "maxCallbacks":1000,"maxCandidateRows":1000000,"maxSearchSteps":10
+            },
+            "globalContract":global_contract
+        });
+        // This fabricated binding proves only the metadata refusal comparison.
+        child.binding = Some(
+            serde_json::from_value(serde_json::json!({
+                "chainRoot":"a".repeat(64),"index":1,"predecessorDirectory":"synthetic",
+                "predecessorSchema":JOURNAL_SCHEMA,"predecessorRoot":"a".repeat(64),
+                "predecessorSpec":"b".repeat(64),"predecessorHead":"c".repeat(64),
+                "predecessorSequence":1,"pool":"d".repeat(64),"parent":parent,
+                "prefix":[0,0],"next":0,"consumed":[],
+                "inherited":{"attempts":0,"successfulUpdates":0,
+                    "reservedWork":{"callbacks":0,"rows":0,"search":0,"bytes":0},
+                    "logicalRecordBytes":0,"storedRecordBytes":0,"metadataBytes":0},
+                "contract":global_contract,"contractChecksum":"e".repeat(64)
+            }))
+            .unwrap(),
+        );
+        require_established_seat_contract(&child, &next_spec).unwrap();
+        next_spec["globalContract"]["protectedDirectories"] = serde_json::json!([]);
+        require_established_seat_contract(&child, &next_spec).unwrap(); // Normalized default is unchanged.
+        next_spec["globalContract"]["maxAttempts"] = serde_json::json!(1001);
+        assert!(
+            require_established_seat_contract(&child, &next_spec)
+                .unwrap_err()
+                .contains("changes the established global contract")
+        );
+        child.binding = None;
         let directory = std::env::temp_dir().join(format!(
             "tzolkin-campaign-metadata-{}-{}",
             std::process::id(),
