@@ -2115,12 +2115,33 @@ pub struct NativeTeacherArenaReport {
 pub fn run_semantic_playing_snapshot_validation<'a>(
     config: &NumericArenaConfig,
     candidate: SemanticPlayingSnapshotArenaPolicy<'a>,
-    reference: SemanticPlayingSnapshotReference,
+    reference: SemanticPlayingSnapshotReference<'a>,
     pool: Vec<Opponent<'a>>,
 ) -> Result<SemanticPlayingSnapshotArenaReport, String> {
     let snapshot = candidate.snapshot;
+    let reference_prepared = match &reference {
+        SemanticPlayingSnapshotReference::SemanticHuman(policy) => Some(policy.prepared()),
+        _ => None,
+    };
     let result = (|| {
         snapshot.recheck()?;
+        if let Some(prepared) = reference_prepared {
+            prepared.recheck_sources()?;
+            let families = prepared
+                .reservations()
+                .keys()
+                .map(|table| crate::human_initial_wealth::table_family_id(table))
+                .collect::<Result<BTreeSet<_>, _>>()?;
+            if config
+                .seeds
+                .iter()
+                .any(|seed| families.contains(&family_id(*seed)))
+            {
+                return Err(
+                    "Semantic Human reference overlaps an original reserved table family".into(),
+                );
+            }
+        }
         candidate.validate_arena_config(config)?;
         if pool.len() != config.players || pool.iter().any(|p| matches!(p, Opponent::Search(_))) {
             return Err("Semantic snapshot Arena requires a fixed procedural/numeric pool".into());
@@ -2130,6 +2151,9 @@ pub fn run_semantic_playing_snapshot_validation<'a>(
                 Role::ResourceCycle(super::resource_cycle::ResourceCycleConfig::v5())
             }
             SemanticPlayingSnapshotReference::GuardedNumeric(policy) => Role::Numeric(*policy),
+            SemanticPlayingSnapshotReference::SemanticHuman(policy) => {
+                Role::ConditionalSemanticPlaying(policy)
+            }
         };
         let candidate = Role::SemanticSnapshot(Box::new(candidate));
         let pool = pool
@@ -2161,6 +2185,14 @@ pub fn run_semantic_playing_snapshot_validation<'a>(
             adoption_granted: false,
         })
     })();
+    let reference_post = reference_prepared.map_or(Ok(()), |p| p.recheck_sources());
+    let result = match (result, reference_post) {
+        (result, Ok(())) => result,
+        (result, Err(post)) => Err(format!(
+            "{}; Semantic Human reference postcheck: {post}",
+            result.err().unwrap_or_default()
+        )),
+    };
     match (result, snapshot.recheck()) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),

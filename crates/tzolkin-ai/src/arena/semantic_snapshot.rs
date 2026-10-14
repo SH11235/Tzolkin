@@ -1,5 +1,6 @@
 //! Read-only Arena borrowing a genuine current semantic actor snapshot.
 //! Snapshot custody and allocation closure grant no producer or strength claim.
+use super::conditional::SemanticPlayingConditionalPolicy;
 use super::numeric::{NumericArenaConfig, NumericArenaReport, NumericPolicy};
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::public_model::ValueValidity;
@@ -90,9 +91,12 @@ impl<'a> SemanticPlayingSnapshotArenaPolicy<'a> {
 }
 
 /// A separately identified fixed reference, never a snapshot/owner constructor.
-pub enum SemanticPlayingSnapshotReference {
+pub enum SemanticPlayingSnapshotReference<'a> {
     ResourceCycleV5,
     GuardedNumeric(Box<NumericPolicy>),
+    /// A genuine source-borrowed Human policy; only the concrete CLI can bind
+    /// this to the candidate journal's exact original BC source.
+    SemanticHuman(Box<SemanticPlayingConditionalPolicy<'a>>),
 }
 
 #[derive(Debug, Serialize)]

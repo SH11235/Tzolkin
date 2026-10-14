@@ -16,6 +16,7 @@ use crate::semantic_playing_rl_pool::SnapshotSlot;
 
 const RUN_SCHEMA: &str = "tzolkin-semantic-playing-journal-run-v1";
 const AUDIT_SCHEMA: &str = "tzolkin-semantic-playing-journal-audit-v1";
+const EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-journal-evaluation-v1";
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 
@@ -217,33 +218,8 @@ pub fn audit_semantic_playing_journal(
     output: &Path,
 ) -> Result<SemanticJournalAudit, String> {
     let w = &spec.wire;
-    if !output.is_absolute() {
-        return Err("Semantic audit output must be absolute".into());
-    }
+    let output = read_only_output(w, output)?;
     let directory = local(Path::new(&w.journal_directory), false)?;
-    let output = local(output, true)?;
-    if !output.is_absolute()
-        || output.to_string_lossy().len() > 1024
-        || directory.to_string_lossy().len() > 1024
-        || fs::symlink_metadata(&output).is_ok()
-    {
-        return Err("Semantic audit needs a fresh bounded output namespace".into());
-    }
-    // Compare existing canonical parents too: Windows path spelling/case must
-    // not allow an output child to be created inside the archived journal.
-    let canonical_directory = fs::canonicalize(&directory).map_err(|e| e.to_string())?;
-    let canonical_output = fs::canonicalize(output.parent().ok_or("Audit output parent")?)
-        .map_err(|e| e.to_string())?
-        .join(output.file_name().ok_or("Audit output name")?);
-    if canonical_output.starts_with(&canonical_directory)
-        || canonical_directory.starts_with(&canonical_output)
-    {
-        return Err("Semantic audit output overlaps journal".into());
-    }
-    reject_input_namespace(
-        &output,
-        &serde_json::to_value(w).map_err(|e| e.to_string())?,
-    )?;
     let external = w.original.external.load()?;
     let history = w.original.history.load()?;
     let pool = ConditionalFrozenPool::from_json(&pinned(&w.procedural_pool, MAX_CONTROL)?)?;
@@ -293,6 +269,264 @@ pub fn audit_semantic_playing_journal(
             result.err().unwrap_or_default()
         )),
     }
+}
+
+fn read_only_output(w: &AuditWire, output: &Path) -> Result<PathBuf, String> {
+    if !output.is_absolute() {
+        return Err("Semantic audit output must be absolute".into());
+    }
+    let directory = local(Path::new(&w.journal_directory), false)?;
+    let output = local(output, true)?;
+    if !output.is_absolute()
+        || output.to_string_lossy().len() > 1024
+        || directory.to_string_lossy().len() > 1024
+        || fs::symlink_metadata(&output).is_ok()
+    {
+        return Err("Semantic audit needs a fresh bounded output namespace".into());
+    }
+    // Compare existing canonical parents too: Windows path spelling/case must
+    // not allow an output child to be created inside the archived journal.
+    let canonical_directory = fs::canonicalize(&directory).map_err(|e| e.to_string())?;
+    let canonical_output = fs::canonicalize(output.parent().ok_or("Audit output parent")?)
+        .map_err(|e| e.to_string())?
+        .join(output.file_name().ok_or("Audit output name")?);
+    if canonical_output.starts_with(&canonical_directory)
+        || canonical_directory.starts_with(&canonical_output)
+    {
+        return Err("Semantic audit output overlaps journal".into());
+    }
+    reject_input_namespace(
+        &output,
+        &serde_json::to_value(w).map_err(|e| e.to_string())?,
+    )?;
+    Ok(output)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum EvaluationReference {
+    OriginalHuman4,
+    ResourceCycleV5,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EvaluationWire {
+    schema: String,
+    audit_control: ContentPin,
+    global_external: External,
+    players: usize,
+    seeds: Vec<u32>,
+    bootstrap_seed: u64,
+    reference: EvaluationReference,
+}
+pub struct SemanticJournalEvaluationSpec {
+    wire: EvaluationWire,
+    checksum: String,
+}
+impl SemanticJournalEvaluationSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if !checkpoint_digest(expected_sha256) || crate::model::digest(raw) != expected_sha256 {
+            return Err("Semantic evaluation control pin differs".into());
+        }
+        let wire: EvaluationWire =
+            serde_json::from_value(unique_json(raw, MAX_CONTROL)?).map_err(|e| e.to_string())?;
+        if wire.schema != EVALUATION_SCHEMA {
+            return Err("Semantic evaluation schema differs".into());
+        }
+        evaluation_config(&wire, Vec::new()).validate()?;
+        Ok(Self {
+            wire,
+            checksum: expected_sha256.into(),
+        })
+    }
+}
+fn evaluation_config(
+    w: &EvaluationWire,
+    families: Vec<String>,
+) -> crate::arena::numeric::NumericArenaConfig {
+    crate::arena::numeric::NumericArenaConfig {
+        schema: crate::arena::numeric::SCHEMA.into(),
+        players: w.players,
+        seeds: w.seeds.clone(),
+        bootstrap_seed: w.bootstrap_seed,
+        external_exclusions: crate::arena::numeric::ExternalExclusions {
+            evidence_sha256: w.global_external.pin.sha256.clone(),
+            excluded_family_ids: families,
+        },
+    }
+}
+fn load_evaluation_config(
+    w: &EvaluationWire,
+) -> Result<
+    (
+        ConditionalNativeExclusions,
+        crate::arena::numeric::NumericArenaConfig,
+    ),
+    String,
+> {
+    let raw = pinned(&w.global_external.pin, 32 * 1024 * 1024)?;
+    let global = w.global_external.load()?;
+    let mut wire = unique_json(&raw, 32 * 1024 * 1024)?;
+    let families = serde_json::from_value(wire["families"].take()).map_err(|e| e.to_string())?;
+    let config = evaluation_config(w, families);
+    config.validate()?;
+    Ok((global, config))
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticJournalEvaluation {
+    schema: &'static str,
+    control_sha256: String,
+    restoration: SemanticJournalAudit,
+    global_external: crate::conditional_human_rl_update::NativeExclusionDescriptor,
+    arena: crate::arena::semantic_snapshot::SemanticPlayingSnapshotArenaReport,
+}
+impl SemanticJournalEvaluation {
+    pub fn exit_code(&self) -> i32 {
+        if self.arena.paired.statistics.failed_games == 0
+            && self.arena.paired.blocks.iter().all(|b| b.complete)
+        {
+            0
+        } else {
+            1
+        }
+    }
+}
+fn evaluation_post<T>(
+    result: Result<T, String>,
+    checks: impl IntoIterator<Item = Result<(), String>>,
+) -> Result<T, String> {
+    let errors = checks
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        result
+    } else {
+        Err(format!(
+            "{}; evaluation POST: {}",
+            result.err().unwrap_or_default(),
+            errors.join("; ")
+        ))
+    }
+}
+/// Reconstruct the genuine current actor, evaluate fixed paired arms, then
+/// drop it. No owner/capture/stream/update is published or allocated.
+pub fn evaluate_semantic_playing_journal(
+    spec: SemanticJournalEvaluationSpec,
+    output: &Path,
+) -> Result<SemanticJournalEvaluation, String> {
+    use crate::arena::{numeric, resource_cycle::ResourceCycleConfig, semantic_snapshot};
+    let e = &spec.wire;
+    let raw = pinned(&e.audit_control, MAX_CONTROL)?;
+    let audit = SemanticJournalAuditSpec::from_json(&raw, &e.audit_control.sha256)?;
+    let w = &audit.wire;
+    let output = read_only_output(w, output)?;
+    reject_input_namespace(
+        &output,
+        &serde_json::to_value((&e.audit_control, &e.global_external)).map_err(|e| e.to_string())?,
+    )?;
+    let (global, config) = load_evaluation_config(e)?;
+    let external = w.original.external.load()?;
+    let history = w.original.history.load()?;
+    let pool = ConditionalFrozenPool::from_json(&pinned(&w.procedural_pool, MAX_CONTROL)?)?;
+    pool.procedural_binding()?;
+    let prepared = w.original.load_prepared()?;
+    let result = (|| {
+        let original = unique_json(
+            &pinned(&w.original.external.pin, 32 * 1024 * 1024)?,
+            32 * 1024 * 1024,
+        )?;
+        if original["families"]
+            .as_array()
+            .ok_or("Original family closure")?
+            .iter()
+            .any(|f| f.as_str().is_none_or(|f| !global.contains_family(f)))
+        {
+            return Err("Evaluation GLOBAL omits original external families".into());
+        }
+        let restored = restore_observed_closed(
+            Path::new(&w.journal_directory),
+            &w.restore.tip,
+            &w.restore.close_declaration,
+            w.original.fresh(&prepared, &external, &history)?,
+            &[&pool],
+        )?;
+        let (journal, snapshots) = restored.into_journal_and_snapshots();
+        let result = (|| {
+            if journal.limits != w.original.limits()?
+                || bounded(&journal.budget)? != bounded(&w.original.budget()?)?
+                || journal
+                    .session
+                    .consumed_families()
+                    .iter()
+                    .any(|f| !global.contains_family(f))
+            {
+                return Err("Evaluation original limits/budget or GLOBAL burns differ".into());
+            }
+            let restoration = audit_report(
+                audit.checksum,
+                &w.restore.close_declaration,
+                &journal,
+                &snapshots,
+            )?;
+            let arena =
+                journal.with_evaluation_snapshot(|snapshot| {
+                    let reference = match e.reference {
+                    EvaluationReference::OriginalHuman4 => {
+                        semantic_snapshot::SemanticPlayingSnapshotReference::SemanticHuman(Box::new(
+                            crate::arena::conditional::SemanticPlayingConditionalPolicy::new(
+                                &prepared,
+                                crate::arena::conditional::ConditionalSetup::CornFirst,
+                                crate::public_trade_guard::TradeGuardConfig::default(),
+                            )?,
+                        ))
+                    }
+                    EvaluationReference::ResourceCycleV5 => {
+                        semantic_snapshot::SemanticPlayingSnapshotReference::ResourceCycleV5
+                    }
+                };
+                    numeric::run_semantic_playing_snapshot_validation(
+                        &config,
+                        semantic_snapshot::SemanticPlayingSnapshotArenaPolicy::new(snapshot)?,
+                        reference,
+                        (0..config.players)
+                            .map(|_| numeric::Opponent::ResourceCycle(ResourceCycleConfig::v5()))
+                            .collect(),
+                    )
+                })?;
+            let report = SemanticJournalEvaluation {
+                schema: "tzolkin-semantic-playing-journal-evaluation-report-v1",
+                control_sha256: spec.checksum,
+                restoration,
+                global_external: global.descriptor().clone(),
+                arena,
+            };
+            fs::create_dir(&output).map_err(|e| e.to_string())?;
+            crate::model::write_new_json_bounded(
+                &output.join("evaluation.json"),
+                &report,
+                numeric::MAX_REPORT_BYTES,
+            )?;
+            Ok(report)
+        })();
+        evaluation_post(result, [journal.evaluation_recheck()])
+    })();
+    evaluation_post(
+        result,
+        [
+            prepared.recheck_sources(),
+            external.recheck(),
+            history.recheck(),
+            global.recheck(),
+            pinned(&w.original.checkpoint, 32 * 1024 * 1024).map(|_| ()),
+            pinned(&w.original.collection, META_BYTES).map(|_| ()),
+            pinned(&e.audit_control, MAX_CONTROL).map(|_| ()),
+            pinned(&w.procedural_pool, MAX_CONTROL).map(|_| ()),
+            pinned(&w.restore.close_declaration, META_BYTES).map(|_| ()),
+            pool.procedural_binding().map(|_| ()),
+        ],
+    )
 }
 
 pub(super) fn audit_report(
@@ -960,6 +1194,41 @@ pub(super) fn control_fixture(root: &Path, limits: CollectionLimits, seeds: [u32
     };
     assert!(parse_audit(&audit).is_ok());
     assert!(parse_audit(&value).is_err()); // No empty/current run-mode shortcut.
+    let validation = (0..10_000)
+        .find(|s| {
+            *s != 42 && split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Validation
+        })
+        .unwrap();
+    let test = (0..10_000)
+        .find(|s| split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Test)
+        .unwrap();
+    let mut evaluation = json!({"schema":EVALUATION_SCHEMA,"auditControl":external_pin,
+        "globalExternal":external,"players":3,"seeds":[validation],"bootstrapSeed":7,"reference":"originalHuman4"});
+    let parse_evaluation = |v: &Value| {
+        let raw = serde_json::to_vec(v).unwrap();
+        SemanticJournalEvaluationSpec::from_json(&raw, &crate::model::digest(&raw))
+    };
+    let mut evaluation_spec = parse_evaluation(&evaluation).unwrap(); // No restore authority.
+    let (_, config) = load_evaluation_config(&evaluation_spec.wire).unwrap();
+    assert_eq!(config.external_exclusions.excluded_family_ids, vec![family]);
+    evaluation_spec.wire.global_external.count = 2;
+    assert!(load_evaluation_config(&evaluation_spec.wire).is_err());
+    assert!(parse_evaluation(&audit).is_err());
+    assert!(parse_audit(&evaluation).is_err());
+    evaluation["reference"] = json!("resourceCycleV5");
+    assert!(parse_evaluation(&evaluation).is_ok());
+    evaluation["reference"] = json!("rawWeights");
+    assert!(parse_evaluation(&evaluation).is_err());
+    evaluation["reference"] = json!("originalHuman4");
+    evaluation["seeds"] = json!([test]);
+    assert!(parse_evaluation(&evaluation).is_err()); // No Test or Development shortcut.
+    evaluation["seeds"] = json!([validation, validation]);
+    assert!(parse_evaluation(&evaluation).is_err());
+    evaluation["seeds"] = json!([validation]);
+    evaluation["batches"] = json!([]);
+    assert!(parse_evaluation(&evaluation).is_err()); // No allocation or capture fields.
+    let error = evaluation_post::<()>(Err("callback".into()), [Err("archive".into())]).unwrap_err();
+    assert!(error.contains("callback") && error.contains("archive"));
     audit["batches"] = json!([]);
     assert!(parse_audit(&audit).is_err()); // Even an empty schedule is refused.
     audit.as_object_mut().unwrap().remove("batches");
