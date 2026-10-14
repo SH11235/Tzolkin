@@ -931,6 +931,268 @@ impl<'a> Role<'a> {
     }
 }
 
+// Optional measurements of the existing choice, never an alternative chooser.
+const MAX_V7_AGREEMENT_CONTEXTS: usize = 96;
+const V7_AGREEMENT_ACTION_KINDS: [&str; 27] = [
+    "place",
+    "remove",
+    "firstPlayer",
+    "beg",
+    "quickAction",
+    "endTurn",
+    "chooseTribe",
+    "chooseWealth",
+    "skip",
+    "selectSpace",
+    "technologyBonus",
+    "prophecyGain",
+    "prophecyTemple",
+    "useAction",
+    "technology",
+    "payment",
+    "temple",
+    "resource",
+    "build",
+    "monument",
+    "technologyExchange",
+    "trade",
+    "harvest",
+    "offering",
+    "rotate",
+    "tribeSell",
+    "tribeSkipSpace",
+];
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct V7AgreementCounts {
+    pub choices: usize,
+    pub raw_full_move_matches: usize,
+    pub effective_full_move_matches: usize,
+    pub raw_semantic_action_matches: usize,
+    pub effective_semantic_action_matches: usize,
+    pub raw_feature_alias_only: usize,
+    pub effective_feature_alias_only: usize,
+    pub guard_changed_move: usize,
+    pub funded_uxmal_eligible: usize,
+    pub funded_uxmal_raw_matches: usize,
+    pub funded_uxmal_effective_matches: usize,
+}
+impl V7AgreementCounts {
+    fn add(&mut self, other: &Self) {
+        self.choices += other.choices;
+        self.raw_full_move_matches += other.raw_full_move_matches;
+        self.effective_full_move_matches += other.effective_full_move_matches;
+        self.raw_semantic_action_matches += other.raw_semantic_action_matches;
+        self.effective_semantic_action_matches += other.effective_semantic_action_matches;
+        self.raw_feature_alias_only += other.raw_feature_alias_only;
+        self.effective_feature_alias_only += other.effective_feature_alias_only;
+        self.guard_changed_move += other.guard_changed_move;
+        self.funded_uxmal_eligible += other.funded_uxmal_eligible;
+        self.funded_uxmal_raw_matches += other.funded_uxmal_raw_matches;
+        self.funded_uxmal_effective_matches += other.funded_uxmal_effective_matches;
+    }
+}
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct V7ChoiceDescriptor {
+    pub kind: String,
+    pub gear: Option<String>,
+    pub target: String,
+}
+impl V7ChoiceDescriptor {
+    fn new(action: &tzolkin_core::observation::TypedAction) -> Result<Self, String> {
+        let value = serde_json::to_value(action).map_err(|e| e.to_string())?;
+        let mut target = serde_json::Map::new();
+        for key in [
+            "position",
+            "technology",
+            "temple",
+            "resource",
+            "id",
+            "kind",
+            "buy",
+            "direction",
+            "days",
+            "doubleAdvance",
+            "resources",
+            "tile",
+        ] {
+            if let Some(v) = value.get(key) {
+                target.insert(key.into(), v.clone());
+            }
+        }
+        let target = serde_json::to_string(&target).map_err(|e| e.to_string())?;
+        if target.len() > 256 {
+            return Err("Agreement target descriptor cap".into());
+        }
+        Ok(Self {
+            kind: value["type"]
+                .as_str()
+                .ok_or("Agreement action kind")?
+                .into(),
+            gear: value["gear"].as_str().map(str::to_owned),
+            target,
+        })
+    }
+}
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct V7AgreementContextKey {
+    pub players: usize,
+    pub actor: usize,
+    pub phase: String,
+    pub round_band: String,
+    pub first_turn: bool,
+    pub teacher: V7ChoiceDescriptor,
+    pub raw: V7ChoiceDescriptor,
+    pub effective: V7ChoiceDescriptor,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct V7AgreementContext {
+    pub key: V7AgreementContextKey,
+    pub counts: V7AgreementCounts,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct V7TeacherAgreement {
+    pub schema: String,
+    pub teacher_policy_version: String,
+    pub choices_attempted: usize,
+    pub measurement_errors: usize,
+    pub totals: V7AgreementCounts,
+    pub round_band_names: [&'static str; 3],
+    pub round_band_totals: [V7AgreementCounts; 3],
+    pub action_kind_names: [&'static str; 27],
+    pub teacher_action_kind_totals: [V7AgreementCounts; 27],
+    pub raw_action_kind_counts: [usize; 27],
+    pub effective_action_kind_counts: [usize; 27],
+    pub context_overflow_choices: usize,
+    pub contexts: Vec<V7AgreementContext>,
+}
+impl Default for V7TeacherAgreement {
+    fn default() -> Self {
+        Self {
+            schema: "tzolkin-native-v7-playing-choice-agreement-v1".into(),
+            teacher_policy_version: super::resource_cycle::V7_POLICY_VERSION.into(),
+            choices_attempted: 0,
+            measurement_errors: 0,
+            totals: V7AgreementCounts::default(),
+            round_band_names: ["early", "middle", "late"],
+            round_band_totals: std::array::from_fn(|_| V7AgreementCounts::default()),
+            action_kind_names: V7_AGREEMENT_ACTION_KINDS,
+            teacher_action_kind_totals: std::array::from_fn(|_| V7AgreementCounts::default()),
+            raw_action_kind_counts: [0; 27],
+            effective_action_kind_counts: [0; 27],
+            context_overflow_choices: 0,
+            contexts: Vec::new(),
+        }
+    }
+}
+impl V7TeacherAgreement {
+    /// All counts describe requested/effective choices before Core apply. Failed
+    /// games retain attempted diagnostics and receive no accepted-label claim.
+    fn record(&mut self, o: &Observation, raw: usize, effective: usize) {
+        self.choices_attempted += 1;
+        if self.record_checked(o, raw, effective).is_err() {
+            // An advisory failure must not alter the actual policy or outcome.
+            self.measurement_errors += 1;
+        }
+    }
+    fn record_checked(
+        &mut self,
+        o: &Observation,
+        raw: usize,
+        effective: usize,
+    ) -> Result<(), String> {
+        if o.phase != Phase::Playing {
+            return Err("Agreement requires Playing".into());
+        }
+        let teacher = super::resource_cycle::choose_move(
+            o,
+            &super::resource_cycle::ResourceCycleConfig::v7(),
+        )?;
+        let ti = o
+            .legal_actions
+            .iter()
+            .position(|a| a.r#move == teacher.r#move)
+            .ok_or("Shadow teacher returned no legal row")?;
+        let t = &o.legal_actions[ti];
+        let r = o.legal_actions.get(raw).ok_or("Raw agreement index")?;
+        let e = o
+            .legal_actions
+            .get(effective)
+            .ok_or("Effective agreement index")?;
+        let encoder = crate::features::FeatureEncoder::new_semantic_playing(o)?;
+        let tf = encoder.encode_legal(ti)?;
+        let same_bits = |index| -> Result<bool, String> {
+            Ok(encoder
+                .encode_legal(index)?
+                .iter()
+                .zip(&tf)
+                .all(|(a, b)| a.to_bits() == b.to_bits()))
+        };
+        let raw_full = r.r#move == t.r#move;
+        let effective_full = e.r#move == t.r#move;
+        let opening = crate::setup_policy::first_uxmal_opening(o);
+        let counts = V7AgreementCounts {
+            choices: 1,
+            raw_full_move_matches: usize::from(raw_full),
+            effective_full_move_matches: usize::from(effective_full),
+            raw_semantic_action_matches: usize::from(r.action == t.action),
+            effective_semantic_action_matches: usize::from(e.action == t.action),
+            raw_feature_alias_only: usize::from(!raw_full && same_bits(raw)?),
+            effective_feature_alias_only: usize::from(!effective_full && same_bits(effective)?),
+            guard_changed_move: usize::from(r.r#move != e.r#move),
+            funded_uxmal_eligible: usize::from(opening.is_some()),
+            funded_uxmal_raw_matches: usize::from(opening.is_some_and(|a| a.r#move == r.r#move)),
+            funded_uxmal_effective_matches: usize::from(
+                opening.is_some_and(|a| a.r#move == e.r#move),
+            ),
+        };
+        let round_band = if o.round <= 9 {
+            0
+        } else if o.round <= 18 {
+            1
+        } else {
+            2
+        };
+        let key = V7AgreementContextKey {
+            players: o.players.len(),
+            actor: o.actor,
+            phase: "playing".into(),
+            round_band: self.round_band_names[round_band].into(),
+            first_turn: o.round == 1 && o.turn_index == 0,
+            teacher: V7ChoiceDescriptor::new(&t.action)?,
+            raw: V7ChoiceDescriptor::new(&r.action)?,
+            effective: V7ChoiceDescriptor::new(&e.action)?,
+        };
+        let kind_index = |kind: &str| {
+            V7_AGREEMENT_ACTION_KINDS
+                .iter()
+                .position(|known| *known == kind)
+                .ok_or("Unknown agreement action kind")
+        };
+        let teacher_kind = kind_index(&key.teacher.kind)?;
+        let raw_kind = kind_index(&key.raw.kind)?;
+        let effective_kind = kind_index(&key.effective.kind)?;
+        // These fixed-size marginals stay exact even if detailed contexts fill.
+        self.totals.add(&counts);
+        self.round_band_totals[round_band].add(&counts);
+        self.teacher_action_kind_totals[teacher_kind].add(&counts);
+        self.raw_action_kind_counts[raw_kind] += 1;
+        self.effective_action_kind_counts[effective_kind] += 1;
+        if let Some(context) = self.contexts.iter_mut().find(|c| c.key == key) {
+            context.counts.add(&counts);
+        } else if self.contexts.len() < MAX_V7_AGREEMENT_CONTEXTS {
+            self.contexts.push(V7AgreementContext { key, counts });
+        } else {
+            self.context_overflow_choices += 1;
+        }
+        Ok(())
+    }
+}
+
 /// Choices are observed before core apply. No applied-choice count is inferred
 /// on a failed game; callbacks/rows include attempted work before that failure.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -950,6 +1212,8 @@ pub struct GuardDiagnostics {
     pub conditional: Option<ConditionalDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub phase_routes: Option<PhaseRouteDiagnostics>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub v7_teacher_agreement: Option<V7TeacherAgreement>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1178,6 +1442,19 @@ fn choose(
             Role::PhaseRouted(policy) => session.choose_phase_routed(index, observation, policy)?,
             _ => return Err("Conditional Arena game session/role mismatch".into()),
         };
+        if let Some(agreement) = d.v7_teacher_agreement.as_mut() {
+            match observation
+                .legal_actions
+                .iter()
+                .position(|a| a.r#move == result.decision.r#move)
+            {
+                Some(effective) => agreement.record(observation, result.requested_index, effective),
+                None => {
+                    agreement.choices_attempted += 1;
+                    agreement.measurement_errors += 1;
+                }
+            }
+        }
         d.choices_returned += 1;
         d.candidate_rows_returned += observation.legal_actions.len();
         if let Some(routes) = d.phase_routes.as_mut() {
@@ -1535,9 +1812,14 @@ fn play_arm_using_with_setup<'a>(
                 ..GuardDiagnostics::default()
             }),
             Role::Teacher(_) | Role::SemanticSetupTeacher(_) => Some(GuardDiagnostics::default()),
-            Role::NativePlayingTeacher(_)
-            | Role::SemanticSnapshot(_)
-            | Role::SemanticCheckpoint(_) => Some(GuardDiagnostics {
+            Role::NativePlayingTeacher(policy) => Some(GuardDiagnostics {
+                v7_teacher_agreement: policy
+                    .v7_agreement_diagnostics
+                    .then(V7TeacherAgreement::default),
+                phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
+                ..GuardDiagnostics::default()
+            }),
+            Role::SemanticSnapshot(_) | Role::SemanticCheckpoint(_) => Some(GuardDiagnostics {
                 phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
                 ..GuardDiagnostics::default()
             }),
@@ -3983,6 +4265,81 @@ pub(super) mod tests {
                     let o = observe(&state, state.current_player)?;
                     assert_eq!(o.phase, Phase::Playing);
                     assert_app_parity(&o)?;
+                    // No extra game or NN prediction: exercise the same legal
+                    // callback counters and prove advisory failures stay local.
+                    let shadow = super::super::resource_cycle::choose_move(
+                        &o,
+                        &super::super::resource_cycle::ResourceCycleConfig::v7(),
+                    )?;
+                    let target = o
+                        .legal_actions
+                        .iter()
+                        .position(|a| a.r#move == shadow.r#move)
+                        .unwrap();
+                    let mut agreement = V7TeacherAgreement::default();
+                    agreement.record(&o, target, target);
+                    assert_eq!(agreement.measurement_errors, 0);
+                    assert_eq!(agreement.totals.raw_full_move_matches, 1);
+                    assert_eq!(agreement.totals.effective_full_move_matches, 1);
+                    assert_eq!(agreement.totals.raw_feature_alias_only, 0);
+                    let mut funded = state.clone();
+                    let actor = funded.current_player;
+                    funded.players[actor]
+                        .resources
+                        .insert(tzolkin_core::Resource::Corn, 30);
+                    let funded = observe(&funded, actor)?;
+                    let opening = crate::setup_policy::first_uxmal_opening(&funded).unwrap();
+                    let opening_index = funded
+                        .legal_actions
+                        .iter()
+                        .position(|a| a.r#move == opening.r#move)
+                        .unwrap();
+                    let other = funded
+                        .legal_actions
+                        .iter()
+                        .position(|a| a.r#move != opening.r#move)
+                        .unwrap();
+                    let mut first_turn = V7TeacherAgreement::default();
+                    first_turn.record(&funded, opening_index, opening_index);
+                    first_turn.record(&funded, other, other);
+                    assert_eq!(first_turn.measurement_errors, 0);
+                    assert_eq!(first_turn.totals.funded_uxmal_eligible, 2);
+                    assert_eq!(first_turn.totals.funded_uxmal_raw_matches, 1);
+                    assert_eq!(first_turn.totals.funded_uxmal_effective_matches, 1);
+                    assert_eq!(first_turn.round_band_totals[0].choices, 2);
+                    assert_eq!(first_turn.round_band_totals[1].choices, 0);
+                    assert_eq!(
+                        first_turn
+                            .teacher_action_kind_totals
+                            .iter()
+                            .map(|counts| counts.choices)
+                            .sum::<usize>(),
+                        2
+                    );
+                    assert_eq!(first_turn.raw_action_kind_counts.iter().sum::<usize>(), 2);
+                    // Synthetic full buffer, not captured game/state evidence:
+                    // coarse marginals must still count the next real callback.
+                    let mut overflow = V7TeacherAgreement::default();
+                    let mut sentinel = first_turn.contexts[0].clone();
+                    sentinel.key.phase = "fixture-buffer".into();
+                    overflow.contexts = vec![sentinel; MAX_V7_AGREEMENT_CONTEXTS];
+                    overflow.record(&funded, opening_index, opening_index);
+                    assert_eq!(overflow.context_overflow_choices, 1);
+                    assert_eq!(overflow.round_band_totals[0].choices, 1);
+                    assert_eq!(
+                        overflow
+                            .teacher_action_kind_totals
+                            .iter()
+                            .map(|counts| counts.choices)
+                            .sum::<usize>(),
+                        1
+                    );
+                    agreement.record(&o, usize::MAX, target);
+                    assert_eq!(agreement.choices_attempted, 2);
+                    assert_eq!(agreement.measurement_errors, 1);
+                    assert_eq!(agreement.totals.choices, 1);
+                    let legacy = serde_json::to_value(GuardDiagnostics::default()).unwrap();
+                    assert!(legacy.get("v7TeacherAgreement").is_none());
                     if players == 4 {
                         let mut preview = state.clone();
                         let actor = preview.current_player;

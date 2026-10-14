@@ -41,6 +41,7 @@ enum Baseline {
 enum InputSchema {
     V5,
     V7,
+    V7Agreement,
 }
 impl TryFrom<String> for InputSchema {
     type Error = &'static str;
@@ -48,6 +49,7 @@ impl TryFrom<String> for InputSchema {
         match schema.as_str() {
             "tzolkin-native-playing4-teacher-arena-input-v1" => Ok(Self::V5),
             "tzolkin-native-playing4-v7-teacher-arena-input-v1" => Ok(Self::V7),
+            "tzolkin-native-playing4-v7-agreement-diagnostic-input-v1" => Ok(Self::V7Agreement),
             _ => Err("Native teacher input schema/absolute-seat roster mismatch"),
         }
     }
@@ -60,7 +62,9 @@ impl InputSchema {
     ) -> Result<PreparedSemanticPlayingTeacher, String> {
         match self {
             Self::V5 => PreparedSemanticPlayingTeacher::load(checkpoint, dataset),
-            Self::V7 => PreparedSemanticPlayingTeacher::load_v7(checkpoint, dataset),
+            Self::V7 | Self::V7Agreement => {
+                PreparedSemanticPlayingTeacher::load_v7(checkpoint, dataset)
+            }
         }
     }
 }
@@ -72,6 +76,18 @@ struct Input {
     consent: Option<NativeTeacherDiagnosticConsent>,
     reference: Reference,
     opponent_pool: Vec<Baseline>,
+}
+impl Input {
+    fn agreement_mode(&self) -> Result<bool, String> {
+        let enabled = self.schema == InputSchema::V7Agreement;
+        if enabled && (self.consent.is_none() || self.config.seeds.len() > 4) {
+            return Err(
+                "V7 agreement requires exposed Development consent and at most four families"
+                    .into(),
+            );
+        }
+        Ok(enabled)
+    }
 }
 struct Pin {
     path: PathBuf,
@@ -204,6 +220,7 @@ fn run() -> Result<(), String> {
         Some(c) => c.validate_for(&input.config)?,
         None => input.config.validate()?,
     }
+    let agreement = input.agreement_mode()?;
     let mut pins = vec![pin];
     let prepared = input
         .schema
@@ -220,20 +237,19 @@ fn run() -> Result<(), String> {
             .iter()
             .map(|b| baseline(b, &mut pins))
             .collect::<Result<Vec<_>, _>>()?;
+        let candidate = prepared.arena_handle()?;
+        let candidate = if agreement {
+            candidate.with_v7_agreement_diagnostics()?
+        } else {
+            candidate
+        };
         match &input.consent {
-            Some(c) => run_native_playing_teacher_diagnostic(
-                &input.config,
-                c,
-                prepared.arena_handle()?,
-                reference,
-                pool,
-            ),
-            None => run_native_playing_teacher_validation(
-                &input.config,
-                prepared.arena_handle()?,
-                reference,
-                pool,
-            ),
+            Some(c) => {
+                run_native_playing_teacher_diagnostic(&input.config, c, candidate, reference, pool)
+            }
+            None => {
+                run_native_playing_teacher_validation(&input.config, candidate, reference, pool)
+            }
         }
     })();
     let mut post = Ok(());
@@ -312,6 +328,10 @@ mod tests {
             assert_eq!(parsed.opponent_pool.len(), 3);
             assert!(parsed.consent.is_none());
         }
+        control["schema"] = "tzolkin-native-playing4-v7-agreement-diagnostic-input-v1".into();
+        let diagnostic: Input = serde_json::from_value(control.clone()).unwrap();
+        assert_eq!(diagnostic.schema, InputSchema::V7Agreement);
+        assert!(diagnostic.agreement_mode().is_err()); // no consent, no loading
         control["schema"] = "tzolkin-native-playing4-v8-teacher-arena-input-v1".into();
         assert!(serde_json::from_value::<Input>(control.clone()).is_err());
         control["schema"] =
