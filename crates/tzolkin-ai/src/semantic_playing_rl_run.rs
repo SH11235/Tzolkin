@@ -905,6 +905,9 @@ struct Wire {
     chunk: Option<Chunk>,
     #[serde(default, skip_serializing_if = "disabled")]
     checkpoint_on_completion: bool,
+    /// Advisory invocation output only; excluded from the allocation/learning plan.
+    #[serde(default, skip_serializing_if = "disabled")]
+    signal_diagnostics: bool,
 }
 fn disabled(value: &bool) -> bool {
     !value
@@ -1026,6 +1029,8 @@ pub struct SemanticJournalInvocation {
     verified_native_policy: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     checkpoint: Option<ContentPin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal_diagnostics: Option<ContentPin>,
 }
 impl SemanticJournalInvocation {
     pub fn exit_code(&self) -> i32 {
@@ -1168,6 +1173,7 @@ pub fn run_semantic_playing_journal(
     fs::create_dir(&output).map_err(|e| e.to_string())?;
     let mut aliases = BTreeMap::new();
     let mut returns = Vec::new();
+    let mut signal_rows = Vec::new();
     let mut last_library_return = None;
     let mut last_returned_pin = None;
     // Lookup metadata is cached once from genuine captures. Warm alias lookup
@@ -1200,7 +1206,7 @@ pub fn run_semantic_playing_journal(
                 };
                 aliases.insert(alias.clone(), id);
             }
-            let close = if batch.slots.is_empty() {
+            let mut close = if batch.slots.is_empty() {
                 journal.update_procedural_whole_four(batch.seeds, &pool)?
             } else {
                 let slots = batch
@@ -1223,6 +1229,8 @@ pub fn run_semantic_playing_journal(
                 let mixture = SemanticFrozenMixture::new(&pool, slots)?;
                 journal.update_mixed_whole_four(batch.seeds, &mixture)?
             };
+            let signals = close.signals.take();
+            let signal_report = close.report.clone();
             let no_change = close.resolution == SemanticJournalResolution::NoChange;
             let name = format!("returned-{:04}.json", close.attempt);
             last_library_return = Some(close);
@@ -1231,7 +1239,12 @@ pub fn run_semantic_playing_journal(
             publish_mixed_metadata(&output, &name, &raw)?;
             let pin = Pin::new(&name, &raw).absolute(&output);
             last_returned_pin = Some(pin.clone());
-            returns.push(pin);
+            returns.push(pin.clone());
+            if w.signal_diagnostics {
+                let signals = signals.ok_or("Returned semantic close lacks same-pass signals")?;
+                signal_rows.push(json!({"returnedClose":pin,
+                    "report":signal_report,"signals":signals}));
+            }
             // Source/global-prior/output failures stop before another attempt.
             recheck_inputs(w, &prior, &prior_history)?;
             if no_change {
@@ -1241,6 +1254,19 @@ pub fn run_semantic_playing_journal(
         Ok(true)
     })();
     let mut error = result.as_ref().err().cloned();
+    let mut signal_diagnostics = None;
+    if w.signal_diagnostics {
+        match publish_signal_diagnostics(&output, &spec.checksum, w.batches.len(), &signal_rows) {
+            Ok(pin) => signal_diagnostics = Some(pin),
+            Err(post) => {
+                error = Some(format!(
+                    "{}; signal diagnostics: {post}",
+                    error.unwrap_or_default()
+                ))
+            }
+        }
+    }
+    // Sidecar publication errors still pass through all archive/source POST checks.
     let full_bytes = journal.verify_archive_bytes();
     if let Err(post) = &full_bytes {
         error = Some(format!(
@@ -1310,6 +1336,7 @@ pub fn run_semantic_playing_journal(
         source_qualified: false,
         verified_native_policy: false,
         checkpoint,
+        signal_diagnostics,
     };
     let raw = bounded(&report)?;
     // On a late IO failure the CLI still receives exact accounting to print.
@@ -1332,6 +1359,28 @@ pub fn run_semantic_playing_journal(
         });
     }
     Ok(report)
+}
+
+fn publish_signal_diagnostics(
+    output: &Path,
+    control: &str,
+    planned_batches: usize,
+    rows: &[Value],
+) -> Result<ContentPin, String> {
+    if !(1..=64).contains(&planned_batches) || rows.len() > planned_batches {
+        return Err("Semantic signal diagnostics row bound".into());
+    }
+    let mut value = json!({"schema":"tzolkin-semantic-playing-signal-diagnostics-v1",
+        "scope":"samePassReturnedLibraryClosesOnly","controlSha256":control,
+        "plannedBatches":planned_batches,"returnedRows":rows.len(),"rows":rows,
+        "sourceAuthenticated":false,"strengthMeasured":false,"adoptionGranted":false,"checksum":""});
+    value["checksum"] = hash(b"semantic-playing-signal-diagnostics-v1\0", &value)?.into();
+    let raw = bounded(&value)?;
+    if raw.len() > MAX_CONTROL {
+        return Err("Semantic signal diagnostics byte bound".into());
+    }
+    publish_mixed_metadata(output, "diagnostics.json", &raw)?;
+    Ok(Pin::new("diagnostics.json", &raw).absolute(output))
 }
 
 fn valid_alias(alias: &str) -> bool {
@@ -1667,6 +1716,48 @@ pub(super) fn control_fixture(
         SemanticJournalRunSpec::from_json(&raw, &crate::model::digest(&raw))
     };
     let spec = parse(&value).unwrap();
+    assert!(!spec.wire.signal_diagnostics);
+    let old_wire = serde_json::to_vec(&spec.wire).unwrap();
+    let mut signal_control = value.clone();
+    signal_control["signalDiagnostics"] = false.into();
+    assert_eq!(
+        serde_json::to_vec(&parse(&signal_control).unwrap().wire).unwrap(),
+        old_wire
+    );
+    signal_control["signalDiagnostics"] = true.into();
+    assert_eq!(
+        plan_checksum(&parse(&signal_control).unwrap().wire).unwrap(),
+        plan_checksum(&spec.wire).unwrap()
+    );
+    let signals_output = root.join("signal-diagnostics-fixture");
+    fs::create_dir(&signals_output).unwrap();
+    let rows = [json!({"report":returned.report,"signals":returned.signals.as_ref().unwrap()})];
+    let signals_pin =
+        publish_signal_diagnostics(&signals_output, &spec.checksum, 1, &rows).unwrap();
+    let mut signals = unique_json(&fs::read(&signals_pin.path).unwrap(), MAX_CONTROL).unwrap();
+    let checksum = signals["checksum"].take();
+    signals["checksum"] = "".into();
+    assert_eq!(
+        checksum.as_str().unwrap(),
+        hash(b"semantic-playing-signal-diagnostics-v1\0", &signals).unwrap()
+    );
+    assert_eq!(signals["rows"], json!(rows));
+    assert_eq!(signals["controlSha256"], spec.checksum);
+    let core = unique_json(&fs::read(&returned.report.path).unwrap(), META_BYTES).unwrap();
+    assert_eq!(
+        signals["rows"][0]["signals"]["reportChecksum"],
+        core["checksum"]
+    );
+    assert_eq!(signals["rows"][0]["signals"]["next"], core["next"]);
+    assert!(core.get("signals").is_none());
+    assert!(
+        serde_json::to_value(returned)
+            .unwrap()
+            .get("signals")
+            .is_none()
+    );
+    assert!(publish_signal_diagnostics(&signals_output, &spec.checksum, 1, &rows).is_err());
+    assert!(publish_signal_diagnostics(&signals_output, &spec.checksum, 65, &rows).is_err());
     assert!(
         serde_json::to_value(&spec.wire.original)
             .unwrap()

@@ -187,6 +187,8 @@ pub(crate) trait PhaseTimer {
     fn enter(&mut self, phase: TimedPhase) -> Self::Span;
     fn returned(&mut self, span: Self::Span, error: bool);
     fn game(&mut self, _: TimedGame<'_>) {}
+    fn actor_member(&mut self, _index: usize, _learner: usize, _players: usize) {}
+    fn actor_signal(&mut self, _target: f64, _baseline: f64, _candidates: usize) {}
     fn enter_conditional(&mut self, _: ConditionalTimedPhase) -> Self::Span {
         self.enter(TimedPhase::Preflight)
     }
@@ -943,6 +945,7 @@ pub(crate) fn accumulate_step_with_baseline_timed_for_profile<
         }
         Ok(value)
     })?;
+    timer.actor_signal(target, baseline, count);
     let mut dlogits = vec![0.0; count];
     timed(timer, TimedPhase::ActorTrace, |_| {
         likelihood.weighted_logit_gradient(likelihood.smooth(), target - baseline, &mut dlogits)

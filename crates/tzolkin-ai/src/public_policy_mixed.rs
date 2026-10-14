@@ -615,7 +615,8 @@ pub(crate) fn prepare_numeric_timed_for_profile<T: PhaseTimer, S: NumericActorSt
     let mut gradient = vec![0.0; public_model::PARAMETER_COUNT];
     let mut observed = [0; 3];
     let mut deltas = Deltas::default();
-    for e in members {
+    for (index, e) in members.iter().enumerate() {
+        timer.actor_member(index, e.learner, e.players);
         let mut own = vec![0.0; public_model::PARAMETER_COUNT];
         for step in &e.steps {
             if step.actor() != e.learner || step.observation().players.len() != e.players {
