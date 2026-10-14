@@ -738,33 +738,54 @@ impl<'a> SemanticPlayingJointSession<'a> {
         self.admit_with_pool(proposal, None)
     }
     fn prepare_admission(
-        &mut self,
+        &self,
         mut proposal: JointProposal,
         mixture: Option<&SemanticFrozenMixture<'_>>,
     ) -> Result<PreparedSemanticAdmission, String> {
-        if proposal.report.parent != self.identity.checksum()
+        let admitted = Self::prepare_admission_metadata(
+            &self.identity,
+            &self.ledger,
+            self.attempt_base,
+            &mut proposal,
+            mixture,
+        )?;
+        let owner = self.state.view(self.identity.checksum());
+        if let Some(mixture) = mixture {
+            self.ledger
+                .recheck_with_pool(&owner, PoolRef::Mixture(mixture))?;
+        } else {
+            self.ledger.recheck(&owner)?;
+        }
+        Ok(PreparedSemanticAdmission { proposal, admitted })
+    }
+    fn prepare_admission_metadata(
+        identity: &SemanticPlayingCurrentIdentity,
+        ledger: &SemanticCollectionLedger<'_>,
+        attempt_base: u64,
+        proposal: &mut JointProposal,
+        mixture: Option<&SemanticFrozenMixture<'_>>,
+    ) -> Result<BTreeSet<String>, String> {
+        if proposal.report.parent != identity.checksum()
             || proposal
                 .report
                 .families
                 .iter()
-                .any(|f| !self.ledger.consumed_families().contains(f))
-            || proposal.identity.previous != self.identity.checksum()
-            || proposal.identity.attempts != self.attempt_base + self.ledger.attempts() as u64
-            || proposal.identity.next != self.ledger.next_episode_ordinal()
+                .any(|f| !ledger.consumed_families().contains(f))
+            || proposal.identity.previous != identity.checksum()
+            || proposal.identity.attempts != attempt_base + ledger.attempts() as u64
+            || proposal.identity.next != ledger.next_episode_ordinal()
             || proposal.report.mixture.as_deref() != mixture.map(SemanticFrozenMixture::checksum)
         {
-            self.ledger.stop();
             return Err("Semantic joint proposal differs from the current reserved parent".into());
         }
-        // No proposal can escape the source-postchecked collection continuation.
-        // Final metadata is fallible and must precede the single state commit.
-        let admitted = self
-            .ledger
-            .prepare_admitted(self.identity.checksum(), proposal.identity.checksum())?;
+        // This only prepares metadata. Source-checked callers retain custody
+        // until their POST, and no identity is admitted until the later commit.
+        let admitted =
+            ledger.prepare_admitted(identity.checksum(), proposal.identity.checksum())?;
         let report = &mut proposal.report;
         report.attempts = usize::try_from(proposal.identity.attempts)
             .map_err(|_| "Semantic cumulative report attempt overflow")?;
-        report.next_ordinal = self.ledger.next_episode_ordinal();
+        report.next_ordinal = ledger.next_episode_ordinal();
         report.next = proposal.identity.checksum().into();
         report.checksum = hash(
             b"semantic-playing-joint-report-v1\0",
@@ -803,7 +824,7 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 &(
                     &report.checksum,
                     counts,
-                    self.identity.composition(),
+                    identity.composition(),
                     tzolkin_inference::trade_guard::TradeGuardConfig::default(),
                 ),
             )?;
@@ -814,14 +835,7 @@ impl<'a> SemanticPlayingJointSession<'a> {
             signals.next = report.next.clone();
             signals.cohort = report.cohort.clone();
         }
-        let owner = self.state.view(self.identity.checksum());
-        if let Some(mixture) = mixture {
-            self.ledger
-                .recheck_with_pool(&owner, PoolRef::Mixture(mixture))?;
-        } else {
-            self.ledger.recheck(&owner)?;
-        }
-        Ok(PreparedSemanticAdmission { proposal, admitted })
+        Ok(admitted)
     }
     fn admit_with_pool(
         &mut self,
@@ -898,40 +912,40 @@ impl<'a> SemanticPlayingJointSession<'a> {
         ) -> Result<tzolkin_core::GameState, String>,
     ) -> Result<PreparedSemanticAdmission, String> {
         let attempt = self.ledger.attempts();
-        let result = (|| {
-            let proposal = self.ledger.collect_reserved_records(
-                &self.state.view(self.identity.checksum()),
-                batch,
-                pool,
-                saved,
-                |scope, cohort| {
-                    let records = crate::semantic_playing_rl_record::encode_records(&cohort)?;
-                    if saved.is_some_and(|saved| *saved != records) {
-                        return Err(
-                            "Semantic restored records differ after fresh source audit".into()
-                        );
-                    }
-                    let mut proposal = prepare(
-                        scope,
-                        &self.identity,
-                        &cohort,
-                        &self.actor_config,
-                        &self.critic_config,
-                        attempt,
-                    )?;
-                    proposal.records = Some(records);
-                    Ok(proposal)
-                },
-                create,
-            )?;
-            self.prepare_admission(
-                proposal,
-                match pool {
-                    PoolRef::Mixture(m) => Some(m),
-                    _ => None,
-                },
-            )
-        })();
+        let identity = &self.identity;
+        let result = self.ledger.collect_reserved_records(
+            &self.state.view(identity.checksum()),
+            batch,
+            pool,
+            saved,
+            |scope, cohort, ledger| {
+                let records = crate::semantic_playing_rl_record::encode_records(&cohort)?;
+                if saved.is_some_and(|saved| *saved != records) {
+                    return Err("Semantic restored records differ after fresh source audit".into());
+                }
+                let mut proposal = prepare(
+                    scope,
+                    identity,
+                    &cohort,
+                    &self.actor_config,
+                    &self.critic_config,
+                    attempt,
+                )?;
+                proposal.records = Some(records);
+                let admitted = Self::prepare_admission_metadata(
+                    identity,
+                    ledger,
+                    self.attempt_base,
+                    &mut proposal,
+                    match pool {
+                        PoolRef::Mixture(m) => Some(m),
+                        _ => None,
+                    },
+                )?;
+                Ok(PreparedSemanticAdmission { proposal, admitted })
+            },
+            create,
+        );
         if result.is_err() {
             self.ledger.stop();
         }
@@ -2002,8 +2016,8 @@ pub(crate) fn joint_fixture() {
         .unwrap()
         .capture_ledger_checksum()
         .to_string();
-    // A raw-byte-only mutation after BOTH numerical proposals still drops the
-    // whole result. No actor/critic/current identity mutation can be admitted.
+    // A metadata refusal and raw-byte mutation after BOTH numerical proposals
+    // still reach POST. No actor/critic/current identity can be admitted.
     let before = session.identity.clone();
     let actor = session.state.actor_parameters().to_vec();
     let critic = session.state.critic_parameters().to_vec();
@@ -2013,13 +2027,21 @@ pub(crate) fn joint_fixture() {
         .clone();
     let checkpoint = fs::read(&checkpoint_path).unwrap();
     let entered = Cell::new(false);
-    let result = session.ledger.collect_mixture_fixture_using(
+    let plan = session
+        .plan_reserved(
+            std::array::from_fn(|_| seeds.next().unwrap()),
+            PoolRef::Mixture(&mixture),
+            limits,
+        )
+        .unwrap();
+    let batch = session.burn_reserved(plan);
+    let result = session.ledger.collect_reserved_records(
         &session.state.view(before.checksum()),
-        std::array::from_fn(|_| seeds.next().unwrap()),
-        &mixture,
-        limits,
-        |scope, cohort| {
-            let proposed = prepare(
+        &batch,
+        PoolRef::Mixture(&mixture),
+        None,
+        |scope, cohort, ledger| {
+            let mut proposed = prepare(
                 scope,
                 &before,
                 &cohort,
@@ -2029,7 +2051,14 @@ pub(crate) fn joint_fixture() {
             )?;
             entered.set(true);
             fs::write(&checkpoint_path, [checkpoint.as_slice(), b" "].concat()).unwrap();
-            Ok(proposed)
+            proposed.report.parent = "0".repeat(64);
+            SemanticPlayingJointSession::prepare_admission_metadata(
+                &before,
+                ledger,
+                session.attempt_base,
+                &mut proposed,
+                Some(&mixture),
+            )
         },
         |config| {
             Ok(crate::conditional_human_rl_update::tests::terminal_start(
@@ -2039,6 +2068,9 @@ pub(crate) fn joint_fixture() {
         },
     );
     assert!(entered.get() && result.is_err());
+    let error = result.unwrap_err();
+    assert!(error.contains("Semantic joint proposal differs"));
+    assert!(error.contains("semantic source postcheck"));
     fs::write(&checkpoint_path, checkpoint).unwrap();
     assert_eq!(session.identity().unwrap().checksum(), before.checksum());
     assert_eq!(session.state.actor_parameters(), actor);
