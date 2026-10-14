@@ -17,10 +17,69 @@ use crate::semantic_playing_rl_pool::SnapshotSlot;
 const RUN_SCHEMA: &str = "tzolkin-semantic-playing-journal-run-v1";
 const AUDIT_SCHEMA: &str = "tzolkin-semantic-playing-journal-audit-v1";
 const EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-journal-evaluation-v1";
+const POLICY_EXPORT_SCHEMA: &str = "tzolkin-semantic-playing-checkpoint-policy-export-v1";
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 #[path = "semantic_playing_rl_checkpoint.rs"]
 mod checkpoint;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PolicyExportWire {
+    schema: String,
+    checkpoint: checkpoint::Input,
+}
+
+/// A separate checked, closed-checkpoint export request, with no original
+/// preparation, critic configuration, training schedule or raw actor input.
+pub struct SemanticPolicyExportSpec {
+    wire: PolicyExportWire,
+    checksum: String,
+}
+impl SemanticPolicyExportSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if !checkpoint_digest(expected_sha256) || crate::model::digest(raw) != expected_sha256 {
+            return Err("Semantic policy export control pin differs".into());
+        }
+        let wire: PolicyExportWire =
+            serde_json::from_value(unique_json(raw, MAX_CONTROL)?).map_err(|e| e.to_string())?;
+        if wire.schema != POLICY_EXPORT_SCHEMA {
+            return Err("Semantic policy export schema differs".into());
+        }
+        Ok(Self {
+            wire,
+            checksum: expected_sha256.into(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticPolicyExport {
+    schema: String,
+    control_sha256: String,
+    artifact_file: String,
+    artifact_bytes: usize,
+    artifact_sha256: String,
+    deployment_checksum: String,
+    actor_checksum: String,
+    current_identity_checksum: String,
+    updates: u64,
+    playing_credit: u64,
+    source_authenticated: bool,
+    source_qualified: bool,
+    strength_measured: bool,
+    adoption_granted: bool,
+}
+
+/// Exports only the actor from a completed locally checked checkpoint. No
+/// Prepared load, archive replay, allocation, learning update or owner escapes.
+pub fn export_semantic_playing_policy(
+    spec: SemanticPolicyExportSpec,
+    output: &Path,
+) -> Result<SemanticPolicyExport, String> {
+    checkpoint::export_policy(&spec.wire.checkpoint, &spec.checksum, output)
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1541,6 +1600,162 @@ pub(super) fn control_fixture(
         "schema":"tzolkin-semantic-playing-checkpoint-close-v1","checkpoint":payload,
         "journalCloseDeclaration":declaration,"invocation":invocation,"producerClose":producing}),
     );
+    let policy_control = json!({"schema":POLICY_EXPORT_SCHEMA,
+        "checkpoint":{"payload":payload,"closeDeclaration":close}});
+    let parse_policy = |v: &Value| {
+        let raw = serde_json::to_vec(v).unwrap();
+        SemanticPolicyExportSpec::from_json(&raw, &crate::model::digest(&raw))
+    };
+    {
+        use tzolkin_inference::{deployment, semantic_playing_deployment as policy};
+        let output = root.join("checkpoint-fixture-policy");
+        let report =
+            export_semantic_playing_policy(parse_policy(&policy_control).unwrap(), &output)
+                .unwrap();
+        let raw = fs::read(output.join("policy.json")).unwrap();
+        let encoded: Value = serde_json::from_slice(&raw).unwrap();
+        let loaded = policy::LoadedSemanticPlayingDeployment::load(&raw).unwrap();
+        let parameters = journal.session.actor_parameters().unwrap();
+        assert_eq!(
+            encoded["parameterBits"],
+            json!(
+                parameters
+                    .iter()
+                    .map(|v| format!("{:08x}", v.to_bits()))
+                    .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(report.artifact_sha256, crate::model::digest(&raw));
+        assert_eq!(report.deployment_checksum, loaded.checksum());
+        assert_eq!(
+            loaded.identity().actor_checksum(),
+            journal.session.identity().unwrap().actor_checksum()
+        );
+        assert!(!std::str::from_utf8(&raw).unwrap().contains("\"path\""));
+        assert!(encoded.get("critic").is_none() && encoded.get("original").is_none());
+        assert!(deployment::LoadedDeployment::load(&raw).is_err());
+        assert!(
+            tzolkin_inference::conditional_deployment::LoadedConditionalDeployment::load(&raw)
+                .is_err()
+        );
+        // Only a few real Setup transitions, never a full game or campaign.
+        let mut state = tzolkin_core::create_game_with_options(
+            (0..3).map(|i| format!("P{i}")).collect(),
+            17,
+            tzolkin_core::GameOptions::default(),
+        )
+        .unwrap();
+        let setup = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+        assert!(loaded.distribution_playing(&setup).is_err());
+        for _ in 0..3 {
+            let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+            state = tzolkin_core::apply_move(
+                &state,
+                crate::setup_policy::choose_move_with_weights(
+                    &o,
+                    &crate::policy::HeuristicWeights::default(),
+                )
+                .unwrap()
+                .r#move,
+            )
+            .unwrap();
+        }
+        let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+        let encoder =
+            tzolkin_inference::features::FeatureEncoder::new_semantic_playing(&o).unwrap();
+        let rows = (0..o.legal_actions.len())
+            .map(|i| encoder.encode_legal_tagged(i).unwrap())
+            .collect::<Vec<_>>();
+        let expected =
+            tzolkin_inference::policy::BorrowedSemanticPlayingPolicy::from_validated_parameters(
+                parameters,
+            )
+            .unwrap()
+            .predict(crate::kernel::Kernel::Scalar.resolve().unwrap(), &rows)
+            .unwrap();
+        let actual = loaded.distribution_playing(&o).unwrap();
+        assert_eq!(
+            actual
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .logits
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual
+                .probabilities
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .probabilities
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        for (key, value) in [
+            ("featureSchema", json!(2)),
+            ("catalogHash", json!("0000000000000000")),
+        ] {
+            let mut bad = encoded.clone();
+            bad["contract"][key] = value;
+            assert!(policy::numeric_checksum(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        for bits in ["7f800000", "7fc00000"] {
+            let mut bad = encoded.clone();
+            bad["parameterBits"][0] = bits.into();
+            assert!(policy::numeric_checksum(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        let mut bad = encoded.clone();
+        let first = u32::from_str_radix(bad["parameterBits"][0].as_str().unwrap(), 16).unwrap();
+        bad["parameterBits"][0] = format!("{:08x}", first ^ 1).into();
+        assert!(policy::numeric_checksum(&serde_json::to_vec(&bad).unwrap()).is_err());
+        for key in ["updates", "playingCredit"] {
+            let mut bad = encoded.clone();
+            bad["identity"][key] = 0.into();
+            assert!(policy::numeric_checksum(&serde_json::to_vec(&bad).unwrap()).is_err());
+        }
+        let mut bad = encoded.clone();
+        bad["identity"]["path"] = "forbidden".into();
+        assert!(
+            policy::LoadedSemanticPlayingDeployment::load(&serde_json::to_vec(&bad).unwrap())
+                .is_err()
+        );
+        let duplicate = format!(
+            "{{\"schema\":{},{}",
+            serde_json::to_string(&encoded["schema"]).unwrap(),
+            &std::str::from_utf8(&raw).unwrap()[1..]
+        );
+        assert!(policy::LoadedSemanticPlayingDeployment::load(duplicate.as_bytes()).is_err());
+        assert!(
+            policy::LoadedSemanticPlayingDeployment::load(&vec![
+                b' ';
+                policy::MAX_DEPLOYMENT_BYTES + 1
+            ])
+            .is_err()
+        );
+        assert!(
+            export_semantic_playing_policy(parse_policy(&policy_control).unwrap(), &output)
+                .is_err()
+        );
+        assert!(
+            export_semantic_playing_policy(
+                parse_policy(&policy_control).unwrap(),
+                &journal.directory.join("forbidden-policy")
+            )
+            .is_err()
+        );
+    }
+    let mut wrong_policy = policy_control.clone();
+    wrong_policy["actor"] = json!([]);
+    assert!(parse_policy(&wrong_policy).is_err());
+    assert!(parse_policy(&audit).is_err());
+    assert!(parse_audit(&policy_control).is_err());
     let mut families = journal.session.consumed_families().clone();
     families.insert(seed_family_id(42));
     let union = save(
@@ -1625,6 +1840,13 @@ pub(super) fn control_fixture(
     let original_bytes = fs::read(&payload.path).unwrap();
     fs::write(&payload.path, b"{}").unwrap();
     assert!(checkpoint::recheck(Some(&chunk)).is_err());
+    assert!(
+        export_semantic_playing_policy(
+            parse_policy(&policy_control).unwrap(),
+            &root.join("checkpoint-fixture-refused-policy")
+        )
+        .is_err()
+    );
     fs::write(&payload.path, original_bytes).unwrap();
     let mut bad_close = unique_json(&pinned(&close, META_BYTES).unwrap(), META_BYTES).unwrap();
     bad_close["schema"] = "invalid".into();
