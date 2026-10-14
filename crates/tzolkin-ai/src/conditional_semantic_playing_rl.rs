@@ -145,7 +145,7 @@ impl NativeOrigin {
             return Ok(());
         }
         #[cfg(test)]
-        NATIVE_BACKING_CHECKS.update(|n| n + 1);
+        NATIVE_BACKING_CHECKS.with(|n| n.set(n.get() + 1));
         prepared.recheck_sources()
     }
     fn recheck_backing(&self) -> Result<(), String> {

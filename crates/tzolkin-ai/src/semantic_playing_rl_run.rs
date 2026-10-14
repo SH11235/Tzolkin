@@ -2612,14 +2612,14 @@ pub(super) fn control_fixture(
                 .iter()
                 .map(|f| f.family_id.clone())
                 .collect::<BTreeSet<_>>();
-            let pin = save(
+            let exclusions_pin = save(
                 "owned-native-exclusions.json",
                 &json!({
                 "schema":"tzolkin-conditional-native-exclusions-v1","families":families}),
             );
             let external = ConditionalNativeExclusions::load(
-                Path::new(&pin.path),
-                &pin,
+                Path::new(&exclusions_pin.path),
+                &exclusions_pin,
                 families.len(),
                 &crate::model::digest(
                     families
@@ -2630,7 +2630,8 @@ pub(super) fn control_fixture(
                 ),
             )
             .unwrap();
-            let history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
+            let history =
+                DeclaredSamplingHistory::declare_complete(vec![], vec![exclusions_pin]).unwrap();
             let make = |custody| {
                 SemanticPlayingJointSession::from_fresh_owner(
                     LoadedInitializationRef::Native(&v7, None)
