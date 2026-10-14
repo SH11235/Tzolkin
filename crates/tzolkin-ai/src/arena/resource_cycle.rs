@@ -10,6 +10,7 @@ use tzolkin_core::{GearId, Phase, Resource, Task, TechnologyId};
 pub const POLICY_VERSION: &str = "resource-cycle-arena-v4";
 pub const V5_POLICY_VERSION: &str = "resource-cycle-arena-v5";
 pub const V6_POLICY_VERSION: &str = "resource-cycle-arena-v6";
+pub const V7_POLICY_VERSION: &str = "resource-cycle-arena-v7";
 
 /// Changing any field requires a separately versioned hypothesis. The complete
 /// configuration is included in Numeric Arena's absolute-seat pool identity.
@@ -52,9 +53,23 @@ impl ResourceCycleConfig {
         }
     }
 
+    /// V6 with the shared fully funded first-player Uxmal opening.
+    pub fn v7() -> Self {
+        Self {
+            policy_version: V7_POLICY_VERSION.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self != &Self::default() && self != &Self::v5() && self != &Self::v6() {
-            return Err("Resource-cycle Arena requires a frozen v4, v5 or v6 configuration".into());
+        if self != &Self::default()
+            && self != &Self::v5()
+            && self != &Self::v6()
+            && self != &Self::v7()
+        {
+            return Err(
+                "Resource-cycle Arena requires a frozen v4, v5, v6 or v7 configuration".into(),
+            );
         }
         Ok(())
     }
@@ -488,6 +503,30 @@ fn v6_removal_score(
 /// baseline scoring; there is no simulation, history, owner or Train interface.
 pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Decision, String> {
     config.validate()?;
+    if config.policy_version == V7_POLICY_VERSION {
+        // V6 validates the schema, actor bounds and observation key before the
+        // shared opening selector can index this observation. Its complete
+        // decision is otherwise retained, including the exact fallback score.
+        let mut decision = choose_move(o, &ResourceCycleConfig::v6())?;
+        decision.policy_version = V7_POLICY_VERSION.into();
+        if let Some(legal) = crate::setup_policy::first_uxmal_opening(o) {
+            if o.legal_actions
+                .iter()
+                .filter(|a| a.r#move == legal.r#move)
+                .count()
+                != 1
+            {
+                return Err("Resource-cycle Arena requires one unique legal move".into());
+            }
+            let score = score_action(o, &legal.action, &config.weights);
+            if !score.is_finite() {
+                return Err("Non-finite resource-cycle score".into());
+            }
+            decision.r#move = legal.r#move.clone();
+            decision.score = score;
+        }
+        return Ok(decision);
+    }
     if o.schema != OBSERVATION_SCHEMA
         || o.move_schema != MOVE_SCHEMA
         || !(3..=4).contains(&o.players.len())
@@ -1364,6 +1403,113 @@ mod tests {
                 }
             );
             opening = apply_move(&opening, v5.r#move).unwrap();
+        }
+        let v6 = ResourceCycleConfig::v6();
+        let v7 = ResourceCycleConfig::v7();
+        assert!(v7.validate().is_ok());
+        let mut changed = v7.clone();
+        changed.qualified_investment_bonus += 1.0;
+        assert!(changed.validate().is_err());
+        let mut dummy_opening =
+            create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        dummy_opening.phase = Phase::Playing;
+        dummy_opening.players[0]
+            .resources
+            .insert(Resource::Corn, 10);
+        dummy_opening
+            .gears
+            .get_mut(&GearId::Uxmal)
+            .unwrap()
+            .fill(None);
+        for position in [2, 7] {
+            dummy_opening.gears.get_mut(&GearId::Uxmal).unwrap()[position] = Some(GearWorker {
+                player_id: -1,
+                dummy: true,
+            });
+        }
+        let mut unfunded = dummy_opening.clone();
+        unfunded.players[0].resources.insert(Resource::Corn, 6);
+        let unfunded_o = observe(&unfunded, 0).unwrap();
+        assert!(crate::setup_policy::first_uxmal_opening(&unfunded_o).is_none());
+        for count in 0..3 {
+            let o = observe(&dummy_opening, 0).unwrap();
+            let decision = choose_move(&o, &v7).unwrap();
+            assert_eq!(decision.policy_version, V7_POLICY_VERSION);
+            assert_eq!(decision.actor, o.actor);
+            assert_eq!(decision.observation_key, o.observation_key);
+            assert_eq!(
+                decision.r#move,
+                tzolkin_core::GameMove::Place {
+                    gear: GearId::Uxmal
+                }
+            );
+            let legal = o
+                .legal_actions
+                .iter()
+                .find(|a| a.r#move == decision.r#move)
+                .unwrap();
+            assert_eq!(decision.score, score_action(&o, &legal.action, &v7.weights));
+            if count == 2 {
+                assert!(matches!(
+                    legal.action,
+                    TypedAction::Place { corn_cost: 5, .. }
+                ));
+                assert_eq!(
+                    choose_move(&o, &v6).unwrap().r#move,
+                    tzolkin_core::GameMove::Place {
+                        gear: GearId::Yaxchilan
+                    }
+                );
+            }
+            dummy_opening = apply_move(&dummy_opening, decision.r#move).unwrap();
+        }
+        let mut fourth_worker = create_game(
+            vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            17,
+            false,
+        )
+        .unwrap();
+        fourth_worker.phase = Phase::Playing;
+        fourth_worker.players[0].workers = 4;
+        fourth_worker.players[0]
+            .resources
+            .insert(Resource::Corn, 20);
+        for _ in 0..3 {
+            let o = observe(&fourth_worker, 0).unwrap();
+            let decision = choose_move(&o, &v7).unwrap();
+            assert_eq!(
+                decision.r#move,
+                tzolkin_core::GameMove::Place {
+                    gear: GearId::Uxmal
+                }
+            );
+            fourth_worker = apply_move(&fourth_worker, decision.r#move).unwrap();
+        }
+        let o = observe(&fourth_worker, 0).unwrap();
+        let end = choose_move(&o, &v7).unwrap();
+        assert_eq!(
+            end.r#move,
+            tzolkin_core::GameMove::EndTurn {
+                double_advance: None
+            }
+        );
+        assert_eq!(tzolkin_core::available_workers(&fourth_worker, 0), 1);
+        fourth_worker = apply_move(&fourth_worker, end.r#move).unwrap();
+        let setup = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        let pending = playing(Task::Action {
+            gear: GearId::Yaxchilan,
+            position: 2,
+            free: None,
+        });
+        for o in [
+            unfunded_o,
+            observe(&setup, 0).unwrap(),
+            observe(&fourth_worker, fourth_worker.current_player).unwrap(),
+            observe(&pending, 1).unwrap(),
+        ] {
+            let mut expected = choose_move(&o, &v6).unwrap();
+            expected.policy_version = V7_POLICY_VERSION.into();
+            assert_eq!(choose_move(&o, &v7).unwrap(), expected);
         }
         for level in [0, 1] {
             let mut state = playing(Task::Technology {
