@@ -3,6 +3,7 @@ pub mod conditional;
 pub mod numeric;
 pub mod phase_routed;
 pub mod resource_cycle;
+pub mod semantic_snapshot;
 pub mod teacher;
 use crate::dataset::{DatasetSplit, load_dataset, split_for_family};
 // Keep the original arena API while all callers use the dataset's family identity.

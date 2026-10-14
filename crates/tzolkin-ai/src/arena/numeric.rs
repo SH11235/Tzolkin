@@ -10,6 +10,10 @@ use super::conditional::{
 use super::phase_routed::{
     PhaseRouteDiagnostics, PhaseRoutedDevelopmentIdentity, PhaseRoutedDevelopmentPolicy,
 };
+use super::semantic_snapshot::{
+    SemanticPlayingSnapshotArenaIdentity, SemanticPlayingSnapshotArenaPolicy,
+    SemanticPlayingSnapshotArenaReport, SemanticPlayingSnapshotReference,
+};
 use super::teacher::{
     ResourceCycleTeacherArenaIdentity, ResourceCycleTeacherArenaPolicy,
     SemanticPlayingTeacherArenaIdentity, SemanticPlayingTeacherArenaPolicy,
@@ -696,6 +700,9 @@ pub enum PolicyIdentity {
     NativeSemanticPlayingTeacher {
         identity: Box<SemanticPlayingTeacherArenaIdentity>,
     },
+    CurrentSemanticPlayingSnapshot {
+        identity: Box<SemanticPlayingSnapshotArenaIdentity>,
+    },
     SemanticSetupTeacherNumericPlayingDevelopment {
         identity: Box<PhaseRoutedDevelopmentIdentity>,
     },
@@ -713,6 +720,7 @@ enum Role<'a> {
     Teacher(Box<ResourceCycleTeacherArenaPolicy<'a>>),
     SemanticSetupTeacher(Box<SemanticSetupResourceCycleTeacherArenaPolicy<'a>>),
     NativePlayingTeacher(Box<SemanticPlayingTeacherArenaPolicy<'a>>),
+    SemanticSnapshot(Box<SemanticPlayingSnapshotArenaPolicy<'a>>),
     PhaseRouted(Box<PhaseRoutedDevelopmentPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
@@ -787,6 +795,9 @@ impl<'a> Role<'a> {
             Self::NativePlayingTeacher(policy) => PolicyIdentity::NativeSemanticPlayingTeacher {
                 identity: Box::new(policy.identity().clone()),
             },
+            Self::SemanticSnapshot(policy) => PolicyIdentity::CurrentSemanticPlayingSnapshot {
+                identity: Box::new(policy.identity().clone()),
+            },
             Self::PhaseRouted(policy) => {
                 PolicyIdentity::SemanticSetupTeacherNumericPlayingDevelopment {
                     identity: Box::new(policy.identity().clone()),
@@ -816,6 +827,7 @@ impl<'a> Role<'a> {
             Self::ConditionalCountZero(policy) => Some(&policy.identity().configuration_key),
             Self::Teacher(policy) => Some(&policy.identity().configuration_key),
             Self::NativePlayingTeacher(policy) => Some(&policy.identity().configuration_key),
+            Self::SemanticSnapshot(policy) => Some(&policy.identity().configuration_key),
             Self::SemanticSetupTeacher(policy) => {
                 Some(&policy.identity().teacher.configuration_key)
             }
@@ -1069,6 +1081,9 @@ fn choose(
             Role::NativePlayingTeacher(policy) => {
                 session.choose_native_playing_teacher(index, observation, policy)?
             }
+            Role::SemanticSnapshot(policy) => {
+                session.choose_semantic_snapshot(index, observation, policy)?
+            }
             Role::SemanticSetupTeacher(policy) => {
                 session.choose_semantic_setup_teacher(index, observation, policy)?
             }
@@ -1178,6 +1193,9 @@ fn choose(
             Role::Teacher(_) => return Err("Teacher Arena missing game session".into()),
             Role::NativePlayingTeacher(_) => {
                 return Err("Native Playing teacher Arena missing game session".into());
+            }
+            Role::SemanticSnapshot(_) => {
+                return Err("Semantic snapshot Arena missing game session".into());
             }
             Role::SemanticSetupTeacher(_) => {
                 return Err("Semantic Setup teacher Arena missing game session".into());
@@ -1409,6 +1427,7 @@ fn play_arm_using_with_setup<'a>(
             Role::NativePlayingTeacher(policy) => {
                 Some(GameSession::new_native_playing_teacher(policy))
             }
+            Role::SemanticSnapshot(policy) => Some(GameSession::new_semantic_snapshot(policy)),
             Role::SemanticSetupTeacher(policy) => {
                 Some(GameSession::new_semantic_setup_teacher(policy))
             }
@@ -1424,7 +1443,7 @@ fn play_arm_using_with_setup<'a>(
                 ..GuardDiagnostics::default()
             }),
             Role::Teacher(_) | Role::SemanticSetupTeacher(_) => Some(GuardDiagnostics::default()),
-            Role::NativePlayingTeacher(_) => Some(GuardDiagnostics {
+            Role::NativePlayingTeacher(_) | Role::SemanticSnapshot(_) => Some(GuardDiagnostics {
                 phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
                 ..GuardDiagnostics::default()
             }),
@@ -2091,6 +2110,67 @@ pub struct NativeTeacherArenaReport {
     pub training_credit_granted: bool,
     pub adoption_granted: bool,
 }
+/// Evaluate a genuine current actor without conversion to BC or a legacy RL
+/// role. Only ordinary disjoint Validation families are admitted.
+pub fn run_semantic_playing_snapshot_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: SemanticPlayingSnapshotArenaPolicy<'a>,
+    reference: SemanticPlayingSnapshotReference,
+    pool: Vec<Opponent<'a>>,
+) -> Result<SemanticPlayingSnapshotArenaReport, String> {
+    let snapshot = candidate.snapshot;
+    let result = (|| {
+        snapshot.recheck()?;
+        candidate.validate_arena_config(config)?;
+        if pool.len() != config.players || pool.iter().any(|p| matches!(p, Opponent::Search(_))) {
+            return Err("Semantic snapshot Arena requires a fixed procedural/numeric pool".into());
+        }
+        let reference = match reference {
+            SemanticPlayingSnapshotReference::ResourceCycleV5 => {
+                Role::ResourceCycle(super::resource_cycle::ResourceCycleConfig::v5())
+            }
+            SemanticPlayingSnapshotReference::GuardedNumeric(policy) => Role::Numeric(*policy),
+        };
+        let candidate = Role::SemanticSnapshot(Box::new(candidate));
+        let pool = pool
+            .into_iter()
+            .map(Role::from_opponent)
+            .collect::<Result<Vec<_>, _>>()?;
+        let guard = candidate.guard_key().expect("validated snapshot guard");
+        if reference.guard_key().is_some_and(|key| key != guard)
+            || pool
+                .iter()
+                .any(|p| p.guard_key().is_some_and(|key| key != guard))
+        {
+            return Err("Semantic snapshot Arena requires the shared default Trade guard".into());
+        }
+        let paired = run_admitted_roles(
+            config,
+            candidate,
+            reference,
+            pool,
+            super::semantic_snapshot::ARENA_SCHEMA,
+            Some(SharedCornFirstSetupIdentity::current()),
+        )?;
+        Ok(SemanticPlayingSnapshotArenaReport {
+            schema: super::semantic_snapshot::ARENA_SCHEMA.into(),
+            paired,
+            read_only_evaluation: true,
+            fresh_test_claimed: false,
+            training_credit_granted: false,
+            adoption_granted: false,
+        })
+    })();
+    match (result, snapshot.recheck()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(post)) => Err(format!("Semantic snapshot Arena postcheck: {post}")),
+        (Err(error), Err(post)) => Err(format!(
+            "{error}; semantic snapshot Arena postcheck: {post}"
+        )),
+    }
+}
+
 pub fn run_native_playing_teacher_validation<'a>(
     config: &NumericArenaConfig,
     candidate: SemanticPlayingTeacherArenaPolicy<'a>,

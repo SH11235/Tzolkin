@@ -284,6 +284,37 @@ impl<'a> SemanticPlayingJournal<'a> {
         self.session.journal_recheck()?;
         self.verify_files()
     }
+    fn evaluation_recheck(&self) -> Result<(), String> {
+        // Closed checks source custody and membership/lengths; archive bytes
+        // need one separate full hash pass, even if the source check fails.
+        match (self.require_closed(), self.verify_archive_bytes()) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(post)) => Err(format!("Semantic evaluation archive: {post}")),
+            (Err(error), Err(post)) => Err(format!("{error}; semantic evaluation archive: {post}")),
+        }
+    }
+    /// Borrow one owned current actor for read-only evaluation. The scoped
+    /// borrow cannot escape; no capture is published or allocation consumed.
+    /// Errors also run the source/archive postcheck and never stop the owner.
+    pub fn with_evaluation_snapshot<R>(
+        &self,
+        run: impl for<'eval> FnOnce(&'eval FrozenSemanticSnapshot<'a>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let result = (|| {
+            self.evaluation_recheck()?;
+            let snapshot = self.session.freeze_snapshot()?;
+            run(&snapshot)
+        })();
+        match (result, self.evaluation_recheck()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(post)) => Err(format!("Semantic evaluation postcheck: {post}")),
+            (Err(error), Err(post)) => {
+                Err(format!("{error}; semantic evaluation postcheck: {post}"))
+            }
+        }
+    }
     /// Warm, internally closed capture only. Its actor stays typed in memory;
     /// this metadata is a replay reference, never a weight/snapshot constructor.
     pub fn freeze_snapshot(&mut self) -> Result<FrozenSemanticSnapshot<'a>, String> {
@@ -779,6 +810,112 @@ pub(crate) fn journal_fixture(
     assert_eq!(journal.status().current.completed_updates(), 2);
     assert_eq!(journal.status().spent_actor_streams, 28);
     assert!(journal.status().current.credited_playing_decisions() > credit);
+    // Evaluation borrows the genuine updated actor but publishes no capture,
+    // including callback errors and source/archive postcheck failures.
+    let evaluation_status = serde_json::to_value(journal.status()).unwrap();
+    let evaluation_head = serde_json::to_value(journal.head()).unwrap();
+    let evaluation_sequence = journal.sequence;
+    let evaluation_captures = journal.captures.clone();
+    let evaluation_files = journal
+        .members
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                fs::read(journal.directory.join(name)).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let actor = journal
+        .with_evaluation_snapshot(|snapshot| {
+            use crate::arena::numeric::{ExternalExclusions, NumericArenaConfig, SCHEMA};
+            use crate::arena::semantic_snapshot::{
+                POLICY_VERSION, SemanticPlayingSnapshotArenaPolicy,
+                SemanticPlayingSnapshotReference,
+            };
+            let policy = SemanticPlayingSnapshotArenaPolicy::new(snapshot)?;
+            assert_eq!(policy.identity().policy_version, POLICY_VERSION);
+            assert_eq!(policy.identity().backend, "scalar");
+            assert!(!policy.identity().source_authenticated);
+            assert!(!policy.identity().strength_measured);
+            for table in snapshot.human_table_reservations()?.keys() {
+                assert!(
+                    snapshot.contains_family(&crate::human_initial_wealth::table_family_id(table)?)
+                );
+            }
+            // Native spent and external closure refusal precedes any arm;
+            // these synthetic families need not themselves be Validation.
+            for seed in [seeds[0], next[0], 42] {
+                let config = NumericArenaConfig {
+                    schema: SCHEMA.into(),
+                    players: 3,
+                    seeds: vec![seed],
+                    bootstrap_seed: 1,
+                    external_exclusions: ExternalExclusions {
+                        evidence_sha256: "0".repeat(64),
+                        excluded_family_ids: vec![],
+                    },
+                };
+                let error = crate::arena::numeric::run_semantic_playing_snapshot_validation(
+                    &config,
+                    SemanticPlayingSnapshotArenaPolicy::new(snapshot)?,
+                    SemanticPlayingSnapshotReference::ResourceCycleV5,
+                    vec![],
+                )
+                .unwrap_err();
+                assert!(error.contains("human/native family closure"));
+            }
+            Ok(policy.identity().actor_checksum.clone())
+        })
+        .unwrap();
+    assert_eq!(actor, journal.status().current.actor_checksum());
+    let callback_error = journal
+        .with_evaluation_snapshot::<()>(|_| Err("Synthetic evaluation callback".into()))
+        .unwrap_err();
+    assert_eq!(callback_error, "Synthetic evaluation callback");
+    let source_path = PathBuf::from(&prepared.loaded_semantic_playing_sources().unwrap()[0].path);
+    let source_bytes = fs::read(&source_path).unwrap();
+    let source_error = journal
+        .with_evaluation_snapshot::<()>(|_| {
+            fs::write(&source_path, b"changed inside read-only evaluation fixture")
+                .map_err(|e| e.to_string())?;
+            Err("Synthetic evaluation callback".into())
+        })
+        .unwrap_err();
+    fs::write(&source_path, source_bytes).unwrap();
+    assert!(source_error.contains("Synthetic evaluation callback"));
+    assert!(source_error.contains("evaluation postcheck"));
+    let archive_name = journal.head.name.clone();
+    let mut changed_bytes = evaluation_files[&archive_name].clone();
+    changed_bytes[0] ^= 1; // Same-length change must be caught by byte hashing.
+    let archive_error = journal
+        .with_evaluation_snapshot::<()>(|_| {
+            fs::write(journal.directory.join(&archive_name), &changed_bytes)
+                .map_err(|e| e.to_string())?;
+            Err("Synthetic evaluation callback".into())
+        })
+        .unwrap_err();
+    fs::write(
+        journal.directory.join(&archive_name),
+        &evaluation_files[&archive_name],
+    )
+    .unwrap();
+    assert!(archive_error.contains("Synthetic evaluation callback"));
+    assert!(archive_error.contains("Semantic journal pin changed"));
+    assert_eq!(
+        serde_json::to_value(journal.status()).unwrap(),
+        evaluation_status
+    );
+    assert_eq!(
+        serde_json::to_value(journal.head()).unwrap(),
+        evaluation_head
+    );
+    assert_eq!(journal.sequence, evaluation_sequence);
+    assert_eq!(journal.captures, evaluation_captures);
+    for (name, bytes) in evaluation_files {
+        assert_eq!(fs::read(journal.directory.join(name)).unwrap(), bytes);
+    }
+    journal.verify_archive_bytes().unwrap();
     let final_capture = journal.freeze_snapshot().unwrap();
     // Synthetic external evidence tests the closed schema, not an actual OS
     // observation. No serialized declaration upgrades authentication flags.
