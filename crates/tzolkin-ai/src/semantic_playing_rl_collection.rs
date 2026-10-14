@@ -25,6 +25,11 @@ use crate::public_stochastic::{
     legal_digest,
 };
 use crate::public_stochastic_native::{CollectionLimits, NativeStochasticConfig};
+use crate::semantic_playing_rl_pool::{
+    FrozenSemanticSnapshot, OPPONENT_SAMPLING_VERSION, SemanticFrozenMixture,
+    SemanticMixtureRoster, SnapshotCaptureLedger,
+};
+use crate::semantic_playing_rl_update::SemanticPlayingCurrentIdentity;
 
 pub const SAMPLING_VERSION: &str = "semantic-playing-only-uniform-tick53-v1";
 pub const TARGET_CONTRACT: &str = "semantic-playing-only-gamma1-terminal-winner-share-v1";
@@ -78,6 +83,18 @@ pub struct DeclaredSamplingHistory {
     checksum: String,
 }
 impl DeclaredSamplingHistory {
+    pub(crate) fn recheck(&self) -> Result<(), String> {
+        for pin in &self.pins {
+            crate::human_policy_dataset::recheck_absolute_pin(pin)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn pins(&self) -> &[ContentPin] {
+        &self.pins
+    }
+    pub(crate) fn checksum(&self) -> &str {
+        &self.checksum
+    }
     pub fn declare_complete(
         ranges: Vec<DeclaredSamplingRange>,
         pins: Vec<ContentPin>,
@@ -133,6 +150,7 @@ struct SemanticSample {
     decision: Decision,
     index: usize,
     sample_index: usize,
+    global_sample_index: usize,
     before: u64,
     after: u64,
     draws_before: u64,
@@ -155,6 +173,10 @@ enum Choice {
         chosen: LegalAction,
     },
     LearnerPlaying(Box<SemanticSample>),
+    OpponentSample {
+        sample: Box<SemanticSample>,
+        snapshot: String,
+    },
     Opponent {
         decision: Decision,
         chosen: LegalAction,
@@ -165,13 +187,13 @@ impl Choice {
         match self {
             Self::LearnerSetup { .. } => SemanticCallbackRole::LearnerSetup,
             Self::LearnerPlaying(_) => SemanticCallbackRole::LearnerPlaying,
-            Self::Opponent { .. } => SemanticCallbackRole::Opponent,
+            Self::Opponent { .. } | Self::OpponentSample { .. } => SemanticCallbackRole::Opponent,
         }
     }
     fn decision(&self) -> &Decision {
         match self {
             Self::LearnerSetup { decision, .. } | Self::Opponent { decision, .. } => decision,
-            Self::LearnerPlaying(s) => &s.decision,
+            Self::LearnerPlaying(s) | Self::OpponentSample { sample: s, .. } => &s.decision,
         }
     }
 }
@@ -193,6 +215,7 @@ struct Record {
     failure: Option<String>,
     draws: [u64; 4],
     samples: usize,
+    opponent_samples: usize,
     rows: usize,
 }
 impl Record {
@@ -217,6 +240,12 @@ impl SemanticPlayingCollectedGame {
     }
     pub fn playing_samples(&self) -> usize {
         self.record.samples
+    }
+    pub fn opponent_playing_samples(&self) -> usize {
+        self.record.opponent_samples
+    }
+    pub fn total_reserved_candidate_rows(&self) -> usize {
+        self.record.rows
     }
     pub fn actor_draws(&self) -> &[u64; 4] {
         &self.record.draws
@@ -258,6 +287,12 @@ impl AuditedSemanticPlayingEpisode {
     }
     pub fn playing_steps(&self) -> usize {
         self.playing.len()
+    }
+    pub fn opponent_playing_samples(&self) -> usize {
+        self.record.opponent_samples
+    }
+    pub fn total_sampled_candidate_rows(&self) -> usize {
+        self.record.rows
     }
     pub fn learner_setup_choices(&self) -> usize {
         self.record
@@ -388,6 +423,7 @@ pub struct AuditedSemanticPlayingCohort {
     parent: String,
     families: [String; 4],
     human_reservations: BTreeMap<String, DatasetSplit>,
+    mixture: Option<String>,
 }
 impl AuditedSemanticPlayingCohort {
     pub fn episodes(&self) -> &[AuditedSemanticPlayingEpisode; 4] {
@@ -404,6 +440,9 @@ impl AuditedSemanticPlayingCohort {
     }
     pub fn credited_decisions(&self) -> u64 {
         0
+    }
+    pub fn mixture_checksum(&self) -> Option<&str> {
+        self.mixture.as_deref()
     }
     pub(crate) fn numeric_counts(&self) -> Result<[usize; 3], String> {
         let mut counts = [0_usize; 3];
@@ -434,7 +473,9 @@ impl AuditedSemanticPlayingCohort {
                     .choice
                     .as_ref()
                     .ok_or("Semantic sealed choice missing")?;
-                let sample = if let Choice::LearnerPlaying(s) = choice {
+                let sample = if let Choice::LearnerPlaying(s)
+                | Choice::OpponentSample { sample: s, .. } = choice
+                {
                     Some(hash(
                         b"semantic-joint-applied-sample-v1\0",
                         &(
@@ -458,7 +499,7 @@ impl AuditedSemanticPlayingCohort {
                     SemanticCallbackRole::LearnerPlaying => 1,
                     SemanticCallbackRole::Opponent => 2,
                 };
-                callbacks.push(hash(
+                let callback_checksum = hash(
                     b"semantic-joint-applied-callback-v1\0",
                     &(
                         callback.index,
@@ -470,7 +511,17 @@ impl AuditedSemanticPlayingCohort {
                         &callback.after,
                         sample,
                     ),
-                )?);
+                )?;
+                callbacks.push(
+                    if let Choice::OpponentSample { sample, snapshot } = choice {
+                        hash(
+                            b"semantic-joint-sampled-opponent-callback-v1\0",
+                            &(callback_checksum, snapshot, sample.global_sample_index),
+                        )?
+                    } else {
+                        callback_checksum
+                    },
+                );
             }
             let identity = episode.config.sampling_identity();
             records.push(hash(
@@ -570,6 +621,90 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
 
 /// Shared allocation state, retained across recurrent semantic parameter updates.
 /// Only the closed collector creates episodes; the continuation cannot inject steps.
+#[derive(Clone, Copy)]
+enum PoolRef<'a> {
+    Legacy(&'a ConditionalFrozenPool, Option<&'a PreparedPublicPolicy>),
+    Mixture(&'a SemanticFrozenMixture<'a>),
+}
+impl PoolRef<'_> {
+    fn recheck(&self) -> Result<(), String> {
+        match self {
+            Self::Legacy(..) => Ok(()),
+            Self::Mixture(p) => p.recheck(),
+        }
+    }
+    fn binding(&self) -> Result<serde_json::Value, String> {
+        match self {
+            Self::Legacy(p, prepared) => p.binding(*prepared),
+            Self::Mixture(p) => Ok(serde_json::json!({"fixedSemanticMixture":p.checksum()})),
+        }
+    }
+    fn freeze(&self) -> Result<FrozenRosters<'_>, String> {
+        match self {
+            Self::Legacy(p, prepared) => Ok(FrozenRosters::Legacy(p.freeze(*prepared)?)),
+            Self::Mixture(p) => Ok(FrozenRosters::Mixture(p.freeze()?)),
+        }
+    }
+}
+enum FrozenRosters<'a> {
+    Legacy([ConditionalFrozenMixRoster<'a>; 4]),
+    Mixture([SemanticMixtureRoster<'a>; 4]),
+}
+impl FrozenRosters<'_> {
+    fn get(&self, index: usize) -> RosterRef<'_> {
+        match self {
+            Self::Legacy(r) => RosterRef::Legacy(&r[index]),
+            Self::Mixture(r) => RosterRef::Mixture(&r[index]),
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum RosterRef<'a> {
+    Legacy(&'a ConditionalFrozenMixRoster<'a>),
+    Mixture(&'a SemanticMixtureRoster<'a>),
+}
+impl<'a> RosterRef<'a> {
+    fn learner_seat(self) -> usize {
+        match self {
+            Self::Legacy(r) => r.learner_seat(),
+            Self::Mixture(r) => r.legacy.learner_seat(),
+        }
+    }
+    fn checksum(self) -> &'a str {
+        match self {
+            Self::Legacy(r) => r.checksum(),
+            Self::Mixture(r) => r.checksum(),
+        }
+    }
+    fn contains_family(self, family: &str) -> bool {
+        match self {
+            Self::Legacy(r) => r.contains_family(family),
+            Self::Mixture(r) => r.contains_family(family),
+        }
+    }
+    fn opponent(
+        self,
+        actor: usize,
+    ) -> Result<&'a crate::arena::FrozenReactiveOpponent<'a>, String> {
+        match self {
+            Self::Legacy(r) => r.opponent(actor),
+            Self::Mixture(r) => r.legacy.opponent(actor),
+        }
+    }
+    fn snapshot(self, actor: usize) -> Option<&'a FrozenSemanticSnapshot<'a>> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Mixture(r) => r.snapshot(actor),
+        }
+    }
+    fn common_setup(self) -> bool {
+        matches!(self, Self::Mixture(_))
+    }
+    fn sampled_opponents(self, players: usize) -> [bool; 4] {
+        std::array::from_fn(|actor| actor < players && self.snapshot(actor).is_some())
+    }
+}
+
 pub(crate) struct SemanticCollectionLedger<'a> {
     external: &'a ConditionalNativeExclusions,
     history: &'a DeclaredSamplingHistory,
@@ -584,6 +719,27 @@ pub(crate) struct SemanticCollectionLedger<'a> {
     failed: Option<SemanticPlayingCollectedGame>,
 }
 impl<'a> SemanticCollectionLedger<'a> {
+    pub(crate) fn freeze_snapshot(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        current: &SemanticPlayingCurrentIdentity,
+    ) -> Result<FrozenSemanticSnapshot<'a>, String> {
+        FrozenSemanticSnapshot::capture(
+            owner,
+            current,
+            SnapshotCaptureLedger {
+                external: self.external,
+                history: self.history,
+                families: self.spent.clone(),
+                streams: self.streams.clone(),
+                sampling_seed: self.seed.value(),
+                replicate: self.replicate,
+                next: self.next,
+                attempts: self.attempts,
+                stopped: self.stopped,
+            },
+        )
+    }
     pub(crate) fn with_checked<R>(
         &self,
         owner: &SemanticOwnerView<'_>,
@@ -660,6 +816,26 @@ impl<'a> SemanticCollectionLedger<'a> {
             create,
         )
     }
+    pub(crate) fn collect_mixture_using<R>(
+        &mut self,
+        owner: &SemanticOwnerView<'_>,
+        seeds: [u32; 4],
+        mixture: &SemanticFrozenMixture<'_>,
+        limits: CollectionLimits,
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.collect_pool(
+            owner,
+            seeds,
+            PoolRef::Mixture(mixture),
+            limits,
+            finish,
+            create,
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     fn collect_using<R>(
         &mut self,
@@ -674,18 +850,43 @@ impl<'a> SemanticCollectionLedger<'a> {
         ) -> Result<R, String>,
         create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
     ) -> Result<R, String> {
-        if self.stopped || self.attempts >= MAX_ATTEMPTS {
-            return Err("Semantic collection stopped or attempt bound".into());
-        }
-        let result = self.collect(
+        self.collect_pool(
             owner,
             seeds,
-            pool,
-            prepared_opponent,
+            PoolRef::Legacy(pool, prepared_opponent),
             limits,
             finish,
             create,
-        );
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn collect_pool<R>(
+        &mut self,
+        owner: &SemanticOwnerView<'_>,
+        seeds: [u32; 4],
+        pool: PoolRef<'_>,
+        limits: CollectionLimits,
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+    ) -> Result<R, String> {
+        if self.stopped || self.attempts >= MAX_ATTEMPTS {
+            return Err("Semantic collection stopped or attempt bound".into());
+        }
+        let result = (|| {
+            pool.recheck()?;
+            let result = self.collect(owner, seeds, pool, limits, finish, create);
+            match (result, pool.recheck()) {
+                (Ok(value), Ok(())) => Ok(value),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(_), Err(post)) => Err(format!("Frozen pool source postcheck: {post}")),
+                (Err(error), Err(post)) => {
+                    Err(format!("{error}; frozen pool source postcheck: {post}"))
+                }
+            }
+        })();
         if result.is_err() {
             self.stopped = true;
         }
@@ -707,13 +908,34 @@ impl<'a> SemanticCollectionLedger<'a> {
     ) -> Result<R, String> {
         self.collect_using(owner, seeds, pool, None, limits, finish, create)
     }
+    #[cfg(test)]
+    pub(crate) fn collect_mixture_fixture_using<R>(
+        &mut self,
+        owner: &SemanticOwnerView<'_>,
+        seeds: [u32; 4],
+        mixture: &SemanticFrozenMixture<'_>,
+        limits: CollectionLimits,
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+    ) -> Result<R, String> {
+        self.collect_pool(
+            owner,
+            seeds,
+            PoolRef::Mixture(mixture),
+            limits,
+            finish,
+            create,
+        )
+    }
     #[allow(clippy::too_many_arguments)]
     fn collect<R>(
         &mut self,
         owner: &SemanticOwnerView<'_>,
         seeds: [u32; 4],
-        pool: &ConditionalFrozenPool,
-        prepared_opponent: Option<&PreparedPublicPolicy>,
+        pool: PoolRef<'_>,
         limits: CollectionLimits,
         finish: impl for<'scope> FnOnce(
             &SemanticCollectionScope<'scope>,
@@ -760,11 +982,8 @@ impl<'a> SemanticCollectionLedger<'a> {
                 players, seed, identity, limits,
             )?);
         }
-        let rosters = pool.freeze(prepared_opponent)?;
-        if rosters
-            .iter()
-            .any(|r| families.iter().any(|f| r.contains_family(f)))
-        {
+        let rosters = pool.freeze()?;
+        if (0..4).any(|i| families.iter().any(|f| rosters.get(i).contains_family(f))) {
             return Err("Semantic family overlaps frozen opponent lineage".into());
         }
         let (identity, reservations) = owner.metadata();
@@ -776,7 +995,7 @@ impl<'a> SemanticCollectionLedger<'a> {
                 &parent,
                 self.external.descriptor(),
                 &self.history.checksum,
-                pool.binding(prepared_opponent)?,
+                pool.binding()?,
                 &human_reservations,
                 crate::setup_policy::POLICY_VERSION,
                 HeuristicWeights::default(),
@@ -793,8 +1012,9 @@ impl<'a> SemanticCollectionLedger<'a> {
             self.streams.extend(streams);
             let mut episodes = Vec::new();
             for i in 0..4 {
+                let roster = rosters.get(i);
                 let episode = owner.with_checked_episode(self.external, &pins, || {
-                    let collected = run(&configs[i], &rosters[i], scope, &binding, None, || {
+                    let collected = run(&configs[i], roster, scope, &binding, None, || {
                         create(&configs[i])
                     })?;
                     if !collected.complete() {
@@ -807,13 +1027,18 @@ impl<'a> SemanticCollectionLedger<'a> {
                     }
                     let audited = run(
                         &configs[i],
-                        &rosters[i],
+                        roster,
                         scope,
                         &binding,
                         Some(&collected),
                         || create(&configs[i]),
                     )?;
-                    seal(audited, configs[i].clone(), rosters[i].learner_seat())
+                    seal(
+                        audited,
+                        configs[i].clone(),
+                        roster.learner_seat(),
+                        roster.sampled_opponents(configs[i].players()),
+                    )
                 })?;
                 episodes.push(episode);
             }
@@ -824,6 +1049,10 @@ impl<'a> SemanticCollectionLedger<'a> {
                 parent,
                 families,
                 human_reservations,
+                mixture: match pool {
+                    PoolRef::Mixture(p) => Some(p.checksum().into()),
+                    PoolRef::Legacy(..) => None,
+                },
             };
             finish(scope, cohort)
         })
@@ -869,7 +1098,7 @@ fn legal_choice(
 }
 fn run(
     config: &NativeStochasticConfig,
-    roster: &ConditionalFrozenMixRoster<'_>,
+    roster: RosterRef<'_>,
     scope: &SemanticCollectionScope<'_>,
     binding: &str,
     expected: Option<&Record>,
@@ -907,6 +1136,7 @@ fn run(
         failure: None,
         draws: [0; 4],
         samples: 0,
+        opponent_samples: 0,
         rows: 0,
     };
     if expected.is_some_and(|e| e.binding != record.binding) {
@@ -918,7 +1148,7 @@ fn run(
     }
     let mut guards = (0..config.players())
         .map(|actor| {
-            if actor == roster.learner_seat() {
+            if actor == roster.learner_seat() || roster.snapshot(actor).is_some() {
                 Ok(None)
             } else {
                 roster.opponent(actor)?.trade_guard_session()
@@ -980,18 +1210,29 @@ fn run(
                 after: None,
             });
             let o = &record.callbacks[index].observation;
-            let choice = if o.actor != roster.learner_seat() {
-                let opponent = roster.opponent(o.actor)?;
-                let decision = opponent.choose_indexed(index, o, guards[o.actor].as_mut())?;
-                let (decision, chosen) = legal_choice(o, decision, opponent.policy_version())?;
-                Choice::Opponent { decision, chosen }
-            } else if o.phase == Phase::Setup {
+            let learner = o.actor == roster.learner_seat();
+            let snapshot = roster.snapshot(o.actor);
+            let choice = if o.phase == Phase::Setup && (learner || roster.common_setup()) {
                 let decision =
                     crate::setup_policy::choose_move_with_weights(o, &HeuristicWeights::default())?;
                 let (decision, chosen) =
                     legal_choice(o, decision, crate::setup_policy::POLICY_VERSION)?;
-                Choice::LearnerSetup { decision, chosen }
+                if learner {
+                    Choice::LearnerSetup { decision, chosen }
+                } else {
+                    Choice::Opponent { decision, chosen }
+                }
+            } else if !learner && snapshot.is_none() {
+                let opponent = roster.opponent(o.actor)?;
+                let decision = opponent.choose_indexed(index, o, guards[o.actor].as_mut())?;
+                let (decision, chosen) = legal_choice(o, decision, opponent.policy_version())?;
+                Choice::Opponent { decision, chosen }
             } else if o.phase == Phase::Playing {
+                let sampled_snapshot = if learner {
+                    None
+                } else {
+                    Some(snapshot.ok_or("Missing frozen sampled actor")?)
+                };
                 let rows_before = record.rows;
                 let rows = record
                     .rows
@@ -1006,7 +1247,11 @@ fn run(
                     return Err("Semantic Playing row/trace cap before forward or draw".into());
                 }
                 record.rows = rows;
-                let prediction = scope.distribution(o)?;
+                let prediction = if let Some(snapshot) = sampled_snapshot {
+                    snapshot.distribution(o, scope.kernel())?
+                } else {
+                    scope.distribution(o)?
+                };
                 if prediction.logits.len() != o.legal_actions.len()
                     || prediction.probabilities.len() != prediction.logits.len()
                 {
@@ -1024,13 +1269,26 @@ fn run(
                     decision: Decision {
                         actor: o.actor,
                         observation_key: o.observation_key.clone(),
-                        policy_version: SAMPLING_VERSION.into(),
+                        policy_version: if learner {
+                            SAMPLING_VERSION
+                        } else {
+                            OPPONENT_SAMPLING_VERSION
+                        }
+                        .into(),
                         r#move: chosen.r#move.clone(),
                         score: f64::from(logit),
                     },
                     chosen,
                     index: draw.index,
-                    sample_index: record.samples,
+                    sample_index: if learner {
+                        record.samples
+                    } else {
+                        record.opponent_samples
+                    },
+                    global_sample_index: record
+                        .samples
+                        .checked_add(record.opponent_samples)
+                        .ok_or("Semantic sampled index overflow")?,
                     before: draw.state_before,
                     after: draw.state_after,
                     draws_before: draw.draws_before,
@@ -1048,9 +1306,20 @@ fn run(
                 };
                 states[o.actor] = draw.state_after;
                 record.draws[o.actor] = draw.draws_after;
-                record.samples += 1;
+                if learner {
+                    record.samples += 1;
+                } else {
+                    record.opponent_samples += 1;
+                }
                 record.rows = rows;
-                Choice::LearnerPlaying(Box::new(sample))
+                if let Some(snapshot) = sampled_snapshot {
+                    Choice::OpponentSample {
+                        sample: Box::new(sample),
+                        snapshot: snapshot.binding().into(),
+                    }
+                } else {
+                    Choice::LearnerPlaying(Box::new(sample))
+                }
             } else {
                 return Err("Semantic callback phase is neither Setup nor Playing".into());
             };
@@ -1082,6 +1351,7 @@ fn seal(
     record: Record,
     config: NativeStochasticConfig,
     learner: usize,
+    sampled_opponents: [bool; 4],
 ) -> Result<AuditedSemanticPlayingEpisode, String> {
     if !record.complete() {
         return Err("Semantic episode requires completed fresh audit".into());
@@ -1092,14 +1362,75 @@ fn seal(
         .enumerate()
         .filter_map(|(i, c)| matches!(c.choice, Some(Choice::LearnerPlaying(_))).then_some(i))
         .collect::<Vec<_>>();
+    let mut draws = [0_u64; 4];
+    let mut own = 0;
+    let mut opponents = 0;
+    let mut rows = 0;
+    for callback in &record.callbacks {
+        let actor = callback.observation.actor;
+        if actor >= config.players() {
+            return Err("Semantic audited actor out of range".into());
+        }
+        let sample = match callback
+            .choice
+            .as_ref()
+            .ok_or("Missing audited semantic choice")?
+        {
+            Choice::LearnerPlaying(sample)
+                if actor == learner && callback.observation.phase == Phase::Playing =>
+            {
+                if sample.sample_index != own {
+                    return Err("Learner sample ordinal differs".into());
+                }
+                own += 1;
+                Some(sample)
+            }
+            Choice::OpponentSample { sample, .. }
+                if actor != learner
+                    && sampled_opponents[actor]
+                    && callback.observation.phase == Phase::Playing =>
+            {
+                if sample.sample_index != opponents {
+                    return Err("Opponent sample ordinal differs".into());
+                }
+                opponents += 1;
+                Some(sample)
+            }
+            Choice::LearnerSetup { .. }
+                if actor == learner && callback.observation.phase == Phase::Setup =>
+            {
+                None
+            }
+            Choice::Opponent { .. }
+                if actor != learner
+                    && (!sampled_opponents[actor]
+                        || callback.observation.phase == Phase::Setup) =>
+            {
+                None
+            }
+            _ => return Err("Semantic audited phase/slot role differs".into()),
+        };
+        if let Some(sample) = sample {
+            if sample.global_sample_index != own + opponents - 1
+                || sample.draws_before != draws[actor]
+                || sample.rows_before != rows
+            {
+                return Err("Semantic all-actor sampled coverage differs".into());
+            }
+            draws[actor] += 1;
+            rows += callback.observation.legal_actions.len();
+            if sample.rows_after != rows {
+                return Err("Semantic sampled row coverage differs".into());
+            }
+        }
+    }
     if playing.is_empty()
         || playing.len() != record.samples
+        || own != record.samples
+        || opponents != record.opponent_samples
+        || rows != record.rows
+        || draws != record.draws
         || record.draws[learner] != playing.len() as u64
-        || record
-            .draws
-            .iter()
-            .enumerate()
-            .any(|(a, &n)| a != learner && n != 0)
     {
         return Err("Semantic Playing-only draw coverage differs".into());
     }
@@ -1112,6 +1443,145 @@ fn seal(
         rank: ranks[learner],
         winners,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn mixed_trace_fixture(
+    scope: &SemanticCollectionScope<'_>,
+    mixture: &SemanticFrozenMixture<'_>,
+    config: &NativeStochasticConfig,
+) {
+    let rosters = mixture.freeze().unwrap();
+    let roster = RosterRef::Mixture(&rosters[0]);
+    let setup_config = NativeStochasticConfig::new(
+        config.players(),
+        config.environment_seed(),
+        *config.sampling_identity(),
+        CollectionLimits::new(2, 4096, 1024 * 1024, 65536).unwrap(),
+    )
+    .unwrap();
+    let prefix = run(
+        &setup_config,
+        roster,
+        scope,
+        "synthetic-all-seat-corn-first",
+        None,
+        || create(&setup_config),
+    )
+    .unwrap();
+    assert!(!prefix.complete());
+    assert_eq!(
+        (prefix.samples, prefix.opponent_samples, prefix.draws),
+        (0, 0, [0; 4])
+    );
+    assert_eq!(prefix.callbacks.len(), 2);
+    assert!(prefix.callbacks.iter().any(|c| c.observation.actor == 1));
+    for callback in &prefix.callbacks {
+        assert_eq!(callback.observation.phase, Phase::Setup);
+        assert_eq!(
+            *callback.choice.as_ref().unwrap().decision(),
+            crate::setup_policy::choose_move_with_weights(
+                &callback.observation,
+                &HeuristicWeights::default()
+            )
+            .unwrap()
+        );
+    }
+    let start = || {
+        let mut state = crate::conditional_human_rl_update::tests::terminal_start(
+            config.players(),
+            config.environment_seed(),
+        );
+        state.turn.mode = tzolkin_core::TurnMode::None;
+        state.turn.count = 0;
+        Ok(state)
+    };
+    let mut complete = run(config, roster, scope, "synthetic-mixed-trace", None, start).unwrap();
+    assert!(complete.complete(), "{:?}", complete.failure);
+    assert!(complete.samples > 0 && complete.opponent_samples > 0);
+    assert_eq!(
+        complete.draws.iter().sum::<u64>(),
+        (complete.samples + complete.opponent_samples) as u64
+    );
+    let audited = run(
+        config,
+        roster,
+        scope,
+        "synthetic-mixed-trace",
+        Some(&complete),
+        start,
+    )
+    .unwrap();
+    let episode = seal(
+        audited,
+        config.clone(),
+        roster.learner_seat(),
+        roster.sampled_opponents(config.players()),
+    )
+    .unwrap();
+    assert_eq!(episode.playing_steps(), complete.samples);
+    assert_eq!(episode.actor_draws(), &complete.draws);
+    for index in 0..episode.playing_steps() {
+        assert_eq!(episode.step(index).unwrap().actor(), roster.learner_seat());
+    }
+    let sample = complete
+        .callbacks
+        .iter_mut()
+        .find_map(|c| match c.choice.as_mut() {
+            Some(Choice::OpponentSample { sample, .. }) => Some(sample),
+            _ => None,
+        })
+        .unwrap();
+    sample.raw ^= 1;
+    assert!(
+        run(
+            config,
+            roster,
+            scope,
+            "synthetic-mixed-trace",
+            Some(&complete),
+            start
+        )
+        .is_err()
+    );
+    assert!(seal(complete, config.clone(), roster.learner_seat(), [false; 4]).is_err());
+
+    // The first actor is a snapshot opponent. Its quota must reject before
+    // that actor's first forward/draw, not merely at learner-gradient admission.
+    let tiny = NativeStochasticConfig::new(
+        config.players(),
+        config.environment_seed(),
+        *config.sampling_identity(),
+        CollectionLimits::new(64, 1, 8 * 1024 * 1024, 1024 * 1024).unwrap(),
+    )
+    .unwrap();
+    let refused = run(
+        &tiny,
+        roster,
+        scope,
+        "synthetic-opponent-row-cap",
+        None,
+        || {
+            let mut state = start()?;
+            state.current_player = 1;
+            state.turn_index = 1;
+            assert!(observe(&state, 1)?.legal_actions.len() > 1);
+            Ok(state)
+        },
+    )
+    .unwrap();
+    assert!(!refused.complete());
+    assert!(
+        refused
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("cap before forward or draw")
+    );
+    assert_eq!(
+        (refused.samples, refused.opponent_samples, refused.draws),
+        (0, 0, [0; 4])
+    );
 }
 
 #[cfg(test)]
@@ -1139,9 +1609,14 @@ pub(crate) fn phase_collection_fixture(
             CollectionLimits::new(1, 4096, 1024 * 1024, 65536).unwrap(),
         )
         .unwrap();
-        let prefix = run(&config, &rosters[0], scope, "synthetic-unit", None, || {
-            create(&config)
-        })
+        let prefix = run(
+            &config,
+            RosterRef::Legacy(&rosters[0]),
+            scope,
+            "synthetic-unit",
+            None,
+            || create(&config),
+        )
         .unwrap();
         assert!(!prefix.complete());
         assert_eq!((prefix.samples, prefix.rows, prefix.draws), (0, 0, [0; 4]));
@@ -1162,14 +1637,14 @@ pub(crate) fn phase_collection_fixture(
         assert_eq!(chosen.r#move, decision.r#move);
         let replayed = run(
             &config,
-            &rosters[0],
+            RosterRef::Legacy(&rosters[0]),
             scope,
             "synthetic-unit",
             Some(&prefix),
             || create(&config),
         )
         .unwrap();
-        assert!(seal(replayed, config.clone(), 0).is_err());
+        assert!(seal(replayed, config.clone(), 0, [false; 4]).is_err());
 
         // Existing synthetic last-round Core oracle; no full game or score
         // prediction is being certified as a native source.
@@ -1181,21 +1656,26 @@ pub(crate) fn phase_collection_fixture(
             CollectionLimits::new(64, 262144, 8 * 1024 * 1024, 1024 * 1024).unwrap(),
         )
         .unwrap();
-        let complete = run(&config, &rosters[0], scope, "synthetic-unit", None, || {
-            Ok(last.clone())
-        })
+        let complete = run(
+            &config,
+            RosterRef::Legacy(&rosters[0]),
+            scope,
+            "synthetic-unit",
+            None,
+            || Ok(last.clone()),
+        )
         .unwrap();
         assert!(complete.complete(), "{:?}", complete.failure);
         let audited = run(
             &config,
-            &rosters[0],
+            RosterRef::Legacy(&rosters[0]),
             scope,
             "synthetic-unit",
             Some(&complete),
             || Ok(last.clone()),
         )
         .unwrap();
-        let episode = seal(audited, config.clone(), 0).unwrap();
+        let episode = seal(audited, config.clone(), 0, [false; 4]).unwrap();
         assert_eq!(episode.learner_setup_choices(), 0);
         assert!(episode.playing_steps() > 0);
         assert_eq!(episode.actor_draws()[0], episode.playing_steps() as u64);
@@ -1236,7 +1716,7 @@ pub(crate) fn phase_collection_fixture(
         assert!(
             run(
                 &config,
-                &rosters[0],
+                RosterRef::Legacy(&rosters[0]),
                 scope,
                 "synthetic-unit",
                 Some(&bad),
