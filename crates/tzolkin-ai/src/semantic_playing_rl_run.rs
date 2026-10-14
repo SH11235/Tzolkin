@@ -351,6 +351,29 @@ struct Original {
     initialization_kind: Option<InitializationKind>,
 }
 impl Original {
+    fn reject_native_namespace(&self, output: &Path) -> Result<(), String> {
+        if self.initialization_kind.is_some() {
+            let directory = Path::new(&self.collection.path)
+                .parent()
+                .ok_or("Native dataset manifest parent")?;
+            let directory =
+                fs::canonicalize(local(directory, false)?).map_err(|e| e.to_string())?;
+            let output = local(output, true)?;
+            let output = match fs::symlink_metadata(&output) {
+                Ok(_) => fs::canonicalize(&output).map_err(|e| e.to_string())?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::canonicalize(output.parent().ok_or("Native output parent")?)
+                        .map_err(|e| e.to_string())?
+                        .join(output.file_name().ok_or("Native output name")?)
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            if output.starts_with(&directory) || directory.starts_with(output) {
+                return Err("Native dataset and journal/output namespaces must be disjoint".into());
+            }
+        }
+        Ok(())
+    }
     fn composition(&self) -> Result<SemanticCollectionComposition, String> {
         if self.initialization_kind.is_some()
             && self.collection_composition != Some(SemanticCollectionComposition::GuardedProposalV2)
@@ -654,6 +677,8 @@ fn read_only_output(w: &AuditWire, output: &Path) -> Result<PathBuf, String> {
     }
     let directory = local(Path::new(&w.journal_directory), false)?;
     let output = local(output, true)?;
+    w.original.reject_native_namespace(&output)?;
+    w.original.reject_native_namespace(&directory)?;
     if !output.is_absolute()
         || output.to_string_lossy().len() > 1024
         || directory.to_string_lossy().len() > 1024
@@ -1160,6 +1185,8 @@ pub fn run_semantic_playing_journal(
         return Err("Semantic journal/invocation directory state differs".into());
     }
     let source = serde_json::to_value(w).map_err(|e| e.to_string())?;
+    w.original.reject_native_namespace(&directory)?;
+    w.original.reject_native_namespace(&output)?;
     reject_input_namespace(&output, &source)?;
     reject_input_namespace(
         &directory,
@@ -1874,6 +1901,47 @@ pub(super) fn control_fixture(
     native_control["original"]["initializationKind"] =
         "nativeCornFirstV5SemanticPlayingTeacher".into();
     let native_spec = parse(&native_control).unwrap();
+    let native_namespace = root.join("native-namespace-source");
+    fs::create_dir(&native_namespace).unwrap();
+    let mut overlap = native_control.clone();
+    overlap["original"]["collection"]["path"] = native_namespace
+        .join("manifest.json")
+        .to_str()
+        .unwrap()
+        .into();
+    let output = root.join("native-namespace-output");
+    let nested_journal = native_namespace.join("journal");
+    overlap["journalDirectory"] = nested_journal.to_str().unwrap().into();
+    let error = run_semantic_playing_journal(parse(&overlap).unwrap(), &output)
+        .err()
+        .unwrap();
+    assert!(error.contains("namespaces must be disjoint"));
+    assert!(!nested_journal.exists() && !output.exists());
+    #[cfg(windows)]
+    {
+        let case_journal = root.join("NATIVE-NAMESPACE-SOURCE").join("case-journal");
+        overlap["journalDirectory"] = case_journal.to_str().unwrap().into();
+        let error = run_semantic_playing_journal(parse(&overlap).unwrap(), &output)
+            .err()
+            .unwrap();
+        assert!(error.contains("namespaces must be disjoint"));
+        assert!(!case_journal.exists() && !output.exists());
+    }
+    let nested_output = native_namespace.join("output");
+    overlap["journalDirectory"] = root
+        .join("native-namespace-journal")
+        .to_str()
+        .unwrap()
+        .into();
+    let error = run_semantic_playing_journal(parse(&overlap).unwrap(), &nested_output)
+        .err()
+        .unwrap();
+    assert!(error.contains("namespaces must be disjoint"));
+    assert!(!nested_output.exists());
+    let original = parse(&overlap).unwrap().wire.original;
+    assert!(original.reject_native_namespace(&native_namespace).is_err());
+    assert!(original.reject_native_namespace(root).is_err());
+    assert!(original.reject_native_namespace(&output).is_ok());
     // The discriminator is part of Original, hence the existing allocation plan hash.
     assert_ne!(
         plan_checksum(&native_spec.wire).unwrap(),
