@@ -19,6 +19,8 @@ const AUDIT_SCHEMA: &str = "tzolkin-semantic-playing-journal-audit-v1";
 const EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-journal-evaluation-v1";
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
+#[path = "semantic_playing_rl_checkpoint.rs"]
+mod checkpoint;
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -144,6 +146,54 @@ struct Restore {
     tip: ContentPin,
     close_declaration: ContentPin,
 }
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Chunk {
+    parent: checkpoint::Input,
+    sampling_seed: u64,
+    replicate: u64,
+    first_ordinal: u64,
+    budget: [u64; 5],
+    prior: Prior,
+}
+impl Chunk {
+    fn budget(&self) -> Result<SemanticJournalBudget, String> {
+        SemanticJournalBudget::new(
+            usize::try_from(self.budget[0]).map_err(|_| "Chunk attempts")?,
+            self.budget[1],
+            self.budget[2],
+            self.budget[3],
+            self.budget[4],
+        )
+    }
+}
+fn source_prior<'a>(
+    original: &'a Original,
+    chunk: Option<&'a Chunk>,
+) -> (&'a External, &'a History) {
+    chunk.map_or((&original.external, &original.history), |c| {
+        (&c.prior.external, &c.prior.history)
+    })
+}
+fn source_budget(
+    original: &Original,
+    chunk: Option<&Chunk>,
+) -> Result<SemanticJournalBudget, String> {
+    chunk.map_or_else(|| original.budget(), Chunk::budget)
+}
+fn source_session<'a>(
+    original: &Original,
+    chunk: Option<&Chunk>,
+    prepared: &PreparedConditionalHumanPolicy,
+    external: &'a ConditionalNativeExclusions,
+    history: &'a DeclaredSamplingHistory,
+) -> Result<SemanticPlayingJointSession<'a>, String> {
+    if let Some(chunk) = chunk {
+        checkpoint::resume(original, chunk, prepared, external, history)
+    } else {
+        original.fresh(prepared, external, history)
+    }
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -153,6 +203,10 @@ struct AuditWire {
     original: Original,
     procedural_pool: ContentPin,
     restore: Restore,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk: Option<Chunk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_export: Option<checkpoint::Export>,
 }
 
 /// Separate restore-only input. It admits no schedule, allocation, new prior,
@@ -174,6 +228,9 @@ impl SemanticJournalAuditSpec {
         }
         wire.original.limits()?;
         wire.original.budget()?;
+        if let Some(chunk) = &wire.chunk {
+            chunk.budget()?;
+        }
         OneStepConfig::from_checkpoint(wire.original.actor_config.clone())?;
         ResidualFitConfig::from_checkpoint(wire.original.critic_config.clone())?;
         Ok(Self {
@@ -206,6 +263,8 @@ pub struct SemanticJournalAudit {
     source_qualified: bool,
     verified_native_policy: bool,
     strength_claimed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<ContentPin>,
 }
 
 /// Replays an existing successful producing tip from its genuinely loaded
@@ -220,8 +279,9 @@ pub fn audit_semantic_playing_journal(
     let w = &spec.wire;
     let output = read_only_output(w, output)?;
     let directory = local(Path::new(&w.journal_directory), false)?;
-    let external = w.original.external.load()?;
-    let history = w.original.history.load()?;
+    let (source_external, source_history) = source_prior(&w.original, w.chunk.as_ref());
+    let external = source_external.load()?;
+    let history = source_history.load()?;
     let pool = ConditionalFrozenPool::from_json(&pinned(&w.procedural_pool, MAX_CONTROL)?)?;
     pool.procedural_binding()?;
     let prepared = w.original.load_prepared()?;
@@ -230,23 +290,30 @@ pub fn audit_semantic_playing_journal(
             &directory,
             &w.restore.tip,
             &w.restore.close_declaration,
-            w.original.fresh(&prepared, &external, &history)?,
+            source_session(
+                &w.original,
+                w.chunk.as_ref(),
+                &prepared,
+                &external,
+                &history,
+            )?,
             &[&pool],
         )?;
         let (journal, snapshots) = restored.into_journal_and_snapshots();
         if journal.limits != w.original.limits()?
-            || bounded(&journal.budget)? != bounded(&w.original.budget()?)?
+            || bounded(&journal.budget)? != bounded(&source_budget(&w.original, w.chunk.as_ref())?)?
         {
             return Err("Semantic audit original limits/budget differ".into());
         }
-        let report = audit_report(
+        let mut report = audit_report(
             spec.checksum,
             &w.restore.close_declaration,
             &journal,
             &snapshots,
         )?;
-        let raw = bounded(&report)?;
         fs::create_dir(&output).map_err(|e| e.to_string())?;
+        report.checkpoint = checkpoint::export(w, &journal, &output)?;
+        let raw = bounded(&report)?;
         publish_mixed_metadata(&output, "audit.json", &raw)?;
         // The read-only report is not authority. Preserve late errors rather
         // than returning a success after changed archive/source evidence.
@@ -261,6 +328,8 @@ pub fn audit_semantic_playing_journal(
         .and_then(|_| pinned(&w.procedural_pool, MAX_CONTROL).map(|_| ()))
         .and_then(|_| pinned(&w.restore.close_declaration, META_BYTES).map(|_| ()))
         .and_then(|_| pool.procedural_binding().map(|_| ()));
+    let post = post.and_then(|_| checkpoint::recheck(w.chunk.as_ref()));
+    let post = post.and_then(|_| checkpoint::recheck_export(w.checkpoint_export.as_ref()));
     match (result, post) {
         (Ok(report), Ok(())) => Ok(report),
         (Err(error), Ok(())) => Err(error),
@@ -420,6 +489,9 @@ pub fn evaluate_semantic_playing_journal(
     let e = &spec.wire;
     let raw = pinned(&e.audit_control, MAX_CONTROL)?;
     let audit = SemanticJournalAuditSpec::from_json(&raw, &e.audit_control.sha256)?;
+    if audit.wire.checkpoint_export.is_some() {
+        return Err("Evaluation does not admit a checkpoint export request".into());
+    }
     let w = &audit.wire;
     let output = read_only_output(w, output)?;
     reject_input_namespace(
@@ -427,8 +499,9 @@ pub fn evaluate_semantic_playing_journal(
         &serde_json::to_value((&e.audit_control, &e.global_external)).map_err(|e| e.to_string())?,
     )?;
     let (global, config) = load_evaluation_config(e)?;
-    let external = w.original.external.load()?;
-    let history = w.original.history.load()?;
+    let (source_external, source_history) = source_prior(&w.original, w.chunk.as_ref());
+    let external = source_external.load()?;
+    let history = source_history.load()?;
     let pool = ConditionalFrozenPool::from_json(&pinned(&w.procedural_pool, MAX_CONTROL)?)?;
     pool.procedural_binding()?;
     let prepared = w.original.load_prepared()?;
@@ -449,13 +522,20 @@ pub fn evaluate_semantic_playing_journal(
             Path::new(&w.journal_directory),
             &w.restore.tip,
             &w.restore.close_declaration,
-            w.original.fresh(&prepared, &external, &history)?,
+            source_session(
+                &w.original,
+                w.chunk.as_ref(),
+                &prepared,
+                &external,
+                &history,
+            )?,
             &[&pool],
         )?;
         let (journal, snapshots) = restored.into_journal_and_snapshots();
         let result = (|| {
             if journal.limits != w.original.limits()?
-                || bounded(&journal.budget)? != bounded(&w.original.budget()?)?
+                || bounded(&journal.budget)?
+                    != bounded(&source_budget(&w.original, w.chunk.as_ref())?)?
                 || journal
                     .session
                     .consumed_families()
@@ -525,6 +605,7 @@ pub fn evaluate_semantic_playing_journal(
             pinned(&w.procedural_pool, MAX_CONTROL).map(|_| ()),
             pinned(&w.restore.close_declaration, META_BYTES).map(|_| ()),
             pool.procedural_binding().map(|_| ()),
+            checkpoint::recheck(w.chunk.as_ref()),
         ],
     )
 }
@@ -559,6 +640,7 @@ pub(super) fn audit_report(
         source_qualified: false,
         verified_native_policy: false,
         strength_claimed: false,
+        checkpoint: None,
     })
 }
 #[derive(Deserialize, Serialize)]
@@ -594,6 +676,13 @@ struct Wire {
     global_prior: Prior,
     permanent_allocation: ContentPin,
     batches: Vec<Batch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunk: Option<Chunk>,
+    #[serde(default, skip_serializing_if = "disabled")]
+    checkpoint_on_completion: bool,
+}
+fn disabled(value: &bool) -> bool {
+    !value
 }
 
 /// Closed pinned control; no learner, snapshot or raw parameter constructor.
@@ -609,8 +698,10 @@ impl SemanticJournalRunSpec {
         let wire: Wire =
             serde_json::from_value(unique_json(raw, MAX_CONTROL)?).map_err(|e| e.to_string())?;
         if wire.schema != RUN_SCHEMA
-            || !matches!(wire.mode.as_str(), "start" | "resume")
+            || !matches!(wire.mode.as_str(), "start" | "resume" | "continue")
             || (wire.mode == "resume") != wire.restore.is_some()
+            || wire.mode == "continue" && wire.chunk.is_none()
+            || wire.mode == "start" && wire.chunk.is_some()
             || wire.batches.is_empty()
             || wire.batches.len() > 64
             || wire.global_prior.forbidden_sampling_seeds.len() > 8192
@@ -624,6 +715,26 @@ impl SemanticJournalRunSpec {
         }
         wire.original.limits()?;
         wire.original.budget()?;
+        if let Some(chunk) = &wire.chunk {
+            chunk.budget()?;
+            if wire.mode == "continue" && bounded(&chunk.prior)? != bounded(&wire.global_prior)? {
+                return Err("New chunk prior must equal the complete current GLOBAL PRIOR".into());
+            }
+        }
+        if wire.chunk.is_some() && !wire.checkpoint_on_completion
+            || wire.checkpoint_on_completion
+                && (!wire.batches.len().is_multiple_of(5)
+                    || wire.batches.iter().enumerate().any(|(i, b)| {
+                        (i % 5 == 0) != b.capture_before.is_some()
+                            || b.slots
+                                .iter()
+                                .any(|s| matches!(&s.snapshot, SnapshotRef::Existing { .. }))
+                    }))
+        {
+            return Err(
+                "Checkpoint chunks require complete five-batch local capture blocks".into(),
+            );
+        }
         OneStepConfig::from_checkpoint(wire.original.actor_config.clone())?;
         ResidualFitConfig::from_checkpoint(wire.original.critic_config.clone())?;
         let mut aliases = BTreeSet::new();
@@ -688,6 +799,8 @@ pub struct SemanticJournalInvocation {
     source_authenticated: bool,
     source_qualified: bool,
     verified_native_policy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checkpoint: Option<ContentPin>,
 }
 impl SemanticJournalInvocation {
     pub fn exit_code(&self) -> i32 {
@@ -707,7 +820,8 @@ pub fn run_semantic_playing_journal(
     output: &Path,
 ) -> Result<SemanticJournalInvocation, String> {
     let w = &spec.wire;
-    let directory = local(Path::new(&w.journal_directory), w.mode == "start")?;
+    let new_directory = w.mode != "resume";
+    let directory = local(Path::new(&w.journal_directory), new_directory)?;
     let output = local(output, true)?;
     if output == directory
         || output.starts_with(&directory)
@@ -718,7 +832,7 @@ pub fn run_semantic_playing_journal(
     {
         return Err("Semantic invocation needs a separate fresh output namespace".into());
     }
-    if w.mode == "start" && fs::symlink_metadata(&directory).is_ok()
+    if new_directory && fs::symlink_metadata(&directory).is_ok()
         || w.mode == "resume"
             && !fs::metadata(&directory)
                 .map_err(|e| e.to_string())?
@@ -732,14 +846,18 @@ pub fn run_semantic_playing_journal(
     reject_input_namespace(
         &directory,
         &json!({"original":w.original,
-        "pool":w.procedural_pool,"allocation":w.permanent_allocation,
+        "pool":w.procedural_pool,"allocation":w.permanent_allocation,"chunk":w.chunk,
         "closeDeclaration":w.restore.as_ref().map(|r|&r.close_declaration)}),
     )?;
-    let original_external = w.original.external.load()?;
-    let original_history = w.original.history.load()?;
+    let (source_external, source_history) = source_prior(&w.original, w.chunk.as_ref());
+    let original_external = source_external.load()?;
+    let original_history = source_history.load()?;
     let prior = w.global_prior.external.load()?;
     let prior_history = w.global_prior.history.load()?;
     check_original_prior(w, &prior)?;
+    if let Some(chunk) = &w.chunk {
+        check_declared_prior(&chunk.prior, &w.global_prior, &prior)?;
+    }
     let pool_raw = pinned(&w.procedural_pool, MAX_CONTROL)?;
     let pool = ConditionalFrozenPool::from_json(&pool_raw)?;
     pool.procedural_binding()?; // Explicitly refuse neural/search legacy slots.
@@ -748,7 +866,10 @@ pub fn run_semantic_playing_journal(
     let plan_checksum = plan_checksum(w)?;
     let limits = w.original.limits()?;
     let expected_first = match &w.restore {
-        None => w.original.first_ordinal,
+        None => w
+            .chunk
+            .as_ref()
+            .map_or(w.original.first_ordinal, |c| c.first_ordinal),
         Some(_) => allocation_first(&allocation_raw)?,
     };
     let expected = allocation(w, &plan_checksum, expected_first, limits)?;
@@ -765,9 +886,13 @@ pub fn run_semantic_playing_journal(
     )?;
     // All control/allocation/prior checks above precede model loading or Game.
     let prepared = w.original.load_prepared()?;
-    let fresh = w
-        .original
-        .fresh(&prepared, &original_external, &original_history)?;
+    let fresh = source_session(
+        &w.original,
+        w.chunk.as_ref(),
+        &prepared,
+        &original_external,
+        &original_history,
+    )?;
     let (mut journal, mut snapshots) = if let Some(restore) = &w.restore {
         restore_observed_closed(
             &directory,
@@ -779,12 +904,17 @@ pub fn run_semantic_playing_journal(
         .into_journal_and_snapshots()
     } else {
         (
-            SemanticPlayingJournal::start(&directory, fresh, limits, w.original.budget()?)?,
+            SemanticPlayingJournal::start_chunk(
+                &directory,
+                fresh,
+                limits,
+                source_budget(&w.original, w.chunk.as_ref())?,
+            )?,
             Vec::new(),
         )
     };
     if journal.limits != limits
-        || bounded(&journal.budget)? != bounded(&w.original.budget()?)?
+        || bounded(&journal.budget)? != bounded(&source_budget(&w.original, w.chunk.as_ref())?)?
         || journal.session.next_episode_ordinal() != expected_first
     {
         return Err("Semantic restored original limits/budget/next cursor differ".into());
@@ -903,6 +1033,24 @@ pub fn run_semantic_playing_journal(
             error.unwrap_or_default()
         ));
     }
+    let checkpoint = if error.is_none() && result == Ok(true) && w.checkpoint_on_completion {
+        match checkpoint::produce(
+            w,
+            &journal,
+            &output,
+            last_returned_pin
+                .as_ref()
+                .ok_or("Checkpoint last close missing")?,
+        ) {
+            Ok(pin) => Some(pin),
+            Err(post) => {
+                error = Some(format!("Checkpoint publication: {post}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
     let disposition = if error.is_some() {
         "refused"
     } else if result == Ok(true) {
@@ -936,6 +1084,7 @@ pub fn run_semantic_playing_journal(
         source_authenticated: false,
         source_qualified: false,
         verified_native_policy: false,
+        checkpoint,
     };
     let raw = bounded(&report)?;
     // On a late IO failure the CLI still receives exact accounting to print.
@@ -982,11 +1131,13 @@ fn pinned(pin: &ContentPin, cap: usize) -> Result<Vec<u8>, String> {
     Ok(raw)
 }
 fn plan_checksum(w: &Wire) -> Result<String, String> {
-    hash(
-        b"semantic-playing-invocation-plan-v1\0",
-        &json!({"mode":w.mode,"journalDirectory":w.journal_directory,
-        "original":w.original,"proceduralPool":w.procedural_pool,"restore":w.restore,"globalPrior":w.global_prior,"batches":w.batches}),
-    )
+    let mut plan = json!({"mode":w.mode,"journalDirectory":w.journal_directory,
+        "original":w.original,"proceduralPool":w.procedural_pool,"restore":w.restore,"globalPrior":w.global_prior,"batches":w.batches});
+    if w.chunk.is_some() || w.checkpoint_on_completion {
+        plan["chunk"] = serde_json::to_value(&w.chunk).map_err(|e| e.to_string())?;
+        plan["checkpointOnCompletion"] = w.checkpoint_on_completion.into();
+    }
+    hash(b"semantic-playing-invocation-plan-v1\0", &plan)
 }
 fn allocation_first(raw: &[u8]) -> Result<u64, String> {
     unique_json(raw, MAX_CONTROL)?
@@ -995,6 +1146,7 @@ fn allocation_first(raw: &[u8]) -> Result<u64, String> {
         .ok_or("Semantic allocation first ordinal".into())
 }
 fn allocation(w: &Wire, plan: &str, first: u64, limits: CollectionLimits) -> Result<Value, String> {
+    let (sampling_seed, replicate) = sampling(w);
     let next = first
         .checked_add(4 * w.batches.len() as u64)
         .ok_or("Semantic invocation ordinal overflow")?;
@@ -1011,17 +1163,17 @@ fn allocation(w: &Wire, plan: &str, first: u64, limits: CollectionLimits) -> Res
             let players = if member < 2 { 3 } else { 4 };
             let ordinal = first + 4 * batch as u64 + member as u64;
             let identity = SamplingStreamIdentity::new(
-                SamplingSeed::new(w.original.sampling_seed),
+                SamplingSeed::new(sampling_seed),
                 ordinal,
-                w.original.replicate,
+                replicate,
                 players,
             )?;
             let config = NativeStochasticConfig::new(players, seed, identity, limits)?;
             for actor in 0..players {
                 streams.insert([
-                    w.original.sampling_seed,
+                    sampling_seed,
                     ordinal,
-                    w.original.replicate,
+                    replicate,
                     players as u64,
                     actor as u64,
                 ]);
@@ -1029,12 +1181,22 @@ fn allocation(w: &Wire, plan: &str, first: u64, limits: CollectionLimits) -> Res
             members.push(json!({"batch":batch,"member":member,"family":family,"config":Config::from_config(&config)}));
         }
     }
-    Ok(
-        json!({"schema":ALLOCATION_SCHEMA,"planChecksum":plan,"globalPrior":w.global_prior,
+    let mut allocation = json!({"schema":ALLOCATION_SCHEMA,"planChecksum":plan,"globalPrior":w.global_prior,
         "priorHead":w.restore.as_ref().map(|r|&r.tip),"permanent":true,"allUnenteredRemainSpent":true,
-        "samplingSeed":w.original.sampling_seed,"replicate":w.original.replicate,"firstOrdinal":first,"nextOrdinal":next,
-        "families":families,"actorStreams":streams,"members":members}),
-    )
+        "samplingSeed":sampling_seed,"replicate":replicate,"firstOrdinal":first,"nextOrdinal":next,
+        "families":families,"actorStreams":streams,"members":members});
+    if let Some(chunk) = &w.chunk {
+        allocation["parentCheckpoint"] =
+            serde_json::to_value(&chunk.parent).map_err(|e| e.to_string())?;
+    }
+    Ok(allocation)
+}
+fn sampling(w: &Wire) -> (u64, u64) {
+    w.chunk
+        .as_ref()
+        .map_or((w.original.sampling_seed, w.original.replicate), |c| {
+            (c.sampling_seed, c.replicate)
+        })
 }
 fn check_new(
     w: &Wire,
@@ -1043,9 +1205,10 @@ fn check_new(
     history: &DeclaredSamplingHistory,
     limits: CollectionLimits,
 ) -> Result<(), String> {
+    let (sampling_seed, replicate) = sampling(w);
     if w.global_prior
         .forbidden_sampling_seeds
-        .binary_search(&w.original.sampling_seed)
+        .binary_search(&sampling_seed)
         .is_ok()
     {
         return Err("Prospective sampling seed is wholly forbidden".into());
@@ -1057,9 +1220,9 @@ fn check_new(
             }
             let players = if member < 2 { 3 } else { 4 };
             let identity = SamplingStreamIdentity::new(
-                SamplingSeed::new(w.original.sampling_seed),
+                SamplingSeed::new(sampling_seed),
                 first + 4 * batch as u64 + member as u64,
-                w.original.replicate,
+                replicate,
                 players,
             )?;
             NativeStochasticConfig::new(players, seed, identity, limits)?;
@@ -1103,12 +1266,19 @@ fn check_prior(
     Ok(())
 }
 fn check_original_prior(w: &Wire, prior: &ConditionalNativeExclusions) -> Result<(), String> {
+    check_source_prior(&w.original, &w.global_prior, prior)
+}
+fn check_source_prior(
+    original: &Original,
+    declared: &Prior,
+    prior: &ConditionalNativeExclusions,
+) -> Result<(), String> {
     // The existing typed loader has already validated this exact pinned wire.
-    let original = unique_json(
-        &pinned(&w.original.external.pin, 32 * 1024 * 1024)?,
+    let original_wire = unique_json(
+        &pinned(&original.external.pin, 32 * 1024 * 1024)?,
         32 * 1024 * 1024,
     )?;
-    if original["families"]
+    if original_wire["families"]
         .as_array()
         .ok_or("Original family closure")?
         .iter()
@@ -1116,8 +1286,8 @@ fn check_original_prior(w: &Wire, prior: &ConditionalNativeExclusions) -> Result
     {
         return Err("GLOBAL PRIOR omits original external families".into());
     }
-    for r in &w.original.history.ranges {
-        if w.global_prior
+    for r in &original.history.ranges {
+        if declared
             .forbidden_sampling_seeds
             .binary_search(&r[0])
             .is_ok()
@@ -1125,13 +1295,62 @@ fn check_original_prior(w: &Wire, prior: &ConditionalNativeExclusions) -> Result
             continue;
         }
         let mut cursor = r[4];
-        for q in &w.global_prior.history.ranges {
+        for q in &declared.history.ranges {
             if q[..4] == r[..4] && q[4] <= cursor && cursor < q[5] {
                 cursor = q[5];
             }
         }
         if cursor < r[5] {
             return Err("GLOBAL PRIOR omits original declared sampling history".into());
+        }
+    }
+    Ok(())
+}
+fn check_declared_prior(
+    old: &Prior,
+    new: &Prior,
+    external: &ConditionalNativeExclusions,
+) -> Result<(), String> {
+    for prior in [old, new] {
+        if prior.forbidden_sampling_seeds.len() > 8192
+            || prior
+                .forbidden_sampling_seeds
+                .windows(2)
+                .any(|p| p[0] >= p[1])
+        {
+            return Err("Chunk forbidden sampling seeds must stay sorted and bounded".into());
+        }
+        prior.history.load()?;
+    }
+    let old_external = unique_json(
+        &pinned(&old.external.pin, 32 * 1024 * 1024)?,
+        32 * 1024 * 1024,
+    )?;
+    if old_external["families"]
+        .as_array()
+        .ok_or("Chunk prior families")?
+        .iter()
+        .any(|f| f.as_str().is_none_or(|f| !external.contains_family(f)))
+        || old
+            .forbidden_sampling_seeds
+            .iter()
+            .any(|seed| new.forbidden_sampling_seeds.binary_search(seed).is_err())
+    {
+        return Err("Chunk prior drops earlier families or unknown sampling seeds".into());
+    }
+    let history = new.history.load()?;
+    for r in &old.history.ranges {
+        if new.forbidden_sampling_seeds.binary_search(&r[0]).is_err()
+            && !history.covers(
+                SamplingSeed::new(r[0]),
+                r[1],
+                r[2] as usize,
+                r[3] as usize,
+                r[4],
+                r[5],
+            )
+        {
+            return Err("Chunk prior drops earlier declared sampling ranges".into());
         }
     }
     Ok(())
@@ -1145,13 +1364,21 @@ fn recheck_inputs(
     history.recheck()?;
     pinned(&w.procedural_pool, MAX_CONTROL)?;
     pinned(&w.permanent_allocation, MAX_CONTROL)?;
+    checkpoint::recheck(w.chunk.as_ref())?;
     Ok(())
 }
 
 // Called by the existing loaded-origin fixture. These are control/tuple
 // assertions, not an execution authorization or an alternative game runner.
 #[cfg(test)]
-pub(super) fn control_fixture(root: &Path, limits: CollectionLimits, seeds: [u32; 4]) {
+pub(super) fn control_fixture(
+    root: &Path,
+    limits: CollectionLimits,
+    seeds: [u32; 4],
+    prepared: &PreparedConditionalHumanPolicy,
+    journal: &SemanticPlayingJournal<'_>,
+    returned: &SemanticJournalReturnedClose,
+) {
     let pin = |path: PathBuf| {
         let raw = fs::read(&path).unwrap();
         ContentPin {
@@ -1253,4 +1480,239 @@ pub(super) fn control_fixture(root: &Path, limits: CollectionLimits, seeds: [u32
     value["batches"][0]["seeds"][0] = 42.into();
     let self_union = parse(&value).unwrap();
     assert!(check_new(&self_union.wire, 200, &prior, &history, limits).is_err());
+
+    // Extend the same short loaded fixture: genuine owned numerics plus
+    // synthetic local close declarations, never a claim of observing an OS.
+    let save = |name: &str, value: &Value| {
+        let raw = bounded(value).unwrap();
+        fs::write(root.join(name), &raw).unwrap();
+        Pin::new(name, &raw).absolute(root)
+    };
+    let mut producer = spec.wire;
+    let ledger = journal.session.capture_ledger();
+    producer.permanent_allocation = save(
+        "checkpoint-fixture-allocation.json",
+        &json!({
+        "schema":ALLOCATION_SCHEMA,"permanent":true,"allUnenteredRemainSpent":true,
+        "families":ledger["families"],"actorStreams":ledger["streams"]}),
+    );
+    let output = root.join("checkpoint-fixture-output");
+    fs::create_dir(&output).unwrap();
+    let returned_pin = save(
+        "checkpoint-fixture-returned.json",
+        &serde_json::to_value(returned).unwrap(),
+    );
+    let payload = checkpoint::produce(&producer, journal, &output, &returned_pin).unwrap();
+    let process = save(
+        "checkpoint-fixture-process.json",
+        &json!({
+        "schema":PROCESS_CLOSE_SCHEMA,"actualClose":true,"pid":1,"exitCode":0,"signal":null,
+        "stdoutEof":true,"stderrEof":true,"allPostchecksPassed":true,
+        "observedHead":journal.head(),"returnedClose":returned_pin}),
+    );
+    let declaration = save(
+        "checkpoint-fixture-journal-close.json",
+        &json!({
+        "schema":CLOSE_DECLARATION_SCHEMA,"observedHead":journal.head(),
+        "processClose":process,"returnedClose":returned_pin,"completeConsumptionDeclared":true,
+        "consumption":ledger,"status":journal.status(),
+        "inventory":journal.members.values().map(|p|p.absolute(&journal.directory)).collect::<Vec<_>>()}),
+    );
+    let invocation = save(
+        "checkpoint-fixture-invocation.json",
+        &json!({
+        "disposition":"completed","error":null,"checkpoint":payload,"head":journal.head(),
+        "status":journal.status(),"completeSessionConsumption":ledger,
+        "historicalArchiveBytesCheckedAtReturn":true,"declaredPermanentAllocation":producer.permanent_allocation}),
+    );
+    let producer_close = |name: &str, payload: &ContentPin, invocation: &ContentPin| {
+        save(
+            name,
+            &json!({
+        "schema":"tzolkin-semantic-playing-checkpoint-observed-process-close-v1",
+        "actualClose":true,"pid":2,"exitCode":0,"signal":null,"stdoutEof":true,
+        "stderrEof":true,"allPostchecksPassed":true,"checkpoint":payload,"invocation":invocation}),
+        )
+    };
+    let producing = producer_close("checkpoint-fixture-producer.json", &payload, &invocation);
+    let close = save(
+        "checkpoint-fixture-close.json",
+        &json!({
+        "schema":"tzolkin-semantic-playing-checkpoint-close-v1","checkpoint":payload,
+        "journalCloseDeclaration":declaration,"invocation":invocation,"producerClose":producing}),
+    );
+    let mut families = journal.session.consumed_families().clone();
+    families.insert(seed_family_id(42));
+    let union = save(
+        "checkpoint-fixture-prior.json",
+        &json!({
+        "schema":"tzolkin-conditional-native-exclusions-v1","families":families}),
+    );
+    let external = json!({"pin":union,"count":families.len(),
+        "canonicalDigest":crate::model::digest(families.iter().map(|f|format!("{f}\n")).collect::<String>().as_bytes())});
+    let chunk_prior = json!({"external":external,"history":producer.global_prior.history,
+        "forbiddenSamplingSeeds":[17]});
+    let mut chunk_value = json!({"parent":{"payload":payload,"closeDeclaration":close},
+        "samplingSeed":29,"replicate":1,"firstOrdinal":journal.session.next_episode_ordinal(),
+        "budget":[5,1u64<<30,1u64<<30,512u64<<20,2u64<<30],"prior":chunk_prior});
+    let chunk: Chunk = serde_json::from_value(chunk_value.clone()).unwrap();
+    let external = chunk.prior.external.load().unwrap();
+    let history = chunk.prior.history.load().unwrap();
+    let resumed =
+        checkpoint::resume(&producer.original, &chunk, prepared, &external, &history).unwrap();
+    assert_eq!(
+        resumed.identity().unwrap().checksum(),
+        journal.session.identity().unwrap().checksum()
+    );
+    assert_eq!(resumed.attempts(), 0);
+    assert_eq!(resumed.identity().unwrap().attempted_whole_four(), 3);
+    assert_eq!(
+        resumed.actor_parameters().unwrap(),
+        journal.session.actor_parameters().unwrap()
+    );
+    assert_eq!(
+        resumed.critic_parameters().unwrap(),
+        journal.session.critic_parameters().unwrap()
+    );
+    assert!(checkpoint::recheck(Some(&chunk)).is_ok());
+    // The immutable Original's seed17 is wholly forbidden here. Only the
+    // explicit new chunk seed29 can admit prospective work.
+    let mut continuation = serde_json::to_value(&producer).unwrap();
+    continuation["mode"] = "continue".into();
+    continuation["chunk"] = serde_json::to_value(&chunk).unwrap();
+    continuation["globalPrior"] = serde_json::to_value(&chunk.prior).unwrap();
+    continuation["checkpointOnCompletion"] = true.into();
+    let mut future = (10_000..11_000)
+        .filter(|seed| split_for_family(&seed_family_id(*seed)).unwrap() == DatasetSplit::Train);
+    continuation["batches"] = (0..5)
+        .map(|index| {
+            json!({
+        "seeds":std::array::from_fn::<_,4,_>(|_|future.next().unwrap()),
+        "captureBefore":if index==0 {Some("fresh")} else {None},"slots":[]})
+        })
+        .collect::<Vec<_>>()
+        .into();
+    let continued = parse(&continuation).unwrap();
+    check_new(
+        &continued.wire,
+        chunk.first_ordinal,
+        &external,
+        &history,
+        limits,
+    )
+    .unwrap();
+    continuation["chunk"]["samplingSeed"] = 17.into();
+    let forbidden = parse(&continuation).unwrap();
+    assert!(
+        check_new(
+            &forbidden.wire,
+            chunk.first_ordinal,
+            &external,
+            &history,
+            limits
+        )
+        .is_err()
+    );
+    continuation["batches"][0]["captureBefore"] = Value::Null;
+    assert!(parse(&continuation).is_err());
+    chunk_value["samplingSeed"] = 17.into();
+    let bad: Chunk = serde_json::from_value(chunk_value.clone()).unwrap();
+    assert!(checkpoint::resume(&producer.original, &bad, prepared, &external, &history).is_err());
+    chunk_value["samplingSeed"] = 29.into();
+    chunk_value["firstOrdinal"] = (journal.session.next_episode_ordinal() + 4).into();
+    let bad: Chunk = serde_json::from_value(chunk_value.clone()).unwrap();
+    assert!(checkpoint::resume(&producer.original, &bad, prepared, &external, &history).is_err());
+    let original_bytes = fs::read(&payload.path).unwrap();
+    fs::write(&payload.path, b"{}").unwrap();
+    assert!(checkpoint::recheck(Some(&chunk)).is_err());
+    fs::write(&payload.path, original_bytes).unwrap();
+    let mut bad_close = unique_json(&pinned(&close, META_BYTES).unwrap(), META_BYTES).unwrap();
+    bad_close["schema"] = "invalid".into();
+    let bad_close = save("checkpoint-fixture-bad-close.json", &bad_close);
+    chunk_value["parent"]["closeDeclaration"] = serde_json::to_value(bad_close).unwrap();
+    let bad: Chunk = serde_json::from_value(chunk_value).unwrap();
+    assert!(checkpoint::recheck(Some(&bad)).is_err());
+    let mut stopped = unique_json(&pinned(&invocation, META_BYTES).unwrap(), META_BYTES).unwrap();
+    stopped["disposition"] = "stoppedNoChange".into();
+    let stopped = save("checkpoint-fixture-stopped-invocation.json", &stopped);
+    let stopped_producer = producer_close(
+        "checkpoint-fixture-stopped-producer.json",
+        &payload,
+        &stopped,
+    );
+    let stopped_close = save(
+        "checkpoint-fixture-stopped-close.json",
+        &json!({
+        "schema":"tzolkin-semantic-playing-checkpoint-close-v1","checkpoint":payload,
+        "journalCloseDeclaration":declaration,"invocation":stopped,"producerClose":stopped_producer}),
+    );
+    let mut stopped_chunk = serde_json::to_value(&chunk).unwrap();
+    stopped_chunk["parent"]["closeDeclaration"] = serde_json::to_value(stopped_close).unwrap();
+    let stopped_chunk: Chunk = serde_json::from_value(stopped_chunk).unwrap();
+    assert!(checkpoint::recheck(Some(&stopped_chunk)).is_err());
+    assert!(checkpoint::recheck(Some(&chunk)).is_ok());
+
+    // The exhausted source can emit its FIRST checkpoint through the existing
+    // audit path without extra games, budget changes or journal writes.
+    let export_wire = parse_audit(&json!({"schema":AUDIT_SCHEMA,"journalDirectory":journal.directory,
+        "original":producer.original,"proceduralPool":producer.procedural_pool,
+        "restore":{"tip":journal.head(),"closeDeclaration":declaration},
+        "checkpointExport":{"prior":chunk.prior,"permanentAllocation":producer.permanent_allocation}})).unwrap();
+    let export_output = root.join("checkpoint-fixture-audit-export");
+    fs::create_dir(&export_output).unwrap();
+    let before = (
+        journal.head(),
+        journal.session.capture_ledger(),
+        journal.members.clone(),
+    );
+    let exported = checkpoint::export(&export_wire.wire, journal, &export_output)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(journal.head()).unwrap(),
+        serde_json::to_value(&before.0).unwrap()
+    );
+    assert_eq!(journal.session.capture_ledger(), before.1);
+    assert_eq!(journal.members, before.2);
+    let export_return = pin(export_output.join("checkpoint-export.json"));
+    let export_process = producer_close(
+        "checkpoint-fixture-export-process.json",
+        &exported,
+        &export_return,
+    );
+    let export_close = save(
+        "checkpoint-fixture-export-close.json",
+        &json!({
+        "schema":"tzolkin-semantic-playing-checkpoint-close-v1","checkpoint":exported,
+        "journalCloseDeclaration":declaration,"invocation":export_return,"producerClose":export_process}),
+    );
+    let mut exported_chunk = serde_json::to_value(&chunk).unwrap();
+    exported_chunk["parent"] = json!({"payload":exported,"closeDeclaration":export_close});
+    let exported_chunk: Chunk = serde_json::from_value(exported_chunk.clone()).unwrap();
+    let resumed = checkpoint::resume(
+        &producer.original,
+        &exported_chunk,
+        prepared,
+        &external,
+        &history,
+    )
+    .unwrap();
+    assert_eq!(
+        resumed.identity().unwrap().checksum(),
+        journal.session.identity().unwrap().checksum()
+    );
+    let mut failed =
+        unique_json(&pinned(&export_process, META_BYTES).unwrap(), META_BYTES).unwrap();
+    failed["exitCode"] = 1.into();
+    let failed = save("checkpoint-fixture-export-failed-process.json", &failed);
+    let failed_close = save(
+        "checkpoint-fixture-export-failed-close.json",
+        &json!({
+        "schema":"tzolkin-semantic-playing-checkpoint-close-v1","checkpoint":exported,
+        "journalCloseDeclaration":declaration,"invocation":export_return,"producerClose":failed}),
+    );
+    let mut failed_chunk = serde_json::to_value(&exported_chunk).unwrap();
+    failed_chunk["parent"]["closeDeclaration"] = serde_json::to_value(failed_close).unwrap();
+    let failed_chunk: Chunk = serde_json::from_value(failed_chunk).unwrap();
+    assert!(checkpoint::recheck(Some(&failed_chunk)).is_err()); // Old successful journal close is insufficient.
 }

@@ -27,14 +27,14 @@ impl<'a> SemanticJournalRestoration<'a> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CloseDeclaration {
+pub(super) struct CloseDeclaration {
     schema: String,
     observed_head: ContentPin,
     process_close: ContentPin,
     returned_close: ContentPin,
     complete_consumption_declared: bool,
-    consumption: Value,
-    status: Value,
+    pub(super) consumption: Value,
+    pub(super) status: Value,
     inventory: Vec<ContentPin>,
 }
 #[derive(Deserialize)]
@@ -53,19 +53,19 @@ struct ProcessClose {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ReturnedClose {
-    head: ContentPin,
+pub(super) struct ReturnedClose {
+    pub(super) head: ContentPin,
     report: ContentPin,
-    current: String,
+    pub(super) current: String,
     attempt: usize,
-    resolution: Resolution,
+    pub(super) resolution: Resolution,
     library_close_returned: bool,
     actual_process_close_verified: bool,
     historical_archive_bytes_verified: bool,
 }
 #[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-enum Resolution {
+pub(super) enum Resolution {
     Updated,
     NoChange,
 }
@@ -166,36 +166,12 @@ pub(super) fn restore_using<'a>(
     create: impl Fn(&NativeStochasticConfig) -> Result<tzolkin_core::GameState, String>,
 ) -> Result<SemanticJournalRestoration<'a>, String> {
     let directory = local(directory, false)?;
-    if fresh.attempts() != 0 || fresh.stopped() || fresh.identity()?.completed_updates() != 0 {
-        return Err("Semantic restore needs a genuinely fresh source root".into());
+    if fresh.attempts() != 0 || fresh.stopped() {
+        return Err("Semantic restore needs an unentered source-owned chunk".into());
     }
     let source = fresh.journal_source()?;
     reject_input_namespace(&directory, &source)?;
-    let declaration: CloseDeclaration = metadata(close_pin, &directory)?;
-    if declaration.schema != CLOSE_DECLARATION_SCHEMA
-        || !declaration.complete_consumption_declared
-        || !same_pin(&declaration.observed_head, expected_tip)?
-    {
-        return Err("Semantic exact-tip/full-consumption declaration differs".into());
-    }
-    let process: ProcessClose = metadata(&declaration.process_close, &directory)?;
-    let returned: ReturnedClose = metadata(&declaration.returned_close, &directory)?;
-    if process.schema != PROCESS_CLOSE_SCHEMA
-        || !process.actual_close
-        || process.pid == 0
-        || process.exit_code != 0
-        || !process.signal.is_null()
-        || !process.stdout_eof
-        || !process.stderr_eof
-        || !process.all_postchecks_passed
-        || !same_pin(&process.observed_head, expected_tip)?
-        || !same_pin(&process.returned_close, &declaration.returned_close)?
-        || !returned.library_close_returned
-        || returned.actual_process_close_verified
-        || returned.historical_archive_bytes_verified
-    {
-        return Err("Semantic declared producing-process close is unsuccessful/incomplete".into());
-    }
+    let (declaration, returned) = checked_close(expected_tip, close_pin, &directory)?;
     let bindings = pool_bindings(pools)?;
     let archive = archive(&directory, &declaration.inventory)?;
     let tip_name = direct_name(expected_tip, &directory)?;
@@ -534,7 +510,7 @@ fn require_member(archive: &BTreeMap<String, Pin>, pin: &Pin) -> Result<(), Stri
     }
     Ok(())
 }
-fn same_pin(a: &ContentPin, b: &ContentPin) -> Result<bool, String> {
+pub(super) fn same_pin(a: &ContentPin, b: &ContentPin) -> Result<bool, String> {
     if !Path::new(&a.path).is_absolute()
         || !Path::new(&b.path).is_absolute()
         || a.bytes == 0
@@ -547,6 +523,39 @@ fn same_pin(a: &ContentPin, b: &ContentPin) -> Result<bool, String> {
     Ok(a.bytes == b.bytes
         && a.sha256 == b.sha256
         && local(Path::new(&a.path), false)? == local(Path::new(&b.path), false)?)
+}
+/// Local close linkage only; no historical game or archive replay is implied.
+pub(super) fn checked_close(
+    expected_tip: &ContentPin,
+    close_pin: &ContentPin,
+    directory: &Path,
+) -> Result<(CloseDeclaration, ReturnedClose), String> {
+    let declaration: CloseDeclaration = metadata(close_pin, directory)?;
+    if declaration.schema != CLOSE_DECLARATION_SCHEMA
+        || !declaration.complete_consumption_declared
+        || !same_pin(&declaration.observed_head, expected_tip)?
+    {
+        return Err("Semantic exact-tip/full-consumption declaration differs".into());
+    }
+    let process: ProcessClose = metadata(&declaration.process_close, directory)?;
+    let returned: ReturnedClose = metadata(&declaration.returned_close, directory)?;
+    if process.schema != PROCESS_CLOSE_SCHEMA
+        || !process.actual_close
+        || process.pid == 0
+        || process.exit_code != 0
+        || !process.signal.is_null()
+        || !process.stdout_eof
+        || !process.stderr_eof
+        || !process.all_postchecks_passed
+        || !same_pin(&process.observed_head, expected_tip)?
+        || !same_pin(&process.returned_close, &declaration.returned_close)?
+        || !returned.library_close_returned
+        || returned.actual_process_close_verified
+        || returned.historical_archive_bytes_verified
+    {
+        return Err("Semantic declared producing-process close is unsuccessful/incomplete".into());
+    }
+    Ok((declaration, returned))
 }
 fn direct_name(pin: &ContentPin, directory: &Path) -> Result<String, String> {
     let path = local(Path::new(&pin.path), false)?;

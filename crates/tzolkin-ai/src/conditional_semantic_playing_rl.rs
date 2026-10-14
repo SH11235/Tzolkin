@@ -265,6 +265,29 @@ pub(crate) struct SemanticTrainingState {
     root: SemanticPlayingRlIdentity,
 }
 impl SemanticTrainingState {
+    pub(crate) fn from_checkpoint(
+        owner: SemanticPlayingRlOwner,
+        root: &str,
+        actor: PublicPolicyModel,
+        critic: Vec<f32>,
+    ) -> Result<Self, String> {
+        owner.origin.recheck_sources()?;
+        actor.validate()?;
+        if owner.identity.checksum() != root
+            || critic.len() != crate::public_state_critic::PARAMETER_COUNT
+            || critic.iter().any(|v| !v.is_finite())
+        {
+            return Err("Semantic checkpoint root/critic differs".into());
+        }
+        let current = Self {
+            origin: owner.origin,
+            actor,
+            critic,
+            root: owner.identity,
+        };
+        current.origin.recheck_sources()?;
+        Ok(current)
+    }
     pub(crate) fn from_fresh(owner: SemanticPlayingRlOwner) -> Result<Self, String> {
         owner.origin.recheck_sources()?;
         let current = Self {
