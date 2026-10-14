@@ -375,6 +375,11 @@ fn export_sources<'a>(
             ReplaySource::Human { .. } => {
                 return Err("Training export accepts native SelfPlay only".into());
             }
+            ReplaySource::CornFirstV5Teacher { .. } => {
+                return Err(
+                    "Corn-first V5 Playing teacher has no legacy native dataset admission".into(),
+                );
+            }
         };
         let terminal = replay::verify_replay(&record)?;
         let winners = terminal.final_scores.iter().filter(|s| s.rank == 1).count();

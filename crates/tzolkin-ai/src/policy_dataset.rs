@@ -483,6 +483,11 @@ fn source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
         ReplaySource::Human { .. } => {
             return Err("Human/public source admission is not implemented".into());
         }
+        ReplaySource::CornFirstV5Teacher { .. } => {
+            return Err(
+                "Corn-first V5 Playing teacher has no legacy native dataset admission".into(),
+            );
+        }
     }
     replay::verify_replay(&record)?;
     Ok((bytes, record))
@@ -1438,6 +1443,31 @@ mod tests {
         let raw = serde_json::to_vec(&record).unwrap();
         fs::write(&path, &raw).unwrap();
         let error = source(&path).unwrap_err();
+        if matches!(
+            &record.header.source,
+            ReplaySource::CornFirstV5Teacher { .. }
+        ) {
+            assert_eq!(
+                replay::verify_corn_first_v5_teacher_replay(&record).unwrap_err(),
+                "Partial logs cannot be verified as complete games",
+            );
+            let output = parent.join("scalar-dataset");
+            assert_eq!(
+                crate::dataset::export_dataset_files(std::slice::from_ref(&path), &output)
+                    .unwrap_err(),
+                "Corn-first V5 Playing teacher has no legacy native dataset admission",
+            );
+            assert!(!output.exists());
+            for route in [
+                SourceRoute::ResourceCycleV5Teacher,
+                SourceRoute::ResourceCycleV5SemanticSetupTeacher,
+            ] {
+                assert_eq!(
+                    route.read(&path).unwrap_err(),
+                    "ResourceCycleV5 teacher requires explicit all-seat policy provenance",
+                );
+            }
+        }
         assert_eq!(fs::read(&path).unwrap(), raw);
         fs::remove_dir_all(parent).unwrap();
         error
@@ -1482,6 +1512,11 @@ mod tests {
     }
     #[test]
     fn historical_self_play_versions_do_not_extend_other_source_routes() {
+        replay::corn_first_v5_teacher_fixture();
+        assert_eq!(
+            incomplete_source_error(replay::corn_first_v5_teacher_provenance()),
+            "Corn-first V5 Playing teacher has no legacy native dataset admission",
+        );
         let policy = replay::SeatPolicy::Heuristic {
             policy_version: "heuristic-v1".into(),
             weights: crate::policy::HeuristicWeights::default(),
