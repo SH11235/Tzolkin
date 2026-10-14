@@ -2712,6 +2712,48 @@ fn observed_primitive_conditional_inputs_and_preserved_heldout_split() {
             .unwrap()
     ));
     assert_eq!(fixture.load().unwrap().samples().len(), 1);
+    // The same current capture may retain its player link instead of a separate id.
+    for (index, player) in fixture.raw["metadata"]["players"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .enumerate()
+    {
+        player["playerUrl"] = json!(format!(
+            "https://boardgamearena.com/player?id={}",
+            101 + index
+        ));
+    }
+    assert_eq!(fixture.load().unwrap().samples().len(), 1); // Matching dual identity.
+    fixture.raw["metadata"]["players"][0]["id"] = json!("102");
+    assert!(fixture.load().is_err());
+    for player in fixture.raw["metadata"]["players"].as_array_mut().unwrap() {
+        player.as_object_mut().unwrap().remove("id");
+    }
+    assert_eq!(fixture.load().unwrap().samples().len(), 1);
+    assert_eq!(
+        fixture
+            .load_scope(INPUT_SCHEMA_V8, Some(json!(CAPPED_EXTRACTION_LABEL_SCOPE)))
+            .unwrap()
+            .samples()
+            .len(),
+        1
+    );
+    for malformed in [
+        "http://boardgamearena.com/player?id=101",
+        "https://example.com/player?id=101",
+        "https://boardgamearena.com/player?id=101&extra=1",
+        "https://boardgamearena.com/player?id=not-decimal",
+        "https://boardgamearena.com/table?table=101",
+        "https://boardgamearena.com/player?id=102", // Duplicate another player's id.
+    ] {
+        fixture.raw["metadata"]["players"][0]["playerUrl"] = json!(malformed);
+        assert!(fixture.load().is_err());
+    }
+    fixture.raw["metadata"]["players"][0]["playerUrl"] =
+        json!("https://boardgamearena.com/player?id=101");
+    fixture.raw["metadata"]["players"][0]["id"] = json!(101);
+    assert!(fixture.load().is_err()); // A malformed supplied id cannot be bypassed.
 }
 
 #[test]

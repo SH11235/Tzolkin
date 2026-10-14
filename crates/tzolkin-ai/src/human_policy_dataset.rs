@@ -567,7 +567,25 @@ fn roster(raw: &Value, record: &PublicReplayRecord, table: &str) -> Result<Vec<S
         let id = if legacy {
             url_identity(string(player, "url")?, "player", "id")?
         } else {
-            string(player, "id")?
+            let from_url = player
+                .get("playerUrl")
+                .map(|value| {
+                    url_identity(
+                        value.as_str().ok_or("Invalid source player URL")?,
+                        "player",
+                        "id",
+                    )
+                })
+                .transpose()?;
+            if let Some(value) = player.get("id") {
+                let id = value.as_str().ok_or("Invalid source player id")?;
+                if from_url.is_some_and(|other| other != id) {
+                    return Err("Conflicting source player id/URL".into());
+                }
+                id
+            } else {
+                from_url.ok_or("Missing source player id or playerUrl")?
+            }
         };
         decimal(id)?;
         if name.is_empty()
