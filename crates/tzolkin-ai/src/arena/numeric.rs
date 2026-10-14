@@ -11,8 +11,10 @@ use super::phase_routed::{
     PhaseRouteDiagnostics, PhaseRoutedDevelopmentIdentity, PhaseRoutedDevelopmentPolicy,
 };
 use super::semantic_snapshot::{
-    SemanticPlayingSnapshotArenaIdentity, SemanticPlayingSnapshotArenaPolicy,
-    SemanticPlayingSnapshotArenaReport, SemanticPlayingSnapshotReference,
+    SemanticPlayingCheckpointArenaIdentity, SemanticPlayingCheckpointArenaPolicy,
+    SemanticPlayingCheckpointArenaReport, SemanticPlayingSnapshotArenaIdentity,
+    SemanticPlayingSnapshotArenaPolicy, SemanticPlayingSnapshotArenaReport,
+    SemanticPlayingSnapshotReference,
 };
 use super::teacher::{
     ResourceCycleTeacherArenaIdentity, ResourceCycleTeacherArenaPolicy,
@@ -703,6 +705,9 @@ pub enum PolicyIdentity {
     CurrentSemanticPlayingSnapshot {
         identity: Box<SemanticPlayingSnapshotArenaIdentity>,
     },
+    SemanticPlayingCheckpointNumeric {
+        identity: Box<SemanticPlayingCheckpointArenaIdentity>,
+    },
     SemanticSetupTeacherNumericPlayingDevelopment {
         identity: Box<PhaseRoutedDevelopmentIdentity>,
     },
@@ -721,6 +726,7 @@ enum Role<'a> {
     SemanticSetupTeacher(Box<SemanticSetupResourceCycleTeacherArenaPolicy<'a>>),
     NativePlayingTeacher(Box<SemanticPlayingTeacherArenaPolicy<'a>>),
     SemanticSnapshot(Box<SemanticPlayingSnapshotArenaPolicy<'a>>),
+    SemanticCheckpoint(Box<SemanticPlayingCheckpointArenaPolicy>),
     PhaseRouted(Box<PhaseRoutedDevelopmentPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
@@ -798,6 +804,9 @@ impl<'a> Role<'a> {
             Self::SemanticSnapshot(policy) => PolicyIdentity::CurrentSemanticPlayingSnapshot {
                 identity: Box::new(policy.identity().clone()),
             },
+            Self::SemanticCheckpoint(policy) => PolicyIdentity::SemanticPlayingCheckpointNumeric {
+                identity: Box::new(policy.identity().clone()),
+            },
             Self::PhaseRouted(policy) => {
                 PolicyIdentity::SemanticSetupTeacherNumericPlayingDevelopment {
                     identity: Box::new(policy.identity().clone()),
@@ -828,6 +837,7 @@ impl<'a> Role<'a> {
             Self::Teacher(policy) => Some(&policy.identity().configuration_key),
             Self::NativePlayingTeacher(policy) => Some(&policy.identity().configuration_key),
             Self::SemanticSnapshot(policy) => Some(&policy.identity().configuration_key),
+            Self::SemanticCheckpoint(policy) => Some(&policy.identity().configuration_key),
             Self::SemanticSetupTeacher(policy) => {
                 Some(&policy.identity().teacher.configuration_key)
             }
@@ -1084,6 +1094,9 @@ fn choose(
             Role::SemanticSnapshot(policy) => {
                 session.choose_semantic_snapshot(index, observation, policy)?
             }
+            Role::SemanticCheckpoint(policy) => {
+                session.choose_checkpoint_policy(index, observation, policy)?
+            }
             Role::SemanticSetupTeacher(policy) => {
                 session.choose_semantic_setup_teacher(index, observation, policy)?
             }
@@ -1196,6 +1209,9 @@ fn choose(
             }
             Role::SemanticSnapshot(_) => {
                 return Err("Semantic snapshot Arena missing game session".into());
+            }
+            Role::SemanticCheckpoint(_) => {
+                return Err("Semantic checkpoint Arena missing game session".into());
             }
             Role::SemanticSetupTeacher(_) => {
                 return Err("Semantic Setup teacher Arena missing game session".into());
@@ -1428,6 +1444,7 @@ fn play_arm_using_with_setup<'a>(
                 Some(GameSession::new_native_playing_teacher(policy))
             }
             Role::SemanticSnapshot(policy) => Some(GameSession::new_semantic_snapshot(policy)),
+            Role::SemanticCheckpoint(policy) => Some(GameSession::new_checkpoint_policy(policy)),
             Role::SemanticSetupTeacher(policy) => {
                 Some(GameSession::new_semantic_setup_teacher(policy))
             }
@@ -1443,7 +1460,9 @@ fn play_arm_using_with_setup<'a>(
                 ..GuardDiagnostics::default()
             }),
             Role::Teacher(_) | Role::SemanticSetupTeacher(_) => Some(GuardDiagnostics::default()),
-            Role::NativePlayingTeacher(_) | Role::SemanticSnapshot(_) => Some(GuardDiagnostics {
+            Role::NativePlayingTeacher(_)
+            | Role::SemanticSnapshot(_)
+            | Role::SemanticCheckpoint(_) => Some(GuardDiagnostics {
                 phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
                 ..GuardDiagnostics::default()
             }),
@@ -2201,6 +2220,36 @@ pub fn run_semantic_playing_snapshot_validation<'a>(
             "{error}; semantic snapshot Arena postcheck: {post}"
         )),
     }
+}
+
+/// Paired actor-only numeric artifacts against the same fixed V5 pool. Family
+/// exclusion completeness remains the caller's declaration; no training owner
+/// or historical replay is reconstructed from an inference artifact.
+pub fn run_semantic_checkpoint_policy_validation(
+    config: &NumericArenaConfig,
+    candidate: SemanticPlayingCheckpointArenaPolicy,
+    reference: SemanticPlayingCheckpointArenaPolicy,
+) -> Result<SemanticPlayingCheckpointArenaReport, String> {
+    let schema = super::semantic_snapshot::CHECKPOINT_ARENA_SCHEMA;
+    let paired = run_roles_with_setup(
+        config,
+        Role::SemanticCheckpoint(Box::new(candidate)),
+        Role::SemanticCheckpoint(Box::new(reference)),
+        (0..config.players)
+            .map(|_| Opponent::ResourceCycle(super::resource_cycle::ResourceCycleConfig::v5()))
+            .collect(),
+        schema,
+        Some(SharedCornFirstSetupIdentity::current()),
+    )?;
+    Ok(SemanticPlayingCheckpointArenaReport {
+        schema: schema.into(),
+        paired,
+        read_only_evaluation: true,
+        family_exclusions_caller_declared: true,
+        fresh_test_claimed: false,
+        training_credit_granted: false,
+        adoption_granted: false,
+    })
 }
 
 pub fn run_native_playing_teacher_validation<'a>(

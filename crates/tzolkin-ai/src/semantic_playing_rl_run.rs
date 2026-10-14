@@ -18,6 +18,7 @@ const RUN_SCHEMA: &str = "tzolkin-semantic-playing-journal-run-v1";
 const AUDIT_SCHEMA: &str = "tzolkin-semantic-playing-journal-audit-v1";
 const EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-journal-evaluation-v1";
 const POLICY_EXPORT_SCHEMA: &str = "tzolkin-semantic-playing-checkpoint-policy-export-v1";
+const POLICY_EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-policy-evaluation-v1";
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 #[path = "semantic_playing_rl_checkpoint.rs"]
@@ -79,6 +80,155 @@ pub fn export_semantic_playing_policy(
     output: &Path,
 ) -> Result<SemanticPolicyExport, String> {
     checkpoint::export_policy(&spec.wire.checkpoint, &spec.checksum, output)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PolicyEvaluationWire {
+    schema: String,
+    candidate: ContentPin,
+    reference: ContentPin,
+    global_external: External,
+    players: usize,
+    seeds: Vec<u32>,
+    bootstrap_seed: u64,
+}
+
+/// Policy-only evaluation accepts validated inference artifacts, never a
+/// checkpoint/owner/journal under a different role. GLOBAL is caller declared.
+pub struct SemanticPolicyEvaluationSpec {
+    wire: PolicyEvaluationWire,
+    checksum: String,
+}
+impl SemanticPolicyEvaluationSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if !checkpoint_digest(expected_sha256) || crate::model::digest(raw) != expected_sha256 {
+            return Err("Semantic policy evaluation control pin differs".into());
+        }
+        let wire: PolicyEvaluationWire =
+            serde_json::from_value(unique_json(raw, MAX_CONTROL)?).map_err(|e| e.to_string())?;
+        if wire.schema != POLICY_EVALUATION_SCHEMA {
+            return Err("Semantic policy evaluation schema differs".into());
+        }
+        policy_evaluation_config(&wire, Vec::new()).validate()?;
+        Ok(Self {
+            wire,
+            checksum: expected_sha256.into(),
+        })
+    }
+}
+fn policy_evaluation_config(
+    w: &PolicyEvaluationWire,
+    families: Vec<String>,
+) -> crate::arena::numeric::NumericArenaConfig {
+    crate::arena::numeric::NumericArenaConfig {
+        schema: crate::arena::numeric::SCHEMA.into(),
+        players: w.players,
+        seeds: w.seeds.clone(),
+        bootstrap_seed: w.bootstrap_seed,
+        external_exclusions: crate::arena::numeric::ExternalExclusions {
+            evidence_sha256: w.global_external.pin.sha256.clone(),
+            excluded_family_ids: families,
+        },
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticPolicyEvaluation {
+    schema: &'static str,
+    control_sha256: String,
+    candidate_artifact: ContentPin,
+    reference_artifact: ContentPin,
+    global_external: crate::conditional_human_rl_update::NativeExclusionDescriptor,
+    arena: crate::arena::semantic_snapshot::SemanticPlayingCheckpointArenaReport,
+    historical_core_replays: usize,
+    source_authenticated: bool,
+    source_qualified: bool,
+    strength_measured: bool,
+    adoption_granted: bool,
+}
+impl SemanticPolicyEvaluation {
+    pub fn exit_code(&self) -> i32 {
+        if self.arena.paired.statistics.failed_games == 0
+            && self.arena.paired.blocks.iter().all(|b| b.complete)
+        {
+            0
+        } else {
+            1
+        }
+    }
+}
+
+/// Numeric paired evaluation with no Prepared load, archive restore or training
+/// admission. The caller must inventory all excluded families independently.
+pub fn evaluate_semantic_playing_policy(
+    spec: SemanticPolicyEvaluationSpec,
+    output: &Path,
+) -> Result<SemanticPolicyEvaluation, String> {
+    use crate::arena::{numeric, semantic_snapshot::SemanticPlayingCheckpointArenaPolicy};
+    use tzolkin_inference::semantic_playing_deployment::{
+        LoadedSemanticPlayingDeployment, MAX_DEPLOYMENT_BYTES,
+    };
+    let w = &spec.wire;
+    let result = (|| {
+        if !output.is_absolute() {
+            return Err("Semantic policy evaluation needs an absolute output namespace".into());
+        }
+        let output = local(output, true)?;
+        if output.to_string_lossy().len() > 1024 || fs::symlink_metadata(&output).is_ok() {
+            return Err("Semantic policy evaluation needs a fresh bounded namespace".into());
+        }
+        reject_input_namespace(
+            &output,
+            &serde_json::to_value((&w.candidate, &w.reference, &w.global_external))
+                .map_err(|e| e.to_string())?,
+        )?;
+        let candidate = SemanticPlayingCheckpointArenaPolicy::new(
+            LoadedSemanticPlayingDeployment::load(&pinned(&w.candidate, MAX_DEPLOYMENT_BYTES)?)?,
+        )?;
+        let reference = SemanticPlayingCheckpointArenaPolicy::new(
+            LoadedSemanticPlayingDeployment::load(&pinned(&w.reference, MAX_DEPLOYMENT_BYTES)?)?,
+        )?;
+        let raw = pinned(&w.global_external.pin, 32 * 1024 * 1024)?;
+        let global = w.global_external.load()?;
+        let mut external = unique_json(&raw, 32 * 1024 * 1024)?;
+        let families =
+            serde_json::from_value(external["families"].take()).map_err(|e| e.to_string())?;
+        let config = policy_evaluation_config(w, families);
+        config.validate()?;
+        let arena =
+            numeric::run_semantic_checkpoint_policy_validation(&config, candidate, reference)?;
+        let report = SemanticPolicyEvaluation {
+            schema: "tzolkin-semantic-playing-policy-evaluation-report-v1",
+            control_sha256: spec.checksum,
+            candidate_artifact: w.candidate.clone(),
+            reference_artifact: w.reference.clone(),
+            global_external: global.descriptor().clone(),
+            arena,
+            historical_core_replays: 0,
+            source_authenticated: false,
+            source_qualified: false,
+            strength_measured: false,
+            adoption_granted: false,
+        };
+        fs::create_dir(&output).map_err(|e| e.to_string())?;
+        crate::model::write_new_json_bounded(
+            &output.join("evaluation.json"),
+            &report,
+            numeric::MAX_REPORT_BYTES,
+        )?;
+        Ok(report)
+    })();
+    evaluation_post(
+        result,
+        [
+            pinned(&w.candidate, MAX_DEPLOYMENT_BYTES).map(|_| ()),
+            pinned(&w.reference, MAX_DEPLOYMENT_BYTES).map(|_| ()),
+            pinned(&w.global_external.pin, 32 * 1024 * 1024)
+                .and_then(|_| w.global_external.load().map(|_| ())),
+        ],
+    )
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1661,6 +1811,72 @@ pub(super) fn control_fixture(
             .unwrap();
         }
         let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+        let arena_policy =
+            crate::arena::semantic_snapshot::SemanticPlayingCheckpointArenaPolicy::new(
+                policy::LoadedSemanticPlayingDeployment::load(&raw).unwrap(),
+            )
+            .unwrap();
+        arena_policy.fixture_checks(&setup, &o);
+        assert_eq!(
+            arena_policy.identity().actor_identity["actorChecksum"],
+            loaded.identity().actor_checksum(),
+        );
+        assert!(!arena_policy.identity().source_authenticated);
+        assert!(!arena_policy.identity().family_closure_authenticated);
+        let artifact = Pin::new("policy.json", &raw).absolute(&output);
+        let mut evaluation = json!({"schema":POLICY_EVALUATION_SCHEMA,
+            "candidate":artifact,"reference":artifact,"globalExternal":external,
+            "players":3,"seeds":[validation],"bootstrapSeed":7});
+        let parse = |v: &Value| {
+            let bytes = serde_json::to_vec(v).unwrap();
+            SemanticPolicyEvaluationSpec::from_json(&bytes, &crate::model::digest(&bytes))
+        };
+        assert!(parse(&evaluation).is_ok());
+        evaluation["seeds"] = json!([test]);
+        assert!(parse(&evaluation).is_err());
+        evaluation["seeds"] = json!([validation]);
+        evaluation["journalDirectory"] = "not-an-owner".into();
+        assert!(parse(&evaluation).is_err());
+        evaluation
+            .as_object_mut()
+            .unwrap()
+            .remove("journalDirectory");
+        let spec = parse(&evaluation).unwrap();
+        let mut changed = raw.clone();
+        changed[0] ^= 1;
+        fs::write(output.join("policy.json"), &changed).unwrap();
+        let error = evaluate_semantic_playing_policy(spec, Path::new("relative-evaluation"))
+            .err()
+            .unwrap();
+        assert!(
+            error.contains("absolute output")
+                && error.contains("evaluation POST")
+                && error.contains("Semantic runner input changed")
+        );
+        fs::write(output.join("policy.json"), &raw).unwrap();
+        let mut unsafe_global = evaluation.clone();
+        unsafe_global["globalExternal"]["pin"]["path"] = root
+            .join("unused-parent")
+            .join("..")
+            .join("global.json")
+            .to_string_lossy()
+            .into_owned()
+            .into();
+        let error = evaluate_semantic_playing_policy(
+            parse(&unsafe_global).unwrap(),
+            Path::new("relative-evaluation"),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("absolute output")
+                && error.contains("evaluation POST")
+                && error.contains("local without parent traversal")
+        );
+        evaluation["globalExternal"]["count"] = 2.into();
+        let refused = root.join("policy-evaluation-refused");
+        assert!(evaluate_semantic_playing_policy(parse(&evaluation).unwrap(), &refused).is_err());
+        assert!(!refused.exists());
         let encoder =
             tzolkin_inference::features::FeatureEncoder::new_semantic_playing(&o).unwrap();
         let rows = (0..o.legal_actions.len())

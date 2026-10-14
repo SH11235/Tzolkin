@@ -109,3 +109,110 @@ pub struct SemanticPlayingSnapshotArenaReport {
     pub training_credit_granted: bool,
     pub adoption_granted: bool,
 }
+
+pub const CHECKPOINT_POLICY_VERSION: &str =
+    "semantic-playing-checkpoint-policy-corn-first-guarded-argmax-v1";
+pub const CHECKPOINT_ARENA_SCHEMA: &str =
+    "tzolkin-semantic-playing-checkpoint-policy-validation-arena-v1";
+
+/// Numeric artifact claims only. Family exclusion completeness is supplied by
+/// the caller's separately pinned GLOBAL declaration, not by the actor bytes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticPlayingCheckpointArenaIdentity {
+    pub policy_version: String,
+    pub deployment_checksum: String,
+    pub actor_identity: serde_json::Value,
+    pub raw_policy_version: String,
+    pub source_numerical_target: String,
+    pub feature_schema: u32,
+    pub feature_count: usize,
+    pub setup_policy_version: String,
+    pub backend: String,
+    pub guard: TradeGuardConfig,
+    pub configuration_key: String,
+    pub value_validity: ValueValidity,
+    pub source_authenticated: bool,
+    pub family_closure_authenticated: bool,
+    pub strength_measured: bool,
+}
+
+/// Owns only the inference loader's immutable actor. No training owner,
+/// snapshot, critic, archive or raw-parameter conversion is available.
+pub struct SemanticPlayingCheckpointArenaPolicy {
+    loaded: tzolkin_inference::semantic_playing_deployment::LoadedSemanticPlayingDeployment,
+    identity: SemanticPlayingCheckpointArenaIdentity,
+}
+impl SemanticPlayingCheckpointArenaPolicy {
+    pub fn new(
+        loaded: tzolkin_inference::semantic_playing_deployment::LoadedSemanticPlayingDeployment,
+    ) -> Result<Self, String> {
+        let guard = TradeGuardConfig::default();
+        let identity = SemanticPlayingCheckpointArenaIdentity {
+            policy_version: CHECKPOINT_POLICY_VERSION.into(),
+            deployment_checksum: loaded.checksum().into(),
+            actor_identity: serde_json::to_value(loaded.identity()).map_err(|e| e.to_string())?,
+            raw_policy_version: loaded.policy_version().into(),
+            source_numerical_target: loaded.source_numerical_target().into(),
+            feature_schema: crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA,
+            feature_count: crate::features::FEATURE_COUNT,
+            setup_policy_version: crate::setup_policy::POLICY_VERSION.into(),
+            backend: loaded.backend().into(),
+            configuration_key: guard.configuration_key()?,
+            guard,
+            value_validity: ValueValidity::UnavailablePolicyOnly,
+            source_authenticated: false,
+            family_closure_authenticated: false,
+            strength_measured: false,
+        };
+        Ok(Self { loaded, identity })
+    }
+    pub fn identity(&self) -> &SemanticPlayingCheckpointArenaIdentity {
+        &self.identity
+    }
+    pub(super) fn distribution(
+        &self,
+        observation: &Observation,
+    ) -> Result<NumericPolicyDistribution, String> {
+        self.loaded.distribution_playing(observation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture_checks(&self, setup: &Observation, playing: &Observation) {
+        use super::conditional::GameSession;
+        let mut session = GameSession::new_checkpoint_policy(self);
+        assert!(session.choose_checkpoint_policy(0, playing, self).is_err());
+        let mut session = GameSession::new_checkpoint_policy(self);
+        session.on_callback(0, setup).unwrap();
+        let chosen = session.choose_checkpoint_policy(0, setup, self).unwrap();
+        assert_eq!(
+            chosen.decision.r#move,
+            crate::setup_policy::choose_move_with_weights(
+                setup,
+                &crate::policy::HeuristicWeights::default(),
+            )
+            .unwrap()
+            .r#move,
+        );
+        let mut session = GameSession::new_checkpoint_policy(self);
+        session.on_callback(0, playing).unwrap();
+        let chosen = session.choose_checkpoint_policy(0, playing, self).unwrap();
+        assert_eq!(
+            chosen.decision.r#move,
+            self.loaded.choose_move_playing(playing).unwrap().r#move,
+        );
+        assert!(session.choose_checkpoint_policy(0, playing, self).is_err());
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticPlayingCheckpointArenaReport {
+    pub schema: String,
+    pub paired: NumericArenaReport,
+    pub read_only_evaluation: bool,
+    pub family_exclusions_caller_declared: bool,
+    pub fresh_test_claimed: bool,
+    pub training_credit_granted: bool,
+    pub adoption_granted: bool,
+}
