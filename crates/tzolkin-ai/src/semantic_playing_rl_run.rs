@@ -288,6 +288,7 @@ impl History {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 enum InitializationKind {
     NativeCornFirstV5SemanticPlayingTeacher,
+    NativeCornFirstV7SemanticPlayingTeacher,
 }
 
 enum LoadedInitialization {
@@ -435,8 +436,22 @@ impl Original {
             )
             .map(LoadedInitialization::Human),
             Some(directory) => {
-                PreparedSemanticPlayingTeacher::load(Path::new(&self.checkpoint.path), directory)
-                    .map(|prepared| LoadedInitialization::Native(Arc::new(prepared)))
+                let loaded = match self.initialization_kind {
+                    Some(InitializationKind::NativeCornFirstV5SemanticPlayingTeacher) => {
+                        PreparedSemanticPlayingTeacher::load(
+                            Path::new(&self.checkpoint.path),
+                            directory,
+                        )
+                    }
+                    Some(InitializationKind::NativeCornFirstV7SemanticPlayingTeacher) => {
+                        PreparedSemanticPlayingTeacher::load_v7(
+                            Path::new(&self.checkpoint.path),
+                            directory,
+                        )
+                    }
+                    None => unreachable!("native directory requires a closed initialization kind"),
+                };
+                loaded.map(|prepared| LoadedInitialization::Native(Arc::new(prepared)))
             }
         };
         // Both raw pins remain checked even when the selected typed loader refuses.
@@ -2078,6 +2093,27 @@ pub(super) fn control_fixture(
     native_control["original"]["initializationKind"] =
         "nativeCornFirstV5SemanticPlayingTeacher".into();
     let native_spec = parse(&native_control).unwrap();
+    let mut native_v7_control = native_control.clone();
+    native_v7_control["original"]["initializationKind"] =
+        "nativeCornFirstV7SemanticPlayingTeacher".into();
+    let native_v7_spec = parse(&native_v7_control).unwrap();
+    assert!(matches!(
+        native_v7_spec.wire.original.initialization_kind,
+        Some(InitializationKind::NativeCornFirstV7SemanticPlayingTeacher)
+    ));
+    assert_ne!(
+        plan_checksum(&native_v7_spec.wire).unwrap(),
+        plan_checksum(&native_spec.wire).unwrap()
+    );
+    assert!(
+        native_v7_spec
+            .wire
+            .original
+            .load_prepared()
+            .err()
+            .unwrap()
+            .contains("must pin dataset manifest.json")
+    );
     let native_namespace = root.join("native-namespace-source");
     fs::create_dir(&native_namespace).unwrap();
     let mut overlap = native_control.clone();
@@ -2148,6 +2184,11 @@ pub(super) fn control_fixture(
         .unwrap()
         .remove("collectionComposition");
     assert!(parse(&unguarded_native).is_err());
+    native_v7_control["original"]
+        .as_object_mut()
+        .unwrap()
+        .remove("collectionComposition");
+    assert!(parse(&native_v7_control).is_err());
     guarded_control["checkpointOnCompletion"] = true.into();
     assert!(parse(&guarded_control).is_err()); // V2 retains the complete five-block rule.
     guarded_control["checkpointOnCompletion"] = false.into();
@@ -2379,8 +2420,10 @@ pub(super) fn control_fixture(
         // Explicitly unqualified numerical fixture, not a successful native
         // source load. Both runner checks refuse before any Arena game.
         let native_directory = root.join("native-reference-cache");
-        let native =
-            PreparedSemanticPlayingTeacher::unqualified_rl_fixture(&native_directory, o.clone());
+        let native = Arc::new(PreparedSemanticPlayingTeacher::unqualified_rl_fixture(
+            &native_directory,
+            o.clone(),
+        ));
         let reference = native.arena_handle().unwrap();
         assert_eq!(
             reference.identity().checkpoint_checksum,
@@ -2391,6 +2434,143 @@ pub(super) fn control_fixture(
             crate::semantic_playing_teacher_dataset::SOURCE_KIND,
         );
         assert!(!reference.identity().source_authenticated);
+        reference.callback_version_fixture(&setup, &o);
+        {
+            use crate::conditional_semantic_playing_rl::SemanticTrainingState;
+            use crate::semantic_playing_teacher_dataset::TeacherProfile;
+            // These synthetic caches remain rejected by both complete-source
+            // loaders; they only exercise the closed profile/custody plumbing.
+            let v7_directory = root.join("native-v7-reference-cache");
+            let v7 = Arc::new(
+                PreparedSemanticPlayingTeacher::unqualified_rl_fixture_for_profile(
+                    &v7_directory,
+                    o.clone(),
+                    TeacherProfile::V7,
+                ),
+            );
+            let identity = v7.arena_handle().unwrap();
+            assert_eq!(
+                identity.identity().policy_version,
+                crate::arena::teacher::SEMANTIC_PLAYING_V7_POLICY_VERSION
+            );
+            assert_eq!(
+                identity.identity().model_version,
+                crate::semantic_playing_teacher_training::V7_MODEL_VERSION
+            );
+            assert_eq!(
+                identity.identity().task,
+                crate::semantic_playing_teacher_training::V7_TASK
+            );
+            assert_eq!(
+                identity.identity().source_kind,
+                TeacherProfile::V7.source_kind()
+            );
+            assert_eq!(
+                identity.identity().input_contract,
+                TeacherProfile::V7.input_contract()
+            );
+            assert!(
+                !identity.identity().source_authenticated && !identity.identity().strength_measured
+            );
+            identity.callback_version_fixture(&setup, &o);
+            for (kind, directory) in [
+                ("nativeCornFirstV7SemanticPlayingTeacher", &native_directory),
+                ("nativeCornFirstV5SemanticPlayingTeacher", &v7_directory),
+            ] {
+                let mut mismatched = native_control.clone();
+                mismatched["original"]["initializationKind"] = kind.into();
+                mismatched["original"]["checkpoint"] =
+                    serde_json::to_value(pin(directory.with_extension("checkpoint.json"))).unwrap();
+                mismatched["original"]["collection"] =
+                    serde_json::to_value(pin(directory.join("manifest.json"))).unwrap();
+                assert!(
+                    parse(&mismatched)
+                        .unwrap()
+                        .wire
+                        .original
+                        .load_prepared()
+                        .err()
+                        .unwrap()
+                        .contains("Teacher loader profile differs")
+                );
+            }
+            let v5_state = SemanticTrainingState::from_fresh(
+                SemanticFreshOwner::native(Arc::clone(&native), 11).unwrap(),
+            )
+            .unwrap();
+            let v7_state = SemanticTrainingState::from_fresh(
+                SemanticFreshOwner::native(Arc::clone(&v7), 11).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(v5_state.actor_parameters(), v7_state.actor_parameters());
+            assert_eq!(v5_state.critic_parameters(), v7_state.critic_parameters());
+            assert_eq!(
+                v5_state.root().policy_version(),
+                crate::conditional_semantic_playing_rl::NATIVE_POLICY_VERSION
+            );
+            assert_eq!(
+                v7_state.root().policy_version(),
+                crate::conditional_semantic_playing_rl::NATIVE_V7_POLICY_VERSION
+            );
+            assert_eq!(
+                v7_state.root().input_contract(),
+                crate::conditional_semantic_playing_rl::NATIVE_V7_INPUT_CONTRACT
+            );
+            assert_ne!(v5_state.root().checksum(), v7_state.root().checksum());
+            let view = v7_state.view(v7_state.root().checksum());
+            let source = view.journal_origin();
+            assert_eq!(
+                source["nativeTeacher"]["schema"],
+                "native-corn-first-v7-semantic-playing-rl-origin-v1"
+            );
+            assert_eq!(
+                source["nativeTeacher"]["sourceKind"],
+                TeacherProfile::V7.source_kind()
+            );
+            let custody = view.origin_custody();
+            assert_ne!(
+                custody.binding().unwrap(),
+                v5_state
+                    .view(v5_state.root().checksum())
+                    .origin_custody()
+                    .binding()
+                    .unwrap()
+            );
+            assert!(
+                v7.rl_checkpoint()
+                    .dataset
+                    .manifest
+                    .families
+                    .iter()
+                    .all(|f| custody.contains_native_family(&f.family_id))
+            );
+            for (prepared, root) in [(&v7, v5_state.root()), (&native, v7_state.root())] {
+                assert!(
+                    SemanticTrainingState::from_checkpoint(
+                        SemanticFreshOwner::native(Arc::clone(prepared), 11).unwrap(),
+                        root.checksum(),
+                        crate::public_model::PublicPolicyModel {
+                            parameters: v7_state.actor_parameters().to_vec(),
+                        },
+                        v7_state.critic_parameters().to_vec(),
+                    )
+                    .err()
+                    .unwrap()
+                    .contains("checkpoint root/critic differs")
+                );
+            }
+            assert!(
+                SemanticTrainingState::from_checkpoint(
+                    SemanticFreshOwner::native(Arc::clone(&v7), 11).unwrap(),
+                    v7_state.root().checksum(),
+                    crate::public_model::PublicPolicyModel {
+                        parameters: v7_state.actor_parameters().to_vec(),
+                    },
+                    v7_state.critic_parameters().to_vec(),
+                )
+                .is_ok()
+            );
+        }
         let mut overlap_config = config.clone();
         overlap_config.seeds = vec![native.rl_checkpoint().dataset.manifest.games[0].seed];
         let error = journal

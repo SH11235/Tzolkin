@@ -369,12 +369,15 @@ pub enum SemanticSetupTeacherReference<'a> {
 
 pub const SEMANTIC_PLAYING_POLICY_VERSION: &str =
     "native-v5-teacher-playing4-corn-first-guarded-argmax-v1";
+pub const SEMANTIC_PLAYING_V7_POLICY_VERSION: &str =
+    "native-v7-teacher-playing4-corn-first-guarded-argmax-v1";
 pub const SEMANTIC_PLAYING_ARENA_SCHEMA: &str =
     "tzolkin-native-playing4-teacher-paired-development-arena-v1";
 
 /// Only a dedicated checkpoint and its fully regenerated original dataset can
 /// construct this inference role. Raw parameters and report identities cannot.
 pub struct PreparedSemanticPlayingTeacher {
+    profile: crate::semantic_playing_teacher_dataset::TeacherProfile,
     checkpoint: Box<crate::semantic_playing_teacher_training::SemanticPlayingTeacherCheckpoint>,
     dataset: crate::semantic_playing_teacher_dataset::ValidatedSemanticPlayingTeacherDataset,
     dataset_path: std::path::PathBuf,
@@ -384,17 +387,45 @@ pub struct PreparedSemanticPlayingTeacher {
 }
 impl PreparedSemanticPlayingTeacher {
     pub fn load(checkpoint: &Path, dataset_path: &Path) -> Result<Self, String> {
+        Self::load_for_profile(
+            checkpoint,
+            dataset_path,
+            crate::semantic_playing_teacher_dataset::TeacherProfile::V5,
+        )
+    }
+    /// Explicit V7 admission with complete source regeneration and an audited
+    /// no-op. The legacy loader continues to accept only the V5 profile.
+    pub fn load_v7(checkpoint: &Path, dataset_path: &Path) -> Result<Self, String> {
+        Self::load_for_profile(
+            checkpoint,
+            dataset_path,
+            crate::semantic_playing_teacher_dataset::TeacherProfile::V7,
+        )
+    }
+    fn load_for_profile(
+        checkpoint: &Path,
+        dataset_path: &Path,
+        profile: crate::semantic_playing_teacher_dataset::TeacherProfile,
+    ) -> Result<Self, String> {
         use crate::semantic_playing_teacher_dataset as data;
         use crate::semantic_playing_teacher_training as training;
         let before = data::read(checkpoint, crate::model::MAX_ARTIFACT_BYTES as u64)?;
         let checkpoint_pin = (before.len(), crate::model::digest(&before));
         let result = (|| {
             let loaded = training::SemanticPlayingTeacherCheckpoint::load(checkpoint)?;
-            let dataset = data::load_semantic_playing_teacher_dataset(dataset_path)?;
+            let dataset = match profile {
+                data::TeacherProfile::V5 => {
+                    data::load_semantic_playing_teacher_dataset(dataset_path)?
+                }
+                data::TeacherProfile::V7 => {
+                    data::load_semantic_playing_v7_teacher_dataset(dataset_path)?
+                }
+            };
             // Exactly one audited no-op outside callbacks. This checks current
             // source/model/metrics consistency, not training-history authenticity.
             training::validate_checkpoint_dataset(&dataset, &loaded)?;
             Ok(Self {
+                profile,
                 checkpoint: Box::new(loaded),
                 dataset,
                 dataset_path: dataset_path.to_path_buf(),
@@ -412,15 +443,29 @@ impl PreparedSemanticPlayingTeacher {
     pub fn arena_handle(&self) -> Result<SemanticPlayingTeacherArenaPolicy<'_>, String> {
         self.recheck_sources()?;
         let guard = TradeGuardConfig::default();
+        use crate::semantic_playing_teacher_dataset::TeacherProfile;
+        use crate::semantic_playing_teacher_training as training;
+        let (policy_version, model_version, task) = match self.profile {
+            TeacherProfile::V5 => (
+                SEMANTIC_PLAYING_POLICY_VERSION,
+                training::MODEL_VERSION,
+                training::TASK,
+            ),
+            TeacherProfile::V7 => (
+                SEMANTIC_PLAYING_V7_POLICY_VERSION,
+                training::V7_MODEL_VERSION,
+                training::V7_TASK,
+            ),
+        };
         Ok(SemanticPlayingTeacherArenaPolicy {
             prepared: self,
             identity: SemanticPlayingTeacherArenaIdentity {
-                policy_version: SEMANTIC_PLAYING_POLICY_VERSION.into(),
-                model_version: crate::semantic_playing_teacher_training::MODEL_VERSION.into(),
+                policy_version: policy_version.into(),
+                model_version: model_version.into(),
                 training_version: self.checkpoint.training_version.clone(),
-                task: crate::semantic_playing_teacher_training::TASK.into(),
-                input_contract: crate::semantic_playing_teacher_dataset::INPUT_CONTRACT.into(),
-                source_kind: crate::semantic_playing_teacher_dataset::SOURCE_KIND.into(),
+                task: task.into(),
+                input_contract: self.profile.input_contract().into(),
+                source_kind: self.profile.source_kind().into(),
                 checkpoint_checksum: self.checkpoint.checksum.clone(),
                 checkpoint_bytes_sha256: self.checkpoint_pin.1.clone(),
                 dataset: self.checkpoint.dataset.clone(),
@@ -459,6 +504,9 @@ impl PreparedSemanticPlayingTeacher {
     ) -> &crate::semantic_playing_teacher_training::SemanticPlayingTeacherCheckpoint {
         &self.checkpoint
     }
+    pub(crate) fn profile(&self) -> crate::semantic_playing_teacher_dataset::TeacherProfile {
+        self.profile
+    }
     pub(crate) fn rl_source_locations(&self) -> serde_json::Value {
         serde_json::json!({"checkpoint":{"path":self.checkpoint_path,
             "bytes":self.checkpoint_pin.0,"sha256":self.checkpoint_pin.1},
@@ -466,15 +514,31 @@ impl PreparedSemanticPlayingTeacher {
     }
     #[cfg(test)]
     pub(crate) fn unqualified_rl_fixture(directory: &Path, observation: Observation) -> Self {
+        Self::unqualified_rl_fixture_for_profile(
+            directory,
+            observation,
+            crate::semantic_playing_teacher_dataset::TeacherProfile::V5,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn unqualified_rl_fixture_for_profile(
+        directory: &Path,
+        observation: Observation,
+        profile: crate::semantic_playing_teacher_dataset::TeacherProfile,
+    ) -> Self {
         use crate::semantic_playing_teacher_dataset as data;
         use crate::semantic_playing_teacher_training as training;
         // A bounded numerical/custody oracle, NOT a complete-source loader
         // success. Production must continue to reject this synthetic dataset.
         let chosen = observation.legal_actions[0].clone();
         let first_playing = observation.players.len();
-        let dataset =
-            data::training_cache_fixture(directory, &[(observation, chosen, first_playing)], None)
-                .unwrap();
+        let dataset = data::training_cache_fixture_for_profile(
+            directory,
+            &[(observation, chosen, first_playing)],
+            None,
+            profile,
+        )
+        .unwrap();
         let outcome = training::train_dataset(
             &dataset,
             &crate::policy_training::PolicyBcConfig {
@@ -489,8 +553,10 @@ impl PreparedSemanticPlayingTeacher {
         let checkpoint_path = directory.with_extension("checkpoint.json");
         outcome.checkpoint.save_new(&checkpoint_path).unwrap();
         assert!(Self::load(&checkpoint_path, directory).is_err());
+        assert!(Self::load_v7(&checkpoint_path, directory).is_err());
         let raw = data::read(&checkpoint_path, crate::model::MAX_ARTIFACT_BYTES as u64).unwrap();
         Self {
+            profile,
             checkpoint: Box::new(outcome.checkpoint),
             dataset,
             dataset_path: directory.to_path_buf(),
@@ -548,6 +614,35 @@ pub struct SemanticPlayingTeacherArenaPolicy<'a> {
 impl SemanticPlayingTeacherArenaPolicy<'_> {
     pub fn identity(&self) -> &SemanticPlayingTeacherArenaIdentity {
         &self.identity
+    }
+    #[cfg(test)]
+    pub(crate) fn callback_version_fixture(&self, setup: &Observation, playing: &Observation) {
+        let mut session = super::conditional::GameSession::new_native_playing_teacher(self);
+        for (index, observation) in [setup, playing].into_iter().enumerate() {
+            session.on_callback(index, observation).unwrap();
+            let selected = session
+                .choose_native_playing_teacher(index, observation, self)
+                .unwrap()
+                .decision;
+            assert_eq!(selected.policy_version, self.identity.policy_version);
+            assert!(
+                observation
+                    .legal_actions
+                    .iter()
+                    .any(|a| a.r#move == selected.r#move)
+            );
+            if observation.phase == tzolkin_core::Phase::Setup {
+                assert_eq!(
+                    selected.r#move,
+                    crate::setup_policy::choose_move_with_weights(
+                        observation,
+                        &crate::policy::HeuristicWeights::default()
+                    )
+                    .unwrap()
+                    .r#move
+                );
+            }
+        }
     }
     pub(super) fn exclude_source_families(
         &self,

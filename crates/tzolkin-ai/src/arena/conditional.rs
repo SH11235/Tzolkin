@@ -15,6 +15,7 @@ use crate::human_policy_dataset::{
 };
 use crate::human_policy_training::{ConditionalDatasetIdentity, PreparedConditionalHumanPolicy};
 use crate::policy::HeuristicWeights;
+use crate::semantic_playing_teacher_dataset::TeacherProfile;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tzolkin_core::Phase;
@@ -643,7 +644,7 @@ pub(super) struct ConditionalDecision {
 enum SetupRoute {
     CornFirst,
     SemanticPlayingCornFirst,
-    NativeTeacherPlayingCornFirst,
+    NativeTeacherPlayingCornFirst(TeacherProfile),
     CurrentSnapshotPlayingCornFirst,
     CheckpointPolicyPlayingCornFirst,
     NumericAllPhase(&'static str),
@@ -654,7 +655,10 @@ impl SetupRoute {
         match self {
             Self::CornFirst => POLICY_VERSION,
             Self::SemanticPlayingCornFirst => SEMANTIC_PLAYING_POLICY_VERSION,
-            Self::NativeTeacherPlayingCornFirst => super::teacher::SEMANTIC_PLAYING_POLICY_VERSION,
+            Self::NativeTeacherPlayingCornFirst(profile) => match profile {
+                TeacherProfile::V5 => super::teacher::SEMANTIC_PLAYING_POLICY_VERSION,
+                TeacherProfile::V7 => super::teacher::SEMANTIC_PLAYING_V7_POLICY_VERSION,
+            },
             Self::CurrentSnapshotPlayingCornFirst => super::semantic_snapshot::POLICY_VERSION,
             Self::CheckpointPolicyPlayingCornFirst => {
                 super::semantic_snapshot::CHECKPOINT_POLICY_VERSION
@@ -687,7 +691,7 @@ impl GameSession {
         policy: &super::teacher::SemanticPlayingTeacherArenaPolicy<'_>,
     ) -> Self {
         Self::with_route(
-            SetupRoute::NativeTeacherPlayingCornFirst,
+            SetupRoute::NativeTeacherPlayingCornFirst(policy.prepared.profile()),
             &policy.identity().guard,
         )
         .expect("native teacher constructor validated guard configuration")
@@ -911,7 +915,7 @@ impl GameSession {
                         self.setup,
                         SetupRoute::CornFirst
                             | SetupRoute::SemanticPlayingCornFirst
-                            | SetupRoute::NativeTeacherPlayingCornFirst
+                            | SetupRoute::NativeTeacherPlayingCornFirst(_)
                             | SetupRoute::CurrentSnapshotPlayingCornFirst
                             | SetupRoute::CheckpointPolicyPlayingCornFirst
                     ) =>
@@ -1480,7 +1484,7 @@ mod tests {
         );
         assert_eq!(selected.policy_version, POLICY_VERSION);
         let mut native = GameSession::with_route(
-            SetupRoute::NativeTeacherPlayingCornFirst,
+            SetupRoute::NativeTeacherPlayingCornFirst(TeacherProfile::V5),
             &TradeGuardConfig::default(),
         )
         .unwrap();
@@ -1638,7 +1642,7 @@ mod tests {
         assert_eq!(native_prediction.logits, expected.logits);
         assert_eq!(native_prediction.probabilities, expected.probabilities);
         let mut native = GameSession::with_route(
-            SetupRoute::NativeTeacherPlayingCornFirst,
+            SetupRoute::NativeTeacherPlayingCornFirst(TeacherProfile::V5),
             &TradeGuardConfig::default(),
         )
         .unwrap();
@@ -1682,7 +1686,7 @@ mod tests {
         for route in [
             SetupRoute::CornFirst,
             SetupRoute::SemanticPlayingCornFirst,
-            SetupRoute::NativeTeacherPlayingCornFirst,
+            SetupRoute::NativeTeacherPlayingCornFirst(TeacherProfile::V5),
             SetupRoute::NumericAllPhase(MIXED_POLICY_VERSION),
             SetupRoute::NumericAllPhase(COUNT_ZERO_POLICY_VERSION),
             SetupRoute::NumericAllPhase(super::super::teacher::POLICY_VERSION),

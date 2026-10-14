@@ -20,6 +20,7 @@ use crate::kernel::{Kernel, ResolvedKernel};
 use crate::public_model::{PublicPolicyModel, ValueValidity, predict_semantic_playing_numeric};
 use crate::public_policy_update::hash;
 use crate::public_state_critic as critic;
+use crate::semantic_playing_teacher_dataset::TeacherProfile;
 
 /// One checked boundary pass, never retained across work or publication. Generic
 /// origin/history pins and typed exclusions keep their distinct read contracts.
@@ -82,18 +83,27 @@ impl NativeOrigin {
     fn from_prepared(prepared: Arc<PreparedSemanticPlayingTeacher>) -> Result<Self, String> {
         prepared.recheck_sources()?;
         let checkpoint = prepared.rl_checkpoint();
+        let (schema, domain, task): (&str, &[u8], &str) = match prepared.profile() {
+            TeacherProfile::V5 => (
+                "native-corn-first-v5-semantic-playing-rl-origin-v1",
+                b"native-corn-first-v5-semantic-playing-rl-origin-v1\0",
+                crate::semantic_playing_teacher_training::TASK,
+            ),
+            TeacherProfile::V7 => (
+                "native-corn-first-v7-semantic-playing-rl-origin-v1",
+                b"native-corn-first-v7-semantic-playing-rl-origin-v1\0",
+                crate::semantic_playing_teacher_training::V7_TASK,
+            ),
+        };
         let description = serde_json::json!({
-            "schema":"native-corn-first-v5-semantic-playing-rl-origin-v1",
-            "sourceKind":crate::semantic_playing_teacher_dataset::SOURCE_KIND,
-            "task":crate::semantic_playing_teacher_training::TASK,
+            "schema":schema,
+            "sourceKind":prepared.profile().source_kind(),
+            "task":task,
             "checkpoint":checkpoint.checksum,
             "actor":parameter_checksum(b"tzolkin-semantic-playing-rl-actor-bits-v1\0",
                 checkpoint.model.parameters()),
             "dataset":checkpoint.dataset,"locations":prepared.rl_source_locations()});
-        let checksum = hash(
-            b"native-corn-first-v5-semantic-playing-rl-origin-v1\0",
-            &description,
-        )?;
+        let checksum = hash(domain, &description)?;
         prepared.recheck_sources()?;
         Ok(Self {
             prepared,
@@ -186,7 +196,12 @@ impl SemanticFreshOwner {
             parameters: origin.prepared.rl_checkpoint().model.parameters().to_vec(),
         };
         actor.validate()?;
-        let (critic, identity) = fresh_identity(&origin.checksum, &actor, seed, true)?;
+        let (critic, identity) = fresh_identity(
+            &origin.checksum,
+            &actor,
+            seed,
+            Some(origin.prepared.profile()),
+        )?;
         origin.prepared.recheck_sources()?;
         Ok(Self::Native {
             origin,
@@ -229,6 +244,9 @@ pub const INPUT_CONTRACT: &str =
 pub const NATIVE_POLICY_VERSION: &str = "native-corn-first-v5-semantic-playing-fresh-scalar-v1";
 pub const NATIVE_INPUT_CONTRACT: &str =
     "native-corn-first-v5-semantic-playing-origin-base-3-4p-schema4-numeric-v1";
+pub const NATIVE_V7_POLICY_VERSION: &str = "native-corn-first-v7-semantic-playing-fresh-scalar-v1";
+pub const NATIVE_V7_INPUT_CONTRACT: &str =
+    "native-corn-first-v7-semantic-playing-origin-base-3-4p-schema4-numeric-v1";
 pub const CRITIC_INIT_VERSION: &str = "semantic-playing-fresh-public384-zero-residual-v1";
 
 /// Only the successful schema-4 production loader supplies this captured closure.
@@ -305,24 +323,24 @@ pub struct SemanticPlayingRlIdentity {
     critic_checksum: String,
     critic_seed: u64,
     checksum: String,
-    native: bool,
+    native: Option<TeacherProfile>,
 }
 impl SemanticPlayingRlIdentity {
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
     pub fn policy_version(&self) -> &'static str {
-        if self.native {
-            NATIVE_POLICY_VERSION
-        } else {
-            POLICY_VERSION
+        match self.native {
+            None => POLICY_VERSION,
+            Some(TeacherProfile::V5) => NATIVE_POLICY_VERSION,
+            Some(TeacherProfile::V7) => NATIVE_V7_POLICY_VERSION,
         }
     }
     pub fn input_contract(&self) -> &'static str {
-        if self.native {
-            NATIVE_INPUT_CONTRACT
-        } else {
-            INPUT_CONTRACT
+        match self.native {
+            None => INPUT_CONTRACT,
+            Some(TeacherProfile::V5) => NATIVE_INPUT_CONTRACT,
+            Some(TeacherProfile::V7) => NATIVE_V7_INPUT_CONTRACT,
         }
     }
     pub fn feature_schema(&self) -> u32 {
@@ -389,7 +407,7 @@ impl SemanticPlayingRlOwner {
         let origin = SemanticPlayingRlOrigin::from_prepared(prepared)?;
         let actor = prepared.model().model.clone();
         actor.validate()?;
-        let (critic, identity) = fresh_identity(&origin.checksum, &actor, critic_seed, false)?;
+        let (critic, identity) = fresh_identity(&origin.checksum, &actor, critic_seed, None)?;
         origin.recheck_sources()?;
         Ok(Self {
             identity,
@@ -427,7 +445,7 @@ fn fresh_identity(
     origin_checksum: &str,
     actor: &PublicPolicyModel,
     critic_seed: u64,
-    native: bool,
+    native: Option<TeacherProfile>,
 ) -> Result<(Vec<f32>, SemanticPlayingRlIdentity), String> {
     let critic = crate::public_policy_baseline::zero_output_parameters(critic_seed);
     let actor_checksum = parameter_checksum(
@@ -435,10 +453,10 @@ fn fresh_identity(
         actor.parameters(),
     );
     let critic_checksum = hash(
-        if native {
-            b"native-corn-first-v5-fresh-critic-v1\0".as_slice()
-        } else {
-            b"tzolkin-semantic-playing-rl-fresh-critic-v1\0".as_slice()
+        match native {
+            None => b"tzolkin-semantic-playing-rl-fresh-critic-v1\0".as_slice(),
+            Some(TeacherProfile::V5) => b"native-corn-first-v5-fresh-critic-v1\0".as_slice(),
+            Some(TeacherProfile::V7) => b"native-corn-first-v7-fresh-critic-v1\0".as_slice(),
         },
         &(
             origin_checksum,
@@ -455,22 +473,22 @@ fn fresh_identity(
         ),
     )?;
     let checksum = hash(
-        if native {
-            b"native-corn-first-v5-fresh-identity-v1\0".as_slice()
-        } else {
-            b"tzolkin-semantic-playing-rl-fresh-identity-v1\0".as_slice()
+        match native {
+            None => b"tzolkin-semantic-playing-rl-fresh-identity-v1\0".as_slice(),
+            Some(TeacherProfile::V5) => b"native-corn-first-v5-fresh-identity-v1\0".as_slice(),
+            Some(TeacherProfile::V7) => b"native-corn-first-v7-fresh-identity-v1\0".as_slice(),
         },
         &(
             (
-                if native {
-                    NATIVE_POLICY_VERSION
-                } else {
-                    POLICY_VERSION
+                match native {
+                    None => POLICY_VERSION,
+                    Some(TeacherProfile::V5) => NATIVE_POLICY_VERSION,
+                    Some(TeacherProfile::V7) => NATIVE_V7_POLICY_VERSION,
                 },
-                if native {
-                    NATIVE_INPUT_CONTRACT
-                } else {
-                    INPUT_CONTRACT
+                match native {
+                    None => INPUT_CONTRACT,
+                    Some(TeacherProfile::V5) => NATIVE_INPUT_CONTRACT,
+                    Some(TeacherProfile::V7) => NATIVE_V7_INPUT_CONTRACT,
                 },
                 SEMANTIC_PLAYING_FEATURE_SCHEMA,
             ),
@@ -712,7 +730,10 @@ impl SemanticOriginCustody {
     pub(crate) fn binding(&self) -> Result<String, String> {
         if let Some(native) = &self.native {
             hash(
-                b"native-corn-first-v5-frozen-origin-custody-v1\0",
+                match native.prepared.profile() {
+                    TeacherProfile::V5 => b"native-corn-first-v5-frozen-origin-custody-v1\0",
+                    TeacherProfile::V7 => b"native-corn-first-v7-frozen-origin-custody-v1\0",
+                },
                 &(&self.checksum, &native.description),
             )
         } else {
@@ -786,7 +807,7 @@ pub(crate) fn with_collection_numeric_fixture<R>(
         critic_checksum: parameter_checksum(b"synthetic-critic", &critic),
         critic_seed: 11,
         checksum: "synthetic-no-source-qualification".into(),
-        native: false,
+        native: None,
     };
     let scope = SemanticCollectionScope {
         actor: &prepared.model().model,
