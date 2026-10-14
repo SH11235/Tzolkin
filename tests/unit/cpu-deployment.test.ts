@@ -97,6 +97,57 @@ function zeroSemanticModel() {
   return { bytes: new TextEncoder().encode(serialize()), checksum: wire.checksum };
 }
 
+// Synthetic BC content only; no source qualification or RL-owner claim.
+function zeroNativeBcModel() {
+  const native = JSON.parse(new TextDecoder().decode(zeroModel().bytes)) as {
+    contract: Record<string, unknown>;
+    sourceNumericalTarget: string;
+    parameterBits: string[];
+  };
+  const wire = {
+    schema: 'tzolkin-native-v7-playing-bc-policy-inference-v1',
+    contract: {
+      ...native.contract,
+      inputContract: 'native-v7-bc-actor-base-3-4p-v1',
+      featureSchema: 4,
+      scope: 'base-3-4p-playing-only',
+    },
+    identity: {
+      sourceRole: 'nativeV7BcPolicy',
+      task: 'NativeV7BcPlayingPolicyInference',
+      sourceKind: 'verifiedNativeCornFirstV7PlayingTeacher',
+      sourceTask: 'nativeCornFirstV7SemanticPlayingPolicyOnlyBc',
+      sourceInputContract: 'native-corn-first-v7-playing-policy-only-semantic4-v1',
+      sourceModelVersion: 'native-corn-first-v7-playing-512x32x1-scalar-v1',
+      sourceTrainingVersion: 'native-playing4-teacher-scalar-adam-fisher-yates-v1',
+      checkpointSha256: 'a'.repeat(64),
+      checkpointChecksum: 'b'.repeat(64),
+      modelChecksum: 'c'.repeat(64),
+      rawManifestSha256: 'd'.repeat(64),
+      datasetFingerprint: 'e'.repeat(64),
+      teacherPolicyId: 'f'.repeat(64),
+      actorChecksum: createHash('sha256')
+        .update('native-v7-bc-actor-f32le-v1\0')
+        .update(new Uint8Array(16449 * 4))
+        .digest('hex'),
+      completedEpochs: 30,
+      sourceAuthenticated: false,
+      sourceQualified: false,
+      verifiedNativePolicy: false,
+      strengthMeasured: false,
+      adoptionGranted: false,
+    },
+    sourceNumericalTarget: native.sourceNumericalTarget,
+    parameterBits: native.parameterBits,
+    checksum: '',
+  };
+  wire.checksum = createHash('sha256')
+    .update('tzolkin-native-v7-playing-bc-policy-inference-v1\0')
+    .update(JSON.stringify(wire))
+    .digest('hex');
+  return { bytes: new TextEncoder().encode(JSON.stringify(wire)), checksum: wire.checksum };
+}
+
 // Synthetic content-consistent metadata is not an authenticated learning owner.
 function zeroConditionalModel() {
   const native = JSON.parse(new TextDecoder().decode(zeroModel().bytes)) as {
@@ -435,35 +486,66 @@ it('moves one loaded Wasm model through fresh guarded games and binds all actors
     [zeroModel(), 'native'],
     [zeroConditionalModel(), 'conditional'],
     [zeroSemanticModel(), 'semantic'],
+    [zeroNativeBcModel(), 'nativeBc'],
   ] as const) {
     const conditional = role === 'conditional';
-    const semantic = role === 'semantic';
+    const nativeBc = role === 'nativeBc';
+    const semantic = role === 'semantic' || nativeBc;
     const model = new CpuDeployment(wire.bytes, wire.checksum);
     try {
       const metadata = JSON.parse(model.metadata()) as Record<string, unknown>;
       expect(metadata.sourceRole).toBe(
         conditional
           ? 'conditionalHumanCurrentMixed'
-          : semantic
-            ? 'semanticPlayingCheckpointCornFirst'
-            : 'bcPrepared',
+          : nativeBc
+            ? 'nativeV7BcCornFirst'
+            : semantic
+              ? 'semanticPlayingCheckpointCornFirst'
+              : 'bcPrepared',
       );
       if (semantic) {
-        expect(metadata).toMatchObject({
-          updateCount: '18446744073709551615',
-          actorPolicyVersion: 'semantic-playing-checkpoint-policy-scalar-v1',
-          setupPolicyVersion: 'corn-first-setup-v2',
-          setupSelection: 'sharedDeterministicSelector',
-          sourceAuthenticated: false,
-          sourceQualified: false,
-          verifiedNativePolicy: false,
-          strengthMeasured: false,
-          semanticCheckpointIdentity: {
-            updates: '18446744073709551615',
-            playingCredit: '18446744073709551615',
-            currentIdentityChecksum: 'e'.repeat(64),
-          },
-        });
+        if (nativeBc) {
+          expect(metadata).toMatchObject({
+            completedEpochs: '30',
+            actorPolicyVersion: 'native-v7-bc-playing-policy-scalar-v1',
+            setupPolicyVersion: 'corn-first-setup-v2',
+            setupSelection: 'sharedDeterministicSelector',
+            sourceAuthenticated: false,
+            sourceQualified: false,
+            verifiedNativePolicy: false,
+            strengthMeasured: false,
+            adoptionGranted: false,
+            nativeBcIdentity: { completedEpochs: '30', sourceRole: 'nativeV7BcPolicy' },
+          });
+          expect(metadata).not.toHaveProperty('updateCount');
+          expect(metadata).not.toHaveProperty('semanticCheckpointIdentity');
+          const parsed = JSON.parse(new TextDecoder().decode(wire.bytes));
+          for (const invalid of [
+            { ...parsed, schema: 'tzolkin-semantic-playing-checkpoint-policy-inference-v1' },
+            { ...parsed, identity: { ...parsed.identity, updates: 1 } },
+            { ...parsed, identity: { ...parsed.identity, completedEpochs: 0 } },
+          ]) {
+            expect(
+              () => new CpuDeployment(new TextEncoder().encode(JSON.stringify(invalid)), ''),
+            ).toThrow();
+          }
+        } else {
+          expect(metadata).toMatchObject({
+            updateCount: '18446744073709551615',
+            actorPolicyVersion: 'semantic-playing-checkpoint-policy-scalar-v1',
+            setupPolicyVersion: 'corn-first-setup-v2',
+            setupSelection: 'sharedDeterministicSelector',
+            sourceAuthenticated: false,
+            sourceQualified: false,
+            verifiedNativePolicy: false,
+            strengthMeasured: false,
+            semanticCheckpointIdentity: {
+              updates: '18446744073709551615',
+              playingCredit: '18446744073709551615',
+              currentIdentityChecksum: 'e'.repeat(64),
+            },
+          });
+        }
         expect(metadata).not.toHaveProperty('conditionalCurrentIdentity');
         expect(metadata).not.toHaveProperty('ownSetupIdentity');
         const catalog = JSON.parse(
@@ -552,16 +634,20 @@ it('moves one loaded Wasm model through fresh guarded games and binds all actors
       expect(game.policyVersion).toBe(
         conditional
           ? 'numeric-conditional-human-trade-guard-v1'
-          : semantic
-            ? 'semantic-checkpoint-corn-first-trade-guard-v1'
-            : 'numeric-public-trade-guard-v1',
+          : nativeBc
+            ? 'native-v7-bc-corn-first-trade-guard-v1'
+            : semantic
+              ? 'semantic-checkpoint-corn-first-trade-guard-v1'
+              : 'numeric-public-trade-guard-v1',
       );
       expect(game.rawPolicyVersion).toBe(
         conditional
           ? 'conditional-human-current-mixed-scalar-v1'
-          : semantic
-            ? 'semantic-checkpoint-corn-first-scalar-v1'
-            : 'learned-public-policy-v1',
+          : nativeBc
+            ? 'native-v7-bc-corn-first-scalar-v1'
+            : semantic
+              ? 'semantic-checkpoint-corn-first-scalar-v1'
+              : 'learned-public-policy-v1',
       );
       expect(game.maxCallbacks).toBe(4000);
       const choose = (index: number) =>
