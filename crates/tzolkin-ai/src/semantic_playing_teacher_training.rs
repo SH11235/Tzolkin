@@ -951,7 +951,7 @@ pub fn export_native_v7_bc_policy(
             "BC export requires absolute local paths and an exact checkpoint SHA256".into(),
         );
     }
-    let checkpoint_pin = || {
+    let checkpoint_pin = || -> Result<Vec<u8>, String> {
         let raw = data::read(checkpoint_path, MAX_ARTIFACT_BYTES as u64)?;
         if digest(&raw) != expected_checkpoint_sha256 {
             return Err("BC export checkpoint pin changed".into());
