@@ -502,8 +502,7 @@ impl<'a> SemanticPlayingJournal<'a> {
         };
         // All semantic proposal/report/identity/admitted-set allocations and
         // every prepublication source/file check precede durable Resolve.
-        self.session.journal_recheck()?;
-        pool.recheck()?;
+        self.session.journal_recheck_with_pool(pool)?;
         self.verify_files()?;
         let publication = self.publish(resolve, "resolve");
         if publication.as_ref().map_or_else(|e| e.published, |_| true) {
@@ -519,12 +518,10 @@ impl<'a> SemanticPlayingJournal<'a> {
                 .map_err(|e| e.to_string())?;
         }
         // Errors here or after Closed stop the session, retaining accepted credit.
-        self.session.journal_recheck()?;
-        pool.recheck()?;
+        self.session.journal_recheck_with_pool(pool)?;
         self.verify_files()?;
         self.publish(closed, "closed").map_err(|e| e.error)?;
-        self.session.journal_recheck()?;
-        pool.recheck()?;
+        self.session.journal_recheck_with_pool(pool)?;
         self.verify_files()?;
         self.phase = if self.session.stopped() {
             SemanticJournalPhase::Stopped
@@ -823,6 +820,55 @@ pub(crate) fn journal_fixture(
     assert_eq!(journal.status().current.completed_updates(), 2);
     assert_eq!(journal.status().spent_actor_streams, 28);
     assert!(journal.status().current.credited_playing_decisions() > credit);
+    // A shared source pass must not survive into POST, including an early Err.
+    // These checks add no games, reservations, callbacks or journal writes.
+    let checked_owner = SemanticPlayingRlOwner::from_prepared(prepared, 11).unwrap();
+    let checked_view = checked_owner.collection_view();
+    let pool_checks = std::cell::Cell::new(0);
+    let check_pool =
+        |checked: &mut crate::conditional_semantic_playing_rl::SemanticSourceCheckPass<'_>| {
+            pool_checks.set(pool_checks.get() + 1);
+            mixture.recheck_in(checked)
+        };
+    let callback_error = checked_view
+        .with_checked_pool::<()>(external, history.pins(), check_pool, |_| {
+            Err("Synthetic checked cohort callback".into())
+        })
+        .unwrap_err();
+    assert_eq!(callback_error, "Synthetic checked cohort callback");
+    assert_eq!(pool_checks.get(), 2);
+    let source_path = PathBuf::from(&prepared.loaded_semantic_playing_sources().unwrap()[0].path);
+    let source_bytes = fs::read(&source_path).unwrap();
+    let source_error = checked_view
+        .with_checked_pool::<()>(external, history.pins(), check_pool, |_| {
+            fs::write(&source_path, b"changed inside checked cohort fixture")
+                .map_err(|e| e.to_string())?;
+            Err("Synthetic checked cohort callback".into())
+        })
+        .unwrap_err();
+    fs::write(&source_path, source_bytes).unwrap();
+    assert!(source_error.contains("Synthetic checked cohort callback"));
+    assert!(source_error.contains("semantic source postcheck"));
+    assert_eq!(pool_checks.get(), 4); // Pool POST is attempted even after source failure.
+    let pin = &prepared.loaded_semantic_playing_sources().unwrap()[0];
+    let mut wrong_bytes = pin.clone();
+    wrong_bytes.bytes += 1;
+    let mut wrong_hash = pin.clone();
+    wrong_hash
+        .sha256
+        .replace_range(..1, if &pin.sha256[..1] == "0" { "1" } else { "0" });
+    let entered = std::cell::Cell::new(false);
+    for conflict in [wrong_bytes, wrong_hash] {
+        let error = checked_view
+            .with_checked_pool(external, &[conflict], check_pool, |_| {
+                entered.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("Conflicting semantic source pins"));
+        assert!(!entered.get());
+    }
+    assert_eq!(pool_checks.get(), 6); // Actor/pool checks still run on owner refusal.
     // Evaluation borrows the genuine updated actor but publishes no capture,
     // including callback errors and source/archive postcheck failures.
     let evaluation_status = serde_json::to_value(journal.status()).unwrap();

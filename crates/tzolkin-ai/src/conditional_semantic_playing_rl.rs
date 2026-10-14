@@ -1,7 +1,7 @@
 //! Fresh schema-4 Playing ownership and private checked numerical custody.
 //! The public fresh identity never becomes an updated or legacy owner. Separate
 //! in-memory routes do not provide a journal/export/resume conversion or source authentication.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 use tzolkin_core::observation::Observation;
@@ -17,6 +17,53 @@ use crate::kernel::{Kernel, ResolvedKernel};
 use crate::public_model::{PublicPolicyModel, ValueValidity, predict_semantic_playing_numeric};
 use crate::public_policy_update::hash;
 use crate::public_state_critic as critic;
+
+/// One checked boundary pass, never retained across work or publication. Generic
+/// origin/history pins and typed exclusions keep their distinct read contracts.
+pub(crate) struct SemanticSourceCheckPass<'a> {
+    pins: BTreeMap<String, ContentPin>,
+    exclusions: BTreeSet<Vec<u8>>,
+    _boundary: &'a (),
+}
+pub(crate) fn with_source_check_pass<R>(
+    run: impl for<'check> FnOnce(&mut SemanticSourceCheckPass<'check>) -> Result<R, String>,
+) -> Result<R, String> {
+    let boundary = ();
+    run(&mut SemanticSourceCheckPass {
+        pins: BTreeMap::new(),
+        exclusions: BTreeSet::new(),
+        _boundary: &boundary,
+    })
+}
+impl SemanticSourceCheckPass<'_> {
+    pub(crate) fn pin(&mut self, pin: &ContentPin) -> Result<(), String> {
+        if let Some(previous) = self.pins.get(&pin.path) {
+            return if previous == pin {
+                Ok(())
+            } else {
+                Err("Conflicting semantic source pins in one boundary pass".into())
+            };
+        }
+        crate::human_policy_dataset::recheck_absolute_pin(pin)?;
+        self.pins.insert(pin.path.clone(), pin.clone());
+        Ok(())
+    }
+    pub(crate) fn external(
+        &mut self,
+        external: &ConditionalNativeExclusions,
+    ) -> Result<(), String> {
+        let descriptor = external.descriptor();
+        let raw = serde_json::to_vec(descriptor).map_err(|e| e.to_string())?;
+        if self.exclusions.contains(&raw) {
+            return Ok(());
+        }
+        // Keep the typed 32MiB loader separate from the generic 16MiB pin path,
+        // including when the same file is declared in both roles.
+        external.recheck()?;
+        self.exclusions.insert(raw);
+        Ok(())
+    }
+}
 
 pub const POLICY_VERSION: &str = "conditional-human-semantic-playing-fresh-scalar-v1";
 pub const INPUT_CONTRACT: &str =
@@ -358,7 +405,18 @@ impl SemanticOwnerView<'_> {
         pins: &[ContentPin],
         run: impl for<'scope> FnOnce(&SemanticCollectionScope<'scope>) -> Result<R, String>,
     ) -> Result<R, String> {
-        self.with_checked_episode(external, pins, || {
+        self.with_checked_pool(external, pins, |_| Ok(()), run)
+    }
+    pub(crate) fn with_checked_pool<R>(
+        &self,
+        external: &ConditionalNativeExclusions,
+        pins: &[ContentPin],
+        check_pool: impl for<'check> Fn(&mut SemanticSourceCheckPass<'check>) -> Result<(), String>,
+        run: impl for<'scope> FnOnce(&SemanticCollectionScope<'scope>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        let check = || self.recheck_with_pool(external, pins, &check_pool);
+        check()?;
+        let result = (|| {
             let scope = SemanticCollectionScope {
                 actor: self.actor,
                 critic: self.critic,
@@ -366,32 +424,42 @@ impl SemanticOwnerView<'_> {
                 kernel: Kernel::Scalar.resolve()?,
             };
             run(&scope)
-        })
-    }
-    pub(crate) fn with_checked_episode<R>(
-        &self,
-        external: &ConditionalNativeExclusions,
-        pins: &[ContentPin],
-        run: impl FnOnce() -> Result<R, String>,
-    ) -> Result<R, String> {
-        let check = || {
-            self.origin.recheck_sources()?;
-            // This typed loader admits up to 32MiB. Do not narrow it through
-            // the generic 16MiB metadata-pin rechecker.
-            external.recheck()?;
-            for pin in pins {
-                crate::human_policy_dataset::recheck_absolute_pin(pin)?;
-            }
-            Ok::<_, String>(())
-        };
-        check()?;
-        let result = run();
+        })();
         match (result, check()) {
             (Ok(value), Ok(())) => Ok(value),
             (Err(error), Ok(())) => Err(error),
             (Ok(_), Err(error)) => Err(format!("Semantic source postcheck: {error}")),
             (Err(error), Err(post)) => Err(format!("{error}; semantic source postcheck: {post}")),
         }
+    }
+    pub(crate) fn recheck_with_pool(
+        &self,
+        external: &ConditionalNativeExclusions,
+        pins: &[ContentPin],
+        check_pool: impl for<'check> Fn(&mut SemanticSourceCheckPass<'check>) -> Result<(), String>,
+    ) -> Result<(), String> {
+        with_source_check_pass(|checked| {
+            let source = (|| {
+                for pin in &self.origin.source_pins {
+                    checked.pin(pin)?;
+                }
+                checked.external(external)?;
+                for pin in pins {
+                    checked.pin(pin)?;
+                }
+                Ok::<_, String>(())
+            })();
+            // Attempt pool validation even when the owner check failed. Each
+            // POST gets a new pass, so no successful PRE entry can mask mutation.
+            match (source, check_pool(checked)) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(error)) => Err(format!("Semantic pool source check: {error}")),
+                (Err(error), Err(pool)) => {
+                    Err(format!("{error}; semantic pool source check: {pool}"))
+                }
+            }
+        })
     }
 }
 
@@ -402,6 +470,15 @@ pub(crate) struct SemanticOriginCustody {
     reservations: BTreeMap<String, DatasetSplit>,
 }
 impl SemanticOriginCustody {
+    pub(crate) fn recheck_in(
+        &self,
+        checked: &mut SemanticSourceCheckPass<'_>,
+    ) -> Result<(), String> {
+        for pin in &self.pins {
+            checked.pin(pin)?;
+        }
+        Ok(())
+    }
     pub(crate) fn recheck(&self) -> Result<(), String> {
         for pin in &self.pins {
             crate::human_policy_dataset::recheck_absolute_pin(pin)?;

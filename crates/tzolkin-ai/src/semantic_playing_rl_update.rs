@@ -531,10 +531,12 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 ),
             )?;
         }
-        self.ledger
-            .recheck(&self.state.view(self.identity.checksum()))?;
+        let owner = self.state.view(self.identity.checksum());
         if let Some(mixture) = mixture {
-            mixture.recheck()?;
+            self.ledger
+                .recheck_with_pool(&owner, PoolRef::Mixture(mixture))?;
+        } else {
+            self.ledger.recheck(&owner)?;
         }
         Ok(PreparedSemanticAdmission { proposal, admitted })
     }
@@ -655,6 +657,10 @@ impl<'a> SemanticPlayingJointSession<'a> {
     pub(crate) fn journal_recheck(&self) -> Result<(), String> {
         self.ledger
             .recheck(&self.state.view(self.identity.checksum()))
+    }
+    pub(crate) fn journal_recheck_with_pool(&self, pool: PoolRef<'_>) -> Result<(), String> {
+        self.ledger
+            .recheck_with_pool(&self.state.view(self.identity.checksum()), pool)
     }
     pub(crate) fn journal_source(&self) -> Result<serde_json::Value, String> {
         Ok(
