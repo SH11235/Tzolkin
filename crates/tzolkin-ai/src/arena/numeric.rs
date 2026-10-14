@@ -2220,6 +2220,9 @@ pub fn run_semantic_playing_snapshot_validation<'a>(
         snapshot.recheck()?;
         if let Some(prepared) = native_prepared {
             prepared.recheck_sources()?;
+            if config.seeds.len() > 64 {
+                return Err("Native teacher reference accepts at most 64 families".into());
+            }
         }
         if let SemanticPlayingSnapshotReference::NativeTeacher(policy) = &reference {
             policy.exclude_source_families(config)?;
