@@ -5,8 +5,8 @@
 use super::*;
 use crate::arena::teacher::PreparedSemanticPlayingTeacher;
 use crate::conditional_human_rl_update::ConditionalNativeExclusions;
-use crate::conditional_semantic_playing_rl::SemanticFreshOwner;
 use crate::conditional_semantic_playing_rl::SemanticPlayingRlOwner;
+use crate::conditional_semantic_playing_rl::{SemanticFreshOwner, SemanticNativeSourceCustody};
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::human_policy_training::PreparedConditionalHumanPolicy;
 use crate::public_policy_baseline::ResidualFitConfig;
@@ -298,19 +298,40 @@ enum LoadedInitialization {
 #[derive(Clone, Copy)]
 enum LoadedInitializationRef<'a> {
     Human(&'a PreparedConditionalHumanPolicy),
-    Native(&'a Arc<PreparedSemanticPlayingTeacher>),
+    Native(
+        &'a Arc<PreparedSemanticPlayingTeacher>,
+        Option<SemanticNativeSourceCustody>,
+    ),
 }
 impl LoadedInitialization {
     fn borrowed(&self) -> LoadedInitializationRef<'_> {
         match self {
             Self::Human(prepared) => LoadedInitializationRef::Human(prepared),
-            Self::Native(prepared) => LoadedInitializationRef::Native(prepared),
+            Self::Native(prepared) => LoadedInitializationRef::Native(prepared, None),
         }
     }
     fn recheck_sources(&self) -> Result<(), String> {
         match self {
             Self::Human(prepared) => prepared.recheck_sources(),
             Self::Native(prepared) => prepared.recheck_sources(),
+        }
+    }
+    fn command_source_recheck(
+        &self,
+        custody: Option<SemanticNativeSourceCustody>,
+    ) -> Result<(), String> {
+        if custody.is_none() {
+            return Ok(());
+        }
+        match self {
+            Self::Native(prepared)
+                if prepared.profile()
+                    == crate::semantic_playing_teacher_dataset::TeacherProfile::V7 =>
+            {
+                // Read the original backing pins, not a digest of owned values.
+                prepared.recheck_sources()
+            }
+            _ => Err("Command-boundary source custody requires a V7 native origin".into()),
         }
     }
     fn human(&self) -> Result<&PreparedConditionalHumanPolicy, String> {
@@ -327,12 +348,27 @@ impl LoadedInitialization {
     }
 }
 impl LoadedInitializationRef<'_> {
+    fn with_custody(self, custody: Option<SemanticNativeSourceCustody>) -> Result<Self, String> {
+        match (self, custody) {
+            (value, None) => Ok(value),
+            (Self::Native(prepared, _), Some(mode))
+                if prepared.profile()
+                    == crate::semantic_playing_teacher_dataset::TeacherProfile::V7 =>
+            {
+                Ok(Self::Native(prepared, Some(mode)))
+            }
+            _ => Err("Command-boundary source custody requires a V7 native origin".into()),
+        }
+    }
     fn fresh_owner(self, seed: u64) -> Result<SemanticFreshOwner, String> {
         match self {
             Self::Human(prepared) => Ok(SemanticFreshOwner::Human(Box::new(
                 SemanticPlayingRlOwner::from_prepared(prepared, seed)?,
             ))),
-            Self::Native(prepared) => SemanticFreshOwner::native(Arc::clone(prepared), seed),
+            Self::Native(prepared, None) => SemanticFreshOwner::native(Arc::clone(prepared), seed),
+            Self::Native(prepared, custody) => {
+                SemanticFreshOwner::native_with_custody(Arc::clone(prepared), seed, custody)
+            }
         }
     }
 }
@@ -586,6 +622,28 @@ fn invocation_pool_post(
                 Ok(report)
             }
             Err(error) => Err(format!("{error}{post}")),
+        },
+    }
+}
+fn native_custody_post(
+    result: Result<SemanticJournalInvocation, String>,
+    prepared: &LoadedInitialization,
+    custody: Option<SemanticNativeSourceCustody>,
+) -> Result<SemanticJournalInvocation, String> {
+    // Unconditional after load, including early errors and Ok(refused) on a
+    // publication failure. Never lose accepted-update or burn accounting.
+    match prepared.command_source_recheck(custody) {
+        Ok(()) => result,
+        Err(post) => match result {
+            Ok(mut report) => {
+                report.disposition = "refused".into();
+                report.error = Some(format!(
+                    "{}; native command source POST: {post}",
+                    report.error.take().unwrap_or_default()
+                ));
+                Ok(report)
+            }
+            Err(error) => Err(format!("{error}; native command source POST: {post}")),
         },
     }
 }
@@ -1193,6 +1251,23 @@ struct Wire {
     /// Advisory invocation output only; excluded from the allocation/learning plan.
     #[serde(default, skip_serializing_if = "disabled")]
     signal_diagnostics: bool,
+    /// Opt-in invocation custody; not a change to Original or numerical lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_custody: Option<SemanticNativeSourceCustody>,
+}
+fn validate_source_custody(
+    custody: Option<SemanticNativeSourceCustody>,
+    original: &Original,
+) -> Result<(), String> {
+    if custody.is_some()
+        && !matches!(
+            original.initialization_kind,
+            Some(InitializationKind::NativeCornFirstV7SemanticPlayingTeacher)
+        )
+    {
+        return Err("Command-boundary source custody requires a V7 native initialization".into());
+    }
+    Ok(())
 }
 fn disabled(value: &bool) -> bool {
     !value
@@ -1210,6 +1285,7 @@ impl SemanticJournalRunSpec {
         }
         let wire: Wire =
             serde_json::from_value(unique_json(raw, MAX_CONTROL)?).map_err(|e| e.to_string())?;
+        validate_source_custody(wire.source_custody, &wire.original)?;
         if wire.schema != RUN_SCHEMA
             || !matches!(wire.mode.as_str(), "start" | "resume" | "continue")
             || (wire.mode == "resume") != wire.restore.is_some()
@@ -1322,6 +1398,8 @@ pub struct SemanticJournalInvocation {
     signal_diagnostics: Option<ContentPin>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     procedural_pools: Vec<ContentPin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_custody: Option<SemanticNativeSourceCustody>,
 }
 impl SemanticJournalInvocation {
     pub fn exit_code(&self) -> i32 {
@@ -1333,9 +1411,11 @@ impl SemanticJournalInvocation {
     }
 }
 
-/// Loads only the declared original source through its genuine Human4 loader.
+/// Loads only the declared Original through its complete typed source loader.
 /// Resume replays before NEW work is admitted. A full fixed allocation is checked
 /// first, but is not confused with the subset actually burned by this session.
+/// Opt-in V7 command custody uses owned load-time values between backing-file
+/// admission/publication checks; it does not assert continuous file immutability.
 pub fn run_semantic_playing_journal(
     spec: SemanticJournalRunSpec,
     output: &Path,
@@ -1416,248 +1496,267 @@ fn run_with_pools(
     )?;
     // All control/allocation/prior checks above precede model loading or Game.
     let prepared = w.original.load_prepared()?;
-    let fresh = source_session(
-        &w.original,
-        w.chunk.as_ref(),
-        prepared.borrowed(),
-        &original_external,
-        &original_history,
-    )?;
-    let (mut journal, mut snapshots) = if let Some(restore) = &w.restore {
-        restore_observed_closed(
-            &directory,
-            &restore.tip,
-            &restore.close_declaration,
-            fresh,
-            &pools.references(),
-        )?
-        .into_journal_and_snapshots()
-    } else {
-        (
-            SemanticPlayingJournal::start_chunk(
-                &directory,
-                fresh,
-                limits,
-                source_budget(&w.original, w.chunk.as_ref())?,
-            )?,
-            Vec::new(),
-        )
-    };
-    if journal.limits != limits
-        || bounded(&journal.budget)? != bounded(&source_budget(&w.original, w.chunk.as_ref())?)?
-        || journal.session.next_episode_ordinal() != expected_first
-    {
-        return Err("Semantic restored original limits/budget/next cursor differ".into());
-    }
-    check_prior(
-        &journal,
-        &prior,
-        &prior_history,
-        &w.global_prior.forbidden_sampling_seeds,
-    )?;
-    if journal.session.attempts() + w.batches.len() > journal.budget.max_attempts {
-        return Err("Semantic complete invocation exceeds original attempt headroom".into());
-    }
-    // Missing restored capture IDs and learner-seat replacements refuse before a new Reserve.
-    for batch in &w.batches {
-        let pool = pools.get(batch.procedural_pool.as_ref().unwrap_or(&w.procedural_pool))?;
-        check_batch_pool_slots(batch, pool, &snapshots)?;
-    }
-    fs::create_dir(&output).map_err(|e| e.to_string())?;
-    let mut aliases = BTreeMap::new();
-    let mut returns = Vec::new();
-    let mut signal_rows = Vec::new();
-    let mut last_library_return = None;
-    let mut last_returned_pin = None;
-    // Lookup metadata is cached once from genuine captures. Warm alias lookup
-    // must not hash every old snapshot's complete origin closure per batch.
-    let mut capture_identities = snapshots
-        .iter()
-        .map(|s| s.journal_identity())
-        .collect::<Result<Vec<_>, _>>()?;
+    let custody = w.source_custody;
     let result = (|| {
-        for batch in &w.batches {
-            recheck_inputs(w, &prior, &prior_history)?;
-            let pool = pools.get(batch.procedural_pool.as_ref().unwrap_or(&w.procedural_pool))?;
-            if let Some(alias) = &batch.capture_before {
-                let current = journal.session.current_unchecked().checksum();
-                let existing = capture_identities
-                    .iter()
-                    .find(|s| s["current"].as_str() == Some(current));
-                let id = match existing {
-                    Some(identity) => identity["checksum"]
-                        .as_str()
-                        .ok_or("Typed capture checksum")?
-                        .to_string(),
-                    None => {
-                        let snapshot = journal.freeze_snapshot()?;
-                        let identity = snapshot.journal_identity()?;
-                        let id = snapshot.binding().to_string();
-                        snapshots.push(snapshot);
-                        capture_identities.push(identity);
-                        id
-                    }
-                };
-                aliases.insert(alias.clone(), id);
-            }
-            let mut close = if batch.slots.is_empty() {
-                journal.update_procedural_whole_four(batch.seeds, pool)?
-            } else {
-                let slots = batch
-                    .slots
-                    .iter()
-                    .map(|slot| {
-                        let id = match &slot.snapshot {
-                            SnapshotRef::Existing { checksum } => checksum,
-                            SnapshotRef::Local { alias } => {
-                                aliases.get(alias).ok_or("Capture alias not produced")?
-                            }
-                        };
-                        let snapshot = snapshots
-                            .iter()
-                            .find(|s| s.binding() == id)
-                            .ok_or("Actual capture missing")?;
-                        SnapshotSlot::new(slot.member, slot.actor, snapshot)
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                let mixture = SemanticFrozenMixture::new(pool, slots)?;
-                journal.update_mixed_whole_four(batch.seeds, &mixture)?
-            };
-            let signals = close.signals.take();
-            let signal_report = close.report.clone();
-            let no_change = close.resolution == SemanticJournalResolution::NoChange;
-            let name = format!("returned-{:04}.json", close.attempt);
-            last_library_return = Some(close);
-            last_returned_pin = None;
-            let raw = bounded(&last_library_return)?;
-            publish_mixed_metadata(&output, &name, &raw)?;
-            let pin = Pin::new(&name, &raw).absolute(&output);
-            last_returned_pin = Some(pin.clone());
-            returns.push(pin.clone());
-            if w.signal_diagnostics {
-                let signals = signals.ok_or("Returned semantic close lacks same-pass signals")?;
-                signal_rows.push(json!({"returnedClose":pin,
-                    "report":signal_report,"signals":signals}));
-            }
-            // Source/global-prior/output failures stop before another attempt.
-            recheck_inputs(w, &prior, &prior_history)?;
-            if no_change {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    })();
-    let mut error = result.as_ref().err().cloned();
-    let mut signal_diagnostics = None;
-    if w.signal_diagnostics {
-        match publish_signal_diagnostics(&output, &spec.checksum, w.batches.len(), &signal_rows) {
-            Ok(pin) => signal_diagnostics = Some(pin),
-            Err(post) => {
-                error = Some(format!(
-                    "{}; signal diagnostics: {post}",
-                    error.unwrap_or_default()
-                ))
-            }
-        }
-    }
-    // Sidecar publication errors still pass through all archive/source POST checks.
-    let full_bytes = journal.verify_archive_bytes();
-    if let Err(post) = &full_bytes {
-        error = Some(format!(
-            "{}; final archive: {post}",
-            error.unwrap_or_default()
-        ));
-    }
-    if let Err(post) = journal
-        .session
-        .journal_recheck()
-        .and_then(|_| recheck_inputs(w, &prior, &prior_history))
-    {
-        error = Some(format!(
-            "{}; final source/prior: {post}",
-            error.unwrap_or_default()
-        ));
-    }
-    let checkpoint = if error.is_none() && result == Ok(true) && w.checkpoint_on_completion {
-        match checkpoint::produce(
-            w,
-            &journal,
-            &output,
-            last_returned_pin
-                .as_ref()
-                .ok_or("Checkpoint last close missing")?,
-        ) {
-            Ok(pin) => Some(pin),
-            Err(post) => {
-                error = Some(format!("Checkpoint publication: {post}"));
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let disposition = if error.is_some() {
-        "refused"
-    } else if result == Ok(true) {
-        "completed"
-    } else {
-        "stoppedNoChange"
-    };
-    let report = SemanticJournalInvocation {
-        schema: "tzolkin-semantic-playing-journal-invocation-v1",
-        control_sha256: spec.checksum,
-        disposition: disposition.into(),
-        error,
-        head: journal.head(),
-        status: journal.status(),
-        complete_session_consumption: journal.session.capture_ledger(),
-        archive_inventory: journal
-            .members
-            .values()
-            .map(|p| p.absolute(&directory))
-            .collect(),
-        capture_aliases: aliases,
-        capture_identities,
-        last_returned_close: last_returned_pin,
-        last_library_return,
-        returned_closes: returns,
-        declared_permanent_allocation: w.permanent_allocation.clone(),
-        declared_families: 4 * w.batches.len(),
-        declared_actor_streams: 14 * w.batches.len(),
-        historical_archive_bytes_checked_at_return: full_bytes.is_ok(),
-        actual_process_close_verified: false,
-        source_authenticated: false,
-        source_qualified: false,
-        verified_native_policy: false,
-        checkpoint,
-        signal_diagnostics,
-        procedural_pools: if pool_overrides(w).next().is_some() {
-            pools.sources.values().map(|(pin, _)| pin.clone()).collect()
+        let fresh = source_session(
+            &w.original,
+            w.chunk.as_ref(),
+            prepared.borrowed().with_custody(custody)?,
+            &original_external,
+            &original_history,
+        )?;
+        let (mut journal, mut snapshots) = if let Some(restore) = &w.restore {
+            restore_observed_closed(
+                &directory,
+                &restore.tip,
+                &restore.close_declaration,
+                fresh,
+                &pools.references(),
+            )?
+            .into_journal_and_snapshots()
         } else {
-            Vec::new()
-        },
-    };
-    let raw = bounded(&report)?;
-    // On a late IO failure the CLI still receives exact accounting to print.
-    if let Err(error) = publish_mixed_metadata(&output, "invocation.json", &raw) {
-        return Ok(SemanticJournalInvocation {
-            disposition: "refused".into(),
-            error: Some(format!("Invocation publication: {error}")),
-            ..report
-        });
-    }
-    if let Err(error) = journal
-        .session
-        .journal_recheck()
-        .and_then(|_| recheck_inputs(w, &prior, &prior_history))
-    {
-        return Ok(SemanticJournalInvocation {
-            disposition: "refused".into(),
-            error: Some(format!("Invocation postpublication: {error}")),
-            ..report
-        });
-    }
-    Ok(report)
+            (
+                SemanticPlayingJournal::start_chunk(
+                    &directory,
+                    fresh,
+                    limits,
+                    source_budget(&w.original, w.chunk.as_ref())?,
+                )?,
+                Vec::new(),
+            )
+        };
+        if journal.limits != limits
+            || bounded(&journal.budget)? != bounded(&source_budget(&w.original, w.chunk.as_ref())?)?
+            || journal.session.next_episode_ordinal() != expected_first
+        {
+            return Err("Semantic restored original limits/budget/next cursor differ".into());
+        }
+        check_prior(
+            &journal,
+            &prior,
+            &prior_history,
+            &w.global_prior.forbidden_sampling_seeds,
+        )?;
+        if journal.session.attempts() + w.batches.len() > journal.budget.max_attempts {
+            return Err("Semantic complete invocation exceeds original attempt headroom".into());
+        }
+        // Missing restored capture IDs and learner-seat replacements refuse before a new Reserve.
+        for batch in &w.batches {
+            let pool = pools.get(batch.procedural_pool.as_ref().unwrap_or(&w.procedural_pool))?;
+            check_batch_pool_slots(batch, pool, &snapshots)?;
+        }
+        fs::create_dir(&output).map_err(|e| e.to_string())?;
+        let mut aliases = BTreeMap::new();
+        let mut returns = Vec::new();
+        let mut signal_rows = Vec::new();
+        let mut last_library_return = None;
+        let mut last_returned_pin = None;
+        // Lookup metadata is cached once from genuine captures. Warm alias lookup
+        // must not hash every old snapshot's complete origin closure per batch.
+        let mut capture_identities = snapshots
+            .iter()
+            .map(|s| s.journal_identity())
+            .collect::<Result<Vec<_>, _>>()?;
+        // Owned typed values are used until the command's publication boundaries.
+        // This full backing-file POST still precedes the first new Reserve.
+        prepared.command_source_recheck(custody)?;
+        let result = (|| {
+            for batch in &w.batches {
+                recheck_inputs(w, &prior, &prior_history)?;
+                let pool =
+                    pools.get(batch.procedural_pool.as_ref().unwrap_or(&w.procedural_pool))?;
+                if let Some(alias) = &batch.capture_before {
+                    let current = journal.session.current_unchecked().checksum();
+                    let existing = capture_identities
+                        .iter()
+                        .find(|s| s["current"].as_str() == Some(current));
+                    let id = match existing {
+                        Some(identity) => identity["checksum"]
+                            .as_str()
+                            .ok_or("Typed capture checksum")?
+                            .to_string(),
+                        None => {
+                            let snapshot = journal.freeze_snapshot()?;
+                            let identity = snapshot.journal_identity()?;
+                            let id = snapshot.binding().to_string();
+                            snapshots.push(snapshot);
+                            capture_identities.push(identity);
+                            id
+                        }
+                    };
+                    aliases.insert(alias.clone(), id);
+                }
+                let mut close = if batch.slots.is_empty() {
+                    journal.update_procedural_whole_four(batch.seeds, pool)?
+                } else {
+                    let slots = batch
+                        .slots
+                        .iter()
+                        .map(|slot| {
+                            let id = match &slot.snapshot {
+                                SnapshotRef::Existing { checksum } => checksum,
+                                SnapshotRef::Local { alias } => {
+                                    aliases.get(alias).ok_or("Capture alias not produced")?
+                                }
+                            };
+                            let snapshot = snapshots
+                                .iter()
+                                .find(|s| s.binding() == id)
+                                .ok_or("Actual capture missing")?;
+                            SnapshotSlot::new(slot.member, slot.actor, snapshot)
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    let mixture = SemanticFrozenMixture::new(pool, slots)?;
+                    journal.update_mixed_whole_four(batch.seeds, &mixture)?
+                };
+                let signals = close.signals.take();
+                let signal_report = close.report.clone();
+                let no_change = close.resolution == SemanticJournalResolution::NoChange;
+                let name = format!("returned-{:04}.json", close.attempt);
+                last_library_return = Some(close);
+                last_returned_pin = None;
+                let raw = bounded(&last_library_return)?;
+                publish_mixed_metadata(&output, &name, &raw)?;
+                let pin = Pin::new(&name, &raw).absolute(&output);
+                last_returned_pin = Some(pin.clone());
+                returns.push(pin.clone());
+                if w.signal_diagnostics {
+                    let signals =
+                        signals.ok_or("Returned semantic close lacks same-pass signals")?;
+                    signal_rows.push(json!({"returnedClose":pin,
+                    "report":signal_report,"signals":signals}));
+                }
+                // Source/global-prior/output failures stop before another attempt.
+                recheck_inputs(w, &prior, &prior_history)?;
+                if no_change {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })();
+        let mut error = result.as_ref().err().cloned();
+        let mut signal_diagnostics = None;
+        if w.signal_diagnostics {
+            match publish_signal_diagnostics(&output, &spec.checksum, w.batches.len(), &signal_rows)
+            {
+                Ok(pin) => signal_diagnostics = Some(pin),
+                Err(post) => {
+                    error = Some(format!(
+                        "{}; signal diagnostics: {post}",
+                        error.unwrap_or_default()
+                    ))
+                }
+            }
+        }
+        // Sidecar publication errors still pass through all archive/source POST checks.
+        let full_bytes = journal.verify_archive_bytes();
+        if let Err(post) = &full_bytes {
+            error = Some(format!(
+                "{}; final archive: {post}",
+                error.unwrap_or_default()
+            ));
+        }
+        if let Err(post) = journal
+            .session
+            .journal_recheck()
+            .and_then(|_| recheck_inputs(w, &prior, &prior_history))
+        {
+            error = Some(format!(
+                "{}; final source/prior: {post}",
+                error.unwrap_or_default()
+            ));
+        }
+        // Evaluate independently: an archive, journal or prior error must not skip
+        // the complete backing-corpus PRE before checkpoint/invocation publication.
+        if let Err(post) = prepared.command_source_recheck(custody) {
+            error = Some(format!(
+                "{}; native command source PRE: {post}",
+                error.unwrap_or_default()
+            ));
+        }
+        let checkpoint = if error.is_none() && result == Ok(true) && w.checkpoint_on_completion {
+            match checkpoint::produce(
+                w,
+                &journal,
+                &output,
+                last_returned_pin
+                    .as_ref()
+                    .ok_or("Checkpoint last close missing")?,
+            ) {
+                Ok(pin) => Some(pin),
+                Err(post) => {
+                    error = Some(format!("Checkpoint publication: {post}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let disposition = if error.is_some() {
+            "refused"
+        } else if result == Ok(true) {
+            "completed"
+        } else {
+            "stoppedNoChange"
+        };
+        let report = SemanticJournalInvocation {
+            schema: "tzolkin-semantic-playing-journal-invocation-v1",
+            control_sha256: spec.checksum,
+            disposition: disposition.into(),
+            error,
+            head: journal.head(),
+            status: journal.status(),
+            complete_session_consumption: journal.session.capture_ledger(),
+            archive_inventory: journal
+                .members
+                .values()
+                .map(|p| p.absolute(&directory))
+                .collect(),
+            capture_aliases: aliases,
+            capture_identities,
+            last_returned_close: last_returned_pin,
+            last_library_return,
+            returned_closes: returns,
+            declared_permanent_allocation: w.permanent_allocation.clone(),
+            declared_families: 4 * w.batches.len(),
+            declared_actor_streams: 14 * w.batches.len(),
+            historical_archive_bytes_checked_at_return: full_bytes.is_ok(),
+            actual_process_close_verified: false,
+            source_authenticated: false,
+            source_qualified: false,
+            verified_native_policy: false,
+            checkpoint,
+            signal_diagnostics,
+            procedural_pools: if pool_overrides(w).next().is_some() {
+                pools.sources.values().map(|(pin, _)| pin.clone()).collect()
+            } else {
+                Vec::new()
+            },
+            source_custody: custody,
+        };
+        let raw = bounded(&report)?;
+        // On a late IO failure the CLI still receives exact accounting to print.
+        if let Err(error) = publish_mixed_metadata(&output, "invocation.json", &raw) {
+            return Ok(SemanticJournalInvocation {
+                disposition: "refused".into(),
+                error: Some(format!("Invocation publication: {error}")),
+                ..report
+            });
+        }
+        if let Err(error) = journal
+            .session
+            .journal_recheck()
+            .and_then(|_| recheck_inputs(w, &prior, &prior_history))
+        {
+            return Ok(SemanticJournalInvocation {
+                disposition: "refused".into(),
+                error: Some(format!("Invocation postpublication: {error}")),
+                ..report
+            });
+        }
+        Ok(report)
+    })();
+    native_custody_post(result, &prepared, custody)
 }
 
 fn publish_signal_diagnostics(
@@ -1709,6 +1808,9 @@ fn plan_checksum(w: &Wire) -> Result<String, String> {
     if w.chunk.is_some() || w.checkpoint_on_completion {
         plan["chunk"] = serde_json::to_value(&w.chunk).map_err(|e| e.to_string())?;
         plan["checkpointOnCompletion"] = w.checkpoint_on_completion.into();
+    }
+    if let Some(custody) = w.source_custody {
+        plan["sourceCustody"] = serde_json::to_value(custody).map_err(|e| e.to_string())?;
     }
     hash(b"semantic-playing-invocation-plan-v1\0", &plan)
 }
@@ -2019,6 +2121,17 @@ pub(super) fn control_fixture(
     let spec = parse(&value).unwrap();
     assert!(!spec.wire.signal_diagnostics);
     let old_wire = serde_json::to_vec(&spec.wire).unwrap();
+    let mut legacy_custody = value.clone();
+    legacy_custody["sourceCustody"] = Value::Null;
+    let legacy_custody = parse(&legacy_custody).unwrap();
+    assert_eq!(serde_json::to_vec(&legacy_custody.wire).unwrap(), old_wire);
+    assert_eq!(
+        plan_checksum(&legacy_custody.wire).unwrap(),
+        plan_checksum(&spec.wire).unwrap()
+    );
+    let mut wrong_custody = value.clone();
+    wrong_custody["sourceCustody"] = "nativeCommandBoundaryV1".into();
+    assert!(parse(&wrong_custody).is_err()); // Human remains freshly checked.
     let mut default_batch_pool = value.clone();
     default_batch_pool["batches"][0]["proceduralPool"] = Value::Null;
     assert_eq!(
@@ -2097,6 +2210,22 @@ pub(super) fn control_fixture(
     native_v7_control["original"]["initializationKind"] =
         "nativeCornFirstV7SemanticPlayingTeacher".into();
     let native_v7_spec = parse(&native_v7_control).unwrap();
+    let mut owned_control = native_v7_control.clone();
+    owned_control["sourceCustody"] = "nativeCommandBoundaryV1".into();
+    let owned_spec = parse(&owned_control).unwrap();
+    assert_eq!(
+        bounded(&owned_spec.wire.original).unwrap(),
+        bounded(&native_v7_spec.wire.original).unwrap()
+    );
+    assert_ne!(
+        plan_checksum(&owned_spec.wire).unwrap(),
+        plan_checksum(&native_v7_spec.wire).unwrap()
+    );
+    owned_control["sourceCustody"] = "futureCommandMode".into();
+    assert!(parse(&owned_control).is_err());
+    owned_control["sourceCustody"] = "nativeCommandBoundaryV1".into();
+    owned_control["original"] = serde_json::to_value(&native_spec.wire.original).unwrap();
+    assert!(parse(&owned_control).is_err()); // V5 also keeps its legacy contract.
     assert!(matches!(
         native_v7_spec.wire.original.initialization_kind,
         Some(InitializationKind::NativeCornFirstV7SemanticPlayingTeacher)
@@ -2356,12 +2485,34 @@ pub(super) fn control_fixture(
         "schema":"tzolkin-semantic-playing-checkpoint-close-v1","checkpoint":payload,
         "journalCloseDeclaration":declaration,"invocation":invocation,"producerClose":producing}),
     );
+    let legacy_payload = unique_json(&pinned(&payload, META_BYTES).unwrap(), META_BYTES).unwrap();
+    assert!(legacy_payload.get("sourceCustody").is_none());
+    let mut mismatched_invocation =
+        unique_json(&pinned(&invocation, META_BYTES).unwrap(), META_BYTES).unwrap();
+    mismatched_invocation["sourceCustody"] = "nativeCommandBoundaryV1".into();
+    let mismatched_invocation = save("custody-mismatched-invocation.json", &mismatched_invocation);
+    let mismatched_producer = producer_close(
+        "custody-mismatched-producer.json",
+        &payload,
+        &mismatched_invocation,
+    );
+    let mut mismatched_close =
+        unique_json(&pinned(&close, META_BYTES).unwrap(), META_BYTES).unwrap();
+    mismatched_close["invocation"] = serde_json::to_value(mismatched_invocation).unwrap();
+    mismatched_close["producerClose"] = serde_json::to_value(mismatched_producer).unwrap();
+    let mismatched_chunk: Chunk = serde_json::from_value(json!({
+        "parent":{"payload":payload,"closeDeclaration":save("custody-mismatched-close.json", &mismatched_close)},
+        "samplingSeed":29,"replicate":0,"firstOrdinal":journal.session.next_episode_ordinal(),
+        "budget":producer.original.budget,"prior":producer.global_prior
+    })).unwrap();
+    assert!(checkpoint::recheck(Some(&mismatched_chunk)).is_err());
     let policy_control = json!({"schema":POLICY_EXPORT_SCHEMA,
         "checkpoint":{"payload":payload,"closeDeclaration":close}});
     let parse_policy = |v: &Value| {
         let raw = serde_json::to_vec(v).unwrap();
         SemanticPolicyExportSpec::from_json(&raw, &crate::model::digest(&raw))
     };
+    let native_custody_fixture;
     {
         use tzolkin_inference::{deployment, semantic_playing_deployment as policy};
         let output = root.join("checkpoint-fixture-policy");
@@ -2448,6 +2599,135 @@ pub(super) fn control_fixture(
                     TeacherProfile::V7,
                 ),
             );
+            native_custody_fixture = Arc::clone(&v7);
+            let custody = Some(SemanticNativeSourceCustody::NativeCommandBoundaryV1);
+            assert!(
+                SemanticFreshOwner::native_with_custody(Arc::clone(&native), 11, custody).is_err()
+            );
+            let families = v7
+                .rl_checkpoint()
+                .dataset
+                .manifest
+                .families
+                .iter()
+                .map(|f| f.family_id.clone())
+                .collect::<BTreeSet<_>>();
+            let pin = save(
+                "owned-native-exclusions.json",
+                &json!({
+                "schema":"tzolkin-conditional-native-exclusions-v1","families":families}),
+            );
+            let external = ConditionalNativeExclusions::load(
+                Path::new(&pin.path),
+                &pin,
+                families.len(),
+                &crate::model::digest(
+                    families
+                        .iter()
+                        .map(|f| format!("{f}\n"))
+                        .collect::<String>()
+                        .as_bytes(),
+                ),
+            )
+            .unwrap();
+            let history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
+            let make = |custody| {
+                SemanticPlayingJointSession::from_fresh_owner(
+                    LoadedInitializationRef::Native(&v7, None)
+                        .with_custody(custody)
+                        .unwrap()
+                        .fresh_owner(11)
+                        .unwrap(),
+                    &external,
+                    &history,
+                    SamplingSeed::new(991),
+                    0,
+                    0,
+                    OneStepConfig::default(),
+                    ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+                    SemanticCollectionComposition::GuardedProposalV2,
+                )
+                .unwrap()
+            };
+            let legacy = make(None);
+            let owned = make(custody);
+            let origin_custody = |custody| {
+                let state = SemanticTrainingState::from_fresh(
+                    LoadedInitializationRef::Native(&v7, None)
+                        .with_custody(custody)
+                        .unwrap()
+                        .fresh_owner(11)
+                        .unwrap(),
+                )
+                .unwrap();
+                state.view(state.root().checksum()).origin_custody()
+            };
+            let legacy_origin = origin_custody(None);
+            let owned_origin = origin_custody(custody);
+            assert_eq!(
+                legacy.journal_source().unwrap(),
+                owned.journal_source().unwrap()
+            );
+            assert_eq!(
+                legacy.actor_parameters().unwrap(),
+                owned.actor_parameters().unwrap()
+            );
+            assert_eq!(
+                legacy.critic_parameters().unwrap(),
+                owned.critic_parameters().unwrap()
+            );
+            let legacy_snapshot = legacy.freeze_snapshot().unwrap();
+            let owned_snapshot = owned.freeze_snapshot().unwrap();
+            assert_eq!(
+                legacy_snapshot.journal_identity().unwrap(),
+                owned_snapshot.journal_identity().unwrap()
+            );
+            use crate::conditional_semantic_playing_rl::{
+                native_backing_checks, with_source_check_pass,
+            };
+            for operations in [1, 60] {
+                let before = native_backing_checks();
+                for _ in 0..operations {
+                    owned.identity().unwrap();
+                    owned.actor_parameters().unwrap();
+                    owned.critic_parameters().unwrap();
+                    owned_snapshot.identity().unwrap();
+                }
+                assert_eq!(native_backing_checks(), before);
+                for _ in 0..operations {
+                    legacy.identity().unwrap();
+                    legacy.actor_parameters().unwrap();
+                    legacy.critic_parameters().unwrap();
+                    legacy_snapshot.identity().unwrap();
+                }
+                assert_eq!(native_backing_checks() - before, 4 * operations);
+            }
+            let source =
+                v7_directory.join(&v7.rl_checkpoint().dataset.manifest.games[0].source_file);
+            let before = fs::read(&source).unwrap();
+            fs::write(&source, b"changed owned-native fixture source").unwrap();
+            assert!(owned.actor_parameters().is_ok()); // Immutable load-time values remain usable.
+            assert!(legacy.actor_parameters().is_err());
+            assert!(v7.recheck_sources().is_err()); // The actual command boundary still refuses.
+            let error = with_source_check_pass(|checked| {
+                owned_origin.recheck_in(checked)?;
+                legacy_origin.recheck_in(checked)
+            })
+            .unwrap_err();
+            assert!(error.contains("changed after load"));
+            let post = native_custody_post(
+                Err("synthetic early command error".into()),
+                &LoadedInitialization::Native(Arc::clone(&v7)),
+                custody,
+            )
+            .err()
+            .unwrap();
+            assert!(
+                post.contains("synthetic early command error")
+                    && post.contains("native command source POST")
+            );
+            fs::write(&source, before).unwrap();
+            v7.recheck_sources().unwrap();
             let identity = v7.arena_handle().unwrap();
             assert_eq!(
                 identity.identity().policy_version,
@@ -3072,6 +3352,7 @@ pub(super) fn control_fixture(
             checkpoint: None,
             signal_diagnostics: None,
             procedural_pools: pool_pins.clone(),
+            source_custody: None,
         };
         let mut expected_accounting = serde_json::to_value(&accounted).unwrap();
         let refused = invocation_pool_post(Ok(accounted), &[pool_pins[1].clone()]).unwrap();
@@ -3082,6 +3363,42 @@ pub(super) fn control_fixture(
         expected_accounting.as_object_mut().unwrap().remove("error");
         actual_accounting.as_object_mut().unwrap().remove("error");
         assert_eq!(actual_accounting, expected_accounting);
+        let native_source = Path::new(
+            native_custody_fixture.rl_source_locations()["datasetDirectory"]
+                .as_str()
+                .unwrap(),
+        )
+        .join(
+            &native_custody_fixture
+                .rl_checkpoint()
+                .dataset
+                .manifest
+                .games[0]
+                .source_file,
+        );
+        let source_before = fs::read(&native_source).unwrap();
+        fs::write(
+            &native_source,
+            b"changed before invocation publication returned",
+        )
+        .unwrap();
+        let refused = native_custody_post(
+            Ok(refused),
+            &LoadedInitialization::Native(Arc::clone(&native_custody_fixture)),
+            Some(SemanticNativeSourceCustody::NativeCommandBoundaryV1),
+        )
+        .unwrap();
+        assert!(
+            refused
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("native command source POST")
+        );
+        let mut actual_accounting = serde_json::to_value(&refused).unwrap();
+        actual_accounting.as_object_mut().unwrap().remove("error");
+        assert_eq!(actual_accounting, expected_accounting);
+        fs::write(native_source, source_before).unwrap();
         let error = run_semantic_playing_journal(parsed, Path::new(".."))
             .err()
             .unwrap();

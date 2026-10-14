@@ -32,6 +32,8 @@ struct Payload {
     source_qualified: bool,
     verified_native_policy: bool,
     independently_replayed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_custody: Option<SemanticNativeSourceCustody>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -91,6 +93,7 @@ fn decode<T: serde::de::DeserializeOwned>(pin: &ContentPin) -> Result<T, String>
 }
 fn read(input: &Input) -> Result<Payload, String> {
     let payload: Payload = decode(&input.payload)?;
+    validate_source_custody(payload.source_custody, &payload.original)?;
     let closed: Closed = decode(&input.close_declaration)?;
     let producer: ProducerClose = decode(&closed.producer_close)?;
     if payload.schema != SCHEMA
@@ -124,7 +127,15 @@ fn read(input: &Input) -> Result<Payload, String> {
     let (declaration, returned) =
         restore::checked_close(&payload.tip, &closed.journal_close_declaration, &directory)?;
     let invocation: Value = decode(&closed.invocation)?;
+    let invocation_custody: Option<SemanticNativeSourceCustody> = serde_json::from_value(
+        invocation
+            .get("sourceCustody")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|e| e.to_string())?;
     if invocation["disposition"] != "completed"
+        || invocation_custody != payload.source_custody
         || !invocation["error"].is_null()
         || invocation["checkpoint"]
             != serde_json::to_value(&input.payload).map_err(|e| e.to_string())?
@@ -372,6 +383,7 @@ pub(super) fn produce(
         &w.global_prior,
         w.chunk.as_ref().map(|c| c.parent.clone()),
         &w.permanent_allocation,
+        w.source_custody,
         journal,
         output,
     )
@@ -381,6 +393,7 @@ fn emit(
     prior: &Prior,
     parent: Option<Input>,
     allocation: &ContentPin,
+    source_custody: Option<SemanticNativeSourceCustody>,
     journal: &SemanticPlayingJournal<'_>,
     output: &Path,
 ) -> Result<ContentPin, String> {
@@ -405,6 +418,7 @@ fn emit(
         source_qualified: false,
         verified_native_policy: false,
         independently_replayed: false,
+        source_custody,
     };
     let raw = bounded(&payload)?;
     let roundtrip: Payload =
@@ -497,6 +511,7 @@ pub(super) fn export(
         &export.prior,
         w.chunk.as_ref().map(|c| c.parent.clone()),
         &export.permanent_allocation,
+        None,
         journal,
         output,
     )?;
