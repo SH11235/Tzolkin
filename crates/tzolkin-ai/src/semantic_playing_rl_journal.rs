@@ -1,6 +1,6 @@
 //! Single-writer semantic-4 durability and source-owned cold reconstruction.
-//! Only a fresh loaded owner enters. Saved descriptors/records never construct
-//! an owner, snapshot or actor step. Library Closed permits warm continuation;
+//! A loaded original supplies every origin; checked owned checkpoints can start
+//! a new bounded chunk. Records never construct an actor step. Library Closed permits warm continuation;
 //! cold reconstruction additionally requires a pinned external close declaration.
 //! That declaration is evidence supplied by the caller, not OS authentication.
 //! Warm checks cover output membership/lengths, not historical payload bytes:
@@ -170,7 +170,7 @@ struct StoredRecord {
     raw_sha256: String,
 }
 
-/// No Deserialize, parameter import/export or caller predictor.
+/// No Deserialize or caller predictor; only the checked runner resumes numerics.
 pub struct SemanticPlayingJournal<'a> {
     directory: PathBuf,
     session: SemanticPlayingJointSession<'a>,
@@ -196,11 +196,21 @@ impl<'a> SemanticPlayingJournal<'a> {
         limits: CollectionLimits,
         budget: SemanticJournalBudget,
     ) -> Result<Self, String> {
-        if session.attempts() != 0
-            || session.stopped()
-            || session.identity()?.completed_updates() != 0
-        {
+        if session.identity()?.completed_updates() != 0 {
             return Err("Semantic journal requires its genuine fresh root".into());
+        }
+        Self::start_chunk(directory, session, limits, budget)
+    }
+    /// A private checked continuation starts a new bounded directory, never
+    /// extends or resets a prior Original journal's budget.
+    pub(crate) fn start_chunk(
+        directory: &Path,
+        session: SemanticPlayingJointSession<'a>,
+        limits: CollectionLimits,
+        budget: SemanticJournalBudget,
+    ) -> Result<Self, String> {
+        if session.attempts() != 0 || session.stopped() {
+            return Err("Semantic journal requires an unentered checked chunk".into());
         }
         let source = session.journal_source()?;
         let directory = local(directory, true)?;
@@ -1153,5 +1163,5 @@ pub(crate) fn journal_fixture(
     assert_eq!(restored.status().next_ordinal, 212);
     assert_eq!(restored.status().spent_actor_streams, 42);
     restored.verify_archive_bytes().unwrap();
-    runner::control_fixture(root, limits, later);
+    runner::control_fixture(root, limits, later, prepared, &restored, &continued);
 }

@@ -141,6 +141,24 @@ impl DeclaredSamplingHistory {
     pub(crate) fn contains(&self, identity: SamplingStreamIdentity, actor: usize) -> bool {
         self.ranges.iter().any(|r| r.contains(identity, actor))
     }
+    pub(crate) fn covers(
+        &self,
+        seed: SamplingSeed,
+        replicate: u64,
+        players: usize,
+        actor: usize,
+        first: u64,
+        next: u64,
+    ) -> bool {
+        let prefix = [seed.value(), replicate, players as u64, actor as u64];
+        let mut cursor = first;
+        for range in &self.ranges {
+            if range.prefix == prefix && range.first <= cursor && cursor < range.next {
+                cursor = range.next;
+            }
+        }
+        cursor >= next
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

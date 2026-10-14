@@ -1,8 +1,8 @@
 //! Recurrent, in-memory whole-four semantic Playing joint updates.
 //! Ownership follows a successfully loaded fresh origin, not a parameter file.
-//! Private staged hooks also serve the separate semantic journal. No resume,
-//! export, legacy owner conversion or Adam state is admitted here.
-use serde::Serialize;
+//! Private staged hooks also serve the journal and its checked continuation.
+//! No legacy owner conversion or Adam state is admitted here.
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::conditional_human_rl_update::{ConditionalFrozenPool, ConditionalNativeExclusions};
@@ -41,6 +41,8 @@ pub struct SemanticPlayingCurrentIdentity {
     attempts: u64,
     next: u64,
     checksum: String,
+    #[serde(skip)]
+    cohort: String,
 }
 impl SemanticPlayingCurrentIdentity {
     pub fn checksum(&self) -> &str {
@@ -171,8 +173,119 @@ pub struct SemanticPlayingJointSession<'a> {
     ledger: SemanticCollectionLedger<'a>,
     actor_config: OneStepConfig,
     critic_config: ResidualFitConfig,
+    attempt_base: u64,
+}
+/// Private numerical payload. It is never a fresh owner or an actor-step DTO.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SemanticCheckpointState {
+    root: String,
+    current: serde_json::Value,
+    cohort: String,
+    actor: PublicPolicyModel,
+    critic: Vec<f32>,
+}
+impl SemanticCheckpointState {
+    pub(crate) fn validate(
+        &self,
+        actor: &OneStepConfig,
+        critic: &ResidualFitConfig,
+    ) -> Result<SemanticPlayingCurrentIdentity, String> {
+        self.actor.validate()?;
+        if self.critic.len() != crate::public_state_critic::PARAMETER_COUNT
+            || self.critic.iter().any(|v| !v.is_finite())
+        {
+            return Err("Semantic checkpoint critic shape/finite values".into());
+        }
+        let u = |key: &str| {
+            self.current[key]
+                .as_u64()
+                .ok_or("Semantic checkpoint counter".to_string())
+        };
+        let previous = self.current["previous"]
+            .as_str()
+            .ok_or("Semantic checkpoint parent")?;
+        let identity = make_identity(
+            &self.root,
+            previous,
+            self.actor.parameters(),
+            &self.critic,
+            u("updates")?,
+            u("credit")?,
+            u("attempts")?,
+            u("next")?,
+            &self.cohort,
+            actor,
+            critic,
+        )?;
+        if serde_json::to_value(&identity).map_err(|e| e.to_string())? != self.current
+            || identity.updates == 0
+            || identity.credit == 0
+            || identity.attempts < identity.updates
+        {
+            return Err("Semantic checkpoint identity differs".into());
+        }
+        Ok(identity)
+    }
 }
 impl<'a> SemanticPlayingJointSession<'a> {
+    pub(crate) fn checkpoint_state(&self) -> Result<SemanticCheckpointState, String> {
+        self.journal_recheck()?;
+        if self.stopped()
+            || self.attempts() == 0
+            || self.identity.attempts != self.attempt_base + self.attempts() as u64
+        {
+            return Err("Semantic checkpoint requires completed admitted work".into());
+        }
+        Ok(SemanticCheckpointState {
+            root: self.identity.root.clone(),
+            current: serde_json::to_value(&self.identity).map_err(|e| e.to_string())?,
+            cohort: self.identity.cohort.clone(),
+            actor: PublicPolicyModel {
+                parameters: self.state.actor_parameters().to_vec(),
+            },
+            critic: self.state.critic_parameters().to_vec(),
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_checkpoint(
+        owner: SemanticPlayingRlOwner,
+        saved: SemanticCheckpointState,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+        actor_config: OneStepConfig,
+        critic_config: ResidualFitConfig,
+    ) -> Result<Self, String> {
+        actor_config.validate()?;
+        critic_config.check_callbacks(1)?;
+        let identity = saved.validate(&actor_config, &critic_config)?;
+        if first < identity.next
+            || (first > identity.next
+                && (3..=4).any(|players| {
+                    (0..players).any(|actor| {
+                        !history.covers(seed, replicate, players, actor, identity.next, first)
+                    })
+                }))
+        {
+            return Err("Semantic checkpoint identity or uncovered ordinal gap differs".into());
+        }
+        let state =
+            SemanticTrainingState::from_checkpoint(owner, &saved.root, saved.actor, saved.critic)?;
+        let mut ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
+        ledger.commit_admitted(BTreeSet::from([identity.checksum().to_string()]));
+        ledger.recheck(&state.view(identity.checksum()))?;
+        Ok(Self {
+            attempt_base: identity.attempts,
+            state,
+            identity,
+            ledger,
+            actor_config,
+            critic_config,
+        })
+    }
     /// Borrow the admitted current source for saved-record auditing only.
     /// No restore, reservation, actor-step or ownership conversion is exposed.
     pub fn record_auditor(
@@ -222,6 +335,7 @@ impl<'a> SemanticPlayingJointSession<'a> {
             ledger,
             actor_config,
             critic_config,
+            attempt_base: 0,
         })
     }
     pub fn identity(&self) -> Result<&SemanticPlayingCurrentIdentity, String> {
@@ -363,7 +477,7 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 .iter()
                 .any(|f| !self.ledger.consumed_families().contains(f))
             || proposal.identity.previous != self.identity.checksum()
-            || proposal.identity.attempts != self.ledger.attempts() as u64
+            || proposal.identity.attempts != self.attempt_base + self.ledger.attempts() as u64
             || proposal.identity.next != self.ledger.next_episode_ordinal()
             || proposal.report.mixture.as_deref() != mixture.map(SemanticFrozenMixture::checksum)
         {
@@ -376,7 +490,8 @@ impl<'a> SemanticPlayingJointSession<'a> {
             .ledger
             .prepare_admitted(self.identity.checksum(), proposal.identity.checksum())?;
         let report = &mut proposal.report;
-        report.attempts = self.ledger.attempts();
+        report.attempts = usize::try_from(proposal.identity.attempts)
+            .map_err(|_| "Semantic cumulative report attempt overflow")?;
         report.next_ordinal = self.ledger.next_episode_ordinal();
         report.next = proposal.identity.checksum().into();
         report.checksum = hash(
@@ -655,7 +770,10 @@ fn prepare(
         &critic.parameters,
         updates,
         total_credit,
-        attempt as u64,
+        parent
+            .attempts
+            .checked_add(1)
+            .ok_or("Semantic cumulative attempt overflow")?,
         next_ordinal,
         &cohort_checksum,
         actor_config,
@@ -668,7 +786,7 @@ fn prepare(
         families: cohort.families().clone(),
         counts,
         changes,
-        attempts: 0,
+        attempts: attempt,
         next_ordinal: 0,
         credit,
         residual_loss: critic.mean_loss,
@@ -760,6 +878,7 @@ fn make_identity(
         attempts,
         next,
         checksum,
+        cohort: cohort.into(),
     })
 }
 
@@ -854,7 +973,18 @@ pub(crate) fn joint_fixture() {
         (0, 0)
     );
     let mut credit = 0;
+    let create = |config: &crate::public_stochastic_native::NativeStochasticConfig| {
+        let mut state = crate::conditional_human_rl_update::tests::terminal_start(
+            config.players(),
+            config.environment_seed(),
+        );
+        state.turn.mode = tzolkin_core::TurnMode::None;
+        state.turn.count = 0;
+        Ok(state)
+    };
     for update in 1..=2 {
+        let saved = (update == 2).then(|| session.checkpoint_state().unwrap());
+        let mut warm_records = None;
         let families = std::array::from_fn(|_| seeds.next().unwrap());
         let previous = session.identity().unwrap().checksum().to_string();
         let proposal = session
@@ -868,6 +998,7 @@ pub(crate) fn joint_fixture() {
                     assert_eq!(cohort.parent_checksum(), previous);
                     let records =
                         crate::semantic_playing_rl_record::encode_records(&cohort).unwrap();
+                    warm_records = Some(records.clone());
                     let stored = crate::semantic_playing_rl_record::store_records(&cohort).unwrap();
                     for (raw, saved) in records.iter().zip(&stored) {
                         assert_eq!(
@@ -895,18 +1026,109 @@ pub(crate) fn joint_fixture() {
                         update,
                     )
                 },
-                |config| {
-                    let mut state = crate::conditional_human_rl_update::tests::terminal_start(
-                        config.players(),
-                        config.environment_seed(),
-                    );
-                    state.turn.mode = tzolkin_core::TurnMode::None;
-                    state.turn.count = 0;
-                    Ok(state)
-                },
+                create,
             )
             .unwrap();
         let report = session.admit(proposal).unwrap();
+        if let Some(saved) = saved {
+            let raw = serde_json::to_vec(&saved).unwrap();
+            let saved: SemanticCheckpointState = serde_json::from_slice(&raw).unwrap();
+            let resume = |saved, first, config| {
+                SemanticPlayingJointSession::from_checkpoint(
+                    SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap(),
+                    saved,
+                    &external,
+                    &history,
+                    SamplingSeed::new(17),
+                    first,
+                    0,
+                    config,
+                    ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+                )
+            };
+            let mut bad = saved.clone();
+            bad.actor.parameters[0] = f32::NAN;
+            assert!(resume(bad, 104, OneStepConfig::default()).is_err());
+            let mut bad = saved.clone();
+            bad.root = "0".repeat(64);
+            assert!(resume(bad, 104, OneStepConfig::default()).is_err());
+            assert!(resume(saved.clone(), 105, OneStepConfig::default()).is_err());
+            assert!(resume(saved.clone(), 103, OneStepConfig::default()).is_err());
+            let changed = OneStepConfig::new(0.0002, 0.01, 4_000_000).unwrap();
+            assert!(resume(saved.clone(), 104, changed).is_err());
+            let mut resumed = resume(saved, 104, OneStepConfig::default()).unwrap();
+            assert_eq!(resumed.attempts(), 0);
+            let proposal = resumed
+                .ledger
+                .collect_fixture_using(
+                    &resumed.state.view(&previous),
+                    families,
+                    &pool,
+                    limits,
+                    |scope, cohort| {
+                        assert_eq!(
+                            crate::semantic_playing_rl_record::encode_records(&cohort).unwrap(),
+                            warm_records.clone().unwrap()
+                        );
+                        prepare(
+                            scope,
+                            &resumed.identity,
+                            &cohort,
+                            &resumed.actor_config,
+                            &resumed.critic_config,
+                            1,
+                        )
+                    },
+                    create,
+                )
+                .unwrap();
+            let resumed_report = resumed.admit(proposal).unwrap();
+            assert_eq!(
+                serde_json::to_value(&resumed_report).unwrap(),
+                serde_json::to_value(&report).unwrap()
+            );
+            assert_eq!(
+                resumed.identity().unwrap().checksum(),
+                session.identity().unwrap().checksum()
+            );
+            assert_eq!(
+                resumed
+                    .actor_parameters()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                session
+                    .actor_parameters()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                resumed
+                    .critic_parameters()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                session
+                    .critic_parameters()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                (
+                    resumed.attempts(),
+                    resumed.identity().unwrap().attempted_whole_four()
+                ),
+                (1, 2)
+            );
+            resumed.stop();
+            assert!(resumed.checkpoint_state().is_err());
+        }
         assert!(report.updated());
         assert_eq!(report.parent_checksum(), previous);
         assert!(report.changed_parameters()[0] > 0);

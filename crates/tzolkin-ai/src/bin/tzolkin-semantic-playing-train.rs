@@ -7,13 +7,21 @@ use tzolkin_ai::semantic_playing_rl_journal::{
     run_semantic_playing_journal,
 };
 
-const HELP: &str = "tzolkin-semantic-playing-train start|resume --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_INVOCATION_DIR\nOne finite predeclared whole-four schedule on one source-owned live session. Resume reconstructs from the exact original Human4/critic/external/history/config inputs and an externally pinned successful close declaration. New global PRIOR exclusions are checked separately, before this invocation's own permanently allocated schedule. Every entered/unentered allocation remains host-consumed; no retry or refund. Captured opponents are actual same-chain typed actors, with common Corn-first Setup. No checkpoint/parameter export, old owner conversion, Test/adoption/strength or process authentication. Each actual returned library close is saved outside the owned journal before the next batch. Exit0: all declared batches Updated; exit2: truthful NoChange stop, not Ready; exit1: refusal/failure/unknown. Use one writer and a separate bounded process/disk observer.\n";
+const HELP: &str = "tzolkin-semantic-playing-train start|resume|continue --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_INVOCATION_DIR\nOne finite predeclared whole-four schedule. Resume optionally audits the current chunk from its checked parent checkpoint. Continue starts a fresh finite journal from a completed owned actor+critic checkpoint and observed producing close, retaining the exact Original and one Prepared load. Each chunk explicitly declares its sampling seed/replicate/ordinal, budget and cumulative prior; forbidden historical seeds remain forbidden. checkpointOnCompletion requires five-batch local capture blocks and emits training-checkpoint.json only on completed work. The separate checkpoint-close-v1 declaration pins that payload, the successful journal close declaration and invocation.json after actual process exit/EOF; it is local evidence, not authentication. Every entered/unentered allocation remains consumed, including failed chunks; no refund or strength/adoption claim. Captured opponents stay within their chunk, with Corn-first Setup. Exit0: completed; exit2: NoChange; exit1: refusal. Use one writer and a bounded process/disk observer.\n";
 const AUDIT_HELP: &str = "tzolkin-semantic-playing-train audit --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_AUDIT_DIR\nSeparate restore-only audit schema: exact original Human4/critic/external/history/config, procedural pool, journal tip and successful producing-close declaration. Freshly replays the saved procedural/mixed records, without allocating new families/streams/updates, changing the journal or returning an owner. Writes bounded audit.json; exit0 means audit returned successfully, not Ready/authentication/strength. Historical NoChange remains stopped. The outer host owns wall/CPU/RSS and actual exit/EOF/pin checks; saved JSON alone is insufficient.\n";
 const EVALUATION_HELP: &str = "tzolkin-semantic-playing-train evaluate --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_EVALUATION_DIR\nSeparate closed evaluation schema pins an unchanged audit control and current global family exclusions. Restores the genuine current actor, then evaluates ordinary disjoint Validation families with all-seat Corn-first Setup, Scalar Playing argmax/default TradeGuard, originalHuman4 or resourceCycleV5 reference and fixed V5 pool. originalHuman4 borrows the exact original preparation used to restore this journal. No new learning allocation, update, capture, weight conversion or journal write. Exit0 requires complete paired arms and all source/archive postchecks; no strength/adoption claim.\n";
+const CHECKPOINT_HELP: &str = "To bootstrap an exhausted successfully updated journal, audit optionally accepts checkpointExport:{prior,permanentAllocation}. It reconstructs the genuine closed actor+critic and writes training-checkpoint.json plus checkpoint-export.json in the fresh audit output, without new games, allocations, updates or journal writes. Omit checkpointExport for unchanged audit behavior. A checkpoint-close-v1 input must separately pin producerClose (checkpoint-observed-process-close-v1, actual exit0/both EOF/checkpoint/invocation pins) and the old journalCloseDeclaration; the old journal close alone cannot attest the new exporter. Both are local evidence, not source authentication.\n";
 
 fn run(args: &[String]) -> Result<i32, String> {
-    if args.len() != 7 || !matches!(args[0].as_str(), "start" | "resume" | "audit" | "evaluate") {
-        return Err("Expected start|resume|audit|evaluate and three flag/value pairs".into());
+    if args.len() != 7
+        || !matches!(
+            args[0].as_str(),
+            "start" | "resume" | "continue" | "audit" | "evaluate"
+        )
+    {
+        return Err(
+            "Expected start|resume|continue|audit|evaluate and three flag/value pairs".into(),
+        );
     }
     let mut flags = std::collections::BTreeMap::new();
     for pair in args[1..].as_chunks::<2>().0 {
@@ -78,7 +86,7 @@ fn run(args: &[String]) -> Result<i32, String> {
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--help"] {
-        print!("{HELP}{AUDIT_HELP}{EVALUATION_HELP}");
+        print!("{HELP}{AUDIT_HELP}{EVALUATION_HELP}{CHECKPOINT_HELP}");
         return;
     }
     match run(&args) {
