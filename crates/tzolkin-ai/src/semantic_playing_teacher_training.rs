@@ -616,7 +616,7 @@ fn train_after_cache_with_fit(
         };
         let (current_train, current_validation) = if let Some(p) = resume {
             let t = evaluate_with_fit(&train, &model, false, fit.as_deref_mut())?;
-            let v = evaluate_with_fit(&validation, &model, true, fit.as_deref_mut())?;
+            let v = evaluate_with_fit(&validation, &model, true, fit)?;
             if p.metrics.initial_train != initial_train
                 || p.metrics.initial_validation != initial_validation
                 || p.metrics.final_train != t
