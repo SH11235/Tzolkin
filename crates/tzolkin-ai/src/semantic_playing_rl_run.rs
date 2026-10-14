@@ -27,6 +27,7 @@ const POLICY_EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-policy-evaluati
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 const MAX_HISTORY_PINS: usize = 128;
+const MAX_PROCEDURAL_POOLS: usize = 64;
 #[path = "semantic_playing_rl_checkpoint.rs"]
 mod checkpoint;
 
@@ -482,6 +483,96 @@ struct Prior {
 struct Restore {
     tip: ContentPin,
     close_declaration: ContentPin,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    procedural_pools: Vec<ContentPin>,
+}
+
+// Keep every raw source pin, but supply each semantic binding only once to
+// restore. Different files may contain the same checked roster declaration.
+struct ProceduralPools {
+    pools: Vec<ConditionalFrozenPool>,
+    sources: BTreeMap<PathBuf, (ContentPin, usize)>,
+}
+impl ProceduralPools {
+    fn load<'a>(pins: impl IntoIterator<Item = &'a ContentPin>) -> Result<Self, String> {
+        let mut pools = Vec::new();
+        let mut sources: BTreeMap<PathBuf, (ContentPin, usize)> = BTreeMap::new();
+        let mut bindings = BTreeMap::new();
+        for pin in pins {
+            let path = local(Path::new(&pin.path), false)?
+                .canonicalize()
+                .map_err(|e| e.to_string())?;
+            if let Some((old, _)) = sources.get(&path) {
+                if old.bytes != pin.bytes || old.sha256 != pin.sha256 {
+                    return Err("Semantic conflicting procedural pool pins".into());
+                }
+                continue;
+            }
+            if sources.len() == MAX_PROCEDURAL_POOLS {
+                return Err("Semantic procedural pool source cap".into());
+            }
+            let pool = ConditionalFrozenPool::from_json(&pinned(pin, MAX_CONTROL)?)?;
+            let binding =
+                serde_json::to_string(&pool.procedural_binding()?).map_err(|e| e.to_string())?;
+            let index = *bindings.entry(binding).or_insert_with(|| {
+                let index = pools.len();
+                pools.push(pool);
+                index
+            });
+            sources.insert(path, (pin.clone(), index));
+        }
+        Ok(Self { pools, sources })
+    }
+    fn get(&self, pin: &ContentPin) -> Result<&ConditionalFrozenPool, String> {
+        let path = local(Path::new(&pin.path), false)?
+            .canonicalize()
+            .map_err(|e| e.to_string())?;
+        let (saved, index) = self
+            .sources
+            .get(&path)
+            .ok_or("Semantic procedural pool was not loaded")?;
+        if saved.bytes != pin.bytes || saved.sha256 != pin.sha256 {
+            return Err("Semantic conflicting procedural pool pins".into());
+        }
+        Ok(&self.pools[*index])
+    }
+    fn references(&self) -> Vec<&ConditionalFrozenPool> {
+        self.pools.iter().collect()
+    }
+}
+
+fn pool_input_post<T>(result: Result<T, String>, pins: &[ContentPin]) -> Result<T, String> {
+    let errors = pins
+        .iter()
+        .filter_map(|p| pinned(p, MAX_CONTROL).err())
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        result
+    } else {
+        Err(format!(
+            "{}; procedural pool POST: {}",
+            result.err().unwrap_or_default(),
+            errors.join("; ")
+        ))
+    }
+}
+fn invocation_pool_post(
+    result: Result<SemanticJournalInvocation, String>,
+    pins: &[ContentPin],
+) -> Result<SemanticJournalInvocation, String> {
+    match pool_input_post(Ok(()), pins) {
+        Ok(()) => result,
+        Err(post) => match result {
+            Ok(mut report) => {
+                // Reserve/admission may already have happened. A late source
+                // refusal must retain the exact descriptive head and accounting.
+                report.disposition = "refused".into();
+                report.error = Some(format!("{}{post}", report.error.take().unwrap_or_default()));
+                Ok(report)
+            }
+            Err(error) => Err(format!("{error}{post}")),
+        },
+    }
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -568,6 +659,9 @@ impl SemanticJournalAuditSpec {
         if let Some(chunk) = &wire.chunk {
             chunk.budget()?;
         }
+        if wire.restore.procedural_pools.len() > MAX_PROCEDURAL_POOLS {
+            return Err("Semantic restored pool cap".into());
+        }
         OneStepConfig::from_checkpoint(wire.original.actor_config.clone())?;
         ResidualFitConfig::from_checkpoint(wire.original.critic_config.clone())?;
         Ok(Self {
@@ -613,14 +707,23 @@ pub fn audit_semantic_playing_journal(
     spec: SemanticJournalAuditSpec,
     output: &Path,
 ) -> Result<SemanticJournalAudit, String> {
+    let pins = spec.wire.restore.procedural_pools.clone();
+    pool_input_post(audit_with_pools(spec, output), &pins)
+}
+fn audit_with_pools(
+    spec: SemanticJournalAuditSpec,
+    output: &Path,
+) -> Result<SemanticJournalAudit, String> {
     let w = &spec.wire;
     let output = read_only_output(w, output)?;
     let directory = local(Path::new(&w.journal_directory), false)?;
     let (source_external, source_history) = source_prior(&w.original, w.chunk.as_ref());
     let external = source_external.load()?;
     let history = source_history.load()?;
-    let pool = ConditionalFrozenPool::from_json(&pinned(&w.procedural_pool, MAX_CONTROL)?)?;
-    pool.procedural_binding()?;
+    let pools = ProceduralPools::load(
+        std::iter::once(&w.procedural_pool).chain(&w.restore.procedural_pools),
+    )?;
+    let pool = pools.get(&w.procedural_pool)?;
     let prepared = w.original.load_prepared()?;
     let result = (|| {
         let restored = restore_observed_closed(
@@ -634,7 +737,7 @@ pub fn audit_semantic_playing_journal(
                 &external,
                 &history,
             )?,
-            &[&pool],
+            &pools.references(),
         )?;
         let (journal, snapshots) = restored.into_journal_and_snapshots();
         if journal.limits != w.original.limits()?
@@ -825,10 +928,19 @@ pub fn evaluate_semantic_playing_journal(
     spec: SemanticJournalEvaluationSpec,
     output: &Path,
 ) -> Result<SemanticJournalEvaluation, String> {
-    use crate::arena::{numeric, resource_cycle::ResourceCycleConfig, semantic_snapshot};
     let e = &spec.wire;
     let raw = pinned(&e.audit_control, MAX_CONTROL)?;
     let audit = SemanticJournalAuditSpec::from_json(&raw, &e.audit_control.sha256)?;
+    let pins = audit.wire.restore.procedural_pools.clone();
+    pool_input_post(evaluate_with_pools(spec, audit, output), &pins)
+}
+fn evaluate_with_pools(
+    spec: SemanticJournalEvaluationSpec,
+    audit: SemanticJournalAuditSpec,
+    output: &Path,
+) -> Result<SemanticJournalEvaluation, String> {
+    use crate::arena::{numeric, resource_cycle::ResourceCycleConfig, semantic_snapshot};
+    let e = &spec.wire;
     if audit.wire.checkpoint_export.is_some() {
         return Err("Evaluation does not admit a checkpoint export request".into());
     }
@@ -852,8 +964,10 @@ pub fn evaluate_semantic_playing_journal(
     let (source_external, source_history) = source_prior(&w.original, w.chunk.as_ref());
     let external = source_external.load()?;
     let history = source_history.load()?;
-    let pool = ConditionalFrozenPool::from_json(&pinned(&w.procedural_pool, MAX_CONTROL)?)?;
-    pool.procedural_binding()?;
+    let pools = ProceduralPools::load(
+        std::iter::once(&w.procedural_pool).chain(&w.restore.procedural_pools),
+    )?;
+    let pool = pools.get(&w.procedural_pool)?;
     let prepared = w.original.load_prepared()?;
     let result = (|| {
         let original = unique_json(
@@ -879,7 +993,7 @@ pub fn evaluate_semantic_playing_journal(
                 &external,
                 &history,
             )?,
-            &[&pool],
+            &pools.references(),
         )?;
         let (journal, snapshots) = restored.into_journal_and_snapshots();
         let result = (|| {
@@ -1018,6 +1132,32 @@ struct Batch {
     // Capture the genuine current actor at this closed boundary, once.
     capture_before: Option<String>,
     slots: Vec<Slot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    procedural_pool: Option<ContentPin>,
+}
+fn pool_overrides(w: &Wire) -> impl Iterator<Item = &ContentPin> {
+    w.batches
+        .iter()
+        .filter_map(|b| b.procedural_pool.as_ref())
+        .chain(w.restore.iter().flat_map(|r| &r.procedural_pools))
+}
+fn check_batch_pool_slots(
+    batch: &Batch,
+    pool: &ConditionalFrozenPool,
+    snapshots: &[FrozenSemanticSnapshot<'_>],
+) -> Result<(), String> {
+    let rosters = pool.freeze_procedural()?;
+    for slot in &batch.slots {
+        if slot.actor == rosters[slot.member].learner_seat() {
+            return Err("Snapshot cannot replace learner".into());
+        }
+        if let SnapshotRef::Existing { checksum } = &slot.snapshot
+            && !snapshots.iter().any(|s| s.binding() == checksum)
+        {
+            return Err("Requested capture was not actually restored".into());
+        }
+    }
+    Ok(())
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1062,6 +1202,10 @@ impl SemanticJournalRunSpec {
             || wire.mode == "start" && wire.chunk.is_some()
             || wire.batches.is_empty()
             || wire.batches.len() > 64
+            || wire
+                .restore
+                .as_ref()
+                .is_some_and(|r| r.procedural_pools.len() > MAX_PROCEDURAL_POOLS)
             || wire.global_prior.forbidden_sampling_seeds.len() > 8192
             || wire
                 .global_prior
@@ -1161,6 +1305,8 @@ pub struct SemanticJournalInvocation {
     checkpoint: Option<ContentPin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signal_diagnostics: Option<ContentPin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    procedural_pools: Vec<ContentPin>,
 }
 impl SemanticJournalInvocation {
     pub fn exit_code(&self) -> i32 {
@@ -1176,6 +1322,13 @@ impl SemanticJournalInvocation {
 /// Resume replays before NEW work is admitted. A full fixed allocation is checked
 /// first, but is not confused with the subset actually burned by this session.
 pub fn run_semantic_playing_journal(
+    spec: SemanticJournalRunSpec,
+    output: &Path,
+) -> Result<SemanticJournalInvocation, String> {
+    let pins = pool_overrides(&spec.wire).cloned().collect::<Vec<_>>();
+    invocation_pool_post(run_with_pools(spec, output), &pins)
+}
+fn run_with_pools(
     spec: SemanticJournalRunSpec,
     output: &Path,
 ) -> Result<SemanticJournalInvocation, String> {
@@ -1208,7 +1361,8 @@ pub fn run_semantic_playing_journal(
     reject_input_namespace(
         &directory,
         &json!({"original":w.original,
-        "pool":w.procedural_pool,"allocation":w.permanent_allocation,"chunk":w.chunk,
+        "pool":w.procedural_pool,"batchPools":pool_overrides(w).collect::<Vec<_>>(),
+        "allocation":w.permanent_allocation,"chunk":w.chunk,
         "closeDeclaration":w.restore.as_ref().map(|r|&r.close_declaration)}),
     )?;
     let (source_external, source_history) = source_prior(&w.original, w.chunk.as_ref());
@@ -1220,9 +1374,8 @@ pub fn run_semantic_playing_journal(
     if let Some(chunk) = &w.chunk {
         check_declared_prior(&chunk.prior, &w.global_prior, &prior)?;
     }
-    let pool_raw = pinned(&w.procedural_pool, MAX_CONTROL)?;
-    let pool = ConditionalFrozenPool::from_json(&pool_raw)?;
-    pool.procedural_binding()?; // Explicitly refuse neural/search legacy slots.
+    let pools =
+        ProceduralPools::load(std::iter::once(&w.procedural_pool).chain(pool_overrides(w)))?;
     let allocation_raw = pinned(&w.permanent_allocation, MAX_CONTROL)?;
     // This is a plan checksum, not a control-pin cycle or an authentication claim.
     let plan_checksum = plan_checksum(w)?;
@@ -1261,7 +1414,7 @@ pub fn run_semantic_playing_journal(
             &restore.tip,
             &restore.close_declaration,
             fresh,
-            &[&pool],
+            &pools.references(),
         )?
         .into_journal_and_snapshots()
     } else {
@@ -1291,16 +1444,9 @@ pub fn run_semantic_playing_journal(
         return Err("Semantic complete invocation exceeds original attempt headroom".into());
     }
     // Missing restored capture IDs and learner-seat replacements refuse before a new Reserve.
-    let rosters = pool.freeze_procedural()?;
-    for slot in w.batches.iter().flat_map(|b| &b.slots) {
-        if slot.actor == rosters[slot.member].learner_seat() {
-            return Err("Snapshot cannot replace learner".into());
-        }
-        if let SnapshotRef::Existing { checksum } = &slot.snapshot
-            && !snapshots.iter().any(|s| s.binding() == checksum)
-        {
-            return Err("Requested capture was not actually restored".into());
-        }
+    for batch in &w.batches {
+        let pool = pools.get(batch.procedural_pool.as_ref().unwrap_or(&w.procedural_pool))?;
+        check_batch_pool_slots(batch, pool, &snapshots)?;
     }
     fs::create_dir(&output).map_err(|e| e.to_string())?;
     let mut aliases = BTreeMap::new();
@@ -1317,6 +1463,7 @@ pub fn run_semantic_playing_journal(
     let result = (|| {
         for batch in &w.batches {
             recheck_inputs(w, &prior, &prior_history)?;
+            let pool = pools.get(batch.procedural_pool.as_ref().unwrap_or(&w.procedural_pool))?;
             if let Some(alias) = &batch.capture_before {
                 let current = journal.session.current_unchecked().checksum();
                 let existing = capture_identities
@@ -1339,7 +1486,7 @@ pub fn run_semantic_playing_journal(
                 aliases.insert(alias.clone(), id);
             }
             let mut close = if batch.slots.is_empty() {
-                journal.update_procedural_whole_four(batch.seeds, &pool)?
+                journal.update_procedural_whole_four(batch.seeds, pool)?
             } else {
                 let slots = batch
                     .slots
@@ -1358,7 +1505,7 @@ pub fn run_semantic_playing_journal(
                         SnapshotSlot::new(slot.member, slot.actor, snapshot)
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-                let mixture = SemanticFrozenMixture::new(&pool, slots)?;
+                let mixture = SemanticFrozenMixture::new(pool, slots)?;
                 journal.update_mixed_whole_four(batch.seeds, &mixture)?
             };
             let signals = close.signals.take();
@@ -1469,6 +1616,11 @@ pub fn run_semantic_playing_journal(
         verified_native_policy: false,
         checkpoint,
         signal_diagnostics,
+        procedural_pools: if pool_overrides(w).next().is_some() {
+            pools.sources.values().map(|(pin, _)| pin.clone()).collect()
+        } else {
+            Vec::new()
+        },
     };
     let raw = bounded(&report)?;
     // On a late IO failure the CLI still receives exact accounting to print.
@@ -1768,7 +1920,9 @@ fn recheck_inputs(
 ) -> Result<(), String> {
     prior.recheck()?;
     history.recheck()?;
-    pinned(&w.procedural_pool, MAX_CONTROL)?;
+    for pin in std::iter::once(&w.procedural_pool).chain(pool_overrides(w)) {
+        pinned(pin, MAX_CONTROL)?;
+    }
     pinned(&w.permanent_allocation, MAX_CONTROL)?;
     checkpoint::recheck(w.chunk.as_ref())?;
     Ok(())
@@ -1850,6 +2004,12 @@ pub(super) fn control_fixture(
     let spec = parse(&value).unwrap();
     assert!(!spec.wire.signal_diagnostics);
     let old_wire = serde_json::to_vec(&spec.wire).unwrap();
+    let mut default_batch_pool = value.clone();
+    default_batch_pool["batches"][0]["proceduralPool"] = Value::Null;
+    assert_eq!(
+        serde_json::to_vec(&parse(&default_batch_pool).unwrap().wire).unwrap(),
+        old_wire
+    );
     assert!(spec.wire.original.initialization_kind.is_none());
     let mut absent_initialization = value.clone();
     absent_initialization["original"]["initializationKind"] = Value::Null;
@@ -2475,6 +2635,284 @@ pub(super) fn control_fixture(
         resumed.critic_parameters().unwrap(),
         journal.session.critic_parameters().unwrap()
     );
+    {
+        // Same existing synthetic last-round oracle: two real whole-four
+        // updates, then exact cold regeneration, with different absolute learners.
+        let mut pool_pins = Vec::new();
+        let learners = [[0, 1, 0, 1], [2, 0, 3, 2]];
+        for (index, seats) in learners.iter().enumerate() {
+            let rosters = seats.iter().enumerate().map(|(member, &learner)| {
+                (0..if member < 2 { 3 } else { 4 }).map(|actor| {
+                    if actor == learner { Value::Null } else {
+                        json!({"kind":"resourceCycle",
+                            "configuration":crate::arena::resource_cycle::ResourceCycleConfig::v5()})
+                    }
+                }).collect::<Vec<_>>()
+            }).collect::<Vec<_>>();
+            pool_pins.push(save(
+                &format!("batch-pool-{index}.json"),
+                &json!({
+                "schema":"tzolkin-conditional-human-mixed-frozen-pool-v1",
+                "weights":crate::policy::HeuristicWeights::default(),"rosters":rosters}),
+            ));
+        }
+        let duplicate = save(
+            "batch-pool-copy.json",
+            &unique_json(&pinned(&pool_pins[1], MAX_CONTROL).unwrap(), MAX_CONTROL).unwrap(),
+        );
+        let pools = ProceduralPools::load([&pool_pins[0], &pool_pins[1], &duplicate]).unwrap();
+        assert_eq!((pools.sources.len(), pools.references().len()), (3, 2));
+        let mut conflict = pool_pins[0].clone();
+        conflict.sha256 = "0".repeat(64);
+        assert!(ProceduralPools::load([&pool_pins[0], &conflict]).is_err());
+        #[cfg(windows)]
+        {
+            conflict.path = conflict.path.to_uppercase();
+            assert!(ProceduralPools::load([&pool_pins[0], &conflict]).is_err());
+        }
+        let mut missing = pool_pins[1].clone();
+        missing.path = root
+            .join("missing-batch-pool.json")
+            .to_str()
+            .unwrap()
+            .into();
+        assert!(ProceduralPools::load([&missing]).is_err());
+        let same_binding_sources = (0..=MAX_PROCEDURAL_POOLS)
+            .map(|i| {
+                save(
+                    &format!("pool-cap-{i:02}.json"),
+                    &unique_json(&pinned(&pool_pins[0], MAX_CONTROL).unwrap(), MAX_CONTROL)
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ProceduralPools::load(&same_binding_sources[..MAX_PROCEDURAL_POOLS])
+                .unwrap()
+                .references()
+                .len(),
+            1
+        );
+        assert!(ProceduralPools::load(&same_binding_sources).is_err());
+        let make = || {
+            checkpoint::resume(
+                &producer.original,
+                &chunk,
+                LoadedInitializationRef::Human(prepared),
+                &external,
+                &history,
+            )
+            .unwrap()
+        };
+        let mut rotated = SemanticPlayingJournal::start_chunk(
+            &root.join("batch-pool-journal"),
+            resumed,
+            limits,
+            chunk.budget().unwrap(),
+        )
+        .unwrap();
+        let snapshot = rotated.freeze_snapshot().unwrap();
+        let mut future = (42_000..43_000)
+            .filter(|s| split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Train);
+        let mut last = None;
+        let mut controls = Vec::new();
+        let create = |config: &NativeStochasticConfig| {
+            let mut state = crate::conditional_human_rl_update::tests::terminal_start(
+                config.players(),
+                config.environment_seed(),
+            );
+            state.turn.mode = tzolkin_core::TurnMode::None;
+            state.turn.count = 0;
+            Ok(state)
+        };
+        for (index, seats) in learners.iter().enumerate() {
+            let slots = [0, 2]
+                .into_iter()
+                .flat_map(|member| {
+                    (0..if member < 2 { 3 } else { 4 })
+                        .filter(move |&actor| actor != seats[member])
+                        .map(move |actor| {
+                            json!({"member":member,"actor":actor,
+                        "snapshot":{"kind":"local","alias":"parent"}})
+                        })
+                })
+                .collect::<Vec<_>>();
+            let mut batch: Batch = serde_json::from_value(json!({
+                "seeds":std::array::from_fn::<_,4,_>(|_|future.next().unwrap()),
+                "captureBefore":if index==0 {Some("parent")} else {None},"slots":slots,
+                "proceduralPool":if index==0 {None} else {Some(&pool_pins[index])}}))
+            .unwrap();
+            let pool = pools
+                .get(batch.procedural_pool.as_ref().unwrap_or(&pool_pins[0]))
+                .unwrap();
+            check_batch_pool_slots(&batch, pool, &[]).unwrap();
+            let actor = batch.slots[0].actor;
+            batch.slots[0].actor = seats[0];
+            assert!(
+                check_batch_pool_slots(&batch, pool, &[])
+                    .unwrap_err()
+                    .contains("replace learner")
+            );
+            assert_eq!(rotated.status().attempts, index);
+            batch.slots[0].actor = actor;
+            let slots = batch
+                .slots
+                .iter()
+                .map(|s| SnapshotSlot::new(s.member, s.actor, &snapshot).unwrap())
+                .collect();
+            let mixture = SemanticFrozenMixture::new(pool, slots).unwrap();
+            let returned = rotated
+                .update_using(batch.seeds, PoolRef::Mixture(&mixture), create)
+                .unwrap();
+            let signals = serde_json::to_value(returned.signals.as_ref().unwrap()).unwrap();
+            for (member, &learner) in seats.iter().enumerate() {
+                assert_eq!(signals["members"][member]["learner"], learner);
+                assert!(signals["members"][member]["callbacks"].as_u64().unwrap() > 0);
+            }
+            assert_eq!(rotated.status().attempts, index + 1);
+            assert_eq!(rotated.status().spent_actor_streams, 14 * (index + 1));
+            last = Some(returned);
+            controls.push(serde_json::to_value(batch).unwrap());
+        }
+        let mut control = serde_json::to_value(&producer).unwrap();
+        control["proceduralPool"] = json!(pool_pins[0]);
+        control["batches"] = json!(controls);
+        let parsed = parse(&control).unwrap();
+        assert!(
+            reject_input_namespace(root, &serde_json::to_value(&parsed.wire).unwrap()).is_err()
+        );
+        assert!(
+            serde_json::to_value(&parsed.wire).unwrap()["batches"][0]
+                .get("proceduralPool")
+                .is_none()
+        );
+        let mut changed_control = control.clone();
+        changed_control["batches"][1]["proceduralPool"] = json!(pool_pins[0]);
+        assert_ne!(
+            plan_checksum(&parsed.wire).unwrap(),
+            plan_checksum(&parse(&changed_control).unwrap().wire).unwrap()
+        );
+        assert_eq!(
+            bounded(&parsed.wire.original).unwrap(),
+            bounded(&producer.original).unwrap()
+        );
+        let returned = save(
+            "batch-pool-returned.json",
+            &serde_json::to_value(last.unwrap()).unwrap(),
+        );
+        let process = save(
+            "batch-pool-process.json",
+            &json!({
+            "schema":PROCESS_CLOSE_SCHEMA,"actualClose":true,"pid":1,"exitCode":0,"signal":null,
+            "stdoutEof":true,"stderrEof":true,"allPostchecksPassed":true,
+            "observedHead":rotated.head(),"returnedClose":returned}),
+        );
+        let declaration = save(
+            "batch-pool-close.json",
+            &json!({
+            "schema":CLOSE_DECLARATION_SCHEMA,"observedHead":rotated.head(),
+            "processClose":process,"returnedClose":returned,"completeConsumptionDeclared":true,
+            "consumption":rotated.session.capture_ledger(),"status":rotated.status(),
+            "inventory":rotated.members.values().map(|p|p.absolute(&rotated.directory)).collect::<Vec<_>>()}),
+        );
+        let restored = restore::restore_using(
+            &rotated.directory,
+            &rotated.head(),
+            &declaration,
+            make(),
+            &pools.references(),
+            create,
+        )
+        .unwrap()
+        .into_journal_and_snapshots()
+        .0;
+        assert_eq!(
+            serde_json::to_value(restored.status()).unwrap(),
+            serde_json::to_value(rotated.status()).unwrap()
+        );
+        assert_eq!(
+            restored.session.actor_parameters().unwrap(),
+            rotated.session.actor_parameters().unwrap()
+        );
+        assert_eq!(
+            restored.session.critic_parameters().unwrap(),
+            rotated.session.critic_parameters().unwrap()
+        );
+        assert!(
+            restore::restore_using(
+                &rotated.directory,
+                &rotated.head(),
+                &declaration,
+                make(),
+                &[pools.get(&pool_pins[0]).unwrap()],
+                create
+            )
+            .is_err()
+        );
+        let restore_wire = json!({"tip":rotated.head(),"closeDeclaration":declaration,
+            "proceduralPools":[pool_pins[1],duplicate]});
+        let audit_value = json!({"schema":AUDIT_SCHEMA,"journalDirectory":rotated.directory,
+            "original":producer.original,"proceduralPool":pool_pins[0],
+            "restore":restore_wire,"chunk":chunk});
+        // Audit controls retain all distinct raw pins; equal bindings are supplied once.
+        let decoded = parse_audit(&audit_value).unwrap();
+        assert_eq!(decoded.wire.restore.procedural_pools.len(), 2);
+        assert!(
+            reject_input_namespace(root, &serde_json::to_value(&decoded.wire).unwrap()).is_err()
+        );
+        let raw = fs::read(&pool_pins[1].path).unwrap();
+        fs::write(&pool_pins[1].path, b"changed pool").unwrap();
+        assert!(ProceduralPools::load([&pool_pins[1]]).is_err());
+        let accounted = SemanticJournalInvocation {
+            schema: "tzolkin-semantic-playing-journal-invocation-v1",
+            control_sha256: parsed.checksum.clone(),
+            disposition: "refused".into(),
+            error: Some("fixture prior refusal".into()),
+            head: rotated.head(),
+            status: rotated.status(),
+            complete_session_consumption: rotated.session.capture_ledger(),
+            archive_inventory: rotated
+                .members
+                .values()
+                .map(|p| p.absolute(&rotated.directory))
+                .collect(),
+            capture_aliases: BTreeMap::new(),
+            capture_identities: Vec::new(),
+            returned_closes: vec![returned.clone()],
+            last_library_return: None,
+            last_returned_close: Some(returned),
+            declared_permanent_allocation: parsed.wire.permanent_allocation.clone(),
+            declared_families: 8,
+            declared_actor_streams: 28,
+            historical_archive_bytes_checked_at_return: true,
+            actual_process_close_verified: false,
+            source_authenticated: false,
+            source_qualified: false,
+            verified_native_policy: false,
+            checkpoint: None,
+            signal_diagnostics: None,
+            procedural_pools: pool_pins.clone(),
+        };
+        let mut expected_accounting = serde_json::to_value(&accounted).unwrap();
+        let refused = invocation_pool_post(Ok(accounted), &[pool_pins[1].clone()]).unwrap();
+        assert_eq!(refused.disposition, "refused");
+        let error = refused.error.as_ref().unwrap();
+        assert!(error.contains("fixture prior refusal") && error.contains("procedural pool POST"));
+        let mut actual_accounting = serde_json::to_value(&refused).unwrap();
+        expected_accounting.as_object_mut().unwrap().remove("error");
+        actual_accounting.as_object_mut().unwrap().remove("error");
+        assert_eq!(actual_accounting, expected_accounting);
+        let error = run_semantic_playing_journal(parsed, Path::new(".."))
+            .err()
+            .unwrap();
+        assert!(error.contains("parent traversal") && error.contains("procedural pool POST"));
+        let error = audit_semantic_playing_journal(decoded, Path::new("relative-audit"))
+            .err()
+            .unwrap();
+        assert!(error.contains("absolute") && error.contains("procedural pool POST"));
+        fs::write(&pool_pins[1].path, raw).unwrap();
+        assert!(ProceduralPools::load([&pool_pins[1]]).is_ok());
+    }
     assert!(checkpoint::recheck(Some(&chunk)).is_ok());
     let mut guarded_original: Original =
         serde_json::from_value(serde_json::to_value(&producer.original).unwrap()).unwrap();
