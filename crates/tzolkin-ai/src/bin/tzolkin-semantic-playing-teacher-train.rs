@@ -8,11 +8,54 @@ use tzolkin_ai::semantic_playing_teacher_dataset::{
     load_semantic_playing_teacher_dataset, load_semantic_playing_v7_teacher_dataset,
 };
 use tzolkin_ai::semantic_playing_teacher_training::{
-    SemanticPlayingTeacherCheckpoint, train_dataset, train_dataset_with_fit_diagnostics,
+    SemanticPlayingTeacherCheckpoint, export_native_v7_bc_policy, train_dataset,
+    train_dataset_with_fit_diagnostics,
 };
 
 const USAGE: &str = "Usage: tzolkin-semantic-playing-teacher-train --dataset DATASET_DIR --config CONFIG.json --output NEW_OUTPUT_DIR [--resume CHECKPOINT.json] [--teacher cornFirstV5|cornFirstV7] [--fit-diagnostics samePass]\nConfig requires epochs, batchSize, learningRate and seed. Epochs is the total target, including resumed epochs. Default teacher is cornFirstV5; explicit cornFirstV7 uses its separate complete-source contract, with no cross-profile resume or source conversion. samePass is V7-only, requires --resume and total epochs equal completed epochs, and emits bounded selected-model per-row diagnostic loss/top1 without an extra forward, update or shuffle. This is fixed-teacher imitation, not strength evaluation.";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
+const EXPORT_USAGE: &str = "Usage: tzolkin-semantic-playing-teacher-train export-policy --checkpoint CHECKPOINT.json --expected-checkpoint-sha256 SHA256 --dataset DATASET_DIR --output NEW_OUTPUT_DIR\nV7-only typed BC export; all paths must be absolute. Loads the complete source offline and emits actor-only policy.json plus policy-export.json, with no RL counters or application adoption. Acceptance requires actual exit0.";
+
+fn export_policy(args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut args = args.peekable();
+    if args.peek().is_some_and(|a| a == "--help") {
+        args.next();
+        if args.next().is_some() {
+            return Err(EXPORT_USAGE.into());
+        }
+        println!("{EXPORT_USAGE}");
+        return Ok(());
+    }
+    let mut flags = BTreeMap::new();
+    while let Some(flag) = args.next() {
+        if !matches!(
+            flag.as_str(),
+            "--checkpoint" | "--expected-checkpoint-sha256" | "--dataset" | "--output"
+        ) {
+            return Err(EXPORT_USAGE.into());
+        }
+        let value = args.next().ok_or(EXPORT_USAGE)?;
+        if value.starts_with("--") || flags.insert(flag, value).is_some() {
+            return Err("Missing or duplicate BC export argument".into());
+        }
+    }
+    let mut required = |name: &str| flags.remove(name).ok_or(EXPORT_USAGE);
+    let checkpoint = required("--checkpoint")?;
+    let expected = required("--expected-checkpoint-sha256")?;
+    let dataset = required("--dataset")?;
+    let output = required("--output")?;
+    let report = export_native_v7_bc_policy(
+        Path::new(&checkpoint),
+        &expected,
+        Path::new(&dataset),
+        Path::new(&output),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string(&report).map_err(|e| e.to_string())?
+    );
+    Ok(())
+}
 
 fn config(path: &Path) -> Result<PolicyBcConfig, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
@@ -35,6 +78,10 @@ fn config(path: &Path) -> Result<PolicyBcConfig, String> {
 
 fn run() -> Result<(), String> {
     let mut args = std::env::args().skip(1).peekable();
+    if args.peek().is_some_and(|arg| arg == "export-policy") {
+        args.next();
+        return export_policy(args);
+    }
     if args.peek().is_some_and(|arg| arg == "--help") {
         args.next();
         if args.next().is_some() {
