@@ -19,11 +19,14 @@ use crate::semantic_playing_rl_collection::{
     AuditedSemanticPlayingCohort, DeclaredSamplingHistory, SemanticCollectionLedger,
     SemanticPlayingCollectedGame,
 };
+use crate::semantic_playing_rl_pool::{FrozenSemanticSnapshot, SemanticFrozenMixture};
 
 pub const UPDATE_VERSION: &str = "semantic-playing-own-sum-quarter-recurrent-scalar-v1";
 
 /// Descriptive, non-deserializable identity of this session's current state.
 /// Counts belong only to complete admitted updates from its own fresh root.
+/// A later failed attempt changes the session's burned allocation ledger, not
+/// these last-admitted weights/counters. Snapshot capture binds both separately.
 #[derive(Clone, Debug)]
 pub struct SemanticPlayingCurrentIdentity {
     root: String,
@@ -97,6 +100,10 @@ pub struct SemanticPlayingJointReport {
     next_ordinal: u64,
     credit: u64,
     residual_loss: f64,
+    mixture: Option<String>,
+    opponent_samples: usize,
+    total_rows: usize,
+    actor_draws: [[u64; 4]; 4],
     checksum: String,
 }
 impl SemanticPlayingJointReport {
@@ -137,6 +144,18 @@ impl SemanticPlayingJointReport {
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
+    pub fn mixture_checksum(&self) -> Option<&str> {
+        self.mixture.as_deref()
+    }
+    pub fn opponent_playing_samples(&self) -> usize {
+        self.opponent_samples
+    }
+    pub fn total_sampled_candidate_rows(&self) -> usize {
+        self.total_rows
+    }
+    pub fn actor_draws(&self) -> &[[u64; 4]; 4] {
+        &self.actor_draws
+    }
 }
 
 /// One fresh root, a recurrent current state and one persistent allocation ledger.
@@ -164,10 +183,10 @@ impl<'a> SemanticPlayingJointSession<'a> {
         actor_config.validate()?;
         critic_config.check_callbacks(1)?;
         let state = SemanticTrainingState::from_fresh(owner)?;
-        let ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
+        let mut ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
         let root = state.root().checksum().to_string();
-        let identity = ledger.with_checked(&state.view(&root), |scope| {
-            make_identity(
+        let (identity, admitted) = ledger.with_checked(&state.view(&root), |scope| {
+            let identity = make_identity(
                 &root,
                 &root,
                 scope.actor().parameters(),
@@ -179,8 +198,11 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 "fresh-root",
                 &actor_config,
                 &critic_config,
-            )
+            )?;
+            let admitted = BTreeSet::from([identity.checksum().to_string()]);
+            Ok((identity, admitted))
         })?;
+        ledger.commit_admitted(admitted);
         Ok(Self {
             state,
             identity,
@@ -222,6 +244,45 @@ impl<'a> SemanticPlayingJointSession<'a> {
     }
     pub fn failed_game(&self) -> Option<&SemanticPlayingCollectedGame> {
         self.ledger.failed_game()
+    }
+    pub fn freeze_snapshot(&self) -> Result<FrozenSemanticSnapshot<'a>, String> {
+        self.ledger
+            .freeze_snapshot(&self.state.view(self.identity.checksum()), &self.identity)
+    }
+
+    pub fn collect_and_update_mixed_whole_four(
+        &mut self,
+        seeds: [u32; 4],
+        mixture: &SemanticFrozenMixture<'_>,
+        limits: CollectionLimits,
+    ) -> Result<SemanticPlayingJointReport, String> {
+        self.check_headroom(limits)?;
+        let attempt = self
+            .ledger
+            .attempts()
+            .checked_add(1)
+            .ok_or("Semantic attempt overflow")?;
+        let proposal = self.ledger.collect_mixture_using(
+            &self.state.view(self.identity.checksum()),
+            seeds,
+            mixture,
+            limits,
+            |scope, cohort| {
+                prepare(
+                    scope,
+                    &self.identity,
+                    &cohort,
+                    &self.actor_config,
+                    &self.critic_config,
+                    attempt,
+                )
+            },
+        )?;
+        let result = self.admit_with_pool(proposal, Some(mixture));
+        if result.is_err() {
+            self.ledger.stop();
+        }
+        result
     }
 
     pub fn collect_and_update_whole_four(
@@ -275,6 +336,13 @@ impl<'a> SemanticPlayingJointSession<'a> {
         self.critic_config.check_callbacks(callbacks)
     }
     fn admit(&mut self, proposal: JointProposal) -> Result<SemanticPlayingJointReport, String> {
+        self.admit_with_pool(proposal, None)
+    }
+    fn admit_with_pool(
+        &mut self,
+        proposal: JointProposal,
+        mixture: Option<&SemanticFrozenMixture<'_>>,
+    ) -> Result<SemanticPlayingJointReport, String> {
         if proposal.report.parent != self.identity.checksum()
             || proposal
                 .report
@@ -284,12 +352,16 @@ impl<'a> SemanticPlayingJointSession<'a> {
             || proposal.identity.previous != self.identity.checksum()
             || proposal.identity.attempts != self.ledger.attempts() as u64
             || proposal.identity.next != self.ledger.next_episode_ordinal()
+            || proposal.report.mixture.as_deref() != mixture.map(SemanticFrozenMixture::checksum)
         {
             self.ledger.stop();
             return Err("Semantic joint proposal differs from the current reserved parent".into());
         }
         // No proposal can escape the source-postchecked collection continuation.
         // Final metadata is fallible and must precede the single state commit.
+        let admitted = self
+            .ledger
+            .prepare_admitted(self.identity.checksum(), proposal.identity.checksum())?;
         let mut report = proposal.report;
         report.attempts = self.ledger.attempts();
         report.next_ordinal = self.ledger.next_episode_ordinal();
@@ -313,14 +385,30 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 report.residual_loss,
             ),
         )?;
+        if report.mixture.is_some() {
+            report.checksum = hash(
+                b"semantic-playing-fixed-mixture-report-v1\0",
+                &(
+                    &report.checksum,
+                    &report.mixture,
+                    report.opponent_samples,
+                    report.total_rows,
+                    report.actor_draws,
+                ),
+            )?;
+        }
         self.ledger
             .recheck(&self.state.view(self.identity.checksum()))?;
+        if let Some(mixture) = mixture {
+            mixture.recheck()?;
+        }
         if let Some((actor, critic)) = proposal.parameters {
             self.state.commit(actor, critic);
         } else {
             self.ledger.stop();
         }
         self.identity = proposal.identity;
+        self.ledger.commit_admitted(admitted);
         Ok(report)
     }
 }
@@ -428,6 +516,13 @@ fn prepare(
         next_ordinal: 0,
         credit,
         residual_loss: critic.mean_loss,
+        mixture: cohort.mixture_checksum().map(str::to_string),
+        opponent_samples: episodes.iter().map(|e| e.opponent_playing_samples()).sum(),
+        total_rows: episodes
+            .iter()
+            .map(|e| e.total_sampled_candidate_rows())
+            .sum(),
+        actor_draws: episodes.each_ref().map(|e| *e.actor_draws()),
         checksum: String::new(),
     };
     let parameters = if updated {
@@ -555,7 +650,21 @@ pub(crate) fn joint_fixture() {
         &digest(format!("{excluded}\n").as_bytes()),
     )
     .unwrap();
-    let history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
+    let history = DeclaredSamplingHistory::declare_complete(
+        vec![
+            crate::semantic_playing_rl_collection::DeclaredSamplingRange::new(
+                SamplingSeed::new(17),
+                0,
+                3,
+                0,
+                90,
+                94,
+            )
+            .unwrap(),
+        ],
+        vec![pin.clone()],
+    )
+    .unwrap();
     let mut session = SemanticPlayingJointSession::from_fresh(
         root_owner,
         &external,
@@ -638,20 +747,254 @@ pub(crate) fn joint_fixture() {
         assert_eq!(session.consumed_actor_streams(), 14 * update);
         assert_eq!(session.consumed_families().len(), 4 * update);
     }
+    // A real captured actor is independent of the learner's next update.
+    // Every preselected snapshot keeps the full unloaded Test reservation too.
+    use crate::semantic_playing_rl_pool::SnapshotSlot;
+    let snapshot = session.freeze_snapshot().unwrap();
+    let frozen_actor = snapshot.identity().unwrap().actor_checksum().to_string();
+    let frozen_identity = snapshot.identity().unwrap().checksum().to_string();
+    assert_eq!(
+        snapshot.human_table_reservations().unwrap()["125"],
+        DatasetSplit::Test
+    );
+    let slots = || {
+        vec![
+            SnapshotSlot::new(0, 1, &snapshot).unwrap(),
+            SnapshotSlot::new(1, 2, &snapshot).unwrap(),
+            SnapshotSlot::new(2, 1, &snapshot).unwrap(),
+            SnapshotSlot::new(3, 3, &snapshot).unwrap(),
+        ]
+    };
+    let mixture = SemanticFrozenMixture::new(&pool, slots()).unwrap();
+    // Each restriction is exercised before a game, attempt or new stream burn.
+    // The only snapshot is in member3, not the first member created.
+    let lineage_pool =
+        SemanticFrozenMixture::new(&pool, vec![SnapshotSlot::new(3, 3, &snapshot).unwrap()])
+            .unwrap();
+    let empty_history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
+    let other_families = std::array::from_fn(|_| seeds.next().unwrap());
+    let reject = |mut other: SemanticPlayingJointSession<'_>,
+                  mixture: &SemanticFrozenMixture<'_>,
+                  expected: &str| {
+        let entered = Cell::new(false);
+        let result = other.ledger.collect_mixture_fixture_using(
+            &other.state.view(other.identity.checksum()),
+            other_families,
+            mixture,
+            limits,
+            |_, _| Ok(()),
+            |_| {
+                entered.set(true);
+                Err("Lineage refusal must precede game creation".into())
+            },
+        );
+        assert_eq!(result.unwrap_err(), expected);
+        assert!(!entered.get());
+        assert_eq!(
+            (
+                other.attempts(),
+                other.next_episode_ordinal(),
+                other.consumed_actor_streams()
+            ),
+            (0, 108, 0)
+        );
+    };
+    for (critic_seed, declaration, expected) in [
+        (12, &history, "Semantic snapshot has a foreign fresh root"),
+        (
+            11,
+            &empty_history,
+            "Semantic snapshot source declaration differs",
+        ),
+        (
+            11,
+            &history,
+            "Semantic snapshot prior burns are not retained",
+        ),
+    ] {
+        let other = SemanticPlayingJointSession::from_fresh(
+            SemanticPlayingRlOwner::from_prepared(&prepared, critic_seed).unwrap(),
+            &external,
+            declaration,
+            SamplingSeed::new(17),
+            108,
+            0,
+            OneStepConfig::default(),
+            ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+        )
+        .unwrap();
+        reject(other, &lineage_pool, expected);
+    }
+    // Same root, source declarations and empty burn sets are insufficient:
+    // another real session's different configuration makes a nonancestor ID.
+    let fork = SemanticPlayingJointSession::from_fresh(
+        SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap(),
+        &external,
+        &history,
+        SamplingSeed::new(17),
+        108,
+        0,
+        OneStepConfig::new(0.0002, 0.01, OneStepConfig::default().max_candidate_rows()).unwrap(),
+        ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+    )
+    .unwrap();
+    let fork_snapshot = fork.freeze_snapshot().unwrap();
+    let fork_pool = SemanticFrozenMixture::new(
+        &pool,
+        vec![SnapshotSlot::new(3, 3, &fork_snapshot).unwrap()],
+    )
+    .unwrap();
+    let other = SemanticPlayingJointSession::from_fresh(
+        SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap(),
+        &external,
+        &history,
+        SamplingSeed::new(17),
+        108,
+        0,
+        OneStepConfig::default(),
+        ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fork_snapshot.identity().unwrap().root_checksum(),
+        other.identity().unwrap().root_checksum()
+    );
+    assert!(fork_snapshot.consumed_families().is_empty());
+    reject(
+        other,
+        &fork_pool,
+        "Semantic snapshot is not an admitted ancestor",
+    );
+    assert!(
+        SemanticFrozenMixture::new(&pool, vec![SnapshotSlot::new(0, 0, &snapshot).unwrap()])
+            .is_err()
+    );
+    assert!(
+        SemanticFrozenMixture::new(
+            &pool,
+            vec![
+                SnapshotSlot::new(0, 1, &snapshot).unwrap(),
+                SnapshotSlot::new(0, 1, &snapshot).unwrap()
+            ]
+        )
+        .is_err()
+    );
+    for kind in [
+        json!({"kind":"preparedBc"}),
+        json!({"kind":"preparedBcTradeGuard","guard":crate::public_trade_guard::TradeGuardConfig::default()}),
+    ] {
+        let mut wire = json!({"schema":"tzolkin-conditional-human-mixed-frozen-pool-v1","weights":HeuristicWeights::default(),
+            "rosters":[[null,opponent,opponent],[null,opponent,opponent],
+                [null,opponent,opponent,opponent],[null,opponent,opponent,opponent]]});
+        wire["rosters"][0][1] = kind;
+        let forbidden =
+            ConditionalFrozenPool::from_json(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        assert!(SemanticFrozenMixture::new(&forbidden, slots()).is_err());
+    }
+    for update in 3..=4 {
+        // The second mixed update uses the actual re-frozen first mixed result.
+        let current_snapshot = session.freeze_snapshot().unwrap();
+        let active_mixture = SemanticFrozenMixture::new(
+            &pool,
+            vec![
+                SnapshotSlot::new(0, 1, &current_snapshot).unwrap(),
+                SnapshotSlot::new(1, 2, &current_snapshot).unwrap(),
+                SnapshotSlot::new(2, 1, &current_snapshot).unwrap(),
+                SnapshotSlot::new(3, 3, &current_snapshot).unwrap(),
+            ],
+        )
+        .unwrap();
+        let before_mixed = session.identity().unwrap().checksum().to_string();
+        let proposal = session
+            .ledger
+            .collect_mixture_fixture_using(
+                &session.state.view(&before_mixed),
+                std::array::from_fn(|_| seeds.next().unwrap()),
+                &active_mixture,
+                limits,
+                |scope, cohort| {
+                    crate::semantic_playing_rl_collection::mixed_trace_fixture(
+                        scope,
+                        &active_mixture,
+                        cohort.episodes()[0].config(),
+                    );
+                    assert_eq!(cohort.mixture_checksum(), Some(active_mixture.checksum()));
+                    assert!(
+                        cohort
+                            .episodes()
+                            .iter()
+                            .all(|e| e.opponent_playing_samples() > 0)
+                    );
+                    prepare(
+                        scope,
+                        &session.identity,
+                        &cohort,
+                        &session.actor_config,
+                        &session.critic_config,
+                        update,
+                    )
+                },
+                |config| {
+                    let mut state = crate::conditional_human_rl_update::tests::terminal_start(
+                        config.players(),
+                        config.environment_seed(),
+                    );
+                    state.turn.mode = tzolkin_core::TurnMode::None;
+                    state.turn.count = 0;
+                    Ok(state)
+                },
+            )
+            .unwrap();
+        let report = session
+            .admit_with_pool(proposal, Some(&active_mixture))
+            .unwrap();
+        assert!(report.updated() && report.opponent_playing_samples() > 0);
+        assert!(report.total_sampled_candidate_rows() > report.counts()[1]);
+        assert_eq!(
+            report.actor_draws().iter().flatten().sum::<u64>(),
+            report.counts()[0] as u64 + report.opponent_playing_samples() as u64
+        );
+        credit += report.counts()[0] as u64;
+        assert_eq!(
+            session.identity().unwrap().credited_playing_decisions(),
+            credit
+        );
+        assert_eq!(
+            session.identity().unwrap().completed_updates(),
+            update as u64
+        );
+        assert!(
+            session
+                .ledger
+                .admitted_checksums()
+                .contains(session.identity().unwrap().checksum())
+        );
+        assert_eq!(session.ledger.admitted_checksums().len(), update + 1);
+    }
+    assert_eq!(snapshot.identity().unwrap().checksum(), frozen_identity);
+    assert_eq!(snapshot.identity().unwrap().actor_checksum(), frozen_actor);
+    assert_ne!(session.identity().unwrap().actor_checksum(), frozen_actor);
+    let before_failure_snapshot = session.freeze_snapshot().unwrap();
+    let before_failure_capture = before_failure_snapshot
+        .identity()
+        .unwrap()
+        .capture_ledger_checksum()
+        .to_string();
     // A raw-byte-only mutation after BOTH numerical proposals still drops the
     // whole result. No actor/critic/current identity mutation can be admitted.
     let before = session.identity.clone();
     let actor = session.state.actor_parameters().to_vec();
     let critic = session.state.critic_parameters().to_vec();
+    let admitted = session.ledger.admitted_checksums().clone();
     let checkpoint_path = prepared.loaded_semantic_playing_sources().unwrap()[0]
         .path
         .clone();
     let checkpoint = fs::read(&checkpoint_path).unwrap();
     let entered = Cell::new(false);
-    let result = session.ledger.collect_fixture_using(
+    let result = session.ledger.collect_mixture_fixture_using(
         &session.state.view(before.checksum()),
         std::array::from_fn(|_| seeds.next().unwrap()),
-        &pool,
+        &mixture,
         limits,
         |scope, cohort| {
             let proposed = prepare(
@@ -660,7 +1003,7 @@ pub(crate) fn joint_fixture() {
                 &cohort,
                 &session.actor_config,
                 &session.critic_config,
-                3,
+                5,
             )?;
             entered.set(true);
             fs::write(&checkpoint_path, [checkpoint.as_slice(), b" "].concat()).unwrap();
@@ -678,6 +1021,7 @@ pub(crate) fn joint_fixture() {
     assert_eq!(session.identity().unwrap().checksum(), before.checksum());
     assert_eq!(session.state.actor_parameters(), actor);
     assert_eq!(session.state.critic_parameters(), critic);
+    assert_eq!(session.ledger.admitted_checksums(), &admitted);
     assert!(session.stopped());
     assert_eq!(
         (
@@ -685,8 +1029,25 @@ pub(crate) fn joint_fixture() {
             session.next_episode_ordinal(),
             session.consumed_actor_streams()
         ),
-        (3, 112, 42)
+        (5, 120, 70)
     );
+    let after_failure = session.freeze_snapshot().unwrap();
+    assert_eq!(
+        after_failure
+            .identity()
+            .unwrap()
+            .current_identity_checksum(),
+        before.checksum()
+    );
+    assert_eq!(
+        after_failure.identity().unwrap().actor_checksum(),
+        before.actor_checksum()
+    );
+    assert_ne!(
+        after_failure.identity().unwrap().capture_ledger_checksum(),
+        before_failure_capture
+    );
+    assert_eq!(after_failure.consumed_families().len(), 20);
 }
 
 /// Two one-decision synthetic original records exercise the ACTUAL schema-4

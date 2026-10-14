@@ -1,6 +1,6 @@
-//! Fresh schema-4 Playing ownership from a successfully loaded conditional origin.
-//! This sealed type has no sampler, collector, update, journal, export or resume
-//! conversion. Numeric consistency and raw custody do not authenticate sources.
+//! Fresh schema-4 Playing ownership and private checked numerical custody.
+//! The public fresh identity never becomes an updated or legacy owner. Separate
+//! in-memory routes do not provide a journal/export/resume conversion or source authentication.
 use std::collections::BTreeMap;
 
 use sha2::{Digest, Sha256};
@@ -161,6 +161,7 @@ impl SemanticPlayingRlOwner {
             actor: &self.actor,
             critic: &self.critic,
             parent: self.identity.checksum(),
+            root: self.identity.checksum(),
         }
     }
 
@@ -290,6 +291,7 @@ impl SemanticTrainingState {
             actor: &self.actor,
             critic: &self.critic,
             parent,
+            root: self.root.checksum(),
         }
     }
     /// All proposal validation and every-outcome source checks precede this move.
@@ -305,8 +307,19 @@ pub(crate) struct SemanticOwnerView<'a> {
     actor: &'a PublicPolicyModel,
     critic: &'a [f32],
     parent: &'a str,
+    root: &'a str,
 }
 impl SemanticOwnerView<'_> {
+    pub(crate) fn root_checksum(&self) -> &str {
+        self.root
+    }
+    pub(crate) fn origin_custody(&self) -> SemanticOriginCustody {
+        SemanticOriginCustody {
+            checksum: self.origin.checksum.clone(),
+            pins: self.origin.source_pins.clone(),
+            reservations: self.origin.table_reservations.clone(),
+        }
+    }
     pub(crate) fn metadata(&self) -> (&str, &BTreeMap<String, DatasetSplit>) {
         (self.parent, &self.origin.table_reservations)
     }
@@ -353,8 +366,32 @@ impl SemanticOwnerView<'_> {
     }
 }
 
-/// No Clone, serialization, public constructor or model getter. Only the
-/// checked owner scope creates it, and scoring performs no filesystem reads.
+/// Copied source metadata, never a numerical owner or a constructor for one.
+pub(crate) struct SemanticOriginCustody {
+    checksum: String,
+    pins: Vec<ContentPin>,
+    reservations: BTreeMap<String, DatasetSplit>,
+}
+impl SemanticOriginCustody {
+    pub(crate) fn recheck(&self) -> Result<(), String> {
+        for pin in &self.pins {
+            crate::human_policy_dataset::recheck_absolute_pin(pin)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn binding(&self) -> Result<String, String> {
+        hash(
+            b"semantic-frozen-origin-custody-v1\0",
+            &(&self.checksum, &self.pins, &self.reservations),
+        )
+    }
+    pub(crate) fn reservations(&self) -> &BTreeMap<String, DatasetSplit> {
+        &self.reservations
+    }
+}
+
+/// Private scoped numerical access; copied values do not carry source ownership.
+/// Only checked owners create a scope, and scoring performs no filesystem reads.
 pub(crate) struct SemanticCollectionScope<'a> {
     actor: &'a PublicPolicyModel,
     critic: &'a [f32],
@@ -370,6 +407,9 @@ impl SemanticCollectionScope<'_> {
     }
     pub(crate) fn critic(&self) -> &[f32] {
         self.critic
+    }
+    pub(crate) fn kernel(&self) -> ResolvedKernel {
+        self.kernel
     }
     pub(crate) fn distribution(
         &self,

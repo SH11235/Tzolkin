@@ -198,6 +198,28 @@ pub struct ConditionalFrozenPool {
     checksum: String,
 }
 impl ConditionalFrozenPool {
+    fn require_procedural(&self) -> Result<(), String> {
+        if self.wire.rosters.iter().flatten().flatten().any(|spec| {
+            !matches!(
+                spec,
+                ConditionalOpponentSpec::Heuristic
+                    | ConditionalOpponentSpec::CornFirstSetup
+                    | ConditionalOpponentSpec::CornFirstUxmalOpening
+                    | ConditionalOpponentSpec::ResourceCycle { .. }
+            )
+        }) {
+            return Err("Conditional pool requires procedural opponents only".into());
+        }
+        Ok(())
+    }
+    pub(crate) fn freeze_procedural(&self) -> Result<[ConditionalFrozenMixRoster<'_>; 4], String> {
+        self.require_procedural()?;
+        self.freeze(None)
+    }
+    pub(crate) fn procedural_binding(&self) -> Result<serde_json::Value, String> {
+        self.require_procedural()?;
+        self.binding(None)
+    }
     pub(crate) fn binding(
         &self,
         prepared: Option<&PreparedPublicPolicy>,
