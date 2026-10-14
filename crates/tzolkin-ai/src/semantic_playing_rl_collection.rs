@@ -1518,7 +1518,14 @@ impl<'a> SemanticCollectionLedger<'a> {
         ) -> Result<R, String>,
         create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
     ) -> Result<R, String> {
-        self.collect_reserved_records(owner, batch, pool, None, finish, create)
+        self.collect_reserved_records(
+            owner,
+            batch,
+            pool,
+            None,
+            |scope, cohort, _| finish(scope, cohort),
+            create,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn collect_reserved_records<R>(
@@ -1530,6 +1537,7 @@ impl<'a> SemanticCollectionLedger<'a> {
         finish: impl for<'scope> FnOnce(
             &SemanticCollectionScope<'scope>,
             AuditedSemanticPlayingCohort,
+            &Self,
         ) -> Result<R, String>,
         create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
     ) -> Result<R, String> {
@@ -1647,7 +1655,10 @@ impl<'a> SemanticCollectionLedger<'a> {
                         PoolRef::Legacy(..) => None,
                     },
                 };
-                finish(scope, cohort)
+                // Final admission metadata belongs to this same checked work.
+                // The immutable ledger borrow cannot change burns or commit an
+                // identity, and every finish error still reaches the fresh POST.
+                finish(scope, cohort, self)
             },
         );
         if result.is_err() {
