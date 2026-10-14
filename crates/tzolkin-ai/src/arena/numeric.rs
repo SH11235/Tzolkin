@@ -1124,12 +1124,14 @@ impl V7TeacherAgreement {
             .get(effective)
             .ok_or("Effective agreement index")?;
         let encoder = crate::features::FeatureEncoder::new_semantic_playing(o)?;
-        let tf = encoder.encode_legal(ti)?;
+        let teacher_row = encoder.encode_legal_tagged(ti)?;
+        let tf = teacher_row.values_for_schema(crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA)?;
         let same_bits = |index| -> Result<bool, String> {
-            Ok(encoder
-                .encode_legal(index)?
+            let row = encoder.encode_legal_tagged(index)?;
+            Ok(row
+                .values_for_schema(crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA)?
                 .iter()
-                .zip(&tf)
+                .zip(tf)
                 .all(|(a, b)| a.to_bits() == b.to_bits()))
         };
         let raw_full = r.r#move == t.r#move;
