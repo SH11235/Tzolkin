@@ -1199,6 +1199,32 @@ impl V7TeacherAgreement {
 /// on a failed game; callbacks/rows include attempted work before that failure.
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FundedUxmalOpeningDiagnostics {
+    pub eligible_choices: usize,
+    pub changed_moves: usize,
+    /// Placement counts0..2 select Uxmal; count3 selects EndTurn.
+    pub eligible_by_placement_count: [usize; 4],
+    pub changed_by_placement_count: [usize; 4],
+}
+impl FundedUxmalOpeningDiagnostics {
+    pub(super) fn record(
+        &mut self,
+        opening: &super::conditional::OpeningSelection,
+    ) -> Result<(), String> {
+        let eligible = self
+            .eligible_by_placement_count
+            .get_mut(opening.placement_count)
+            .ok_or("Opening choice placement count outside prefix")?;
+        *eligible += 1;
+        self.eligible_choices += 1;
+        self.changed_moves += usize::from(opening.changed_move);
+        self.changed_by_placement_count[opening.placement_count] +=
+            usize::from(opening.changed_move);
+        Ok(())
+    }
+}
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GuardDiagnostics {
     pub notifications_attempted: usize,
     pub notifications_returned: usize,
@@ -1216,6 +1242,8 @@ pub struct GuardDiagnostics {
     pub phase_routes: Option<PhaseRouteDiagnostics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub v7_teacher_agreement: Option<V7TeacherAgreement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub funded_uxmal_opening: Option<FundedUxmalOpeningDiagnostics>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1444,6 +1472,12 @@ fn choose(
             Role::PhaseRouted(policy) => session.choose_phase_routed(index, observation, policy)?,
             _ => return Err("Conditional Arena game session/role mismatch".into()),
         };
+        if let Some(opening) = result.opening.as_ref() {
+            d.funded_uxmal_opening
+                .as_mut()
+                .ok_or("Opening choice requires composite diagnostics")?
+                .record(opening)?;
+        }
         if let Some(agreement) = d.v7_teacher_agreement.as_mut() {
             match observation
                 .legal_actions
@@ -1818,6 +1852,9 @@ fn play_arm_using_with_setup<'a>(
                 v7_teacher_agreement: policy
                     .v7_agreement_diagnostics
                     .then(V7TeacherAgreement::default),
+                funded_uxmal_opening: policy
+                    .funded_uxmal_opening
+                    .then(FundedUxmalOpeningDiagnostics::default),
                 phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
                 ..GuardDiagnostics::default()
             }),

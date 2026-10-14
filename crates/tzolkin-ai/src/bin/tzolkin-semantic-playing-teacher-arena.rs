@@ -42,6 +42,7 @@ enum InputSchema {
     V5,
     V7,
     V7Agreement,
+    V7FundedUxmal,
 }
 impl TryFrom<String> for InputSchema {
     type Error = &'static str;
@@ -50,6 +51,7 @@ impl TryFrom<String> for InputSchema {
             "tzolkin-native-playing4-teacher-arena-input-v1" => Ok(Self::V5),
             "tzolkin-native-playing4-v7-teacher-arena-input-v1" => Ok(Self::V7),
             "tzolkin-native-playing4-v7-agreement-diagnostic-input-v1" => Ok(Self::V7Agreement),
+            "tzolkin-native-playing4-v7-funded-uxmal-arena-input-v1" => Ok(Self::V7FundedUxmal),
             _ => Err("Native teacher input schema/absolute-seat roster mismatch"),
         }
     }
@@ -62,7 +64,7 @@ impl InputSchema {
     ) -> Result<PreparedSemanticPlayingTeacher, String> {
         match self {
             Self::V5 => PreparedSemanticPlayingTeacher::load(checkpoint, dataset),
-            Self::V7 | Self::V7Agreement => {
+            Self::V7 | Self::V7Agreement | Self::V7FundedUxmal => {
                 PreparedSemanticPlayingTeacher::load_v7(checkpoint, dataset)
             }
         }
@@ -243,6 +245,11 @@ fn run() -> Result<(), String> {
         } else {
             candidate
         };
+        let candidate = if input.schema == InputSchema::V7FundedUxmal {
+            candidate.with_v7_funded_uxmal_opening()?
+        } else {
+            candidate
+        };
         match &input.consent {
             Some(c) => {
                 run_native_playing_teacher_diagnostic(&input.config, c, candidate, reference, pool)
@@ -319,6 +326,10 @@ mod tests {
             (
                 "tzolkin-native-playing4-v7-teacher-arena-input-v1",
                 InputSchema::V7,
+            ),
+            (
+                "tzolkin-native-playing4-v7-funded-uxmal-arena-input-v1",
+                InputSchema::V7FundedUxmal,
             ),
         ] {
             control["schema"] = schema.into();
