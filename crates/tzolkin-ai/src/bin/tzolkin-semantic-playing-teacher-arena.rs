@@ -36,10 +36,38 @@ enum Baseline {
     Numeric { deployment: PathBuf },
     Heuristic { weights: HeuristicWeights },
 }
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(try_from = "String")]
+enum InputSchema {
+    V5,
+    V7,
+}
+impl TryFrom<String> for InputSchema {
+    type Error = &'static str;
+    fn try_from(schema: String) -> Result<Self, Self::Error> {
+        match schema.as_str() {
+            "tzolkin-native-playing4-teacher-arena-input-v1" => Ok(Self::V5),
+            "tzolkin-native-playing4-v7-teacher-arena-input-v1" => Ok(Self::V7),
+            _ => Err("Native teacher input schema/absolute-seat roster mismatch"),
+        }
+    }
+}
+impl InputSchema {
+    fn prepare(
+        &self,
+        checkpoint: &Path,
+        dataset: &Path,
+    ) -> Result<PreparedSemanticPlayingTeacher, String> {
+        match self {
+            Self::V5 => PreparedSemanticPlayingTeacher::load(checkpoint, dataset),
+            Self::V7 => PreparedSemanticPlayingTeacher::load_v7(checkpoint, dataset),
+        }
+    }
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Input {
-    schema: String,
+    schema: InputSchema,
     config: NumericArenaConfig,
     consent: Option<NativeTeacherDiagnosticConsent>,
     reference: Reference,
@@ -169,10 +197,7 @@ fn run() -> Result<(), String> {
     }
     let (bytes, pin) = read(Path::new(&args[2]), 16 * 1024 * 1024)?;
     let input: Input = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if input.schema != "tzolkin-native-playing4-teacher-arena-input-v1"
-        || input.opponent_pool.len() != input.config.players
-        || input.config.seeds.len() > 64
-    {
+    if input.opponent_pool.len() != input.config.players || input.config.seeds.len() > 64 {
         return Err("Native teacher input schema/absolute-seat roster mismatch".into());
     }
     match &input.consent {
@@ -180,7 +205,9 @@ fn run() -> Result<(), String> {
         None => input.config.validate()?,
     }
     let mut pins = vec![pin];
-    let prepared = PreparedSemanticPlayingTeacher::load(Path::new(&args[0]), Path::new(&args[1]))?;
+    let prepared = input
+        .schema
+        .prepare(Path::new(&args[0]), Path::new(&args[1]))?;
     let result = (|| {
         let reference = match &input.reference {
             Reference::ResourceCycleV5 {} => SemanticPlayingTeacherReference::ResourceCycleV5,
@@ -258,6 +285,40 @@ mod tests {
 
     #[test]
     fn local_input_pin_can_be_read_again() {
+        let mut control = serde_json::json!({
+            "schema":"tzolkin-native-playing4-teacher-arena-input-v1",
+            "config":{"schema":tzolkin_ai::arena::numeric::SCHEMA,"players":3,
+                "seeds":[17],"bootstrapSeed":7,
+                "externalExclusions":{"evidenceSha256":"0".repeat(64),
+                    "excludedFamilyIds":[]}},
+            "reference":{"kind":"resourceCycleV5"},
+            "opponentPool":[{"kind":"resourceCycleV5"},
+                {"kind":"resourceCycleV5"},{"kind":"resourceCycleV5"}]
+        });
+        for (schema, expected) in [
+            (
+                "tzolkin-native-playing4-teacher-arena-input-v1",
+                InputSchema::V5,
+            ),
+            (
+                "tzolkin-native-playing4-v7-teacher-arena-input-v1",
+                InputSchema::V7,
+            ),
+        ] {
+            control["schema"] = schema.into();
+            let parsed: Input = serde_json::from_value(control.clone()).unwrap();
+            assert_eq!(parsed.schema, expected);
+            assert!(matches!(parsed.reference, Reference::ResourceCycleV5 {}));
+            assert_eq!(parsed.opponent_pool.len(), 3);
+            assert!(parsed.consent.is_none());
+        }
+        control["schema"] = "tzolkin-native-playing4-v8-teacher-arena-input-v1".into();
+        assert!(serde_json::from_value::<Input>(control.clone()).is_err());
+        control["schema"] =
+            serde_json::json!({"tzolkin-native-playing4-v7-teacher-arena-input-v1":null});
+        assert!(serde_json::from_value::<Input>(control.clone()).is_err());
+        control.as_object_mut().unwrap().remove("schema");
+        assert!(serde_json::from_value::<Input>(control).is_err());
         struct OwnedTemp {
             path: PathBuf,
             file: Option<File>,
