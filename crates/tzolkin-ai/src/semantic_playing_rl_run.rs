@@ -3,7 +3,9 @@
 //! only prospective work; the separately pinned full allocation is host-consumed
 //! even when its later batches never enter. Neither metadata authenticates an OS.
 use super::*;
+use crate::arena::teacher::PreparedSemanticPlayingTeacher;
 use crate::conditional_human_rl_update::ConditionalNativeExclusions;
+use crate::conditional_semantic_playing_rl::SemanticFreshOwner;
 use crate::conditional_semantic_playing_rl::SemanticPlayingRlOwner;
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::human_policy_training::PreparedConditionalHumanPolicy;
@@ -15,6 +17,7 @@ use crate::semantic_playing_rl_collection::{
     DeclaredSamplingHistory, DeclaredSamplingRange, SemanticCollectionComposition,
 };
 use crate::semantic_playing_rl_pool::SnapshotSlot;
+use std::sync::Arc;
 
 const RUN_SCHEMA: &str = "tzolkin-semantic-playing-journal-run-v1";
 const AUDIT_SCHEMA: &str = "tzolkin-semantic-playing-journal-audit-v1";
@@ -282,6 +285,52 @@ impl History {
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+enum InitializationKind {
+    NativeCornFirstV5SemanticPlayingTeacher,
+}
+
+enum LoadedInitialization {
+    Human(PreparedConditionalHumanPolicy),
+    Native(Arc<PreparedSemanticPlayingTeacher>),
+}
+#[derive(Clone, Copy)]
+enum LoadedInitializationRef<'a> {
+    Human(&'a PreparedConditionalHumanPolicy),
+    Native(&'a Arc<PreparedSemanticPlayingTeacher>),
+}
+impl LoadedInitialization {
+    fn borrowed(&self) -> LoadedInitializationRef<'_> {
+        match self {
+            Self::Human(prepared) => LoadedInitializationRef::Human(prepared),
+            Self::Native(prepared) => LoadedInitializationRef::Native(prepared),
+        }
+    }
+    fn recheck_sources(&self) -> Result<(), String> {
+        match self {
+            Self::Human(prepared) => prepared.recheck_sources(),
+            Self::Native(prepared) => prepared.recheck_sources(),
+        }
+    }
+    fn human(&self) -> Result<&PreparedConditionalHumanPolicy, String> {
+        match self {
+            Self::Human(prepared) => Ok(prepared),
+            Self::Native(_) => Err("OriginalHuman4 requires a Human initialization".into()),
+        }
+    }
+}
+impl LoadedInitializationRef<'_> {
+    fn fresh_owner(self, seed: u64) -> Result<SemanticFreshOwner, String> {
+        match self {
+            Self::Human(prepared) => Ok(SemanticFreshOwner::Human(Box::new(
+                SemanticPlayingRlOwner::from_prepared(prepared, seed)?,
+            ))),
+            Self::Native(prepared) => SemanticFreshOwner::native(Arc::clone(prepared), seed),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Original {
     checkpoint: ContentPin,
     collection: ContentPin,
@@ -298,9 +347,39 @@ struct Original {
     budget: [u64; 5],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     collection_composition: Option<SemanticCollectionComposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    initialization_kind: Option<InitializationKind>,
 }
 impl Original {
+    fn reject_native_namespace(&self, output: &Path) -> Result<(), String> {
+        if self.initialization_kind.is_some() {
+            let directory = Path::new(&self.collection.path)
+                .parent()
+                .ok_or("Native dataset manifest parent")?;
+            let directory =
+                fs::canonicalize(local(directory, false)?).map_err(|e| e.to_string())?;
+            let output = local(output, true)?;
+            let output = match fs::symlink_metadata(&output) {
+                Ok(_) => fs::canonicalize(&output).map_err(|e| e.to_string())?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    fs::canonicalize(output.parent().ok_or("Native output parent")?)
+                        .map_err(|e| e.to_string())?
+                        .join(output.file_name().ok_or("Native output name")?)
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            if output.starts_with(&directory) || directory.starts_with(output) {
+                return Err("Native dataset and journal/output namespaces must be disjoint".into());
+            }
+        }
+        Ok(())
+    }
     fn composition(&self) -> Result<SemanticCollectionComposition, String> {
+        if self.initialization_kind.is_some()
+            && self.collection_composition != Some(SemanticCollectionComposition::GuardedProposalV2)
+        {
+            return Err("Native initialization requires guardedProposalV2".into());
+        }
         match self.collection_composition {
             None => Ok(SemanticCollectionComposition::LegacyV1),
             Some(SemanticCollectionComposition::GuardedProposalV2) => {
@@ -327,25 +406,52 @@ impl Original {
             self.budget[4],
         )
     }
-    fn load_prepared(&self) -> Result<PreparedConditionalHumanPolicy, String> {
+    fn load_prepared(&self) -> Result<LoadedInitialization, String> {
+        self.composition()?;
+        let dataset_directory = if self.initialization_kind.is_some() {
+            let path = Path::new(&self.collection.path);
+            if path.file_name().and_then(|name| name.to_str()) != Some("manifest.json") {
+                return Err(
+                    "Native initialization collection must pin dataset manifest.json".into(),
+                );
+            }
+            Some(path.parent().ok_or("Native dataset manifest parent")?)
+        } else {
+            None
+        };
         pinned(&self.checkpoint, 32 * 1024 * 1024)?;
         pinned(&self.collection, 16 * 1024 * 1024)?;
-        let prepared = PreparedConditionalHumanPolicy::load_semantic_playing(
-            Path::new(&self.checkpoint.path),
-            Path::new(&self.collection.path),
-        )?;
-        pinned(&self.checkpoint, 32 * 1024 * 1024)?;
-        pinned(&self.collection, 16 * 1024 * 1024)?;
-        Ok(prepared)
+        let result = match dataset_directory {
+            None => PreparedConditionalHumanPolicy::load_semantic_playing(
+                Path::new(&self.checkpoint.path),
+                Path::new(&self.collection.path),
+            )
+            .map(LoadedInitialization::Human),
+            Some(directory) => {
+                PreparedSemanticPlayingTeacher::load(Path::new(&self.checkpoint.path), directory)
+                    .map(|prepared| LoadedInitialization::Native(Arc::new(prepared)))
+            }
+        };
+        // Both raw pins remain checked even when the selected typed loader refuses.
+        let post = pinned(&self.checkpoint, 32 * 1024 * 1024)
+            .and_then(|_| pinned(&self.collection, 16 * 1024 * 1024));
+        match (result, post) {
+            (Ok(prepared), Ok(_)) => Ok(prepared),
+            (Err(error), Ok(_)) => Err(error),
+            (result, Err(post)) => Err(format!(
+                "{}; initialization source POST: {post}",
+                result.err().unwrap_or_default()
+            )),
+        }
     }
     fn fresh<'a>(
         &self,
-        prepared: &PreparedConditionalHumanPolicy,
+        prepared: LoadedInitializationRef<'_>,
         external: &'a ConditionalNativeExclusions,
         history: &'a DeclaredSamplingHistory,
     ) -> Result<SemanticPlayingJointSession<'a>, String> {
-        SemanticPlayingJointSession::from_fresh_composed(
-            SemanticPlayingRlOwner::from_prepared(prepared, self.critic_seed)?,
+        SemanticPlayingJointSession::from_fresh_owner(
+            prepared.fresh_owner(self.critic_seed)?,
             external,
             history,
             SamplingSeed::new(self.sampling_seed),
@@ -409,7 +515,7 @@ fn source_budget(
 fn source_session<'a>(
     original: &Original,
     chunk: Option<&Chunk>,
-    prepared: &PreparedConditionalHumanPolicy,
+    prepared: LoadedInitializationRef<'_>,
     external: &'a ConditionalNativeExclusions,
     history: &'a DeclaredSamplingHistory,
 ) -> Result<SemanticPlayingJointSession<'a>, String> {
@@ -493,7 +599,7 @@ pub struct SemanticJournalAudit {
 }
 
 /// Replays an existing successful producing tip from its genuinely loaded
-/// original Human4 source and fresh critic. Writes only a fresh, separate audit
+/// original checked initialization and fresh critic. Writes only a fresh, separate audit
 /// report; the journal, its budget, burns and admitted lineage are not modified.
 /// A saved report alone is insufficient: publication/POST errors return Err and
 /// the host must independently require exit0/EOF/pins. No process is observed here.
@@ -518,7 +624,7 @@ pub fn audit_semantic_playing_journal(
             source_session(
                 &w.original,
                 w.chunk.as_ref(),
-                &prepared,
+                prepared.borrowed(),
                 &external,
                 &history,
             )?,
@@ -571,6 +677,8 @@ fn read_only_output(w: &AuditWire, output: &Path) -> Result<PathBuf, String> {
     }
     let directory = local(Path::new(&w.journal_directory), false)?;
     let output = local(output, true)?;
+    w.original.reject_native_namespace(&output)?;
+    w.original.reject_native_namespace(&directory)?;
     if !output.is_absolute()
         || output.to_string_lossy().len() > 1024
         || directory.to_string_lossy().len() > 1024
@@ -718,6 +826,11 @@ pub fn evaluate_semantic_playing_journal(
         return Err("Evaluation does not admit a checkpoint export request".into());
     }
     let w = &audit.wire;
+    if matches!(e.reference, EvaluationReference::OriginalHuman4)
+        && w.original.initialization_kind.is_some()
+    {
+        return Err("OriginalHuman4 requires a Human initialization".into());
+    }
     let output = read_only_output(w, output)?;
     reject_input_namespace(
         &output,
@@ -750,7 +863,7 @@ pub fn evaluate_semantic_playing_journal(
             source_session(
                 &w.original,
                 w.chunk.as_ref(),
-                &prepared,
+                prepared.borrowed(),
                 &external,
                 &history,
             )?,
@@ -781,7 +894,7 @@ pub fn evaluate_semantic_playing_journal(
                     EvaluationReference::OriginalHuman4 => {
                         semantic_snapshot::SemanticPlayingSnapshotReference::SemanticHuman(Box::new(
                             crate::arena::conditional::SemanticPlayingConditionalPolicy::new(
-                                &prepared,
+                                prepared.human()?,
                                 crate::arena::conditional::ConditionalSetup::CornFirst,
                                 crate::public_trade_guard::TradeGuardConfig::default(),
                             )?,
@@ -1072,6 +1185,8 @@ pub fn run_semantic_playing_journal(
         return Err("Semantic journal/invocation directory state differs".into());
     }
     let source = serde_json::to_value(w).map_err(|e| e.to_string())?;
+    w.original.reject_native_namespace(&directory)?;
+    w.original.reject_native_namespace(&output)?;
     reject_input_namespace(&output, &source)?;
     reject_input_namespace(
         &directory,
@@ -1119,7 +1234,7 @@ pub fn run_semantic_playing_journal(
     let fresh = source_session(
         &w.original,
         w.chunk.as_ref(),
-        &prepared,
+        prepared.borrowed(),
         &original_external,
         &original_history,
     )?;
@@ -1718,6 +1833,13 @@ pub(super) fn control_fixture(
     let spec = parse(&value).unwrap();
     assert!(!spec.wire.signal_diagnostics);
     let old_wire = serde_json::to_vec(&spec.wire).unwrap();
+    assert!(spec.wire.original.initialization_kind.is_none());
+    let mut absent_initialization = value.clone();
+    absent_initialization["original"]["initializationKind"] = Value::Null;
+    assert_eq!(
+        serde_json::to_vec(&parse(&absent_initialization).unwrap().wire).unwrap(),
+        old_wire
+    );
     let mut signal_control = value.clone();
     signal_control["signalDiagnostics"] = false.into();
     assert_eq!(
@@ -1775,6 +1897,80 @@ pub(super) fn control_fixture(
         plan_checksum(&guarded_spec.wire).unwrap(),
         plan_checksum(&spec.wire).unwrap()
     );
+    let mut native_control = guarded_control.clone();
+    native_control["original"]["initializationKind"] =
+        "nativeCornFirstV5SemanticPlayingTeacher".into();
+    let native_spec = parse(&native_control).unwrap();
+    let native_namespace = root.join("native-namespace-source");
+    fs::create_dir(&native_namespace).unwrap();
+    let mut overlap = native_control.clone();
+    overlap["original"]["collection"]["path"] = native_namespace
+        .join("manifest.json")
+        .to_str()
+        .unwrap()
+        .into();
+    let output = root.join("native-namespace-output");
+    let nested_journal = native_namespace.join("journal");
+    overlap["journalDirectory"] = nested_journal.to_str().unwrap().into();
+    let error = run_semantic_playing_journal(parse(&overlap).unwrap(), &output)
+        .err()
+        .unwrap();
+    assert!(error.contains("namespaces must be disjoint"));
+    assert!(!nested_journal.exists() && !output.exists());
+    #[cfg(windows)]
+    {
+        let case_journal = root.join("NATIVE-NAMESPACE-SOURCE").join("case-journal");
+        overlap["journalDirectory"] = case_journal.to_str().unwrap().into();
+        let error = run_semantic_playing_journal(parse(&overlap).unwrap(), &output)
+            .err()
+            .unwrap();
+        assert!(error.contains("namespaces must be disjoint"));
+        assert!(!case_journal.exists() && !output.exists());
+    }
+    let nested_output = native_namespace.join("output");
+    overlap["journalDirectory"] = root
+        .join("native-namespace-journal")
+        .to_str()
+        .unwrap()
+        .into();
+    let error = run_semantic_playing_journal(parse(&overlap).unwrap(), &nested_output)
+        .err()
+        .unwrap();
+    assert!(error.contains("namespaces must be disjoint"));
+    assert!(!nested_output.exists());
+    let original = parse(&overlap).unwrap().wire.original;
+    assert!(original.reject_native_namespace(&native_namespace).is_err());
+    assert!(original.reject_native_namespace(root).is_err());
+    assert!(original.reject_native_namespace(&output).is_ok());
+    // The discriminator is part of Original, hence the existing allocation plan hash.
+    assert_ne!(
+        plan_checksum(&native_spec.wire).unwrap(),
+        plan_checksum(&guarded_spec.wire).unwrap()
+    );
+    assert!(
+        native_spec
+            .wire
+            .original
+            .load_prepared()
+            .err()
+            .unwrap()
+            .contains("must pin dataset manifest.json")
+    );
+    let mut missing_manifest = native_control.clone();
+    missing_manifest["original"]
+        .as_object_mut()
+        .unwrap()
+        .remove("collection");
+    assert!(parse(&missing_manifest).is_err());
+    let mut wrong_initialization = native_control.clone();
+    wrong_initialization["original"]["initializationKind"] = "human".into();
+    assert!(parse(&wrong_initialization).is_err());
+    let mut unguarded_native = native_control.clone();
+    unguarded_native["original"]
+        .as_object_mut()
+        .unwrap()
+        .remove("collectionComposition");
+    assert!(parse(&unguarded_native).is_err());
     guarded_control["checkpointOnCompletion"] = true.into();
     assert!(parse(&guarded_control).is_err()); // V2 retains the complete five-block rule.
     guarded_control["checkpointOnCompletion"] = false.into();
@@ -1805,6 +2001,24 @@ pub(super) fn control_fixture(
         SemanticJournalEvaluationSpec::from_json(&raw, &crate::model::digest(&raw))
     };
     let mut evaluation_spec = parse_evaluation(&evaluation).unwrap(); // No restore authority.
+    let mut native_audit = audit.clone();
+    native_audit["original"] = native_control["original"].clone();
+    assert!(parse_audit(&native_audit).is_ok());
+    let native_audit_path = root.join("native-human-reference-audit.json");
+    fs::write(
+        &native_audit_path,
+        serde_json::to_vec(&native_audit).unwrap(),
+    )
+    .unwrap();
+    let mut native_evaluation = evaluation.clone();
+    native_evaluation["auditControl"] = serde_json::to_value(pin(native_audit_path)).unwrap();
+    let refused_reference = evaluate_semantic_playing_journal(
+        parse_evaluation(&native_evaluation).unwrap(),
+        &root.join("native-human-reference-output"),
+    )
+    .err()
+    .unwrap();
+    assert!(refused_reference.contains("OriginalHuman4 requires a Human initialization"));
     let (_, config) = load_evaluation_config(&evaluation_spec.wire).unwrap();
     assert_eq!(config.external_exclusions.excluded_family_ids, vec![family]);
     evaluation_spec.wire.global_external.count = 2;
@@ -2149,8 +2363,14 @@ pub(super) fn control_fixture(
     let chunk: Chunk = serde_json::from_value(chunk_value.clone()).unwrap();
     let external = chunk.prior.external.load().unwrap();
     let history = chunk.prior.history.load().unwrap();
-    let resumed =
-        checkpoint::resume(&producer.original, &chunk, prepared, &external, &history).unwrap();
+    let resumed = checkpoint::resume(
+        &producer.original,
+        &chunk,
+        LoadedInitializationRef::Human(prepared),
+        &external,
+        &history,
+    )
+    .unwrap();
     assert_eq!(
         resumed.identity().unwrap().checksum(),
         journal.session.identity().unwrap().checksum()
@@ -2170,9 +2390,15 @@ pub(super) fn control_fixture(
         serde_json::from_value(serde_json::to_value(&producer.original).unwrap()).unwrap();
     guarded_original.collection_composition =
         Some(SemanticCollectionComposition::GuardedProposalV2);
-    let refused_mode = checkpoint::resume(&guarded_original, &chunk, prepared, &external, &history)
-        .err()
-        .unwrap();
+    let refused_mode = checkpoint::resume(
+        &guarded_original,
+        &chunk,
+        LoadedInitializationRef::Human(prepared),
+        &external,
+        &history,
+    )
+    .err()
+    .unwrap();
     assert!(refused_mode.contains("Original differs"));
     // The immutable Original's seed17 is wholly forbidden here. Only the
     // explicit new chunk seed29 can admit prospective work.
@@ -2216,11 +2442,29 @@ pub(super) fn control_fixture(
     assert!(parse(&continuation).is_err());
     chunk_value["samplingSeed"] = 17.into();
     let bad: Chunk = serde_json::from_value(chunk_value.clone()).unwrap();
-    assert!(checkpoint::resume(&producer.original, &bad, prepared, &external, &history).is_err());
+    assert!(
+        checkpoint::resume(
+            &producer.original,
+            &bad,
+            LoadedInitializationRef::Human(prepared),
+            &external,
+            &history
+        )
+        .is_err()
+    );
     chunk_value["samplingSeed"] = 29.into();
     chunk_value["firstOrdinal"] = (journal.session.next_episode_ordinal() + 4).into();
     let bad: Chunk = serde_json::from_value(chunk_value.clone()).unwrap();
-    assert!(checkpoint::resume(&producer.original, &bad, prepared, &external, &history).is_err());
+    assert!(
+        checkpoint::resume(
+            &producer.original,
+            &bad,
+            LoadedInitializationRef::Human(prepared),
+            &external,
+            &history
+        )
+        .is_err()
+    );
     let original_bytes = fs::read(&payload.path).unwrap();
     fs::write(&payload.path, b"{}").unwrap();
     assert!(checkpoint::recheck(Some(&chunk)).is_err());
@@ -2298,7 +2542,7 @@ pub(super) fn control_fixture(
     let resumed = checkpoint::resume(
         &producer.original,
         &exported_chunk,
-        prepared,
+        LoadedInitializationRef::Human(prepared),
         &external,
         &history,
     )

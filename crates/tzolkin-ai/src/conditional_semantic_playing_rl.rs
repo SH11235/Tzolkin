@@ -2,6 +2,9 @@
 //! The public fresh identity never becomes an updated or legacy owner. Separate
 //! in-memory routes do not provide a journal/export/resume conversion or source authentication.
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use crate::arena::teacher::PreparedSemanticPlayingTeacher;
 
 use sha2::{Digest, Sha256};
 use tzolkin_core::observation::Observation;
@@ -23,6 +26,7 @@ use crate::public_state_critic as critic;
 pub(crate) struct SemanticSourceCheckPass<'a> {
     pins: BTreeMap<String, ContentPin>,
     exclusions: BTreeSet<Vec<u8>>,
+    native: BTreeSet<String>,
     _boundary: &'a (),
 }
 pub(crate) fn with_source_check_pass<R>(
@@ -32,6 +36,7 @@ pub(crate) fn with_source_check_pass<R>(
     run(&mut SemanticSourceCheckPass {
         pins: BTreeMap::new(),
         exclusions: BTreeSet::new(),
+        native: BTreeSet::new(),
         _boundary: &boundary,
     })
 }
@@ -65,9 +70,165 @@ impl SemanticSourceCheckPass<'_> {
     }
 }
 
+/// Native custody retains the successful complete-source loader, including its
+/// typed dataset caps. It cannot be constructed from an actor parameter slice.
+pub(crate) struct NativeOrigin {
+    prepared: Arc<PreparedSemanticPlayingTeacher>,
+    description: serde_json::Value,
+    checksum: String,
+    tables: BTreeMap<String, DatasetSplit>,
+}
+impl NativeOrigin {
+    fn from_prepared(prepared: Arc<PreparedSemanticPlayingTeacher>) -> Result<Self, String> {
+        prepared.recheck_sources()?;
+        let checkpoint = prepared.rl_checkpoint();
+        let description = serde_json::json!({
+            "schema":"native-corn-first-v5-semantic-playing-rl-origin-v1",
+            "sourceKind":crate::semantic_playing_teacher_dataset::SOURCE_KIND,
+            "task":crate::semantic_playing_teacher_training::TASK,
+            "checkpoint":checkpoint.checksum,
+            "actor":parameter_checksum(b"tzolkin-semantic-playing-rl-actor-bits-v1\0",
+                checkpoint.model.parameters()),
+            "dataset":checkpoint.dataset,"locations":prepared.rl_source_locations()});
+        let checksum = hash(
+            b"native-corn-first-v5-semantic-playing-rl-origin-v1\0",
+            &description,
+        )?;
+        prepared.recheck_sources()?;
+        Ok(Self {
+            prepared,
+            description,
+            checksum,
+            tables: BTreeMap::new(),
+        })
+    }
+    fn recheck_in(&self, checked: &mut SemanticSourceCheckPass<'_>) -> Result<(), String> {
+        if !checked.native.contains(&self.checksum) {
+            self.prepared.recheck_sources()?;
+            checked.native.insert(self.checksum.clone());
+        }
+        Ok(())
+    }
+    fn check_external(&self, external: &ConditionalNativeExclusions) -> Result<(), String> {
+        if self
+            .prepared
+            .rl_checkpoint()
+            .dataset
+            .manifest
+            .families
+            .iter()
+            .any(|f| !external.contains_family(&f.family_id))
+        {
+            return Err("Native4 RL prior omits a retained teacher family".into());
+        }
+        Ok(())
+    }
+}
+enum TrainingOrigin {
+    Human(Box<SemanticPlayingRlOrigin>),
+    Native(Arc<NativeOrigin>),
+}
+#[derive(Clone, Copy)]
+enum OriginRef<'a> {
+    Human(&'a SemanticPlayingRlOrigin),
+    Native(&'a Arc<NativeOrigin>),
+}
+impl TrainingOrigin {
+    fn view(&self) -> OriginRef<'_> {
+        match self {
+            Self::Human(o) => OriginRef::Human(o),
+            Self::Native(o) => OriginRef::Native(o),
+        }
+    }
+}
+impl OriginRef<'_> {
+    fn recheck(&self) -> Result<(), String> {
+        match self {
+            Self::Human(o) => o.recheck_sources(),
+            Self::Native(o) => o.prepared.recheck_sources(),
+        }
+    }
+    fn tables(&self) -> &BTreeMap<String, DatasetSplit> {
+        match self {
+            Self::Human(o) => &o.table_reservations,
+            Self::Native(o) => &o.tables,
+        }
+    }
+    fn recheck_in(&self, checked: &mut SemanticSourceCheckPass<'_>) -> Result<(), String> {
+        match self {
+            Self::Human(o) => {
+                for pin in &o.source_pins {
+                    checked.pin(pin)?;
+                }
+                Ok(())
+            }
+            Self::Native(o) => o.recheck_in(checked),
+        }
+    }
+}
+/// Closed internal initialization; only successful typed loaders supply owners.
+pub(crate) enum SemanticFreshOwner {
+    Human(Box<SemanticPlayingRlOwner>),
+    Native {
+        origin: Arc<NativeOrigin>,
+        actor: PublicPolicyModel,
+        critic: Vec<f32>,
+        identity: SemanticPlayingRlIdentity,
+    },
+}
+impl SemanticFreshOwner {
+    pub(crate) fn native(
+        prepared: Arc<PreparedSemanticPlayingTeacher>,
+        seed: u64,
+    ) -> Result<Self, String> {
+        let origin = Arc::new(NativeOrigin::from_prepared(prepared)?);
+        let actor = PublicPolicyModel {
+            parameters: origin.prepared.rl_checkpoint().model.parameters().to_vec(),
+        };
+        actor.validate()?;
+        let (critic, identity) = fresh_identity(&origin.checksum, &actor, seed, true)?;
+        origin.prepared.recheck_sources()?;
+        Ok(Self::Native {
+            origin,
+            actor,
+            critic,
+            identity,
+        })
+    }
+    fn parts(
+        self,
+    ) -> (
+        TrainingOrigin,
+        PublicPolicyModel,
+        Vec<f32>,
+        SemanticPlayingRlIdentity,
+    ) {
+        match self {
+            Self::Human(o) => {
+                let o = *o;
+                (
+                    TrainingOrigin::Human(Box::new(o.origin)),
+                    o.actor,
+                    o.critic,
+                    o.identity,
+                )
+            }
+            Self::Native {
+                origin,
+                actor,
+                critic,
+                identity,
+            } => (TrainingOrigin::Native(origin), actor, critic, identity),
+        }
+    }
+}
+
 pub const POLICY_VERSION: &str = "conditional-human-semantic-playing-fresh-scalar-v1";
 pub const INPUT_CONTRACT: &str =
     "conditional-human-semantic-playing-origin-base-3-4p-schema4-numeric-v1";
+pub const NATIVE_POLICY_VERSION: &str = "native-corn-first-v5-semantic-playing-fresh-scalar-v1";
+pub const NATIVE_INPUT_CONTRACT: &str =
+    "native-corn-first-v5-semantic-playing-origin-base-3-4p-schema4-numeric-v1";
 pub const CRITIC_INIT_VERSION: &str = "semantic-playing-fresh-public384-zero-residual-v1";
 
 /// Only the successful schema-4 production loader supplies this captured closure.
@@ -144,16 +305,25 @@ pub struct SemanticPlayingRlIdentity {
     critic_checksum: String,
     critic_seed: u64,
     checksum: String,
+    native: bool,
 }
 impl SemanticPlayingRlIdentity {
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
     pub fn policy_version(&self) -> &'static str {
-        POLICY_VERSION
+        if self.native {
+            NATIVE_POLICY_VERSION
+        } else {
+            POLICY_VERSION
+        }
     }
     pub fn input_contract(&self) -> &'static str {
-        INPUT_CONTRACT
+        if self.native {
+            NATIVE_INPUT_CONTRACT
+        } else {
+            INPUT_CONTRACT
+        }
     }
     pub fn feature_schema(&self) -> u32 {
         SEMANTIC_PLAYING_FEATURE_SCHEMA
@@ -204,7 +374,7 @@ pub struct SemanticPlayingRlOwner {
 impl SemanticPlayingRlOwner {
     pub(crate) fn collection_view(&self) -> SemanticOwnerView<'_> {
         SemanticOwnerView {
-            origin: &self.origin,
+            origin: OriginRef::Human(&self.origin),
             actor: &self.actor,
             critic: &self.critic,
             parent: self.identity.checksum(),
@@ -219,60 +389,10 @@ impl SemanticPlayingRlOwner {
         let origin = SemanticPlayingRlOrigin::from_prepared(prepared)?;
         let actor = prepared.model().model.clone();
         actor.validate()?;
-        let critic = crate::public_policy_baseline::zero_output_parameters(critic_seed);
-        let actor_checksum = parameter_checksum(
-            b"tzolkin-semantic-playing-rl-actor-bits-v1\0",
-            actor.parameters(),
-        );
-        let critic_checksum = hash(
-            b"tzolkin-semantic-playing-rl-fresh-critic-v1\0",
-            &(
-                &origin.checksum,
-                CRITIC_INIT_VERSION,
-                critic::MODEL_VERSION,
-                critic::CONTEXT_CONTRACT,
-                (
-                    critic::CONTEXT_SCHEMA,
-                    PUBLIC_FEATURE_SCHEMA,
-                    critic::CONTEXT_COUNT,
-                ),
-                critic_seed,
-                parameter_checksum(b"tzolkin-semantic-playing-rl-critic-bits-v1\0", &critic),
-            ),
-        )?;
-        let checksum = hash(
-            b"tzolkin-semantic-playing-rl-fresh-identity-v1\0",
-            &(
-                (
-                    POLICY_VERSION,
-                    INPUT_CONTRACT,
-                    SEMANTIC_PLAYING_FEATURE_SCHEMA,
-                ),
-                (
-                    &origin.checksum,
-                    &actor_checksum,
-                    &critic_checksum,
-                    critic_seed,
-                ),
-                (
-                    "scalar",
-                    0_u64,
-                    false,
-                    false,
-                    false,
-                    ValueValidity::UnavailablePolicyOnly,
-                ),
-            ),
-        )?;
+        let (critic, identity) = fresh_identity(&origin.checksum, &actor, critic_seed, false)?;
         origin.recheck_sources()?;
         Ok(Self {
-            identity: SemanticPlayingRlIdentity {
-                origin_checksum: origin.checksum.clone(),
-                actor_checksum,
-                critic_checksum,
-                critic_seed,
-                checksum,
-            },
+            identity,
             origin,
             actor,
             critic,
@@ -303,47 +423,129 @@ impl SemanticPlayingRlOwner {
     }
 }
 
+fn fresh_identity(
+    origin_checksum: &str,
+    actor: &PublicPolicyModel,
+    critic_seed: u64,
+    native: bool,
+) -> Result<(Vec<f32>, SemanticPlayingRlIdentity), String> {
+    let critic = crate::public_policy_baseline::zero_output_parameters(critic_seed);
+    let actor_checksum = parameter_checksum(
+        b"tzolkin-semantic-playing-rl-actor-bits-v1\0",
+        actor.parameters(),
+    );
+    let critic_checksum = hash(
+        if native {
+            b"native-corn-first-v5-fresh-critic-v1\0".as_slice()
+        } else {
+            b"tzolkin-semantic-playing-rl-fresh-critic-v1\0".as_slice()
+        },
+        &(
+            origin_checksum,
+            CRITIC_INIT_VERSION,
+            critic::MODEL_VERSION,
+            critic::CONTEXT_CONTRACT,
+            (
+                critic::CONTEXT_SCHEMA,
+                PUBLIC_FEATURE_SCHEMA,
+                critic::CONTEXT_COUNT,
+            ),
+            critic_seed,
+            parameter_checksum(b"tzolkin-semantic-playing-rl-critic-bits-v1\0", &critic),
+        ),
+    )?;
+    let checksum = hash(
+        if native {
+            b"native-corn-first-v5-fresh-identity-v1\0".as_slice()
+        } else {
+            b"tzolkin-semantic-playing-rl-fresh-identity-v1\0".as_slice()
+        },
+        &(
+            (
+                if native {
+                    NATIVE_POLICY_VERSION
+                } else {
+                    POLICY_VERSION
+                },
+                if native {
+                    NATIVE_INPUT_CONTRACT
+                } else {
+                    INPUT_CONTRACT
+                },
+                SEMANTIC_PLAYING_FEATURE_SCHEMA,
+            ),
+            (
+                origin_checksum,
+                &actor_checksum,
+                &critic_checksum,
+                critic_seed,
+            ),
+            (
+                "scalar",
+                0_u64,
+                false,
+                false,
+                false,
+                ValueValidity::UnavailablePolicyOnly,
+            ),
+        ),
+    )?;
+    Ok((
+        critic,
+        SemanticPlayingRlIdentity {
+            origin_checksum: origin_checksum.into(),
+            actor_checksum,
+            critic_checksum,
+            critic_seed,
+            checksum,
+            native,
+        },
+    ))
+}
+
 /// An owned, private numerical state obtained only by consuming a fresh owner.
 /// It cannot be exposed as that fresh owner after either parameter vector changes.
 pub(crate) struct SemanticTrainingState {
-    origin: SemanticPlayingRlOrigin,
+    origin: TrainingOrigin,
     actor: PublicPolicyModel,
     critic: Vec<f32>,
     root: SemanticPlayingRlIdentity,
 }
 impl SemanticTrainingState {
     pub(crate) fn from_checkpoint(
-        owner: SemanticPlayingRlOwner,
+        owner: SemanticFreshOwner,
         root: &str,
         actor: PublicPolicyModel,
         critic: Vec<f32>,
     ) -> Result<Self, String> {
-        owner.origin.recheck_sources()?;
+        let (origin, _, _, identity) = owner.parts();
+        origin.view().recheck()?;
         actor.validate()?;
-        if owner.identity.checksum() != root
+        if identity.checksum() != root
             || critic.len() != crate::public_state_critic::PARAMETER_COUNT
             || critic.iter().any(|v| !v.is_finite())
         {
             return Err("Semantic checkpoint root/critic differs".into());
         }
         let current = Self {
-            origin: owner.origin,
+            origin,
             actor,
             critic,
-            root: owner.identity,
+            root: identity,
         };
-        current.origin.recheck_sources()?;
+        current.origin.view().recheck()?;
         Ok(current)
     }
-    pub(crate) fn from_fresh(owner: SemanticPlayingRlOwner) -> Result<Self, String> {
-        owner.origin.recheck_sources()?;
+    pub(crate) fn from_fresh(owner: SemanticFreshOwner) -> Result<Self, String> {
+        let (origin, actor, critic, root) = owner.parts();
+        origin.view().recheck()?;
         let current = Self {
-            origin: owner.origin,
-            actor: owner.actor,
-            critic: owner.critic,
-            root: owner.identity,
+            origin,
+            actor,
+            critic,
+            root,
         };
-        current.origin.recheck_sources()?;
+        current.origin.view().recheck()?;
         Ok(current)
     }
     pub(crate) fn root(&self) -> &SemanticPlayingRlIdentity {
@@ -357,7 +559,7 @@ impl SemanticTrainingState {
     }
     pub(crate) fn view<'a>(&'a self, parent: &'a str) -> SemanticOwnerView<'a> {
         SemanticOwnerView {
-            origin: &self.origin,
+            origin: self.origin.view(),
             actor: &self.actor,
             critic: &self.critic,
             parent,
@@ -373,7 +575,7 @@ impl SemanticTrainingState {
 /// Closed borrowed source: only fresh/current sealed owners can construct it.
 /// Neither models nor a caller predictor can construct a numerical scope.
 pub(crate) struct SemanticOwnerView<'a> {
-    origin: &'a SemanticPlayingRlOrigin,
+    origin: OriginRef<'a>,
     actor: &'a PublicPolicyModel,
     critic: &'a [f32],
     parent: &'a str,
@@ -381,23 +583,37 @@ pub(crate) struct SemanticOwnerView<'a> {
 }
 impl SemanticOwnerView<'_> {
     pub(crate) fn journal_origin(&self) -> serde_json::Value {
-        serde_json::json!({"checksum":self.origin.checksum,
-            "checkpoint":self.origin.checkpoint_checksum,"model":self.origin.model_checksum,
-            "dataset":self.origin.dataset,"reservations":self.origin.table_reservations,
-            "pins":self.origin.source_pins})
+        match self.origin {
+            OriginRef::Human(origin) => serde_json::json!({"checksum":origin.checksum,
+                "checkpoint":origin.checkpoint_checksum,"model":origin.model_checksum,
+                "dataset":origin.dataset,"reservations":origin.table_reservations,
+                "pins":origin.source_pins}),
+            OriginRef::Native(origin) => {
+                serde_json::json!({"checksum":origin.checksum,"nativeTeacher":origin.description})
+            }
+        }
     }
     pub(crate) fn root_checksum(&self) -> &str {
         self.root
     }
     pub(crate) fn origin_custody(&self) -> SemanticOriginCustody {
-        SemanticOriginCustody {
-            checksum: self.origin.checksum.clone(),
-            pins: self.origin.source_pins.clone(),
-            reservations: self.origin.table_reservations.clone(),
+        match self.origin {
+            OriginRef::Human(origin) => SemanticOriginCustody {
+                checksum: origin.checksum.clone(),
+                pins: origin.source_pins.clone(),
+                reservations: origin.table_reservations.clone(),
+                native: None,
+            },
+            OriginRef::Native(origin) => SemanticOriginCustody {
+                checksum: origin.checksum.clone(),
+                pins: Vec::new(),
+                reservations: BTreeMap::new(),
+                native: Some(Arc::clone(origin)),
+            },
         }
     }
     pub(crate) fn metadata(&self) -> (&str, &BTreeMap<String, DatasetSplit>) {
-        (self.parent, &self.origin.table_reservations)
+        (self.parent, self.origin.tables())
     }
     pub(crate) fn with_checked<R>(
         &self,
@@ -440,10 +656,11 @@ impl SemanticOwnerView<'_> {
     ) -> Result<(), String> {
         with_source_check_pass(|checked| {
             let source = (|| {
-                for pin in &self.origin.source_pins {
-                    checked.pin(pin)?;
-                }
+                self.origin.recheck_in(checked)?;
                 checked.external(external)?;
+                if let OriginRef::Native(origin) = self.origin {
+                    origin.check_external(external)?;
+                }
                 for pin in pins {
                     checked.pin(pin)?;
                 }
@@ -468,6 +685,7 @@ pub(crate) struct SemanticOriginCustody {
     checksum: String,
     pins: Vec<ContentPin>,
     reservations: BTreeMap<String, DatasetSplit>,
+    native: Option<Arc<NativeOrigin>>,
 }
 impl SemanticOriginCustody {
     pub(crate) fn recheck_in(
@@ -477,19 +695,43 @@ impl SemanticOriginCustody {
         for pin in &self.pins {
             checked.pin(pin)?;
         }
+        if let Some(native) = &self.native {
+            native.recheck_in(checked)?;
+        }
         Ok(())
     }
     pub(crate) fn recheck(&self) -> Result<(), String> {
         for pin in &self.pins {
             crate::human_policy_dataset::recheck_absolute_pin(pin)?;
         }
+        if let Some(native) = &self.native {
+            native.prepared.recheck_sources()?;
+        }
         Ok(())
     }
     pub(crate) fn binding(&self) -> Result<String, String> {
-        hash(
-            b"semantic-frozen-origin-custody-v1\0",
-            &(&self.checksum, &self.pins, &self.reservations),
-        )
+        if let Some(native) = &self.native {
+            hash(
+                b"native-corn-first-v5-frozen-origin-custody-v1\0",
+                &(&self.checksum, &native.description),
+            )
+        } else {
+            hash(
+                b"semantic-frozen-origin-custody-v1\0",
+                &(&self.checksum, &self.pins, &self.reservations),
+            )
+        }
+    }
+    pub(crate) fn contains_native_family(&self, family: &str) -> bool {
+        self.native.as_ref().is_some_and(|n| {
+            n.prepared
+                .rl_checkpoint()
+                .dataset
+                .manifest
+                .families
+                .iter()
+                .any(|f| f.family_id == family)
+        })
     }
     pub(crate) fn reservations(&self) -> &BTreeMap<String, DatasetSplit> {
         &self.reservations
@@ -544,6 +786,7 @@ pub(crate) fn with_collection_numeric_fixture<R>(
         critic_checksum: parameter_checksum(b"synthetic-critic", &critic),
         critic_seed: 11,
         checksum: "synthetic-no-source-qualification".into(),
+        native: false,
     };
     let scope = SemanticCollectionScope {
         actor: &prepared.model().model,

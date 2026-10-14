@@ -286,7 +286,7 @@ pub(super) fn recheck_export(export: Option<&Export>) -> Result<(), String> {
 pub(super) fn resume<'a>(
     original: &Original,
     chunk: &Chunk,
-    prepared: &PreparedConditionalHumanPolicy,
+    prepared: LoadedInitializationRef<'_>,
     external: &'a ConditionalNativeExclusions,
     history: &'a DeclaredSamplingHistory,
 ) -> Result<SemanticPlayingJointSession<'a>, String> {
@@ -336,8 +336,8 @@ pub(super) fn resume<'a>(
             return Err("Chunk prior omits a parent permanent stream allocation".into());
         }
     }
-    let session = SemanticPlayingJointSession::from_checkpoint(
-        SemanticPlayingRlOwner::from_prepared(prepared, original.critic_seed)?,
+    let session = SemanticPlayingJointSession::from_checkpoint_owner(
+        prepared.fresh_owner(original.critic_seed)?,
         payload.numerics,
         external,
         history,
