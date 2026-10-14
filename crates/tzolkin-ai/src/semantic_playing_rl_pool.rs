@@ -174,6 +174,13 @@ impl<'a> FrozenSemanticSnapshot<'a> {
         self.recheck()?;
         Ok(&self.identity)
     }
+    pub(crate) fn journal_identity(&self) -> Result<serde_json::Value, String> {
+        self.recheck()?;
+        Ok(serde_json::json!({"checksum":self.identity.checksum,
+            "current":self.identity.current,"root":self.identity.root,
+            "actor":self.identity.actor,"capture":self.identity.capture,
+            "sources":self.identity.sources}))
+    }
     pub fn human_table_reservations(&self) -> Result<&BTreeMap<String, DatasetSplit>, String> {
         self.recheck()?;
         Ok(self.origin.reservations())
@@ -303,6 +310,15 @@ impl<'a> SemanticFrozenMixture<'a> {
     }
     pub fn checksum(&self) -> &str {
         &self.binding
+    }
+    pub(crate) fn journal_binding(&self) -> Result<serde_json::Value, String> {
+        self.recheck()?;
+        Ok(serde_json::json!({"checksum":self.binding,
+            "procedural":self.legacy.procedural_binding()?,
+            "snapshots":self.slots.iter().map(|s| serde_json::json!({
+                "member":s.member,"actor":s.actor,"snapshot":s.snapshot.binding(),
+                "current":s.snapshot.identity.current,"capture":s.snapshot.identity.capture
+            })).collect::<Vec<_>>()}))
     }
     pub(crate) fn require_receiver(
         &self,
