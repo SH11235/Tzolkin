@@ -765,7 +765,7 @@ impl<'a> SemanticCollectionLedger<'a> {
         current: &str,
         next: &str,
     ) -> Result<BTreeSet<String>, String> {
-        if !self.admitted.contains(current) || self.admitted.len() >= MAX_ATTEMPTS + 1 {
+        if !self.admitted.contains(current) || self.admitted.len() > MAX_ATTEMPTS {
             return Err("Semantic admitted identity chain differs or exceeds its bound".into());
         }
         let mut admitted = self.admitted.clone();
