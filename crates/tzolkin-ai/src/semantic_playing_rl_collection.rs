@@ -1000,7 +1000,7 @@ impl<'a> SemanticCollectionLedger<'a> {
                 (0..config.players()).any(|actor| {
                     rosters
                         .get(i)
-                        .contains_stream(config.sampling_identity(), actor)
+                        .contains_stream(*config.sampling_identity(), actor)
                 })
             })
         }) {
