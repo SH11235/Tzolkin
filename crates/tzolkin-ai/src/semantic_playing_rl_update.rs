@@ -643,7 +643,21 @@ pub(crate) fn joint_fixture() {
         &digest(format!("{excluded}\n").as_bytes()),
     )
     .unwrap();
-    let history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
+    let history = DeclaredSamplingHistory::declare_complete(
+        vec![
+            crate::semantic_playing_rl_collection::DeclaredSamplingRange::new(
+                SamplingSeed::new(17),
+                0,
+                3,
+                0,
+                90,
+                94,
+            )
+            .unwrap(),
+        ],
+        vec![pin.clone()],
+    )
+    .unwrap();
     let mut session = SemanticPlayingJointSession::from_fresh(
         root_owner,
         &external,
@@ -745,6 +759,53 @@ pub(crate) fn joint_fixture() {
         ]
     };
     let mixture = SemanticFrozenMixture::new(&pool, slots()).unwrap();
+    // A receiving session cannot erase another snapshot's local burns or its
+    // declared source history by supplying different fresh families/history.
+    // Put the only snapshot in member3: even member0's tuples must be checked
+    // before creating the first game, not merely that snapshot's assigned seat.
+    let lineage_pool =
+        SemanticFrozenMixture::new(&pool, vec![SnapshotSlot::new(3, 3, &snapshot).unwrap()])
+            .unwrap();
+    let empty_history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
+    let other_families = std::array::from_fn(|_| seeds.next().unwrap());
+    for first in [90, 100] {
+        let mut other = SemanticPlayingJointSession::from_fresh(
+            SemanticPlayingRlOwner::from_prepared(&prepared, 12).unwrap(),
+            &external,
+            &empty_history,
+            SamplingSeed::new(17),
+            first,
+            0,
+            OneStepConfig::default(),
+            ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+        )
+        .unwrap();
+        let entered = Cell::new(false);
+        let result = other.ledger.collect_mixture_fixture_using(
+            &other.state.view(other.identity.checksum()),
+            other_families,
+            &lineage_pool,
+            limits,
+            |_, _| Ok(()),
+            |_| {
+                entered.set(true);
+                Err("Lineage refusal must precede game creation".into())
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "Semantic sampling stream overlaps frozen opponent lineage"
+        );
+        assert!(!entered.get());
+        assert_eq!(
+            (
+                other.attempts(),
+                other.next_episode_ordinal(),
+                other.consumed_actor_streams()
+            ),
+            (0, first, 0)
+        );
+    }
     assert!(
         SemanticFrozenMixture::new(&pool, vec![SnapshotSlot::new(0, 0, &snapshot).unwrap()])
             .is_err()

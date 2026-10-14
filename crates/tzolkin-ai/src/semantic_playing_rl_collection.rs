@@ -132,7 +132,7 @@ impl DeclaredSamplingHistory {
             checksum,
         })
     }
-    fn contains(&self, identity: SamplingStreamIdentity, actor: usize) -> bool {
+    pub(crate) fn contains(&self, identity: SamplingStreamIdentity, actor: usize) -> bool {
         self.ranges.iter().any(|r| r.contains(identity, actor))
     }
 }
@@ -682,6 +682,12 @@ impl<'a> RosterRef<'a> {
             Self::Mixture(r) => r.contains_family(family),
         }
     }
+    fn contains_stream(self, identity: SamplingStreamIdentity, actor: usize) -> bool {
+        match self {
+            Self::Legacy(_) => false,
+            Self::Mixture(r) => r.contains_stream(identity, actor),
+        }
+    }
     fn opponent(
         self,
         actor: usize,
@@ -985,6 +991,20 @@ impl<'a> SemanticCollectionLedger<'a> {
         let rosters = pool.freeze()?;
         if (0..4).any(|i| families.iter().any(|f| rosters.get(i).contains_family(f))) {
             return Err("Semantic family overlaps frozen opponent lineage".into());
+        }
+        // A snapshot may come from another session with different declarations.
+        // Check every proposed actor tuple against every captured lineage before
+        // burning this batch or creating its first game, not only sampled slots.
+        if (0..4).any(|i| {
+            configs.iter().any(|config| {
+                (0..config.players()).any(|actor| {
+                    rosters
+                        .get(i)
+                        .contains_stream(config.sampling_identity(), actor)
+                })
+            })
+        }) {
+            return Err("Semantic sampling stream overlaps frozen opponent lineage".into());
         }
         let (identity, reservations) = owner.metadata();
         let parent = identity.to_string();

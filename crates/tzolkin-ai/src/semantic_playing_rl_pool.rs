@@ -16,6 +16,7 @@ use crate::features::FeatureEncoder;
 use crate::kernel::ResolvedKernel;
 use crate::public_model::{PublicPolicyModel, predict_semantic_playing_numeric};
 use crate::public_policy_update::hash;
+use crate::public_stochastic::SamplingStreamIdentity;
 use crate::semantic_playing_rl_collection::DeclaredSamplingHistory;
 use crate::semantic_playing_rl_update::SemanticPlayingCurrentIdentity;
 
@@ -61,6 +62,7 @@ pub struct FrozenSemanticSnapshot<'a> {
     external: &'a ConditionalNativeExclusions,
     history: &'a DeclaredSamplingHistory,
     families: BTreeSet<String>,
+    streams: BTreeSet<[u64; 5]>,
     human_families: BTreeSet<String>,
     identity: FrozenSemanticSnapshotIdentity,
 }
@@ -147,6 +149,7 @@ impl<'a> FrozenSemanticSnapshot<'a> {
                 external,
                 history,
                 families,
+                streams,
                 human_families,
                 identity: FrozenSemanticSnapshotIdentity {
                     current: current.checksum().into(),
@@ -192,7 +195,18 @@ impl<'a> FrozenSemanticSnapshot<'a> {
         &self.identity.checksum
     }
     pub(crate) fn contains_family(&self, family: &str) -> bool {
-        self.families.contains(family) || self.human_families.contains(family)
+        self.families.contains(family)
+            || self.human_families.contains(family)
+            || self.external.contains_family(family)
+    }
+    pub(crate) fn contains_stream(&self, identity: SamplingStreamIdentity, actor: usize) -> bool {
+        self.streams.contains(&[
+            identity.sampling_seed().value(),
+            identity.episode_ordinal(),
+            identity.replicate_ordinal(),
+            identity.players() as u64,
+            actor as u64,
+        ]) || self.history.contains(identity, actor)
     }
     /// Called only inside the closed source-checked batch/episode borrow.
     pub(crate) fn distribution(
@@ -343,6 +357,12 @@ impl<'a> SemanticMixtureRoster<'a> {
                 .iter()
                 .flatten()
                 .any(|s| s.contains_family(family))
+    }
+    pub(crate) fn contains_stream(&self, identity: SamplingStreamIdentity, actor: usize) -> bool {
+        self.snapshots
+            .iter()
+            .flatten()
+            .any(|s| s.contains_stream(identity, actor))
     }
     pub(crate) fn checksum(&self) -> &str {
         &self.binding
