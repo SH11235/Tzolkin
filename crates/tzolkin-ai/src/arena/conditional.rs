@@ -644,6 +644,7 @@ enum SetupRoute {
     CornFirst,
     SemanticPlayingCornFirst,
     NativeTeacherPlayingCornFirst,
+    CurrentSnapshotPlayingCornFirst,
     NumericAllPhase(&'static str),
     PhaseRoutedDevelopment,
 }
@@ -653,6 +654,7 @@ impl SetupRoute {
             Self::CornFirst => POLICY_VERSION,
             Self::SemanticPlayingCornFirst => SEMANTIC_PLAYING_POLICY_VERSION,
             Self::NativeTeacherPlayingCornFirst => super::teacher::SEMANTIC_PLAYING_POLICY_VERSION,
+            Self::CurrentSnapshotPlayingCornFirst => super::semantic_snapshot::POLICY_VERSION,
             Self::NumericAllPhase(version) => version,
             Self::PhaseRoutedDevelopment => super::phase_routed::POLICY_VERSION,
         }
@@ -685,6 +687,15 @@ impl GameSession {
             &policy.identity().guard,
         )
         .expect("native teacher constructor validated guard configuration")
+    }
+    pub(super) fn new_semantic_snapshot(
+        policy: &super::semantic_snapshot::SemanticPlayingSnapshotArenaPolicy<'_>,
+    ) -> Self {
+        Self::with_route(
+            SetupRoute::CurrentSnapshotPlayingCornFirst,
+            &policy.identity().guard,
+        )
+        .expect("semantic snapshot constructor validated guard configuration")
     }
     pub(super) fn new_mixed(policy: &ConditionalMixedArenaPolicy<'_>) -> Self {
         Self::with_route(
@@ -835,6 +846,14 @@ impl GameSession {
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.prepared.distribution(o))
     }
+    pub(super) fn choose_semantic_snapshot(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &super::semantic_snapshot::SemanticPlayingSnapshotArenaPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.distribution(o))
+    }
     pub(super) fn choose_phase_routed(
         &mut self,
         index: usize,
@@ -872,6 +891,7 @@ impl GameSession {
                         SetupRoute::CornFirst
                             | SetupRoute::SemanticPlayingCornFirst
                             | SetupRoute::NativeTeacherPlayingCornFirst
+                            | SetupRoute::CurrentSnapshotPlayingCornFirst
                     ) =>
                 {
                     let decision = crate::setup_policy::choose_move_with_weights(
