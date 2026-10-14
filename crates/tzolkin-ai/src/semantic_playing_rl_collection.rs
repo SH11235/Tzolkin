@@ -1011,12 +1011,10 @@ impl<'a> SemanticCollectionLedger<'a> {
             self.spent.extend(families.iter().cloned());
             self.streams.extend(streams);
             let mut episodes = Vec::new();
-            for i in 0..4 {
+            for (i, config) in configs.iter().enumerate() {
                 let roster = rosters.get(i);
                 let episode = owner.with_checked_episode(self.external, &pins, || {
-                    let collected = run(&configs[i], roster, scope, &binding, None, || {
-                        create(&configs[i])
-                    })?;
+                    let collected = run(config, roster, scope, &binding, None, || create(config))?;
                     if !collected.complete() {
                         let error = collected
                             .failure
@@ -1025,19 +1023,14 @@ impl<'a> SemanticCollectionLedger<'a> {
                         self.failed = Some(SemanticPlayingCollectedGame { record: collected });
                         return Err(error);
                     }
-                    let audited = run(
-                        &configs[i],
-                        roster,
-                        scope,
-                        &binding,
-                        Some(&collected),
-                        || create(&configs[i]),
-                    )?;
+                    let audited = run(config, roster, scope, &binding, Some(&collected), || {
+                        create(config)
+                    })?;
                     seal(
                         audited,
-                        configs[i].clone(),
+                        config.clone(),
                         roster.learner_seat(),
-                        roster.sampled_opponents(configs[i].players()),
+                        roster.sampled_opponents(config.players()),
                     )
                 })?;
                 episodes.push(episode);
