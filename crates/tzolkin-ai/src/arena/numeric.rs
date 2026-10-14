@@ -56,6 +56,10 @@ pub const RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA: &str =
     "tzolkin-resource-cycle-v6-v5-validation-command-v1";
 pub const RESOURCE_CYCLE_V6_V5_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v6-v5-shared-corn-first-validation-arena-v1";
+pub const RESOURCE_CYCLE_V7_V5_COMMAND_SCHEMA: &str =
+    "tzolkin-resource-cycle-v7-v5-validation-command-v1";
+pub const RESOURCE_CYCLE_V7_V5_ARENA_SCHEMA: &str =
+    "tzolkin-resource-cycle-v7-v5-shared-corn-first-validation-arena-v1";
 pub const OWN_SETUP_ARENA_SCHEMA: &str = "tzolkin-own-setup-composite-development-arena-v1";
 pub const RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-own-setup-composite-development-arena-v1";
@@ -161,6 +165,39 @@ impl ResourceCycleV6V5ArenaSpec {
     }
     fn validate(&self) -> Result<(), String> {
         if self.schema != RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA || self.arena.seeds.len() > 64 {
+            return Err(
+                "Resource-cycle paired control requires its closed schema and 1..64 seeds".into(),
+            );
+        }
+        self.arena.validate()
+    }
+}
+
+/// A separate frozen V7 comparison, with the same bounded caller declarations.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceCycleV7V5ArenaSpec {
+    schema: String,
+    arena: NumericArenaConfig,
+}
+impl ResourceCycleV7V5ArenaSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if raw.len() > 16 * 1024 * 1024
+            || !digest(expected_sha256)
+            || format!("{:x}", Sha256::digest(raw)) != expected_sha256
+        {
+            return Err("Resource-cycle paired control pin differs".into());
+        }
+        let spec: Self = serde_json::from_value(crate::public_stochastic_record::unique_json(
+            raw,
+            16 * 1024 * 1024,
+        )?)
+        .map_err(|e| e.to_string())?;
+        spec.validate()?;
+        Ok(spec)
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != RESOURCE_CYCLE_V7_V5_COMMAND_SCHEMA || self.arena.seeds.len() > 64 {
             return Err(
                 "Resource-cycle paired control requires its closed schema and 1..64 seeds".into(),
             );
@@ -1944,6 +1981,38 @@ pub fn run_resource_cycle_v6_v5_validation(
     )
 }
 
+fn resource_cycle_v7_v5_roles(
+    players: usize,
+) -> (Role<'static>, Role<'static>, Vec<Role<'static>>) {
+    use super::resource_cycle::ResourceCycleConfig;
+    (
+        Role::ResourceCycle(ResourceCycleConfig::v7()),
+        Role::ResourceCycle(ResourceCycleConfig::v5()),
+        (0..players)
+            .map(|_| Role::ResourceCycle(ResourceCycleConfig::v5()))
+            .collect(),
+    )
+}
+
+/// Ordinary Development Validation only: V7 minus V5, fixed V5 absolute-seat
+/// opponents, and the exact shared Corn-first selector in every Setup callback.
+/// The unchanged paired engine retains all-seat arms and whole-family bootstrap;
+/// these procedural roles load no model and have no numeric TradeGuard.
+pub fn run_resource_cycle_v7_v5_validation(
+    spec: &ResourceCycleV7V5ArenaSpec,
+) -> Result<NumericArenaReport, String> {
+    spec.validate()?;
+    let (candidate, reference, pool) = resource_cycle_v7_v5_roles(spec.arena.players);
+    run_admitted_roles(
+        &spec.arena,
+        candidate,
+        reference,
+        pool,
+        RESOURCE_CYCLE_V7_V5_ARENA_SCHEMA,
+        Some(SharedCornFirstSetupIdentity::current()),
+    )
+}
+
 /// Audited learned V5 teacher, using the same paired all-seat callback/Trade
 /// engine. Source families from every partition are excluded locally. This is
 /// Development Validation, without native, training or fresh Test authority.
@@ -2983,6 +3052,51 @@ pub(super) mod tests {
 
     #[test]
     fn numeric_validation_preflight_and_failed_arm_discard_only_game_history() {
+        for players in [3, 4] {
+            let wire = json!({
+                "schema": RESOURCE_CYCLE_V7_V5_COMMAND_SCHEMA,
+                "arena": {"schema": SCHEMA, "players": players, "seeds": [3],
+                    "bootstrapSeed": 7, "externalExclusions": {
+                        "evidenceSha256": "a".repeat(64), "excludedFamilyIds": []}}
+            });
+            let parse = |value: &serde_json::Value| {
+                let raw = serde_json::to_vec(value).unwrap();
+                ResourceCycleV7V5ArenaSpec::from_json(&raw, &crate::model::digest(&raw))
+            };
+            assert!(parse(&wire).is_ok());
+            for schema in [RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA, "unknown"] {
+                let mut wrong = wire.clone();
+                wrong["schema"] = schema.into();
+                assert!(parse(&wrong).is_err());
+            }
+            let raw = serde_json::to_vec(&wire).unwrap();
+            assert!(
+                ResourceCycleV6V5ArenaSpec::from_json(&raw, &crate::model::digest(&raw)).is_err()
+            );
+            assert!(ResourceCycleV7V5ArenaSpec::from_json(&raw, &"0".repeat(64)).is_err());
+            for key in ["candidate", "reference", "opponentPool", "allowTest"] {
+                let mut unknown = wire.clone();
+                unknown[key] = true.into();
+                assert!(parse(&unknown).is_err());
+            }
+            let mut too_many = wire.clone();
+            too_many["arena"]["seeds"] = json!(vec![3; 65]);
+            assert!(parse(&too_many).is_err());
+            let (candidate, reference, pool) = resource_cycle_v7_v5_roles(players);
+            assert!(
+                matches!(candidate.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v7())
+            );
+            assert!(
+                matches!(reference.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v5())
+            );
+            assert_eq!(pool.len(), players);
+            assert!(pool.iter().all(
+                |r| matches!(r.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v5())
+            ));
+        }
         // The new closed procedural route shares the actual arm callback and
         // Corn-first override, without adding a full-game fixture.
         for players in [3, 4] {
