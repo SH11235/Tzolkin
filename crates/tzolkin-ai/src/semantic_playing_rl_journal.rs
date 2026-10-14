@@ -850,6 +850,54 @@ pub(crate) fn journal_fixture(
     assert!(source_error.contains("Synthetic checked cohort callback"));
     assert!(source_error.contains("semantic source postcheck"));
     assert_eq!(pool_checks.get(), 4); // Pool POST is attempted even after source failure.
+    // A loaded exclusion set stays private and immutable, but every boundary
+    // still checks its exact raw bytes, including after a callback error.
+    let descriptor = serde_json::to_value(external.descriptor()).unwrap();
+    let external_pin: ContentPin = serde_json::from_value(descriptor["pin"].clone()).unwrap();
+    let external_path = PathBuf::from(&external_pin.path);
+    let external_bytes = fs::read(&external_path).unwrap();
+    external.recheck().unwrap();
+    let mut changed_external = external_bytes.clone();
+    changed_external[0] ^= 1; // Same length, different bytes.
+    let external_error = checked_view
+        .with_checked_pool::<()>(
+            external,
+            history.pins(),
+            |_| Ok(()),
+            |_| {
+                fs::write(&external_path, &changed_external).map_err(|e| e.to_string())?;
+                Err("Synthetic external callback".into())
+            },
+        )
+        .unwrap_err();
+    fs::write(&external_path, &external_bytes).unwrap();
+    assert!(external_error.contains("Synthetic external callback"));
+    assert!(external_error.contains("semantic source postcheck"));
+    assert!(external_error.contains("External exclusions raw pin differs"));
+    fs::write(&external_path, &external_bytes[..external_bytes.len() - 1]).unwrap();
+    assert!(external.recheck().is_err());
+    fs::write(&external_path, &external_bytes).unwrap();
+    external.recheck().unwrap();
+    // Typed exclusions keep their own 32MiB bound, beyond generic 16MiB pins.
+    let large_path = root.join("large-external-fixture.json");
+    let mut large_bytes = external_bytes.clone();
+    large_bytes.resize(16 * 1024 * 1024 + 1, b' ');
+    fs::write(&large_path, &large_bytes).unwrap();
+    let large_pin = ContentPin {
+        path: large_path.to_str().unwrap().into(),
+        bytes: large_bytes.len() as u64,
+        sha256: crate::model::digest(&large_bytes),
+    };
+    let count = descriptor["count"].as_u64().unwrap() as usize;
+    let digest = descriptor["canonicalDigest"].as_str().unwrap();
+    use crate::conditional_human_rl_update::ConditionalNativeExclusions;
+    let large = ConditionalNativeExclusions::load(&large_path, &large_pin, count, digest).unwrap();
+    large.recheck().unwrap();
+    assert!(ConditionalNativeExclusions::load(&large_path, &large_pin, count + 1, digest).is_err());
+    assert!(
+        ConditionalNativeExclusions::load(&large_path, &large_pin, count, &"0".repeat(64)).is_err()
+    );
+    fs::remove_file(large_path).unwrap();
     let pin = &prepared.loaded_semantic_playing_sources().unwrap()[0];
     let mut wrong_bytes = pin.clone();
     wrong_bytes.bytes += 1;

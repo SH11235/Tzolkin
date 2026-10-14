@@ -85,12 +85,12 @@ pub struct ConditionalNativeExclusions {
     families: BTreeSet<String>,
 }
 impl ConditionalNativeExclusions {
-    pub fn load(
+    fn checked_raw(
         path: &Path,
         expected: &ContentPin,
         expected_count: usize,
         expected_digest: &str,
-    ) -> Result<Self, String> {
+    ) -> Result<Vec<u8>, String> {
         if !path.is_absolute()
             || path.to_str() != Some(expected.path.as_str())
             || !(1..=MAX_EXTERNAL_FAMILIES).contains(&expected_count)
@@ -114,6 +114,15 @@ impl ConditionalNativeExclusions {
         {
             return Err("External exclusions raw pin differs".into());
         }
+        Ok(raw)
+    }
+    pub fn load(
+        path: &Path,
+        expected: &ContentPin,
+        expected_count: usize,
+        expected_digest: &str,
+    ) -> Result<Self, String> {
+        let raw = Self::checked_raw(path, expected, expected_count, expected_digest)?;
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase", deny_unknown_fields)]
         struct Wire {
@@ -148,16 +157,15 @@ impl ConditionalNativeExclusions {
         &self.descriptor
     }
     pub(crate) fn recheck(&self) -> Result<(), String> {
-        let checked = Self::load(
+        // Only load constructs this immutable closure. Exact current bytes keep
+        // its validated schema, sorted families and canonical digest unchanged.
+        Self::checked_raw(
             Path::new(&self.descriptor.pin.path),
             &self.descriptor.pin,
             self.descriptor.count,
             &self.descriptor.canonical_digest,
-        )?;
-        if checked.families != self.families {
-            return Err("External family closure changed".into());
-        }
-        Ok(())
+        )
+        .map(|_| ())
     }
     pub(crate) fn contains_family(&self, family: &str) -> bool {
         self.families.contains(family)
