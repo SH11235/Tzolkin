@@ -322,7 +322,13 @@ impl<'a> SemanticFrozenMixture<'a> {
         &self.binding
     }
     pub(crate) fn journal_binding(&self) -> Result<serde_json::Value, String> {
-        self.recheck()?;
+        with_source_check_pass(|checked| self.journal_binding_in(checked))
+    }
+    pub(crate) fn journal_binding_in(
+        &self,
+        checked: &mut SemanticSourceCheckPass<'_>,
+    ) -> Result<serde_json::Value, String> {
+        self.recheck_in(checked)?;
         Ok(serde_json::json!({"checksum":self.binding,
             "procedural":self.legacy.procedural_binding()?,
             "snapshots":self.slots.iter().map(|s| serde_json::json!({

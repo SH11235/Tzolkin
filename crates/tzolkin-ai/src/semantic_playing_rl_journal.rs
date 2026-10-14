@@ -407,7 +407,11 @@ impl<'a> SemanticPlayingJournal<'a> {
     ) -> Result<SemanticJournalReturnedClose, String> {
         let result = (|| {
             self.preflight()?;
-            let pool_description = pool.journal_binding()?; // Reject legacy neural/search slots before a game.
+            let plan = self.session.plan_reserved(seeds, pool, self.limits)?;
+            let pool_description = match plan.checked_pool_binding() {
+                Some(binding) => binding.clone(),
+                None => pool.journal_binding()?, // Legacy neural/search slots still refuse before a game.
+            };
             if let Some(slots) = pool_description.get("snapshots").and_then(Value::as_array)
                 && slots.iter().any(|s| {
                     s.get("snapshot")
@@ -417,7 +421,6 @@ impl<'a> SemanticPlayingJournal<'a> {
             {
                 return Err("Semantic mixture capture was not published by this journal".into());
             }
-            let plan = self.session.plan_reserved(seeds, pool, self.limits)?;
             let reserve = self
                 .prepare_entry(&json!({"kind":"reserve","plan":plan.description(),
                 "fixedPool":pool_description}))?;
@@ -817,6 +820,16 @@ pub(crate) fn journal_fixture(
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
+    let attempts_before_plan = journal.session.attempts();
+    let next_before_plan = journal.session.next_episode_ordinal();
+    let planned = journal
+        .session
+        .plan_reserved(next, PoolRef::Mixture(&mixture), limits)
+        .unwrap();
+    let pool_binding = mixture.journal_binding().unwrap();
+    assert_eq!(planned.checked_pool_binding(), Some(&pool_binding));
+    assert_eq!(journal.session.attempts(), attempts_before_plan);
+    assert_eq!(journal.session.next_episode_ordinal(), next_before_plan);
     let mixed_close = journal
         .update_using(next, PoolRef::Mixture(&mixture), create)
         .unwrap();
@@ -831,7 +844,8 @@ pub(crate) fn journal_fixture(
     let check_pool =
         |checked: &mut crate::conditional_semantic_playing_rl::SemanticSourceCheckPass<'_>| {
             pool_checks.set(pool_checks.get() + 1);
-            mixture.recheck_in(checked)
+            assert_eq!(mixture.journal_binding_in(checked)?, pool_binding);
+            Ok(())
         };
     let callback_error = checked_view
         .with_checked_pool::<()>(external, history.pins(), check_pool, |_| {
