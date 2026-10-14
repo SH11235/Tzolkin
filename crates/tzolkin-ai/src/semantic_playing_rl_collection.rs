@@ -1,7 +1,10 @@
 //! Separate in-memory schema-4 collection and fresh mechanical audit.
 //! Setup is an applied Corn-first teacher choice, never a learner draw or
-//! gradient step. No wire, journal, update, export or legacy-owner conversion.
+//! gradient step. Its separate closed record codec grants no journal, update,
+//! parameter export or legacy-owner conversion.
 use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
 
 use tzolkin_core::observation::{LegalAction, Observation, observe};
 use tzolkin_core::{
@@ -28,6 +31,9 @@ use crate::public_stochastic_native::{CollectionLimits, NativeStochasticConfig};
 use crate::semantic_playing_rl_pool::{
     FrozenSemanticSnapshot, OPPONENT_SAMPLING_VERSION, SemanticFrozenMixture,
     SemanticMixtureRoster, SnapshotCaptureLedger,
+};
+use crate::semantic_playing_rl_record::{
+    Header as RecordHeader, SemanticPlayingRecordAudit, SemanticPlayingRecordAuditor,
 };
 use crate::semantic_playing_rl_update::SemanticPlayingCurrentIdentity;
 
@@ -144,9 +150,11 @@ pub enum SemanticCallbackRole {
     Opponent,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SemanticSample {
     chosen: LegalAction,
+    #[serde(with = "crate::semantic_playing_rl_record::decision_bits")]
     decision: Decision,
     index: usize,
     sample_index: usize,
@@ -166,9 +174,16 @@ struct SemanticSample {
     logits_digest: String,
     distribution_digest: String,
 }
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(
+    tag = "role",
+    content = "payload",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
 enum Choice {
     LearnerSetup {
+        #[serde(with = "crate::semantic_playing_rl_record::decision_bits")]
         decision: Decision,
         chosen: LegalAction,
     },
@@ -178,6 +193,7 @@ enum Choice {
         snapshot: String,
     },
     Opponent {
+        #[serde(with = "crate::semantic_playing_rl_record::decision_bits")]
         decision: Decision,
         chosen: LegalAction,
     },
@@ -197,7 +213,8 @@ impl Choice {
         }
     }
 }
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Callback {
     index: usize,
     observation: Observation,
@@ -206,7 +223,8 @@ struct Callback {
     apply_attempted: bool,
     after: Option<String>,
 }
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Record {
     binding: String,
     callbacks: Vec<Callback>,
@@ -562,6 +580,27 @@ impl AuditedSemanticPlayingCohort {
     }
 }
 
+pub(crate) fn encode_records(
+    cohort: &AuditedSemanticPlayingCohort,
+) -> Result<[Vec<u8>; 4], String> {
+    cohort
+        .episodes
+        .iter()
+        .enumerate()
+        .map(|(member, episode)| {
+            let header = RecordHeader::new(
+                &cohort.parent,
+                member,
+                cohort.mixture.as_deref(),
+                &episode.config,
+            )?;
+            crate::semantic_playing_rl_record::encode(&header, &episode.record, &episode.config)
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .try_into()
+        .map_err(|_| "Semantic encoded whole-four shape".into())
+}
+
 /// Fixed fresh owner and explicit new allocation. This in-memory ledger burns
 /// whole-four families and ALL configured actor streams before game creation.
 /// It is not a durable reservation or proof of global history completeness.
@@ -570,6 +609,16 @@ pub struct SemanticPlayingCollectionSession<'a> {
     ledger: SemanticCollectionLedger<'a>,
 }
 impl<'a> SemanticPlayingCollectionSession<'a> {
+    /// Audit saved records against this unchanged current source. This borrow
+    /// cannot reserve or mutate the live session and exposes no training step.
+    pub fn record_auditor(&self) -> Result<SemanticPlayingRecordAuditor<'_, 'a>, String> {
+        let owner = self.owner.collection_view();
+        self.ledger.recheck(&owner)?;
+        Ok(SemanticPlayingRecordAuditor {
+            owner,
+            ledger: &self.ledger,
+        })
+    }
     pub fn new(
         owner: &'a SemanticPlayingRlOwner,
         external: &'a ConditionalNativeExclusions,
@@ -726,6 +775,104 @@ pub(crate) struct SemanticCollectionLedger<'a> {
     failed: Option<SemanticPlayingCollectedGame>,
 }
 impl<'a> SemanticCollectionLedger<'a> {
+    pub(crate) fn record_auditor<'state>(
+        &'state self,
+        owner: SemanticOwnerView<'state>,
+    ) -> Result<SemanticPlayingRecordAuditor<'state, 'a>, String> {
+        self.recheck(&owner)?;
+        Ok(SemanticPlayingRecordAuditor {
+            owner,
+            ledger: self,
+        })
+    }
+    pub(crate) fn audit_procedural_record(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        raw: &[u8],
+        config: &NativeStochasticConfig,
+        member: usize,
+        pool: &ConditionalFrozenPool,
+    ) -> Result<SemanticPlayingRecordAudit, String> {
+        pool.freeze_procedural()?;
+        self.audit_record(owner, raw, config, member, PoolRef::Legacy(pool, None))
+    }
+    pub(crate) fn audit_mixed_record(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        raw: &[u8],
+        config: &NativeStochasticConfig,
+        member: usize,
+        mixture: &SemanticFrozenMixture<'_>,
+    ) -> Result<SemanticPlayingRecordAudit, String> {
+        mixture.require_receiver(
+            owner,
+            self.external,
+            self.history,
+            (&self.spent, &self.streams),
+            &self.admitted,
+        )?;
+        self.audit_record(owner, raw, config, member, PoolRef::Mixture(mixture))
+    }
+    fn audit_record(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        raw: &[u8],
+        config: &NativeStochasticConfig,
+        member: usize,
+        pool: PoolRef<'_>,
+    ) -> Result<SemanticPlayingRecordAudit, String> {
+        let family = seed_family_id(config.environment_seed());
+        if member >= 4
+            || config.players() != if member < 2 { 3 } else { 4 }
+            || config.sampling_identity().sampling_seed() != self.seed
+            || config.sampling_identity().replicate_ordinal() != self.replicate
+            || !self.spent.contains(&family)
+            || self.external.contains_family(&family)
+            || split_for_family(&family)? != DatasetSplit::Train
+            || (0..config.players()).any(|actor| {
+                !self.streams.contains(&[
+                    self.seed.value(),
+                    config.sampling_identity().episode_ordinal(),
+                    self.replicate,
+                    config.players() as u64,
+                    actor as u64,
+                ])
+            })
+        {
+            return Err("Semantic record is outside this source's burned allocation".into());
+        }
+        pool.recheck()?;
+        let result = owner.with_checked(self.external, &self.pins, |scope| {
+            let rosters = pool.freeze()?;
+            let roster = rosters.get(member);
+            if roster.contains_family(&family) {
+                return Err("Semantic saved family overlaps frozen opponent lineage".into());
+            }
+            let binding = collection_binding(owner, self.external, self.history, pool)?;
+            let header = RecordHeader::new(
+                scope.parent_checksum(),
+                member,
+                match pool {
+                    PoolRef::Legacy(..) => None,
+                    PoolRef::Mixture(mixture) => Some(mixture.checksum()),
+                },
+                config,
+            )?;
+            let audited =
+                audit_bound_record(raw, &header, config, roster, scope, &binding, || {
+                    create(config)
+                })?;
+            Ok(SemanticPlayingRecordAudit::new(raw, &audited))
+        });
+        match (result, pool.recheck()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(post)) => Err(format!("Semantic record pool postcheck: {post}")),
+            (Err(error), Err(post)) => {
+                Err(format!("{error}; semantic record pool postcheck: {post}"))
+            }
+        }
+    }
     pub(crate) fn freeze_snapshot(
         &self,
         owner: &SemanticOwnerView<'_>,
@@ -1029,9 +1176,9 @@ impl<'a> SemanticCollectionLedger<'a> {
         if (0..4).any(|i| families.iter().any(|f| rosters.get(i).contains_family(f))) {
             return Err("Semantic family overlaps frozen opponent lineage".into());
         }
-        // A snapshot may come from another session with different declarations.
-        // Check every proposed actor tuple against every captured lineage before
-        // burning this batch or creating its first game, not only sampled slots.
+        // Only admitted same-chain snapshots with matching declarations and
+        // retained prior burns reach here. Check every proposed actor tuple
+        // against every captured ancestor before this batch, not only its slots.
         if (0..4).any(|i| {
             configs.iter().any(|config| {
                 (0..config.players()).any(|actor| {
@@ -1046,18 +1193,7 @@ impl<'a> SemanticCollectionLedger<'a> {
         let (identity, reservations) = owner.metadata();
         let parent = identity.to_string();
         let human_reservations = reservations.clone();
-        let binding = hash(
-            b"tzolkin-semantic-playing-in-memory-collection-v1\0",
-            &(
-                &parent,
-                self.external.descriptor(),
-                &self.history.checksum,
-                pool.binding()?,
-                &human_reservations,
-                crate::setup_policy::POLICY_VERSION,
-                HeuristicWeights::default(),
-            ),
-        )?;
+        let binding = collection_binding(owner, self.external, self.history, pool)?;
         let pins = self.pins.clone();
         owner.with_checked(self.external, &pins, |scope| {
             if scope.parent_checksum() != parent {
@@ -1107,6 +1243,65 @@ impl<'a> SemanticCollectionLedger<'a> {
             finish(scope, cohort)
         })
     }
+}
+
+fn collection_binding(
+    owner: &SemanticOwnerView<'_>,
+    external: &ConditionalNativeExclusions,
+    history: &DeclaredSamplingHistory,
+    pool: PoolRef<'_>,
+) -> Result<String, String> {
+    let (parent, human_reservations) = owner.metadata();
+    hash(
+        b"tzolkin-semantic-playing-in-memory-collection-v1\0",
+        &(
+            parent,
+            external.descriptor(),
+            &history.checksum,
+            pool.binding()?,
+            human_reservations,
+            crate::setup_policy::POLICY_VERSION,
+            HeuristicWeights::default(),
+        ),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_bound_record(
+    raw: &[u8],
+    header: &RecordHeader,
+    config: &NativeStochasticConfig,
+    roster: RosterRef<'_>,
+    scope: &SemanticCollectionScope<'_>,
+    binding: &str,
+    start: impl FnOnce() -> Result<GameState, String>,
+) -> Result<AuditedSemanticPlayingEpisode, String> {
+    // Deserializing this private record is not sealing it. Every callback,
+    // numerical draw, actual apply and terminal must match a fresh replay first.
+    let expected: Record = crate::semantic_playing_rl_record::decode(raw, header, config)?;
+    if !expected.complete() {
+        return Err("Incomplete semantic records have no successful audit".into());
+    }
+    if expected.callbacks.len() > config.limits().max_callbacks()
+        || expected.rows > config.limits().max_candidate_rows()
+        || expected
+            .callbacks
+            .iter()
+            .enumerate()
+            .any(|(i, c)| c.index != i)
+    {
+        return Err("Semantic saved callback/row bound or global index differs".into());
+    }
+    let actual = run(config, roster, scope, binding, Some(&expected), start)?;
+    if crate::semantic_playing_rl_record::encode(header, &actual, config)? != raw {
+        return Err("Semantic record numerical/decision bits differ after fresh replay".into());
+    }
+    seal(
+        actual,
+        config.clone(),
+        roster.learner_seat(),
+        roster.sampled_opponents(config.players()),
+    )
 }
 
 fn create(config: &NativeStochasticConfig) -> Result<GameState, String> {
@@ -1571,6 +1766,46 @@ pub(crate) fn mixed_trace_fixture(
     .unwrap();
     assert_eq!(episode.playing_steps(), complete.samples);
     assert_eq!(episode.actor_draws(), &complete.draws);
+    let header =
+        RecordHeader::new(scope.parent_checksum(), 0, Some(mixture.checksum()), config).unwrap();
+    let raw = crate::semantic_playing_rl_record::encode(&header, &episode.record, config).unwrap();
+    let replayed = audit_bound_record(
+        &raw,
+        &header,
+        config,
+        roster,
+        scope,
+        "synthetic-mixed-trace",
+        start,
+    )
+    .unwrap();
+    assert_eq!(replayed.record, episode.record);
+    // A recorded snapshot identity is a checked reference, never a snapshot
+    // constructor. The typed live roster determines its numerical behavior.
+    let mut changed: Record =
+        crate::semantic_playing_rl_record::decode(&raw, &header, config).unwrap();
+    let identity = changed
+        .callbacks
+        .iter_mut()
+        .find_map(|c| match c.choice.as_mut() {
+            Some(Choice::OpponentSample { snapshot, .. }) => Some(snapshot),
+            _ => None,
+        })
+        .unwrap();
+    *identity = "0".repeat(64);
+    let changed = crate::semantic_playing_rl_record::encode(&header, &changed, config).unwrap();
+    assert!(
+        audit_bound_record(
+            &changed,
+            &header,
+            config,
+            roster,
+            scope,
+            "synthetic-mixed-trace",
+            start,
+        )
+        .is_err()
+    );
     for index in 0..episode.playing_steps() {
         assert_eq!(episode.step(index).unwrap().actor(), roster.learner_seat());
     }
@@ -1729,6 +1964,83 @@ pub(crate) fn phase_collection_fixture(
         assert_eq!(episode.learner_setup_choices(), 0);
         assert!(episode.playing_steps() > 0);
         assert_eq!(episode.actor_draws()[0], episode.playing_steps() as u64);
+        let header = RecordHeader::new(scope.parent_checksum(), 0, None, &config).unwrap();
+        let raw =
+            crate::semantic_playing_rl_record::encode(&header, &episode.record, &config).unwrap();
+        assert!(
+            crate::public_stochastic_record::decode_typed_record::<crate::replay::SeatPolicy>(&raw)
+                .is_err()
+        );
+        let stored = crate::public_rl_record_storage::encode(&raw).unwrap();
+        let decoded = crate::public_rl_record_storage::decode(
+            &stored,
+            raw.len(),
+            &crate::model::digest(&raw),
+        )
+        .unwrap();
+        assert_eq!(decoded, raw);
+        let audited = audit_bound_record(
+            &decoded,
+            &header,
+            &config,
+            RosterRef::Legacy(&rosters[0]),
+            scope,
+            "synthetic-unit",
+            || Ok(last.clone()),
+        )
+        .unwrap();
+        assert_eq!(audited.record, episode.record);
+        assert_eq!(audited.playing_steps(), episode.playing_steps());
+        let mut wrong_schema: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        wrong_schema["header"]["featureSchema"] = json!(2);
+        assert!(
+            crate::semantic_playing_rl_record::decode::<Record>(
+                &serde_json::to_vec(&wrong_schema).unwrap(),
+                &header,
+                &config,
+            )
+            .is_err()
+        );
+        wrong_schema["header"]["featureSchema"] = json!(4);
+        wrong_schema["record"]["unrepresented"] = json!(true);
+        assert!(
+            crate::semantic_playing_rl_record::decode::<Record>(
+                &serde_json::to_vec(&wrong_schema).unwrap(),
+                &header,
+                &config,
+            )
+            .is_err()
+        );
+        let duplicate = [br#"{"header":null,"#.as_slice(), &raw[1..]].concat();
+        assert!(
+            crate::semantic_playing_rl_record::decode::<Record>(&duplicate, &header, &config)
+                .is_err()
+        );
+        let mut changed: Record =
+            crate::semantic_playing_rl_record::decode(&raw, &header, &config).unwrap();
+        changed
+            .callbacks
+            .iter_mut()
+            .find_map(|c| match c.choice.as_mut() {
+                Some(Choice::LearnerPlaying(sample)) => Some(sample),
+                _ => None,
+            })
+            .unwrap()
+            .raw ^= 1;
+        let changed =
+            crate::semantic_playing_rl_record::encode(&header, &changed, &config).unwrap();
+        assert!(
+            audit_bound_record(
+                &changed,
+                &header,
+                &config,
+                RosterRef::Legacy(&rosters[0]),
+                scope,
+                "synthetic-unit",
+                || Ok(last.clone()),
+            )
+            .is_err()
+        );
         for i in 0..episode.playing_steps() {
             let step = episode.step(i).unwrap();
             assert_eq!(step.observation().phase, Phase::Playing);
