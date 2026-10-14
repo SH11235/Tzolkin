@@ -366,3 +366,161 @@ pub enum SemanticSetupTeacherReference<'a> {
     GuardedNumeric(Box<super::numeric::NumericPolicy>),
     ConditionalHumanCountZeroAllPhase(Box<super::conditional::ConditionalCountZeroArenaPolicy<'a>>),
 }
+
+pub const SEMANTIC_PLAYING_POLICY_VERSION: &str =
+    "native-v5-teacher-playing4-corn-first-guarded-argmax-v1";
+pub const SEMANTIC_PLAYING_ARENA_SCHEMA: &str =
+    "tzolkin-native-playing4-teacher-paired-development-arena-v1";
+
+/// Only a dedicated checkpoint and its fully regenerated original dataset can
+/// construct this inference role. Raw parameters and report identities cannot.
+pub struct PreparedSemanticPlayingTeacher {
+    checkpoint: Box<crate::semantic_playing_teacher_training::SemanticPlayingTeacherCheckpoint>,
+    dataset: crate::semantic_playing_teacher_dataset::ValidatedSemanticPlayingTeacherDataset,
+    checkpoint_path: std::path::PathBuf,
+    checkpoint_pin: (usize, String),
+    kernel: ResolvedKernel,
+}
+impl PreparedSemanticPlayingTeacher {
+    pub fn load(checkpoint: &Path, dataset: &Path) -> Result<Self, String> {
+        use crate::semantic_playing_teacher_dataset as data;
+        use crate::semantic_playing_teacher_training as training;
+        let before = data::read(checkpoint, crate::model::MAX_ARTIFACT_BYTES as u64)?;
+        let checkpoint_pin = (before.len(), crate::model::digest(&before));
+        let result = (|| {
+            let loaded = training::SemanticPlayingTeacherCheckpoint::load(checkpoint)?;
+            let dataset = data::load_semantic_playing_teacher_dataset(dataset)?;
+            // Exactly one audited no-op outside callbacks. This checks current
+            // source/model/metrics consistency, not training-history authenticity.
+            training::validate_checkpoint_dataset(&dataset, &loaded)?;
+            Ok(Self {
+                checkpoint: Box::new(loaded),
+                dataset,
+                checkpoint_path: checkpoint.to_path_buf(),
+                checkpoint_pin: checkpoint_pin.clone(),
+                kernel: Kernel::Scalar.resolve()?,
+            })
+        })();
+        let after = data::read(checkpoint, crate::model::MAX_ARTIFACT_BYTES as u64)?;
+        if (after.len(), crate::model::digest(&after)) != checkpoint_pin {
+            return Err("Native Playing teacher checkpoint changed during load".into());
+        }
+        result
+    }
+    pub fn arena_handle(&self) -> Result<SemanticPlayingTeacherArenaPolicy<'_>, String> {
+        self.recheck_sources()?;
+        let guard = TradeGuardConfig::default();
+        Ok(SemanticPlayingTeacherArenaPolicy {
+            prepared: self,
+            identity: SemanticPlayingTeacherArenaIdentity {
+                policy_version: SEMANTIC_PLAYING_POLICY_VERSION.into(),
+                model_version: crate::semantic_playing_teacher_training::MODEL_VERSION.into(),
+                training_version: self.checkpoint.training_version.clone(),
+                task: crate::semantic_playing_teacher_training::TASK.into(),
+                input_contract: crate::semantic_playing_teacher_dataset::INPUT_CONTRACT.into(),
+                source_kind: crate::semantic_playing_teacher_dataset::SOURCE_KIND.into(),
+                checkpoint_checksum: self.checkpoint.checksum.clone(),
+                checkpoint_bytes_sha256: self.checkpoint_pin.1.clone(),
+                dataset: self.checkpoint.dataset.clone(),
+                feature_schema: crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA,
+                feature_count: crate::features::FEATURE_COUNT,
+                setup_policy_version: crate::setup_policy::POLICY_VERSION.into(),
+                setup_weights: crate::policy::HeuristicWeights::default(),
+                backend: self.kernel.backend().into(),
+                configuration_key: guard.configuration_key()?,
+                guard,
+                value_validity: ValueValidity::UnavailablePolicyOnly,
+                source_authenticated: false,
+                strength_measured: false,
+            },
+        })
+    }
+    pub(super) fn distribution(
+        &self,
+        o: &Observation,
+    ) -> Result<NumericPolicyDistribution, String> {
+        semantic_playing_distribution(self.checkpoint.model.parameters(), self.kernel, o)
+    }
+    pub fn recheck_sources(&self) -> Result<(), String> {
+        let result = self.dataset.recheck();
+        let bytes = crate::semantic_playing_teacher_dataset::read(
+            &self.checkpoint_path,
+            crate::model::MAX_ARTIFACT_BYTES as u64,
+        )?;
+        if (bytes.len(), crate::model::digest(&bytes)) != self.checkpoint_pin {
+            return Err("Native Playing teacher checkpoint changed after load".into());
+        }
+        result
+    }
+}
+pub(super) fn semantic_playing_distribution(
+    parameters: &[f32],
+    kernel: ResolvedKernel,
+    o: &Observation,
+) -> Result<NumericPolicyDistribution, String> {
+    validate_contract(o)?;
+    if o.phase != tzolkin_core::Phase::Playing
+        || o.legal_actions.len() > super::numeric::MAX_ROWS_PER_CALLBACK
+    {
+        return Err("Native Playing teacher requires bounded Playing rows".into());
+    }
+    let encoder = FeatureEncoder::new_semantic_playing(o)?;
+    let rows = (0..o.legal_actions.len())
+        .map(|i| encoder.encode_legal_tagged(i))
+        .collect::<Result<Vec<_>, _>>()?;
+    tzolkin_inference::policy::BorrowedSemanticPlayingPolicy::from_validated_parameters(parameters)?
+        .predict(kernel, &rows)
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticPlayingTeacherArenaIdentity {
+    pub policy_version: String,
+    pub model_version: String,
+    pub training_version: String,
+    pub task: String,
+    pub input_contract: String,
+    pub source_kind: String,
+    pub checkpoint_checksum: String,
+    pub checkpoint_bytes_sha256: String,
+    pub dataset: crate::semantic_playing_teacher_training::NativeTeacherDatasetIdentity,
+    pub feature_schema: u32,
+    pub feature_count: usize,
+    pub setup_policy_version: String,
+    pub setup_weights: crate::policy::HeuristicWeights,
+    pub backend: String,
+    pub guard: TradeGuardConfig,
+    pub configuration_key: String,
+    pub value_validity: ValueValidity,
+    pub source_authenticated: bool,
+    pub strength_measured: bool,
+}
+pub struct SemanticPlayingTeacherArenaPolicy<'a> {
+    pub(super) prepared: &'a PreparedSemanticPlayingTeacher,
+    identity: SemanticPlayingTeacherArenaIdentity,
+}
+impl SemanticPlayingTeacherArenaPolicy<'_> {
+    pub fn identity(&self) -> &SemanticPlayingTeacherArenaIdentity {
+        &self.identity
+    }
+    pub(super) fn exclude_source_families(
+        &self,
+        config: &super::numeric::NumericArenaConfig,
+    ) -> Result<(), String> {
+        if config.seeds.iter().any(|seed| {
+            self.identity
+                .dataset
+                .manifest
+                .families
+                .iter()
+                .any(|g| g.family_id == seed_family_id(*seed))
+        }) {
+            return Err("Native Playing Arena rejects every retained teacher source family".into());
+        }
+        Ok(())
+    }
+}
+/// Explicit fixed reference; no raw weights, Human origin or Search fallback.
+pub enum SemanticPlayingTeacherReference {
+    ResourceCycleV5,
+    GuardedNumeric(Box<super::numeric::NumericPolicy>),
+}

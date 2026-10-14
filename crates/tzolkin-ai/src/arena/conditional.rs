@@ -643,6 +643,7 @@ pub(super) struct ConditionalDecision {
 enum SetupRoute {
     CornFirst,
     SemanticPlayingCornFirst,
+    NativeTeacherPlayingCornFirst,
     NumericAllPhase(&'static str),
     PhaseRoutedDevelopment,
 }
@@ -651,6 +652,7 @@ impl SetupRoute {
         match self {
             Self::CornFirst => POLICY_VERSION,
             Self::SemanticPlayingCornFirst => SEMANTIC_PLAYING_POLICY_VERSION,
+            Self::NativeTeacherPlayingCornFirst => super::teacher::SEMANTIC_PLAYING_POLICY_VERSION,
             Self::NumericAllPhase(version) => version,
             Self::PhaseRoutedDevelopment => super::phase_routed::POLICY_VERSION,
         }
@@ -674,6 +676,15 @@ impl GameSession {
     pub(super) fn new_semantic_playing(policy: &SemanticPlayingConditionalPolicy<'_>) -> Self {
         Self::with_route(SetupRoute::SemanticPlayingCornFirst, &policy.identity.guard)
             .expect("semantic Playing constructor validated guard configuration")
+    }
+    pub(super) fn new_native_playing_teacher(
+        policy: &super::teacher::SemanticPlayingTeacherArenaPolicy<'_>,
+    ) -> Self {
+        Self::with_route(
+            SetupRoute::NativeTeacherPlayingCornFirst,
+            &policy.identity().guard,
+        )
+        .expect("native teacher constructor validated guard configuration")
     }
     pub(super) fn new_mixed(policy: &ConditionalMixedArenaPolicy<'_>) -> Self {
         Self::with_route(
@@ -816,6 +827,14 @@ impl GameSession {
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.prepared.distribution(o))
     }
+    pub(super) fn choose_native_playing_teacher(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &super::teacher::SemanticPlayingTeacherArenaPolicy<'_>,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.prepared.distribution(o))
+    }
     pub(super) fn choose_phase_routed(
         &mut self,
         index: usize,
@@ -850,7 +869,9 @@ impl GameSession {
                 Phase::Setup
                     if matches!(
                         self.setup,
-                        SetupRoute::CornFirst | SetupRoute::SemanticPlayingCornFirst
+                        SetupRoute::CornFirst
+                            | SetupRoute::SemanticPlayingCornFirst
+                            | SetupRoute::NativeTeacherPlayingCornFirst
                     ) =>
                 {
                     let decision = crate::setup_policy::choose_move_with_weights(
@@ -1416,6 +1437,27 @@ mod tests {
                 .r#move
         );
         assert_eq!(selected.policy_version, POLICY_VERSION);
+        let mut native = GameSession::with_route(
+            SetupRoute::NativeTeacherPlayingCornFirst,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        native.on_callback(0, &o).unwrap();
+        let selected_native = native
+            .choose_using(0, &o, |_| {
+                panic!("Native Playing teacher must not predict Setup")
+            })
+            .unwrap()
+            .decision;
+        assert_eq!(selected_native.r#move, selected.r#move);
+        assert_eq!(
+            selected_native.policy_version,
+            super::super::teacher::SEMANTIC_PLAYING_POLICY_VERSION
+        );
+        assert!(
+            super::super::teacher::semantic_playing_distribution(model.parameters(), scalar, &o)
+                .is_err()
+        );
         let corn_index = o
             .legal_actions
             .iter()
@@ -1547,6 +1589,28 @@ mod tests {
                 .choose_using(0, &o, |_| unreachable!())
                 .is_err()
         );
+        let native_prediction =
+            super::super::teacher::semantic_playing_distribution(model.parameters(), scalar, &o)
+                .unwrap();
+        let expected = playing.predict(scalar, &rows).unwrap();
+        assert_eq!(native_prediction.logits, expected.logits);
+        assert_eq!(native_prediction.probabilities, expected.probabilities);
+        let mut native = GameSession::with_route(
+            SetupRoute::NativeTeacherPlayingCornFirst,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        native.on_callback(0, &o).unwrap();
+        let decision = native
+            .choose_using(0, &o, |_| Ok(native_prediction))
+            .unwrap()
+            .decision;
+        assert_eq!(decision.r#move, o.legal_actions[expected_index].r#move);
+        assert_eq!(
+            decision.policy_version,
+            super::super::teacher::SEMANTIC_PLAYING_POLICY_VERSION
+        );
+        assert!(native.choose_using(0, &o, |_| unreachable!()).is_err());
     }
     #[test]
     fn conditional_trade_uses_shared_history_and_resets_on_other_actor() {
@@ -1576,6 +1640,7 @@ mod tests {
         for route in [
             SetupRoute::CornFirst,
             SetupRoute::SemanticPlayingCornFirst,
+            SetupRoute::NativeTeacherPlayingCornFirst,
             SetupRoute::NumericAllPhase(MIXED_POLICY_VERSION),
             SetupRoute::NumericAllPhase(COUNT_ZERO_POLICY_VERSION),
             SetupRoute::NumericAllPhase(super::super::teacher::POLICY_VERSION),

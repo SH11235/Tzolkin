@@ -12,8 +12,9 @@ use super::phase_routed::{
 };
 use super::teacher::{
     ResourceCycleTeacherArenaIdentity, ResourceCycleTeacherArenaPolicy,
-    SemanticSetupResourceCycleTeacherArenaPolicy, SemanticSetupTeacherArenaIdentity,
-    SemanticSetupTeacherReference,
+    SemanticPlayingTeacherArenaIdentity, SemanticPlayingTeacherArenaPolicy,
+    SemanticPlayingTeacherReference, SemanticSetupResourceCycleTeacherArenaPolicy,
+    SemanticSetupTeacherArenaIdentity, SemanticSetupTeacherReference,
 };
 use super::{
     ArmResult, BorrowedArenaPolicy, BorrowedArenaWorkBounds, InitialConditions, PairedStatistics,
@@ -692,6 +693,9 @@ pub enum PolicyIdentity {
     ResourceCycleV5SemanticSetupLearnedTeacher {
         identity: Box<SemanticSetupTeacherArenaIdentity>,
     },
+    NativeSemanticPlayingTeacher {
+        identity: Box<SemanticPlayingTeacherArenaIdentity>,
+    },
     SemanticSetupTeacherNumericPlayingDevelopment {
         identity: Box<PhaseRoutedDevelopmentIdentity>,
     },
@@ -708,6 +712,7 @@ enum Role<'a> {
     ConditionalCountZero(Box<ConditionalCountZeroArenaPolicy<'a>>),
     Teacher(Box<ResourceCycleTeacherArenaPolicy<'a>>),
     SemanticSetupTeacher(Box<SemanticSetupResourceCycleTeacherArenaPolicy<'a>>),
+    NativePlayingTeacher(Box<SemanticPlayingTeacherArenaPolicy<'a>>),
     PhaseRouted(Box<PhaseRoutedDevelopmentPolicy<'a>>),
     Reactive(PolicyHandle<'a>),
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
@@ -779,6 +784,9 @@ impl<'a> Role<'a> {
                     identity: Box::new(policy.identity().clone()),
                 }
             }
+            Self::NativePlayingTeacher(policy) => PolicyIdentity::NativeSemanticPlayingTeacher {
+                identity: Box::new(policy.identity().clone()),
+            },
             Self::PhaseRouted(policy) => {
                 PolicyIdentity::SemanticSetupTeacherNumericPlayingDevelopment {
                     identity: Box::new(policy.identity().clone()),
@@ -807,6 +815,7 @@ impl<'a> Role<'a> {
             Self::ConditionalMixed(policy) => Some(&policy.identity().configuration_key),
             Self::ConditionalCountZero(policy) => Some(&policy.identity().configuration_key),
             Self::Teacher(policy) => Some(&policy.identity().configuration_key),
+            Self::NativePlayingTeacher(policy) => Some(&policy.identity().configuration_key),
             Self::SemanticSetupTeacher(policy) => {
                 Some(&policy.identity().teacher.configuration_key)
             }
@@ -1057,6 +1066,9 @@ fn choose(
                 session.choose_count_zero(index, observation, policy)?
             }
             Role::Teacher(policy) => session.choose_teacher(index, observation, policy)?,
+            Role::NativePlayingTeacher(policy) => {
+                session.choose_native_playing_teacher(index, observation, policy)?
+            }
             Role::SemanticSetupTeacher(policy) => {
                 session.choose_semantic_setup_teacher(index, observation, policy)?
             }
@@ -1164,6 +1176,9 @@ fn choose(
                 return Err("Conditional Arena missing game session".into());
             }
             Role::Teacher(_) => return Err("Teacher Arena missing game session".into()),
+            Role::NativePlayingTeacher(_) => {
+                return Err("Native Playing teacher Arena missing game session".into());
+            }
             Role::SemanticSetupTeacher(_) => {
                 return Err("Semantic Setup teacher Arena missing game session".into());
             }
@@ -1391,6 +1406,9 @@ fn play_arm_using_with_setup<'a>(
             Role::ConditionalMixed(policy) => Some(GameSession::new_mixed(policy)),
             Role::ConditionalCountZero(policy) => Some(GameSession::new_count_zero(policy)),
             Role::Teacher(policy) => Some(GameSession::new_teacher(policy)),
+            Role::NativePlayingTeacher(policy) => {
+                Some(GameSession::new_native_playing_teacher(policy))
+            }
             Role::SemanticSetupTeacher(policy) => {
                 Some(GameSession::new_semantic_setup_teacher(policy))
             }
@@ -1406,6 +1424,10 @@ fn play_arm_using_with_setup<'a>(
                 ..GuardDiagnostics::default()
             }),
             Role::Teacher(_) | Role::SemanticSetupTeacher(_) => Some(GuardDiagnostics::default()),
+            Role::NativePlayingTeacher(_) => Some(GuardDiagnostics {
+                phase_routes: shared_setup.map(|_| PhaseRouteDiagnostics::default()),
+                ..GuardDiagnostics::default()
+            }),
             Role::Conditional(_)
             | Role::ConditionalSemanticPlaying(_)
             | Role::ConditionalMixed(_)
@@ -1994,6 +2016,170 @@ pub fn run_conditional_count_zero_validation<'a>(
         opponent_pool,
         super::conditional::COUNT_ZERO_ARENA_SCHEMA,
     )
+}
+
+pub const NATIVE_TEACHER_CONSENT_SCHEMA: &str =
+    "tzolkin-native-playing4-teacher-development-consent-v1";
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeTeacherDiagnosticConsent {
+    pub schema: String,
+    pub evidence_sha256: String,
+    pub exposed_development_family_ids: Vec<String>,
+    pub protected_holdout_family_ids: Vec<String>,
+}
+impl NativeTeacherDiagnosticConsent {
+    /// Checks a caller's explicit exposed-family declaration, not its completeness
+    /// or authority. Retained native teacher sources are excluded separately.
+    pub fn validate_for(&self, config: &NumericArenaConfig) -> Result<(), String> {
+        if self.schema != NATIVE_TEACHER_CONSENT_SCHEMA
+            || config.schema != SCHEMA
+            || ![3, 4].contains(&config.players)
+            || config.seeds.is_empty()
+            || config.seeds.len() > 64
+            || !digest(&self.evidence_sha256)
+            || !digest(&config.external_exclusions.evidence_sha256)
+        {
+            return Err(
+                "Native teacher diagnostic requires explicit bounded Development consent".into(),
+            );
+        }
+        fn ids(values: &[String], max: usize) -> Result<BTreeSet<&String>, String> {
+            let set = values.iter().collect::<BTreeSet<_>>();
+            if values.len() > max || set.len() != values.len() || set.iter().any(|v| !digest(v)) {
+                return Err("Invalid native teacher family metadata".into());
+            }
+            Ok(set)
+        }
+        let excluded = ids(
+            &config.external_exclusions.excluded_family_ids,
+            MAX_EXCLUDED_FAMILIES,
+        )?;
+        let allowed = ids(&self.exposed_development_family_ids, 64)?;
+        let protected = ids(&self.protected_holdout_family_ids, MAX_EXCLUDED_FAMILIES)?;
+        let selected = config
+            .seeds
+            .iter()
+            .map(|s| family_id(*s))
+            .collect::<BTreeSet<_>>();
+        if !allowed.is_subset(&excluded)
+            || !protected.is_subset(&excluded)
+            || !allowed.is_disjoint(&protected)
+            || allowed.iter().any(|id| {
+                !matches!(
+                    crate::dataset::split_for_family(id),
+                    Ok(DatasetSplit::Train | DatasetSplit::Validation)
+                )
+            })
+            || selected.len() != config.seeds.len()
+            || selected.iter().collect::<BTreeSet<_>>() != allowed
+        {
+            return Err("Native teacher diagnostic requires exact exposed families and full heldout protection".into());
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTeacherArenaReport {
+    pub schema: String,
+    pub consent: Option<NativeTeacherDiagnosticConsent>,
+    pub admission_sha256: String,
+    pub paired: NumericArenaReport,
+    pub count_neutral: bool,
+    pub fresh_test_claimed: bool,
+    pub training_credit_granted: bool,
+    pub adoption_granted: bool,
+}
+pub fn run_native_playing_teacher_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: SemanticPlayingTeacherArenaPolicy<'a>,
+    reference: SemanticPlayingTeacherReference,
+    pool: Vec<Opponent<'a>>,
+) -> Result<NativeTeacherArenaReport, String> {
+    run_native_playing_teacher(config, None, candidate, reference, pool)
+}
+pub fn run_native_playing_teacher_diagnostic<'a>(
+    config: &NumericArenaConfig,
+    consent: &NativeTeacherDiagnosticConsent,
+    candidate: SemanticPlayingTeacherArenaPolicy<'a>,
+    reference: SemanticPlayingTeacherReference,
+    pool: Vec<Opponent<'a>>,
+) -> Result<NativeTeacherArenaReport, String> {
+    run_native_playing_teacher(config, Some(consent), candidate, reference, pool)
+}
+fn run_native_playing_teacher<'a>(
+    config: &NumericArenaConfig,
+    consent: Option<&NativeTeacherDiagnosticConsent>,
+    candidate: SemanticPlayingTeacherArenaPolicy<'a>,
+    reference: SemanticPlayingTeacherReference,
+    pool: Vec<Opponent<'a>>,
+) -> Result<NativeTeacherArenaReport, String> {
+    let prepared = candidate.prepared;
+    prepared.recheck_sources()?;
+    let result = (|| {
+        match consent {
+            Some(c) => c.validate_for(config)?,
+            None => config.validate()?,
+        }
+        if config.seeds.len() > 64 {
+            return Err("Native teacher Arena accepts at most 64 families".into());
+        }
+        candidate.exclude_source_families(config)?;
+        if pool.len() != config.players || pool.iter().any(|p| matches!(p, Opponent::Search(_))) {
+            return Err(
+                "Native teacher requires a fixed procedural/numeric absolute-seat pool".into(),
+            );
+        }
+        let reference = match reference {
+            SemanticPlayingTeacherReference::ResourceCycleV5 => {
+                Role::ResourceCycle(super::resource_cycle::ResourceCycleConfig::v5())
+            }
+            SemanticPlayingTeacherReference::GuardedNumeric(policy) => Role::Numeric(*policy),
+        };
+        let candidate = Role::NativePlayingTeacher(Box::new(candidate));
+        let pool = pool
+            .into_iter()
+            .map(Role::from_opponent)
+            .collect::<Result<Vec<_>, _>>()?;
+        let guard = candidate
+            .guard_key()
+            .expect("validated native teacher guard");
+        if reference.guard_key().is_some_and(|key| key != guard)
+            || pool
+                .iter()
+                .any(|p| p.guard_key().is_some_and(|key| key != guard))
+        {
+            return Err("Native teacher requires one fixed shared trade guard".into());
+        }
+        let admission_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(config, consent)).map_err(|e| e.to_string())?)
+        );
+        let schema = super::teacher::SEMANTIC_PLAYING_ARENA_SCHEMA;
+        let paired = run_admitted_roles(
+            config,
+            candidate,
+            reference,
+            pool,
+            schema,
+            Some(SharedCornFirstSetupIdentity::current()),
+        )?;
+        Ok(NativeTeacherArenaReport {
+            schema: schema.into(),
+            consent: consent.cloned(),
+            admission_sha256,
+            paired,
+            count_neutral: consent.is_some(),
+            fresh_test_claimed: false,
+            training_credit_granted: false,
+            adoption_granted: false,
+        })
+    })();
+    // The entire paired operation, including failed/incomplete arms, keeps the
+    // original custody checks outside every numeric callback.
+    prepared.recheck_sources()?;
+    result
 }
 
 fn run_roles<'a>(
@@ -2976,6 +3162,43 @@ pub(super) mod tests {
             protected_holdout_family_ids: vec![family_id(10)],
         };
         consent.validate_for(&reanalysis).unwrap();
+        let native_consent = NativeTeacherDiagnosticConsent {
+            schema: NATIVE_TEACHER_CONSENT_SCHEMA.into(),
+            evidence_sha256: consent.evidence_sha256.clone(),
+            exposed_development_family_ids: consent.exposed_development_family_ids.clone(),
+            protected_holdout_family_ids: consent.protected_holdout_family_ids.clone(),
+        };
+        native_consent.validate_for(&reanalysis).unwrap();
+        for mutate in 0..5 {
+            let mut c = native_consent.clone();
+            let mut configured = reanalysis.clone();
+            let expected = match mutate {
+                0 => {
+                    c.protected_holdout_family_ids.push(family_id(3));
+                    "Native teacher diagnostic requires exact exposed families and full heldout protection"
+                }
+                1 => {
+                    c.exposed_development_family_ids.push(family_id(3));
+                    "Invalid native teacher family metadata"
+                }
+                2 => {
+                    configured.external_exclusions.excluded_family_ids.clear();
+                    "Native teacher diagnostic requires exact exposed families and full heldout protection"
+                }
+                3 => {
+                    assert_eq!(seed_partition(10), Ok(DatasetSplit::Test));
+                    configured.seeds = vec![10];
+                    c.exposed_development_family_ids = vec![family_id(10)];
+                    c.protected_holdout_family_ids.clear();
+                    "Native teacher diagnostic requires exact exposed families and full heldout protection"
+                }
+                _ => {
+                    c.evidence_sha256.clear();
+                    "Native teacher diagnostic requires explicit bounded Development consent"
+                }
+            };
+            assert_eq!(c.validate_for(&configured).unwrap_err(), expected);
+        }
         let mut no_additional_holdout = consent.clone();
         no_additional_holdout.protected_holdout_family_ids.clear();
         no_additional_holdout.validate_for(&reanalysis).unwrap();
