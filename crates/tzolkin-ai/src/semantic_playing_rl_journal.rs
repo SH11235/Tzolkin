@@ -743,7 +743,7 @@ pub(crate) fn journal_fixture(
         .enumerate()
     {
         assert_eq!(config["environmentSeed"], seeds[i]);
-        assert_eq!(config["episodeOrdinal"], (200 + i).to_string());
+        assert_eq!(config["episodeOrdinal"], format!("{:016x}", 200 + i));
         assert_eq!(config["players"], if i < 2 { 3 } else { 4 });
     }
     let snapshot = journal.freeze_snapshot().unwrap(); // Warm capture needs no OS-close claim.
