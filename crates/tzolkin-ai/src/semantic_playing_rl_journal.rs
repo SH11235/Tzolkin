@@ -848,7 +848,7 @@ pub(crate) fn journal_fixture(
         .unwrap_err();
     fs::write(&source_path, source_bytes).unwrap();
     assert!(source_error.contains("Synthetic checked cohort callback"));
-    assert!(source_error.contains("Semantic source postcheck"));
+    assert!(source_error.contains("semantic source postcheck"));
     assert_eq!(pool_checks.get(), 4); // Pool POST is attempted even after source failure.
     let pin = &prepared.loaded_semantic_playing_sources().unwrap()[0];
     let mut wrong_bytes = pin.clone();
