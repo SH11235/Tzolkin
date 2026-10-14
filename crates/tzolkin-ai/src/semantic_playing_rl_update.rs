@@ -169,6 +169,15 @@ pub struct SemanticPlayingJointSession<'a> {
     critic_config: ResidualFitConfig,
 }
 impl<'a> SemanticPlayingJointSession<'a> {
+    /// Borrow the admitted current source for saved-record auditing only.
+    /// No restore, reservation, actor-step or ownership conversion is exposed.
+    pub fn record_auditor(
+        &self,
+    ) -> Result<crate::semantic_playing_rl_record::SemanticPlayingRecordAuditor<'_, 'a>, String>
+    {
+        self.ledger
+            .record_auditor(self.state.view(self.identity.checksum()))
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn from_fresh(
         owner: SemanticPlayingRlOwner,
@@ -706,6 +715,20 @@ pub(crate) fn joint_fixture() {
                 limits,
                 |scope, cohort| {
                     assert_eq!(cohort.parent_checksum(), previous);
+                    let records =
+                        crate::semantic_playing_rl_record::encode_records(&cohort).unwrap();
+                    let stored = crate::semantic_playing_rl_record::store_records(&cohort).unwrap();
+                    for (raw, saved) in records.iter().zip(&stored) {
+                        assert_eq!(
+                            crate::public_rl_record_storage::decode(
+                                saved.stored_bytes(),
+                                saved.raw_bytes(),
+                                saved.raw_sha256(),
+                            )
+                            .unwrap(),
+                            *raw,
+                        );
+                    }
                     assert!(
                         cohort
                             .episodes()

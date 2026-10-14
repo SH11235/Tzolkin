@@ -79,6 +79,7 @@ pub mod search_native;
 pub mod selfplay_batch;
 pub mod semantic_playing_rl_collection;
 pub mod semantic_playing_rl_pool;
+pub mod semantic_playing_rl_record;
 pub mod semantic_playing_rl_update;
 pub mod setup_policy;
 pub mod state_mc_dataset;
