@@ -150,6 +150,29 @@ export interface SemanticCheckpointIdentity {
   readonly verifiedNativePolicy: false;
   readonly strengthMeasured: false;
 }
+/** Closed BC lineage; epochs are not RL updates or credit. */
+export interface NativeBcIdentity {
+  readonly sourceRole: 'nativeV7BcPolicy';
+  readonly task: 'NativeV7BcPlayingPolicyInference';
+  readonly sourceKind: 'verifiedNativeCornFirstV7PlayingTeacher';
+  readonly sourceTask: 'nativeCornFirstV7SemanticPlayingPolicyOnlyBc';
+  readonly sourceInputContract: 'native-corn-first-v7-playing-policy-only-semantic4-v1';
+  readonly sourceModelVersion: 'native-corn-first-v7-playing-512x32x1-scalar-v1';
+  readonly sourceTrainingVersion: 'native-playing4-teacher-scalar-adam-fisher-yates-v1';
+  readonly checkpointSha256: string;
+  readonly checkpointChecksum: string;
+  readonly modelChecksum: string;
+  readonly rawManifestSha256: string;
+  readonly datasetFingerprint: string;
+  readonly teacherPolicyId: string;
+  readonly actorChecksum: string;
+  readonly completedEpochs: string;
+  readonly sourceAuthenticated: false;
+  readonly sourceQualified: false;
+  readonly verifiedNativePolicy: false;
+  readonly strengthMeasured: false;
+  readonly adoptionGranted: false;
+}
 /** Numeric content identity only; these fields do not establish training qualification. */
 export interface CpuModelMetadata {
   readonly checksum: string;
@@ -160,10 +183,11 @@ export interface CpuModelMetadata {
     | 'rlCurrentMixed'
     | 'conditionalHumanCurrentMixed'
     | 'ownSetupCurrentMixedComposite'
-    | 'semanticPlayingCheckpointCornFirst';
+    | 'semanticPlayingCheckpointCornFirst'
+    | 'nativeV7BcCornFirst';
   readonly sourceChecksum: string;
   readonly sourceNumericalTarget: string;
-  readonly updateCount: number | string | null;
+  readonly updateCount?: number | string | null;
   readonly policyVersion: string;
   readonly backend: 'scalar';
   readonly currentMixedIdentity?: CurrentMixedIdentity;
@@ -171,7 +195,11 @@ export interface CpuModelMetadata {
   readonly ownSetupIdentity?: OwnSetupIdentity;
   readonly fixedPlayingIdentity?: FixedPlayingIdentity;
   readonly semanticCheckpointIdentity?: SemanticCheckpointIdentity;
-  readonly actorPolicyVersion?: 'semantic-playing-checkpoint-policy-scalar-v1';
+  readonly nativeBcIdentity?: NativeBcIdentity;
+  readonly completedEpochs?: string;
+  readonly adoptionGranted?: false;
+  readonly actorPolicyVersion?:
+    'semantic-playing-checkpoint-policy-scalar-v1' | 'native-v7-bc-playing-policy-scalar-v1';
   readonly setupPolicyVersion?: 'corn-first-setup-v2';
   readonly setupSelection?: 'sharedDeterministicSelector';
   readonly sourceAuthenticated?: false;
@@ -185,6 +213,7 @@ export const GUARDED_CONDITIONAL_POLICY_VERSION = 'numeric-conditional-human-tra
 export const GUARDED_OWN_SETUP_POLICY_VERSION = 'own-setup-composite-trade-guard-v1';
 export const GUARDED_SEMANTIC_CHECKPOINT_POLICY_VERSION =
   'semantic-checkpoint-corn-first-trade-guard-v1';
+export const GUARDED_NATIVE_V7_BC_POLICY_VERSION = 'native-v7-bc-corn-first-trade-guard-v1';
 const GUARD_VERSION = 'public-trade-cycle-guard-v1';
 const PROJECTION_VERSION = 'public-trading-state-v1';
 export interface CpuGameMetadata {
@@ -194,7 +223,8 @@ export interface CpuGameMetadata {
     | typeof GUARDED_POLICY_VERSION
     | typeof GUARDED_CONDITIONAL_POLICY_VERSION
     | typeof GUARDED_OWN_SETUP_POLICY_VERSION
-    | typeof GUARDED_SEMANTIC_CHECKPOINT_POLICY_VERSION;
+    | typeof GUARDED_SEMANTIC_CHECKPOINT_POLICY_VERSION
+    | typeof GUARDED_NATIVE_V7_BC_POLICY_VERSION;
   readonly rawPolicyVersion: string;
   readonly guardVersion: string;
   readonly projectionVersion: string;
@@ -296,17 +326,24 @@ function modelMetadata(value: unknown): CpuModelMetadata {
   const metadata = value as CpuModelMetadata;
   if (
     metadata.sourceRole !== 'semanticPlayingCheckpointCornFirst' &&
-    [
-      'semanticCheckpointIdentity',
-      'actorPolicyVersion',
-      'setupPolicyVersion',
-      'setupSelection',
-    ].some((key) => Object.hasOwn(metadata, key))
+    metadata.sourceRole !== 'nativeV7BcCornFirst' &&
+    ['actorPolicyVersion', 'setupPolicyVersion', 'setupSelection'].some((key) =>
+      Object.hasOwn(metadata, key),
+    )
   )
     throw new Error('NNモデル情報が不正です。');
   if (
     metadata.sourceRole !== 'ownSetupCurrentMixedComposite' &&
     (Object.hasOwn(metadata, 'ownSetupIdentity') || Object.hasOwn(metadata, 'fixedPlayingIdentity'))
+  )
+    throw new Error('NNモデル情報が不正です。');
+  if (
+    (metadata.sourceRole !== 'semanticPlayingCheckpointCornFirst' &&
+      Object.hasOwn(metadata, 'semanticCheckpointIdentity')) ||
+    (metadata.sourceRole !== 'nativeV7BcCornFirst' &&
+      ['nativeBcIdentity', 'completedEpochs', 'adoptionGranted'].some((key) =>
+        Object.hasOwn(metadata, key),
+      ))
   )
     throw new Error('NNモデル情報が不正です。');
   const roleMatches =
@@ -329,7 +366,8 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     (metadata.sourceRole === 'ownSetupCurrentMixedComposite' &&
       ownSetupMetadataMatches(metadata)) ||
     (metadata.sourceRole === 'semanticPlayingCheckpointCornFirst' &&
-      semanticCheckpointMetadataMatches(metadata));
+      semanticCheckpointMetadataMatches(metadata)) ||
+    (metadata.sourceRole === 'nativeV7BcCornFirst' && nativeBcMetadataMatches(metadata));
   if (
     typeof metadata.checksum !== 'string' ||
     !SHA256.test(metadata.checksum) ||
@@ -342,6 +380,11 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     !roleMatches
   )
     throw new Error('NNモデル情報が不正です。');
+  if (metadata.sourceRole === 'nativeV7BcCornFirst')
+    return Object.freeze({
+      ...metadata,
+      nativeBcIdentity: Object.freeze({ ...metadata.nativeBcIdentity! }),
+    });
   if (metadata.sourceRole === 'semanticPlayingCheckpointCornFirst')
     return Object.freeze({
       ...metadata,
@@ -388,6 +431,80 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     });
   }
   return Object.freeze({ ...metadata });
+}
+
+function nativeBcMetadataMatches(metadata: CpuModelMetadata): boolean {
+  const identity = metadata.nativeBcIdentity;
+  if (!identity || typeof identity !== 'object') return false;
+  const constants = {
+    sourceRole: 'nativeV7BcPolicy',
+    task: 'NativeV7BcPlayingPolicyInference',
+    sourceKind: 'verifiedNativeCornFirstV7PlayingTeacher',
+    sourceTask: 'nativeCornFirstV7SemanticPlayingPolicyOnlyBc',
+    sourceInputContract: 'native-corn-first-v7-playing-policy-only-semantic4-v1',
+    sourceModelVersion: 'native-corn-first-v7-playing-512x32x1-scalar-v1',
+    sourceTrainingVersion: 'native-playing4-teacher-scalar-adam-fisher-yates-v1',
+    sourceAuthenticated: false,
+    sourceQualified: false,
+    verifiedNativePolicy: false,
+    strengthMeasured: false,
+    adoptionGranted: false,
+  };
+  const digests = [
+    'checkpointSha256',
+    'checkpointChecksum',
+    'modelChecksum',
+    'rawManifestSha256',
+    'datasetFingerprint',
+    'teacherPolicyId',
+    'actorChecksum',
+  ] as const;
+  const keys = [...Object.keys(constants), ...digests, 'completedEpochs'];
+  const metadataKeys = [
+    'checksum',
+    'sourceRole',
+    'sourceChecksum',
+    'sourceNumericalTarget',
+    'completedEpochs',
+    'policyVersion',
+    'backend',
+    'actorPolicyVersion',
+    'setupPolicyVersion',
+    'setupSelection',
+    'nativeBcIdentity',
+    'sourceAuthenticated',
+    'sourceQualified',
+    'verifiedNativePolicy',
+    'strengthMeasured',
+    'adoptionGranted',
+    'valueValidity',
+  ];
+  return (
+    Object.keys(identity).length === keys.length &&
+    keys.every((key) => Object.hasOwn(identity, key)) &&
+    Object.entries(constants).every(([key, value]) => Reflect.get(identity, key) === value) &&
+    digests.every((key) => typeof identity[key] === 'string' && SHA256.test(identity[key])) &&
+    typeof identity.completedEpochs === 'string' &&
+    /^[1-9][0-9]{0,3}$/.test(identity.completedEpochs) &&
+    Number(identity.completedEpochs) <= 1000 &&
+    Object.keys(metadata).length === metadataKeys.length &&
+    metadataKeys.every((key) => Object.hasOwn(metadata, key)) &&
+    metadata.completedEpochs === identity.completedEpochs &&
+    metadata.sourceChecksum === identity.actorChecksum &&
+    metadata.policyVersion === 'native-v7-bc-corn-first-scalar-v1' &&
+    metadata.actorPolicyVersion === 'native-v7-bc-playing-policy-scalar-v1' &&
+    metadata.setupPolicyVersion === 'corn-first-setup-v2' &&
+    metadata.setupSelection === 'sharedDeterministicSelector' &&
+    /^scalar-f32-f64-tick53-v1:[a-z0-9_]{1,32}:[a-z0-9_]{1,32}:(32|64)$/.test(
+      metadata.sourceNumericalTarget,
+    ) &&
+    metadata.sourceAuthenticated === false &&
+    metadata.sourceQualified === false &&
+    metadata.verifiedNativePolicy === false &&
+    metadata.strengthMeasured === false &&
+    metadata.adoptionGranted === false &&
+    metadata.valueValidity === 'unavailablePolicyOnly'
+  );
 }
 
 function semanticCheckpointMetadataMatches(metadata: CpuModelMetadata): boolean {
@@ -997,7 +1114,9 @@ export function startCpuGame(signal: AbortSignal, modelChecksum: string): Promis
               ? GUARDED_OWN_SETUP_POLICY_VERSION
               : metadata.sourceRole === 'semanticPlayingCheckpointCornFirst'
                 ? GUARDED_SEMANTIC_CHECKPOINT_POLICY_VERSION
-                : GUARDED_POLICY_VERSION) ||
+                : metadata.sourceRole === 'nativeV7BcCornFirst'
+                  ? GUARDED_NATIVE_V7_BC_POLICY_VERSION
+                  : GUARDED_POLICY_VERSION) ||
         value.rawPolicyVersion !== metadata.policyVersion ||
         value.guardVersion !== GUARD_VERSION ||
         value.projectionVersion !== PROJECTION_VERSION ||

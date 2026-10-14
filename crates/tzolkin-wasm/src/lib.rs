@@ -176,7 +176,7 @@ impl CpuGuard {
             Self::Native(_) => deployment::GUARDED_DEPLOYMENT_VERSION,
             Self::Conditional(_) => conditional::GUARDED_POLICY_VERSION,
             Self::OwnSetup(_) => own_setup::GUARDED_POLICY_VERSION,
-            Self::Semantic(_) => semantic::GUARDED_POLICY_VERSION,
+            Self::Semantic(game) => game.policy().guarded_policy_version(),
         }
     }
     fn on_callback(
@@ -287,6 +287,12 @@ impl CpuDeployment {
             tzolkin_inference::semantic_playing_deployment::DEPLOYMENT_SCHEMA => {
                 CpuPolicy::Semantic(Box::new(
                     semantic::Policy::load(bytes).map_err(|error| JsError::new(&error))?,
+                ))
+            }
+            tzolkin_inference::semantic_playing_deployment::NATIVE_V7_BC_SCHEMA => {
+                CpuPolicy::Semantic(Box::new(
+                    semantic::Policy::load_native_v7_bc(bytes)
+                        .map_err(|error| JsError::new(&error))?,
                 ))
             }
             _ => return Err(JsError::new("Unsupported NN deployment format")),

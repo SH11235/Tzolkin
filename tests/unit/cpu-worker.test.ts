@@ -754,6 +754,102 @@ describe('CPU Worker request lifecycle', () => {
       expect(currentWorker.terminated).toBe(true);
       expect(getLoadedCpuModel()).toBeUndefined();
     }
+    const nativeBc: CpuModelMetadata = {
+      checksum: model.checksum,
+      sourceRole: 'nativeV7BcCornFirst',
+      sourceChecksum: 'c'.repeat(64),
+      sourceNumericalTarget: model.sourceNumericalTarget,
+      policyVersion: 'native-v7-bc-corn-first-scalar-v1',
+      actorPolicyVersion: 'native-v7-bc-playing-policy-scalar-v1',
+      backend: 'scalar',
+      completedEpochs: '30',
+      setupPolicyVersion: 'corn-first-setup-v2',
+      setupSelection: 'sharedDeterministicSelector',
+      sourceAuthenticated: false,
+      sourceQualified: false,
+      verifiedNativePolicy: false,
+      strengthMeasured: false,
+      adoptionGranted: false,
+      valueValidity: 'unavailablePolicyOnly',
+      nativeBcIdentity: {
+        sourceRole: 'nativeV7BcPolicy',
+        task: 'NativeV7BcPlayingPolicyInference',
+        sourceKind: 'verifiedNativeCornFirstV7PlayingTeacher',
+        sourceTask: 'nativeCornFirstV7SemanticPlayingPolicyOnlyBc',
+        sourceInputContract: 'native-corn-first-v7-playing-policy-only-semantic4-v1',
+        sourceModelVersion: 'native-corn-first-v7-playing-512x32x1-scalar-v1',
+        sourceTrainingVersion: 'native-playing4-teacher-scalar-adam-fisher-yates-v1',
+        checkpointSha256: 'a'.repeat(64),
+        checkpointChecksum: 'b'.repeat(64),
+        modelChecksum: 'c'.repeat(64),
+        rawManifestSha256: 'd'.repeat(64),
+        datasetFingerprint: 'e'.repeat(64),
+        teacherPolicyId: 'f'.repeat(64),
+        actorChecksum: 'c'.repeat(64),
+        completedEpochs: '30',
+        sourceAuthenticated: false,
+        sourceQualified: false,
+        verifiedNativePolicy: false,
+        strengthMeasured: false,
+        adoptionGranted: false,
+      },
+    };
+    const bcLoad = loadCpuModel(bytes, signal);
+    const bcWorker = FakeWorker.instances.at(-1)!;
+    bcWorker.respond({ metadata: nativeBc });
+    await expect(bcLoad).resolves.toEqual(nativeBc);
+    expect(Object.isFrozen(getLoadedCpuModel()?.nativeBcIdentity)).toBe(true);
+    expect(getLoadedCpuModel()).not.toHaveProperty('updateCount');
+    expect(getLoadedCpuModel()).not.toHaveProperty('semanticCheckpointIdentity');
+    const bcStart = api.startCpuGame(signal, nativeBc.checksum);
+    const bcGame = {
+      ...gameMetadata,
+      gameId: bcWorker.request!.gameId,
+      policyVersion: 'native-v7-bc-corn-first-trade-guard-v1',
+      rawPolicyVersion: nativeBc.policyVersion,
+    };
+    bcWorker.respond({ gameMetadata: bcGame });
+    const bcCallback = await notify(api, bcWorker, await bcStart, signal);
+    const bcChoice = chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: nativeBc.checksum },
+      bcCallback,
+    );
+    const bcDecision = {
+      ...nnDecision,
+      policyVersion: bcGame.policyVersion,
+      rawPolicyVersion: nativeBc.policyVersion,
+      callbackIndex: bcCallback.index,
+    };
+    bcWorker.reply(bcDecision);
+    await expect(bcChoice).resolves.toEqual(bcDecision);
+    for (const invalid of [
+      { ...nativeBc, updateCount: '30' },
+      { ...nativeBc, semanticCheckpointIdentity: semantic.semanticCheckpointIdentity },
+      { ...nativeBc, sourceRole: 'semanticPlayingCheckpointCornFirst' },
+      { ...nativeBc, actorPolicyVersion: semantic.actorPolicyVersion },
+      { ...nativeBc, completedEpochs: 30 },
+      { ...nativeBc, completedEpochs: '030' },
+      { ...nativeBc, sourceChecksum: 'd'.repeat(64) },
+      { ...nativeBc, adoptionGranted: true },
+      { ...nativeBc, nativeBcIdentity: { ...nativeBc.nativeBcIdentity, completedEpochs: '1001' } },
+      {
+        ...nativeBc,
+        nativeBcIdentity: {
+          ...nativeBc.nativeBcIdentity,
+          sourceKind: 'verifiedNativeCornFirstV5PlayingTeacher',
+        },
+      },
+      { ...nativeBc, nativeBcIdentity: { ...nativeBc.nativeBcIdentity, extra: false } },
+    ]) {
+      const refused = loadCpuModel(bytes, signal);
+      const currentWorker = FakeWorker.instances.at(-1)!;
+      currentWorker.respond({ metadata: invalid });
+      await expect(refused).rejects.toThrow('不正');
+      expect(currentWorker.terminated).toBe(true);
+      expect(getLoadedCpuModel()).toBeUndefined();
+    }
   });
 
   it('invalidates replacement/aborted caches and rejects busy or unloaded NN calls without fallback', async () => {
