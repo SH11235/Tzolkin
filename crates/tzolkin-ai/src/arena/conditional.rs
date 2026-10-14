@@ -1822,7 +1822,7 @@ mod tests {
                 assert_eq!(counts.eligible_by_placement_count, [1; 4]);
                 assert_eq!(
                     counts.changed_moves,
-                    counts.changed_by_placement_count.iter().sum()
+                    counts.changed_by_placement_count.iter().sum::<usize>()
                 );
                 assert_eq!(tzolkin_core::available_workers(&state, 0), workers - 3);
                 let later = observe(&state, state.current_player).unwrap();
