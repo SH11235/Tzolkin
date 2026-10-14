@@ -459,6 +459,7 @@ impl PreparedSemanticPlayingTeacher {
         };
         Ok(SemanticPlayingTeacherArenaPolicy {
             prepared: self,
+            v7_agreement_diagnostics: false,
             identity: SemanticPlayingTeacherArenaIdentity {
                 policy_version: policy_version.into(),
                 model_version: model_version.into(),
@@ -610,10 +611,20 @@ pub struct SemanticPlayingTeacherArenaIdentity {
 pub struct SemanticPlayingTeacherArenaPolicy<'a> {
     pub(super) prepared: &'a PreparedSemanticPlayingTeacher,
     identity: SemanticPlayingTeacherArenaIdentity,
+    pub(super) v7_agreement_diagnostics: bool,
 }
 impl SemanticPlayingTeacherArenaPolicy<'_> {
     pub fn identity(&self) -> &SemanticPlayingTeacherArenaIdentity {
         &self.identity
+    }
+    /// Counts a pure V7 shadow on the same legal callback after the existing
+    /// numeric choice. This cannot change inference, own sources or grant labels.
+    pub fn with_v7_agreement_diagnostics(mut self) -> Result<Self, String> {
+        if self.prepared.profile != crate::semantic_playing_teacher_dataset::TeacherProfile::V7 {
+            return Err("V7 agreement requires the typed V7 teacher origin".into());
+        }
+        self.v7_agreement_diagnostics = true;
+        Ok(self)
     }
     #[cfg(test)]
     pub(crate) fn callback_version_fixture(&self, setup: &Observation, playing: &Observation) {
