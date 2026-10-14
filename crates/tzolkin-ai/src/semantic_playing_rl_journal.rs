@@ -41,8 +41,10 @@ pub use restore::{
 #[path = "semantic_playing_rl_run.rs"]
 mod runner;
 pub use runner::{
-    SemanticJournalAudit, SemanticJournalAuditSpec, SemanticJournalInvocation,
-    SemanticJournalRunSpec, audit_semantic_playing_journal, run_semantic_playing_journal,
+    SemanticJournalAudit, SemanticJournalAuditSpec, SemanticJournalEvaluation,
+    SemanticJournalEvaluationSpec, SemanticJournalInvocation, SemanticJournalRunSpec,
+    audit_semantic_playing_journal, evaluate_semantic_playing_journal,
+    run_semantic_playing_journal,
 };
 const META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 640;
