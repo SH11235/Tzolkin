@@ -34,7 +34,10 @@ pub struct BorrowedGuardedDeployment<'a> {
 
 /// Shared callback/Trade lifecycle; immutable model storage stays with each
 /// closed deployment type. No serialized state can restore this game history.
-pub(crate) struct GuardedGame {
+/// This numerical composition API grants no model or learning ownership. Its
+/// predictor must return finite logits/probabilities in the observation's full
+/// legal order, using the already validated immutable policy or selector.
+pub struct GuardedGame {
     configuration_key: String,
     history: TradeHistory,
     next_callback: usize,
@@ -121,7 +124,7 @@ impl<'a> BorrowedGuardedDeployment<'a> {
 }
 
 impl GuardedGame {
-    pub(crate) fn new(config: TradeGuardConfig) -> Result<Self, String> {
+    pub fn new(config: TradeGuardConfig) -> Result<Self, String> {
         let configuration_key = config.configuration_key()?;
         Ok(Self {
             configuration_key,
@@ -137,7 +140,7 @@ impl GuardedGame {
         })
     }
 
-    pub(crate) fn configuration_key(&self) -> &str {
+    pub fn configuration_key(&self) -> &str {
         &self.configuration_key
     }
 
@@ -151,7 +154,7 @@ impl GuardedGame {
         self.failed = true;
     }
 
-    pub(crate) fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
+    pub fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
         let result = (|| {
             if self.failed || index != self.next_callback || index >= MAX_GAME_CALLBACKS {
                 return Err("Stale/out-of-order guarded deployment callback".into());
@@ -175,7 +178,7 @@ impl GuardedGame {
         result
     }
 
-    pub(crate) fn choose_move(
+    pub fn choose_move(
         &mut self,
         index: usize,
         o: &Observation,

@@ -17,7 +17,7 @@ pub use current_mixed::CurrentMixedIdentity;
 pub(crate) mod guarded;
 pub use guarded::{
     BorrowedGuardedDeployment, GUARDED_DEPLOYMENT_VERSION, GuardedDeployment,
-    GuardedDeploymentDecision, GuardedTradeTrace, MAX_GAME_CALLBACKS,
+    GuardedDeploymentDecision, GuardedGame, GuardedTradeTrace, MAX_GAME_CALLBACKS,
 };
 
 pub const DEPLOYMENT_SCHEMA: &str = "tzolkin-numeric-policy-deployment-v1";

@@ -133,6 +133,23 @@ export interface FixedPlayingIdentity {
   readonly guardVersion: 'public-trade-cycle-guard-v1';
   readonly projectionVersion: 'public-trading-state-v1';
 }
+/** Actor-only checkpoint links; cumulative u64 counters stay decimal strings. */
+export interface SemanticCheckpointIdentity {
+  readonly sourceRole: 'semanticPlayingCheckpoint';
+  readonly task: 'SemanticPlayingCheckpointPolicyInference';
+  readonly checkpointSha256: string;
+  readonly closeDeclarationSha256: string;
+  readonly rootChecksum: string;
+  readonly previousIdentityChecksum: string;
+  readonly currentIdentityChecksum: string;
+  readonly actorChecksum: string;
+  readonly updates: string;
+  readonly playingCredit: string;
+  readonly sourceAuthenticated: false;
+  readonly sourceQualified: false;
+  readonly verifiedNativePolicy: false;
+  readonly strengthMeasured: false;
+}
 /** Numeric content identity only; these fields do not establish training qualification. */
 export interface CpuModelMetadata {
   readonly checksum: string;
@@ -142,24 +159,32 @@ export interface CpuModelMetadata {
     | 'rlRepeated'
     | 'rlCurrentMixed'
     | 'conditionalHumanCurrentMixed'
-    | 'ownSetupCurrentMixedComposite';
+    | 'ownSetupCurrentMixedComposite'
+    | 'semanticPlayingCheckpointCornFirst';
   readonly sourceChecksum: string;
   readonly sourceNumericalTarget: string;
-  readonly updateCount: number | null;
+  readonly updateCount: number | string | null;
   readonly policyVersion: string;
   readonly backend: 'scalar';
   readonly currentMixedIdentity?: CurrentMixedIdentity;
   readonly conditionalCurrentIdentity?: ConditionalCurrentIdentity;
   readonly ownSetupIdentity?: OwnSetupIdentity;
   readonly fixedPlayingIdentity?: FixedPlayingIdentity;
+  readonly semanticCheckpointIdentity?: SemanticCheckpointIdentity;
+  readonly actorPolicyVersion?: 'semantic-playing-checkpoint-policy-scalar-v1';
+  readonly setupPolicyVersion?: 'corn-first-setup-v2';
+  readonly setupSelection?: 'sharedDeterministicSelector';
   readonly sourceAuthenticated?: false;
   readonly sourceQualified?: false;
   readonly verifiedNativePolicy?: false;
+  readonly strengthMeasured?: false;
   readonly valueValidity?: 'unavailablePolicyOnly';
 }
 export const GUARDED_POLICY_VERSION = 'numeric-public-trade-guard-v1';
 export const GUARDED_CONDITIONAL_POLICY_VERSION = 'numeric-conditional-human-trade-guard-v1';
 export const GUARDED_OWN_SETUP_POLICY_VERSION = 'own-setup-composite-trade-guard-v1';
+export const GUARDED_SEMANTIC_CHECKPOINT_POLICY_VERSION =
+  'semantic-checkpoint-corn-first-trade-guard-v1';
 const GUARD_VERSION = 'public-trade-cycle-guard-v1';
 const PROJECTION_VERSION = 'public-trading-state-v1';
 export interface CpuGameMetadata {
@@ -168,7 +193,8 @@ export interface CpuGameMetadata {
   readonly policyVersion:
     | typeof GUARDED_POLICY_VERSION
     | typeof GUARDED_CONDITIONAL_POLICY_VERSION
-    | typeof GUARDED_OWN_SETUP_POLICY_VERSION;
+    | typeof GUARDED_OWN_SETUP_POLICY_VERSION
+    | typeof GUARDED_SEMANTIC_CHECKPOINT_POLICY_VERSION;
   readonly rawPolicyVersion: string;
   readonly guardVersion: string;
   readonly projectionVersion: string;
@@ -269,6 +295,16 @@ function modelMetadata(value: unknown): CpuModelMetadata {
   if (!value || typeof value !== 'object') throw new Error('NNモデル情報が不正です。');
   const metadata = value as CpuModelMetadata;
   if (
+    metadata.sourceRole !== 'semanticPlayingCheckpointCornFirst' &&
+    [
+      'semanticCheckpointIdentity',
+      'actorPolicyVersion',
+      'setupPolicyVersion',
+      'setupSelection',
+    ].some((key) => Object.hasOwn(metadata, key))
+  )
+    throw new Error('NNモデル情報が不正です。');
+  if (
     metadata.sourceRole !== 'ownSetupCurrentMixedComposite' &&
     (Object.hasOwn(metadata, 'ownSetupIdentity') || Object.hasOwn(metadata, 'fixedPlayingIdentity'))
   )
@@ -281,6 +317,7 @@ function modelMetadata(value: unknown): CpuModelMetadata {
       metadata.updateCount === 1 &&
       metadata.policyVersion === 'learned-public-rl-one-step-v1') ||
     (metadata.sourceRole === 'rlRepeated' &&
+      typeof metadata.updateCount === 'number' &&
       Number.isSafeInteger(metadata.updateCount) &&
       metadata.updateCount !== null &&
       metadata.updateCount >= 2 &&
@@ -289,7 +326,10 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     (metadata.sourceRole === 'rlCurrentMixed' && currentMixedMetadataMatches(metadata)) ||
     (metadata.sourceRole === 'conditionalHumanCurrentMixed' &&
       conditionalMetadataMatches(metadata)) ||
-    (metadata.sourceRole === 'ownSetupCurrentMixedComposite' && ownSetupMetadataMatches(metadata));
+    (metadata.sourceRole === 'ownSetupCurrentMixedComposite' &&
+      ownSetupMetadataMatches(metadata)) ||
+    (metadata.sourceRole === 'semanticPlayingCheckpointCornFirst' &&
+      semanticCheckpointMetadataMatches(metadata));
   if (
     typeof metadata.checksum !== 'string' ||
     !SHA256.test(metadata.checksum) ||
@@ -302,6 +342,11 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     !roleMatches
   )
     throw new Error('NNモデル情報が不正です。');
+  if (metadata.sourceRole === 'semanticPlayingCheckpointCornFirst')
+    return Object.freeze({
+      ...metadata,
+      semanticCheckpointIdentity: Object.freeze({ ...metadata.semanticCheckpointIdentity! }),
+    });
   if (metadata.sourceRole === 'ownSetupCurrentMixedComposite') {
     const identity = metadata.ownSetupIdentity!;
     const playing = metadata.fixedPlayingIdentity!;
@@ -343,6 +388,85 @@ function modelMetadata(value: unknown): CpuModelMetadata {
     });
   }
   return Object.freeze({ ...metadata });
+}
+
+function semanticCheckpointMetadataMatches(metadata: CpuModelMetadata): boolean {
+  const identity = metadata.semanticCheckpointIdentity;
+  if (!identity || typeof identity !== 'object') return false;
+  const keys = [
+    'sourceRole',
+    'task',
+    'checkpointSha256',
+    'closeDeclarationSha256',
+    'rootChecksum',
+    'previousIdentityChecksum',
+    'currentIdentityChecksum',
+    'actorChecksum',
+    'updates',
+    'playingCredit',
+    'sourceAuthenticated',
+    'sourceQualified',
+    'verifiedNativePolicy',
+    'strengthMeasured',
+  ];
+  const metadataKeys = [
+    'checksum',
+    'sourceRole',
+    'sourceChecksum',
+    'sourceNumericalTarget',
+    'updateCount',
+    'policyVersion',
+    'backend',
+    'actorPolicyVersion',
+    'setupPolicyVersion',
+    'setupSelection',
+    'semanticCheckpointIdentity',
+    'sourceAuthenticated',
+    'sourceQualified',
+    'verifiedNativePolicy',
+    'strengthMeasured',
+    'valueValidity',
+  ];
+  const positiveU64 = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    /^[1-9][0-9]{0,19}$/.test(value) &&
+    BigInt(value) <= 18446744073709551615n;
+  return (
+    Object.keys(identity).length === keys.length &&
+    keys.every((key) => Object.hasOwn(identity, key)) &&
+    Object.keys(metadata).length === metadataKeys.length &&
+    metadataKeys.every((key) => Object.hasOwn(metadata, key)) &&
+    identity.sourceRole === 'semanticPlayingCheckpoint' &&
+    identity.task === 'SemanticPlayingCheckpointPolicyInference' &&
+    [
+      identity.checkpointSha256,
+      identity.closeDeclarationSha256,
+      identity.rootChecksum,
+      identity.previousIdentityChecksum,
+      identity.currentIdentityChecksum,
+      identity.actorChecksum,
+    ].every((digest) => typeof digest === 'string' && SHA256.test(digest)) &&
+    positiveU64(identity.updates) &&
+    positiveU64(identity.playingCredit) &&
+    metadata.updateCount === identity.updates &&
+    metadata.sourceChecksum === identity.currentIdentityChecksum &&
+    metadata.policyVersion === 'semantic-checkpoint-corn-first-scalar-v1' &&
+    metadata.actorPolicyVersion === 'semantic-playing-checkpoint-policy-scalar-v1' &&
+    metadata.setupPolicyVersion === 'corn-first-setup-v2' &&
+    metadata.setupSelection === 'sharedDeterministicSelector' &&
+    /^scalar-f32-f64-tick53-v1:[a-z0-9_]{1,32}:[a-z0-9_]{1,32}:(32|64)$/.test(
+      metadata.sourceNumericalTarget,
+    ) &&
+    metadata.sourceAuthenticated === false &&
+    identity.sourceAuthenticated === false &&
+    metadata.sourceQualified === false &&
+    identity.sourceQualified === false &&
+    metadata.verifiedNativePolicy === false &&
+    identity.verifiedNativePolicy === false &&
+    metadata.strengthMeasured === false &&
+    identity.strengthMeasured === false &&
+    metadata.valueValidity === 'unavailablePolicyOnly'
+  );
 }
 
 // The Wasm loader validates the raw closed wire and all numeric checksums.
@@ -871,7 +995,9 @@ export function startCpuGame(signal: AbortSignal, modelChecksum: string): Promis
             ? GUARDED_CONDITIONAL_POLICY_VERSION
             : metadata.sourceRole === 'ownSetupCurrentMixedComposite'
               ? GUARDED_OWN_SETUP_POLICY_VERSION
-              : GUARDED_POLICY_VERSION) ||
+              : metadata.sourceRole === 'semanticPlayingCheckpointCornFirst'
+                ? GUARDED_SEMANTIC_CHECKPOINT_POLICY_VERSION
+                : GUARDED_POLICY_VERSION) ||
         value.rawPolicyVersion !== metadata.policyVersion ||
         value.guardVersion !== GUARD_VERSION ||
         value.projectionVersion !== PROJECTION_VERSION ||

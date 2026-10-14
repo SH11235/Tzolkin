@@ -48,6 +48,55 @@ function zeroModel() {
   return { bytes: new TextEncoder().encode(JSON.stringify(wire)), checksum: wire.checksum };
 }
 
+// Content-consistent numeric fixture only; no training/checkpoint-owner claim.
+function zeroSemanticModel() {
+  const native = JSON.parse(new TextDecoder().decode(zeroModel().bytes)) as {
+    contract: Record<string, unknown>;
+    sourceNumericalTarget: string;
+    parameterBits: string[];
+  };
+  const wire = {
+    schema: 'tzolkin-semantic-playing-checkpoint-policy-inference-v1',
+    contract: {
+      ...native.contract,
+      inputContract: 'semantic-playing-checkpoint-actor-base-3-4p-v1',
+      featureSchema: 4,
+      scope: 'base-3-4p-playing-only',
+    },
+    identity: {
+      sourceRole: 'semanticPlayingCheckpoint',
+      task: 'SemanticPlayingCheckpointPolicyInference',
+      checkpointSha256: 'a'.repeat(64),
+      closeDeclarationSha256: 'b'.repeat(64),
+      rootChecksum: 'c'.repeat(64),
+      previousIdentityChecksum: 'd'.repeat(64),
+      currentIdentityChecksum: 'e'.repeat(64),
+      actorChecksum: createHash('sha256')
+        .update('semantic-current-actor-bits-v1\0')
+        .update(new Uint8Array(16449 * 4))
+        .digest('hex'),
+      updates: '18446744073709551615',
+      playingCredit: '18446744073709551615',
+      sourceAuthenticated: false,
+      sourceQualified: false,
+      verifiedNativePolicy: false,
+      strengthMeasured: false,
+    },
+    sourceNumericalTarget: native.sourceNumericalTarget,
+    parameterBits: native.parameterBits,
+    checksum: '',
+  };
+  const serialize = () =>
+    JSON.stringify(wire)
+      .replace('"updates":"18446744073709551615"', '"updates":18446744073709551615')
+      .replace('"playingCredit":"18446744073709551615"', '"playingCredit":18446744073709551615');
+  wire.checksum = createHash('sha256')
+    .update('tzolkin-semantic-playing-checkpoint-policy-inference-v1\0')
+    .update(serialize())
+    .digest('hex');
+  return { bytes: new TextEncoder().encode(serialize()), checksum: wire.checksum };
+}
+
 // Synthetic content-consistent metadata is not an authenticated learning owner.
 function zeroConditionalModel() {
   const native = JSON.parse(new TextDecoder().decode(zeroModel().bytes)) as {
@@ -382,14 +431,100 @@ it('moves one loaded Wasm model through fresh guarded games and binds all actors
   snapshot.state.pending = { title: 'Trade', task: { type: 'trade' }, after: [] };
   const o = await observeGame(snapshot.state, snapshot.state.currentPlayer);
   const input = JSON.stringify(o);
-  for (const [wire, conditional] of [
-    [zeroModel(), false],
-    [zeroConditionalModel(), true],
+  for (const [wire, role] of [
+    [zeroModel(), 'native'],
+    [zeroConditionalModel(), 'conditional'],
+    [zeroSemanticModel(), 'semantic'],
   ] as const) {
+    const conditional = role === 'conditional';
+    const semantic = role === 'semantic';
     const model = new CpuDeployment(wire.bytes, wire.checksum);
     try {
       const metadata = JSON.parse(model.metadata()) as Record<string, unknown>;
-      expect(metadata.sourceRole).toBe(conditional ? 'conditionalHumanCurrentMixed' : 'bcPrepared');
+      expect(metadata.sourceRole).toBe(
+        conditional
+          ? 'conditionalHumanCurrentMixed'
+          : semantic
+            ? 'semanticPlayingCheckpointCornFirst'
+            : 'bcPrepared',
+      );
+      if (semantic) {
+        expect(metadata).toMatchObject({
+          updateCount: '18446744073709551615',
+          actorPolicyVersion: 'semantic-playing-checkpoint-policy-scalar-v1',
+          setupPolicyVersion: 'corn-first-setup-v2',
+          setupSelection: 'sharedDeterministicSelector',
+          sourceAuthenticated: false,
+          sourceQualified: false,
+          verifiedNativePolicy: false,
+          strengthMeasured: false,
+          semanticCheckpointIdentity: {
+            updates: '18446744073709551615',
+            playingCredit: '18446744073709551615',
+            currentIdentityChecksum: 'e'.repeat(64),
+          },
+        });
+        expect(metadata).not.toHaveProperty('conditionalCurrentIdentity');
+        expect(metadata).not.toHaveProperty('ownSetupIdentity');
+        const catalog = JSON.parse(
+          readFileSync(
+            new URL('../../crates/tzolkin-core/data/catalog.json', import.meta.url),
+            'utf8',
+          ),
+        ) as {
+          STARTING_WEALTH: {
+            id: string;
+            resources: { corn?: number };
+            effects?: {
+              type: string;
+              resources?: { corn?: number };
+            }[];
+          }[];
+        };
+        const corn = new Map(
+          catalog.STARTING_WEALTH.map((tile) => [
+            tile.id,
+            (tile.resources.corn ?? 0) +
+              (tile.effects ?? []).reduce(
+                (n, effect) =>
+                  n + (effect.type === 'resources' ? (effect.resources?.corn ?? 0) : 0),
+                0,
+              ),
+          ]),
+        );
+        let nonFirst = 0;
+        for (const players of [3, 4]) {
+          let opening = await createGame(
+            Array.from({ length: players }, (_, i) => `S${i}`),
+            17,
+          );
+          const id = `semantic-setup-${players}`;
+          model.start_game(id, wire.checksum);
+          let index = 0;
+          while (opening.state.phase === 'setup') {
+            const o = await observeGame(opening.state, opening.state.currentPlayer);
+            const input = JSON.stringify(o);
+            const legal = o.legalActions as {
+              action: { ids: string[] };
+              move: Parameters<typeof applyMove>[1];
+            }[];
+            const quantities = legal.map((row) =>
+              row.action.ids.reduce((n, id) => n + corn.get(id)!, 0),
+            );
+            model.notify(id, index, input, wire.checksum);
+            const chosen = JSON.parse(
+              model.choose_guarded(id, index, input, wire.checksum),
+            ) as GuardedCpuDecision;
+            expect(quantities[chosen.rawLegalIndex]).toBe(Math.max(...quantities));
+            expect(chosen.move).toEqual(JSON.parse(model.choose(input, wire.checksum)).move);
+            expect(chosen.trade).toBeNull();
+            nonFirst += Number(chosen.rawLegalIndex !== 0);
+            opening = await applyMove(opening.state, chosen.move);
+            index++;
+          }
+        }
+        expect(nonFirst).toBeGreaterThan(0); // A zero NN Setup path would always choose0.
+      }
       if (conditional) {
         expect(metadata).toMatchObject({
           sourceAuthenticated: false,
@@ -410,15 +545,23 @@ it('moves one loaded Wasm model through fresh guarded games and binds all actors
       ) as GuardedCpuDecision;
       const rawOpening = JSON.parse(model.choose(setup, wire.checksum)) as { move: unknown };
       expect(opening.move).toEqual(rawOpening.move);
-      expect(opening.rawLegalIndex).toBe(0); // Equal logits use the first legal action.
+      if (!semantic) expect(opening.rawLegalIndex).toBe(0); // Equal NN logits use first legal.
       expect(opening.trade).toBeNull();
       const game = JSON.parse(model.start_game('game-one', wire.checksum)) as CpuGameMetadata;
       expect(game.modelChecksum).toBe(wire.checksum);
       expect(game.policyVersion).toBe(
-        conditional ? 'numeric-conditional-human-trade-guard-v1' : 'numeric-public-trade-guard-v1',
+        conditional
+          ? 'numeric-conditional-human-trade-guard-v1'
+          : semantic
+            ? 'semantic-checkpoint-corn-first-trade-guard-v1'
+            : 'numeric-public-trade-guard-v1',
       );
       expect(game.rawPolicyVersion).toBe(
-        conditional ? 'conditional-human-current-mixed-scalar-v1' : 'learned-public-policy-v1',
+        conditional
+          ? 'conditional-human-current-mixed-scalar-v1'
+          : semantic
+            ? 'semantic-checkpoint-corn-first-scalar-v1'
+            : 'learned-public-policy-v1',
       );
       expect(game.maxCallbacks).toBe(4000);
       const choose = (index: number) =>
@@ -427,6 +570,14 @@ it('moves one loaded Wasm model through fresh guarded games and binds all actors
         ) as GuardedCpuDecision;
       model.notify('game-one', 0, input, wire.checksum);
       const first = choose(0);
+      if (semantic) {
+        const rawPlaying = JSON.parse(model.choose(input, wire.checksum)) as {
+          move: unknown;
+          score: number;
+        };
+        expect(first.move).toEqual(rawPlaying.move);
+        expect(first.score).toBe(rawPlaying.score);
+      }
       expect(first.policyVersion).toBe(game.policyVersion);
       expect(first.rawPolicyVersion).toBe(game.rawPolicyVersion);
       expect(first.rawLegalIndex).toBe(first.effectiveLegalIndex);

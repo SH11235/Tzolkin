@@ -659,6 +659,101 @@ describe('CPU Worker request lifecycle', () => {
       expect(currentWorker.terminated).toBe(true);
       expect(getLoadedCpuModel()).toBeUndefined();
     }
+    const semantic: CpuModelMetadata = {
+      ...model,
+      sourceRole: 'semanticPlayingCheckpointCornFirst',
+      updateCount: '18446744073709551615',
+      policyVersion: 'semantic-checkpoint-corn-first-scalar-v1',
+      actorPolicyVersion: 'semantic-playing-checkpoint-policy-scalar-v1',
+      setupPolicyVersion: 'corn-first-setup-v2',
+      setupSelection: 'sharedDeterministicSelector',
+      sourceAuthenticated: false,
+      sourceQualified: false,
+      verifiedNativePolicy: false,
+      strengthMeasured: false,
+      valueValidity: 'unavailablePolicyOnly',
+      semanticCheckpointIdentity: {
+        sourceRole: 'semanticPlayingCheckpoint',
+        task: 'SemanticPlayingCheckpointPolicyInference',
+        checkpointSha256: 'c'.repeat(64),
+        closeDeclarationSha256: 'd'.repeat(64),
+        rootChecksum: 'e'.repeat(64),
+        previousIdentityChecksum: 'f'.repeat(64),
+        currentIdentityChecksum: model.sourceChecksum,
+        actorChecksum: 'c'.repeat(64),
+        updates: '18446744073709551615',
+        playingCredit: '18446744073709551615',
+        sourceAuthenticated: false,
+        sourceQualified: false,
+        verifiedNativePolicy: false,
+        strengthMeasured: false,
+      },
+    };
+    const semanticLoad = loadCpuModel(bytes, signal);
+    const semanticWorker = FakeWorker.instances.at(-1)!;
+    semanticWorker.respond({ metadata: semantic });
+    await expect(semanticLoad).resolves.toEqual(semantic);
+    expect(Object.isFrozen(getLoadedCpuModel()?.semanticCheckpointIdentity)).toBe(true);
+    const semanticStart = api.startCpuGame(signal, semantic.checksum);
+    const semanticGame = {
+      ...gameMetadata,
+      gameId: semanticWorker.request!.gameId,
+      policyVersion: 'semantic-checkpoint-corn-first-trade-guard-v1',
+      rawPolicyVersion: semantic.policyVersion,
+    };
+    semanticWorker.respond({ gameMetadata: semanticGame });
+    const semanticCallback = await notify(api, semanticWorker, await semanticStart, signal);
+    const semanticChoice = chooseCpu(
+      observation,
+      signal,
+      { mode: 'nn', modelChecksum: semantic.checksum },
+      semanticCallback,
+    );
+    const semanticDecision = {
+      ...nnDecision,
+      policyVersion: semanticGame.policyVersion,
+      rawPolicyVersion: semantic.policyVersion,
+      callbackIndex: semanticCallback.index,
+    };
+    semanticWorker.reply(semanticDecision);
+    await expect(semanticChoice).resolves.toEqual(semanticDecision);
+    const stillDefault = chooseCpu(observation, signal);
+    expect(semanticWorker.request?.mode).toBe('heuristic');
+    semanticWorker.reply(decision);
+    await expect(stillDefault).resolves.toEqual(decision);
+    for (const invalid of [
+      { ...semantic, updateCount: Number('18446744073709551615') },
+      {
+        ...semantic,
+        sourceRole: 'bcPrepared',
+        updateCount: null,
+        policyVersion: model.policyVersion,
+      },
+      { ...semantic, setupPolicyVersion: 'corn-first-setup-v1' },
+      { ...semantic, actorPolicyVersion: model.policyVersion },
+      { ...semantic, strengthMeasured: true },
+      {
+        ...semantic,
+        semanticCheckpointIdentity: {
+          ...semantic.semanticCheckpointIdentity,
+          playingCredit: '18446744073709551616',
+        },
+      },
+      {
+        ...semantic,
+        semanticCheckpointIdentity: {
+          ...semantic.semanticCheckpointIdentity,
+          updates: '01',
+        },
+      },
+    ]) {
+      const refused = loadCpuModel(bytes, signal);
+      const currentWorker = FakeWorker.instances.at(-1)!;
+      currentWorker.respond({ metadata: invalid });
+      await expect(refused).rejects.toThrow('不正');
+      expect(currentWorker.terminated).toBe(true);
+      expect(getLoadedCpuModel()).toBeUndefined();
+    }
   });
 
   it('invalidates replacement/aborted caches and rejects busy or unloaded NN calls without fallback', async () => {
