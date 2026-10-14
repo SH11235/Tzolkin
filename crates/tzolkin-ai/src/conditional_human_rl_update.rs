@@ -167,7 +167,8 @@ impl ConditionalNativeExclusions {
         )
         .map(|_| ())
     }
-    pub(crate) fn contains_family(&self, family: &str) -> bool {
+    /// Membership in the checked caller-declared union, not proof of completeness.
+    pub fn contains_family(&self, family: &str) -> bool {
         self.families.contains(family)
     }
 }
