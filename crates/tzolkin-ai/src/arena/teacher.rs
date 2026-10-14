@@ -615,6 +615,35 @@ impl SemanticPlayingTeacherArenaPolicy<'_> {
     pub fn identity(&self) -> &SemanticPlayingTeacherArenaIdentity {
         &self.identity
     }
+    #[cfg(test)]
+    pub(crate) fn callback_version_fixture(&self, setup: &Observation, playing: &Observation) {
+        let mut session = super::conditional::GameSession::new_native_playing_teacher(self);
+        for (index, observation) in [setup, playing].into_iter().enumerate() {
+            session.on_callback(index, observation).unwrap();
+            let selected = session
+                .choose_native_playing_teacher(index, observation, self)
+                .unwrap()
+                .decision;
+            assert_eq!(selected.policy_version, self.identity.policy_version);
+            assert!(
+                observation
+                    .legal_actions
+                    .iter()
+                    .any(|a| a.r#move == selected.r#move)
+            );
+            if observation.phase == tzolkin_core::Phase::Setup {
+                assert_eq!(
+                    selected.r#move,
+                    crate::setup_policy::choose_move_with_weights(
+                        observation,
+                        &crate::policy::HeuristicWeights::default()
+                    )
+                    .unwrap()
+                    .r#move
+                );
+            }
+        }
+    }
     pub(super) fn exclude_source_families(
         &self,
         config: &super::numeric::NumericArenaConfig,

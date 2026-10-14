@@ -2434,6 +2434,7 @@ pub(super) fn control_fixture(
             crate::semantic_playing_teacher_dataset::SOURCE_KIND,
         );
         assert!(!reference.identity().source_authenticated);
+        reference.callback_version_fixture(&setup, &o);
         {
             use crate::conditional_semantic_playing_rl::SemanticTrainingState;
             use crate::semantic_playing_teacher_dataset::TeacherProfile;
@@ -2471,6 +2472,7 @@ pub(super) fn control_fixture(
             assert!(
                 !identity.identity().source_authenticated && !identity.identity().strength_measured
             );
+            identity.callback_version_fixture(&setup, &o);
             for (kind, directory) in [
                 ("nativeCornFirstV7SemanticPlayingTeacher", &native_directory),
                 ("nativeCornFirstV5SemanticPlayingTeacher", &v7_directory),
