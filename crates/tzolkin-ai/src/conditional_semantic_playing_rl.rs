@@ -310,6 +310,12 @@ pub(crate) struct SemanticOwnerView<'a> {
     root: &'a str,
 }
 impl SemanticOwnerView<'_> {
+    pub(crate) fn journal_origin(&self) -> serde_json::Value {
+        serde_json::json!({"checksum":self.origin.checksum,
+            "checkpoint":self.origin.checkpoint_checksum,"model":self.origin.model_checksum,
+            "dataset":self.origin.dataset,"reservations":self.origin.table_reservations,
+            "pins":self.origin.source_pins})
+    }
     pub(crate) fn root_checksum(&self) -> &str {
         self.root
     }
