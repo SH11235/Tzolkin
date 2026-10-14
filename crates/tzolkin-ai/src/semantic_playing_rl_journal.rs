@@ -43,9 +43,9 @@ mod runner;
 pub use runner::{
     SemanticJournalAudit, SemanticJournalAuditSpec, SemanticJournalEvaluation,
     SemanticJournalEvaluationSpec, SemanticJournalInvocation, SemanticJournalRunSpec,
-    SemanticPolicyExport, SemanticPolicyExportSpec, audit_semantic_playing_journal,
-    evaluate_semantic_playing_journal, export_semantic_playing_policy,
-    run_semantic_playing_journal,
+    SemanticPolicyEvaluation, SemanticPolicyEvaluationSpec, SemanticPolicyExport,
+    SemanticPolicyExportSpec, audit_semantic_playing_journal, evaluate_semantic_playing_journal,
+    evaluate_semantic_playing_policy, export_semantic_playing_policy, run_semantic_playing_journal,
 };
 const META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 640;

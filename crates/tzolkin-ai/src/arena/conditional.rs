@@ -645,6 +645,7 @@ enum SetupRoute {
     SemanticPlayingCornFirst,
     NativeTeacherPlayingCornFirst,
     CurrentSnapshotPlayingCornFirst,
+    CheckpointPolicyPlayingCornFirst,
     NumericAllPhase(&'static str),
     PhaseRoutedDevelopment,
 }
@@ -655,6 +656,9 @@ impl SetupRoute {
             Self::SemanticPlayingCornFirst => SEMANTIC_PLAYING_POLICY_VERSION,
             Self::NativeTeacherPlayingCornFirst => super::teacher::SEMANTIC_PLAYING_POLICY_VERSION,
             Self::CurrentSnapshotPlayingCornFirst => super::semantic_snapshot::POLICY_VERSION,
+            Self::CheckpointPolicyPlayingCornFirst => {
+                super::semantic_snapshot::CHECKPOINT_POLICY_VERSION
+            }
             Self::NumericAllPhase(version) => version,
             Self::PhaseRoutedDevelopment => super::phase_routed::POLICY_VERSION,
         }
@@ -696,6 +700,15 @@ impl GameSession {
             &policy.identity().guard,
         )
         .expect("semantic snapshot constructor validated guard configuration")
+    }
+    pub(super) fn new_checkpoint_policy(
+        policy: &super::semantic_snapshot::SemanticPlayingCheckpointArenaPolicy,
+    ) -> Self {
+        Self::with_route(
+            SetupRoute::CheckpointPolicyPlayingCornFirst,
+            &policy.identity().guard,
+        )
+        .expect("semantic checkpoint constructor validated the default guard")
     }
     pub(super) fn new_mixed(policy: &ConditionalMixedArenaPolicy<'_>) -> Self {
         Self::with_route(
@@ -854,6 +867,14 @@ impl GameSession {
     ) -> Result<ConditionalDecision, String> {
         self.choose_using(index, o, |o| policy.distribution(o))
     }
+    pub(super) fn choose_checkpoint_policy(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        policy: &super::semantic_snapshot::SemanticPlayingCheckpointArenaPolicy,
+    ) -> Result<ConditionalDecision, String> {
+        self.choose_using(index, o, |o| policy.distribution(o))
+    }
     pub(super) fn choose_phase_routed(
         &mut self,
         index: usize,
@@ -892,6 +913,7 @@ impl GameSession {
                             | SetupRoute::SemanticPlayingCornFirst
                             | SetupRoute::NativeTeacherPlayingCornFirst
                             | SetupRoute::CurrentSnapshotPlayingCornFirst
+                            | SetupRoute::CheckpointPolicyPlayingCornFirst
                     ) =>
                 {
                     let decision = crate::setup_policy::choose_move_with_weights(
