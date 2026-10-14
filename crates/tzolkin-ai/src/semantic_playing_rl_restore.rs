@@ -110,7 +110,7 @@ enum Event {
         attempt: usize,
         resolution: Resolution,
         report: Pin,
-        records: [StoredRecord; 4],
+        records: Box<[StoredRecord; 4]>,
         current: String,
         credited_playing: u64,
     },
