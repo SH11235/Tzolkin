@@ -23,6 +23,7 @@ const POLICY_EXPORT_SCHEMA: &str = "tzolkin-semantic-playing-checkpoint-policy-e
 const POLICY_EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-policy-evaluation-v1";
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
+const MAX_HISTORY_PINS: usize = 128;
 #[path = "semantic_playing_rl_checkpoint.rs"]
 mod checkpoint;
 
@@ -259,7 +260,7 @@ struct History {
 }
 impl History {
     fn load(&self) -> Result<DeclaredSamplingHistory, String> {
-        if self.pins.len() > 64 || self.ranges.len() > 8192 {
+        if self.pins.len() > MAX_HISTORY_PINS || self.ranges.len() > 8192 {
             return Err("Runner history cap".into());
         }
         let ranges = self
@@ -1616,6 +1617,37 @@ pub(super) fn control_fixture(
     let external = json!({"pin":external_pin,"count":1,
         "canonicalDigest":crate::model::digest(format!("{family}\n").as_bytes())});
     let history = json!({"ranges":[[17,0,3,0,90,94]],"pins":[external_pin]});
+    // Continuation keeps earlier provenance instead of dropping old allocations.
+    // Every newly admitted pin still passes the ordinary byte recheck.
+    let provenance = (0..=MAX_HISTORY_PINS)
+        .map(|i| {
+            let path = root.join(format!("history-pin-{i:03}.json"));
+            fs::write(&path, b"synthetic history provenance").unwrap();
+            pin(path)
+        })
+        .collect::<Vec<_>>();
+    for count in [65, MAX_HISTORY_PINS] {
+        let declared = History {
+            ranges: vec![[17, 0, 3, 0, 90, 94]],
+            pins: provenance[..count].to_vec(),
+        };
+        assert!(declared.load().is_ok());
+    }
+    let admitted = History {
+        ranges: vec![[17, 0, 3, 0, 90, 94]],
+        pins: provenance[..65].to_vec(),
+    };
+    fs::write(&provenance[64].path, b"changed provenance").unwrap();
+    assert!(admitted.load().is_err());
+    fs::write(&provenance[64].path, b"synthetic history provenance").unwrap();
+    assert!(matches!(
+        History {
+            ranges: vec![],
+            pins: provenance,
+        }
+        .load(),
+        Err(error) if error == "Runner history cap"
+    ));
     let mut value = json!({"schema":RUN_SCHEMA,"mode":"start",
         "journalDirectory":root.join("new-cli-journal"),
         "original":{"checkpoint":pin(root.join("checkpoint/checkpoint.json")),
