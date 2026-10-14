@@ -26,7 +26,9 @@ pub(crate) fn choose_move_for_revision(
     tzolkin_bot::setup_policy::choose_move_for_revision(o, weights, revision)
 }
 
-fn first_uxmal_opening(o: &Observation) -> Option<&LegalAction> {
+/// Internal selector for callers that have validated the observation schema,
+/// actor bounds and key. It grants no authority to an unchecked observation.
+pub(crate) fn first_uxmal_opening(o: &Observation) -> Option<&LegalAction> {
     let p = &o.players[o.actor];
     let count = o.turn.count;
     if o.phase != Phase::Playing
