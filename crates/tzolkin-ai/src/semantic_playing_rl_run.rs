@@ -556,6 +556,24 @@ fn pool_input_post<T>(result: Result<T, String>, pins: &[ContentPin]) -> Result<
         ))
     }
 }
+fn invocation_pool_post(
+    result: Result<SemanticJournalInvocation, String>,
+    pins: &[ContentPin],
+) -> Result<SemanticJournalInvocation, String> {
+    match pool_input_post(Ok(()), pins) {
+        Ok(()) => result,
+        Err(post) => match result {
+            Ok(mut report) => {
+                // Reserve/admission may already have happened. A late source
+                // refusal must retain the exact descriptive head and accounting.
+                report.disposition = "refused".into();
+                report.error = Some(format!("{}{post}", report.error.take().unwrap_or_default()));
+                Ok(report)
+            }
+            Err(error) => Err(format!("{error}{post}")),
+        },
+    }
+}
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Chunk {
@@ -1308,7 +1326,7 @@ pub fn run_semantic_playing_journal(
     output: &Path,
 ) -> Result<SemanticJournalInvocation, String> {
     let pins = pool_overrides(&spec.wire).cloned().collect::<Vec<_>>();
-    pool_input_post(run_with_pools(spec, output), &pins)
+    invocation_pool_post(run_with_pools(spec, output), &pins)
 }
 fn run_with_pools(
     spec: SemanticJournalRunSpec,
@@ -2845,6 +2863,45 @@ pub(super) fn control_fixture(
         let raw = fs::read(&pool_pins[1].path).unwrap();
         fs::write(&pool_pins[1].path, b"changed pool").unwrap();
         assert!(ProceduralPools::load([&pool_pins[1]]).is_err());
+        let accounted = SemanticJournalInvocation {
+            schema: "tzolkin-semantic-playing-journal-invocation-v1",
+            control_sha256: parsed.checksum.clone(),
+            disposition: "refused".into(),
+            error: Some("fixture prior refusal".into()),
+            head: rotated.head(),
+            status: rotated.status(),
+            complete_session_consumption: rotated.session.capture_ledger(),
+            archive_inventory: rotated
+                .members
+                .values()
+                .map(|p| p.absolute(&rotated.directory))
+                .collect(),
+            capture_aliases: BTreeMap::new(),
+            capture_identities: Vec::new(),
+            returned_closes: vec![returned.clone()],
+            last_library_return: None,
+            last_returned_close: Some(returned),
+            declared_permanent_allocation: parsed.wire.permanent_allocation.clone(),
+            declared_families: 8,
+            declared_actor_streams: 28,
+            historical_archive_bytes_checked_at_return: true,
+            actual_process_close_verified: false,
+            source_authenticated: false,
+            source_qualified: false,
+            verified_native_policy: false,
+            checkpoint: None,
+            signal_diagnostics: None,
+            procedural_pools: pool_pins.clone(),
+        };
+        let mut expected_accounting = serde_json::to_value(&accounted).unwrap();
+        let refused = invocation_pool_post(Ok(accounted), &[pool_pins[1].clone()]).unwrap();
+        assert_eq!(refused.disposition, "refused");
+        let error = refused.error.as_ref().unwrap();
+        assert!(error.contains("fixture prior refusal") && error.contains("procedural pool POST"));
+        let mut actual_accounting = serde_json::to_value(&refused).unwrap();
+        expected_accounting.as_object_mut().unwrap().remove("error");
+        actual_accounting.as_object_mut().unwrap().remove("error");
+        assert_eq!(actual_accounting, expected_accounting);
         let error = run_semantic_playing_journal(parsed, Path::new(".."))
             .err()
             .unwrap();
