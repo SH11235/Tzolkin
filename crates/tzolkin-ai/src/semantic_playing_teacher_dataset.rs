@@ -147,6 +147,8 @@ struct RowWire {
     source_callback_index: usize,
     actor: usize,
     phase: Phase,
+    round: i64,
+    players: usize,
     ordered_legal_sha256: String,
     candidates: Vec<CandidateWire>,
     chosen: usize,
@@ -160,6 +162,8 @@ pub struct ValidatedSemanticPlayingTeacherSample {
     family_id: String,
     source_callback_index: usize,
     actor: usize,
+    round: i64,
+    players: usize,
     ordered_legal_sha256: String,
     candidates: Vec<EncodedCandidate>,
     chosen: usize,
@@ -179,6 +183,12 @@ impl ValidatedSemanticPlayingTeacherSample {
     }
     pub fn actor(&self) -> usize {
         self.actor
+    }
+    pub fn round(&self) -> i64 {
+        self.round
+    }
+    pub fn players(&self) -> usize {
+        self.players
     }
     /// Hash of the complete ordered legal DTOs retained in the original replay.
     pub fn ordered_legal_sha256(&self) -> &str {
@@ -212,6 +222,8 @@ impl ValidatedSemanticPlayingTeacherSample {
             source_callback_index: self.source_callback_index,
             actor: self.actor,
             phase: Phase::Playing,
+            round: self.round,
+            players: self.players,
             ordered_legal_sha256: self.ordered_legal_sha256.clone(),
             chosen: self.chosen,
             value_target: (),
@@ -327,6 +339,8 @@ fn sample(
         family_id: family.into(),
         source_callback_index: index,
         actor: observation.actor,
+        round: observation.round,
+        players: observation.players.len(),
         ordered_legal_sha256: content_id(
             b"tzolkin-native-playing4-legal-order-v1\0",
             &observation.legal_actions,
@@ -506,9 +520,12 @@ fn validate_manifest(m: &SemanticPlayingTeacherManifest) -> Result<(), String> {
         return Err("Unsupported/corrupt native semantic teacher manifest".into());
     }
     let bytes = serde_json::to_vec(m).map_err(|e| e.to_string())?.len() as u64;
-    if bytes > policy_dataset::MAX_MANIFEST_BYTES
-        || m.stored_bytes
-            .checked_add(bytes)
+    stored_manifest_bytes(m.stored_bytes, bytes)
+}
+fn stored_manifest_bytes(stored: u64, manifest_bytes: u64) -> Result<(), String> {
+    if manifest_bytes > policy_dataset::MAX_MANIFEST_BYTES
+        || stored
+            .checked_add(manifest_bytes)
             .is_none_or(|n| n > MAX_STORED_BYTES)
     {
         return Err("Teacher manifest/aggregate byte budget exceeded".into());
@@ -786,6 +803,9 @@ pub fn load_semantic_playing_teacher_dataset(
         policy_dataset::MAX_MANIFEST_BYTES,
     )?;
     let m: SemanticPlayingTeacherManifest = json(&bytes, policy_dataset::MAX_MANIFEST_BYTES)?;
+    // Charge the actual raw manifest, including accepted JSON whitespace, before
+    // any source or row body is ingested. Canonical length alone is insufficient.
+    stored_manifest_bytes(m.stored_bytes, bytes.len() as u64)?;
     validate_manifest(&m)?;
     namespace(directory, &m, true)?;
     let samples = audit(directory, &m, true)?;
@@ -839,6 +859,8 @@ pub(crate) fn fixture(parent: &Path) {
         let row = sample(&o, chosen, index, &"a".repeat(64), &seed_family_id(42)).unwrap();
         assert_eq!(row.source_callback_index(), index);
         assert_eq!(row.actor(), o.actor);
+        assert_eq!(row.round(), o.round);
+        assert_eq!(row.players(), players);
         assert_eq!(&o.legal_actions[row.chosen()], chosen);
         let oracle = FeatureEncoder::new_semantic_playing(&o).unwrap();
         for (i, c) in row.candidates().iter().enumerate() {
@@ -862,13 +884,20 @@ pub(crate) fn fixture(parent: &Path) {
             json::<RowWire>(&raw, policy_dataset::MAX_SAMPLE_BYTES).unwrap(),
             row.wire().unwrap()
         );
+        for (key, value) in [
+            ("sourceCallbackIndex", serde_json::json!(index + 1)),
+            ("round", serde_json::json!(o.round + 1)),
+            ("players", serde_json::json!(players + 1)),
+        ] {
+            let mut bad: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+            bad[key] = value;
+            let mut changed = serde_json::to_vec(&bad).unwrap();
+            changed.push(b'\n');
+            assert!(match_row(&changed, &row, &raw).is_err());
+        }
         let mut bad: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        bad["sourceCallbackIndex"] = serde_json::json!(index + 1);
-        let mut changed = serde_json::to_vec(&bad).unwrap();
-        changed.push(b'\n');
-        assert!(match_row(&changed, &row, &raw).is_err());
         bad["futureScore"] = serde_json::json!(80);
-        changed = serde_json::to_vec(&bad).unwrap();
+        let mut changed = serde_json::to_vec(&bad).unwrap();
         changed.push(b'\n');
         assert!(match_row(&changed, &row, &raw).is_err());
         let duplicate = raw
@@ -1012,4 +1041,7 @@ pub(crate) fn fixture(parent: &Path) {
         )
         .is_err()
     );
+    stored_manifest_bytes(MAX_STORED_BYTES - 8, 8).unwrap();
+    assert!(stored_manifest_bytes(MAX_STORED_BYTES - 8, 9).is_err());
+    assert!(stored_manifest_bytes(u64::MAX, 1).is_err());
 }
