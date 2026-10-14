@@ -52,6 +52,10 @@ pub const CORN_FIRST_SEMANTIC_PLAYING_CONDITIONAL_ARENA_SCHEMA: &str =
     "tzolkin-conditional-human-semantic-playing-shared-corn-first-validation-arena-v1";
 pub const RESOURCE_CYCLE_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-development-validation-arena-v1";
+pub const RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA: &str =
+    "tzolkin-resource-cycle-v6-v5-validation-command-v1";
+pub const RESOURCE_CYCLE_V6_V5_ARENA_SCHEMA: &str =
+    "tzolkin-resource-cycle-v6-v5-shared-corn-first-validation-arena-v1";
 pub const OWN_SETUP_ARENA_SCHEMA: &str = "tzolkin-own-setup-composite-development-arena-v1";
 pub const RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-own-setup-composite-development-arena-v1";
@@ -128,6 +132,40 @@ impl NumericArenaConfig {
             }
         }
         Ok(())
+    }
+}
+
+/// A fixed procedural comparison. The caller declares complete exclusions;
+/// parsing checks their shape and disjointness, not historical completeness.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceCycleV6V5ArenaSpec {
+    schema: String,
+    arena: NumericArenaConfig,
+}
+impl ResourceCycleV6V5ArenaSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if raw.len() > 16 * 1024 * 1024
+            || !digest(expected_sha256)
+            || format!("{:x}", Sha256::digest(raw)) != expected_sha256
+        {
+            return Err("Resource-cycle paired control pin differs".into());
+        }
+        let spec: Self = serde_json::from_value(crate::public_stochastic_record::unique_json(
+            raw,
+            16 * 1024 * 1024,
+        )?)
+        .map_err(|e| e.to_string())?;
+        spec.validate()?;
+        Ok(spec)
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA || self.arena.seeds.len() > 64 {
+            return Err(
+                "Resource-cycle paired control requires its closed schema and 1..64 seeds".into(),
+            );
+        }
+        self.arena.validate()
     }
 }
 
@@ -1874,6 +1912,38 @@ pub fn run_resource_cycle_validation<'a>(
     )
 }
 
+fn resource_cycle_v6_v5_roles(
+    players: usize,
+) -> (Role<'static>, Role<'static>, Vec<Role<'static>>) {
+    use super::resource_cycle::ResourceCycleConfig;
+    (
+        Role::ResourceCycle(ResourceCycleConfig::v6()),
+        Role::ResourceCycle(ResourceCycleConfig::v5()),
+        (0..players)
+            .map(|_| Role::ResourceCycle(ResourceCycleConfig::v5()))
+            .collect(),
+    )
+}
+
+/// Ordinary Development Validation only: V6 minus V5, fixed V5 absolute-seat
+/// opponents, and the exact shared Corn-first selector in every Setup callback.
+/// These closed procedural roles have no numeric guard or model to load. The
+/// existing paired engine retains all-seat arms, failures and family bootstrap.
+pub fn run_resource_cycle_v6_v5_validation(
+    spec: &ResourceCycleV6V5ArenaSpec,
+) -> Result<NumericArenaReport, String> {
+    spec.validate()?;
+    let (candidate, reference, pool) = resource_cycle_v6_v5_roles(spec.arena.players);
+    run_admitted_roles(
+        &spec.arena,
+        candidate,
+        reference,
+        pool,
+        RESOURCE_CYCLE_V6_V5_ARENA_SCHEMA,
+        Some(SharedCornFirstSetupIdentity::current()),
+    )
+}
+
 /// Audited learned V5 teacher, using the same paired all-seat callback/Trade
 /// engine. Source families from every partition are excluded locally. This is
 /// Development Validation, without native, training or fresh Test authority.
@@ -2889,6 +2959,119 @@ pub(super) mod tests {
 
     #[test]
     fn numeric_validation_preflight_and_failed_arm_discard_only_game_history() {
+        // The new closed procedural route shares the actual arm callback and
+        // Corn-first override, without adding a full-game fixture.
+        for players in [3, 4] {
+            let wire = json!({
+                "schema": RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA,
+                "arena": {"schema": SCHEMA, "players": players, "seeds": [3],
+                    "bootstrapSeed": 7, "externalExclusions": {
+                        "evidenceSha256": "a".repeat(64), "excludedFamilyIds": []}}
+            });
+            let parse = |value: &serde_json::Value| {
+                let raw = serde_json::to_vec(value).unwrap();
+                ResourceCycleV6V5ArenaSpec::from_json(&raw, &crate::model::digest(&raw))
+            };
+            assert!(parse(&wire).is_ok());
+            for key in ["candidate", "reference", "opponentPool", "allowTest"] {
+                let mut unknown = wire.clone();
+                unknown[key] = true.into();
+                assert!(parse(&unknown).is_err());
+            }
+            let mut excluded = wire.clone();
+            excluded["arena"]["externalExclusions"]["excludedFamilyIds"] = json!([family_id(3)]);
+            assert!(parse(&excluded).is_err());
+            let mut wrong_split = wire.clone();
+            wrong_split["arena"]["seeds"] = json!([10]);
+            assert!(parse(&wrong_split).is_err());
+            let duplicate = format!(
+                "{{\"schema\":\"{RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA}\",\"schema\":\"duplicate\"}}"
+            );
+            assert!(
+                ResourceCycleV6V5ArenaSpec::from_json(
+                    duplicate.as_bytes(),
+                    &crate::model::digest(duplicate.as_bytes())
+                )
+                .is_err()
+            );
+            let raw = serde_json::to_vec(&wire).unwrap();
+            assert!(ResourceCycleV6V5ArenaSpec::from_json(&raw, &"0".repeat(64)).is_err());
+            let (candidate, reference, mut pool) = resource_cycle_v6_v5_roles(players);
+            assert!(
+                matches!(candidate.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v6())
+            );
+            assert!(pool.iter().all(
+                |r| matches!(r.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v5())
+            ));
+            let setup = SharedCornFirstSetupIdentity::current();
+            for (mut focal, configuration) in [
+                (
+                    candidate,
+                    super::super::resource_cycle::ResourceCycleConfig::v6(),
+                ),
+                (
+                    reference,
+                    super::super::resource_cycle::ResourceCycleConfig::v5(),
+                ),
+            ] {
+                let mut setup_seen = vec![0; players];
+                let mut playing_seen = 0;
+                let (arm, guards) = play_arm_using_with_setup(
+                    3,
+                    0,
+                    &mut focal,
+                    &mut pool,
+                    Some(&setup),
+                    |players, seed, decide| {
+                        let mut state = tzolkin_core::create_game(
+                            (0..players).map(|i| format!("Seat {i}")).collect(),
+                            seed,
+                            false,
+                        )?;
+                        for index in 0..16 {
+                            let observation = observe(&state, state.current_player)?;
+                            let expected = if observation.phase == Phase::Setup {
+                                setup_seen[observation.actor] += 1;
+                                crate::setup_policy::choose_move_with_weights(
+                                    &observation,
+                                    &setup.weights,
+                                )?
+                            } else {
+                                playing_seen += 1;
+                                let fixed = super::super::resource_cycle::ResourceCycleConfig::v5();
+                                super::super::resource_cycle::choose_move(
+                                    &observation,
+                                    if observation.actor == 0 {
+                                        &configuration
+                                    } else {
+                                        &fixed
+                                    },
+                                )?
+                            };
+                            let decision = decide(index, &observation)?;
+                            assert_eq!(decision.r#move, expected.r#move);
+                            assert_eq!(decision.policy_version, expected.policy_version);
+                            assert_eq!(decision.score.to_bits(), expected.score.to_bits());
+                            state = tzolkin_core::apply_move(&state, decision.r#move)?;
+                            if playing_seen == 1 {
+                                break;
+                            }
+                        }
+                        Err("Bounded procedural prefix completed".into())
+                    },
+                );
+                assert!(setup_seen.iter().all(|n| *n > 0));
+                assert_eq!(playing_seen, 1);
+                assert_eq!(
+                    arm.error.as_deref(),
+                    Some("Bounded procedural prefix completed")
+                );
+                assert!(arm.score.is_none() && arm.rank.is_none());
+                assert!(guards.iter().all(Option::is_none));
+            }
+        }
         // Small actual Core operations, not a played campaign. Selecting a
         // paid technology is not itself a paid resolution; origin follows the
         // actual Tikal chain, and unknown chains stay unknown.
