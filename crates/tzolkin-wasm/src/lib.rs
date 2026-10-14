@@ -2,22 +2,27 @@ use tzolkin_inference::{
     conditional_deployment as conditional, deployment, own_setup_deployment as own_setup,
 };
 use wasm_bindgen::prelude::*;
+mod semantic_checkpoint_cpu;
+use semantic_checkpoint_cpu as semantic;
 
 // Closed loader alternatives: no branch is a learning-owner constructor.
 enum CpuPolicy {
     Native(Box<deployment::LoadedDeployment>),
     Conditional(Box<conditional::LoadedConditionalDeployment>),
     OwnSetup(Box<own_setup::LoadedOwnSetupComposite>),
+    Semantic(Box<semantic::Policy>),
 }
 enum CpuGuard {
     Native(Box<deployment::GuardedDeployment>),
     Conditional(Box<conditional::GuardedConditionalDeployment>),
     OwnSetup(Box<own_setup::GuardedOwnSetupComposite>),
+    Semantic(Box<semantic::Guard>),
 }
 enum CpuPolicyRef<'a> {
     Native(&'a deployment::LoadedDeployment),
     Conditional(&'a conditional::LoadedConditionalDeployment),
     OwnSetup(&'a own_setup::LoadedOwnSetupComposite),
+    Semantic(&'a semantic::Policy),
 }
 impl CpuPolicy {
     fn as_ref(&self) -> CpuPolicyRef<'_> {
@@ -25,6 +30,7 @@ impl CpuPolicy {
             Self::Native(policy) => CpuPolicyRef::Native(policy),
             Self::Conditional(policy) => CpuPolicyRef::Conditional(policy),
             Self::OwnSetup(policy) => CpuPolicyRef::OwnSetup(policy),
+            Self::Semantic(policy) => CpuPolicyRef::Semantic(policy),
         }
     }
     fn into_guard(self) -> Result<CpuGuard, String> {
@@ -38,6 +44,9 @@ impl CpuPolicy {
             Self::OwnSetup(policy) => Ok(CpuGuard::OwnSetup(Box::new(
                 own_setup::GuardedOwnSetupComposite::new(*policy)?,
             ))),
+            Self::Semantic(policy) => {
+                Ok(CpuGuard::Semantic(Box::new(semantic::Guard::new(*policy)?)))
+            }
         }
     }
 }
@@ -47,6 +56,7 @@ impl CpuPolicyRef<'_> {
             Self::Native(policy) => policy.checksum(),
             Self::Conditional(policy) => policy.checksum(),
             Self::OwnSetup(policy) => policy.checksum(),
+            Self::Semantic(policy) => policy.checksum(),
         }
     }
     fn policy_version(&self) -> &str {
@@ -54,6 +64,7 @@ impl CpuPolicyRef<'_> {
             Self::Native(policy) => policy.policy_version(),
             Self::Conditional(policy) => policy.policy_version(),
             Self::OwnSetup(policy) => policy.policy_version(),
+            Self::Semantic(policy) => policy.policy_version(),
         }
     }
     fn choose_move(
@@ -64,10 +75,12 @@ impl CpuPolicyRef<'_> {
             Self::Native(policy) => policy.choose_move(observation),
             Self::Conditional(policy) => policy.choose_move(observation),
             Self::OwnSetup(policy) => policy.choose_move(observation),
+            Self::Semantic(policy) => policy.choose_move(observation),
         }
     }
     fn metadata(&self) -> Result<serde_json::Value, String> {
         match self {
+            Self::Semantic(policy) => policy.metadata(),
             Self::Native(policy) => {
                 let mut metadata = serde_json::json!({
                     "checksum": policy.checksum(),
@@ -139,6 +152,7 @@ impl CpuGuard {
             Self::Native(game) => CpuPolicyRef::Native(game.policy()),
             Self::Conditional(game) => CpuPolicyRef::Conditional(game.policy()),
             Self::OwnSetup(game) => CpuPolicyRef::OwnSetup(game.policy()),
+            Self::Semantic(game) => CpuPolicyRef::Semantic(game.policy()),
         }
     }
     fn into_policy(self) -> CpuPolicy {
@@ -146,6 +160,7 @@ impl CpuGuard {
             Self::Native(game) => CpuPolicy::Native(Box::new((*game).into_policy())),
             Self::Conditional(game) => CpuPolicy::Conditional(Box::new((*game).into_policy())),
             Self::OwnSetup(game) => CpuPolicy::OwnSetup(Box::new((*game).into_policy())),
+            Self::Semantic(game) => CpuPolicy::Semantic(Box::new((*game).into_policy())),
         }
     }
     fn configuration_key(&self) -> &str {
@@ -153,6 +168,7 @@ impl CpuGuard {
             Self::Native(game) => game.configuration_key(),
             Self::Conditional(game) => game.configuration_key(),
             Self::OwnSetup(game) => game.configuration_key(),
+            Self::Semantic(game) => game.configuration_key(),
         }
     }
     fn policy_version(&self) -> &'static str {
@@ -160,6 +176,7 @@ impl CpuGuard {
             Self::Native(_) => deployment::GUARDED_DEPLOYMENT_VERSION,
             Self::Conditional(_) => conditional::GUARDED_POLICY_VERSION,
             Self::OwnSetup(_) => own_setup::GUARDED_POLICY_VERSION,
+            Self::Semantic(_) => semantic::GUARDED_POLICY_VERSION,
         }
     }
     fn on_callback(
@@ -171,6 +188,7 @@ impl CpuGuard {
             Self::Native(game) => game.on_callback(index, observation),
             Self::Conditional(game) => game.on_callback(index, observation),
             Self::OwnSetup(game) => game.on_callback(index, observation),
+            Self::Semantic(game) => game.on_callback(index, observation),
         }
     }
     fn choose_move(
@@ -182,6 +200,7 @@ impl CpuGuard {
             Self::Native(game) => game.choose_move(index, observation),
             Self::Conditional(game) => game.choose_move(index, observation),
             Self::OwnSetup(game) => game.choose_move(index, observation),
+            Self::Semantic(game) => game.choose_move(index, observation),
         }
     }
 }
@@ -265,6 +284,11 @@ impl CpuDeployment {
                 own_setup::LoadedOwnSetupComposite::load(bytes)
                     .map_err(|error| JsError::new(&error))?,
             )),
+            tzolkin_inference::semantic_playing_deployment::DEPLOYMENT_SCHEMA => {
+                CpuPolicy::Semantic(Box::new(
+                    semantic::Policy::load(bytes).map_err(|error| JsError::new(&error))?,
+                ))
+            }
             _ => return Err(JsError::new("Unsupported NN deployment format")),
         };
         if !expected_checksum.is_empty() && expected_checksum != policy.as_ref().checksum() {
