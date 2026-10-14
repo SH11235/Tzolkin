@@ -8,10 +8,10 @@ use tzolkin_ai::semantic_playing_teacher_dataset::{
     load_semantic_playing_teacher_dataset, load_semantic_playing_v7_teacher_dataset,
 };
 use tzolkin_ai::semantic_playing_teacher_training::{
-    SemanticPlayingTeacherCheckpoint, train_dataset,
+    SemanticPlayingTeacherCheckpoint, train_dataset, train_dataset_with_fit_diagnostics,
 };
 
-const USAGE: &str = "Usage: tzolkin-semantic-playing-teacher-train --dataset DATASET_DIR --config CONFIG.json --output NEW_OUTPUT_DIR [--resume CHECKPOINT.json] [--teacher cornFirstV5|cornFirstV7]\nConfig requires epochs, batchSize, learningRate and seed. Epochs is the total target, including resumed epochs. Default teacher is cornFirstV5; explicit cornFirstV7 uses its separate complete-source contract, with no cross-profile resume or source conversion. This is fixed-teacher imitation, not strength evaluation.";
+const USAGE: &str = "Usage: tzolkin-semantic-playing-teacher-train --dataset DATASET_DIR --config CONFIG.json --output NEW_OUTPUT_DIR [--resume CHECKPOINT.json] [--teacher cornFirstV5|cornFirstV7] [--fit-diagnostics samePass]\nConfig requires epochs, batchSize, learningRate and seed. Epochs is the total target, including resumed epochs. Default teacher is cornFirstV5; explicit cornFirstV7 uses its separate complete-source contract, with no cross-profile resume or source conversion. samePass is V7-only, requires --resume and total epochs equal completed epochs, and emits bounded selected-model per-row diagnostic loss/top1 without an extra forward, update or shuffle. This is fixed-teacher imitation, not strength evaluation.";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 fn config(path: &Path) -> Result<PolicyBcConfig, String> {
@@ -47,7 +47,7 @@ fn run() -> Result<(), String> {
     while let Some(flag) = args.next() {
         if !matches!(
             flag.as_str(),
-            "--dataset" | "--config" | "--output" | "--resume" | "--teacher"
+            "--dataset" | "--config" | "--output" | "--resume" | "--teacher" | "--fit-diagnostics"
         ) {
             return Err(format!("Unknown flag: {flag}\n{USAGE}"));
         }
@@ -73,6 +73,11 @@ fn run() -> Result<(), String> {
         Some("cornFirstV7") => true,
         _ => return Err("Teacher must be cornFirstV5 or cornFirstV7".into()),
     };
+    let fit = match flags.remove("--fit-diagnostics").as_deref() {
+        None => false,
+        Some("samePass") if v7 && resume_path.is_some() => true,
+        _ => return Err("Fit diagnostics require explicit cornFirstV7 and a no-op resume".into()),
+    };
     let directory = Path::new(&directory);
     let output = Path::new(&output_path);
     validate_new_output_directory(output)?;
@@ -91,13 +96,41 @@ fn run() -> Result<(), String> {
     let resume = resume_path
         .map(|p| SemanticPlayingTeacherCheckpoint::load(Path::new(&p)))
         .transpose()?;
+    if fit
+        && resume
+            .as_ref()
+            .is_none_or(|p| p.completed_epochs != config.epochs)
+    {
+        return Err("Fit diagnostics cannot change completed epochs".into());
+    }
     let dataset = if v7 {
         load_semantic_playing_v7_teacher_dataset(directory)?
     } else {
         load_semantic_playing_teacher_dataset(directory)?
     };
-    let outcome = train_dataset(&dataset, &config, resume.as_ref())?;
-    outcome.save_new_directory(output)?;
+    let outcome = if fit {
+        let prepared = (|| {
+            let checkpoint = resume.as_ref().ok_or("Fit diagnostics require resume")?;
+            let (outcome, diagnostics) =
+                train_dataset_with_fit_diagnostics(&dataset, &config, checkpoint)?;
+            outcome.save_new_directory(output)?;
+            Ok::<_, String>((outcome, diagnostics))
+        })();
+        // Also recheck on no-op/output errors, before final diagnostic commit.
+        let post = dataset.recheck();
+        post?;
+        let (outcome, diagnostics) = prepared?;
+        if let Err(error) = diagnostics.save_new(output) {
+            let post = dataset.recheck();
+            post?;
+            return Err(error);
+        }
+        outcome
+    } else {
+        let outcome = train_dataset(&dataset, &config, resume.as_ref())?;
+        outcome.save_new_directory(output)?;
+        outcome
+    };
     println!(
         "{}",
         serde_json::to_string(&outcome.metrics).map_err(|e| e.to_string())?

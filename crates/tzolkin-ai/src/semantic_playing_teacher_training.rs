@@ -206,6 +206,14 @@ fn evaluate(
     model: &PublicPolicyModel,
     validation: bool,
 ) -> Result<TeacherEvaluation, String> {
+    evaluate_with_fit(rows, model, validation, None)
+}
+fn evaluate_with_fit(
+    rows: &[&ValidatedSemanticPlayingTeacherSample],
+    model: &PublicPolicyModel,
+    validation: bool,
+    mut fit: Option<&mut Vec<NativeTeacherSampleFit>>,
+) -> Result<TeacherEvaluation, String> {
     let mut total = empty_loss();
     let mut groups: BTreeMap<(usize, RoundBand), PolicyLossReport> = BTreeMap::new();
     let mut scratch = Scratch::default();
@@ -213,6 +221,23 @@ fn evaluate(
         // One real scalar forward per row contributes to overall and its group.
         let (loss, correct) =
             semantic_playing_policy_loss(model, s.candidates(), s.chosen(), &mut scratch, None)?;
+        if let Some(fit) = fit.as_deref_mut() {
+            if fit.len() >= 2 * crate::policy_dataset::MAX_PARTITION_SAMPLES || !loss.is_finite() {
+                return Err("Native teacher fit row bound/finite mismatch".into());
+            }
+            fit.push(NativeTeacherSampleFit {
+                sample_id: s.sample_id().into(),
+                split: if validation {
+                    DatasetSplit::Validation
+                } else {
+                    DatasetSplit::Train
+                },
+                players: s.players(),
+                round: s.round(),
+                nll: loss,
+                correct_top1: correct,
+            });
+        }
         for r in std::iter::once(&mut total).chain(if validation {
             Some(
                 groups
@@ -506,6 +531,15 @@ fn train_after_cache(
     resume: Option<&SemanticPlayingTeacherCheckpoint>,
     after_cache: impl FnOnce() -> Result<(), String>,
 ) -> Result<SemanticPlayingTeacherOutcome, String> {
+    train_after_cache_with_fit(dataset, config, resume, after_cache, None)
+}
+fn train_after_cache_with_fit(
+    dataset: &ValidatedSemanticPlayingTeacherDataset,
+    config: &PolicyBcConfig,
+    resume: Option<&SemanticPlayingTeacherCheckpoint>,
+    after_cache: impl FnOnce() -> Result<(), String>,
+    mut fit: Option<&mut Vec<NativeTeacherSampleFit>>,
+) -> Result<SemanticPlayingTeacherOutcome, String> {
     dataset.with_checked_cache(|samples, raw_pin| {
         config.validate()?;
         let identity = NativeTeacherDatasetIdentity {
@@ -529,6 +563,11 @@ fn train_after_cache(
             }
         }
         let remaining = config.epochs - completed;
+        if fit.is_some()
+            && (profile != data::TeacherProfile::V7 || resume.is_none() || remaining != 0)
+        {
+            return Err("Fit diagnostics require a V7 no-op resume".into());
+        }
         let metric_passes = 1 + usize::from(resume.is_some()) + usize::from(remaining > 0);
         let tc = identity.count(DatasetSplit::Train);
         let vc = identity.count(DatasetSplit::Validation);
@@ -576,8 +615,8 @@ fn train_after_cache(
             state: resume.map_or_else(|| seeded(SHUFFLE_DOMAIN, config.seed), |p| p.random_state),
         };
         let (current_train, current_validation) = if let Some(p) = resume {
-            let t = evaluate(&train, &model, false)?;
-            let v = evaluate(&validation, &model, true)?;
+            let t = evaluate_with_fit(&train, &model, false, fit.as_deref_mut())?;
+            let v = evaluate_with_fit(&validation, &model, true, fit)?;
             if p.metrics.initial_train != initial_train
                 || p.metrics.initial_validation != initial_validation
                 || p.metrics.final_train != t
@@ -675,6 +714,96 @@ fn train_after_cache(
         })
     })
 }
+// Advisory selected-model rows, kept outside every serialized BC core type.
+const FIT_SCHEMA: &str = "tzolkin-native-v7-selected-bc-fit-diagnostics-v1";
+const MAX_FIT_BYTES: usize = 32 * 1024 * 1024;
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTeacherSampleFit {
+    sample_id: String,
+    split: DatasetSplit,
+    players: usize,
+    round: i64,
+    nll: f64,
+    correct_top1: bool,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTeacherFitDiagnostics {
+    schema: String,
+    dataset_fingerprint: String,
+    raw_manifest_sha256: String,
+    checkpoint_checksum: String,
+    model_checksum: String,
+    config: PolicyBcConfig,
+    completed_epochs: usize,
+    existing_metric_passes_per_row: usize,
+    diagnostic_additional_forward_passes: usize,
+    training_updates: usize,
+    strength_claimed: bool,
+    rows: Vec<NativeTeacherSampleFit>,
+    checksum: String,
+}
+impl NativeTeacherFitDiagnostics {
+    fn expected_checksum(&self) -> Result<String, String> {
+        let mut value = serde_json::to_value(self).map_err(|e| e.to_string())?;
+        value["checksum"] = "".into();
+        let mut hash = Sha256::new();
+        hash.update(b"tzolkin-native-v7-selected-bc-fit-diagnostics-v1\0");
+        hash.update(serde_json::to_vec(&value).map_err(|e| e.to_string())?);
+        Ok(format!("{:x}", hash.finalize()))
+    }
+    /// Caller must finish source POST before this final advisory publication;
+    /// an actual successful CLI exit is still required for acceptance.
+    pub fn save_new(&self, directory: &Path) -> Result<(), String> {
+        data::local(directory)?;
+        if self.checksum != self.expected_checksum()? {
+            return Err("Fit checksum".into());
+        }
+        let bytes = serde_json::to_vec(self).map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_FIT_BYTES {
+            return Err("Fit diagnostics byte cap".into());
+        }
+        crate::policy_dataset::publish_bytes(directory, "fit-diagnostics.json", &bytes)
+    }
+}
+/// Reuses only the selected model's existing no-op resume metric pass. The
+/// existing initialized-model checks still run; no optimizer/RNG step is added.
+pub fn train_dataset_with_fit_diagnostics(
+    dataset: &ValidatedSemanticPlayingTeacherDataset,
+    config: &PolicyBcConfig,
+    checkpoint: &SemanticPlayingTeacherCheckpoint,
+) -> Result<(SemanticPlayingTeacherOutcome, NativeTeacherFitDiagnostics), String> {
+    let mut rows = Vec::new();
+    let outcome = train_after_cache_with_fit(
+        dataset,
+        config,
+        Some(checkpoint),
+        || Ok(()),
+        Some(&mut rows),
+    )?;
+    if bounded_json(&outcome.checkpoint)? != bounded_json(checkpoint)? {
+        return Err("Fit no-op changed checkpoint".into());
+    }
+    let mut report = NativeTeacherFitDiagnostics {
+        schema: FIT_SCHEMA.into(),
+        dataset_fingerprint: checkpoint.dataset.manifest.fingerprint.clone(),
+        raw_manifest_sha256: checkpoint.dataset.raw_manifest_sha256.clone(),
+        checkpoint_checksum: checkpoint.checksum.clone(),
+        model_checksum: checkpoint.model.checksum.clone(),
+        config: config.clone(),
+        completed_epochs: checkpoint.completed_epochs,
+        existing_metric_passes_per_row: 2,
+        diagnostic_additional_forward_passes: 0,
+        training_updates: 0,
+        strength_claimed: false,
+        rows,
+        checksum: String::new(),
+    };
+    report.checksum = report.expected_checksum()?;
+    Ok((outcome, report))
+}
+
 pub fn train_dataset(
     dataset: &ValidatedSemanticPlayingTeacherDataset,
     config: &PolicyBcConfig,
@@ -756,6 +885,53 @@ pub(crate) fn fixture(
         bounded_json(&v7_resumed.checkpoint).unwrap()
     );
     validate_checkpoint_dataset(&v7_data, &v7_full.checkpoint).unwrap();
+    let (fit_noop, fit) =
+        train_dataset_with_fit_diagnostics(&v7_data, &config(3), &v7_full.checkpoint).unwrap();
+    assert_eq!(
+        bounded_json(&fit_noop.checkpoint).unwrap(),
+        bounded_json(&v7_full.checkpoint).unwrap()
+    );
+    assert_eq!(
+        fit.rows.len(),
+        v7_full.metrics.final_train.overall.samples
+            + v7_full.metrics.final_validation.overall.samples
+    );
+    assert!(
+        fit.rows
+            .iter()
+            .all(|r| r.split != DatasetSplit::Test && r.nll.is_finite())
+    );
+    for (split, expected) in [
+        (DatasetSplit::Train, &v7_full.metrics.final_train.overall),
+        (
+            DatasetSplit::Validation,
+            &v7_full.metrics.final_validation.overall,
+        ),
+    ] {
+        let rows: Vec<_> = fit.rows.iter().filter(|r| r.split == split).collect();
+        assert_eq!(
+            rows.iter().filter(|r| r.correct_top1).count(),
+            expected.correct_top1
+        );
+        assert!(
+            (rows.iter().map(|r| r.nll).sum::<f64>() / rows.len() as f64 - expected.policy_loss)
+                .abs()
+                < 1e-12
+        );
+    }
+    assert_eq!(fit.checksum, fit.expected_checksum().unwrap());
+    let fit_output = parent.join("native4-v7-fit-diagnostics");
+    fs::create_dir(&fit_output).unwrap();
+    fit.save_new(&fit_output).unwrap();
+    let saved = fs::read(fit_output.join("fit-diagnostics.json")).unwrap();
+    assert_eq!(saved, serde_json::to_vec(&fit).unwrap());
+    assert!(fit.save_new(&fit_output).is_err());
+    assert_eq!(
+        fs::read(fit_output.join("fit-diagnostics.json")).unwrap(),
+        saved
+    );
+    assert!(train_dataset_with_fit_diagnostics(&v7_data, &config(4), &v7_full.checkpoint).is_err());
+    assert!(train_dataset_with_fit_diagnostics(&dataset, &config(3), &full.checkpoint).is_err());
     assert_eq!(v7_full.model.source_kind, data::V7_SOURCE_KIND);
     assert_eq!(v7_full.model.task, V7_TASK);
     assert_eq!(v7_full.model.input_contract, data::V7_INPUT_CONTRACT);
