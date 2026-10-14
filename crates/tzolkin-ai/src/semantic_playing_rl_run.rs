@@ -15,6 +15,7 @@ use crate::semantic_playing_rl_collection::{DeclaredSamplingHistory, DeclaredSam
 use crate::semantic_playing_rl_pool::SnapshotSlot;
 
 const RUN_SCHEMA: &str = "tzolkin-semantic-playing-journal-run-v1";
+const AUDIT_SCHEMA: &str = "tzolkin-semantic-playing-journal-audit-v1";
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 
@@ -99,6 +100,34 @@ impl Original {
             self.budget[4],
         )
     }
+    fn load_prepared(&self) -> Result<PreparedConditionalHumanPolicy, String> {
+        pinned(&self.checkpoint, 32 * 1024 * 1024)?;
+        pinned(&self.collection, 16 * 1024 * 1024)?;
+        let prepared = PreparedConditionalHumanPolicy::load_semantic_playing(
+            Path::new(&self.checkpoint.path),
+            Path::new(&self.collection.path),
+        )?;
+        pinned(&self.checkpoint, 32 * 1024 * 1024)?;
+        pinned(&self.collection, 16 * 1024 * 1024)?;
+        Ok(prepared)
+    }
+    fn fresh<'a>(
+        &self,
+        prepared: &PreparedConditionalHumanPolicy,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+    ) -> Result<SemanticPlayingJointSession<'a>, String> {
+        SemanticPlayingJointSession::from_fresh(
+            SemanticPlayingRlOwner::from_prepared(prepared, self.critic_seed)?,
+            external,
+            history,
+            SamplingSeed::new(self.sampling_seed),
+            self.first_ordinal,
+            self.replicate,
+            OneStepConfig::from_checkpoint(self.actor_config.clone())?,
+            ResidualFitConfig::from_checkpoint(self.critic_config.clone())?,
+        )
+    }
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -113,6 +142,190 @@ struct Prior {
 struct Restore {
     tip: ContentPin,
     close_declaration: ContentPin,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuditWire {
+    schema: String,
+    journal_directory: String,
+    original: Original,
+    procedural_pool: ContentPin,
+    restore: Restore,
+}
+
+/// Separate restore-only input. It admits no schedule, allocation, new prior,
+/// capture request or empty start/resume invocation. Original source pins and
+/// the producing-close declaration still pass the existing cold restore gates.
+pub struct SemanticJournalAuditSpec {
+    wire: AuditWire,
+    checksum: String,
+}
+impl SemanticJournalAuditSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if !checkpoint_digest(expected_sha256) || crate::model::digest(raw) != expected_sha256 {
+            return Err("Semantic audit control pin differs".into());
+        }
+        let wire: AuditWire =
+            serde_json::from_value(unique_json(raw, MAX_CONTROL)?).map_err(|e| e.to_string())?;
+        if wire.schema != AUDIT_SCHEMA || !Path::new(&wire.journal_directory).is_absolute() {
+            return Err("Semantic audit schema/absolute journal differs".into());
+        }
+        wire.original.limits()?;
+        wire.original.budget()?;
+        OneStepConfig::from_checkpoint(wire.original.actor_config.clone())?;
+        ResidualFitConfig::from_checkpoint(wire.original.critic_config.clone())?;
+        Ok(Self {
+            wire,
+            checksum: expected_sha256.into(),
+        })
+    }
+}
+
+/// Descriptive replay result only: no owner, parameters, Ready token or new
+/// learning admission escapes. Historical updates/draws are freshly recomputed,
+/// not newly allocated. An outer observer measures CPU/RSS and actual OS close.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticJournalAudit {
+    schema: &'static str,
+    control_sha256: String,
+    declared_producing_close: ContentPin,
+    head: ContentPin,
+    status: SemanticJournalStatus,
+    complete_session_consumption: Value,
+    archive_inventory: Vec<ContentPin>,
+    capture_ids: Vec<String>,
+    historical_archive_bytes_verified: bool,
+    new_families: usize,
+    new_actor_streams: usize,
+    new_logical_updates: usize,
+    actual_process_close_verified: bool,
+    source_authenticated: bool,
+    source_qualified: bool,
+    verified_native_policy: bool,
+    strength_claimed: bool,
+}
+
+/// Replays an existing successful producing tip from its genuinely loaded
+/// original Human4 source and fresh critic. Writes only a fresh, separate audit
+/// report; the journal, its budget, burns and admitted lineage are not modified.
+/// A saved report alone is insufficient: publication/POST errors return Err and
+/// the host must independently require exit0/EOF/pins. No process is observed here.
+pub fn audit_semantic_playing_journal(
+    spec: SemanticJournalAuditSpec,
+    output: &Path,
+) -> Result<SemanticJournalAudit, String> {
+    let w = &spec.wire;
+    if !output.is_absolute() {
+        return Err("Semantic audit output must be absolute".into());
+    }
+    let directory = local(Path::new(&w.journal_directory), false)?;
+    let output = local(output, true)?;
+    if !output.is_absolute()
+        || output.to_string_lossy().len() > 1024
+        || directory.to_string_lossy().len() > 1024
+        || fs::symlink_metadata(&output).is_ok()
+    {
+        return Err("Semantic audit needs a fresh bounded output namespace".into());
+    }
+    // Compare existing canonical parents too: Windows path spelling/case must
+    // not allow an output child to be created inside the archived journal.
+    let canonical_directory = fs::canonicalize(&directory).map_err(|e| e.to_string())?;
+    let canonical_output = fs::canonicalize(output.parent().ok_or("Audit output parent")?)
+        .map_err(|e| e.to_string())?
+        .join(output.file_name().ok_or("Audit output name")?);
+    if canonical_output.starts_with(&canonical_directory)
+        || canonical_directory.starts_with(&canonical_output)
+    {
+        return Err("Semantic audit output overlaps journal".into());
+    }
+    reject_input_namespace(
+        &output,
+        &serde_json::to_value(w).map_err(|e| e.to_string())?,
+    )?;
+    let external = w.original.external.load()?;
+    let history = w.original.history.load()?;
+    let pool = ConditionalFrozenPool::from_json(&pinned(&w.procedural_pool, MAX_CONTROL)?)?;
+    pool.procedural_binding()?;
+    let prepared = w.original.load_prepared()?;
+    let result = (|| {
+        let restored = restore_observed_closed(
+            &directory,
+            &w.restore.tip,
+            &w.restore.close_declaration,
+            w.original.fresh(&prepared, &external, &history)?,
+            &[&pool],
+        )?;
+        let (journal, snapshots) = restored.into_journal_and_snapshots();
+        if journal.limits != w.original.limits()?
+            || bounded(&journal.budget)? != bounded(&w.original.budget()?)?
+        {
+            return Err("Semantic audit original limits/budget differ".into());
+        }
+        let report = audit_report(
+            spec.checksum,
+            &w.restore.close_declaration,
+            &journal,
+            &snapshots,
+        )?;
+        let raw = bounded(&report)?;
+        fs::create_dir(&output).map_err(|e| e.to_string())?;
+        publish_mixed_metadata(&output, "audit.json", &raw)?;
+        // The read-only report is not authority. Preserve late errors rather
+        // than returning a success after changed archive/source evidence.
+        journal.verify_archive_bytes()?;
+        journal.session.journal_recheck()?;
+        Ok(report)
+    })();
+    let post = prepared
+        .recheck_sources()
+        .and_then(|_| external.recheck())
+        .and_then(|_| history.recheck())
+        .and_then(|_| pinned(&w.procedural_pool, MAX_CONTROL).map(|_| ()))
+        .and_then(|_| pinned(&w.restore.close_declaration, META_BYTES).map(|_| ()))
+        .and_then(|_| pool.procedural_binding().map(|_| ()));
+    match (result, post) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (result, Err(post)) => Err(format!(
+            "{}; audit source POST: {post}",
+            result.err().unwrap_or_default()
+        )),
+    }
+}
+
+pub(super) fn audit_report(
+    checksum: String,
+    close: &ContentPin,
+    journal: &SemanticPlayingJournal<'_>,
+    snapshots: &[FrozenSemanticSnapshot<'_>],
+) -> Result<SemanticJournalAudit, String> {
+    journal.verify_archive_bytes()?;
+    journal.session.journal_recheck()?;
+    Ok(SemanticJournalAudit {
+        schema: "tzolkin-semantic-playing-journal-audit-report-v1",
+        control_sha256: checksum,
+        declared_producing_close: close.clone(),
+        head: journal.head(),
+        status: journal.status(),
+        complete_session_consumption: journal.session.capture_ledger(),
+        archive_inventory: journal
+            .members
+            .values()
+            .map(|p| p.absolute(&journal.directory))
+            .collect(),
+        capture_ids: snapshots.iter().map(|s| s.binding().to_string()).collect(),
+        historical_archive_bytes_verified: true,
+        new_families: 0,
+        new_actor_streams: 0,
+        new_logical_updates: 0,
+        actual_process_close_verified: false,
+        source_authenticated: false,
+        source_qualified: false,
+        verified_native_policy: false,
+        strength_claimed: false,
+    })
 }
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
@@ -317,24 +530,10 @@ pub fn run_semantic_playing_journal(
         limits,
     )?;
     // All control/allocation/prior checks above precede model loading or Game.
-    pinned(&w.original.checkpoint, 32 * 1024 * 1024)?;
-    pinned(&w.original.collection, 16 * 1024 * 1024)?;
-    let prepared = PreparedConditionalHumanPolicy::load_semantic_playing(
-        Path::new(&w.original.checkpoint.path),
-        Path::new(&w.original.collection.path),
-    )?;
-    pinned(&w.original.checkpoint, 32 * 1024 * 1024)?;
-    pinned(&w.original.collection, 16 * 1024 * 1024)?;
-    let fresh = SemanticPlayingJointSession::from_fresh(
-        SemanticPlayingRlOwner::from_prepared(&prepared, w.original.critic_seed)?,
-        &original_external,
-        &original_history,
-        SamplingSeed::new(w.original.sampling_seed),
-        w.original.first_ordinal,
-        w.original.replicate,
-        OneStepConfig::from_checkpoint(w.original.actor_config.clone())?,
-        ResidualFitConfig::from_checkpoint(w.original.critic_config.clone())?,
-    )?;
+    let prepared = w.original.load_prepared()?;
+    let fresh = w
+        .original
+        .fresh(&prepared, &original_external, &original_history)?;
     let (mut journal, mut snapshots) = if let Some(restore) = &w.restore {
         restore_observed_closed(
             &directory,
@@ -752,6 +951,23 @@ pub(super) fn control_fixture(root: &Path, limits: CollectionLimits, seeds: [u32
     };
     let spec = parse(&value).unwrap();
     let w = &spec.wire;
+    let mut audit = json!({"schema":AUDIT_SCHEMA,"journalDirectory":root.join("journal"),
+        "original":value["original"],"proceduralPool":external_pin,
+        "restore":{"tip":external_pin,"closeDeclaration":external_pin}});
+    let parse_audit = |value: &Value| {
+        let raw = serde_json::to_vec(value).unwrap();
+        SemanticJournalAuditSpec::from_json(&raw, &crate::model::digest(&raw))
+    };
+    assert!(parse_audit(&audit).is_ok());
+    assert!(parse_audit(&value).is_err()); // No empty/current run-mode shortcut.
+    audit["batches"] = json!([]);
+    assert!(parse_audit(&audit).is_err()); // Even an empty schedule is refused.
+    audit.as_object_mut().unwrap().remove("batches");
+    audit["original"]["budget"][0] = 0.into();
+    assert!(parse_audit(&audit).is_err()); // No budget/refund override.
+    audit["original"]["budget"][0] = 3.into();
+    audit["restore"] = Value::Null;
+    assert!(parse_audit(&audit).is_err()); // A real producing-close input is mandatory.
     let declared = allocation(w, &plan_checksum(w).unwrap(), 200, limits).unwrap();
     let streams = declared["actorStreams"].as_array().unwrap();
     assert_eq!(streams.len(), 14);
