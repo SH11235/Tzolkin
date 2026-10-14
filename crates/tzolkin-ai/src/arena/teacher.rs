@@ -471,8 +471,10 @@ impl PreparedSemanticPlayingTeacher {
         // A bounded numerical/custody oracle, NOT a complete-source loader
         // success. Production must continue to reject this synthetic dataset.
         let chosen = observation.legal_actions[0].clone();
+        let first_playing = observation.players.len();
         let dataset =
-            data::training_cache_fixture(directory, &[(observation, chosen, 0)], None).unwrap();
+            data::training_cache_fixture(directory, &[(observation, chosen, first_playing)], None)
+                .unwrap();
         let outcome = training::train_dataset(
             &dataset,
             &crate::policy_training::PolicyBcConfig {
