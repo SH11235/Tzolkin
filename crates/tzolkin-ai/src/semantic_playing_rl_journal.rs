@@ -40,7 +40,10 @@ pub use restore::{
 };
 #[path = "semantic_playing_rl_run.rs"]
 mod runner;
-pub use runner::{SemanticJournalInvocation, SemanticJournalRunSpec, run_semantic_playing_journal};
+pub use runner::{
+    SemanticJournalAudit, SemanticJournalAuditSpec, SemanticJournalInvocation,
+    SemanticJournalRunSpec, audit_semantic_playing_journal, run_semantic_playing_journal,
+};
 const META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 640;
 
@@ -840,6 +843,23 @@ pub(crate) fn journal_fixture(
         captures[1].journal_identity().unwrap(),
         final_capture.journal_identity().unwrap()
     );
+    let audit = runner::audit_report("0".repeat(64), &declared, &restored, &captures).unwrap();
+    let audit = serde_json::to_value(audit).unwrap();
+    assert_eq!(
+        audit["status"],
+        serde_json::to_value(journal.status()).unwrap()
+    );
+    assert_eq!(
+        audit["completeSessionConsumption"],
+        journal.session.capture_ledger()
+    );
+    assert_eq!(audit["captureIds"].as_array().unwrap().len(), 2);
+    assert_eq!(audit["newFamilies"], 0);
+    assert_eq!(audit["newActorStreams"], 0);
+    assert_eq!(audit["newLogicalUpdates"], 0);
+    assert_eq!(audit["historicalArchiveBytesVerified"], true);
+    assert_eq!(audit["actualProcessCloseVerified"], false);
+    assert_eq!(audit["strengthClaimed"], false);
     assert!(
         restore::restore_using(
             &journal.directory,
@@ -871,6 +891,7 @@ pub(crate) fn journal_fixture(
     fs::write(&report_path, &corrupt).unwrap();
     journal.verify_files().unwrap(); // Warm outputs are not learning inputs.
     assert!(journal.verify_archive_bytes().is_err());
+    assert!(runner::audit_report("0".repeat(64), &declared, &restored, &captures).is_err());
     assert!(
         restore::restore_using(
             &journal.directory,
