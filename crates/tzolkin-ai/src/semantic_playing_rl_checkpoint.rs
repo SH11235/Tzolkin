@@ -151,6 +151,113 @@ fn read(input: &Input) -> Result<Payload, String> {
     restore::checked_close(&payload.tip, &closed.journal_close_declaration, &directory)?;
     Ok(payload)
 }
+
+/// Only this checked checkpoint path can emit the policy export. Loading that
+/// numeric artifact later validates content, not the producer's external truth.
+pub(super) fn export_policy(
+    input: &Input,
+    control_checksum: &str,
+    output: &Path,
+) -> Result<SemanticPolicyExport, String> {
+    use tzolkin_inference::{deployment, semantic_playing_deployment as policy};
+    let result = (|| {
+        let payload = read(input)?;
+        if !output.is_absolute() {
+            return Err("Semantic policy output must be absolute".into());
+        }
+        let output = local(output, true)?;
+        if output.to_string_lossy().len() > 1024 || fs::symlink_metadata(&output).is_ok() {
+            return Err("Semantic policy export needs a fresh bounded namespace".into());
+        }
+        let directory = Path::new(&payload.tip.path)
+            .parent()
+            .ok_or("Checkpoint journal parent")?;
+        let canonical_directory = fs::canonicalize(directory).map_err(|e| e.to_string())?;
+        let canonical_output = fs::canonicalize(output.parent().ok_or("Policy output parent")?)
+            .map_err(|e| e.to_string())?
+            .join(output.file_name().ok_or("Policy output name")?);
+        if canonical_output.starts_with(&canonical_directory)
+            || canonical_directory.starts_with(&canonical_output)
+        {
+            return Err("Semantic policy output overlaps journal".into());
+        }
+        reject_input_namespace(
+            &output,
+            &serde_json::to_value((input, &payload)).map_err(|e| e.to_string())?,
+        )?;
+        let identity = payload.numerics.validate(
+            &OneStepConfig::from_checkpoint(payload.original.actor_config.clone())?,
+            &ResidualFitConfig::from_checkpoint(payload.original.critic_config.clone())?,
+        )?;
+        let parameters = payload.numerics.actor_for_policy_export();
+        let mut wire = json!({
+            "schema":policy::DEPLOYMENT_SCHEMA,
+            "contract":{
+                "modelVersion":deployment::MODEL_VERSION,"inputContract":policy::INPUT_CONTRACT,
+                "featureSchema":tzolkin_inference::features::SEMANTIC_PLAYING_FEATURE_SCHEMA,
+                "featureCount":tzolkin_inference::features::FEATURE_COUNT,
+                "hiddenCount":tzolkin_inference::policy::HIDDEN,
+                "parameterCount":tzolkin_inference::policy::PARAMETER_COUNT,
+                "rulesVersion":deployment::RULES_VERSION,"rulesBaseline":deployment::RULES_BASELINE,
+                "observationSchema":tzolkin_core::observation::OBSERVATION_SCHEMA,
+                "moveSchema":tzolkin_core::observation::MOVE_SCHEMA,
+                "catalogHash":deployment::catalog_hash(),"backend":"scalar",
+                "numericContract":deployment::NUMERIC_CONTRACT,"scope":policy::SCOPE,
+                "valueValidity":deployment::VALUE_VALIDITY},
+            "identity":{
+                "sourceRole":policy::SOURCE_ROLE,"task":policy::TASK,
+                "checkpointSha256":input.payload.sha256,
+                "closeDeclarationSha256":input.close_declaration.sha256,
+                "rootChecksum":identity.root_checksum(),
+                "previousIdentityChecksum":identity.immediate_parent_checksum(),
+                "currentIdentityChecksum":identity.checksum(),
+                "actorChecksum":identity.actor_checksum(),
+                "updates":identity.completed_updates(),
+                "playingCredit":identity.credited_playing_decisions(),
+                "sourceAuthenticated":false,"sourceQualified":false,
+                "verifiedNativePolicy":false,"strengthMeasured":false},
+            "sourceNumericalTarget":crate::public_stochastic_native::numerical_target(),
+            "parameterBits":parameters.iter().map(|v|format!("{:08x}",v.to_bits())).collect::<Vec<_>>(),
+            "checksum":""});
+        wire["checksum"] =
+            policy::numeric_checksum(&serde_json::to_vec(&wire).map_err(|e| e.to_string())?)?
+                .into();
+        let raw = serde_json::to_vec(&wire).map_err(|e| e.to_string())?;
+        let loaded = policy::LoadedSemanticPlayingDeployment::load(&raw)?;
+        let report = SemanticPolicyExport {
+            schema: "tzolkin-semantic-playing-checkpoint-policy-export-report-v1".into(),
+            control_sha256: control_checksum.into(),
+            artifact_file: "policy.json".into(),
+            artifact_bytes: raw.len(),
+            artifact_sha256: crate::model::digest(&raw),
+            deployment_checksum: loaded.checksum().into(),
+            actor_checksum: loaded.identity().actor_checksum().into(),
+            current_identity_checksum: loaded.identity().current_identity_checksum().into(),
+            updates: loaded.identity().updates(),
+            playing_credit: loaded.identity().playing_credit(),
+            source_authenticated: false,
+            source_qualified: false,
+            strength_measured: false,
+            adoption_granted: false,
+        };
+        fs::create_dir(&output).map_err(|e| e.to_string())?;
+        publish_mixed_metadata(&output, "policy.json", &raw)?;
+        publish_mixed_metadata(&output, "policy-export.json", &bounded(&report)?)?;
+        Ok(report)
+    })();
+    // A parse, namespace, serialization or publication error cannot bypass
+    // rechecking the original pinned checkpoint and producing-close inputs.
+    let post = read(input).map(|_| ());
+    match (result, post) {
+        (Ok(report), Ok(())) => Ok(report),
+        (Err(error), Ok(())) => Err(error),
+        (result, Err(post)) => Err(format!(
+            "{}; semantic policy export POST: {post}",
+            result.err().unwrap_or_default()
+        )),
+    }
+}
+
 pub(super) fn recheck(chunk: Option<&Chunk>) -> Result<(), String> {
     if let Some(chunk) = chunk {
         read(&chunk.parent)?;

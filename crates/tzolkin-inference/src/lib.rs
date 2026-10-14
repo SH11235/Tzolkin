@@ -8,4 +8,5 @@ pub mod kernel;
 pub mod own_setup_contract;
 pub mod own_setup_deployment;
 pub mod policy;
+pub mod semantic_playing_deployment;
 pub mod trade_guard;

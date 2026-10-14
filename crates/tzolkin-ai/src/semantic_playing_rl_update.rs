@@ -186,6 +186,12 @@ pub(crate) struct SemanticCheckpointState {
     critic: Vec<f32>,
 }
 impl SemanticCheckpointState {
+    /// Numeric borrow only; the checkpoint reader validates its owned identity.
+    /// This does not expose a training owner or a checkpoint constructor.
+    pub(crate) fn actor_for_policy_export(&self) -> &[f32] {
+        self.actor.parameters()
+    }
+
     pub(crate) fn validate(
         &self,
         actor: &OneStepConfig,
