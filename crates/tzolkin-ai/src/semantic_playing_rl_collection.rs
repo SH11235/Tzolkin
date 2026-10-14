@@ -940,6 +940,8 @@ pub(crate) struct PlannedSemanticReservation {
     batch: SemanticReservation,
     spent: BTreeSet<String>,
     streams: BTreeSet<[u64; 5]>,
+    // Copied journal metadata, never a reusable source-check capability.
+    checked_pool_binding: Option<serde_json::Value>,
 }
 pub(crate) struct SemanticReservation {
     parent: String,
@@ -954,6 +956,9 @@ pub(crate) struct SemanticReservation {
 impl PlannedSemanticReservation {
     pub(crate) fn description(&self) -> &serde_json::Value {
         &self.batch.description
+    }
+    pub(crate) fn checked_pool_binding(&self) -> Option<&serde_json::Value> {
+        self.checked_pool_binding.as_ref()
     }
 }
 impl SemanticReservation {
@@ -1379,7 +1384,22 @@ impl<'a> SemanticCollectionLedger<'a> {
         if self.stopped || self.attempts >= MAX_ATTEMPTS {
             return Err("Semantic collection stopped or attempt bound".into());
         }
-        owner.with_checked_pool(self.external, &self.pins, |checked| pool.recheck_in(checked), |_| {
+        // The metadata travels only with this checked plan. PRE and POST each
+        // receive a fresh source pass, which is discarded before Reserve.
+        let checked_pool_binding = std::cell::RefCell::new(None);
+        owner.with_checked_pool(self.external, &self.pins, |checked| {
+            if let PoolRef::Mixture(mixture) = pool {
+                let binding = mixture.journal_binding_in(checked)?;
+                let mut previous = checked_pool_binding.borrow_mut();
+                if previous.as_ref().is_some_and(|value| value != &binding) {
+                    return Err("Semantic planned pool metadata changed during checks".into());
+                }
+                *previous = Some(binding);
+                Ok(())
+            } else {
+                pool.recheck_in(checked)
+            }
+        }, |_| {
             if let PoolRef::Mixture(mixture) = pool {
                 mixture.require_receiver(owner, self.external, self.history,
                     (&self.spent, &self.streams), &self.admitted)?;
@@ -1457,7 +1477,8 @@ impl<'a> SemanticCollectionLedger<'a> {
                 "pool":pool.binding()?});
             Ok(PlannedSemanticReservation {batch:SemanticReservation {
                 parent,binding,configs,families,attempt,next,burns,description,
-            },spent,streams:all_streams})
+            },spent,streams:all_streams,
+                checked_pool_binding:checked_pool_binding.borrow().clone()})
         })
     }
     /// The opaque plan already owns every allocation. No fallible operation or
