@@ -71,6 +71,10 @@ function mechanical(state) {
   delete value.log;
   return value;
 }
+const buildingSignature = (id) =>
+  Object.fromEntries(
+    Object.entries(buildings.get(id)).filter(([key]) => !['id', 'name'].includes(key)),
+  );
 // The witness declares calibrated local identities, not a physical card choice.
 export function validateBuildingEquivalenceClass(witness) {
   const ids = witness.buildingEquivalenceClass;
@@ -84,11 +88,7 @@ export function validateBuildingEquivalenceClass(witness) {
     ids.some((id) => !buildings.has(id))
   )
     fail('Invalid building equivalence class');
-  const signature = (id) =>
-    Object.fromEntries(
-      Object.entries(buildings.get(id)).filter(([key]) => !['id', 'name'].includes(key)),
-    );
-  if (ids.some((id) => !same(signature(id), signature(ids[0]))))
+  if (ids.some((id) => !same(buildingSignature(id), buildingSignature(ids[0]))))
     fail('Building equivalence class has different catalog fields');
   return [...ids].sort();
 }
@@ -379,6 +379,90 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   const state = () => frame.snapshot.state;
   const actorId = (name) => names.indexOf(name);
   const pending = () => frame.observation?.pendingTask?.type ?? null;
+
+  function paidBuildingClass(event, events, witness, payments) {
+    const actor = actorId(event.actor);
+    const task = state().pending?.task;
+    if (
+      declaredProfile === null ||
+      event.kind !== 'build' ||
+      witness.buildings !== undefined ||
+      witness.buildingEquivalenceClass !== undefined ||
+      state().version !== 1 ||
+      state().additionalBuildings !== false ||
+      state().expansion != null ||
+      actor !== state().currentPlayer ||
+      state().players[actor]?.technologies.architecture !== 0 ||
+      pending() !== 'build' ||
+      task?.type !== 'build' ||
+      task.remaining !== 1 ||
+      task.cornPayment !== false ||
+      !Array.isArray(state().pending.after) ||
+      state().pending.after.length !== 0 ||
+      (witness.refills?.currentAge?.length ?? 0) !== 0 ||
+      (witness.refills?.age2?.length ?? 0) !== 0 ||
+      events.length < 2 ||
+      events.at(-1) !== event ||
+      event.iconResources.length !== 0 ||
+      events
+        .slice(0, -1)
+        .some((item) => item.kind !== 'resourcePayment' || item.actor !== event.actor) ||
+      !payments.some(Boolean) ||
+      payments[0] !== 0 ||
+      payments[4] !== 0
+    )
+      return null;
+    // Require the whole literal payment caption, including every resource/amount.
+    // Empty captured icons are allowed only when that exact HTML supplied them.
+    for (const payment of events.slice(0, -1)) {
+      const message = raw.dom_entries.find((entry) => entry.action_id === payment.actionId)
+        ?.messages[payment.messageIndex];
+      const icons = payment.iconResources
+        .map((resource) => `<div class="tz_icon resource_${resource}"></div>`)
+        .join('');
+      const amount = payment.detail.explicitAmount ?? '';
+      if (
+        !(amount === '' ? [''] : ['', ' ']).some(
+          (space) => message?.html === `${payment.actor}は${amount}${space}${icons}を支払った`,
+        ) ||
+        !Array.isArray(message?.icons) ||
+        (message.icons.length !== 0 &&
+          (message.icons.length !== payment.iconResources.length ||
+            message.icons.some(
+              (icon, index) =>
+                (raw.schema_version === 1 ? icon.class : icon.classes) !==
+                `tz_icon resource_${payment.iconResources[index]}`,
+            )))
+      )
+        return null;
+    }
+    const candidates = legal().filter(
+      (row) => row.action.type === 'build' && same(row.action.cost, payments),
+    );
+    if (new Set(candidates.map((row) => row.action.id)).size < 2) return null;
+    if (
+      candidates.some(
+        ({ action }) =>
+          !buildings.has(action.id) ||
+          action.architecture !== false ||
+          action.discountResource !== null ||
+          action.renovation !== null ||
+          !same(
+            RESOURCES.map((resource) => buildings.get(action.id).cost[resource] ?? 0),
+            payments,
+          ),
+      )
+    )
+      return null;
+    const signature = buildingSignature(candidates[0].action.id);
+    if (candidates.some(({ action }) => !same(buildingSignature(action.id), signature)))
+      return null;
+    const ids = catalog.BUILDINGS.filter((card) => same(buildingSignature(card.id), signature)).map(
+      (card) => card.id,
+    );
+    if (ids.length < 2 || ids.length > 3) return null;
+    return validateBuildingEquivalenceClass({ buildingEquivalenceClass: ids });
+  }
 
   function architectureScoreCaption(event) {
     if (event.kind !== 'unparsed' || event.iconResources.length) return null;
@@ -3154,7 +3238,10 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               fail('Observed market price mismatch');
           } else if (event.kind === 'build' || event.kind === 'monument') {
             alignActor(event.actor);
-            const buildingClass = validateBuildingEquivalenceClass(witness);
+            const witnessedClass = validateBuildingEquivalenceClass(witness);
+            const inferredClass =
+              witnessedClass === null ? paidBuildingClass(event, events, witness, payments) : null;
+            const buildingClass = witnessedClass ?? inferredClass;
             const ids =
               buildingClass ?? witness[event.kind === 'build' ? 'buildings' : 'monuments'];
             if (
@@ -3190,6 +3277,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               actionScorePair(ids[0]) === null,
               buildingClass,
             );
+            if (inferredClass !== null)
+              audit.at(-1).buildingEquivalenceEvidence = {
+                kind: 'completePaymentAndCoreLegalTargets',
+                payment: copy(payments),
+              };
             context.purchase = {
               actor: actorId(event.actor),
               architecture:

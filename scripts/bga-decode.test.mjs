@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import test from 'node:test';
-import { decodePublicGame, WITNESS_SCHEMA } from './bga-decode.mjs';
+import { decodeConditionalPublicGame, decodePublicGame, WITNESS_SCHEMA } from './bga-decode.mjs';
 import { coreDispatcher } from './bga-replay.mjs';
 
 const saved = JSON.parse(
@@ -63,10 +63,12 @@ function input() {
     },
   };
 }
-function decode(value, dispatch, tableBytes = null) {
+function decode(value, dispatch, tableBytes = null, profile = null) {
   const bytes = Buffer.from(JSON.stringify(value.raw));
   value.witness.rawSha256 = hash(bytes);
-  return decodePublicGame(bytes, value.witness, dispatch, tableBytes);
+  return profile === null
+    ? decodePublicGame(bytes, value.witness, dispatch, tableBytes)
+    : decodeConditionalPublicGame(bytes, value.witness, dispatch, profile, tableBytes);
 }
 function dispatcher(initial, apply) {
   return (request) => {
@@ -6168,19 +6170,22 @@ test('matches begging captions to the actual corn gain and rolls back every refu
   }
 });
 
-function equivalentBuildingFixture(alter = () => {}, exact = false) {
+function equivalentBuildingFixture(alter = () => {}, exact = false, paidCost = 0) {
   const initial = clone(saved.core.initialFrame);
   const before = initial.snapshot.state;
-  before.age = 2;
-  before.round = 15;
+  const ids = paidCost === 1 ? ['b01', 'b02', 'b03'] : ['b15', 'b16'];
+  const cost = paidCost || 2;
+  before.age = paidCost === 1 ? 1 : 2;
+  before.round = paidCost === 1 ? 1 : 15;
   before.players[0].resources.wood = 4;
-  before.buildings = ['b16', 'b04', 'b15', 'b05'];
+  before.buildings =
+    paidCost === 1 ? ['b03', 'b04', 'b01', 'b02', 'b05'] : ['b16', 'b04', 'b15', 'b05'];
   const rows = (ids) =>
     ids.map((id) => ({
       action: {
         type: 'build',
         id,
-        cost: [0, 2, 0, 0, 0],
+        cost: [0, cost, 0, 0, 0],
         architecture: false,
         discountResource: null,
         renovation: null,
@@ -6195,26 +6200,29 @@ function equivalentBuildingFixture(alter = () => {}, exact = false) {
       ? { title: 'Build', task: clone(frame.observation.pendingTask), after: [] }
       : null;
     frame.observation.legalActions = remaining
-      ? rows(frame.snapshot.state.buildings.filter((id) => ['b15', 'b16'].includes(id)))
+      ? rows(frame.snapshot.state.buildings.filter((id) => ids.includes(id)))
       : [];
   };
-  setTask(initial, 2);
+  setTask(initial, paidCost ? 1 : 2);
   alter(initial, 'initial');
   const value = input();
   const purchase = [
     {
       raw_text: 'Aは\nを支払った',
-      icons: [{ classes: 'tz_icon resource_wood' }, { classes: 'tz_icon resource_wood' }],
+      icons: Array.from({ length: cost }, () => ({ classes: 'tz_icon resource_wood' })),
+      ...(paidCost
+        ? { html: `Aは${'<div class="tz_icon resource_wood"></div>'.repeat(cost)}を支払った` }
+        : {}),
     },
     { raw_text: 'Aは建物を建てた' },
   ];
   replaceEvents(value, [
     [6, purchase],
-    [7, purchase],
+    ...(paidCost ? [] : [[7, purchase]]),
     [8, [{ raw_text: 'unobserved decision' }]],
   ]);
   value.witness.initial = clone(before);
-  value.witness.witnesses = [6, 7].map((actionId) => ({
+  value.witness.witnesses = (paidCost ? [] : [6, 7]).map((actionId) => ({
     actionId,
     ...(exact
       ? { buildings: [actionId === 6 ? 'b16' : 'b15'] }
@@ -6222,12 +6230,12 @@ function equivalentBuildingFixture(alter = () => {}, exact = false) {
   }));
   const apply = (request) => {
     const id = request.move.choiceId.split(':')[1];
-    assert.ok(['b15', 'b16'].includes(id));
+    assert.ok(ids.includes(id));
     const next = clone(initial);
     next.snapshot.state = clone(request.state);
     const state = next.snapshot.state;
-    state.players[0].resources.wood -= 2;
-    state.players[0].feedWorkers += 3;
+    state.players[0].resources.wood -= cost;
+    state.players[0].feedWorkers += paidCost === 1 ? 1 : 3;
     state.players[0].buildings.push(id);
     state.buildings.splice(state.buildings.indexOf(id), 1);
     setTask(next, state.pending.task.remaining - 1);
@@ -6263,6 +6271,193 @@ test('calibrated equivalent building witnesses retain unknown physical targets a
   assert.equal(result.manifest.blocked.actionId, 8);
   original.rawSha256 = f.value.witness.rawSha256;
   assert.deepEqual(f.value.witness, original);
+
+  const profile = {
+    schema: 'tzolkin-bga-declared-mechanical-profile-v1',
+    rules: 'basic',
+    market: 'unlimited',
+    sourceOptions: 'unknown',
+  };
+  const paid = equivalentBuildingFixture(() => {}, false, 1);
+  const paidWitness = clone(paid.value.witness);
+  const constrained = decode(paid.value, paid.dispatch, null, profile);
+  assert.equal(constrained.record.steps.length, 1);
+  assert.equal(constrained.record.steps[0].move.choiceId, 'build:b01');
+  assert.deepEqual(constrained.manifest.audit[0].buildingEquivalenceClass, ['b01', 'b02', 'b03']);
+  assert.deepEqual(constrained.manifest.audit[0].buildingEquivalenceEvidence, {
+    kind: 'completePaymentAndCoreLegalTargets',
+    payment: [0, 1, 0, 0, 0],
+  });
+  assert.equal(constrained.manifest.audit[0].physicalSelectionUnknown, true);
+  assert.equal(constrained.manifest.audit[0].equivalentChoices, 3);
+  assert.deepEqual(constrained.manifest.conditionalMechanicalProfile, profile);
+  assert.equal(constrained.manifest.trainingReady, false);
+  assert.equal(constrained.manifest.policyTrainingReady, false);
+  paidWitness.rawSha256 = paid.value.witness.rawSha256;
+  assert.deepEqual(paid.value.witness, paidWitness);
+  const observedOnly = decode(paid.value, paid.dispatch);
+  assert.equal(observedOnly.record.steps.length, 0);
+  assert.match(observedOnly.manifest.blocked.reason, /Observed purchased card identity/);
+
+  for (const explicit of [false, true]) {
+    const htmlOnly = equivalentBuildingFixture(() => {}, false, 1);
+    const source = htmlOnly.value.raw.dom_entries.find((entry) => entry.action_id === 6);
+    source.messages[0].icons = [];
+    if (explicit) {
+      source.messages[0].raw_text = 'Aは1\nを支払った';
+      source.messages[0].html = 'Aは1 <div class="tz_icon resource_wood"></div>を支払った';
+      htmlOnly.value.raw.entries.find((entry) => entry.action_id === 6).raw_text = source.messages
+        .map((message) => message.raw_text)
+        .join('\n');
+    }
+    const recovered = decode(htmlOnly.value, htmlOnly.dispatch, null, profile);
+    assert.equal(recovered.record.steps.length, 1);
+    assert.deepEqual(recovered.manifest.audit[0].buildingEquivalenceClass, ['b01', 'b02', 'b03']);
+    assert.deepEqual(
+      recovered.manifest.audit[0].buildingEquivalenceEvidence.payment,
+      [0, 1, 0, 0, 0],
+    );
+  }
+
+  for (const [label, alter, changeSource, paidCost, reason] of [
+    ...[
+      [
+        'extra wood in HTML',
+        'Aは<div class="tz_icon resource_wood"></div><div class="tz_icon resource_wood"></div>を支払った',
+      ],
+      [
+        'different resource in HTML',
+        'Aは<div class="tz_icon resource_wood"></div><div class="tz_icon resource_stone"></div>を支払った',
+      ],
+      ['conflicting HTML amount', 'Aは2<div class="tz_icon resource_wood"></div>を支払った'],
+      [
+        'unparsed HTML markup',
+        'Aは<span><div class="tz_icon resource_wood"></div></span>を支払った',
+      ],
+      ['missing HTML resource', 'Aはを支払った'],
+    ].map(([label, html]) => [
+      label,
+      () => {},
+      (value) =>
+        (value.raw.dom_entries.find((entry) => entry.action_id === 6).messages[0].html = html),
+      1,
+      /Observed purchased card identity/,
+    ]),
+    [
+      'partial payment',
+      () => {},
+      (value) =>
+        value.raw.dom_entries.find((entry) => entry.action_id === 6).messages[0].icons.pop(),
+      2,
+      /Observed purchased card identity/,
+    ],
+    [
+      'unknown icon',
+      () => {},
+      (value) =>
+        value.raw.dom_entries
+          .find((entry) => entry.action_id === 6)
+          .messages[0].icons.push({ classes: 'tz_icon unknown' }),
+      1,
+      /Unsupported resource icons/,
+    ],
+    [
+      'multiple resource classes',
+      () => {},
+      (value) =>
+        (value.raw.dom_entries.find(
+          (entry) => entry.action_id === 6,
+        ).messages[0].icons[0].classes += ' resource_stone'),
+      1,
+      /Observed purchased card identity/,
+    ],
+    [
+      'Architecture',
+      (frame, stage) => {
+        if (stage === 'initial') frame.snapshot.state.players[0].technologies.architecture = 1;
+      },
+      () => {},
+      1,
+      /Observed purchased card identity/,
+    ],
+    [
+      'corn payment',
+      (frame, stage) => {
+        if (stage === 'initial') frame.snapshot.state.pending.task.cornPayment = true;
+      },
+      () => {},
+      1,
+      /Observed purchased card identity/,
+    ],
+    [
+      'discount',
+      (frame, stage) => {
+        if (stage === 'initial') frame.observation.legalActions[0].action.discountResource = 'wood';
+      },
+      () => {},
+      1,
+      /Observed purchased card identity/,
+    ],
+    [
+      'renovation',
+      (frame, stage) => {
+        if (stage === 'initial') frame.observation.legalActions[0].action.renovation = 'b04';
+      },
+      () => {},
+      1,
+      /Observed purchased card identity/,
+    ],
+    [
+      'singleton',
+      (frame, stage) => {
+        if (stage === 'initial') frame.observation.legalActions.splice(1);
+      },
+      () => {},
+      1,
+      /Observed purchased card identity/,
+    ],
+    [
+      'additional buildings',
+      (frame, stage) => {
+        if (stage === 'initial') frame.snapshot.state.additionalBuildings = true;
+      },
+      () => {},
+      1,
+      /Observed purchased card identity/,
+    ],
+    [
+      'different outcome',
+      (frame, stage) => {
+        if (stage === 'b03') frame.snapshot.state.players[1].score++;
+      },
+      () => {},
+      1,
+      /Ambiguous legal operation/,
+    ],
+    [
+      'mixed catalog classes',
+      (frame, stage) => {
+        if (stage === 'initial') {
+          const row = clone(frame.observation.legalActions[0]);
+          row.action.id = 'b09';
+          row.move.choiceId = 'build:b09';
+          frame.observation.legalActions.push(row);
+          frame.snapshot.state.buildings.push('b09');
+        }
+      },
+      () => {},
+      2,
+      /Observed purchased card identity/,
+    ],
+  ]) {
+    const candidate = equivalentBuildingFixture(alter, false, paidCost);
+    changeSource(candidate.value);
+    const refused = decode(candidate.value, candidate.dispatch, null, profile);
+    assert.equal(refused.record.steps.length, 0, label);
+    assert.deepEqual(refused.manifest.audit, [], label);
+    assert.equal(refused.manifest.blocked.actionId, 6, label);
+    assert.match(refused.manifest.blocked.reason, reason, label);
+  }
 });
 
 test('equivalent building witnesses refuse unrelated catalogs, typed actions and complete state differences atomically', () => {
