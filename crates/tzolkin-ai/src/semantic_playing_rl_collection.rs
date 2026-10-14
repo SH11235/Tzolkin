@@ -1305,6 +1305,21 @@ impl<'a> SemanticCollectionLedger<'a> {
         ) -> Result<R, String>,
         create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
     ) -> Result<R, String> {
+        self.collect_reserved_records(owner, batch, pool, None, finish, create)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect_reserved_records<R>(
+        &mut self,
+        owner: &SemanticOwnerView<'_>,
+        batch: &SemanticReservation,
+        pool: PoolRef<'_>,
+        saved: Option<&[Vec<u8>; 4]>,
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+    ) -> Result<R, String> {
         pool.recheck()?;
         let pins = self.pins.clone();
         let result = owner.with_checked(self.external, &pins, |scope| {
@@ -1339,6 +1354,28 @@ impl<'a> SemanticCollectionLedger<'a> {
             for (i, config) in batch.configs.iter().enumerate() {
                 let roster = rosters.get(i);
                 let episode = owner.with_checked_episode(self.external, &pins, || {
+                    if let Some(saved) = saved {
+                        let header = RecordHeader::new(
+                            &batch.parent,
+                            i,
+                            match pool {
+                                PoolRef::Mixture(p) => Some(p.checksum()),
+                                _ => None,
+                            },
+                            config,
+                        )?;
+                        // Raw DTOs stay private. Only this same source-owned
+                        // fresh Core audit can seal a historical learner step.
+                        return audit_bound_record(
+                            &saved[i],
+                            &header,
+                            config,
+                            roster,
+                            scope,
+                            binding,
+                            || create(config),
+                        );
+                    }
                     let collected = run(config, roster, scope, binding, None, || create(config))?;
                     if !collected.complete() {
                         let error = collected
