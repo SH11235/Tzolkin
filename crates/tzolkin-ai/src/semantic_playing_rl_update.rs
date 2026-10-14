@@ -1,6 +1,8 @@
 //! Recurrent, in-memory whole-four semantic Playing joint updates.
 //! Ownership follows a successfully loaded fresh origin, not a parameter file.
-//! No journal, resume, export, legacy owner conversion or Adam state is admitted.
+//! Private staged hooks also serve the separate semantic journal. No resume,
+//! export, legacy owner conversion or Adam state is admitted here.
+use serde::Serialize;
 use std::collections::BTreeSet;
 
 use crate::conditional_human_rl_update::{ConditionalFrozenPool, ConditionalNativeExclusions};
@@ -16,8 +18,8 @@ use crate::public_policy_update::{OneStepConfig, Untimed, hash};
 use crate::public_stochastic::SamplingSeed;
 use crate::public_stochastic_native::CollectionLimits;
 use crate::semantic_playing_rl_collection::{
-    AuditedSemanticPlayingCohort, DeclaredSamplingHistory, SemanticCollectionLedger,
-    SemanticPlayingCollectedGame,
+    AuditedSemanticPlayingCohort, DeclaredSamplingHistory, PlannedSemanticReservation, PoolRef,
+    SemanticCollectionLedger, SemanticPlayingCollectedGame, SemanticReservation,
 };
 use crate::semantic_playing_rl_pool::{FrozenSemanticSnapshot, SemanticFrozenMixture};
 
@@ -27,7 +29,8 @@ pub const UPDATE_VERSION: &str = "semantic-playing-own-sum-quarter-recurrent-sca
 /// Counts belong only to complete admitted updates from its own fresh root.
 /// A later failed attempt changes the session's burned allocation ledger, not
 /// these last-admitted weights/counters. Snapshot capture binds both separately.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SemanticPlayingCurrentIdentity {
     root: String,
     previous: String,
@@ -88,7 +91,8 @@ impl SemanticPlayingCurrentIdentity {
 }
 
 /// A closed outcome, not a checkpoint or a constructor for an owner.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SemanticPlayingJointReport {
     parent: String,
     next: String,
@@ -347,11 +351,11 @@ impl<'a> SemanticPlayingJointSession<'a> {
     fn admit(&mut self, proposal: JointProposal) -> Result<SemanticPlayingJointReport, String> {
         self.admit_with_pool(proposal, None)
     }
-    fn admit_with_pool(
+    fn prepare_admission(
         &mut self,
-        proposal: JointProposal,
+        mut proposal: JointProposal,
         mixture: Option<&SemanticFrozenMixture<'_>>,
-    ) -> Result<SemanticPlayingJointReport, String> {
+    ) -> Result<PreparedSemanticAdmission, String> {
         if proposal.report.parent != self.identity.checksum()
             || proposal
                 .report
@@ -371,7 +375,7 @@ impl<'a> SemanticPlayingJointSession<'a> {
         let admitted = self
             .ledger
             .prepare_admitted(self.identity.checksum(), proposal.identity.checksum())?;
-        let mut report = proposal.report;
+        let report = &mut proposal.report;
         report.attempts = self.ledger.attempts();
         report.next_ordinal = self.ledger.next_episode_ordinal();
         report.next = proposal.identity.checksum().into();
@@ -411,6 +415,23 @@ impl<'a> SemanticPlayingJointSession<'a> {
         if let Some(mixture) = mixture {
             mixture.recheck()?;
         }
+        Ok(PreparedSemanticAdmission { proposal, admitted })
+    }
+    fn admit_with_pool(
+        &mut self,
+        proposal: JointProposal,
+        mixture: Option<&SemanticFrozenMixture<'_>>,
+    ) -> Result<SemanticPlayingJointReport, String> {
+        let prepared = self.prepare_admission(proposal, mixture)?;
+        Ok(self.commit_prepared(prepared))
+    }
+    /// Prepared by the same source-postchecked numerical path. Nothing here
+    /// hashes, allocates, performs IO or can return an error after Resolve.
+    pub(crate) fn commit_prepared(
+        &mut self,
+        prepared: PreparedSemanticAdmission,
+    ) -> SemanticPlayingJointReport {
+        let PreparedSemanticAdmission { proposal, admitted } = prepared;
         if let Some((actor, critic)) = proposal.parameters {
             self.state.commit(actor, critic);
         } else {
@@ -418,11 +439,109 @@ impl<'a> SemanticPlayingJointSession<'a> {
         }
         self.identity = proposal.identity;
         self.ledger.commit_admitted(admitted);
-        Ok(report)
+        proposal.report
+    }
+    pub(crate) fn plan_reserved(
+        &self,
+        seeds: [u32; 4],
+        pool: PoolRef<'_>,
+        limits: CollectionLimits,
+    ) -> Result<PlannedSemanticReservation, String> {
+        self.check_headroom(limits)?;
+        self.ledger.plan(
+            &self.state.view(self.identity.checksum()),
+            seeds,
+            pool,
+            limits,
+        )
+    }
+    pub(crate) fn burn_reserved(
+        &mut self,
+        plan: PlannedSemanticReservation,
+    ) -> SemanticReservation {
+        self.ledger.reserve(plan)
+    }
+    pub(crate) fn stage_reserved_using(
+        &mut self,
+        batch: &SemanticReservation,
+        pool: PoolRef<'_>,
+        create: impl Fn(
+            &crate::public_stochastic_native::NativeStochasticConfig,
+        ) -> Result<tzolkin_core::GameState, String>,
+    ) -> Result<PreparedSemanticAdmission, String> {
+        let attempt = self.ledger.attempts();
+        let result = (|| {
+            let proposal = self.ledger.collect_reserved(
+                &self.state.view(self.identity.checksum()),
+                batch,
+                pool,
+                |scope, cohort| {
+                    let records = crate::semantic_playing_rl_record::encode_records(&cohort)?;
+                    let mut proposal = prepare(
+                        scope,
+                        &self.identity,
+                        &cohort,
+                        &self.actor_config,
+                        &self.critic_config,
+                        attempt,
+                    )?;
+                    proposal.records = Some(records);
+                    Ok(proposal)
+                },
+                create,
+            )?;
+            self.prepare_admission(
+                proposal,
+                match pool {
+                    PoolRef::Mixture(m) => Some(m),
+                    _ => None,
+                },
+            )
+        })();
+        if result.is_err() {
+            self.ledger.stop();
+        }
+        result
+    }
+    pub(crate) fn journal_recheck(&self) -> Result<(), String> {
+        self.ledger
+            .recheck(&self.state.view(self.identity.checksum()))
+    }
+    pub(crate) fn journal_source(&self) -> Result<serde_json::Value, String> {
+        Ok(
+            serde_json::json!({"sources":self.ledger.journal_source(&self.state.view(self.identity.checksum()))?,
+            "freshRoot":{"checksum":self.state.root().checksum(),"criticSeed":self.state.root().critic_seed()},
+            "actorConfig":self.actor_config,"criticConfig":self.critic_config,"current":self.identity}),
+        )
+    }
+    pub(crate) fn current_unchecked(&self) -> &SemanticPlayingCurrentIdentity {
+        &self.identity
+    }
+    pub(crate) fn capture_ledger(&self) -> serde_json::Value {
+        self.ledger.capture_ledger()
+    }
+    pub(crate) fn stop(&mut self) {
+        self.ledger.stop();
     }
 }
 
+pub(crate) struct PreparedSemanticAdmission {
+    proposal: JointProposal,
+    admitted: BTreeSet<String>,
+}
+impl PreparedSemanticAdmission {
+    pub(crate) fn report(&self) -> &SemanticPlayingJointReport {
+        &self.proposal.report
+    }
+    pub(crate) fn records(&self) -> Result<&[Vec<u8>; 4], String> {
+        self.proposal
+            .records
+            .as_ref()
+            .ok_or_else(|| "Semantic staged records missing".into())
+    }
+}
 struct JointProposal {
+    records: Option<[Vec<u8>; 4]>,
     identity: SemanticPlayingCurrentIdentity,
     parameters: Option<(PublicPolicyModel, Vec<f32>)>,
     report: SemanticPlayingJointReport,
@@ -544,6 +663,7 @@ fn prepare(
         None
     };
     Ok(JointProposal {
+        records: None,
         identity,
         parameters,
         report,
@@ -697,6 +817,9 @@ pub(crate) fn joint_fixture() {
             [null,opponent,opponent,opponent],[null,opponent,opponent,opponent]]
     })).unwrap()).unwrap();
     let limits = CollectionLimits::new(64, 65536, 8 * 1024 * 1024, 1024 * 1024).unwrap();
+    crate::semantic_playing_rl_journal::journal_fixture(
+        &files.0, &prepared, &external, &history, &pool, limits,
+    );
     assert!(session.check_headroom(CollectionLimits::default()).is_err());
     assert_eq!(
         (session.attempts(), session.consumed_actor_streams()),

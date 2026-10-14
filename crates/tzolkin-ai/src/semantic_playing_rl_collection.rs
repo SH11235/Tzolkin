@@ -671,12 +671,12 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
 /// Shared allocation state, retained across recurrent semantic parameter updates.
 /// Only the closed collector creates episodes; the continuation cannot inject steps.
 #[derive(Clone, Copy)]
-enum PoolRef<'a> {
+pub(crate) enum PoolRef<'a> {
     Legacy(&'a ConditionalFrozenPool, Option<&'a PreparedPublicPolicy>),
     Mixture(&'a SemanticFrozenMixture<'a>),
 }
 impl PoolRef<'_> {
-    fn recheck(&self) -> Result<(), String> {
+    pub(crate) fn recheck(&self) -> Result<(), String> {
         match self {
             Self::Legacy(..) => Ok(()),
             Self::Mixture(p) => p.recheck(),
@@ -686,6 +686,12 @@ impl PoolRef<'_> {
         match self {
             Self::Legacy(p, prepared) => p.binding(*prepared),
             Self::Mixture(p) => Ok(serde_json::json!({"fixedSemanticMixture":p.checksum()})),
+        }
+    }
+    pub(crate) fn journal_binding(&self) -> Result<serde_json::Value, String> {
+        match self {
+            Self::Legacy(p, _) => p.procedural_binding(),
+            Self::Mixture(p) => p.journal_binding(),
         }
     }
     fn freeze(&self) -> Result<FrozenRosters<'_>, String> {
@@ -757,6 +763,34 @@ impl<'a> RosterRef<'a> {
     }
     fn sampled_opponents(self, players: usize) -> [bool; 4] {
         std::array::from_fn(|actor| actor < players && self.snapshot(actor).is_some())
+    }
+}
+
+/// Neither type is deserializable. Only checked planning creates the exact
+/// seed/member/ordinal/limits binding; burns are preallocated before publication.
+pub(crate) struct PlannedSemanticReservation {
+    batch: SemanticReservation,
+    spent: BTreeSet<String>,
+    streams: BTreeSet<[u64; 5]>,
+}
+pub(crate) struct SemanticReservation {
+    parent: String,
+    binding: String,
+    configs: [NativeStochasticConfig; 4],
+    families: [String; 4],
+    attempt: usize,
+    next: u64,
+    burns: String,
+    description: serde_json::Value,
+}
+impl PlannedSemanticReservation {
+    pub(crate) fn description(&self) -> &serde_json::Value {
+        &self.batch.description
+    }
+}
+impl SemanticReservation {
+    pub(crate) fn description(&self) -> &serde_json::Value {
+        &self.description
     }
 }
 
@@ -1133,81 +1167,179 @@ impl<'a> SemanticCollectionLedger<'a> {
         ) -> Result<R, String>,
         create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
     ) -> Result<R, String> {
-        let next = self
-            .next
-            .checked_add(4)
-            .ok_or("Semantic ordinal overflow")?;
-        let families = seeds.map(seed_family_id);
-        let mut configs = Vec::new();
-        let mut streams = Vec::new();
-        for (i, &seed) in seeds.iter().enumerate() {
-            if split_for_family(&families[i])? != DatasetSplit::Train
-                || families[..i].contains(&families[i])
-                || self.spent.contains(&families[i])
-                || self.external.contains_family(&families[i])
-            {
-                return Err("Semantic family is held-out, excluded or already consumed".into());
+        let plan = self.plan(owner, seeds, pool, limits)?;
+        let batch = self.reserve(plan);
+        self.collect_reserved(owner, &batch, pool, finish, create)
+    }
+    pub(crate) fn plan(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        seeds: [u32; 4],
+        pool: PoolRef<'_>,
+        limits: CollectionLimits,
+    ) -> Result<PlannedSemanticReservation, String> {
+        if self.stopped || self.attempts >= MAX_ATTEMPTS {
+            return Err("Semantic collection stopped or attempt bound".into());
+        }
+        pool.recheck()?;
+        let result = owner.with_checked(self.external, &self.pins, |_| {
+            if let PoolRef::Mixture(mixture) = pool {
+                mixture.require_receiver(owner, self.external, self.history,
+                    (&self.spent, &self.streams), &self.admitted)?;
             }
-            let players = if i < 2 { 3 } else { 4 };
-            let identity = SamplingStreamIdentity::new(
-                self.seed,
-                self.next + i as u64,
-                self.replicate,
-                players,
-            )?;
-            for actor in 0..players {
-                let key = [
-                    self.seed.value(),
-                    identity.episode_ordinal(),
-                    self.replicate,
-                    players as u64,
-                    actor as u64,
-                ];
-                if self.history.contains(identity, actor) || self.streams.contains(&key) {
-                    return Err("Semantic sampling stream was permanently excluded".into());
+            let next = self
+                .next
+                .checked_add(4)
+                .ok_or("Semantic ordinal overflow")?;
+            let families = seeds.map(seed_family_id);
+            let mut configs = Vec::new();
+            let mut streams = Vec::new();
+            for (i, &seed) in seeds.iter().enumerate() {
+                if split_for_family(&families[i])? != DatasetSplit::Train
+                    || families[..i].contains(&families[i])
+                    || self.spent.contains(&families[i])
+                    || self.external.contains_family(&families[i])
+                {
+                    return Err("Semantic family is held-out, excluded or already consumed".into());
                 }
-                streams.push(key);
+                let players = if i < 2 { 3 } else { 4 };
+                let identity = SamplingStreamIdentity::new(
+                    self.seed,
+                    self.next + i as u64,
+                    self.replicate,
+                    players,
+                )?;
+                for actor in 0..players {
+                    let key = [
+                        self.seed.value(),
+                        identity.episode_ordinal(),
+                        self.replicate,
+                        players as u64,
+                        actor as u64,
+                    ];
+                    if self.history.contains(identity, actor) || self.streams.contains(&key) {
+                        return Err("Semantic sampling stream was permanently excluded".into());
+                    }
+                    streams.push(key);
+                }
+                configs.push(NativeStochasticConfig::new(
+                    players, seed, identity, limits,
+                )?);
             }
-            configs.push(NativeStochasticConfig::new(
-                players, seed, identity, limits,
-            )?);
-        }
-        let rosters = pool.freeze()?;
-        if (0..4).any(|i| families.iter().any(|f| rosters.get(i).contains_family(f))) {
-            return Err("Semantic family overlaps frozen opponent lineage".into());
-        }
-        // Only admitted same-chain snapshots with matching declarations and
-        // retained prior burns reach here. Check every proposed actor tuple
-        // against every captured ancestor before this batch, not only its slots.
-        if (0..4).any(|i| {
-            configs.iter().any(|config| {
-                (0..config.players()).any(|actor| {
-                    rosters
-                        .get(i)
-                        .contains_stream(*config.sampling_identity(), actor)
+            let rosters = pool.freeze()?;
+            if (0..4).any(|i| families.iter().any(|f| rosters.get(i).contains_family(f))) {
+                return Err("Semantic family overlaps frozen opponent lineage".into());
+            }
+            // Only admitted same-chain snapshots with matching declarations and
+            // retained prior burns reach here. Check every proposed actor tuple
+            // against every captured ancestor before this batch, not only its slots.
+            if (0..4).any(|i| {
+                configs.iter().any(|config| {
+                    (0..config.players()).any(|actor| {
+                        rosters
+                            .get(i)
+                            .contains_stream(*config.sampling_identity(), actor)
+                    })
                 })
-            })
-        }) {
-            return Err("Semantic sampling stream overlaps frozen opponent lineage".into());
-        }
-        let (identity, reservations) = owner.metadata();
-        let parent = identity.to_string();
-        let human_reservations = reservations.clone();
-        let binding = collection_binding(owner, self.external, self.history, pool)?;
-        let pins = self.pins.clone();
-        owner.with_checked(self.external, &pins, |scope| {
-            if scope.parent_checksum() != parent {
-                return Err("Semantic checked owner differs from collection parent".into());
+            }) {
+                return Err("Semantic sampling stream overlaps frozen opponent lineage".into());
             }
-            self.attempts += 1;
-            self.next = next;
-            self.spent.extend(families.iter().cloned());
-            self.streams.extend(streams);
+
+            let configs: [NativeStochasticConfig; 4] = configs.try_into().map_err(|_| "Semantic plan shape")?;
+            let parent = owner.metadata().0.to_string();
+            let binding = collection_binding(owner, self.external, self.history, pool)?;
+            let attempt = self.attempts + 1;
+            let mut spent = self.spent.clone();
+            spent.extend(families.iter().cloned());
+            let mut all_streams = self.streams.clone();
+            all_streams.extend(streams);
+            let burns = hash(b"semantic-reserved-allocation-v1\0", &(attempt, next, &spent, &all_streams))?;
+            let description = serde_json::json!({"parent":parent,"sourceBinding":binding,
+                "attempt":attempt,"nextOrdinal":next,"families":families,"allocation":burns,
+                "members":configs.each_ref().map(crate::public_stochastic_record::Config::from_config),
+                "pool":pool.binding()?});
+            Ok(PlannedSemanticReservation {batch:SemanticReservation {
+                parent,binding,configs,families,attempt,next,burns,description,
+            },spent,streams:all_streams})
+        });
+        match (result, pool.recheck()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(post)) => Err(format!("Semantic plan pool postcheck: {post}")),
+        }
+    }
+    /// The opaque plan already owns every allocation. No fallible operation or
+    /// allocation follows a durably published Reserve before these moves.
+    pub(crate) fn reserve(&mut self, plan: PlannedSemanticReservation) -> SemanticReservation {
+        self.attempts = plan.batch.attempt;
+        self.next = plan.batch.next;
+        self.spent = plan.spent;
+        self.streams = plan.streams;
+        plan.batch
+    }
+    pub(crate) fn journal_source(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+    ) -> Result<serde_json::Value, String> {
+        self.recheck(owner)?;
+        Ok(
+            serde_json::json!({"origin":owner.journal_origin(),"external":self.external.descriptor(),
+            "history":{"checksum":self.history.checksum,"pins":self.history.pins,
+                "ranges":self.history.ranges.iter().map(|r|(r.prefix,r.first,r.next)).collect::<Vec<_>>()},
+            "samplingSeed":self.seed.value(),"replicate":self.replicate,"nextOrdinal":self.next}),
+        )
+    }
+    pub(crate) fn capture_ledger(&self) -> serde_json::Value {
+        serde_json::json!({"families":self.spent,"streams":self.streams,
+            "samplingSeed":self.seed.value(),"replicate":self.replicate,
+            "nextOrdinal":self.next,"attempts":self.attempts,"stopped":self.stopped})
+    }
+    pub(crate) fn collect_reserved<R>(
+        &mut self,
+        owner: &SemanticOwnerView<'_>,
+        batch: &SemanticReservation,
+        pool: PoolRef<'_>,
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+    ) -> Result<R, String> {
+        pool.recheck()?;
+        let pins = self.pins.clone();
+        let result = owner.with_checked(self.external, &pins, |scope| {
+            if self.stopped
+                || batch.parent != scope.parent_checksum()
+                || self.attempts != batch.attempt
+                || self.next != batch.next
+                || batch.burns
+                    != hash(
+                        b"semantic-reserved-allocation-v1\0",
+                        &(self.attempts, self.next, &self.spent, &self.streams),
+                    )?
+                || batch.binding != collection_binding(owner, self.external, self.history, pool)?
+            {
+                return Err(
+                    "Semantic exact reserved parent/configuration/allocation differs".into(),
+                );
+            }
+            if let PoolRef::Mixture(mixture) = pool {
+                mixture.require_receiver(
+                    owner,
+                    self.external,
+                    self.history,
+                    (&self.spent, &self.streams),
+                    &self.admitted,
+                )?;
+            }
+            let rosters = pool.freeze()?;
+            let binding = &batch.binding;
+            let human_reservations = owner.metadata().1.clone();
             let mut episodes = Vec::new();
-            for (i, config) in configs.iter().enumerate() {
+            for (i, config) in batch.configs.iter().enumerate() {
                 let roster = rosters.get(i);
                 let episode = owner.with_checked_episode(self.external, &pins, || {
-                    let collected = run(config, roster, scope, &binding, None, || create(config))?;
+                    let collected = run(config, roster, scope, binding, None, || create(config))?;
                     if !collected.complete() {
                         let error = collected
                             .failure
@@ -1216,7 +1348,7 @@ impl<'a> SemanticCollectionLedger<'a> {
                         self.failed = Some(SemanticPlayingCollectedGame { record: collected });
                         return Err(error);
                     }
-                    let audited = run(config, roster, scope, &binding, Some(&collected), || {
+                    let audited = run(config, roster, scope, binding, Some(&collected), || {
                         create(config)
                     })?;
                     seal(
@@ -1232,8 +1364,8 @@ impl<'a> SemanticCollectionLedger<'a> {
                 episodes: episodes
                     .try_into()
                     .map_err(|_| "Semantic whole-four shape")?,
-                parent,
-                families,
+                parent: batch.parent.clone(),
+                families: batch.families.clone(),
                 human_reservations,
                 mixture: match pool {
                     PoolRef::Mixture(p) => Some(p.checksum().into()),
@@ -1241,7 +1373,16 @@ impl<'a> SemanticCollectionLedger<'a> {
                 },
             };
             finish(scope, cohort)
-        })
+        });
+        let result = match (result, pool.recheck()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (_, Err(post)) => Err(format!("Semantic reserved pool postcheck: {post}")),
+        };
+        if result.is_err() {
+            self.stop();
+        }
+        result
     }
 }
 
@@ -1304,7 +1445,7 @@ fn audit_bound_record(
     )
 }
 
-fn create(config: &NativeStochasticConfig) -> Result<GameState, String> {
+pub(crate) fn create(config: &NativeStochasticConfig) -> Result<GameState, String> {
     create_game_with_options(
         (0..config.players())
             .map(|p| format!("Semantic P{p}"))
