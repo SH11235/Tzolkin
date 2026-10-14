@@ -249,7 +249,7 @@ fn json<T: DeserializeOwned>(bytes: &[u8], cap: u64) -> Result<T, String> {
     )?)
     .map_err(|e| e.to_string())
 }
-fn local(path: &Path) -> Result<(), String> {
+pub(crate) fn local(path: &Path) -> Result<(), String> {
     policy_dataset::local_path(path)?;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -279,7 +279,7 @@ fn local(path: &Path) -> Result<(), String> {
     }
     Ok(())
 }
-fn read(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     local(path)?;
     policy_dataset::read_bytes(path, cap)
 }
@@ -480,7 +480,7 @@ fn manifest(games: Vec<TeacherGame>) -> Result<SemanticPlayingTeacherManifest, S
     m.fingerprint = fingerprint(&m)?;
     Ok(m)
 }
-fn validate_manifest(m: &SemanticPlayingTeacherManifest) -> Result<(), String> {
+pub(crate) fn validate_manifest(m: &SemanticPlayingTeacherManifest) -> Result<(), String> {
     if m.games.is_empty() || m.games.len() > MAX_GAMES {
         return Err("Invalid native semantic teacher game count".into());
     }
@@ -719,6 +719,20 @@ impl ValidatedSemanticPlayingTeacherDataset {
     pub fn manifest(&self) -> &SemanticPlayingTeacherManifest {
         &self.manifest
     }
+    // Numerical borrow only. Production handles still require the complete
+    // source loader; no public raw-row constructor or returned source authority.
+    pub(crate) fn with_checked_cache<R>(
+        &self,
+        consume: impl FnOnce(
+            &[ValidatedSemanticPlayingTeacherSample],
+            &(u64, String),
+        ) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.recheck()?;
+        let result = consume(&self.samples, &self.manifest_pin);
+        self.recheck()?; // Also on numerical/error outcomes; no outcome escapes.
+        result
+    }
     /// Raw custody recheck; it does not reclassify split, source kind or quality.
     pub fn recheck(&self) -> Result<(), String> {
         namespace(&self.directory, &self.manifest, true)?;
@@ -820,8 +834,124 @@ pub fn load_semantic_playing_teacher_dataset(
 }
 
 #[cfg(test)]
+pub(crate) fn training_cache_fixture(
+    parent: &Path,
+    examples: &[(Observation, LegalAction, usize)],
+    bad_cache_split: Option<DatasetSplit>,
+) -> Result<ValidatedSemanticPlayingTeacherDataset, String> {
+    // Deliberately NOT a complete replay or a qualified source fixture. Only the
+    // production numerical/cache transaction is exercised without full games.
+    fs::create_dir(parent).map_err(|e| e.to_string())?;
+    fs::create_dir(parent.join("sources")).map_err(|e| e.to_string())?;
+    let train: Vec<_> = (0..100u32)
+        .filter(|seed| split_for_family(&seed_family_id(*seed)).unwrap() == DatasetSplit::Train)
+        .take(2)
+        .collect();
+    let validation = (0..100u32)
+        .find(|seed| split_for_family(&seed_family_id(*seed)).unwrap() == DatasetSplit::Validation)
+        .unwrap();
+    let test = (0..100u32)
+        .find(|seed| split_for_family(&seed_family_id(*seed)).unwrap() == DatasetSplit::Test)
+        .unwrap();
+    let mut samples = Vec::new();
+    let mut games = Vec::new();
+    for (o, chosen, index) in examples {
+        for seed in [train[0], train[1], validation, test] {
+            let i = games.len();
+            let family = seed_family_id(seed);
+            let split = split_for_family(&family)?;
+            let raw = format!(
+                "UNQUALIFIED numeric cache fixture: {} {seed}",
+                o.players.len()
+            )
+            .into_bytes();
+            let game_id = content_id(b"native4-numeric-fixture-only\0", &(i, &raw))?;
+            let mut row = sample(o, chosen, *index, &game_id, &family)?;
+            let mut wire = serde_json::to_vec(&row.wire()?).map_err(|e| e.to_string())?;
+            wire.push(b'\n');
+            fs::write(parent.join(format!("sources/source-{i:06}.json")), &raw)
+                .map_err(|e| e.to_string())?;
+            fs::write(parent.join(format!("rows-{i:06}.jsonl")), &wire)
+                .map_err(|e| e.to_string())?;
+            games.push(TeacherGame {
+                game_id,
+                family_id: family,
+                seed,
+                split,
+                players: o.players.len(),
+                source_file: format!("sources/source-{i:06}.json"),
+                source_bytes: raw.len() as u64,
+                source_sha256: digest(&raw),
+                row_file: format!("rows-{i:06}.jsonl"),
+                row_bytes: wire.len() as u64,
+                row_sha256: digest(&wire),
+                counts: TeacherCounts {
+                    setup_callbacks: *index,
+                    playing_callbacks: 1,
+                    rows: 1,
+                    candidates: row.candidates.len(),
+                },
+            });
+            if bad_cache_split == Some(split) {
+                let encoder = FeatureEncoder::new_public(o)?;
+                row.candidates = (0..o.legal_actions.len())
+                    .map(|i| encoder.encode_legal_tagged(i))
+                    .collect::<Result<_, _>>()?;
+            }
+            samples.push(row);
+        }
+    }
+    let m = manifest(games)?;
+    validate_manifest(&m)?;
+    let bytes = serde_json::to_vec(&m).map_err(|e| e.to_string())?;
+    fs::write(parent.join("manifest.json"), &bytes).map_err(|e| e.to_string())?;
+    let dataset = ValidatedSemanticPlayingTeacherDataset {
+        directory: parent.to_path_buf(),
+        manifest: m,
+        manifest_pin: (bytes.len() as u64, digest(&bytes)),
+        samples,
+    };
+    dataset.recheck()?;
+    Ok(dataset)
+}
+#[cfg(test)]
+pub(crate) fn collision_fixture(
+    example: &(Observation, LegalAction, usize),
+) -> Vec<ValidatedSemanticPlayingTeacherSample> {
+    let (o, chosen, index) = example;
+    let first = sample(o, chosen, *index, &"a".repeat(64), &seed_family_id(42)).unwrap();
+    let c0 = first.candidates[0].clone();
+    let c1 = first
+        .candidates
+        .iter()
+        .find(|c| {
+            c.values_for_schema(SEMANTIC_PLAYING_FEATURE_SCHEMA)
+                .unwrap()
+                .iter()
+                .zip(
+                    c0.values_for_schema(SEMANTIC_PLAYING_FEATURE_SCHEMA)
+                        .unwrap(),
+                )
+                .any(|(a, b)| a.to_bits() != b.to_bits())
+        })
+        .unwrap()
+        .clone();
+    (0..3)
+        .map(|chosen_index| {
+            let mut row = sample(o, chosen, *index, &"a".repeat(64), &seed_family_id(42)).unwrap();
+            row.candidates = vec![c0.clone(), c0.clone(), c1.clone()];
+            row.chosen = chosen_index;
+            if chosen_index == 2 {
+                row.ordered_legal_sha256 = "b".repeat(64);
+            }
+            row
+        })
+        .collect()
+}
+#[cfg(test)]
 pub(crate) fn fixture(parent: &Path) {
     use crate::policy::HeuristicWeights;
+    let mut training_examples = Vec::new();
     // Short real Core Setup prefixes only; no complete game generation in CI.
     for players in [3, 4] {
         let mut state = create_game_with_options(
@@ -922,6 +1052,7 @@ pub(crate) fn fixture(parent: &Path) {
         assert!(row.allocation_bytes().unwrap() < MAX_CACHE_BYTES);
         let mut allocation = MAX_CACHE_BYTES - row.allocation_bytes().unwrap() + 1;
         assert!(add_allocation(&mut allocation, &row).is_err());
+        training_examples.push((o.clone(), chosen.clone(), index));
     }
     let record = GameReplay {
         header: replay::ReplayHeader {
@@ -1044,4 +1175,5 @@ pub(crate) fn fixture(parent: &Path) {
     stored_manifest_bytes(MAX_STORED_BYTES - 8, 8).unwrap();
     assert!(stored_manifest_bytes(MAX_STORED_BYTES - 8, 9).is_err());
     assert!(stored_manifest_bytes(u64::MAX, 1).is_err());
+    crate::semantic_playing_teacher_training::fixture(parent, &training_examples);
 }
