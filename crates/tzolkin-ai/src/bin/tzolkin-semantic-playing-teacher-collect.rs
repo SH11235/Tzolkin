@@ -19,18 +19,20 @@ use tzolkin_ai::{
     replay::{self, ReplaySource},
     semantic_playing_teacher_dataset::{
         MAX_GAMES, MAX_STORED_BYTES, TeacherGame, export_semantic_playing_teacher_files,
+        export_semantic_playing_v7_teacher_files,
     },
     setup_policy,
 };
 use tzolkin_core::{GameOptions, Phase};
 
 const SCHEMA: &str = "tzolkin-corn-first-v5-teacher-collect-v1";
+const V7_SCHEMA: &str = "tzolkin-corn-first-v7-teacher-collect-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 const MAX_REPORT: u64 = 64 * 1024;
 // Reserve both report links if staging cleanup fails after atomic publication.
 // Originals + <=256MiB dataset + both <=64KiB links fit <=512MiB.
 const MAX_ORIGINALS: u64 = MAX_STORED_BYTES - 2 * MAX_REPORT;
-const HELP: &str = "tzolkin-semantic-playing-teacher-collect CONTROL.json CONTROL_SHA256 NEW_OUTPUT_DIR\nAll paths must be absolute local paths. Closed control: schema=tzolkin-corn-first-v5-teacher-collect-v1, globalExclusions={pin:{path,bytes,sha256},count,canonicalDigest}, games=[{players,seed,role}]. Supply 1..64 distinct prospective base 3/4p families with their natural train/validation role; Test is refused. The pinned exclusions use tzolkin-conditional-native-exclusions-v1 and must declare the complete prior union. Permanent allocation and completeness are the caller's responsibility, not authenticated by this command.\nUses fixed all-seat CornFirst/default-weight Setup and ResourceCycle V5 Playing, then independent replay/teacher verification and semantic4 export. Control <=1MiB, exclusions <=32MiB, each original <=64MiB, originals+dataset+report <=512MiB; dataset/cache/row/candidate caps remain unchanged. Use an external wall/process watchdog. There is no retry or seed selection. On refusal retained originals and any incomplete export remain; only exit0 with report.json denotes whole-command completion. No Human origin, model, training, fresh Test, strength or adoption authority is granted.";
+const HELP: &str = "tzolkin-semantic-playing-teacher-collect CONTROL.json CONTROL_SHA256 NEW_OUTPUT_DIR\nAll paths must be absolute local paths. Closed control: schema=tzolkin-corn-first-v5-teacher-collect-v1 (fixed V5) or tzolkin-corn-first-v7-teacher-collect-v1 (explicit fixed V7), globalExclusions={pin:{path,bytes,sha256},count,canonicalDigest}, games=[{players,seed,role}]. Supply 1..64 distinct prospective base 3/4p families with their natural train/validation role; Test is refused. The pinned exclusions use tzolkin-conditional-native-exclusions-v1 and must declare the complete prior union. Permanent allocation and completeness are the caller's responsibility, not authenticated by this command.\nUses fixed all-seat CornFirst/default-weight Setup and the selected fixed ResourceCycle V5/V7 Playing contract, then independent replay/teacher verification and semantic4 export. Control <=1MiB, exclusions <=32MiB, each original <=64MiB, originals+dataset+report <=512MiB; dataset/cache/row/candidate caps remain unchanged. Use an external wall/process watchdog. There is no retry or seed selection. On refusal retained originals and any incomplete export remain; only exit0 with report.json denotes whole-command completion. No Human origin, model, training, fresh Test, strength or adoption authority is granted.";
 
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -55,7 +57,9 @@ struct Control {
 }
 impl Control {
     fn validate(&self, excluded: &ConditionalNativeExclusions) -> Result<(), String> {
-        if self.schema != SCHEMA || !(1..=MAX_GAMES).contains(&self.games.len()) {
+        if ![SCHEMA, V7_SCHEMA].contains(&self.schema.as_str())
+            || !(1..=MAX_GAMES).contains(&self.games.len())
+        {
             return Err("Collector schema or game count refused".into());
         }
         let mut families = BTreeSet::new();
@@ -249,13 +253,27 @@ fn collect(control: &Control, output: &Path) -> Result<serde_json::Value, String
     fs::create_dir(output).map_err(|e| e.to_string())?;
     fs::create_dir(output.join("originals")).map_err(|e| e.to_string())?;
     let weights = HeuristicWeights::default();
-    let config = ResourceCycleConfig::v5();
+    let v7 = control.schema == V7_SCHEMA;
+    let config = if v7 {
+        ResourceCycleConfig::v7()
+    } else {
+        ResourceCycleConfig::v5()
+    };
     for (i, game) in control.games.iter().enumerate() {
-        let source = ReplaySource::CornFirstV5Teacher {
-            policy_version: replay::CORN_FIRST_V5_TEACHER_POLICY_VERSION.into(),
-            setup_policy_version: setup_policy::POLICY_VERSION.into(),
-            setup_weights: weights.clone(),
-            playing_configuration: config.clone(),
+        let source = if v7 {
+            ReplaySource::CornFirstV7Teacher {
+                policy_version: replay::CORN_FIRST_V7_TEACHER_POLICY_VERSION.into(),
+                setup_policy_version: setup_policy::POLICY_VERSION.into(),
+                setup_weights: weights.clone(),
+                playing_configuration: config.clone(),
+            }
+        } else {
+            ReplaySource::CornFirstV5Teacher {
+                policy_version: replay::CORN_FIRST_V5_TEACHER_POLICY_VERSION.into(),
+                setup_policy_version: setup_policy::POLICY_VERSION.into(),
+                setup_weights: weights.clone(),
+                playing_configuration: config.clone(),
+            }
         };
         let (_, _, record) = replay::play_game_using_fast(
             game.players,
@@ -296,14 +314,19 @@ fn collect(control: &Control, output: &Path) -> Result<serde_json::Value, String
     // This performs full Core/phase-choice verification and measures all actual
     // source, row, candidate and cache allocations before creating the dataset.
     // A refusal deliberately leaves every completed original in place.
-    let manifest = export_semantic_playing_teacher_files(&paths, &output.join("dataset"))?;
+    let manifest = if v7 {
+        export_semantic_playing_v7_teacher_files(&paths, &output.join("dataset"))?
+    } else {
+        export_semantic_playing_teacher_files(&paths, &output.join("dataset"))?
+    };
     join_export(control, &originals, &manifest.games)?;
     let manifest_raw = read_bounded(&output.join("dataset/manifest.json"), MAX_CONTROL)?;
     if manifest_raw != serde_json::to_vec(&manifest).map_err(|e| e.to_string())? {
         return Err("Published teacher manifest differs from returned export".into());
     }
     Ok(serde_json::json!({
-        "schema":"tzolkin-corn-first-v5-teacher-collection-report-v1",
+        "schema":if v7 { "tzolkin-corn-first-v7-teacher-collection-report-v1" }
+            else { "tzolkin-corn-first-v5-teacher-collection-report-v1" },
         "complete":true, "originals":originals, "originalBytes":stored,
         "datasetFingerprint":manifest.fingerprint,
         "datasetManifest":{"bytes":manifest_raw.len(),"sha256":sha(&manifest_raw)},
@@ -356,8 +379,13 @@ fn run(args: &[String]) -> Result<(), String> {
         serde_json::to_vec(&report).map_err(|e| e.to_string())
     })();
     publish_report(output, &control_pin, &control.global_exclusions.pin, result)?;
+    let version = if control.schema == V7_SCHEMA {
+        "V7"
+    } else {
+        "V5"
+    };
     println!(
-        "Completed fixed CornFirst/V5 originals and verified semantic4 dataset; no training or strength qualification"
+        "Completed fixed CornFirst/{version} originals and verified semantic4 dataset; no training or strength qualification"
     );
     Ok(())
 }
@@ -420,6 +448,11 @@ mod tests {
             "games":[{"players":3,"seed":train,"role":"train"}]});
         let mut control: Control = serde_json::from_value(value.clone()).unwrap();
         control.validate(&excluded).unwrap();
+        control.schema = V7_SCHEMA.into();
+        control.validate(&excluded).unwrap();
+        control.schema = "tzolkin-corn-first-v6-teacher-collect-v1".into();
+        assert!(control.validate(&excluded).is_err());
+        control.schema = SCHEMA.into();
         let originals = [Original {
             game: control.games[0].clone(),
             family_id: seed_family_id(train),

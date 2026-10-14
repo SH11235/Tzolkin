@@ -24,9 +24,25 @@ pub const MODEL_VERSION: &str = "native-corn-first-v5-playing-512x32x1-scalar-v1
 pub const CHECKPOINT_SCHEMA: &str = "tzolkin-native-semantic-playing-teacher-checkpoint-v1";
 pub const TRAINING_VERSION: &str = "native-playing4-teacher-scalar-adam-fisher-yates-v1";
 pub const TASK: &str = "nativeCornFirstV5SemanticPlayingPolicyOnlyBc";
+pub const V7_MODEL_VERSION: &str = "native-corn-first-v7-playing-512x32x1-scalar-v1";
+pub const V7_TASK: &str = "nativeCornFirstV7SemanticPlayingPolicyOnlyBc";
 const SHUFFLE: &str = "descending-fisher-yates-random-index-v1";
 const INIT_DOMAIN: &[u8] = b"tzolkin-native-playing4-teacher-init-v1\0";
 const SHUFFLE_DOMAIN: &[u8] = b"tzolkin-native-playing4-teacher-shuffle-v1\0";
+impl data::TeacherProfile {
+    fn model_version(self) -> &'static str {
+        match self {
+            Self::V5 => MODEL_VERSION,
+            Self::V7 => V7_MODEL_VERSION,
+        }
+    }
+    fn bc_task(self) -> &'static str {
+        match self {
+            Self::V5 => TASK,
+            Self::V7 => V7_TASK,
+        }
+    }
+}
 fn seeded(domain: &[u8], seed: u64) -> u64 {
     let mut h = Sha256::new();
     h.update(domain);
@@ -102,13 +118,21 @@ impl SemanticPlayingTeacherModel {
         m.checksum.clear();
         checksum(&m)
     }
+    fn profile(&self) -> Result<data::TeacherProfile, String> {
+        [data::TeacherProfile::V5, data::TeacherProfile::V7]
+            .into_iter()
+            .find(|p| {
+                self.model_version == p.model_version()
+                    && self.source_kind == p.source_kind()
+                    && self.task == p.bc_task()
+                    && self.input_contract == p.input_contract()
+            })
+            .ok_or_else(|| "Invalid native4 teacher model contract/checksum".into())
+    }
     pub fn validate(&self) -> Result<(), String> {
         tzolkin_inference::policy::validate_parameters(self.parameters())?;
+        self.profile()?;
         if self.schema != MODEL_SCHEMA
-            || self.model_version != MODEL_VERSION
-            || self.source_kind != data::SOURCE_KIND
-            || self.task != TASK
-            || self.input_contract != data::INPUT_CONTRACT
             || self.feature_schema != SEMANTIC_PLAYING_FEATURE_SCHEMA
             || self.feature_count != FEATURE_COUNT
             || self.value_validity != ValueValidity::UnavailablePolicyOnly
@@ -392,6 +416,7 @@ impl SemanticPlayingTeacherCheckpoint {
             || self.metrics.completed_epochs != self.completed_epochs
             || self.metrics.strength_measured
             || self.model.dataset_fingerprint != self.dataset.manifest.fingerprint
+            || self.model.profile()? != self.dataset.manifest.profile()?
             || steps.checked_mul(self.completed_epochs as u64) != Some(self.optimizer.step)
             || self.optimizer.step > MAX_UPDATES
             || self.checksum != self.expected_checksum()?
@@ -489,6 +514,7 @@ fn train_after_cache(
             raw_manifest_sha256: raw_pin.1.clone(),
         };
         identity.validate()?;
+        let profile = identity.manifest.profile()?;
         // Test is removed before ALL loss, top1, alias and round-band operations.
         let train = selected(samples, &identity.manifest, DatasetSplit::Train);
         let validation = selected(samples, &identity.manifest, DatasetSplit::Validation);
@@ -614,10 +640,10 @@ fn train_after_cache(
         };
         let mut artifact = SemanticPlayingTeacherModel {
             schema: MODEL_SCHEMA.into(),
-            model_version: MODEL_VERSION.into(),
-            source_kind: data::SOURCE_KIND.into(),
-            task: TASK.into(),
-            input_contract: data::INPUT_CONTRACT.into(),
+            model_version: profile.model_version().into(),
+            source_kind: profile.source_kind().into(),
+            task: profile.bc_task().into(),
+            input_contract: profile.input_contract().into(),
             feature_schema: SEMANTIC_PLAYING_FEATURE_SCHEMA,
             feature_count: FEATURE_COUNT,
             dataset_fingerprint: identity.manifest.fingerprint.clone(),
@@ -713,6 +739,66 @@ pub(crate) fn fixture(
     assert_eq!(
         bounded_json(&noop.checkpoint).unwrap(),
         bounded_json(&full.checkpoint).unwrap()
+    );
+    let v7_root = parent.join("native4-v7-training-cache");
+    let v7_data = data::training_cache_fixture_for_profile(
+        &v7_root,
+        examples,
+        Some(DatasetSplit::Test),
+        data::TeacherProfile::V7,
+    )
+    .unwrap();
+    let v7_full = train_dataset(&v7_data, &config(3), None).unwrap();
+    let v7_first = train_dataset(&v7_data, &config(1), None).unwrap();
+    let v7_resumed = train_dataset(&v7_data, &config(3), Some(&v7_first.checkpoint)).unwrap();
+    assert_eq!(
+        bounded_json(&v7_full.checkpoint).unwrap(),
+        bounded_json(&v7_resumed.checkpoint).unwrap()
+    );
+    validate_checkpoint_dataset(&v7_data, &v7_full.checkpoint).unwrap();
+    assert_eq!(v7_full.model.source_kind, data::V7_SOURCE_KIND);
+    assert_eq!(v7_full.model.task, V7_TASK);
+    assert_eq!(v7_full.model.input_contract, data::V7_INPUT_CONTRACT);
+    assert_eq!(v7_full.model.model_version, V7_MODEL_VERSION);
+    // Identical synthetic features/labels retain exact numerical math; teacher
+    // metadata/fingerprints differ. These caches are not qualified replays.
+    assert_eq!(
+        full.model
+            .parameters()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        v7_full
+            .model
+            .parameters()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        bounded_json(&full.checkpoint.optimizer).unwrap(),
+        bounded_json(&v7_full.checkpoint.optimizer).unwrap()
+    );
+    assert_eq!(
+        full.checkpoint.random_state,
+        v7_full.checkpoint.random_state
+    );
+    assert!(train_dataset(&v7_data, &config(3), Some(&first.checkpoint)).is_err());
+    assert!(train_dataset(&dataset, &config(3), Some(&v7_first.checkpoint)).is_err());
+    let mut mismatched = first.checkpoint.clone();
+    mismatched.model.source_kind = data::V7_SOURCE_KIND.into();
+    mismatched.model.task = V7_TASK.into();
+    mismatched.model.input_contract = data::V7_INPUT_CONTRACT.into();
+    mismatched.model.model_version = V7_MODEL_VERSION.into();
+    mismatched.model.checksum = mismatched.model.expected_checksum().unwrap();
+    mismatched.model.validate().unwrap();
+    mismatched.checksum = mismatched.expected_checksum().unwrap();
+    assert!(mismatched.validate().is_err());
+    let v7_checkpoint = v7_root.with_extension("checkpoint.json");
+    v7_full.checkpoint.save_new(&v7_checkpoint).unwrap();
+    assert!(
+        crate::arena::teacher::PreparedSemanticPlayingTeacher::load(&v7_checkpoint, &v7_root)
+            .is_err()
     );
     assert_eq!(
         evaluate_validation(&dataset, &full.checkpoint).unwrap(),

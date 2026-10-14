@@ -4,12 +4,14 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use tzolkin_ai::policy_training::{PolicyBcConfig, validate_new_output_directory};
-use tzolkin_ai::semantic_playing_teacher_dataset::load_semantic_playing_teacher_dataset;
+use tzolkin_ai::semantic_playing_teacher_dataset::{
+    load_semantic_playing_teacher_dataset, load_semantic_playing_v7_teacher_dataset,
+};
 use tzolkin_ai::semantic_playing_teacher_training::{
     SemanticPlayingTeacherCheckpoint, train_dataset,
 };
 
-const USAGE: &str = "Usage: tzolkin-semantic-playing-teacher-train --dataset DATASET_DIR --config CONFIG.json --output NEW_OUTPUT_DIR [--resume CHECKPOINT.json]\nConfig requires epochs, batchSize, learningRate and seed. Epochs is the total target, including resumed epochs. This is fixed-teacher imitation, not strength evaluation.";
+const USAGE: &str = "Usage: tzolkin-semantic-playing-teacher-train --dataset DATASET_DIR --config CONFIG.json --output NEW_OUTPUT_DIR [--resume CHECKPOINT.json] [--teacher cornFirstV5|cornFirstV7]\nConfig requires epochs, batchSize, learningRate and seed. Epochs is the total target, including resumed epochs. Default teacher is cornFirstV5; explicit cornFirstV7 uses its separate complete-source contract, with no cross-profile resume or source conversion. This is fixed-teacher imitation, not strength evaluation.";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 fn config(path: &Path) -> Result<PolicyBcConfig, String> {
@@ -45,7 +47,7 @@ fn run() -> Result<(), String> {
     while let Some(flag) = args.next() {
         if !matches!(
             flag.as_str(),
-            "--dataset" | "--config" | "--output" | "--resume"
+            "--dataset" | "--config" | "--output" | "--resume" | "--teacher"
         ) {
             return Err(format!("Unknown flag: {flag}\n{USAGE}"));
         }
@@ -66,6 +68,11 @@ fn run() -> Result<(), String> {
     let config_path = required("--config")?;
     let output_path = required("--output")?;
     let resume_path = flags.remove("--resume");
+    let v7 = match flags.remove("--teacher").as_deref() {
+        None | Some("cornFirstV5") => false,
+        Some("cornFirstV7") => true,
+        _ => return Err("Teacher must be cornFirstV5 or cornFirstV7".into()),
+    };
     let directory = Path::new(&directory);
     let output = Path::new(&output_path);
     validate_new_output_directory(output)?;
@@ -84,7 +91,11 @@ fn run() -> Result<(), String> {
     let resume = resume_path
         .map(|p| SemanticPlayingTeacherCheckpoint::load(Path::new(&p)))
         .transpose()?;
-    let dataset = load_semantic_playing_teacher_dataset(directory)?;
+    let dataset = if v7 {
+        load_semantic_playing_v7_teacher_dataset(directory)?
+    } else {
+        load_semantic_playing_teacher_dataset(directory)?
+    };
     let outcome = train_dataset(&dataset, &config, resume.as_ref())?;
     outcome.save_new_directory(output)?;
     println!(

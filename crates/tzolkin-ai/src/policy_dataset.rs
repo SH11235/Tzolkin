@@ -500,6 +500,11 @@ fn source(path: &Path) -> Result<(Vec<u8>, GameReplay), String> {
                 "Corn-first V5 Playing teacher has no legacy native dataset admission".into(),
             );
         }
+        ReplaySource::CornFirstV7Teacher { .. } => {
+            return Err(
+                "Corn-first V7 Playing teacher requires its dedicated semantic4 dataset".into(),
+            );
+        }
     }
     replay::verify_replay(&record)?;
     Ok((bytes, record))
@@ -1482,6 +1487,31 @@ mod tests {
                 );
             }
         }
+        if matches!(
+            &record.header.source,
+            ReplaySource::CornFirstV7Teacher { .. }
+        ) {
+            assert_eq!(
+                replay::verify_corn_first_v7_teacher_replay(&record).unwrap_err(),
+                "Partial logs cannot be verified as complete games"
+            );
+            let output = parent.join("v7-scalar-dataset");
+            assert_eq!(
+                crate::dataset::export_dataset_files(std::slice::from_ref(&path), &output)
+                    .unwrap_err(),
+                "Corn-first V7 Playing teacher has no legacy native dataset admission"
+            );
+            assert!(!output.exists());
+            for route in [
+                SourceRoute::ResourceCycleV5Teacher,
+                SourceRoute::ResourceCycleV5SemanticSetupTeacher,
+            ] {
+                assert_eq!(
+                    route.read(&path).unwrap_err(),
+                    "ResourceCycleV5 teacher requires explicit all-seat policy provenance"
+                );
+            }
+        }
         assert_eq!(fs::read(&path).unwrap(), raw);
         fs::remove_dir_all(parent).unwrap();
         error
@@ -1533,6 +1563,10 @@ mod tests {
         assert_eq!(
             incomplete_source_error(replay::corn_first_v5_teacher_provenance()),
             "Corn-first V5 Playing teacher has no legacy native dataset admission",
+        );
+        assert_eq!(
+            incomplete_source_error(replay::corn_first_v7_teacher_provenance()),
+            "Corn-first V7 Playing teacher requires its dedicated semantic4 dataset"
         );
         let policy = replay::SeatPolicy::Heuristic {
             policy_version: "heuristic-v1".into(),
