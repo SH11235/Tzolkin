@@ -38,6 +38,9 @@ pub use restore::{
     CLOSE_DECLARATION_SCHEMA, PROCESS_CLOSE_SCHEMA, SemanticJournalRestoration,
     restore_observed_closed,
 };
+#[path = "semantic_playing_rl_run.rs"]
+mod runner;
+pub use runner::{SemanticJournalInvocation, SemanticJournalRunSpec, run_semantic_playing_journal};
 const META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 640;
 
@@ -819,7 +822,7 @@ pub(crate) fn journal_fixture(
         create,
     )
     .unwrap();
-    let (restored, captures) = restored.into_journal_and_snapshots();
+    let (mut restored, captures) = restored.into_journal_and_snapshots();
     assert_eq!(
         serde_json::to_value(restored.status()).unwrap(),
         serde_json::to_value(journal.status()).unwrap()
@@ -977,4 +980,18 @@ pub(crate) fn journal_fixture(
         Some(SemanticJournalResolution::Updated)
     );
     assert!(changed.status().current.credited_playing_decisions() > 0);
+    // A reconstructed typed capture can drive the next warm batch on the same
+    // held learner; no parameter import or per-batch process restart is needed.
+    let mixture =
+        SemanticFrozenMixture::new(pool, vec![SnapshotSlot::new(3, 3, &captures[0]).unwrap()])
+            .unwrap();
+    let continued = restored
+        .update_using(later, PoolRef::Mixture(&mixture), create)
+        .unwrap();
+    assert_eq!(continued.attempt, 3);
+    assert_eq!(restored.status().current.completed_updates(), 3);
+    assert_eq!(restored.status().next_ordinal, 212);
+    assert_eq!(restored.status().spent_actor_streams, 42);
+    restored.verify_archive_bytes().unwrap();
+    runner::control_fixture(root, limits, later);
 }
