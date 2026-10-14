@@ -28,7 +28,7 @@ use crate::semantic_playing_rl_collection::PoolRef;
 use crate::semantic_playing_rl_pool::{FrozenSemanticSnapshot, SemanticFrozenMixture};
 use crate::semantic_playing_rl_update::{
     PreparedSemanticAdmission, SemanticPlayingCurrentIdentity, SemanticPlayingJointReport,
-    SemanticPlayingJointSession,
+    SemanticPlayingJointSession, SemanticSignalDiagnostics,
 };
 
 pub const JOURNAL_SCHEMA: &str = "tzolkin-semantic-playing-joint-journal-v1";
@@ -121,6 +121,8 @@ pub struct SemanticJournalStatus {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SemanticJournalReturnedClose {
+    #[serde(skip)]
+    signals: Option<SemanticSignalDiagnostics>,
     head: ContentPin,
     report: ContentPin,
     current: String,
@@ -458,7 +460,7 @@ impl<'a> SemanticPlayingJournal<'a> {
     }
     fn resolve(
         &mut self,
-        prepared: PreparedSemanticAdmission,
+        mut prepared: PreparedSemanticAdmission,
         pool: PoolRef<'_>,
     ) -> Result<SemanticJournalReturnedClose, String> {
         let attempt = self.session.attempts();
@@ -491,6 +493,7 @@ impl<'a> SemanticPlayingJournal<'a> {
             "resolve":resolve.pin,"current":next,"actualProcessCloseVerified":false}),
         )?;
         let returned = SemanticJournalReturnedClose {
+            signals: prepared.take_signals(),
             head: closed.pin.absolute(&self.directory),
             report: report.absolute(&self.directory),
             current: next,

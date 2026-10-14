@@ -14,7 +14,7 @@ use crate::public_model::PublicPolicyModel;
 use crate::public_native::PreparedPublicPolicy;
 use crate::public_policy_baseline::ResidualFitConfig;
 use crate::public_policy_mixed::{SemanticNumericMember, prepare_numeric_timed_for_profile};
-use crate::public_policy_update::{OneStepConfig, Untimed, hash};
+use crate::public_policy_update::{NumericReport, OneStepConfig, PhaseTimer, TimedPhase, hash};
 use crate::public_stochastic::SamplingSeed;
 use crate::public_stochastic_native::CollectionLimits;
 use crate::semantic_playing_rl_collection::{
@@ -26,6 +26,126 @@ use crate::semantic_playing_rl_pool::{FrozenSemanticSnapshot, SemanticFrozenMixt
 
 pub const UPDATE_VERSION: &str = "semantic-playing-own-sum-quarter-recurrent-scalar-v1";
 pub const GUARDED_UPDATE_VERSION: &str = "semantic-playing-guarded-proposal-sum-quarter-scalar-v2";
+
+/// Same-pass observations only; never serialized into an owned report or identity.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SemanticSignalDiagnostics {
+    report_checksum: String,
+    parent: String,
+    next: String,
+    cohort: String,
+    actor: NumericReport,
+    members: [MemberSignal; 4],
+}
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignalSummary {
+    min: f64,
+    max: f64,
+    mean: f64,
+    positive: usize,
+    negative: usize,
+    zero: usize,
+    one: usize,
+}
+impl SignalSummary {
+    fn observe(&mut self, value: f64, count: usize) {
+        self.min = if count == 1 {
+            value
+        } else {
+            self.min.min(value)
+        };
+        self.max = if count == 1 {
+            value
+        } else {
+            self.max.max(value)
+        };
+        self.mean += value; // Converted from ordered sum exactly once at finish.
+        self.positive += usize::from(value > 0.0);
+        self.negative += usize::from(value < 0.0);
+        self.zero += usize::from(value == 0.0);
+        self.one += usize::from(value == 1.0);
+    }
+}
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberSignal {
+    learner: usize,
+    players: usize,
+    callbacks: usize,
+    candidates: usize,
+    singletons: usize,
+    terminal_winner_share: f64,
+    baseline: SignalSummary,
+    advantage: SignalSummary,
+}
+#[derive(Default)]
+struct SignalCollector {
+    member: usize,
+    inconsistent_target: bool,
+    members: [MemberSignal; 4],
+}
+impl PhaseTimer for SignalCollector {
+    type Span = ();
+    fn enter(&mut self, _: TimedPhase) {}
+    fn returned(&mut self, _: (), _: bool) {}
+    fn actor_member(&mut self, index: usize, learner: usize, players: usize) {
+        self.member = index;
+        self.members[index].learner = learner;
+        self.members[index].players = players;
+    }
+    fn actor_signal(&mut self, target: f64, baseline: f64, candidates: usize) {
+        let member = &mut self.members[self.member];
+        if member.callbacks == 0 {
+            member.terminal_winner_share = target;
+        } else {
+            self.inconsistent_target |= member.terminal_winner_share != target;
+        }
+        member.callbacks += 1;
+        member.candidates += candidates;
+        member.singletons += usize::from(candidates == 1);
+        member.baseline.observe(baseline, member.callbacks);
+        member
+            .advantage
+            .observe(target - baseline, member.callbacks);
+    }
+}
+impl SignalCollector {
+    fn finish(
+        mut self,
+        actor: NumericReport,
+        counts: [usize; 3],
+    ) -> Result<SemanticSignalDiagnostics, String> {
+        let observed = self.members.iter().fold([0; 3], |mut sums, m| {
+            for (sum, n) in sums
+                .iter_mut()
+                .zip([m.callbacks, m.candidates, m.singletons])
+            {
+                *sum += n;
+            }
+            sums
+        });
+        if self.inconsistent_target
+            || observed != counts
+            || self.members.iter().any(|m| m.callbacks == 0)
+        {
+            return Err("Semantic signal summary differs from sealed learner steps".into());
+        }
+        for m in &mut self.members {
+            m.baseline.mean /= m.callbacks as f64;
+            m.advantage.mean /= m.callbacks as f64;
+        }
+        Ok(SemanticSignalDiagnostics {
+            report_checksum: String::new(),
+            parent: String::new(),
+            next: String::new(),
+            cohort: String::new(),
+            actor,
+            members: self.members,
+        })
+    }
+}
 
 /// Descriptive, non-deserializable identity of this session's current state.
 /// Counts belong only to complete admitted updates from its own fresh root.
@@ -109,6 +229,8 @@ impl SemanticPlayingCurrentIdentity {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SemanticPlayingJointReport {
+    #[serde(skip)]
+    signals: Option<SemanticSignalDiagnostics>,
     parent: String,
     next: String,
     cohort: String,
@@ -637,6 +759,12 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 ),
             )?;
         }
+        if let Some(signals) = &mut report.signals {
+            signals.report_checksum = report.checksum.clone();
+            signals.parent = report.parent.clone();
+            signals.next = report.next.clone();
+            signals.cohort = report.cohort.clone();
+        }
         let owner = self.state.view(self.identity.checksum());
         if let Some(mixture) = mixture {
             self.ledger
@@ -794,6 +922,9 @@ impl PreparedSemanticAdmission {
     pub(crate) fn report(&self) -> &SemanticPlayingJointReport {
         &self.proposal.report
     }
+    pub(crate) fn take_signals(&mut self) -> Option<SemanticSignalDiagnostics> {
+        self.proposal.report.signals.take()
+    }
     pub(crate) fn records(&self) -> Result<&[Vec<u8>; 4], String> {
         self.proposal
             .records
@@ -858,6 +989,7 @@ fn prepare(
         .try_into()
         .map_err(|_| "Semantic numeric whole-four shape")?;
     let counts = cohort.numeric_counts()?;
+    let mut signals = SignalCollector::default();
     let (_, actor, critic) = prepare_numeric_timed_for_profile(
         ConditionalFeatureProfile::SemanticPlaying4,
         scope.actor(),
@@ -866,7 +998,7 @@ fn prepare(
         counts,
         actor_config,
         critic_config,
-        &mut Untimed,
+        &mut signals,
     )?;
     let changes = [actor.numeric.changed_parameters, critic.changed_parameters];
     let updated = changes != [0, 0];
@@ -904,6 +1036,7 @@ fn prepare(
         parent.composition(),
     )?;
     let report = SemanticPlayingJointReport {
+        signals: Some(signals.finish(actor.numeric, counts)?),
         parent: parent.checksum().into(),
         next: String::new(),
         cohort: cohort_checksum,
@@ -1164,8 +1297,29 @@ pub(crate) fn joint_fixture() {
             create,
         )
         .unwrap();
-    let report = guarded.admit(proposed).unwrap();
+    let mut report = guarded.admit(proposed).unwrap();
     assert_eq!(report.guarded_proposals.unwrap()[0], report.counts[0]);
+    let old_report_wire = serde_json::to_vec(&report).unwrap();
+    let signals = report.signals.take().unwrap();
+    assert_eq!(old_report_wire, serde_json::to_vec(&report).unwrap());
+    assert_eq!(signals.report_checksum, report.checksum);
+    assert_eq!(signals.actor.changed_parameters, report.changes[0]);
+    assert_eq!(
+        signals.members.iter().map(|m| m.callbacks).sum::<usize>(),
+        report.counts[0]
+    );
+    assert_eq!(
+        signals.members.iter().map(|m| m.singletons).sum::<usize>(),
+        report.counts[2]
+    );
+    for m in &signals.members {
+        assert!(m.baseline.min >= 0.0 && m.baseline.max <= 1.0);
+        assert_eq!(
+            m.advantage.positive + m.advantage.negative + m.advantage.zero,
+            m.callbacks
+        );
+        assert!((m.advantage.mean - (m.terminal_winner_share - m.baseline.mean)).abs() < 1e-12);
+    }
     let saved = guarded.checkpoint_state().unwrap();
     assert_eq!(
         saved.composition().unwrap(),
