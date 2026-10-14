@@ -16,7 +16,7 @@ use crate::conditional_human_rl_update::{
     ConditionalFrozenMixRoster, ConditionalFrozenPool, ConditionalNativeExclusions,
 };
 use crate::conditional_semantic_playing_rl::{
-    SemanticCollectionScope, SemanticOwnerView, SemanticPlayingRlOwner,
+    SemanticCollectionScope, SemanticOwnerView, SemanticPlayingRlOwner, SemanticSourceCheckPass,
 };
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::human_initial_wealth::ContentPin;
@@ -700,6 +700,15 @@ impl PoolRef<'_> {
             Self::Mixture(p) => p.recheck(),
         }
     }
+    pub(crate) fn recheck_in(
+        &self,
+        checked: &mut SemanticSourceCheckPass<'_>,
+    ) -> Result<(), String> {
+        match self {
+            Self::Legacy(..) => Ok(()),
+            Self::Mixture(p) => p.recheck_in(checked),
+        }
+    }
     fn binding(&self) -> Result<serde_json::Value, String> {
         match self {
             Self::Legacy(p, prepared) => p.binding(*prepared),
@@ -893,37 +902,33 @@ impl<'a> SemanticCollectionLedger<'a> {
         {
             return Err("Semantic record is outside this source's burned allocation".into());
         }
-        pool.recheck()?;
-        let result = owner.with_checked(self.external, &self.pins, |scope| {
-            let rosters = pool.freeze()?;
-            let roster = rosters.get(member);
-            if roster.contains_family(&family) {
-                return Err("Semantic saved family overlaps frozen opponent lineage".into());
-            }
-            let binding = collection_binding(owner, self.external, self.history, pool)?;
-            let header = RecordHeader::new(
-                scope.parent_checksum(),
-                member,
-                match pool {
-                    PoolRef::Legacy(..) => None,
-                    PoolRef::Mixture(mixture) => Some(mixture.checksum()),
-                },
-                config,
-            )?;
-            let audited =
-                audit_bound_record(raw, &header, config, roster, scope, &binding, || {
-                    create(config)
-                })?;
-            Ok(SemanticPlayingRecordAudit::new(raw, &audited))
-        });
-        match (result, pool.recheck()) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(post)) => Err(format!("Semantic record pool postcheck: {post}")),
-            (Err(error), Err(post)) => {
-                Err(format!("{error}; semantic record pool postcheck: {post}"))
-            }
-        }
+        owner.with_checked_pool(
+            self.external,
+            &self.pins,
+            |checked| pool.recheck_in(checked),
+            |scope| {
+                let rosters = pool.freeze()?;
+                let roster = rosters.get(member);
+                if roster.contains_family(&family) {
+                    return Err("Semantic saved family overlaps frozen opponent lineage".into());
+                }
+                let binding = collection_binding(owner, self.external, self.history, pool)?;
+                let header = RecordHeader::new(
+                    scope.parent_checksum(),
+                    member,
+                    match pool {
+                        PoolRef::Legacy(..) => None,
+                        PoolRef::Mixture(mixture) => Some(mixture.checksum()),
+                    },
+                    config,
+                )?;
+                let audited =
+                    audit_bound_record(raw, &header, config, roster, scope, &binding, || {
+                        create(config)
+                    })?;
+                Ok(SemanticPlayingRecordAudit::new(raw, &audited))
+            },
+        )
     }
     pub(crate) fn freeze_snapshot(
         &self,
@@ -957,7 +962,16 @@ impl<'a> SemanticCollectionLedger<'a> {
         owner.with_checked(self.external, &self.pins, run)
     }
     pub(crate) fn recheck(&self, owner: &SemanticOwnerView<'_>) -> Result<(), String> {
-        owner.with_checked_episode(self.external, &self.pins, || Ok(()))
+        owner.recheck_with_pool(self.external, &self.pins, |_| Ok(()))
+    }
+    pub(crate) fn recheck_with_pool(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        pool: PoolRef<'_>,
+    ) -> Result<(), String> {
+        owner.recheck_with_pool(self.external, &self.pins, |checked| {
+            pool.recheck_in(checked)
+        })
     }
     pub(crate) fn prepare_admitted(
         &self,
@@ -1199,8 +1213,7 @@ impl<'a> SemanticCollectionLedger<'a> {
         if self.stopped || self.attempts >= MAX_ATTEMPTS {
             return Err("Semantic collection stopped or attempt bound".into());
         }
-        pool.recheck()?;
-        let result = owner.with_checked(self.external, &self.pins, |_| {
+        owner.with_checked_pool(self.external, &self.pins, |checked| pool.recheck_in(checked), |_| {
             if let PoolRef::Mixture(mixture) = pool {
                 mixture.require_receiver(owner, self.external, self.history,
                     (&self.spent, &self.streams), &self.admitted)?;
@@ -1279,12 +1292,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             Ok(PlannedSemanticReservation {batch:SemanticReservation {
                 parent,binding,configs,families,attempt,next,burns,description,
             },spent,streams:all_streams})
-        });
-        match (result, pool.recheck()) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (_, Err(post)) => Err(format!("Semantic plan pool postcheck: {post}")),
-        }
+        })
     }
     /// The opaque plan already owns every allocation. No fallible operation or
     /// allocation follows a durably published Reserve before these moves.
@@ -1338,97 +1346,105 @@ impl<'a> SemanticCollectionLedger<'a> {
         ) -> Result<R, String>,
         create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
     ) -> Result<R, String> {
-        pool.recheck()?;
         let pins = self.pins.clone();
-        let result = owner.with_checked(self.external, &pins, |scope| {
-            if self.stopped
-                || batch.parent != scope.parent_checksum()
-                || self.attempts != batch.attempt
-                || self.next != batch.next
-                || batch.burns
-                    != hash(
-                        b"semantic-reserved-allocation-v1\0",
-                        &(self.attempts, self.next, &self.spent, &self.streams),
-                    )?
-                || batch.binding != collection_binding(owner, self.external, self.history, pool)?
-            {
-                return Err(
-                    "Semantic exact reserved parent/configuration/allocation differs".into(),
-                );
-            }
-            if let PoolRef::Mixture(mixture) = pool {
-                mixture.require_receiver(
-                    owner,
-                    self.external,
-                    self.history,
-                    (&self.spent, &self.streams),
-                    &self.admitted,
-                )?;
-            }
-            let rosters = pool.freeze()?;
-            let binding = &batch.binding;
-            let human_reservations = owner.metadata().1.clone();
-            let mut episodes = Vec::new();
-            for (i, config) in batch.configs.iter().enumerate() {
-                let roster = rosters.get(i);
-                // Reuse the outer whole-four checked scope. Its POST runs before
-                // any prepared result leaves, including a member or finish error.
-                let episode = if let Some(saved) = saved {
-                    let header = RecordHeader::new(
-                        &batch.parent,
-                        i,
-                        match pool {
-                            PoolRef::Mixture(p) => Some(p.checksum()),
-                            _ => None,
-                        },
-                        config,
+        let result = owner.with_checked_pool(
+            self.external,
+            &pins,
+            |checked| pool.recheck_in(checked),
+            |scope| {
+                if self.stopped
+                    || batch.parent != scope.parent_checksum()
+                    || self.attempts != batch.attempt
+                    || self.next != batch.next
+                    || batch.burns
+                        != hash(
+                            b"semantic-reserved-allocation-v1\0",
+                            &(self.attempts, self.next, &self.spent, &self.streams),
+                        )?
+                    || batch.binding
+                        != collection_binding(owner, self.external, self.history, pool)?
+                {
+                    return Err(
+                        "Semantic exact reserved parent/configuration/allocation differs".into(),
+                    );
+                }
+                if let PoolRef::Mixture(mixture) = pool {
+                    mixture.require_receiver(
+                        owner,
+                        self.external,
+                        self.history,
+                        (&self.spent, &self.streams),
+                        &self.admitted,
                     )?;
-                    // Raw DTOs stay private. Only this same source-owned
-                    // fresh Core audit can seal a historical learner step.
-                    audit_bound_record(&saved[i], &header, config, roster, scope, binding, || {
-                        create(config)
-                    })?
-                } else {
-                    let collected = run(config, roster, scope, binding, None, || create(config))?;
-                    if !collected.complete() {
-                        let error = collected
-                            .failure
-                            .clone()
-                            .unwrap_or_else(|| "Semantic game incomplete".into());
-                        self.failed = Some(SemanticPlayingCollectedGame { record: collected });
-                        return Err(error);
-                    }
-                    let audited = run(config, roster, scope, binding, Some(&collected), || {
-                        create(config)
-                    })?;
-                    seal(
-                        audited,
-                        config.clone(),
-                        roster.learner_seat(),
-                        roster.sampled_opponents(config.players()),
-                    )?
+                }
+                let rosters = pool.freeze()?;
+                let binding = &batch.binding;
+                let human_reservations = owner.metadata().1.clone();
+                let mut episodes = Vec::new();
+                for (i, config) in batch.configs.iter().enumerate() {
+                    let roster = rosters.get(i);
+                    // Reuse the outer whole-four checked scope. Its POST runs before
+                    // any prepared result leaves, including a member or finish error.
+                    let episode = if let Some(saved) = saved {
+                        let header = RecordHeader::new(
+                            &batch.parent,
+                            i,
+                            match pool {
+                                PoolRef::Mixture(p) => Some(p.checksum()),
+                                _ => None,
+                            },
+                            config,
+                        )?;
+                        // Raw DTOs stay private. Only this same source-owned
+                        // fresh Core audit can seal a historical learner step.
+                        audit_bound_record(
+                            &saved[i],
+                            &header,
+                            config,
+                            roster,
+                            scope,
+                            binding,
+                            || create(config),
+                        )?
+                    } else {
+                        let collected =
+                            run(config, roster, scope, binding, None, || create(config))?;
+                        if !collected.complete() {
+                            let error = collected
+                                .failure
+                                .clone()
+                                .unwrap_or_else(|| "Semantic game incomplete".into());
+                            self.failed = Some(SemanticPlayingCollectedGame { record: collected });
+                            return Err(error);
+                        }
+                        let audited =
+                            run(config, roster, scope, binding, Some(&collected), || {
+                                create(config)
+                            })?;
+                        seal(
+                            audited,
+                            config.clone(),
+                            roster.learner_seat(),
+                            roster.sampled_opponents(config.players()),
+                        )?
+                    };
+                    episodes.push(episode);
+                }
+                let cohort = AuditedSemanticPlayingCohort {
+                    episodes: episodes
+                        .try_into()
+                        .map_err(|_| "Semantic whole-four shape")?,
+                    parent: batch.parent.clone(),
+                    families: batch.families.clone(),
+                    human_reservations,
+                    mixture: match pool {
+                        PoolRef::Mixture(p) => Some(p.checksum().into()),
+                        PoolRef::Legacy(..) => None,
+                    },
                 };
-                episodes.push(episode);
-            }
-            let cohort = AuditedSemanticPlayingCohort {
-                episodes: episodes
-                    .try_into()
-                    .map_err(|_| "Semantic whole-four shape")?,
-                parent: batch.parent.clone(),
-                families: batch.families.clone(),
-                human_reservations,
-                mixture: match pool {
-                    PoolRef::Mixture(p) => Some(p.checksum().into()),
-                    PoolRef::Legacy(..) => None,
-                },
-            };
-            finish(scope, cohort)
-        });
-        let result = match (result, pool.recheck()) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (_, Err(post)) => Err(format!("Semantic reserved pool postcheck: {post}")),
-        };
+                finish(scope, cohort)
+            },
+        );
         if result.is_err() {
             self.stop();
         }

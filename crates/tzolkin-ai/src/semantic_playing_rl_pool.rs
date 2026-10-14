@@ -9,7 +9,8 @@ use crate::conditional_human_rl_update::{
     ConditionalFrozenMixRoster, ConditionalFrozenPool, ConditionalNativeExclusions,
 };
 use crate::conditional_semantic_playing_rl::{
-    SemanticOriginCustody, SemanticOwnerView, parameter_checksum,
+    SemanticOriginCustody, SemanticOwnerView, SemanticSourceCheckPass, parameter_checksum,
+    with_source_check_pass,
 };
 use crate::dataset::DatasetSplit;
 use crate::features::FeatureEncoder;
@@ -206,6 +207,14 @@ impl<'a> FrozenSemanticSnapshot<'a> {
         self.external.recheck()?;
         self.history.recheck()
     }
+    fn recheck_sources_in(&self, checked: &mut SemanticSourceCheckPass<'_>) -> Result<(), String> {
+        self.origin.recheck_in(checked)?;
+        checked.external(self.external)?;
+        for pin in self.history.pins() {
+            checked.pin(pin)?;
+        }
+        Ok(())
+    }
     pub(crate) fn binding(&self) -> &str {
         &self.identity.checksum
     }
@@ -347,6 +356,12 @@ impl<'a> SemanticFrozenMixture<'a> {
         Ok(())
     }
     pub(crate) fn recheck(&self) -> Result<(), String> {
+        with_source_check_pass(|checked| self.recheck_in(checked))
+    }
+    pub(crate) fn recheck_in(
+        &self,
+        checked: &mut SemanticSourceCheckPass<'_>,
+    ) -> Result<(), String> {
         // Different weight snapshots often retain identical source files.
         // Recheck each exact source closure once at this boundary, never per move.
         let mut sources = BTreeSet::new();
@@ -356,7 +371,7 @@ impl<'a> SemanticFrozenMixture<'a> {
                 slot.snapshot.check_actor()?;
             }
             if sources.insert(&slot.snapshot.identity.sources) {
-                slot.snapshot.recheck_sources()?;
+                slot.snapshot.recheck_sources_in(checked)?;
             }
         }
         Ok(())
