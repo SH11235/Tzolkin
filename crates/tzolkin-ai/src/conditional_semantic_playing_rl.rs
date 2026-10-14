@@ -22,6 +22,23 @@ use crate::public_policy_update::hash;
 use crate::public_state_critic as critic;
 use crate::semantic_playing_teacher_dataset::TeacherProfile;
 
+/// Invocation-only custody for already-owned values from the complete V7 loader.
+/// It is deliberately absent from origin, numerical and snapshot identities.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SemanticNativeSourceCustody {
+    NativeCommandBoundaryV1,
+}
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_BACKING_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn native_backing_checks() -> usize {
+    NATIVE_BACKING_CHECKS.get()
+}
+
 /// One checked boundary pass, never retained across work or publication. Generic
 /// origin/history pins and typed exclusions keep their distinct read contracts.
 pub(crate) struct SemanticSourceCheckPass<'a> {
@@ -75,13 +92,20 @@ impl SemanticSourceCheckPass<'_> {
 /// typed dataset caps. It cannot be constructed from an actor parameter slice.
 pub(crate) struct NativeOrigin {
     prepared: Arc<PreparedSemanticPlayingTeacher>,
+    source_custody: Option<SemanticNativeSourceCustody>,
     description: serde_json::Value,
     checksum: String,
     tables: BTreeMap<String, DatasetSplit>,
 }
 impl NativeOrigin {
-    fn from_prepared(prepared: Arc<PreparedSemanticPlayingTeacher>) -> Result<Self, String> {
-        prepared.recheck_sources()?;
+    fn from_prepared(
+        prepared: Arc<PreparedSemanticPlayingTeacher>,
+        source_custody: Option<SemanticNativeSourceCustody>,
+    ) -> Result<Self, String> {
+        if source_custody.is_some() && prepared.profile() != TeacherProfile::V7 {
+            return Err("Command-boundary source custody requires a V7 native origin".into());
+        }
+        Self::recheck_prepared(&prepared, source_custody)?;
         let checkpoint = prepared.rl_checkpoint();
         let (schema, domain, task): (&str, &[u8], &str) = match prepared.profile() {
             TeacherProfile::V5 => (
@@ -104,17 +128,37 @@ impl NativeOrigin {
                 checkpoint.model.parameters()),
             "dataset":checkpoint.dataset,"locations":prepared.rl_source_locations()});
         let checksum = hash(domain, &description)?;
-        prepared.recheck_sources()?;
+        Self::recheck_prepared(&prepared, source_custody)?;
         Ok(Self {
             prepared,
+            source_custody,
             description,
             checksum,
             tables: BTreeMap::new(),
         })
     }
+    fn recheck_prepared(
+        prepared: &PreparedSemanticPlayingTeacher,
+        source_custody: Option<SemanticNativeSourceCustody>,
+    ) -> Result<(), String> {
+        if source_custody.is_some() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        NATIVE_BACKING_CHECKS.with(|n| n.set(n.get() + 1));
+        prepared.recheck_sources()
+    }
+    fn recheck_backing(&self) -> Result<(), String> {
+        Self::recheck_prepared(&self.prepared, self.source_custody)
+    }
     fn recheck_in(&self, checked: &mut SemanticSourceCheckPass<'_>) -> Result<(), String> {
+        // A skipped backing read must never satisfy a separately supplied legacy
+        // origin with the same data checksum in this boundary pass.
+        if self.source_custody.is_some() {
+            return Ok(());
+        }
         if !checked.native.contains(&self.checksum) {
-            self.prepared.recheck_sources()?;
+            self.recheck_backing()?;
             checked.native.insert(self.checksum.clone());
         }
         Ok(())
@@ -155,7 +199,7 @@ impl OriginRef<'_> {
     fn recheck(&self) -> Result<(), String> {
         match self {
             Self::Human(o) => o.recheck_sources(),
-            Self::Native(o) => o.prepared.recheck_sources(),
+            Self::Native(o) => o.recheck_backing(),
         }
     }
     fn tables(&self) -> &BTreeMap<String, DatasetSplit> {
@@ -191,7 +235,14 @@ impl SemanticFreshOwner {
         prepared: Arc<PreparedSemanticPlayingTeacher>,
         seed: u64,
     ) -> Result<Self, String> {
-        let origin = Arc::new(NativeOrigin::from_prepared(prepared)?);
+        Self::native_with_custody(prepared, seed, None)
+    }
+    pub(crate) fn native_with_custody(
+        prepared: Arc<PreparedSemanticPlayingTeacher>,
+        seed: u64,
+        source_custody: Option<SemanticNativeSourceCustody>,
+    ) -> Result<Self, String> {
+        let origin = Arc::new(NativeOrigin::from_prepared(prepared, source_custody)?);
         let actor = PublicPolicyModel {
             parameters: origin.prepared.rl_checkpoint().model.parameters().to_vec(),
         };
@@ -202,7 +253,7 @@ impl SemanticFreshOwner {
             seed,
             Some(origin.prepared.profile()),
         )?;
-        origin.prepared.recheck_sources()?;
+        origin.recheck_backing()?;
         Ok(Self::Native {
             origin,
             actor,
@@ -723,7 +774,7 @@ impl SemanticOriginCustody {
             crate::human_policy_dataset::recheck_absolute_pin(pin)?;
         }
         if let Some(native) = &self.native {
-            native.prepared.recheck_sources()?;
+            native.recheck_backing()?;
         }
         Ok(())
     }
