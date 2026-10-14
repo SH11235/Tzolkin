@@ -6210,6 +6210,9 @@ function equivalentBuildingFixture(alter = () => {}, exact = false, paidCost = 0
     {
       raw_text: 'Aは\nを支払った',
       icons: Array.from({ length: cost }, () => ({ classes: 'tz_icon resource_wood' })),
+      ...(paidCost
+        ? { html: `Aは${'<div class="tz_icon resource_wood"></div>'.repeat(cost)}を支払った` }
+        : {}),
     },
     { raw_text: 'Aは建物を建てた' },
   ];
@@ -6296,7 +6299,50 @@ test('calibrated equivalent building witnesses retain unknown physical targets a
   assert.equal(observedOnly.record.steps.length, 0);
   assert.match(observedOnly.manifest.blocked.reason, /Observed purchased card identity/);
 
+  for (const explicit of [false, true]) {
+    const htmlOnly = equivalentBuildingFixture(() => {}, false, 1);
+    const source = htmlOnly.value.raw.dom_entries.find((entry) => entry.action_id === 6);
+    source.messages[0].icons = [];
+    if (explicit) {
+      source.messages[0].raw_text = 'Aは1\nを支払った';
+      source.messages[0].html = 'Aは1 <div class="tz_icon resource_wood"></div>を支払った';
+      htmlOnly.value.raw.entries.find((entry) => entry.action_id === 6).raw_text = source.messages
+        .map((message) => message.raw_text)
+        .join('\n');
+    }
+    const recovered = decode(htmlOnly.value, htmlOnly.dispatch, null, profile);
+    assert.equal(recovered.record.steps.length, 1);
+    assert.deepEqual(recovered.manifest.audit[0].buildingEquivalenceClass, ['b01', 'b02', 'b03']);
+    assert.deepEqual(
+      recovered.manifest.audit[0].buildingEquivalenceEvidence.payment,
+      [0, 1, 0, 0, 0],
+    );
+  }
+
   for (const [label, alter, changeSource, paidCost, reason] of [
+    ...[
+      [
+        'extra wood in HTML',
+        'Aは<div class="tz_icon resource_wood"></div><div class="tz_icon resource_wood"></div>を支払った',
+      ],
+      [
+        'different resource in HTML',
+        'Aは<div class="tz_icon resource_wood"></div><div class="tz_icon resource_stone"></div>を支払った',
+      ],
+      ['conflicting HTML amount', 'Aは2<div class="tz_icon resource_wood"></div>を支払った'],
+      [
+        'unparsed HTML markup',
+        'Aは<span><div class="tz_icon resource_wood"></div></span>を支払った',
+      ],
+      ['missing HTML resource', 'Aはを支払った'],
+    ].map(([label, html]) => [
+      label,
+      () => {},
+      (value) =>
+        (value.raw.dom_entries.find((entry) => entry.action_id === 6).messages[0].html = html),
+      1,
+      /Observed purchased card identity/,
+    ]),
     [
       'partial payment',
       () => {},

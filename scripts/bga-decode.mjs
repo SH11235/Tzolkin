@@ -412,19 +412,27 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       payments[4] !== 0
     )
       return null;
-    // All captured payment icons must be complete, literal material icons.
-    // No HTML-only, empty, unknown or multiply classified icon is inferred here.
+    // Require the whole literal payment caption, including every resource/amount.
+    // Empty captured icons are allowed only when that exact HTML supplied them.
     for (const payment of events.slice(0, -1)) {
       const message = raw.dom_entries.find((entry) => entry.action_id === payment.actionId)
         ?.messages[payment.messageIndex];
+      const icons = payment.iconResources
+        .map((resource) => `<div class="tz_icon resource_${resource}"></div>`)
+        .join('');
+      const amount = payment.detail.explicitAmount ?? '';
       if (
-        !message?.icons?.length ||
-        message.icons.length !== payment.iconResources.length ||
-        message.icons.some(
-          (icon, index) =>
-            (raw.schema_version === 1 ? icon.class : icon.classes) !==
-            `tz_icon resource_${payment.iconResources[index]}`,
-        )
+        !(amount === '' ? [''] : ['', ' ']).some(
+          (space) => message?.html === `${payment.actor}は${amount}${space}${icons}を支払った`,
+        ) ||
+        !Array.isArray(message?.icons) ||
+        (message.icons.length !== 0 &&
+          (message.icons.length !== payment.iconResources.length ||
+            message.icons.some(
+              (icon, index) =>
+                (raw.schema_version === 1 ? icon.class : icon.classes) !==
+                `tz_icon resource_${payment.iconResources[index]}`,
+            )))
       )
         return null;
     }
