@@ -24,12 +24,54 @@ pub const DATASET_SCHEMA: &str = "tzolkin-semantic-playing-native-teacher-datase
 pub const SOURCE_KIND: &str = "verifiedNativeCornFirstV5PlayingTeacher";
 pub const TASK: &str = "cornFirstV5SemanticPlayingPolicyOnlyTeacher";
 pub const INPUT_CONTRACT: &str = "native-corn-first-v5-playing-policy-only-semantic4-v1";
+pub const V7_SOURCE_KIND: &str = "verifiedNativeCornFirstV7PlayingTeacher";
+pub const V7_TASK: &str = "cornFirstV7SemanticPlayingPolicyOnlyTeacher";
+pub const V7_INPUT_CONTRACT: &str = "native-corn-first-v7-playing-policy-only-semantic4-v1";
 pub const MAX_STORED_BYTES: u64 = 256 * 1024 * 1024;
 /// Retained encoded allocations, not a promise about total process RSS.
 pub const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_GAMES: usize = 64;
 pub const MAX_ROWS: usize = policy_dataset::MAX_PARTITION_SAMPLES;
 pub const MAX_CANDIDATES: usize = policy_dataset::MAX_PARTITION_CANDIDATES;
+
+/// Non-wire discriminator obtained only from a complete matched contract tuple.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TeacherProfile {
+    V5,
+    V7,
+}
+impl TeacherProfile {
+    pub(crate) fn source_kind(self) -> &'static str {
+        match self {
+            Self::V5 => SOURCE_KIND,
+            Self::V7 => V7_SOURCE_KIND,
+        }
+    }
+    fn task(self) -> &'static str {
+        match self {
+            Self::V5 => TASK,
+            Self::V7 => V7_TASK,
+        }
+    }
+    pub(crate) fn input_contract(self) -> &'static str {
+        match self {
+            Self::V5 => INPUT_CONTRACT,
+            Self::V7 => V7_INPUT_CONTRACT,
+        }
+    }
+    fn provenance(self) -> replay::ReplaySource {
+        match self {
+            Self::V5 => replay::corn_first_v5_teacher_provenance(),
+            Self::V7 => replay::corn_first_v7_teacher_provenance(),
+        }
+    }
+    fn verify(self, record: &GameReplay) -> Result<tzolkin_core::GameState, String> {
+        match self {
+            Self::V5 => replay::verify_corn_first_v5_teacher_replay(record),
+            Self::V7 => replay::verify_corn_first_v7_teacher_replay(record),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -120,6 +162,18 @@ pub struct SemanticPlayingTeacherManifest {
     pub families: Vec<TeacherFamily>,
     pub games: Vec<TeacherGame>,
     pub strata: Vec<TeacherStratum>,
+}
+impl SemanticPlayingTeacherManifest {
+    pub(crate) fn profile(&self) -> Result<TeacherProfile, String> {
+        [TeacherProfile::V5, TeacherProfile::V7]
+            .into_iter()
+            .find(|p| {
+                self.source_kind == p.source_kind()
+                    && self.task == p.task()
+                    && self.input_contract == p.input_contract()
+            })
+            .ok_or_else(|| "Unsupported/corrupt native semantic teacher manifest".into())
+    }
 }
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -287,10 +341,10 @@ fn raw_pin(path: &Path, cap: u64) -> Result<(u64, String), String> {
     local(path)?;
     policy_dataset::file_digest(path, cap)
 }
-fn teacher_id() -> Result<String, String> {
+fn teacher_id(profile: TeacherProfile) -> Result<String, String> {
     content_id(
         b"tzolkin-semantic-playing-native-teacher-v1\0",
-        &replay::corn_first_v5_teacher_provenance(),
+        &profile.provenance(),
     )
 }
 fn fingerprint(m: &SemanticPlayingTeacherManifest) -> Result<String, String> {
@@ -350,13 +404,14 @@ fn sample(
     })
 }
 fn derive_game(
+    profile: TeacherProfile,
     index: usize,
     bytes: &[u8],
     record: &GameReplay,
     mut row: impl FnMut(ValidatedSemanticPlayingTeacherSample, &[u8]) -> Result<(), String>,
 ) -> Result<TeacherGame, String> {
     // Header/ordinary Core replay verification alone is intentionally insufficient.
-    let terminal = replay::verify_corn_first_v5_teacher_replay(record)?;
+    let terminal = profile.verify(record)?;
     let game_id = content_id(b"tzolkin-native-playing4-game-v1\0", record)?;
     let family_id = seed_family_id(record.header.seed);
     let mut state = create_game_with_options(
@@ -426,7 +481,10 @@ fn source(path: &Path, cap: u64) -> Result<(Vec<u8>, GameReplay), String> {
     let replay = policy_dataset::decode_strict_native_replay(&bytes)?;
     Ok((bytes, replay))
 }
-fn manifest(games: Vec<TeacherGame>) -> Result<SemanticPlayingTeacherManifest, String> {
+fn manifest(
+    profile: TeacherProfile,
+    games: Vec<TeacherGame>,
+) -> Result<SemanticPlayingTeacherManifest, String> {
     let mut counts = TeacherCounts::default();
     let mut stored_bytes = 0u64;
     let mut families = BTreeMap::new();
@@ -447,9 +505,9 @@ fn manifest(games: Vec<TeacherGame>) -> Result<SemanticPlayingTeacherManifest, S
     }
     let mut m = SemanticPlayingTeacherManifest {
         schema: DATASET_SCHEMA.into(),
-        source_kind: SOURCE_KIND.into(),
-        task: TASK.into(),
-        input_contract: INPUT_CONTRACT.into(),
+        source_kind: profile.source_kind().into(),
+        task: profile.task().into(),
+        input_contract: profile.input_contract().into(),
         feature_schema: SEMANTIC_PLAYING_FEATURE_SCHEMA,
         feature_count: FEATURE_COUNT,
         rules_version: replay::RULES_VERSION,
@@ -458,7 +516,7 @@ fn manifest(games: Vec<TeacherGame>) -> Result<SemanticPlayingTeacherManifest, S
         move_schema: MOVE_SCHEMA,
         observation_schema: OBSERVATION_SCHEMA,
         options: GameOptions::default(),
-        teacher_policy_id: teacher_id()?,
+        teacher_policy_id: teacher_id(profile)?,
         value_supervised: false,
         fingerprint: String::new(),
         stored_bytes,
@@ -516,7 +574,7 @@ pub(crate) fn validate_manifest(m: &SemanticPlayingTeacherManifest) -> Result<()
         }
     }
     // Rebuild all fixed contracts, aggregate counts, per-player strata and family roles.
-    if *m != manifest(m.games.clone())? {
+    if *m != manifest(m.profile()?, m.games.clone())? {
         return Err("Unsupported/corrupt native semantic teacher manifest".into());
     }
     let bytes = serde_json::to_vec(m).map_err(|e| e.to_string())?.len() as u64;
@@ -583,6 +641,7 @@ fn audit(
     m: &SemanticPlayingTeacherManifest,
     cache: bool,
 ) -> Result<Vec<ValidatedSemanticPlayingTeacherSample>, String> {
+    let profile = m.profile()?;
     let mut samples = if cache {
         Vec::with_capacity(m.counts.rows)
     } else {
@@ -598,7 +657,7 @@ fn audit(
             return Err("Teacher raw source/row pin mismatch".into());
         }
         let mut lines = rows.split_inclusive(|b| *b == b'\n');
-        let derived = derive_game(i, &bytes, &record, |sample, expected| {
+        let derived = derive_game(profile, i, &bytes, &record, |sample, expected| {
             let line = lines.next().ok_or("Missing Playing teacher row")?;
             match_row(line, &sample, expected)?;
             add_allocation(&mut allocation, &sample)?;
@@ -645,6 +704,20 @@ pub fn export_semantic_playing_teacher_files(
     paths: &[PathBuf],
     output: &Path,
 ) -> Result<SemanticPlayingTeacherManifest, String> {
+    export_files(TeacherProfile::V5, paths, output)
+}
+/// Explicit V7 sibling; the existing V5 exporter remains V5-only.
+pub fn export_semantic_playing_v7_teacher_files(
+    paths: &[PathBuf],
+    output: &Path,
+) -> Result<SemanticPlayingTeacherManifest, String> {
+    export_files(TeacherProfile::V7, paths, output)
+}
+fn export_files(
+    profile: TeacherProfile,
+    paths: &[PathBuf],
+    output: &Path,
+) -> Result<SemanticPlayingTeacherManifest, String> {
     local(output)?;
     if fs::symlink_metadata(output).is_ok() || paths.is_empty() || paths.len() > MAX_GAMES {
         return Err("Invalid teacher destination/source count".into());
@@ -659,7 +732,7 @@ pub fn export_semantic_playing_teacher_files(
             return Err("Duplicate teacher source path".into());
         }
         let (bytes, record) = source(path, MAX_STORED_BYTES - stored)?;
-        let game = derive_game(i, &bytes, &record, |s, _| {
+        let game = derive_game(profile, i, &bytes, &record, |s, _| {
             add_allocation(&mut allocation, &s)
         })?;
         stored = stored
@@ -669,7 +742,7 @@ pub fn export_semantic_playing_teacher_files(
             .ok_or("Teacher aggregate stored byte budget exceeded")?;
         games.push(game);
     }
-    let m = manifest(games)?;
+    let m = manifest(profile, games)?;
     validate_manifest(&m)?;
     fs::create_dir(output).map_err(|e| e.to_string())?;
     fs::create_dir(output.join("sources")).map_err(|e| e.to_string())?;
@@ -689,7 +762,7 @@ pub fn export_semantic_playing_teacher_files(
             .create_new(true)
             .open(output.join(&g.row_file))
             .map_err(|e| e.to_string())?;
-        let derived = derive_game(i, &bytes, &record, |_, line| {
+        let derived = derive_game(profile, i, &bytes, &record, |_, line| {
             file.write_all(line).map_err(|e| e.to_string())
         })?;
         file.sync_all().map_err(|e| e.to_string())?;
@@ -812,6 +885,18 @@ impl<'a> Iterator for SemanticPlayingTeacherIter<'a> {
 pub fn load_semantic_playing_teacher_dataset(
     directory: &Path,
 ) -> Result<ValidatedSemanticPlayingTeacherDataset, String> {
+    load_dataset(directory, TeacherProfile::V5)
+}
+/// Explicit V7 complete-source loader; it grants no V5 Prepared/owner admission.
+pub fn load_semantic_playing_v7_teacher_dataset(
+    directory: &Path,
+) -> Result<ValidatedSemanticPlayingTeacherDataset, String> {
+    load_dataset(directory, TeacherProfile::V7)
+}
+fn load_dataset(
+    directory: &Path,
+    expected: TeacherProfile,
+) -> Result<ValidatedSemanticPlayingTeacherDataset, String> {
     let bytes = read(
         &directory.join("manifest.json"),
         policy_dataset::MAX_MANIFEST_BYTES,
@@ -821,6 +906,9 @@ pub fn load_semantic_playing_teacher_dataset(
     // any source or row body is ingested. Canonical length alone is insufficient.
     stored_manifest_bytes(m.stored_bytes, bytes.len() as u64)?;
     validate_manifest(&m)?;
+    if m.profile()? != expected {
+        return Err("Teacher loader profile differs from complete dataset contract".into());
+    }
     namespace(directory, &m, true)?;
     let samples = audit(directory, &m, true)?;
     let dataset = ValidatedSemanticPlayingTeacherDataset {
@@ -838,6 +926,15 @@ pub(crate) fn training_cache_fixture(
     parent: &Path,
     examples: &[(Observation, LegalAction, usize)],
     bad_cache_split: Option<DatasetSplit>,
+) -> Result<ValidatedSemanticPlayingTeacherDataset, String> {
+    training_cache_fixture_for_profile(parent, examples, bad_cache_split, TeacherProfile::V5)
+}
+#[cfg(test)]
+pub(crate) fn training_cache_fixture_for_profile(
+    parent: &Path,
+    examples: &[(Observation, LegalAction, usize)],
+    bad_cache_split: Option<DatasetSplit>,
+    profile: TeacherProfile,
 ) -> Result<ValidatedSemanticPlayingTeacherDataset, String> {
     // Deliberately NOT a complete replay or a qualified source fixture. Only the
     // production numerical/cache transaction is exercised without full games.
@@ -901,7 +998,7 @@ pub(crate) fn training_cache_fixture(
             samples.push(row);
         }
     }
-    let m = manifest(games)?;
+    let m = manifest(profile, games)?;
     validate_manifest(&m)?;
     let bytes = serde_json::to_vec(&m).map_err(|e| e.to_string())?;
     fs::write(parent.join("manifest.json"), &bytes).map_err(|e| e.to_string())?;
@@ -1076,10 +1173,29 @@ pub(crate) fn fixture(parent: &Path) {
     fs::write(&source, serde_json::to_vec(&record).unwrap()).unwrap();
     let output = parent.join("native4-dataset");
     assert_eq!(
-        export_semantic_playing_teacher_files(&[source], &output).unwrap_err(),
+        export_semantic_playing_teacher_files(std::slice::from_ref(&source), &output).unwrap_err(),
         "Partial logs cannot be verified as complete games"
     );
     assert!(!output.exists());
+    let mut v7_record = record.clone();
+    v7_record.header.source = replay::corn_first_v7_teacher_provenance();
+    let v7_source = parent.join("partial-native4-v7.json");
+    fs::write(&v7_source, serde_json::to_vec(&v7_record).unwrap()).unwrap();
+    let v7_output = parent.join("native4-v7-dataset");
+    assert_eq!(
+        export_semantic_playing_v7_teacher_files(std::slice::from_ref(&v7_source), &v7_output)
+            .unwrap_err(),
+        "Partial logs cannot be verified as complete games"
+    );
+    assert_eq!(
+        export_semantic_playing_teacher_files(&[v7_source], &v7_output).unwrap_err(),
+        "Corn-first V5 teacher requires its dedicated replay source"
+    );
+    assert_eq!(
+        export_semantic_playing_v7_teacher_files(&[source], &v7_output).unwrap_err(),
+        "Corn-first V7 teacher requires its dedicated replay source"
+    );
+    assert!(!v7_output.exists());
     // These are untrusted declarations only; the typed loader still requires
     // full original replay verification. They exercise the production contract.
     let game = TeacherGame {
@@ -1101,8 +1217,20 @@ pub(crate) fn fixture(parent: &Path) {
             candidates: 1,
         },
     };
-    let m = manifest(vec![game.clone()]).unwrap();
+    let m = manifest(TeacherProfile::V5, vec![game.clone()]).unwrap();
     validate_manifest(&m).unwrap();
+    let m7 = manifest(TeacherProfile::V7, vec![game.clone()]).unwrap();
+    validate_manifest(&m7).unwrap();
+    assert_eq!(m7.profile().unwrap(), TeacherProfile::V7);
+    assert_eq!(m7.source_kind, V7_SOURCE_KIND);
+    assert_eq!(m7.task, V7_TASK);
+    assert_eq!(m7.input_contract, V7_INPUT_CONTRACT);
+    assert_ne!(m7.teacher_policy_id, m.teacher_policy_id);
+    assert_ne!(m7.fingerprint, m.fingerprint);
+    let mut mixed = m.clone();
+    mixed.source_kind = V7_SOURCE_KIND.into();
+    mixed.fingerprint = fingerprint(&mixed).unwrap();
+    assert!(validate_manifest(&mixed).is_err());
     for key in [
         "schema",
         "sourceKind",
@@ -1136,7 +1264,7 @@ pub(crate) fn fixture(parent: &Path) {
     assert!(validate_manifest(&bad).is_err());
     let mut big = game.clone();
     big.source_bytes = policy_dataset::MAX_SOURCE_BYTES;
-    assert!(manifest(vec![big; 4]).is_err());
+    assert!(manifest(TeacherProfile::V5, vec![big; 4]).is_err());
     let pretend = parent.join("declaration-only");
     fs::create_dir(&pretend).unwrap();
     fs::write(
@@ -1145,6 +1273,26 @@ pub(crate) fn fixture(parent: &Path) {
     )
     .unwrap();
     assert!(load_semantic_playing_teacher_dataset(&pretend).is_err());
+    assert!(
+        load_semantic_playing_v7_teacher_dataset(&pretend)
+            .err()
+            .unwrap()
+            .contains("loader profile differs")
+    );
+    let pretend7 = parent.join("v7-declaration-only");
+    fs::create_dir(&pretend7).unwrap();
+    fs::write(
+        pretend7.join("manifest.json"),
+        serde_json::to_vec(&m7).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        load_semantic_playing_teacher_dataset(&pretend7)
+            .err()
+            .unwrap()
+            .contains("loader profile differs")
+    );
+    assert!(load_semantic_playing_v7_teacher_dataset(&pretend7).is_err());
     assert!(policy_dataset::load_policy_dataset(&pretend).is_err());
     assert!(
         policy_dataset::load_resource_cycle_v5_semantic_setup_teacher_dataset(&pretend).is_err()
