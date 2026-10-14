@@ -434,7 +434,8 @@ pub(crate) fn file_digest(path: &Path, max: u64) -> Result<(u64, String), String
     let mut reader = regular_file(path, max)?.take(max + 1);
     let mut hash = Sha256::new();
     let mut bytes = 0u64;
-    let mut buffer = [0u8; 16 * 1024];
+    // Source checks stream whole files repeatedly; amortize native read calls.
+    let mut buffer = [0u8; 128 * 1024];
     loop {
         let read = reader.read(&mut buffer).map_err(|e| e.to_string())?;
         if read == 0 {
