@@ -128,7 +128,9 @@ pub struct PolicyDatasetManifest {
     pub strata: Vec<PolicyDatasetStratum>,
 }
 
-fn strict_options<'de, D: serde::Deserializer<'de>>(d: D) -> Result<GameOptions, D::Error> {
+pub(crate) fn strict_options<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<GameOptions, D::Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Options {
@@ -192,6 +194,15 @@ impl NativeReplay {
             verified_complete: self.verified_complete,
         }
     }
+}
+
+// Parsing only: the caller must use its own closed source and full replay verifier.
+pub(crate) fn decode_strict_native_replay(bytes: &[u8]) -> Result<GameReplay, String> {
+    let parsed: NativeReplay = serde_json::from_value(
+        crate::public_stochastic_record::unique_json(bytes, MAX_SOURCE_BYTES as usize)?,
+    )
+    .map_err(|e| format!("Invalid strict native replay: {e}"))?;
+    Ok(parsed.into_replay())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -306,13 +317,13 @@ impl ValidatedPolicySample {
 fn hex(hash: impl AsRef<[u8]>) -> String {
     hash.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
-fn digest_id(id: &str) -> bool {
+pub(crate) fn digest_id(id: &str) -> bool {
     id.len() == 64
         && id
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn content_id<T: Serialize>(domain: &[u8], value: &T) -> Result<String, String> {
+pub(crate) fn content_id<T: Serialize>(domain: &[u8], value: &T) -> Result<String, String> {
     struct Sink(Sha256);
     impl Write for Sink {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -351,7 +362,7 @@ fn fingerprint(m: &PolicyDatasetManifest) -> Result<String, String> {
         &serde_json::to_vec(&canonical).map_err(|e| e.to_string())?,
     ))
 }
-fn local_path(path: &Path) -> Result<(), String> {
+pub(crate) fn local_path(path: &Path) -> Result<(), String> {
     let text = path.to_string_lossy();
     if text.is_empty()
         || text.contains('\0')
@@ -408,7 +419,7 @@ fn regular_file(path: &Path, max: u64) -> Result<File, String> {
     }
     Ok(file)
 }
-fn read_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     regular_file(path, max)?
         .take(max + 1)
@@ -419,7 +430,7 @@ fn read_bytes(path: &Path, max: u64) -> Result<Vec<u8>, String> {
     }
     Ok(bytes)
 }
-fn file_digest(path: &Path, max: u64) -> Result<(u64, String), String> {
+pub(crate) fn file_digest(path: &Path, max: u64) -> Result<(u64, String), String> {
     let mut reader = regular_file(path, max)?.take(max + 1);
     let mut hash = Sha256::new();
     let mut bytes = 0u64;
@@ -658,7 +669,7 @@ fn strata(games: &[PolicyDatasetGame]) -> Vec<PolicyDatasetStratum> {
         )
         .collect()
 }
-fn publish_bytes(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn publish_bytes(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     let temp = directory.join(format!(".{name}.tmp"));
     let mut created = false;
     let result = (|| {
@@ -1513,6 +1524,9 @@ mod tests {
     #[test]
     fn historical_self_play_versions_do_not_extend_other_source_routes() {
         replay::corn_first_v5_teacher_fixture();
+        let parent = directory();
+        crate::semantic_playing_teacher_dataset::fixture(&parent);
+        fs::remove_dir_all(parent).unwrap();
         assert_eq!(
             incomplete_source_error(replay::corn_first_v5_teacher_provenance()),
             "Corn-first V5 Playing teacher has no legacy native dataset admission",

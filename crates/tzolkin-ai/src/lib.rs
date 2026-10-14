@@ -82,6 +82,7 @@ pub mod semantic_playing_rl_journal;
 pub mod semantic_playing_rl_pool;
 pub mod semantic_playing_rl_record;
 pub mod semantic_playing_rl_update;
+pub mod semantic_playing_teacher_dataset;
 pub mod setup_policy;
 pub mod state_mc_dataset;
 pub mod state_mc_training;
