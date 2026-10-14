@@ -317,6 +317,12 @@ impl LoadedInitialization {
             Self::Native(_) => Err("OriginalHuman4 requires a Human initialization".into()),
         }
     }
+    fn native(&self) -> Result<&PreparedSemanticPlayingTeacher, String> {
+        match self {
+            Self::Native(prepared) => Ok(prepared),
+            Self::Human(_) => Err("OriginalNativeTeacher requires a native initialization".into()),
+        }
+    }
 }
 impl LoadedInitializationRef<'_> {
     fn fresh_owner(self, seed: u64) -> Result<SemanticFreshOwner, String> {
@@ -708,6 +714,7 @@ fn read_only_output(w: &AuditWire, output: &Path) -> Result<PathBuf, String> {
 #[serde(rename_all = "camelCase")]
 enum EvaluationReference {
     OriginalHuman4,
+    OriginalNativeTeacher,
     ResourceCycleV5,
 }
 #[derive(Deserialize)]
@@ -831,6 +838,11 @@ pub fn evaluate_semantic_playing_journal(
     {
         return Err("OriginalHuman4 requires a Human initialization".into());
     }
+    if matches!(e.reference, EvaluationReference::OriginalNativeTeacher)
+        && w.original.initialization_kind.is_none()
+    {
+        return Err("OriginalNativeTeacher requires a native initialization".into());
+    }
     let output = read_only_output(w, output)?;
     reject_input_namespace(
         &output,
@@ -902,6 +914,11 @@ pub fn evaluate_semantic_playing_journal(
                     }
                     EvaluationReference::ResourceCycleV5 => {
                         semantic_snapshot::SemanticPlayingSnapshotReference::ResourceCycleV5
+                    }
+                    EvaluationReference::OriginalNativeTeacher => {
+                        semantic_snapshot::SemanticPlayingSnapshotReference::NativeTeacher(Box::new(
+                            prepared.native()?.arena_handle()?,
+                        ))
                     }
                 };
                     numeric::run_semantic_playing_snapshot_validation(
@@ -2019,6 +2036,20 @@ pub(super) fn control_fixture(
     .err()
     .unwrap();
     assert!(refused_reference.contains("OriginalHuman4 requires a Human initialization"));
+    let human_audit_path = root.join("human-native-reference-audit.json");
+    fs::write(&human_audit_path, serde_json::to_vec(&audit).unwrap()).unwrap();
+    let mut human_evaluation = evaluation.clone();
+    human_evaluation["auditControl"] = serde_json::to_value(pin(human_audit_path)).unwrap();
+    human_evaluation["reference"] = "originalNativeTeacher".into();
+    let output = root.join("human-native-reference-output");
+    let error =
+        evaluate_semantic_playing_journal(parse_evaluation(&human_evaluation).unwrap(), &output)
+            .err()
+            .unwrap();
+    assert!(error.contains("OriginalNativeTeacher requires a native initialization"));
+    assert!(!output.exists());
+    native_evaluation["reference"] = "originalNativeTeacher".into();
+    assert!(parse_evaluation(&native_evaluation).is_ok());
     let (_, config) = load_evaluation_config(&evaluation_spec.wire).unwrap();
     assert_eq!(config.external_exclusions.excluded_family_ids, vec![family]);
     evaluation_spec.wire.global_external.count = 2;
@@ -2185,6 +2216,65 @@ pub(super) fn control_fixture(
             .unwrap();
         }
         let o = tzolkin_core::observation::observe(&state, state.current_player).unwrap();
+        // Explicitly unqualified numerical fixture, not a successful native
+        // source load. Both runner checks refuse before any Arena game.
+        let native_directory = root.join("native-reference-cache");
+        let native =
+            PreparedSemanticPlayingTeacher::unqualified_rl_fixture(&native_directory, o.clone());
+        let reference = native.arena_handle().unwrap();
+        assert_eq!(
+            reference.identity().checkpoint_checksum,
+            native.rl_checkpoint().checksum,
+        );
+        assert_eq!(
+            reference.identity().source_kind,
+            crate::semantic_playing_teacher_dataset::SOURCE_KIND,
+        );
+        assert!(!reference.identity().source_authenticated);
+        let mut overlap_config = config.clone();
+        overlap_config.seeds = vec![native.rl_checkpoint().dataset.manifest.games[0].seed];
+        let error = journal
+            .with_evaluation_snapshot(|snapshot| {
+                crate::arena::numeric::run_semantic_playing_snapshot_validation(
+                    &overlap_config,
+                    crate::arena::semantic_snapshot::SemanticPlayingSnapshotArenaPolicy::new(
+                        snapshot,
+                    )?,
+                    crate::arena::semantic_snapshot::SemanticPlayingSnapshotReference::NativeTeacher(
+                        Box::new(reference),
+                    ),
+                    (0..config.players)
+                        .map(|_| {
+                            crate::arena::numeric::Opponent::ResourceCycle(
+                                crate::arena::resource_cycle::ResourceCycleConfig::v5(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .err()
+            .unwrap();
+        assert!(error.contains("rejects every retained teacher source family"));
+        let reference = native.arena_handle().unwrap();
+        let checkpoint = native_directory.with_extension("checkpoint.json");
+        let original_checkpoint = fs::read(&checkpoint).unwrap();
+        let mut changed_checkpoint = original_checkpoint.clone();
+        changed_checkpoint[0] ^= 1;
+        fs::write(&checkpoint, changed_checkpoint).unwrap();
+        let result = journal.with_evaluation_snapshot(|snapshot| {
+            crate::arena::numeric::run_semantic_playing_snapshot_validation(
+                &config,
+                crate::arena::semantic_snapshot::SemanticPlayingSnapshotArenaPolicy::new(snapshot)?,
+                crate::arena::semantic_snapshot::SemanticPlayingSnapshotReference::NativeTeacher(
+                    Box::new(reference),
+                ),
+                Vec::new(),
+            )
+        });
+        fs::write(&checkpoint, original_checkpoint).unwrap();
+        let error = result.err().unwrap();
+        assert!(error.contains("checkpoint changed after load"));
+        assert!(error.contains("Native teacher reference postcheck"));
         let arena_policy =
             crate::arena::semantic_snapshot::SemanticPlayingCheckpointArenaPolicy::new(
                 policy::LoadedSemanticPlayingDeployment::load(&raw).unwrap(),

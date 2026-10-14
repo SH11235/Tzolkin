@@ -2,6 +2,7 @@
 //! Snapshot custody and allocation closure grant no producer or strength claim.
 use super::conditional::SemanticPlayingConditionalPolicy;
 use super::numeric::{NumericArenaConfig, NumericArenaReport, NumericPolicy};
+use super::teacher::SemanticPlayingTeacherArenaPolicy;
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::public_model::ValueValidity;
 use crate::semantic_playing_rl_pool::FrozenSemanticSnapshot;
@@ -97,6 +98,9 @@ pub enum SemanticPlayingSnapshotReference<'a> {
     /// A genuine source-borrowed Human policy; only the concrete CLI can bind
     /// this to the candidate journal's exact original BC source.
     SemanticHuman(Box<SemanticPlayingConditionalPolicy<'a>>),
+    /// A genuine typed native teacher reference; the CLI binds the exact
+    /// original checkpoint and complete dataset used to restore its journal.
+    NativeTeacher(Box<SemanticPlayingTeacherArenaPolicy<'a>>),
 }
 
 #[derive(Debug, Serialize)]
