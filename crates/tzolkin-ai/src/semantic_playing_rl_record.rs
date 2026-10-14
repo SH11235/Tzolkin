@@ -15,6 +15,7 @@ use crate::semantic_playing_rl_collection::{
 use crate::semantic_playing_rl_pool::SemanticFrozenMixture;
 
 pub const RECORD_SCHEMA: &str = "tzolkin-semantic-playing-native-record-v1";
+const GUARDED_RECORD_SCHEMA: &str = "tzolkin-semantic-playing-guarded-proposal-record-v2";
 
 // The new wire stores numeric decision bits explicitly. This does not change
 // Decision's existing public JSON or any old record, scoring or digest path.
@@ -86,19 +87,45 @@ pub(crate) struct Header {
     sampling_version: String,
     target_contract: String,
     numerical_target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    composition: Option<crate::semantic_playing_rl_collection::SemanticCollectionComposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trade_guard: Option<tzolkin_inference::trade_guard::TradeGuardConfig>,
 }
 impl Header {
+    #[cfg(test)]
     pub(crate) fn new(
         parent: &str,
         member: usize,
         mixture: Option<&str>,
         config: &NativeStochasticConfig,
     ) -> Result<Self, String> {
+        Self::new_composed(
+            parent,
+            member,
+            mixture,
+            config,
+            crate::semantic_playing_rl_collection::SemanticCollectionComposition::LegacyV1,
+        )
+    }
+    pub(crate) fn new_composed(
+        parent: &str,
+        member: usize,
+        mixture: Option<&str>,
+        config: &NativeStochasticConfig,
+        composition: crate::semantic_playing_rl_collection::SemanticCollectionComposition,
+    ) -> Result<Self, String> {
+        use crate::semantic_playing_rl_collection::SemanticCollectionComposition::LegacyV1;
         if member >= 4 || config.players() != if member < 2 { 3 } else { 4 } {
             return Err("Semantic record member/player count differs".into());
         }
         Ok(Self {
-            schema: RECORD_SCHEMA.into(),
+            schema: if composition == LegacyV1 {
+                RECORD_SCHEMA
+            } else {
+                GUARDED_RECORD_SCHEMA
+            }
+            .into(),
             feature_schema: crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA,
             rules_version: crate::replay::RULES_VERSION,
             rules_baseline: crate::replay::RULES_BASELINE.into(),
@@ -107,10 +134,18 @@ impl Header {
             parent: parent.into(),
             member,
             mixture: mixture.map(str::to_owned),
-            sampling_version: crate::semantic_playing_rl_collection::SAMPLING_VERSION.into(),
+            sampling_version: composition.sampling_version().into(),
             target_contract: crate::semantic_playing_rl_collection::TARGET_CONTRACT.into(),
             numerical_target: crate::public_stochastic_native::numerical_target(),
+            composition: (composition != LegacyV1).then_some(composition),
+            trade_guard: (composition != LegacyV1)
+                .then(tzolkin_inference::trade_guard::TradeGuardConfig::default),
         })
+    }
+    pub(crate) fn composition(
+        &self,
+    ) -> crate::semantic_playing_rl_collection::SemanticCollectionComposition {
+        self.composition.unwrap_or_default()
     }
 }
 
