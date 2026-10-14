@@ -720,6 +720,7 @@ pub(crate) struct SemanticCollectionLedger<'a> {
     attempts: usize,
     spent: BTreeSet<String>,
     streams: BTreeSet<[u64; 5]>,
+    admitted: BTreeSet<String>,
     pins: Vec<ContentPin>,
     stopped: bool,
     failed: Option<SemanticPlayingCollectedGame>,
@@ -730,6 +731,9 @@ impl<'a> SemanticCollectionLedger<'a> {
         owner: &SemanticOwnerView<'_>,
         current: &SemanticPlayingCurrentIdentity,
     ) -> Result<FrozenSemanticSnapshot<'a>, String> {
+        if !self.admitted.contains(current.checksum()) {
+            return Err("Semantic snapshot current identity was not admitted".into());
+        }
         FrozenSemanticSnapshot::capture(
             owner,
             current,
@@ -756,6 +760,27 @@ impl<'a> SemanticCollectionLedger<'a> {
     pub(crate) fn recheck(&self, owner: &SemanticOwnerView<'_>) -> Result<(), String> {
         owner.with_checked_episode(self.external, &self.pins, || Ok(()))
     }
+    pub(crate) fn prepare_admitted(
+        &self,
+        current: &str,
+        next: &str,
+    ) -> Result<BTreeSet<String>, String> {
+        if !self.admitted.contains(current) || self.admitted.len() >= MAX_ATTEMPTS + 1 {
+            return Err("Semantic admitted identity chain differs or exceeds its bound".into());
+        }
+        let mut admitted = self.admitted.clone();
+        if !admitted.insert(next.into()) {
+            return Err("Semantic identity was already admitted".into());
+        }
+        Ok(admitted)
+    }
+    pub(crate) fn commit_admitted(&mut self, admitted: BTreeSet<String>) {
+        self.admitted = admitted;
+    }
+    #[cfg(test)]
+    pub(crate) fn admitted_checksums(&self) -> &BTreeSet<String> {
+        &self.admitted
+    }
     pub(crate) fn new(
         external: &'a ConditionalNativeExclusions,
         history: &'a DeclaredSamplingHistory,
@@ -774,6 +799,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             attempts: 0,
             spent: BTreeSet::new(),
             streams: BTreeSet::new(),
+            admitted: BTreeSet::new(),
             pins,
             stopped: false,
             failed: None,
@@ -883,7 +909,18 @@ impl<'a> SemanticCollectionLedger<'a> {
         }
         let result = (|| {
             pool.recheck()?;
-            let result = self.collect(owner, seeds, pool, limits, finish, create);
+            let result = (|| {
+                if let PoolRef::Mixture(mixture) = pool {
+                    mixture.require_receiver(
+                        owner,
+                        self.external,
+                        self.history,
+                        (&self.spent, &self.streams),
+                        &self.admitted,
+                    )?;
+                }
+                self.collect(owner, seeds, pool, limits, finish, create)
+            })();
             match (result, pool.recheck()) {
                 (Ok(value), Ok(())) => Ok(value),
                 (Err(error), Ok(())) => Err(error),

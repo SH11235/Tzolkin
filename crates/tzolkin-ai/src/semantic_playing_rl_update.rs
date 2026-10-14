@@ -183,10 +183,10 @@ impl<'a> SemanticPlayingJointSession<'a> {
         actor_config.validate()?;
         critic_config.check_callbacks(1)?;
         let state = SemanticTrainingState::from_fresh(owner)?;
-        let ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
+        let mut ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
         let root = state.root().checksum().to_string();
-        let identity = ledger.with_checked(&state.view(&root), |scope| {
-            make_identity(
+        let (identity, admitted) = ledger.with_checked(&state.view(&root), |scope| {
+            let identity = make_identity(
                 &root,
                 &root,
                 scope.actor().parameters(),
@@ -198,8 +198,11 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 "fresh-root",
                 &actor_config,
                 &critic_config,
-            )
+            )?;
+            let admitted = BTreeSet::from([identity.checksum().to_string()]);
+            Ok((identity, admitted))
         })?;
+        ledger.commit_admitted(admitted);
         Ok(Self {
             state,
             identity,
@@ -356,6 +359,9 @@ impl<'a> SemanticPlayingJointSession<'a> {
         }
         // No proposal can escape the source-postchecked collection continuation.
         // Final metadata is fallible and must precede the single state commit.
+        let admitted = self
+            .ledger
+            .prepare_admitted(self.identity.checksum(), proposal.identity.checksum())?;
         let mut report = proposal.report;
         report.attempts = self.ledger.attempts();
         report.next_ordinal = self.ledger.next_episode_ordinal();
@@ -402,6 +408,7 @@ impl<'a> SemanticPlayingJointSession<'a> {
             self.ledger.stop();
         }
         self.identity = proposal.identity;
+        self.ledger.commit_admitted(admitted);
         Ok(report)
     }
 }
@@ -759,32 +766,21 @@ pub(crate) fn joint_fixture() {
         ]
     };
     let mixture = SemanticFrozenMixture::new(&pool, slots()).unwrap();
-    // A receiving session cannot erase another snapshot's local burns or its
-    // declared source history by supplying different fresh families/history.
-    // Put the only snapshot in member3: even member0's tuples must be checked
-    // before creating the first game, not merely that snapshot's assigned seat.
+    // Each restriction is exercised before a game, attempt or new stream burn.
+    // The only snapshot is in member3, not the first member created.
     let lineage_pool =
         SemanticFrozenMixture::new(&pool, vec![SnapshotSlot::new(3, 3, &snapshot).unwrap()])
             .unwrap();
     let empty_history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin]).unwrap();
     let other_families = std::array::from_fn(|_| seeds.next().unwrap());
-    for first in [90, 100] {
-        let mut other = SemanticPlayingJointSession::from_fresh(
-            SemanticPlayingRlOwner::from_prepared(&prepared, 12).unwrap(),
-            &external,
-            &empty_history,
-            SamplingSeed::new(17),
-            first,
-            0,
-            OneStepConfig::default(),
-            ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
-        )
-        .unwrap();
+    let reject = |mut other: SemanticPlayingJointSession<'_>,
+                  mixture: &SemanticFrozenMixture<'_>,
+                  expected: &str| {
         let entered = Cell::new(false);
         let result = other.ledger.collect_mixture_fixture_using(
             &other.state.view(other.identity.checksum()),
             other_families,
-            &lineage_pool,
+            mixture,
             limits,
             |_, _| Ok(()),
             |_| {
@@ -792,10 +788,7 @@ pub(crate) fn joint_fixture() {
                 Err("Lineage refusal must precede game creation".into())
             },
         );
-        assert_eq!(
-            result.unwrap_err(),
-            "Semantic sampling stream overlaps frozen opponent lineage"
-        );
+        assert_eq!(result.unwrap_err(), expected);
         assert!(!entered.get());
         assert_eq!(
             (
@@ -803,9 +796,75 @@ pub(crate) fn joint_fixture() {
                 other.next_episode_ordinal(),
                 other.consumed_actor_streams()
             ),
-            (0, first, 0)
+            (0, 108, 0)
         );
+    };
+    for (critic_seed, declaration, expected) in [
+        (12, &history, "Semantic snapshot has a foreign fresh root"),
+        (
+            11,
+            &empty_history,
+            "Semantic snapshot source declaration differs",
+        ),
+        (
+            11,
+            &history,
+            "Semantic snapshot prior burns are not retained",
+        ),
+    ] {
+        let other = SemanticPlayingJointSession::from_fresh(
+            SemanticPlayingRlOwner::from_prepared(&prepared, critic_seed).unwrap(),
+            &external,
+            declaration,
+            SamplingSeed::new(17),
+            108,
+            0,
+            OneStepConfig::default(),
+            ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+        )
+        .unwrap();
+        reject(other, &lineage_pool, expected);
     }
+    // Same root, source declarations and empty burn sets are insufficient:
+    // another real session's different configuration makes a nonancestor ID.
+    let fork = SemanticPlayingJointSession::from_fresh(
+        SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap(),
+        &external,
+        &history,
+        SamplingSeed::new(17),
+        108,
+        0,
+        OneStepConfig::new(0.0002, 0.01, OneStepConfig::default().max_candidate_rows()).unwrap(),
+        ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+    )
+    .unwrap();
+    let fork_snapshot = fork.freeze_snapshot().unwrap();
+    let fork_pool = SemanticFrozenMixture::new(
+        &pool,
+        vec![SnapshotSlot::new(3, 3, &fork_snapshot).unwrap()],
+    )
+    .unwrap();
+    let other = SemanticPlayingJointSession::from_fresh(
+        SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap(),
+        &external,
+        &history,
+        SamplingSeed::new(17),
+        108,
+        0,
+        OneStepConfig::default(),
+        ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        fork_snapshot.identity().unwrap().root_checksum(),
+        other.identity().unwrap().root_checksum()
+    );
+    assert!(fork_snapshot.consumed_families().is_empty());
+    reject(
+        other,
+        &fork_pool,
+        "Semantic snapshot is not an admitted ancestor",
+    );
     assert!(
         SemanticFrozenMixture::new(&pool, vec![SnapshotSlot::new(0, 0, &snapshot).unwrap()])
             .is_err()
@@ -832,60 +891,86 @@ pub(crate) fn joint_fixture() {
             ConditionalFrozenPool::from_json(&serde_json::to_vec(&wire).unwrap()).unwrap();
         assert!(SemanticFrozenMixture::new(&forbidden, slots()).is_err());
     }
-    let before_mixed = session.identity().unwrap().checksum().to_string();
-    let proposal = session
-        .ledger
-        .collect_mixture_fixture_using(
-            &session.state.view(&before_mixed),
-            std::array::from_fn(|_| seeds.next().unwrap()),
-            &mixture,
-            limits,
-            |scope, cohort| {
-                crate::semantic_playing_rl_collection::mixed_trace_fixture(
-                    scope,
-                    &mixture,
-                    cohort.episodes()[0].config(),
-                );
-                assert_eq!(cohort.mixture_checksum(), Some(mixture.checksum()));
-                assert!(
-                    cohort
-                        .episodes()
-                        .iter()
-                        .all(|e| e.opponent_playing_samples() > 0)
-                );
-                prepare(
-                    scope,
-                    &session.identity,
-                    &cohort,
-                    &session.actor_config,
-                    &session.critic_config,
-                    3,
-                )
-            },
-            |config| {
-                let mut state = crate::conditional_human_rl_update::tests::terminal_start(
-                    config.players(),
-                    config.environment_seed(),
-                );
-                state.turn.mode = tzolkin_core::TurnMode::None;
-                state.turn.count = 0;
-                Ok(state)
-            },
+    for update in 3..=4 {
+        // The second mixed update uses the actual re-frozen first mixed result.
+        let current_snapshot = session.freeze_snapshot().unwrap();
+        let active_mixture = SemanticFrozenMixture::new(
+            &pool,
+            vec![
+                SnapshotSlot::new(0, 1, &current_snapshot).unwrap(),
+                SnapshotSlot::new(1, 2, &current_snapshot).unwrap(),
+                SnapshotSlot::new(2, 1, &current_snapshot).unwrap(),
+                SnapshotSlot::new(3, 3, &current_snapshot).unwrap(),
+            ],
         )
         .unwrap();
-    let report = session.admit_with_pool(proposal, Some(&mixture)).unwrap();
-    assert!(report.updated() && report.opponent_playing_samples() > 0);
-    assert!(report.total_sampled_candidate_rows() > report.counts()[1]);
-    assert_eq!(
-        report.actor_draws().iter().flatten().sum::<u64>(),
-        report.counts()[0] as u64 + report.opponent_playing_samples() as u64
-    );
-    credit += report.counts()[0] as u64;
-    assert_eq!(
-        session.identity().unwrap().credited_playing_decisions(),
-        credit
-    );
-    assert_eq!(session.identity().unwrap().completed_updates(), 3);
+        let before_mixed = session.identity().unwrap().checksum().to_string();
+        let proposal = session
+            .ledger
+            .collect_mixture_fixture_using(
+                &session.state.view(&before_mixed),
+                std::array::from_fn(|_| seeds.next().unwrap()),
+                &active_mixture,
+                limits,
+                |scope, cohort| {
+                    crate::semantic_playing_rl_collection::mixed_trace_fixture(
+                        scope,
+                        &active_mixture,
+                        cohort.episodes()[0].config(),
+                    );
+                    assert_eq!(cohort.mixture_checksum(), Some(active_mixture.checksum()));
+                    assert!(
+                        cohort
+                            .episodes()
+                            .iter()
+                            .all(|e| e.opponent_playing_samples() > 0)
+                    );
+                    prepare(
+                        scope,
+                        &session.identity,
+                        &cohort,
+                        &session.actor_config,
+                        &session.critic_config,
+                        update,
+                    )
+                },
+                |config| {
+                    let mut state = crate::conditional_human_rl_update::tests::terminal_start(
+                        config.players(),
+                        config.environment_seed(),
+                    );
+                    state.turn.mode = tzolkin_core::TurnMode::None;
+                    state.turn.count = 0;
+                    Ok(state)
+                },
+            )
+            .unwrap();
+        let report = session
+            .admit_with_pool(proposal, Some(&active_mixture))
+            .unwrap();
+        assert!(report.updated() && report.opponent_playing_samples() > 0);
+        assert!(report.total_sampled_candidate_rows() > report.counts()[1]);
+        assert_eq!(
+            report.actor_draws().iter().flatten().sum::<u64>(),
+            report.counts()[0] as u64 + report.opponent_playing_samples() as u64
+        );
+        credit += report.counts()[0] as u64;
+        assert_eq!(
+            session.identity().unwrap().credited_playing_decisions(),
+            credit
+        );
+        assert_eq!(
+            session.identity().unwrap().completed_updates(),
+            update as u64
+        );
+        assert!(
+            session
+                .ledger
+                .admitted_checksums()
+                .contains(session.identity().unwrap().checksum())
+        );
+        assert_eq!(session.ledger.admitted_checksums().len(), update + 1);
+    }
     assert_eq!(snapshot.identity().unwrap().checksum(), frozen_identity);
     assert_eq!(snapshot.identity().unwrap().actor_checksum(), frozen_actor);
     assert_ne!(session.identity().unwrap().actor_checksum(), frozen_actor);
@@ -900,6 +985,7 @@ pub(crate) fn joint_fixture() {
     let before = session.identity.clone();
     let actor = session.state.actor_parameters().to_vec();
     let critic = session.state.critic_parameters().to_vec();
+    let admitted = session.ledger.admitted_checksums().clone();
     let checkpoint_path = prepared.loaded_semantic_playing_sources().unwrap()[0]
         .path
         .clone();
@@ -917,7 +1003,7 @@ pub(crate) fn joint_fixture() {
                 &cohort,
                 &session.actor_config,
                 &session.critic_config,
-                4,
+                5,
             )?;
             entered.set(true);
             fs::write(&checkpoint_path, [checkpoint.as_slice(), b" "].concat()).unwrap();
@@ -935,6 +1021,7 @@ pub(crate) fn joint_fixture() {
     assert_eq!(session.identity().unwrap().checksum(), before.checksum());
     assert_eq!(session.state.actor_parameters(), actor);
     assert_eq!(session.state.critic_parameters(), critic);
+    assert_eq!(session.ledger.admitted_checksums(), &admitted);
     assert!(session.stopped());
     assert_eq!(
         (
@@ -942,7 +1029,7 @@ pub(crate) fn joint_fixture() {
             session.next_episode_ordinal(),
             session.consumed_actor_streams()
         ),
-        (4, 116, 56)
+        (5, 120, 70)
     );
     let after_failure = session.freeze_snapshot().unwrap();
     assert_eq!(
@@ -960,7 +1047,7 @@ pub(crate) fn joint_fixture() {
         after_failure.identity().unwrap().capture_ledger_checksum(),
         before_failure_capture
     );
-    assert_eq!(after_failure.consumed_families().len(), 16);
+    assert_eq!(after_failure.consumed_families().len(), 20);
 }
 
 /// Two one-decision synthetic original records exercise the ACTUAL schema-4

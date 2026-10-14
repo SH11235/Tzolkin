@@ -161,6 +161,7 @@ impl SemanticPlayingRlOwner {
             actor: &self.actor,
             critic: &self.critic,
             parent: self.identity.checksum(),
+            root: self.identity.checksum(),
         }
     }
 
@@ -290,6 +291,7 @@ impl SemanticTrainingState {
             actor: &self.actor,
             critic: &self.critic,
             parent,
+            root: self.root.checksum(),
         }
     }
     /// All proposal validation and every-outcome source checks precede this move.
@@ -305,8 +307,12 @@ pub(crate) struct SemanticOwnerView<'a> {
     actor: &'a PublicPolicyModel,
     critic: &'a [f32],
     parent: &'a str,
+    root: &'a str,
 }
 impl SemanticOwnerView<'_> {
+    pub(crate) fn root_checksum(&self) -> &str {
+        self.root
+    }
     pub(crate) fn origin_custody(&self) -> SemanticOriginCustody {
         SemanticOriginCustody {
             checksum: self.origin.checksum.clone(),

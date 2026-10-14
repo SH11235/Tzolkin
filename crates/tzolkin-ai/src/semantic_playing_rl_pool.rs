@@ -23,6 +23,17 @@ use crate::semantic_playing_rl_update::SemanticPlayingCurrentIdentity;
 pub const MIXTURE_VERSION: &str = "semantic-playing-fixed-snapshot-corn-first-pool-v1";
 pub const OPPONENT_SAMPLING_VERSION: &str = "semantic-playing-frozen-opponent-tick53-v1";
 
+fn source_binding(
+    origin: &SemanticOriginCustody,
+    external: &ConditionalNativeExclusions,
+    history: &DeclaredSamplingHistory,
+) -> Result<String, String> {
+    hash(
+        b"semantic-frozen-source-closure-v1\0",
+        &(origin.binding()?, external.descriptor(), history.checksum()),
+    )
+}
+
 /// The weight identity and allocation capture identity are deliberately separate.
 #[derive(Debug)]
 pub struct FrozenSemanticSnapshotIdentity {
@@ -111,10 +122,7 @@ impl<'a> FrozenSemanticSnapshot<'a> {
                 .keys()
                 .map(|table| crate::human_initial_wealth::table_family_id(table))
                 .collect::<Result<BTreeSet<_>, _>>()?;
-            let sources = hash(
-                b"semantic-frozen-source-closure-v1\0",
-                &(origin.binding()?, external.descriptor(), history.checksum()),
-            )?;
+            let sources = source_binding(&origin, external, history)?;
             let capture = hash(
                 b"semantic-frozen-allocation-capture-v1\0",
                 &(
@@ -246,7 +254,9 @@ impl<'a> SnapshotSlot<'a> {
 }
 
 /// This opt-in route uses common CornFirst Setup and procedural-only legacy
-/// Playing slots. The legacy pool's wire and existing methods are unchanged.
+/// Playing slots. Collection admits only past snapshots of the same sealed
+/// learning chain, with identical source declarations and already retained burns.
+/// The legacy pool's wire and existing methods are unchanged.
 pub struct SemanticFrozenMixture<'a> {
     legacy: &'a ConditionalFrozenPool,
     slots: Vec<SnapshotSlot<'a>>,
@@ -293,6 +303,32 @@ impl<'a> SemanticFrozenMixture<'a> {
     }
     pub fn checksum(&self) -> &str {
         &self.binding
+    }
+    pub(crate) fn require_receiver(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        external: &ConditionalNativeExclusions,
+        history: &DeclaredSamplingHistory,
+        burns: (&BTreeSet<String>, &BTreeSet<[u64; 5]>),
+        admitted: &BTreeSet<String>,
+    ) -> Result<(), String> {
+        let sources = source_binding(&owner.origin_custody(), external, history)?;
+        for slot in &self.slots {
+            let snapshot = slot.snapshot;
+            if snapshot.identity.root != owner.root_checksum() {
+                return Err("Semantic snapshot has a foreign fresh root".into());
+            }
+            if snapshot.identity.sources != sources {
+                return Err("Semantic snapshot source declaration differs".into());
+            }
+            if !snapshot.families.is_subset(burns.0) || !snapshot.streams.is_subset(burns.1) {
+                return Err("Semantic snapshot prior burns are not retained".into());
+            }
+            if !admitted.contains(&snapshot.identity.current) {
+                return Err("Semantic snapshot is not an admitted ancestor".into());
+            }
+        }
+        Ok(())
     }
     pub(crate) fn recheck(&self) -> Result<(), String> {
         // Different weight snapshots often retain identical source files.
