@@ -1,7 +1,8 @@
-//! Single-writer semantic-4 durability, not cold restore or process-close authority.
+//! Single-writer semantic-4 durability and source-owned cold reconstruction.
 //! Only a fresh loaded owner enters. Saved descriptors/records never construct
 //! an owner, snapshot or actor step. Library Closed permits warm continuation;
-//! an external observed process close is a separate, future restore boundary.
+//! cold reconstruction additionally requires a pinned external close declaration.
+//! That declaration is evidence supplied by the caller, not OS authentication.
 //! Warm checks cover output membership/lengths, not historical payload bytes:
 //! only the new destination is read back by the shared publisher. Historical
 //! outputs are never warm learning inputs. Cold restore must hash and replay.
@@ -11,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::conditional_human_rl_update::ConditionalFrozenPool;
@@ -31,6 +32,12 @@ use crate::semantic_playing_rl_update::{
 };
 
 pub const JOURNAL_SCHEMA: &str = "tzolkin-semantic-playing-joint-journal-v1";
+#[path = "semantic_playing_rl_restore.rs"]
+mod restore;
+pub use restore::{
+    CLOSE_DECLARATION_SCHEMA, PROCESS_CLOSE_SCHEMA, SemanticJournalRestoration,
+    restore_observed_closed,
+};
 const META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 640;
 
@@ -114,8 +121,8 @@ pub struct SemanticJournalReturnedClose {
     actual_process_close_verified: bool,
     historical_archive_bytes_verified: bool,
 }
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Pin {
     name: String,
     bytes: usize,
@@ -147,15 +154,15 @@ struct PublishError {
     error: String,
     published: bool,
 }
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StoredRecord {
     stored: Pin,
     raw_bytes: usize,
     raw_sha256: String,
 }
 
-/// No Deserialize, parameter import/export, caller predictor or resume method.
+/// No Deserialize, parameter import/export or caller predictor.
 pub struct SemanticPlayingJournal<'a> {
     directory: PathBuf,
     session: SemanticPlayingJointSession<'a>,
@@ -321,6 +328,9 @@ impl<'a> SemanticPlayingJournal<'a> {
     }
     fn preflight(&self) -> Result<(), String> {
         self.require_closed()?;
+        self.check_attempt_capacity()
+    }
+    fn check_attempt_capacity(&self) -> Result<(), String> {
         if self.session.attempts() >= self.budget.max_attempts {
             return Err("Semantic journal attempt cap".into());
         }
@@ -688,9 +698,9 @@ pub(crate) fn journal_fixture(
     use crate::public_policy_update::OneStepConfig;
     use crate::public_stochastic::SamplingSeed;
     use crate::semantic_playing_rl_pool::SnapshotSlot;
-    let make = || {
+    let make_with_seed = |critic_seed| {
         SemanticPlayingJointSession::from_fresh(
-            SemanticPlayingRlOwner::from_prepared(prepared, 11).unwrap(),
+            SemanticPlayingRlOwner::from_prepared(prepared, critic_seed).unwrap(),
             external,
             history,
             SamplingSeed::new(17),
@@ -701,6 +711,7 @@ pub(crate) fn journal_fixture(
         )
         .unwrap()
     };
+    let make = || make_with_seed(11);
     let budget = SemanticJournalBudget::new(3, 1 << 30, 1 << 30, 512 << 20, 2 << 30).unwrap();
     let seeds: [u32; 4] = (400..500)
         .filter(|s| split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Train)
@@ -756,12 +767,99 @@ pub(crate) fn journal_fixture(
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-    journal
+    let mixed_close = journal
         .update_using(next, PoolRef::Mixture(&mixture), create)
         .unwrap();
     assert_eq!(journal.status().current.completed_updates(), 2);
     assert_eq!(journal.status().spent_actor_streams, 28);
     assert!(journal.status().current.credited_playing_decisions() > credit);
+    let final_capture = journal.freeze_snapshot().unwrap();
+    // Synthetic external evidence tests the closed schema, not an actual OS
+    // observation. No serialized declaration upgrades authentication flags.
+    let save = |name: &str, value: &Value| {
+        let raw = bounded(value).unwrap();
+        let path = root.join(name);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, &raw).unwrap();
+        Pin::new(name, &raw).absolute(root)
+    };
+    let declaration = |name: &str, journal: &SemanticPlayingJournal<'_>, exit_code: i32| {
+        let returned = save(
+            &format!("{name}-returned.json"),
+            &serde_json::to_value(&mixed_close).unwrap(),
+        );
+        let process = save(
+            &format!("{name}-process.json"),
+            &json!({
+            "schema":PROCESS_CLOSE_SCHEMA,"actualClose":true,"pid":1,"exitCode":exit_code,
+            "signal":null,"stdoutEof":true,"stderrEof":true,"allPostchecksPassed":true,
+            "observedHead":journal.head(),"returnedClose":returned}),
+        );
+        save(
+            &format!("{name}-declaration.json"),
+            &json!({
+                "schema":CLOSE_DECLARATION_SCHEMA,"observedHead":journal.head(),
+                "processClose":process,"returnedClose":returned,"completeConsumptionDeclared":true,
+                "consumption":journal.session.capture_ledger(),"status":journal.status(),
+                "inventory":journal.members.values().map(|p|p.absolute(&journal.directory)).collect::<Vec<_>>()
+            }),
+        )
+    };
+    let declared = declaration("closed", &journal, 0);
+    let restored = restore::restore_using(
+        &journal.directory,
+        &journal.head(),
+        &declared,
+        make(),
+        &[pool],
+        create,
+    )
+    .unwrap();
+    let (restored, captures) = restored.into_journal_and_snapshots();
+    assert_eq!(
+        serde_json::to_value(restored.status()).unwrap(),
+        serde_json::to_value(journal.status()).unwrap()
+    );
+    assert_eq!(
+        restored.session.capture_ledger(),
+        journal.session.capture_ledger()
+    );
+    assert_eq!(captures.len(), 2);
+    assert_eq!(
+        captures[0].journal_identity().unwrap(),
+        snapshot.journal_identity().unwrap()
+    );
+    assert_eq!(
+        captures[1].journal_identity().unwrap(),
+        final_capture.journal_identity().unwrap()
+    );
+    assert!(
+        restore::restore_using(
+            &journal.directory,
+            &journal.head(),
+            &declared,
+            make_with_seed(12),
+            &[pool],
+            create
+        )
+        .is_err()
+    );
+    let failed_close = declaration("failed-close", &journal, 1);
+    assert!(
+        restore::restore_using(
+            &journal.directory,
+            &journal.head(),
+            &failed_close,
+            make(),
+            &[pool],
+            create
+        )
+        .is_err()
+    );
     journal.verify_archive_bytes().unwrap();
     let report_path = root.join("journal/report-0001.json");
     let original_report = fs::read(&report_path).unwrap();
@@ -770,6 +868,17 @@ pub(crate) fn journal_fixture(
     fs::write(&report_path, &corrupt).unwrap();
     journal.verify_files().unwrap(); // Warm outputs are not learning inputs.
     assert!(journal.verify_archive_bytes().is_err());
+    assert!(
+        restore::restore_using(
+            &journal.directory,
+            &journal.head(),
+            &declared,
+            make(),
+            &[pool],
+            create
+        )
+        .is_err()
+    );
     fs::write(&report_path, [original_report.as_slice(), b" "].concat()).unwrap();
     assert!(journal.verify_files().is_err());
     fs::write(&report_path, &original_report).unwrap();
@@ -778,6 +887,45 @@ pub(crate) fn journal_fixture(
     assert!(journal.verify_files().is_err());
     fs::remove_file(extra).unwrap();
     journal.verify_archive_bytes().unwrap();
+    // A valid old Closed does not rule out a later attempted Reserve. Even a
+    // fully declared/pinned later tip cannot continue without Resolve+Closed.
+    let later: [u32; 4] = (600..700)
+        .filter(|s| split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Train)
+        .take(4)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let plan = journal
+        .session
+        .plan_reserved(later, PoolRef::Legacy(pool, None), limits)
+        .unwrap();
+    let raw = entry(
+        journal.sequence + 1,
+        Some(&journal.head),
+        &json!({
+        "kind":"reserve","plan":plan.description(),"fixedPool":pool.procedural_binding().unwrap()}),
+    )
+    .unwrap();
+    let name = format!("entry-{:04}.json", journal.sequence + 1);
+    let pin = Pin::new(&name, &raw);
+    fs::write(journal.directory.join(&name), raw).unwrap();
+    let old_head = std::mem::replace(&mut journal.head, pin.clone());
+    journal.members.insert(name.clone(), pin);
+    let pending = declaration("pending", &journal, 0);
+    assert!(
+        restore::restore_using(
+            &journal.directory,
+            &journal.head(),
+            &pending,
+            make(),
+            &[pool],
+            create
+        )
+        .is_err()
+    );
+    journal.head = old_head;
+    journal.members.remove(&name);
+    fs::remove_file(journal.directory.join(name)).unwrap();
     // Exact destination despite publisher Err: Reserve burns but enters no game;
     // Resolve admits the prepared update, retains credit and cannot claim close.
     for label in ["reserve", "resolve"] {

@@ -469,14 +469,42 @@ impl<'a> SemanticPlayingJointSession<'a> {
             &crate::public_stochastic_native::NativeStochasticConfig,
         ) -> Result<tzolkin_core::GameState, String>,
     ) -> Result<PreparedSemanticAdmission, String> {
+        self.stage_records_using(batch, pool, None, create)
+    }
+    pub(crate) fn stage_saved_records_using(
+        &mut self,
+        batch: &SemanticReservation,
+        pool: PoolRef<'_>,
+        saved: &[Vec<u8>; 4],
+        create: impl Fn(
+            &crate::public_stochastic_native::NativeStochasticConfig,
+        ) -> Result<tzolkin_core::GameState, String>,
+    ) -> Result<PreparedSemanticAdmission, String> {
+        self.stage_records_using(batch, pool, Some(saved), create)
+    }
+    fn stage_records_using(
+        &mut self,
+        batch: &SemanticReservation,
+        pool: PoolRef<'_>,
+        saved: Option<&[Vec<u8>; 4]>,
+        create: impl Fn(
+            &crate::public_stochastic_native::NativeStochasticConfig,
+        ) -> Result<tzolkin_core::GameState, String>,
+    ) -> Result<PreparedSemanticAdmission, String> {
         let attempt = self.ledger.attempts();
         let result = (|| {
-            let proposal = self.ledger.collect_reserved(
+            let proposal = self.ledger.collect_reserved_records(
                 &self.state.view(self.identity.checksum()),
                 batch,
                 pool,
+                saved,
                 |scope, cohort| {
                     let records = crate::semantic_playing_rl_record::encode_records(&cohort)?;
+                    if saved.is_some_and(|saved| *saved != records) {
+                        return Err(
+                            "Semantic restored records differ after fresh source audit".into()
+                        );
+                    }
                     let mut proposal = prepare(
                         scope,
                         &self.identity,
