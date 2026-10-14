@@ -590,7 +590,7 @@ fn stored_manifest_bytes(stored: u64, manifest_bytes: u64) -> Result<(), String>
     }
     Ok(())
 }
-fn namespace(
+pub(crate) fn namespace(
     directory: &Path,
     m: &SemanticPlayingTeacherManifest,
     complete: bool,

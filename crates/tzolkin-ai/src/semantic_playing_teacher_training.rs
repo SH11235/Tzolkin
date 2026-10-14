@@ -92,6 +92,31 @@ impl NativeTeacherDatasetIdentity {
                 (r + g.counts.rows, c + g.counts.candidates)
             })
     }
+    fn recheck_export_source(&self, directory: &Path) -> Result<(), String> {
+        self.validate()?;
+        data::namespace(directory, &self.manifest, true)?;
+        let manifest = data::read(
+            &directory.join("manifest.json"),
+            crate::policy_dataset::MAX_MANIFEST_BYTES,
+        )?;
+        if manifest.len() as u64 != self.raw_manifest_bytes
+            || digest(&manifest) != self.raw_manifest_sha256
+        {
+            return Err("BC export manifest pin changed".into());
+        }
+        for game in &self.manifest.games {
+            for (file, bytes, sha256) in [
+                (&game.source_file, game.source_bytes, &game.source_sha256),
+                (&game.row_file, game.row_bytes, &game.row_sha256),
+            ] {
+                let raw = data::read(&directory.join(file), bytes)?;
+                if raw.len() as u64 != bytes || digest(&raw) != *sha256 {
+                    return Err("BC export source/row pin changed".into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 /// Own wire and parameter key; no constructor/conversion from old or Human models.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -804,6 +829,201 @@ pub fn train_dataset_with_fit_diagnostics(
     Ok((outcome, report))
 }
 
+/// Offline numeric export from a typed V7 BC checkpoint and its complete source.
+/// This is imitation lineage, not an RL close, source signature or App adoption.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeV7BcPolicyExport {
+    schema: String,
+    complete: bool,
+    checkpoint_sha256: String,
+    checkpoint_checksum: String,
+    model_checksum: String,
+    raw_manifest_sha256: String,
+    dataset_fingerprint: String,
+    teacher_policy_id: String,
+    completed_epochs: usize,
+    artifact_file: String,
+    artifact_bytes: usize,
+    artifact_sha256: String,
+    deployment_checksum: String,
+    actor_checksum: String,
+    source_authenticated: bool,
+    source_qualified: bool,
+    verified_native_policy: bool,
+    strength_measured: bool,
+    training_performed: bool,
+    adoption_granted: bool,
+}
+
+fn native_v7_bc_policy_bytes(
+    checkpoint: &SemanticPlayingTeacherCheckpoint,
+    checkpoint_sha256: &str,
+) -> Result<(Vec<u8>, NativeV7BcPolicyExport), String> {
+    use tzolkin_inference::{deployment, semantic_playing_deployment as policy};
+    checkpoint.validate()?;
+    if checkpoint.model.profile()? != data::TeacherProfile::V7
+        || !crate::policy_dataset::digest_id(checkpoint_sha256)
+    {
+        return Err("Native V7 BC export requires its exact V7 checkpoint".into());
+    }
+    let mut actor = Sha256::new();
+    actor.update(policy::NATIVE_V7_BC_ACTOR_DOMAIN);
+    for value in checkpoint.model.parameters() {
+        actor.update(value.to_bits().to_le_bytes());
+    }
+    let actor_checksum = format!("{:x}", actor.finalize());
+    let mut wire = serde_json::json!({
+        "schema":policy::NATIVE_V7_BC_SCHEMA,
+        "contract":{
+            "modelVersion":deployment::MODEL_VERSION,
+            "inputContract":policy::NATIVE_V7_BC_INPUT_CONTRACT,
+            "featureSchema":SEMANTIC_PLAYING_FEATURE_SCHEMA,"featureCount":FEATURE_COUNT,
+            "hiddenCount":tzolkin_inference::policy::HIDDEN,"parameterCount":PARAMETER_COUNT,
+            "rulesVersion":deployment::RULES_VERSION,"rulesBaseline":deployment::RULES_BASELINE,
+            "observationSchema":tzolkin_core::observation::OBSERVATION_SCHEMA,
+            "moveSchema":tzolkin_core::observation::MOVE_SCHEMA,
+            "catalogHash":deployment::catalog_hash(),"backend":"scalar",
+            "numericContract":deployment::NUMERIC_CONTRACT,"scope":policy::SCOPE,
+            "valueValidity":deployment::VALUE_VALIDITY},
+        "identity":{
+            "sourceRole":policy::NATIVE_V7_BC_SOURCE_ROLE,"task":policy::NATIVE_V7_BC_TASK,
+            "sourceKind":data::V7_SOURCE_KIND,"sourceTask":V7_TASK,
+            "sourceInputContract":data::V7_INPUT_CONTRACT,"sourceModelVersion":V7_MODEL_VERSION,
+            "sourceTrainingVersion":TRAINING_VERSION,
+            "checkpointSha256":checkpoint_sha256,"checkpointChecksum":checkpoint.checksum,
+            "modelChecksum":checkpoint.model.checksum,
+            "rawManifestSha256":checkpoint.dataset.raw_manifest_sha256,
+            "datasetFingerprint":checkpoint.dataset.manifest.fingerprint,
+            "teacherPolicyId":checkpoint.dataset.manifest.teacher_policy_id,
+            "actorChecksum":actor_checksum,"completedEpochs":checkpoint.completed_epochs,
+            "sourceAuthenticated":false,"sourceQualified":false,"verifiedNativePolicy":false,
+            "strengthMeasured":false,"adoptionGranted":false},
+        "sourceNumericalTarget":crate::public_stochastic_native::numerical_target(),
+        "parameterBits":checkpoint.model.parameters().iter().map(|v|format!("{:08x}",v.to_bits())).collect::<Vec<_>>(),
+        "checksum":""});
+    wire["checksum"] = policy::native_v7_bc_numeric_checksum(
+        &serde_json::to_vec(&wire).map_err(|e| e.to_string())?,
+    )?
+    .into();
+    let raw = serde_json::to_vec(&wire).map_err(|e| e.to_string())?;
+    let loaded = policy::LoadedNativeV7BcDeployment::load(&raw)?;
+    let report = NativeV7BcPolicyExport {
+        schema: "tzolkin-native-v7-bc-policy-export-report-v1".into(),
+        complete: true,
+        checkpoint_sha256: checkpoint_sha256.into(),
+        checkpoint_checksum: checkpoint.checksum.clone(),
+        model_checksum: checkpoint.model.checksum.clone(),
+        raw_manifest_sha256: checkpoint.dataset.raw_manifest_sha256.clone(),
+        dataset_fingerprint: checkpoint.dataset.manifest.fingerprint.clone(),
+        teacher_policy_id: checkpoint.dataset.manifest.teacher_policy_id.clone(),
+        completed_epochs: checkpoint.completed_epochs,
+        artifact_file: "policy.json".into(),
+        artifact_bytes: raw.len(),
+        artifact_sha256: digest(&raw),
+        deployment_checksum: loaded.checksum().into(),
+        actor_checksum: loaded.identity().actor_checksum().into(),
+        source_authenticated: false,
+        source_qualified: false,
+        verified_native_policy: false,
+        strength_measured: false,
+        training_performed: false,
+        adoption_granted: false,
+    };
+    Ok((raw, report))
+}
+
+/// Explicit V7-only bridge. The source directory is fully verified offline;
+/// neither its paths nor optimizer/corpus/journal data enter the inference file.
+/// The final report is published after input POST; acceptance requires CLI exit0.
+pub fn export_native_v7_bc_policy(
+    checkpoint_path: &Path,
+    expected_checkpoint_sha256: &str,
+    dataset_directory: &Path,
+    output: &Path,
+) -> Result<NativeV7BcPolicyExport, String> {
+    if !crate::policy_dataset::digest_id(expected_checkpoint_sha256)
+        || !checkpoint_path.is_absolute()
+        || !dataset_directory.is_absolute()
+        || !output.is_absolute()
+    {
+        return Err(
+            "BC export requires absolute local paths and an exact checkpoint SHA256".into(),
+        );
+    }
+    let checkpoint_pin = || {
+        let raw = data::read(checkpoint_path, MAX_ARTIFACT_BYTES as u64)?;
+        if digest(&raw) != expected_checkpoint_sha256 {
+            return Err("BC export checkpoint pin changed".into());
+        }
+        Ok(raw)
+    };
+    let mut source_identity = None;
+    let prepared = (|| {
+        data::local(checkpoint_path)?;
+        data::local(dataset_directory)?;
+        data::local(output)?;
+        validate_new_output_directory(output)?;
+        let destination = fs::canonicalize(output.parent().ok_or("BC export output parent")?)
+            .map_err(|e| e.to_string())?
+            .join(output.file_name().ok_or("BC export output name")?);
+        let original = fs::canonicalize(checkpoint_path.parent().ok_or("BC checkpoint parent")?)
+            .map_err(|e| e.to_string())?;
+        let sources = fs::canonicalize(dataset_directory).map_err(|e| e.to_string())?;
+        if [original, sources]
+            .iter()
+            .any(|p| destination.starts_with(p) || p.starts_with(&destination))
+        {
+            return Err("BC export output overlaps immutable checkpoint/dataset namespace".into());
+        }
+        let checkpoint_raw = checkpoint_pin()?;
+        let checkpoint: SemanticPlayingTeacherCheckpoint = serde_json::from_value(
+            crate::public_stochastic_record::unique_json(&checkpoint_raw, MAX_ARTIFACT_BYTES)?,
+        )
+        .map_err(|e| e.to_string())?;
+        checkpoint.validate()?;
+        if checkpoint.model.profile()? != data::TeacherProfile::V7 {
+            return Err("BC export requires a V7 checkpoint".into());
+        }
+        source_identity = Some(checkpoint.dataset.clone());
+        checkpoint
+            .dataset
+            .recheck_export_source(dataset_directory)?;
+        let dataset = data::load_semantic_playing_v7_teacher_dataset(dataset_directory)?;
+        validate_checkpoint_dataset(&dataset, &checkpoint)?;
+        let (raw, report) = native_v7_bc_policy_bytes(&checkpoint, expected_checkpoint_sha256)?;
+        let report_raw = serde_json::to_vec(&report).map_err(|e| e.to_string())?;
+        if raw.len() > tzolkin_inference::semantic_playing_deployment::MAX_DEPLOYMENT_BYTES
+            || report_raw.len() > 64 * 1024
+        {
+            return Err("BC export output byte cap".into());
+        }
+        Ok::<_, String>((raw, report_raw, report))
+    })();
+    let source_post = source_identity.as_ref().map_or(Ok(()), |identity| {
+        identity.recheck_export_source(dataset_directory)
+    });
+    let checkpoint_post_result = checkpoint_pin().map(|_| ());
+    source_post?;
+    checkpoint_post_result?;
+    let (raw, report_raw, report) = prepared?;
+    let publication = (|| {
+        fs::create_dir(output).map_err(|e| e.to_string())?;
+        crate::policy_dataset::publish_bytes(output, "policy.json", &raw)?;
+        crate::policy_dataset::publish_bytes(output, "policy-export.json", &report_raw)
+    })();
+    if let Err(error) = publication {
+        let source_post = source_identity.as_ref().map_or(Ok(()), |identity| {
+            identity.recheck_export_source(dataset_directory)
+        });
+        let checkpoint_post_result = checkpoint_pin().map(|_| ());
+        source_post?;
+        checkpoint_post_result?;
+        return Err(error);
+    }
+    Ok(report)
+}
+
 pub fn train_dataset(
     dataset: &ValidatedSemanticPlayingTeacherDataset,
     config: &PolicyBcConfig,
@@ -885,6 +1105,143 @@ pub(crate) fn fixture(
         bounded_json(&v7_resumed.checkpoint).unwrap()
     );
     validate_checkpoint_dataset(&v7_data, &v7_full.checkpoint).unwrap();
+    // Numeric export roundtrip only: this synthetic cache still cannot pass
+    // the production complete-source loader or grant model/App admission.
+    use tzolkin_inference::semantic_playing_deployment as inference;
+    let checkpoint_raw = bounded_json(&v7_full.checkpoint).unwrap();
+    let checkpoint_sha = digest(&checkpoint_raw);
+    let (actor_raw, export) =
+        native_v7_bc_policy_bytes(&v7_full.checkpoint, &checkpoint_sha).unwrap();
+    let actor = inference::LoadedNativeV7BcDeployment::load(&actor_raw).unwrap();
+    assert_eq!(actor.identity().completed_epochs(), 3);
+    assert_eq!(export.artifact_sha256, digest(&actor_raw));
+    assert!(inference::LoadedSemanticPlayingDeployment::load(&actor_raw).is_err());
+    let wire: serde_json::Value = serde_json::from_slice(&actor_raw).unwrap();
+    let tokens = wire["parameterBits"].as_array().unwrap();
+    assert_eq!(tokens.len(), PARAMETER_COUNT);
+    for (value, token) in v7_full.model.parameters().iter().zip(tokens) {
+        assert_eq!(token.as_str().unwrap(), format!("{:08x}", value.to_bits()));
+    }
+    for (observation, _, _) in examples {
+        if observation.phase != tzolkin_core::Phase::Playing {
+            continue;
+        }
+        let encoder =
+            tzolkin_inference::features::FeatureEncoder::new_semantic_playing(observation).unwrap();
+        let rows = (0..observation.legal_actions.len())
+            .map(|i| encoder.encode_legal_tagged(i).unwrap())
+            .collect::<Vec<_>>();
+        let original =
+            tzolkin_inference::policy::BorrowedSemanticPlayingPolicy::from_validated_parameters(
+                v7_full.model.parameters(),
+            )
+            .unwrap()
+            .predict(
+                tzolkin_inference::kernel::Kernel::Scalar.resolve().unwrap(),
+                &rows,
+            )
+            .unwrap();
+        let actual = actor.distribution_playing(observation).unwrap();
+        assert!(
+            original
+                .logits
+                .iter()
+                .zip(&actual.logits)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        assert!(
+            original
+                .probabilities
+                .iter()
+                .zip(&actual.probabilities)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        let chosen = actor.choose_move_playing(observation).unwrap();
+        let best = (1..original.logits.len()).fold(0, |best, i| {
+            if original.logits[i] > original.logits[best] {
+                i
+            } else {
+                best
+            }
+        });
+        assert_eq!(chosen.r#move, observation.legal_actions[best].r#move);
+        assert_eq!(
+            chosen.score.to_bits(),
+            f64::from(original.logits[best]).to_bits()
+        );
+        let mut setup = observation.clone();
+        setup.phase = tzolkin_core::Phase::Setup;
+        assert!(actor.distribution_playing(&setup).is_err());
+    }
+    for (pointer, value) in [
+        ("/parameterBits/0", serde_json::json!("7f800000")),
+        ("/contract/featureSchema", serde_json::json!(2)),
+        ("/contract/catalogHash", serde_json::json!("0")),
+        ("/identity/sourceKind", serde_json::json!(data::SOURCE_KIND)),
+        ("/identity/completedEpochs", serde_json::json!(0)),
+        ("/identity/sourceAuthenticated", serde_json::json!(true)),
+    ] {
+        let mut bad = wire.clone();
+        *bad.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            inference::native_v7_bc_numeric_checksum(&serde_json::to_vec(&bad).unwrap()).is_err()
+        );
+    }
+    let mut bad = wire.clone();
+    bad["identity"]["updates"] = 1.into();
+    assert!(
+        inference::LoadedNativeV7BcDeployment::load(&serde_json::to_vec(&bad).unwrap()).is_err()
+    );
+    let mut bad = wire.clone();
+    bad["checksum"] = "0".repeat(64).into();
+    assert!(
+        inference::LoadedNativeV7BcDeployment::load(&serde_json::to_vec(&bad).unwrap()).is_err()
+    );
+    assert!(
+        inference::LoadedNativeV7BcDeployment::load(&vec![
+            b' ';
+            inference::MAX_DEPLOYMENT_BYTES + 1
+        ])
+        .is_err()
+    );
+    assert!(native_v7_bc_policy_bytes(&full.checkpoint, &checkpoint_sha).is_err());
+    let source_dir = parent.join("native-v7-bc-export-source");
+    fs::create_dir(&source_dir).unwrap();
+    let source_checkpoint = source_dir.join("checkpoint.json");
+    v7_full.checkpoint.save_new(&source_checkpoint).unwrap();
+    let refused_output = parent.join("native-v7-bc-refused-export");
+    assert!(
+        export_native_v7_bc_policy(
+            &source_checkpoint,
+            &"0".repeat(64),
+            &v7_root,
+            &refused_output
+        )
+        .is_err()
+    );
+    assert!(!refused_output.exists());
+    assert!(
+        export_native_v7_bc_policy(
+            &source_checkpoint,
+            &checkpoint_sha,
+            &v7_root,
+            &v7_root.join("overlap")
+        )
+        .unwrap_err()
+        .contains("namespace")
+    );
+    assert!(!v7_root.join("overlap").exists());
+    assert!(
+        export_native_v7_bc_policy(
+            &source_checkpoint,
+            &checkpoint_sha,
+            &v7_root,
+            &refused_output
+        )
+        .is_err()
+    );
+    assert!(!refused_output.exists());
+    assert_eq!(fs::read(&source_checkpoint).unwrap(), checkpoint_raw);
     let (fit_noop, fit) =
         train_dataset_with_fit_diagnostics(&v7_data, &config(3), &v7_full.checkpoint).unwrap();
     assert_eq!(
