@@ -221,6 +221,7 @@ impl<'a> FrozenSemanticSnapshot<'a> {
     pub(crate) fn contains_family(&self, family: &str) -> bool {
         self.families.contains(family)
             || self.human_families.contains(family)
+            || self.origin.contains_native_family(family)
             || self.external.contains_family(family)
     }
     pub(crate) fn contains_stream(&self, identity: SamplingStreamIdentity, actor: usize) -> bool {

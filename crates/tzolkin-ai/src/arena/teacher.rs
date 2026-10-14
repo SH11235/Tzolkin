@@ -377,25 +377,27 @@ pub const SEMANTIC_PLAYING_ARENA_SCHEMA: &str =
 pub struct PreparedSemanticPlayingTeacher {
     checkpoint: Box<crate::semantic_playing_teacher_training::SemanticPlayingTeacherCheckpoint>,
     dataset: crate::semantic_playing_teacher_dataset::ValidatedSemanticPlayingTeacherDataset,
+    dataset_path: std::path::PathBuf,
     checkpoint_path: std::path::PathBuf,
     checkpoint_pin: (usize, String),
     kernel: ResolvedKernel,
 }
 impl PreparedSemanticPlayingTeacher {
-    pub fn load(checkpoint: &Path, dataset: &Path) -> Result<Self, String> {
+    pub fn load(checkpoint: &Path, dataset_path: &Path) -> Result<Self, String> {
         use crate::semantic_playing_teacher_dataset as data;
         use crate::semantic_playing_teacher_training as training;
         let before = data::read(checkpoint, crate::model::MAX_ARTIFACT_BYTES as u64)?;
         let checkpoint_pin = (before.len(), crate::model::digest(&before));
         let result = (|| {
             let loaded = training::SemanticPlayingTeacherCheckpoint::load(checkpoint)?;
-            let dataset = data::load_semantic_playing_teacher_dataset(dataset)?;
+            let dataset = data::load_semantic_playing_teacher_dataset(dataset_path)?;
             // Exactly one audited no-op outside callbacks. This checks current
             // source/model/metrics consistency, not training-history authenticity.
             training::validate_checkpoint_dataset(&dataset, &loaded)?;
             Ok(Self {
                 checkpoint: Box::new(loaded),
                 dataset,
+                dataset_path: dataset_path.to_path_buf(),
                 checkpoint_path: checkpoint.to_path_buf(),
                 checkpoint_pin: checkpoint_pin.clone(),
                 kernel: Kernel::Scalar.resolve()?,
@@ -451,6 +453,49 @@ impl PreparedSemanticPlayingTeacher {
             return Err("Native Playing teacher checkpoint changed after load".into());
         }
         result
+    }
+    pub(crate) fn rl_checkpoint(
+        &self,
+    ) -> &crate::semantic_playing_teacher_training::SemanticPlayingTeacherCheckpoint {
+        &self.checkpoint
+    }
+    pub(crate) fn rl_source_locations(&self) -> serde_json::Value {
+        serde_json::json!({"checkpoint":{"path":self.checkpoint_path,
+            "bytes":self.checkpoint_pin.0,"sha256":self.checkpoint_pin.1},
+            "datasetDirectory":self.dataset_path})
+    }
+    #[cfg(test)]
+    pub(crate) fn unqualified_rl_fixture(directory: &Path, observation: Observation) -> Self {
+        use crate::semantic_playing_teacher_dataset as data;
+        use crate::semantic_playing_teacher_training as training;
+        // A bounded numerical/custody oracle, NOT a complete-source loader
+        // success. Production must continue to reject this synthetic dataset.
+        let chosen = observation.legal_actions[0].clone();
+        let dataset =
+            data::training_cache_fixture(directory, &[(observation, chosen, 0)], None).unwrap();
+        let outcome = training::train_dataset(
+            &dataset,
+            &crate::policy_training::PolicyBcConfig {
+                epochs: 1,
+                batch_size: 2,
+                learning_rate: 0.001,
+                seed: 7,
+            },
+            None,
+        )
+        .unwrap();
+        let checkpoint_path = directory.with_extension("checkpoint.json");
+        outcome.checkpoint.save_new(&checkpoint_path).unwrap();
+        assert!(Self::load(&checkpoint_path, directory).is_err());
+        let raw = data::read(&checkpoint_path, crate::model::MAX_ARTIFACT_BYTES as u64).unwrap();
+        Self {
+            checkpoint: Box::new(outcome.checkpoint),
+            dataset,
+            dataset_path: directory.to_path_buf(),
+            checkpoint_path,
+            checkpoint_pin: (raw.len(), crate::model::digest(&raw)),
+            kernel: Kernel::Scalar.resolve().unwrap(),
+        }
     }
 }
 pub(super) fn semantic_playing_distribution(

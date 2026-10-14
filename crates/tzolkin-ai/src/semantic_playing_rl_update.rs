@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use crate::conditional_human_rl_update::{ConditionalFrozenPool, ConditionalNativeExclusions};
 use crate::conditional_semantic_playing_rl::{
-    SemanticCollectionScope, SemanticPlayingRlOwner, SemanticTrainingState,
+    SemanticCollectionScope, SemanticFreshOwner, SemanticPlayingRlOwner, SemanticTrainingState,
 };
 use crate::human_policy_dataset::ConditionalFeatureProfile;
 use crate::public_model::PublicPolicyModel;
@@ -407,8 +407,33 @@ impl<'a> SemanticPlayingJointSession<'a> {
         })
     }
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) fn from_checkpoint(
         owner: SemanticPlayingRlOwner,
+        saved: SemanticCheckpointState,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+        actor_config: OneStepConfig,
+        critic_config: ResidualFitConfig,
+    ) -> Result<Self, String> {
+        Self::from_checkpoint_owner(
+            SemanticFreshOwner::Human(Box::new(owner)),
+            saved,
+            external,
+            history,
+            seed,
+            first,
+            replicate,
+            actor_config,
+            critic_config,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_checkpoint_owner(
+        owner: SemanticFreshOwner,
         saved: SemanticCheckpointState,
         external: &'a ConditionalNativeExclusions,
         history: &'a DeclaredSamplingHistory,
@@ -512,6 +537,30 @@ impl<'a> SemanticPlayingJointSession<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_fresh_composed(
         owner: SemanticPlayingRlOwner,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+        actor_config: OneStepConfig,
+        critic_config: ResidualFitConfig,
+        composition: SemanticCollectionComposition,
+    ) -> Result<Self, String> {
+        Self::from_fresh_owner(
+            SemanticFreshOwner::Human(Box::new(owner)),
+            external,
+            history,
+            seed,
+            first,
+            replicate,
+            actor_config,
+            critic_config,
+            composition,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_fresh_owner(
+        owner: SemanticFreshOwner,
         external: &'a ConditionalNativeExclusions,
         history: &'a DeclaredSamplingHistory,
         seed: SamplingSeed,
@@ -1321,6 +1370,214 @@ pub(crate) fn joint_fixture() {
         assert!((m.advantage.mean - (m.terminal_winner_share - m.baseline.mean)).abs() < 1e-12);
     }
     let saved = guarded.checkpoint_state().unwrap();
+    {
+        // Explicitly unqualified source fixture: the real native loader rejects
+        // it. Exercise native numerical custody/Reserve ordering without a new
+        // full-game CI fixture or claiming a successful source qualification.
+        let initial = crate::conditional_human_rl_update::tests::terminal_start(3, 1);
+        let observation =
+            tzolkin_core::observation::observe(&initial, initial.current_player).unwrap();
+        let directory = files.0.join("native-origin-cache");
+        let native_prepared = std::sync::Arc::new(
+            crate::arena::teacher::PreparedSemanticPlayingTeacher::unqualified_rl_fixture(
+                &directory,
+                observation,
+            ),
+        );
+        let families: Vec<_> = native_prepared
+            .rl_checkpoint()
+            .dataset
+            .manifest
+            .families
+            .iter()
+            .map(|f| f.family_id.clone())
+            .collect();
+        let exclusions = |name: &str, families: &[String]| {
+            let raw =
+                serde_json::to_vec(&json!({"schema":"tzolkin-conditional-native-exclusions-v1",
+                "families":families}))
+                .unwrap();
+            let path = files.0.join(name);
+            fs::write(&path, &raw).unwrap();
+            let pin = ContentPin {
+                path: path.to_str().unwrap().into(),
+                bytes: raw.len() as u64,
+                sha256: digest(&raw),
+            };
+            let excluded = ConditionalNativeExclusions::load(
+                &path,
+                &pin,
+                families.len(),
+                &digest(format!("{}\n", families.join("\n")).as_bytes()),
+            )
+            .unwrap();
+            (excluded, pin)
+        };
+        let (all, all_pin) = exclusions("native-all.json", &families);
+        let (missing, _) = exclusions("native-missing-one.json", &families[..families.len() - 1]);
+        let history = DeclaredSamplingHistory::declare_complete(vec![], vec![all_pin]).unwrap();
+        let owner =
+            || SemanticFreshOwner::native(std::sync::Arc::clone(&native_prepared), 11).unwrap();
+        let state = SemanticTrainingState::from_fresh(owner()).unwrap();
+        assert_eq!(
+            state.root().policy_version(),
+            crate::conditional_semantic_playing_rl::NATIVE_POLICY_VERSION
+        );
+        let refused = SemanticCollectionLedger::new_composed(
+            &missing,
+            &history,
+            SamplingSeed::new(991),
+            0,
+            0,
+            SemanticCollectionComposition::GuardedProposalV2,
+        )
+        .unwrap();
+        let seeds: [u32; 4] = (10_000..)
+            .filter(|s| split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Train)
+            .take(4)
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        let error = refused
+            .plan(
+                &state.view(state.root().checksum()),
+                seeds,
+                PoolRef::Legacy(&pool, None),
+                limits,
+            )
+            .err()
+            .unwrap();
+        assert!(error.contains("omits a retained teacher family"));
+        assert_eq!(
+            (
+                refused.attempts(),
+                refused.next_episode_ordinal(),
+                refused.consumed_actor_streams()
+            ),
+            (0, 0, 0)
+        );
+        assert!(refused.consumed_families().is_empty());
+        let mut native = SemanticPlayingJointSession::from_fresh_owner(
+            owner(),
+            &all,
+            &history,
+            SamplingSeed::new(991),
+            0,
+            0,
+            OneStepConfig::default(),
+            ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+            SemanticCollectionComposition::GuardedProposalV2,
+        )
+        .unwrap();
+        assert_eq!(native.identity().unwrap().completed_updates(), 0);
+        assert_eq!(native.identity().unwrap().credited_playing_decisions(), 0);
+        assert!(
+            native
+                .actor_parameters()
+                .unwrap()
+                .iter()
+                .zip(native_prepared.rl_checkpoint().model.parameters())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        assert!(native.check_headroom(CollectionLimits::default()).is_err());
+        let snapshot = native.freeze_snapshot().unwrap();
+        for family in &families {
+            assert!(snapshot.contains_family(family));
+        }
+        let parent = native.identity().unwrap().checksum().to_string();
+        let proposed = native
+            .ledger
+            .collect_fixture_using(
+                &native.state.view(&parent),
+                seeds,
+                &pool,
+                limits,
+                |scope, cohort| {
+                    prepare(
+                        scope,
+                        &native.identity,
+                        &cohort,
+                        &native.actor_config,
+                        &native.critic_config,
+                        1,
+                    )
+                },
+                create,
+            )
+            .unwrap();
+        let report = native.admit(proposed).unwrap();
+        assert!(report.updated());
+        let native_saved = native.checkpoint_state().unwrap();
+        assert!(
+            SemanticPlayingJointSession::from_checkpoint_owner(
+                owner(),
+                saved.clone(),
+                &all,
+                &history,
+                SamplingSeed::new(993),
+                saved.current["next"].as_u64().unwrap(),
+                0,
+                OneStepConfig::default(),
+                ResidualFitConfig::new(0.001, 0.01, 256).unwrap()
+            )
+            .is_err()
+        );
+        assert!(
+            SemanticPlayingJointSession::from_checkpoint_owner(
+                SemanticFreshOwner::Human(Box::new(
+                    SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap()
+                )),
+                native_saved.clone(),
+                &all,
+                &history,
+                SamplingSeed::new(993),
+                native.next_episode_ordinal(),
+                0,
+                OneStepConfig::default(),
+                ResidualFitConfig::new(0.001, 0.01, 256).unwrap()
+            )
+            .is_err()
+        );
+        let resumed = SemanticPlayingJointSession::from_checkpoint_owner(
+            owner(),
+            native_saved,
+            &all,
+            &history,
+            SamplingSeed::new(993),
+            native.next_episode_ordinal(),
+            0,
+            OneStepConfig::default(),
+            ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            resumed.identity().unwrap().checksum(),
+            native.identity().unwrap().checksum()
+        );
+        let source =
+            directory.join(&native_prepared.rl_checkpoint().dataset.manifest.games[0].source_file);
+        let before = fs::read(&source).unwrap();
+        let parent = native.identity().unwrap().checksum().to_string();
+        let error = native
+            .ledger
+            .with_checked(&native.state.view(&parent), |_| {
+                fs::write(&source, b"changed unqualified native source").unwrap();
+                Err::<(), String>("synthetic native early error".into())
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("synthetic native early error") && error.contains("source postcheck")
+        );
+        assert_eq!(
+            (
+                native.attempts(),
+                native.consumed_families().len(),
+                native.consumed_actor_streams()
+            ),
+            (1, 4, 14)
+        );
+        fs::write(&source, before).unwrap();
+    }
     assert_eq!(
         saved.composition().unwrap(),
         SemanticCollectionComposition::GuardedProposalV2
