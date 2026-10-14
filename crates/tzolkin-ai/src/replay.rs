@@ -17,6 +17,8 @@ pub const RULES_VERSION: u32 = 1;
 pub const RULES_BASELINE: &str = "1ec8fdbb61f671ca2cbf0dbac7f3662c160be677";
 pub const MAX_DECISIONS: usize = 4000;
 pub const RL_ARGMAX_SELECTION_VERSION: &str = "public-rl-argmax-first-legal-tie-v1";
+pub const CORN_FIRST_V5_TEACHER_POLICY_VERSION: &str =
+    "corn-first-setup-resource-cycle-v5-playing-teacher-v1";
 fn required_null<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<(), D::Error> {
     if serde_json::Value::deserialize(deserializer)?.is_null() {
         Ok(())
@@ -40,6 +42,14 @@ pub enum ReplaySource {
     },
     PolicySelfPlay {
         policies: Vec<SeatPolicy>,
+    },
+    /// One fixed teacher for every seat. This describes generation, not dataset,
+    /// model, Human origin or source-authentication authority.
+    CornFirstV5Teacher {
+        policy_version: String,
+        setup_policy_version: String,
+        setup_weights: HeuristicWeights,
+        playing_configuration: crate::arena::resource_cycle::ResourceCycleConfig,
     },
     Human {
         provider: String,
@@ -545,6 +555,178 @@ pub fn play_game_using(
         |o| Ok((decide(o)?, None, None)),
         true,
     )
+}
+
+pub(crate) fn corn_first_v5_teacher_provenance() -> ReplaySource {
+    ReplaySource::CornFirstV5Teacher {
+        policy_version: CORN_FIRST_V5_TEACHER_POLICY_VERSION.into(),
+        setup_policy_version: crate::setup_policy::POLICY_VERSION.into(),
+        setup_weights: HeuristicWeights::default(),
+        playing_configuration: crate::arena::resource_cycle::ResourceCycleConfig::v5(),
+    }
+}
+fn require_corn_first_v5_teacher_source(
+    source: &ReplaySource,
+    players: usize,
+    options: &GameOptions,
+) -> Result<bool, String> {
+    if !matches!(source, ReplaySource::CornFirstV5Teacher { .. }) {
+        return Ok(false);
+    }
+    // Compare the entire closed declaration, including the effective floating
+    // config bytes. No alternate version, weights, per-seat choice or options.
+    if !(3..=4).contains(&players)
+        || *options != GameOptions::default()
+        || serde_json::to_vec(source).map_err(|e| e.to_string())?
+            != serde_json::to_vec(&corn_first_v5_teacher_provenance()).map_err(|e| e.to_string())?
+    {
+        return Err("Corn-first V5 teacher requires fixed all-seat base 3/4p provenance".into());
+    }
+    Ok(true)
+}
+fn corn_first_v5_teacher_choice(observation: &Observation) -> Result<crate::Decision, String> {
+    match observation.phase {
+        Phase::Setup => {
+            crate::setup_policy::choose_move_with_weights(observation, &HeuristicWeights::default())
+        }
+        Phase::Playing => crate::arena::resource_cycle::choose_move(
+            observation,
+            &crate::arena::resource_cycle::ResourceCycleConfig::v5(),
+        ),
+        _ => Err("Corn-first V5 teacher requires an actual Setup or Playing callback".into()),
+    }
+}
+/// Generate a complete all-seat fixed teacher replay from a real base-game
+/// initial state. This grants no split reservation, dataset or model admission.
+pub fn play_corn_first_v5_teacher(players: usize, seed: u32) -> Result<GameReplay, String> {
+    let source = corn_first_v5_teacher_provenance();
+    require_corn_first_v5_teacher_source(&source, players, &GameOptions::default())?;
+    let (state, _, record) = play_game_using(
+        players,
+        seed,
+        GameOptions::default(),
+        true,
+        source,
+        corn_first_v5_teacher_choice,
+    )?;
+    let record = record.ok_or("Corn-first V5 teacher did not produce a replay")?;
+    if verify_corn_first_v5_teacher_replay(&record)? != state {
+        return Err("Corn-first V5 teacher terminal state differs".into());
+    }
+    Ok(record)
+}
+/// First replay every Core operation/view/result, then regenerate every actual
+/// phase's teacher choice for every actor. Consistency is not authentication or
+/// eligibility for any existing native/Human training route.
+pub fn verify_corn_first_v5_teacher_replay(replay: &GameReplay) -> Result<GameState, String> {
+    if !require_corn_first_v5_teacher_source(
+        &replay.header.source,
+        replay.header.names.len(),
+        &replay.header.options,
+    )? {
+        return Err("Corn-first V5 teacher requires its dedicated replay source".into());
+    }
+    let terminal = verify_replay(replay)?;
+    for step in &replay.steps {
+        let decision = corn_first_v5_teacher_choice(&step.observation)?;
+        if decision.actor != step.actor
+            || !decision.score.is_finite()
+            || decision.r#move != step.chosen.r#move
+            || decision.policy_version
+                != match step.observation.phase {
+                    Phase::Setup => crate::setup_policy::POLICY_VERSION,
+                    Phase::Playing => crate::arena::resource_cycle::V5_POLICY_VERSION,
+                    _ => return Err("Unexpected teacher callback phase".into()),
+                }
+        {
+            return Err(format!(
+                "Corn-first V5 teacher choice differs at step {}",
+                step.index
+            ));
+        }
+    }
+    Ok(terminal)
+}
+
+#[cfg(test)]
+pub(crate) fn corn_first_v5_teacher_fixture() {
+    let source = corn_first_v5_teacher_provenance();
+    for players in [2, 5] {
+        assert!(play_corn_first_v5_teacher(players, 42).is_err());
+    }
+    for key in [
+        "policyVersion",
+        "setupPolicyVersion",
+        "setupWeights",
+        "playingConfiguration",
+    ] {
+        let mut bad = serde_json::to_value(&source).unwrap();
+        match key {
+            "setupWeights" => bad[key]["worker"] = serde_json::json!(999.0),
+            "playingConfiguration" => {
+                bad[key] = serde_json::to_value(
+                    crate::arena::resource_cycle::ResourceCycleConfig::default(),
+                )
+                .unwrap();
+            }
+            _ => bad[key] = serde_json::json!("wrong-version"),
+        }
+        let bad: ReplaySource = serde_json::from_value(bad).unwrap();
+        assert!(require_corn_first_v5_teacher_source(&bad, 3, &GameOptions::default()).is_err());
+    }
+    let mut unknown = serde_json::to_value(&source).unwrap();
+    unknown["policies"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<ReplaySource>(unknown).is_err());
+    assert!(require_corn_first_v5_teacher_source(&source, 3, &options_from_mask(1)).is_err());
+    for players in [3, 4] {
+        assert!(
+            require_corn_first_v5_teacher_source(&source, players, &GameOptions::default())
+                .unwrap()
+        );
+        let names = (0..players).map(|i| format!("P{i}")).collect();
+        let mut state = create_game_with_options(names, 42, GameOptions::default()).unwrap();
+        let mut actors = std::collections::BTreeSet::new();
+        let mut setup_callbacks = 0;
+        while state.phase == Phase::Setup {
+            let observation = observe(&state, state.current_player).unwrap();
+            let actual = corn_first_v5_teacher_choice(&observation).unwrap();
+            let expected = crate::setup_policy::choose_move_with_weights(
+                &observation,
+                &HeuristicWeights::default(),
+            )
+            .unwrap();
+            assert_eq!(actual.policy_version, crate::setup_policy::POLICY_VERSION);
+            assert_eq!(actual.actor, observation.actor);
+            assert_eq!(actual.r#move, expected.r#move);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            assert!(
+                observation
+                    .legal_actions
+                    .iter()
+                    .any(|a| a.r#move == actual.r#move)
+            );
+            actors.insert(observation.actor);
+            state = apply_move(&state, actual.r#move).unwrap();
+            setup_callbacks += 1;
+            assert!(setup_callbacks <= 64);
+        }
+        assert_eq!(actors.len(), players);
+        assert_eq!(state.phase, Phase::Playing);
+        let observation = observe(&state, state.current_player).unwrap();
+        let actual = corn_first_v5_teacher_choice(&observation).unwrap();
+        let expected = crate::arena::resource_cycle::choose_move(
+            &observation,
+            &crate::arena::resource_cycle::ResourceCycleConfig::v5(),
+        )
+        .unwrap();
+        assert_eq!(
+            actual.policy_version,
+            crate::arena::resource_cycle::V5_POLICY_VERSION
+        );
+        assert_eq!(actual.actor, observation.actor);
+        assert_eq!(actual.r#move, expected.r#move);
+        assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+    }
 }
 /// Native games start from a validated seed/options and use checked legal operations.
 /// Avoids per-transition saved-JSON roundtrips; terminal validation remains mandatory.
@@ -1097,6 +1279,9 @@ fn play_game_internal_with_diagnostics(
     if source.is_none() && record {
         return Err("Unrecorded inference has no replay source".into());
     }
+    if let Some(source) = &source {
+        require_corn_first_v5_teacher_source(source, players, &options)?;
+    }
     if let Some(ReplaySource::PolicySelfPlay { policies }) = &source {
         if policies.len() != players {
             return Err("Selfplay policy/seat count mismatch".into());
@@ -1289,6 +1474,7 @@ pub fn verify_replay(replay: &GameReplay) -> Result<GameState, String> {
     if replay.steps.len() > MAX_DECISIONS {
         return Err("Replay exceeds decision limit".into());
     }
+    require_corn_first_v5_teacher_source(&h.source, h.names.len(), &h.options)?;
     if let ReplaySource::PolicySelfPlay { policies } = &h.source {
         if policies.len() != h.names.len() {
             return Err("Replay policy/seat count mismatch".into());
