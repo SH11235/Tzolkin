@@ -11,7 +11,9 @@ use crate::public_policy_baseline::ResidualFitConfig;
 use crate::public_policy_update::{OneStepConfig, checkpoint_digest};
 use crate::public_stochastic::{SamplingSeed, SamplingStreamIdentity};
 use crate::public_stochastic_record::{Config, unique_json};
-use crate::semantic_playing_rl_collection::{DeclaredSamplingHistory, DeclaredSamplingRange};
+use crate::semantic_playing_rl_collection::{
+    DeclaredSamplingHistory, DeclaredSamplingRange, SemanticCollectionComposition,
+};
 use crate::semantic_playing_rl_pool::SnapshotSlot;
 
 const RUN_SCHEMA: &str = "tzolkin-semantic-playing-journal-run-v1";
@@ -293,9 +295,21 @@ struct Original {
     limits: [usize; 4],
     // attempts, logical, stored, metadata, disk; exactly the original budget.
     budget: [u64; 5],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    collection_composition: Option<SemanticCollectionComposition>,
 }
 impl Original {
+    fn composition(&self) -> Result<SemanticCollectionComposition, String> {
+        match self.collection_composition {
+            None => Ok(SemanticCollectionComposition::LegacyV1),
+            Some(SemanticCollectionComposition::GuardedProposalV2) => {
+                Ok(SemanticCollectionComposition::GuardedProposalV2)
+            }
+            _ => Err("Original collectionComposition must be absent or guardedProposalV2".into()),
+        }
+    }
     fn limits(&self) -> Result<CollectionLimits, String> {
+        self.composition()?;
         CollectionLimits::new(
             self.limits[0],
             self.limits[1],
@@ -329,7 +343,7 @@ impl Original {
         external: &'a ConditionalNativeExclusions,
         history: &'a DeclaredSamplingHistory,
     ) -> Result<SemanticPlayingJointSession<'a>, String> {
-        SemanticPlayingJointSession::from_fresh(
+        SemanticPlayingJointSession::from_fresh_composed(
             SemanticPlayingRlOwner::from_prepared(prepared, self.critic_seed)?,
             external,
             history,
@@ -338,6 +352,7 @@ impl Original {
             self.replicate,
             OneStepConfig::from_checkpoint(self.actor_config.clone())?,
             ResidualFitConfig::from_checkpoint(self.critic_config.clone())?,
+            self.composition()?,
         )
     }
 }
@@ -1620,6 +1635,28 @@ pub(super) fn control_fixture(
         SemanticJournalRunSpec::from_json(&raw, &crate::model::digest(&raw))
     };
     let spec = parse(&value).unwrap();
+    assert!(
+        serde_json::to_value(&spec.wire.original)
+            .unwrap()
+            .get("collectionComposition")
+            .is_none()
+    );
+    let mut guarded_control = value.clone();
+    guarded_control["original"]["collectionComposition"] = "guardedProposalV2".into();
+    let guarded_spec = parse(&guarded_control).unwrap();
+    assert_eq!(
+        guarded_spec.wire.original.composition().unwrap(),
+        SemanticCollectionComposition::GuardedProposalV2
+    );
+    assert_ne!(
+        plan_checksum(&guarded_spec.wire).unwrap(),
+        plan_checksum(&spec.wire).unwrap()
+    );
+    guarded_control["checkpointOnCompletion"] = true.into();
+    assert!(parse(&guarded_control).is_err()); // V2 retains the complete five-block rule.
+    guarded_control["checkpointOnCompletion"] = false.into();
+    guarded_control["original"]["collectionComposition"] = "legacyV1".into();
+    assert!(parse(&guarded_control).is_err()); // Legacy mode has one canonical absent spelling.
     let w = &spec.wire;
     let mut audit = json!({"schema":AUDIT_SCHEMA,"journalDirectory":root.join("journal"),
         "original":value["original"],"proceduralPool":external_pin,
@@ -2006,6 +2043,14 @@ pub(super) fn control_fixture(
         journal.session.critic_parameters().unwrap()
     );
     assert!(checkpoint::recheck(Some(&chunk)).is_ok());
+    let mut guarded_original: Original =
+        serde_json::from_value(serde_json::to_value(&producer.original).unwrap()).unwrap();
+    guarded_original.collection_composition =
+        Some(SemanticCollectionComposition::GuardedProposalV2);
+    let refused_mode = checkpoint::resume(&guarded_original, &chunk, prepared, &external, &history)
+        .err()
+        .unwrap();
+    assert!(refused_mode.contains("Original differs"));
     // The immutable Original's seed17 is wholly forbidden here. Only the
     // explicit new chunk seed29 can admit prospective work.
     let mut continuation = serde_json::to_value(&producer).unwrap();

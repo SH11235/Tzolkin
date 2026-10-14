@@ -38,9 +38,49 @@ use crate::semantic_playing_rl_record::{
 use crate::semantic_playing_rl_update::SemanticPlayingCurrentIdentity;
 
 pub const SAMPLING_VERSION: &str = "semantic-playing-only-uniform-tick53-v1";
+pub const GUARDED_SAMPLING_VERSION: &str = "semantic-playing-guarded-latent-proposal-tick53-v2";
+const GUARDED_OPPONENT_VERSION: &str = "semantic-playing-guarded-frozen-proposal-tick53-v2";
 pub const TARGET_CONTRACT: &str = "semantic-playing-only-gamma1-terminal-winner-share-v1";
 const MAX_ATTEMPTS: usize = 64;
 const MAX_RANGES: usize = 8192;
+
+/// Explicit collection composition. Old controls and identities omit LegacyV1.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SemanticCollectionComposition {
+    #[default]
+    LegacyV1,
+    GuardedProposalV2,
+}
+impl SemanticCollectionComposition {
+    pub(crate) fn sampling_version(self) -> &'static str {
+        match self {
+            Self::LegacyV1 => SAMPLING_VERSION,
+            Self::GuardedProposalV2 => GUARDED_SAMPLING_VERSION,
+        }
+    }
+    fn opponent_version(self) -> &'static str {
+        match self {
+            Self::LegacyV1 => OPPONENT_SAMPLING_VERSION,
+            Self::GuardedProposalV2 => GUARDED_OPPONENT_VERSION,
+        }
+    }
+    pub(crate) fn bind(self, legacy: String) -> Result<String, String> {
+        if self == Self::LegacyV1 {
+            Ok(legacy)
+        } else {
+            hash(
+                b"semantic-guarded-proposal-composition-v2\0",
+                &(
+                    legacy,
+                    self.sampling_version(),
+                    self.opponent_version(),
+                    tzolkin_inference::trade_guard::TradeGuardConfig::default(),
+                ),
+            )
+        }
+    }
+}
 
 /// One fixed-domain five-u64 actor-stream interval. No policy label or native
 /// environment seed is part of this sampling identity.
@@ -193,6 +233,26 @@ struct SemanticSample {
     distribution_digest: String,
 }
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AppliedSampleChoice {
+    chosen: LegalAction,
+    #[serde(with = "crate::semantic_playing_rl_record::decision_bits")]
+    decision: Decision,
+    trade: Option<SampledTradeTrace>,
+}
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SampledTradeTrace {
+    configuration_key: String,
+    public_state_sha256: String,
+    first_seen_index: Option<usize>,
+    repeat_seen: bool,
+    budget_reached: bool,
+    overridden: bool,
+    count_before: usize,
+    count_after: usize,
+}
+#[derive(Debug, Deserialize, Serialize, PartialEq)]
 #[serde(
     tag = "role",
     content = "payload",
@@ -206,9 +266,18 @@ enum Choice {
         chosen: LegalAction,
     },
     LearnerPlaying(Box<SemanticSample>),
+    GuardedLearnerPlaying {
+        proposal: Box<SemanticSample>,
+        applied: AppliedSampleChoice,
+    },
     OpponentSample {
         sample: Box<SemanticSample>,
         snapshot: String,
+    },
+    GuardedOpponentSample {
+        proposal: Box<SemanticSample>,
+        snapshot: String,
+        applied: AppliedSampleChoice,
     },
     Opponent {
         #[serde(with = "crate::semantic_playing_rl_record::decision_bits")]
@@ -220,15 +289,36 @@ impl Choice {
     fn role(&self) -> SemanticCallbackRole {
         match self {
             Self::LearnerSetup { .. } => SemanticCallbackRole::LearnerSetup,
-            Self::LearnerPlaying(_) => SemanticCallbackRole::LearnerPlaying,
-            Self::Opponent { .. } | Self::OpponentSample { .. } => SemanticCallbackRole::Opponent,
+            Self::LearnerPlaying(_) | Self::GuardedLearnerPlaying { .. } => {
+                SemanticCallbackRole::LearnerPlaying
+            }
+            Self::Opponent { .. }
+            | Self::OpponentSample { .. }
+            | Self::GuardedOpponentSample { .. } => SemanticCallbackRole::Opponent,
         }
     }
     fn decision(&self) -> &Decision {
         match self {
             Self::LearnerSetup { decision, .. } | Self::Opponent { decision, .. } => decision,
             Self::LearnerPlaying(s) | Self::OpponentSample { sample: s, .. } => &s.decision,
+            Self::GuardedLearnerPlaying { applied, .. }
+            | Self::GuardedOpponentSample { applied, .. } => &applied.decision,
         }
+    }
+    fn sample(&self) -> Option<&SemanticSample> {
+        match self {
+            Self::LearnerPlaying(s)
+            | Self::OpponentSample { sample: s, .. }
+            | Self::GuardedLearnerPlaying { proposal: s, .. }
+            | Self::GuardedOpponentSample { proposal: s, .. } => Some(s),
+            _ => None,
+        }
+    }
+    fn guarded(&self) -> bool {
+        matches!(
+            self,
+            Self::GuardedLearnerPlaying { .. } | Self::GuardedOpponentSample { .. }
+        )
     }
 }
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -310,8 +400,12 @@ pub struct AuditedSemanticPlayingEpisode {
     playing: Vec<usize>,
     rank: usize,
     winners: usize,
+    composition: SemanticCollectionComposition,
 }
 impl AuditedSemanticPlayingEpisode {
+    pub(crate) fn composition(&self) -> SemanticCollectionComposition {
+        self.composition
+    }
     pub fn config(&self) -> &NativeStochasticConfig {
         &self.config
     }
@@ -361,9 +455,11 @@ impl AuditedSemanticPlayingEpisode {
         let &global = self.playing.get(index)?;
         let next = self.playing.get(index + 1).copied();
         let callback = &self.record.callbacks[global];
-        let Some(Choice::LearnerPlaying(sample)) = &callback.choice else {
+        let choice = callback.choice.as_ref()?;
+        if choice.role() != SemanticCallbackRole::LearnerPlaying {
             return None;
-        };
+        }
+        let sample = choice.sample()?;
         Some(SemanticPlayingActorStep {
             callback,
             sample,
@@ -378,8 +474,9 @@ impl AuditedSemanticPlayingEpisode {
         })
     }
 }
-/// Borrowed Playing-only target. No Deserialize, public constructor, Setup
-/// projection or conversion to the old AppliedActorStep exists.
+/// Borrowed Playing-only target. V2 likelihood getters describe the latent
+/// proposal; applied() and state_after() describe the actual guarded trajectory.
+/// No Deserialize, public constructor, Setup projection or legacy conversion.
 pub struct SemanticPlayingActorStep<'a> {
     callback: &'a Callback,
     sample: &'a SemanticSample,
@@ -394,6 +491,19 @@ impl SemanticPlayingActorStep<'_> {
     }
     pub fn chosen(&self) -> &LegalAction {
         &self.sample.chosen
+    }
+    /// Actual Core action after the deterministic composition. In V2, chosen()
+    /// and its likelihood still describe the sampled latent proposal.
+    pub fn applied(&self) -> &LegalAction {
+        match self
+            .callback
+            .choice
+            .as_ref()
+            .expect("audited semantic choice")
+        {
+            Choice::GuardedLearnerPlaying { applied, .. } => &applied.chosen,
+            _ => &self.sample.chosen,
+        }
     }
     pub fn chosen_index(&self) -> usize {
         self.sample.index
@@ -462,6 +572,30 @@ pub struct AuditedSemanticPlayingCohort {
     mixture: Option<String>,
 }
 impl AuditedSemanticPlayingCohort {
+    pub(crate) fn guarded_proposals(&self) -> Option<[usize; 4]> {
+        if self.episodes[0].composition == SemanticCollectionComposition::LegacyV1 {
+            return None;
+        }
+        let mut counts = [0; 4];
+        for episode in &self.episodes {
+            for c in &episode.record.callbacks {
+                match c.choice.as_ref() {
+                    Some(Choice::GuardedLearnerPlaying { applied, .. }) => {
+                        counts[0] += 1;
+                        counts[1] +=
+                            usize::from(applied.trade.as_ref().is_some_and(|t| t.overridden));
+                    }
+                    Some(Choice::GuardedOpponentSample { applied, .. }) => {
+                        counts[2] += 1;
+                        counts[3] +=
+                            usize::from(applied.trade.as_ref().is_some_and(|t| t.overridden));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(counts)
+    }
     pub fn episodes(&self) -> &[AuditedSemanticPlayingEpisode; 4] {
         &self.episodes
     }
@@ -509,9 +643,7 @@ impl AuditedSemanticPlayingCohort {
                     .choice
                     .as_ref()
                     .ok_or("Semantic sealed choice missing")?;
-                let sample = if let Choice::LearnerPlaying(s)
-                | Choice::OpponentSample { sample: s, .. } = choice
-                {
+                let sample = if let Some(s) = choice.sample() {
                     Some(hash(
                         b"semantic-joint-applied-sample-v1\0",
                         &(
@@ -548,6 +680,14 @@ impl AuditedSemanticPlayingCohort {
                         sample,
                     ),
                 )?;
+                let callback_checksum = if choice.guarded() {
+                    hash(
+                        b"semantic-joint-guarded-proposal-callback-v2\0",
+                        &(callback_checksum, choice),
+                    )?
+                } else {
+                    callback_checksum
+                };
                 callbacks.push(
                     if let Choice::OpponentSample { sample, snapshot } = choice {
                         hash(
@@ -606,11 +746,12 @@ pub(crate) fn encode_records(
         .iter()
         .enumerate()
         .map(|(member, episode)| {
-            let header = RecordHeader::new(
+            let header = RecordHeader::new_composed(
                 &cohort.parent,
                 member,
                 cohort.mixture.as_deref(),
                 &episode.config,
+                episode.composition,
             )?;
             crate::semantic_playing_rl_record::encode(&header, &episode.record, &episode.config)
         })
@@ -822,6 +963,7 @@ impl SemanticReservation {
 }
 
 pub(crate) struct SemanticCollectionLedger<'a> {
+    composition: SemanticCollectionComposition,
     external: &'a ConditionalNativeExclusions,
     history: &'a DeclaredSamplingHistory,
     seed: SamplingSeed,
@@ -912,8 +1054,13 @@ impl<'a> SemanticCollectionLedger<'a> {
                 if roster.contains_family(&family) {
                     return Err("Semantic saved family overlaps frozen opponent lineage".into());
                 }
-                let binding = collection_binding(owner, self.external, self.history, pool)?;
-                let header = RecordHeader::new(
+                let binding = self.composition.bind(collection_binding(
+                    owner,
+                    self.external,
+                    self.history,
+                    pool,
+                )?)?;
+                let header = RecordHeader::new_composed(
                     scope.parent_checksum(),
                     member,
                     match pool {
@@ -921,6 +1068,7 @@ impl<'a> SemanticCollectionLedger<'a> {
                         PoolRef::Mixture(mixture) => Some(mixture.checksum()),
                     },
                     config,
+                    self.composition,
                 )?;
                 let audited =
                     audit_bound_record(raw, &header, config, roster, scope, &binding, || {
@@ -1001,9 +1149,27 @@ impl<'a> SemanticCollectionLedger<'a> {
         first: u64,
         replicate: u64,
     ) -> Result<Self, String> {
+        Self::new_composed(
+            external,
+            history,
+            seed,
+            first,
+            replicate,
+            SemanticCollectionComposition::LegacyV1,
+        )
+    }
+    pub(crate) fn new_composed(
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+        composition: SemanticCollectionComposition,
+    ) -> Result<Self, String> {
         first.checked_add(4).ok_or("Semantic ordinal overflow")?;
         let pins = history.pins.clone();
         Ok(Self {
+            composition,
             external,
             history,
             seed,
@@ -1278,7 +1444,7 @@ impl<'a> SemanticCollectionLedger<'a> {
 
             let configs: [NativeStochasticConfig; 4] = configs.try_into().map_err(|_| "Semantic plan shape")?;
             let parent = owner.metadata().0.to_string();
-            let binding = collection_binding(owner, self.external, self.history, pool)?;
+            let binding = self.composition.bind(collection_binding(owner, self.external, self.history, pool)?)?;
             let attempt = self.attempts + 1;
             let mut spent = self.spent.clone();
             spent.extend(families.iter().cloned());
@@ -1362,7 +1528,12 @@ impl<'a> SemanticCollectionLedger<'a> {
                             &(self.attempts, self.next, &self.spent, &self.streams),
                         )?
                     || batch.binding
-                        != collection_binding(owner, self.external, self.history, pool)?
+                        != self.composition.bind(collection_binding(
+                            owner,
+                            self.external,
+                            self.history,
+                            pool,
+                        )?)?
                 {
                     return Err(
                         "Semantic exact reserved parent/configuration/allocation differs".into(),
@@ -1386,7 +1557,7 @@ impl<'a> SemanticCollectionLedger<'a> {
                     // Reuse the outer whole-four checked scope. Its POST runs before
                     // any prepared result leaves, including a member or finish error.
                     let episode = if let Some(saved) = saved {
-                        let header = RecordHeader::new(
+                        let header = RecordHeader::new_composed(
                             &batch.parent,
                             i,
                             match pool {
@@ -1394,6 +1565,7 @@ impl<'a> SemanticCollectionLedger<'a> {
                                 _ => None,
                             },
                             config,
+                            self.composition,
                         )?;
                         // Raw DTOs stay private. Only this same source-owned
                         // fresh Core audit can seal a historical learner step.
@@ -1407,8 +1579,15 @@ impl<'a> SemanticCollectionLedger<'a> {
                             || create(config),
                         )?
                     } else {
-                        let collected =
-                            run(config, roster, scope, binding, None, || create(config))?;
+                        let collected = run_composed(
+                            config,
+                            roster,
+                            scope,
+                            binding,
+                            None,
+                            self.composition,
+                            || create(config),
+                        )?;
                         if !collected.complete() {
                             let error = collected
                                 .failure
@@ -1417,10 +1596,15 @@ impl<'a> SemanticCollectionLedger<'a> {
                             self.failed = Some(SemanticPlayingCollectedGame { record: collected });
                             return Err(error);
                         }
-                        let audited =
-                            run(config, roster, scope, binding, Some(&collected), || {
-                                create(config)
-                            })?;
+                        let audited = run_composed(
+                            config,
+                            roster,
+                            scope,
+                            binding,
+                            Some(&collected),
+                            self.composition,
+                            || create(config),
+                        )?;
                         seal(
                             audited,
                             config.clone(),
@@ -1499,7 +1683,15 @@ fn audit_bound_record(
     {
         return Err("Semantic saved callback/row bound or global index differs".into());
     }
-    let actual = run(config, roster, scope, binding, Some(&expected), start)?;
+    let actual = run_composed(
+        config,
+        roster,
+        scope,
+        binding,
+        Some(&expected),
+        header.composition(),
+        start,
+    )?;
     if crate::semantic_playing_rl_record::encode(header, &actual, config)? != raw {
         return Err("Semantic record numerical/decision bits differ after fresh replay".into());
     }
@@ -1548,12 +1740,33 @@ fn legal_choice(
     }
     Ok((decision, matches[0].clone()))
 }
+#[cfg(test)]
 fn run(
     config: &NativeStochasticConfig,
     roster: RosterRef<'_>,
     scope: &SemanticCollectionScope<'_>,
     binding: &str,
     expected: Option<&Record>,
+    start: impl FnOnce() -> Result<GameState, String>,
+) -> Result<Record, String> {
+    run_composed(
+        config,
+        roster,
+        scope,
+        binding,
+        expected,
+        SemanticCollectionComposition::LegacyV1,
+        start,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn run_composed(
+    config: &NativeStochasticConfig,
+    roster: RosterRef<'_>,
+    scope: &SemanticCollectionScope<'_>,
+    binding: &str,
+    expected: Option<&Record>,
+    composition: SemanticCollectionComposition,
     start: impl FnOnce() -> Result<GameState, String>,
 ) -> Result<Record, String> {
     let binding = hash(
@@ -1581,7 +1794,7 @@ fn run(
         ),
     )?;
     let mut record = Record {
-        binding,
+        binding: composition.bind(binding)?,
         callbacks: vec![],
         final_state: None,
         scores: vec![],
@@ -1607,6 +1820,25 @@ fn run(
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let guard_config = tzolkin_inference::trade_guard::TradeGuardConfig::default();
+    let guard_key = if composition == SemanticCollectionComposition::GuardedProposalV2 {
+        guard_config.configuration_key()?
+    } else {
+        String::new()
+    };
+    let mut sampled_histories =
+        (0..if composition == SemanticCollectionComposition::GuardedProposalV2 {
+            config.players()
+        } else {
+            0
+        })
+            .map(|_| {
+                tzolkin_inference::trade_guard::TradeHistory::new(
+                    guard_config.max_trades_per_episode,
+                    guard_config.max_public_state_bytes,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
     let mut source_bytes = 16 * 1024usize;
     let mut trace_bytes = 0usize;
     let result = (|| {
@@ -1653,6 +1885,11 @@ fn run(
             for guard in guards.iter_mut().flatten() {
                 guard.on_callback(index, &o)?;
             }
+            for (actor, history) in sampled_histories.iter_mut().enumerate() {
+                if actor != o.actor || !tzolkin_inference::trade_guard::is_trade(&o) {
+                    history.reset();
+                }
+            }
             record.callbacks.push(Callback {
                 index,
                 observation: o,
@@ -1691,7 +1928,11 @@ fn run(
                     .checked_add(o.legal_actions.len())
                     .ok_or("Semantic row overflow")?;
                 trace_bytes = trace_bytes
-                    .checked_add(4096)
+                    .checked_add(if composition == SemanticCollectionComposition::LegacyV1 {
+                        4096
+                    } else {
+                        8192
+                    })
                     .ok_or("Semantic trace overflow")?;
                 if rows > config.limits().max_candidate_rows()
                     || trace_bytes > config.limits().max_trace_bytes()
@@ -1722,9 +1963,9 @@ fn run(
                         actor: o.actor,
                         observation_key: o.observation_key.clone(),
                         policy_version: if learner {
-                            SAMPLING_VERSION
+                            composition.sampling_version()
                         } else {
-                            OPPONENT_SAMPLING_VERSION
+                            composition.opponent_version()
                         }
                         .into(),
                         r#move: chosen.r#move.clone(),
@@ -1764,7 +2005,29 @@ fn run(
                     record.opponent_samples += 1;
                 }
                 record.rows = rows;
-                if let Some(snapshot) = sampled_snapshot {
+                if composition == SemanticCollectionComposition::GuardedProposalV2 {
+                    let applied = guarded_sample_choice(
+                        sample.index,
+                        &sample.decision.policy_version,
+                        &prediction.logits,
+                        &mut sampled_histories[o.actor],
+                        &guard_key,
+                        index,
+                        o,
+                    )?;
+                    if let Some(snapshot) = sampled_snapshot {
+                        Choice::GuardedOpponentSample {
+                            proposal: Box::new(sample),
+                            snapshot: snapshot.binding().into(),
+                            applied,
+                        }
+                    } else {
+                        Choice::GuardedLearnerPlaying {
+                            proposal: Box::new(sample),
+                            applied,
+                        }
+                    }
+                } else if let Some(snapshot) = sampled_snapshot {
                     Choice::OpponentSample {
                         sample: Box::new(sample),
                         snapshot: snapshot.binding().into(),
@@ -1799,6 +2062,64 @@ fn run(
     }
     Ok(record)
 }
+
+/// The proposal keeps its original full-legal likelihood and RNG draw. Only the
+/// separate applied choice is passed to Core; no rejection or redraw occurs.
+fn guarded_sample_choice(
+    proposal_index: usize,
+    policy_version: &str,
+    logits: &[f32],
+    history: &mut tzolkin_inference::trade_guard::TradeHistory,
+    configuration_key: &str,
+    index: usize,
+    o: &Observation,
+) -> Result<AppliedSampleChoice, String> {
+    use tzolkin_inference::trade_guard::{is_trade, public_bytes, skip_index};
+    let mut effective = proposal_index;
+    let trade = if is_trade(o) {
+        let skip = skip_index(o)?;
+        let bytes = public_bytes(o)?;
+        let public_state_sha256 = crate::model::digest(&bytes);
+        let t = history.transition(index, bytes, proposal_index == skip)?;
+        if t.force_exit {
+            effective = skip;
+        }
+        Some(SampledTradeTrace {
+            configuration_key: configuration_key.into(),
+            public_state_sha256,
+            first_seen_index: t.first_seen_index,
+            repeat_seen: t.repeat_seen,
+            budget_reached: t.budget_reached,
+            overridden: t.force_exit,
+            count_before: t.count_before,
+            count_after: t.count_after,
+        })
+    } else {
+        None
+    };
+    let chosen = o
+        .legal_actions
+        .get(effective)
+        .ok_or("Guarded proposal applied index differs")?
+        .clone();
+    let score = *logits
+        .get(effective)
+        .ok_or("Guarded proposal applied logit differs")?;
+    if !score.is_finite() {
+        return Err("Guarded proposal applied logit is nonfinite".into());
+    }
+    Ok(AppliedSampleChoice {
+        decision: Decision {
+            actor: o.actor,
+            observation_key: o.observation_key.clone(),
+            r#move: chosen.r#move.clone(),
+            policy_version: policy_version.into(),
+            score: f64::from(score),
+        },
+        chosen,
+        trade,
+    })
+}
 fn seal(
     record: Record,
     config: NativeStochasticConfig,
@@ -1808,11 +2129,25 @@ fn seal(
     if !record.complete() {
         return Err("Semantic episode requires completed fresh audit".into());
     }
+    let composition = if record
+        .callbacks
+        .iter()
+        .any(|c| c.choice.as_ref().is_some_and(Choice::guarded))
+    {
+        SemanticCollectionComposition::GuardedProposalV2
+    } else {
+        SemanticCollectionComposition::LegacyV1
+    };
     let playing = record
         .callbacks
         .iter()
         .enumerate()
-        .filter_map(|(i, c)| matches!(c.choice, Some(Choice::LearnerPlaying(_))).then_some(i))
+        .filter_map(|(i, c)| {
+            c.choice
+                .as_ref()
+                .is_some_and(|choice| choice.role() == SemanticCallbackRole::LearnerPlaying)
+                .then_some(i)
+        })
         .collect::<Vec<_>>();
     let mut draws = [0_u64; 4];
     let mut own = 0;
@@ -1829,8 +2164,9 @@ fn seal(
             .ok_or("Missing audited semantic choice")?
         {
             Choice::LearnerPlaying(sample)
-                if actor == learner && callback.observation.phase == Phase::Playing =>
-            {
+            | Choice::GuardedLearnerPlaying {
+                proposal: sample, ..
+            } if actor == learner && callback.observation.phase == Phase::Playing => {
                 if sample.sample_index != own {
                     return Err("Learner sample ordinal differs".into());
                 }
@@ -1838,9 +2174,11 @@ fn seal(
                 Some(sample)
             }
             Choice::OpponentSample { sample, .. }
-                if actor != learner
-                    && sampled_opponents[actor]
-                    && callback.observation.phase == Phase::Playing =>
+            | Choice::GuardedOpponentSample {
+                proposal: sample, ..
+            } if actor != learner
+                && sampled_opponents[actor]
+                && callback.observation.phase == Phase::Playing =>
             {
                 if sample.sample_index != opponents {
                     return Err("Opponent sample ordinal differs".into());
@@ -1894,6 +2232,7 @@ fn seal(
         playing,
         rank: ranks[learner],
         winners,
+        composition,
     })
 }
 
@@ -2074,6 +2413,49 @@ pub(crate) fn mixed_trace_fixture(
         (refused.samples, refused.opponent_samples, refused.draws),
         (0, 0, [0; 4])
     );
+    let mode = SemanticCollectionComposition::GuardedProposalV2;
+    let guarded = run_composed(
+        config,
+        roster,
+        scope,
+        "synthetic-guarded-mixed",
+        None,
+        mode,
+        start,
+    )
+    .unwrap();
+    assert!(guarded.complete(), "{:?}", guarded.failure);
+    let sampled = guarded
+        .callbacks
+        .iter()
+        .filter(|c| matches!(c.choice, Some(Choice::GuardedOpponentSample { .. })))
+        .count();
+    assert_eq!(sampled, guarded.opponent_samples);
+    assert!(sampled > 0);
+    assert_eq!(
+        guarded.draws.iter().sum::<u64>(),
+        (guarded.samples + sampled) as u64
+    );
+    let header = RecordHeader::new_composed(
+        scope.parent_checksum(),
+        0,
+        Some(mixture.checksum()),
+        config,
+        mode,
+    )
+    .unwrap();
+    let raw = crate::semantic_playing_rl_record::encode(&header, &guarded, config).unwrap();
+    let audited = audit_bound_record(
+        &raw,
+        &header,
+        config,
+        roster,
+        scope,
+        "synthetic-guarded-mixed",
+        start,
+    )
+    .unwrap();
+    assert_eq!(audited.record, guarded);
 }
 
 #[cfg(test)]
@@ -2174,6 +2556,138 @@ pub(crate) fn phase_collection_fixture(
         let header = RecordHeader::new(scope.parent_checksum(), 0, None, &config).unwrap();
         let raw =
             crate::semantic_playing_rl_record::encode(&header, &episode.record, &config).unwrap();
+        let legacy: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(legacy["header"].get("composition").is_none());
+        assert!(legacy["header"].get("tradeGuard").is_none());
+        let mode = SemanticCollectionComposition::GuardedProposalV2;
+        let guarded = run_composed(
+            &config,
+            RosterRef::Legacy(&rosters[0]),
+            scope,
+            "synthetic-guarded-proposal",
+            None,
+            mode,
+            || Ok(last.clone()),
+        )
+        .unwrap();
+        assert!(guarded.complete(), "{:?}", guarded.failure);
+        let guarded_header =
+            RecordHeader::new_composed(scope.parent_checksum(), 0, None, &config, mode).unwrap();
+        let guarded_raw =
+            crate::semantic_playing_rl_record::encode(&guarded_header, &guarded, &config).unwrap();
+        assert!(
+            crate::semantic_playing_rl_record::decode::<Record>(&guarded_raw, &header, &config)
+                .is_err()
+        );
+        let mut replayed = audit_bound_record(
+            &guarded_raw,
+            &guarded_header,
+            &config,
+            RosterRef::Legacy(&rosters[0]),
+            scope,
+            "synthetic-guarded-proposal",
+            || Ok(last.clone()),
+        )
+        .unwrap();
+        assert_eq!(replayed.record, guarded);
+        assert_eq!(replayed.actor_draws()[0], replayed.playing_steps() as u64);
+        for i in 0..replayed.playing_steps() {
+            let s = replayed.step(i).unwrap();
+            assert_eq!(s.nominal_probability().to_bits(), s.sample.nominal_bits);
+            assert_eq!(s.chosen(), s.applied()); // This short non-Trade prefix has no override.
+        }
+        let applied = replayed
+            .record
+            .callbacks
+            .iter_mut()
+            .find_map(|c| match c.choice.as_mut() {
+                Some(Choice::GuardedLearnerPlaying { applied, .. }) => Some(applied),
+                _ => None,
+            })
+            .unwrap();
+        applied.decision.score += 1.0;
+        let tampered =
+            crate::semantic_playing_rl_record::encode(&guarded_header, &replayed.record, &config)
+                .unwrap();
+        assert!(
+            audit_bound_record(
+                &tampered,
+                &guarded_header,
+                &config,
+                RosterRef::Legacy(&rosters[0]),
+                scope,
+                "synthetic-guarded-proposal",
+                || Ok(last.clone())
+            )
+            .is_err()
+        );
+
+        // The shared reducer maps a supported raw proposal to a different applied
+        // move on the second exact state. It cannot mutate a proposal likelihood.
+        let mut trading = last.clone();
+        trading.current_player = 0;
+        trading.players[0]
+            .resources
+            .insert(tzolkin_core::Resource::Corn, 9);
+        trading.pending = Some(tzolkin_core::Pending {
+            title: "Trade".into(),
+            task: tzolkin_core::Task::Trade,
+            after: vec![],
+        });
+        let trade = observe(&trading, 0).unwrap();
+        let prediction = scope.distribution(&trade).unwrap();
+        let proposal = trade
+            .legal_actions
+            .iter()
+            .position(|a| {
+                matches!(
+                    a.action,
+                    tzolkin_core::observation::TypedAction::Trade { .. }
+                )
+            })
+            .unwrap();
+        let skip = tzolkin_inference::trade_guard::skip_index(&trade).unwrap();
+        let guard = tzolkin_inference::trade_guard::TradeGuardConfig::default();
+        let key = guard.configuration_key().unwrap();
+        let mut history = tzolkin_inference::trade_guard::TradeHistory::new(
+            guard.max_trades_per_episode,
+            guard.max_public_state_bytes,
+        )
+        .unwrap();
+        let first = guarded_sample_choice(
+            proposal,
+            GUARDED_SAMPLING_VERSION,
+            &prediction.logits,
+            &mut history,
+            &key,
+            0,
+            &trade,
+        )
+        .unwrap();
+        let second = guarded_sample_choice(
+            proposal,
+            GUARDED_SAMPLING_VERSION,
+            &prediction.logits,
+            &mut history,
+            &key,
+            1,
+            &trade,
+        )
+        .unwrap();
+        assert_eq!(first.chosen, trade.legal_actions[proposal]);
+        assert_eq!(second.chosen, trade.legal_actions[skip]);
+        assert!(second.trade.unwrap().overridden);
+        let reset = guarded_sample_choice(
+            proposal,
+            GUARDED_SAMPLING_VERSION,
+            &prediction.logits,
+            &mut history,
+            &key,
+            2,
+            &trade,
+        )
+        .unwrap();
+        assert_eq!(reset.chosen, first.chosen);
         assert!(
             crate::public_stochastic_record::decode_typed_record::<crate::replay::SeatPolicy>(&raw)
                 .is_err()

@@ -62,8 +62,8 @@ pub(super) struct Export {
     prior: Prior,
     permanent_allocation: ContentPin,
 }
-fn contracts() -> Value {
-    json!({"update":crate::semantic_playing_rl_update::UPDATE_VERSION,
+fn contracts(composition: SemanticCollectionComposition) -> Value {
+    let mut value = json!({"update":crate::semantic_playing_rl_update::UPDATE_VERSION,
         "featureSchema":crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA,
         "featureCount":crate::features::FEATURE_COUNT,
         "criticContract":crate::public_state_critic::CONTEXT_CONTRACT,
@@ -73,7 +73,17 @@ fn contracts() -> Value {
         "moves":tzolkin_core::observation::MOVE_SCHEMA,
         "sampling":crate::semantic_playing_rl_collection::SAMPLING_VERSION,
         "target":crate::semantic_playing_rl_collection::TARGET_CONTRACT,
-        "rng":crate::public_stochastic::RNG_VERSION,"kernel":"scalar"})
+        "rng":crate::public_stochastic::RNG_VERSION,"kernel":"scalar"});
+    if composition == SemanticCollectionComposition::GuardedProposalV2 {
+        value["update"] = crate::semantic_playing_rl_update::GUARDED_UPDATE_VERSION.into();
+        value["sampling"] = composition.sampling_version().into();
+        value["collectionComposition"] =
+            serde_json::to_value(composition).expect("closed composition serializes");
+        value["tradeGuard"] =
+            serde_json::to_value(tzolkin_inference::trade_guard::TradeGuardConfig::default())
+                .expect("closed guard serializes");
+    }
+    value
 }
 fn decode<T: serde::de::DeserializeOwned>(pin: &ContentPin) -> Result<T, String> {
     serde_json::from_value(unique_json(&pinned(pin, META_BYTES)?, META_BYTES)?)
@@ -84,7 +94,8 @@ fn read(input: &Input) -> Result<Payload, String> {
     let closed: Closed = decode(&input.close_declaration)?;
     let producer: ProducerClose = decode(&closed.producer_close)?;
     if payload.schema != SCHEMA
-        || payload.contracts != contracts()
+        || payload.contracts != contracts(payload.original.composition()?)
+        || payload.numerics.composition()? != payload.original.composition()?
         || closed.schema != CLOSE_SCHEMA
         || !restore::same_pin(&closed.checkpoint, &input.payload)?
         || payload.source_authenticated
@@ -376,7 +387,7 @@ fn emit(
     journal.require_closed()?;
     let payload = Payload {
         schema: SCHEMA.into(),
-        contracts: contracts(),
+        contracts: contracts(original.composition()?),
         original: serde_json::from_value(
             serde_json::to_value(original).map_err(|e| e.to_string())?,
         )

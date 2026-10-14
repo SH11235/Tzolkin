@@ -19,11 +19,13 @@ use crate::public_stochastic::SamplingSeed;
 use crate::public_stochastic_native::CollectionLimits;
 use crate::semantic_playing_rl_collection::{
     AuditedSemanticPlayingCohort, DeclaredSamplingHistory, PlannedSemanticReservation, PoolRef,
-    SemanticCollectionLedger, SemanticPlayingCollectedGame, SemanticReservation,
+    SemanticCollectionComposition, SemanticCollectionLedger, SemanticPlayingCollectedGame,
+    SemanticReservation,
 };
 use crate::semantic_playing_rl_pool::{FrozenSemanticSnapshot, SemanticFrozenMixture};
 
 pub const UPDATE_VERSION: &str = "semantic-playing-own-sum-quarter-recurrent-scalar-v1";
+pub const GUARDED_UPDATE_VERSION: &str = "semantic-playing-guarded-proposal-sum-quarter-scalar-v2";
 
 /// Descriptive, non-deserializable identity of this session's current state.
 /// Counts belong only to complete admitted updates from its own fresh root.
@@ -43,6 +45,10 @@ pub struct SemanticPlayingCurrentIdentity {
     checksum: String,
     #[serde(skip)]
     cohort: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection_composition: Option<SemanticCollectionComposition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trade_guard: Option<tzolkin_inference::trade_guard::TradeGuardConfig>,
 }
 impl SemanticPlayingCurrentIdentity {
     pub fn checksum(&self) -> &str {
@@ -73,7 +79,14 @@ impl SemanticPlayingCurrentIdentity {
         self.next
     }
     pub fn policy_version(&self) -> &'static str {
-        UPDATE_VERSION
+        if self.composition() == SemanticCollectionComposition::LegacyV1 {
+            UPDATE_VERSION
+        } else {
+            GUARDED_UPDATE_VERSION
+        }
+    }
+    pub fn composition(&self) -> SemanticCollectionComposition {
+        self.collection_composition.unwrap_or_default()
     }
     pub fn feature_schema(&self) -> u32 {
         crate::features::SEMANTIC_PLAYING_FEATURE_SCHEMA
@@ -111,6 +124,10 @@ pub struct SemanticPlayingJointReport {
     total_rows: usize,
     actor_draws: [[u64; 4]; 4],
     checksum: String,
+    /// Learner proposals/overrides, then sampled opponent proposals/overrides.
+    /// Probabilities and credit continue to describe full-legal latent draws.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    guarded_proposals: Option<[usize; 4]>,
 }
 impl SemanticPlayingJointReport {
     pub fn parent_checksum(&self) -> &str {
@@ -223,6 +240,7 @@ impl SemanticCheckpointState {
             &self.cohort,
             actor,
             critic,
+            self.composition()?,
         )?;
         if serde_json::to_value(&identity).map_err(|e| e.to_string())? != self.current
             || identity.updates == 0
@@ -232,6 +250,19 @@ impl SemanticCheckpointState {
             return Err("Semantic checkpoint identity differs".into());
         }
         Ok(identity)
+    }
+    pub(crate) fn composition(&self) -> Result<SemanticCollectionComposition, String> {
+        match self.current.get("collectionComposition") {
+            None => Ok(SemanticCollectionComposition::LegacyV1),
+            Some(value) => {
+                let composition: SemanticCollectionComposition =
+                    serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                if composition != SemanticCollectionComposition::GuardedProposalV2 {
+                    return Err("Semantic checkpoint explicit composition differs".into());
+                }
+                Ok(composition)
+            }
+        }
     }
 }
 impl<'a> SemanticPlayingJointSession<'a> {
@@ -280,7 +311,14 @@ impl<'a> SemanticPlayingJointSession<'a> {
         }
         let state =
             SemanticTrainingState::from_checkpoint(owner, &saved.root, saved.actor, saved.critic)?;
-        let mut ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
+        let mut ledger = SemanticCollectionLedger::new_composed(
+            external,
+            history,
+            seed,
+            first,
+            replicate,
+            identity.composition(),
+        )?;
         ledger.commit_admitted(BTreeSet::from([identity.checksum().to_string()]));
         ledger.recheck(&state.view(identity.checksum()))?;
         Ok(Self {
@@ -312,10 +350,66 @@ impl<'a> SemanticPlayingJointSession<'a> {
         actor_config: OneStepConfig,
         critic_config: ResidualFitConfig,
     ) -> Result<Self, String> {
+        Self::from_fresh_composed(
+            owner,
+            external,
+            history,
+            seed,
+            first,
+            replicate,
+            actor_config,
+            critic_config,
+            SemanticCollectionComposition::LegacyV1,
+        )
+    }
+    /// A distinct fresh guarded-proposal session from the same checked Human4
+    /// source. It does not migrate or relabel an earlier unguarded checkpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_fresh_guarded(
+        owner: SemanticPlayingRlOwner,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+        actor_config: OneStepConfig,
+        critic_config: ResidualFitConfig,
+    ) -> Result<Self, String> {
+        Self::from_fresh_composed(
+            owner,
+            external,
+            history,
+            seed,
+            first,
+            replicate,
+            actor_config,
+            critic_config,
+            SemanticCollectionComposition::GuardedProposalV2,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_fresh_composed(
+        owner: SemanticPlayingRlOwner,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+        actor_config: OneStepConfig,
+        critic_config: ResidualFitConfig,
+        composition: SemanticCollectionComposition,
+    ) -> Result<Self, String> {
         actor_config.validate()?;
         critic_config.check_callbacks(1)?;
         let state = SemanticTrainingState::from_fresh(owner)?;
-        let mut ledger = SemanticCollectionLedger::new(external, history, seed, first, replicate)?;
+        let mut ledger = SemanticCollectionLedger::new_composed(
+            external,
+            history,
+            seed,
+            first,
+            replicate,
+            composition,
+        )?;
         let root = state.root().checksum().to_string();
         let (identity, admitted) = ledger.with_checked(&state.view(&root), |scope| {
             let identity = make_identity(
@@ -330,6 +424,7 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 "fresh-root",
                 &actor_config,
                 &critic_config,
+                composition,
             )?;
             let admitted = BTreeSet::from([identity.checksum().to_string()]);
             Ok((identity, admitted))
@@ -531,6 +626,17 @@ impl<'a> SemanticPlayingJointSession<'a> {
                 ),
             )?;
         }
+        if let Some(counts) = report.guarded_proposals {
+            report.checksum = hash(
+                b"semantic-playing-guarded-proposal-report-v2\0",
+                &(
+                    &report.checksum,
+                    counts,
+                    self.identity.composition(),
+                    tzolkin_inference::trade_guard::TradeGuardConfig::default(),
+                ),
+            )?;
+        }
         let owner = self.state.view(self.identity.checksum());
         if let Some(mixture) = mixture {
             self.ledger
@@ -709,7 +815,12 @@ fn prepare(
     critic_config: &ResidualFitConfig,
     attempt: usize,
 ) -> Result<JointProposal, String> {
-    if scope.parent_checksum() != parent.checksum() || cohort.parent_checksum() != parent.checksum()
+    if scope.parent_checksum() != parent.checksum()
+        || cohort.parent_checksum() != parent.checksum()
+        || cohort
+            .episodes()
+            .iter()
+            .any(|e| e.composition() != parent.composition())
     {
         return Err("Semantic joint numerical parent mismatch".into());
     }
@@ -790,6 +901,7 @@ fn prepare(
         &cohort_checksum,
         actor_config,
         critic_config,
+        parent.composition(),
     )?;
     let report = SemanticPlayingJointReport {
         parent: parent.checksum().into(),
@@ -810,6 +922,7 @@ fn prepare(
             .sum(),
         actor_draws: episodes.each_ref().map(|e| *e.actor_draws()),
         checksum: String::new(),
+        guarded_proposals: cohort.guarded_proposals(),
     };
     let parameters = if updated {
         let model = PublicPolicyModel {
@@ -841,6 +954,7 @@ fn make_identity(
     cohort: &str,
     actor_config: &OneStepConfig,
     critic_config: &ResidualFitConfig,
+    composition: SemanticCollectionComposition,
 ) -> Result<SemanticPlayingCurrentIdentity, String> {
     let actor = crate::conditional_semantic_playing_rl::parameter_checksum(
         b"semantic-current-actor-bits-v1\0",
@@ -889,8 +1003,12 @@ fn make_identity(
         credit,
         attempts,
         next,
-        checksum,
+        checksum: composition.bind(checksum)?,
         cohort: cohort.into(),
+        collection_composition: (composition != SemanticCollectionComposition::LegacyV1)
+            .then_some(composition),
+        trade_guard: (composition != SemanticCollectionComposition::LegacyV1)
+            .then(tzolkin_inference::trade_guard::TradeGuardConfig::default),
     })
 }
 
@@ -994,6 +1112,91 @@ pub(crate) fn joint_fixture() {
         state.turn.count = 0;
         Ok(state)
     };
+    // The same checked source can start an explicitly distinct guarded session;
+    // legacy identity bytes have neither the mode nor a guard field.
+    let legacy_identity = serde_json::to_value(session.identity().unwrap()).unwrap();
+    assert!(legacy_identity.get("collectionComposition").is_none());
+    assert!(legacy_identity.get("tradeGuard").is_none());
+    let mut guarded = SemanticPlayingJointSession::from_fresh_guarded(
+        SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap(),
+        &external,
+        &history,
+        SamplingSeed::new(29),
+        100,
+        0,
+        OneStepConfig::default(),
+        ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        guarded.actor_parameters().unwrap(),
+        session.actor_parameters().unwrap()
+    );
+    assert_eq!(
+        guarded.critic_parameters().unwrap(),
+        session.critic_parameters().unwrap()
+    );
+    assert_ne!(
+        guarded.identity().unwrap().checksum(),
+        session.identity().unwrap().checksum()
+    );
+    let guard_parent = guarded.identity.checksum().to_string();
+    let mut guarded_seeds = (700..800)
+        .filter(|seed| split_for_family(&seed_family_id(*seed)).unwrap() == DatasetSplit::Train);
+    let families = std::array::from_fn(|_| guarded_seeds.next().unwrap());
+    let proposed = guarded
+        .ledger
+        .collect_fixture_using(
+            &guarded.state.view(&guard_parent),
+            families,
+            &pool,
+            limits,
+            |scope, cohort| {
+                prepare(
+                    scope,
+                    &guarded.identity,
+                    &cohort,
+                    &guarded.actor_config,
+                    &guarded.critic_config,
+                    1,
+                )
+            },
+            create,
+        )
+        .unwrap();
+    let report = guarded.admit(proposed).unwrap();
+    assert_eq!(report.guarded_proposals.unwrap()[0], report.counts[0]);
+    let saved = guarded.checkpoint_state().unwrap();
+    assert_eq!(
+        saved.composition().unwrap(),
+        SemanticCollectionComposition::GuardedProposalV2
+    );
+    let bytes = serde_json::to_vec(&saved).unwrap();
+    let saved: SemanticCheckpointState = serde_json::from_slice(&bytes).unwrap();
+    let restored_guard = SemanticPlayingJointSession::from_checkpoint(
+        SemanticPlayingRlOwner::from_prepared(&prepared, 11).unwrap(),
+        saved,
+        &external,
+        &history,
+        SamplingSeed::new(31),
+        guarded.identity.next,
+        0,
+        OneStepConfig::default(),
+        ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        restored_guard.identity().unwrap().composition(),
+        SemanticCollectionComposition::GuardedProposalV2
+    );
+    assert_eq!(
+        restored_guard.actor_parameters().unwrap(),
+        guarded.actor_parameters().unwrap()
+    );
+    assert_eq!(
+        restored_guard.critic_parameters().unwrap(),
+        guarded.critic_parameters().unwrap()
+    );
     for update in 1..=2 {
         let saved = (update == 2).then(|| session.checkpoint_state().unwrap());
         let mut warm_records = None;
