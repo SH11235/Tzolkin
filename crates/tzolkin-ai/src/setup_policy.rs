@@ -2,21 +2,15 @@
 use crate::Decision;
 use crate::policy::HeuristicWeights;
 use tzolkin_bot::policy::HeuristicRevision;
-use tzolkin_core::catalog::wealth;
 use tzolkin_core::observation::{LegalAction, Observation, TypedAction};
-use tzolkin_core::{Effect, GameMove, GearId, Phase, Resource, StartingWealth, TurnMode};
+use tzolkin_core::{GameMove, GearId, Phase, TurnMode};
 
-pub const POLICY_VERSION: &str = "corn-first-setup-v2";
+pub use tzolkin_bot::setup_policy::{
+    LEGACY_POLICY_VERSION, POLICY_VERSION, choose_move_with_weights,
+};
 pub const UXMAL_OPENING_POLICY_VERSION: &str = "corn-first-uxmal-opening-v2";
-pub const LEGACY_POLICY_VERSION: &str = "corn-first-setup-v1";
 pub const LEGACY_UXMAL_OPENING_POLICY_VERSION: &str = "corn-first-uxmal-opening-v1";
 
-fn policy_version(revision: HeuristicRevision) -> &'static str {
-    match revision {
-        HeuristicRevision::V1 => LEGACY_POLICY_VERSION,
-        HeuristicRevision::V2 => POLICY_VERSION,
-    }
-}
 fn opening_policy_version(revision: HeuristicRevision) -> &'static str {
     match revision {
         HeuristicRevision::V1 => LEGACY_UXMAL_OPENING_POLICY_VERSION,
@@ -24,79 +18,12 @@ fn opening_policy_version(revision: HeuristicRevision) -> &'static str {
     }
 }
 
-fn direct_corn(tile: &StartingWealth) -> i64 {
-    tile.resources.get(&Resource::Corn).copied().unwrap_or(0)
-        + tile
-            .effects
-            .iter()
-            .map(|effect| match effect {
-                Effect::Resources { resources } => {
-                    resources.get(&Resource::Corn).copied().unwrap_or(0)
-                }
-                _ => 0,
-            })
-            .sum::<i64>()
-}
-
-fn selected_corn(o: &Observation, ids: &[String]) -> Result<i64, String> {
-    if ids.len() != 2
-        || ids[0] == ids[1]
-        || ids.iter().any(|id| !o.private.wealth_offer.contains(id))
-    {
-        return Err("Corn-first setup requires two distinct own offered wealth tiles".into());
-    }
-    ids.iter()
-        .map(|id| {
-            wealth(id)
-                .map(direct_corn)
-                .ok_or_else(|| "Unknown starting wealth tile".into())
-        })
-        .sum()
-}
-
-/// Base 3/4-player setup orders wealth choices by direct corn, baseline score,
-/// then original legal order. `score` is the baseline tie-break score, not the
-/// primary corn objective or an estimate of expected utility. All other inputs
-/// retain the baseline move and score, with this candidate's explicit version.
-pub fn choose_move_with_weights(
-    o: &Observation,
-    weights: &HeuristicWeights,
-) -> Result<Decision, String> {
-    choose_move_for_revision(o, weights, HeuristicRevision::V2)
-}
 pub(crate) fn choose_move_for_revision(
     o: &Observation,
     weights: &HeuristicWeights,
     revision: HeuristicRevision,
 ) -> Result<Decision, String> {
-    let mut decision = tzolkin_bot::choose_move_with_weights_for_revision(o, weights, revision)?;
-    decision.policy_version = policy_version(revision).into();
-    if o.phase != Phase::Setup
-        || !(3..=4).contains(&o.players.len())
-        || o.additional_buildings
-        || o.expansion.is_some()
-    {
-        return Ok(decision);
-    }
-    let mut best = None;
-    for legal in &o.legal_actions {
-        if let TypedAction::ChooseWealth { ids } = &legal.action {
-            let corn = selected_corn(o, ids)?;
-            let score =
-                tzolkin_bot::policy::score_action_for_revision(o, &legal.action, weights, revision);
-            if best
-                .as_ref()
-                .is_none_or(|(_, c, s)| corn > *c || (corn == *c && score > *s))
-            {
-                best = Some((legal, corn, score));
-            }
-        }
-    }
-    if let Some((legal, _, score)) = best {
-        decision.r#move = legal.r#move.clone();
-        decision.score = score;
-    }
-    Ok(decision)
+    tzolkin_bot::setup_policy::choose_move_for_revision(o, weights, revision)
 }
 
 fn first_uxmal_opening(o: &Observation) -> Option<&LegalAction> {
@@ -227,8 +154,9 @@ mod tests {
     use super::*;
     use crate::policy::score_action;
     use crate::replay::{self, ReplaySource, SeatPolicy};
+    use tzolkin_core::catalog::wealth;
     use tzolkin_core::observation::{observation_key, observe};
-    use tzolkin_core::{GameOptions, apply_move, create_game_with_options};
+    use tzolkin_core::{Effect, GameOptions, Resource, apply_move, create_game_with_options};
 
     fn setup(players: usize, seed: u32, options: GameOptions) -> tzolkin_core::GameState {
         create_game_with_options(
@@ -248,7 +176,24 @@ mod tests {
         else {
             panic!("wealth expected")
         };
-        selected_corn(o, ids).unwrap()
+        // The fixture independently reads the offered catalog effects; the
+        // production selector has moved to Bot and remains a single body.
+        ids.iter()
+            .map(|id| {
+                let tile = wealth(id).unwrap();
+                tile.resources.get(&Resource::Corn).copied().unwrap_or(0)
+                    + tile
+                        .effects
+                        .iter()
+                        .map(|effect| match effect {
+                            Effect::Resources { resources } => {
+                                resources.get(&Resource::Corn).copied().unwrap_or(0)
+                            }
+                            _ => 0,
+                        })
+                        .sum::<i64>()
+            })
+            .sum()
     }
 
     fn playing_with_wealth(players: usize, seed: u32, choice_id: &str) -> tzolkin_core::GameState {
@@ -453,18 +398,38 @@ mod tests {
                 .max()
                 .unwrap();
             assert_eq!(corn(&o, &chosen.r#move), maximum);
+            for revision in [HeuristicRevision::V1, HeuristicRevision::V2] {
+                assert_eq!(
+                    choose_move_for_revision(&o, &weights, revision).unwrap(),
+                    tzolkin_bot::setup_policy::choose_move_for_revision(&o, &weights, revision)
+                        .unwrap()
+                );
+            }
+            let legal = o
+                .legal_actions
+                .iter()
+                .find(|a| a.r#move == chosen.r#move)
+                .unwrap();
+            assert_eq!(
+                chosen.score.to_bits(),
+                tzolkin_bot::policy::score_action_for_revision(
+                    &o,
+                    &legal.action,
+                    &weights,
+                    HeuristicRevision::V2,
+                )
+                .to_bits()
+            );
+            let mut missing_offer = o.clone();
+            missing_offer.private.wealth_offer.clear();
+            missing_offer.observation_key = observation_key(&missing_offer).unwrap();
+            assert!(choose_move_with_weights(&missing_offer, &weights).is_err());
             let after = apply_move(&state, chosen.r#move).unwrap();
             assert_eq!(
                 after.players[o.actor].resources[&Resource::Corn],
                 o.players[o.actor].resources[0] + maximum
             );
         }
-        let mut tile = wealth("w15").unwrap().clone();
-        assert_eq!(direct_corn(&tile), 0); // Worker+1 is not future corn.
-        tile.effects.push(Effect::Resources {
-            resources: [(Resource::Corn, 2), (Resource::Gold, 3)].into(),
-        });
-        assert_eq!(direct_corn(&tile), 2);
     }
 
     #[test]
@@ -556,7 +521,11 @@ mod tests {
                     tzolkin_bot::choose_move_with_weights_for_revision(&o, &weights, revision)
                         .unwrap();
                 let mut expected = baseline.clone();
-                expected.policy_version = policy_version(revision).into();
+                expected.policy_version = match revision {
+                    HeuristicRevision::V1 => LEGACY_POLICY_VERSION,
+                    HeuristicRevision::V2 => POLICY_VERSION,
+                }
+                .into();
                 assert_eq!(
                     choose_move_for_revision(&o, &weights, revision).unwrap(),
                     expected

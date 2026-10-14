@@ -1,5 +1,6 @@
 //! Deterministic, untrained policy operating exclusively on an actor observation.
 pub mod policy;
+pub mod setup_policy;
 use serde::{Deserialize, Serialize};
 use tzolkin_core::GameMove;
 use tzolkin_core::observation::{MOVE_SCHEMA, OBSERVATION_SCHEMA, Observation, observation_key};
