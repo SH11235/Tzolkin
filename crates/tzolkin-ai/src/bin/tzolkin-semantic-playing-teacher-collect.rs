@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
-    fs::{self, File},
+    fs,
     io::{self, Write},
     path::{Component, Path, PathBuf},
 };
@@ -13,11 +13,12 @@ use tzolkin_ai::{
     dataset::{DatasetSplit, MAX_REPLAY_BYTES, seed_family_id, split_for_family},
     human_initial_wealth::ContentPin,
     policy::HeuristicWeights,
+    policy_dataset::publish_bytes,
     policy_training::validate_new_output_directory,
     public_rl_paired_session::read_bounded,
     replay::{self, ReplaySource},
     semantic_playing_teacher_dataset::{
-        MAX_GAMES, MAX_STORED_BYTES, export_semantic_playing_teacher_files,
+        MAX_GAMES, MAX_STORED_BYTES, TeacherGame, export_semantic_playing_teacher_files,
     },
     setup_policy,
 };
@@ -26,11 +27,12 @@ use tzolkin_core::{GameOptions, Phase};
 const SCHEMA: &str = "tzolkin-corn-first-v5-teacher-collect-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 const MAX_REPORT: u64 = 64 * 1024;
-// Originals plus the exporter's <=256MiB dataset plus report fit <=512MiB.
-const MAX_ORIGINALS: u64 = MAX_STORED_BYTES - MAX_REPORT;
+// Reserve both report links if staging cleanup fails after atomic publication.
+// Originals + <=256MiB dataset + both <=64KiB links fit <=512MiB.
+const MAX_ORIGINALS: u64 = MAX_STORED_BYTES - 2 * MAX_REPORT;
 const HELP: &str = "tzolkin-semantic-playing-teacher-collect CONTROL.json CONTROL_SHA256 NEW_OUTPUT_DIR\nAll paths must be absolute local paths. Closed control: schema=tzolkin-corn-first-v5-teacher-collect-v1, globalExclusions={pin:{path,bytes,sha256},count,canonicalDigest}, games=[{players,seed,role}]. Supply 1..64 distinct prospective base 3/4p families with their natural train/validation role; Test is refused. The pinned exclusions use tzolkin-conditional-native-exclusions-v1 and must declare the complete prior union. Permanent allocation and completeness are the caller's responsibility, not authenticated by this command.\nUses fixed all-seat CornFirst/default-weight Setup and ResourceCycle V5 Playing, then independent replay/teacher verification and semantic4 export. Control <=1MiB, exclusions <=32MiB, each original <=64MiB, originals+dataset+report <=512MiB; dataset/cache/row/candidate caps remain unchanged. Use an external wall/process watchdog. There is no retry or seed selection. On refusal retained originals and any incomplete export remain; only exit0 with report.json denotes whole-command completion. No Human origin, model, training, fresh Test, strength or adoption authority is granted.";
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Game {
     players: usize,
@@ -152,6 +154,27 @@ fn with_post<T>(result: Result<T, String>, post: Result<(), String>) -> Result<T
         (Err(error), Err(post)) => Err(format!("{error}; {post}")),
     }
 }
+fn publish_report(
+    output: &Path,
+    control: &ContentPin,
+    external: &ContentPin,
+    result: Result<Vec<u8>, String>,
+) -> Result<(), String> {
+    let prepared = result.and_then(|bytes| {
+        if bytes.len() as u64 > MAX_REPORT {
+            return Err("Collector report exceeds byte cap".into());
+        }
+        local(output)?;
+        Ok(bytes)
+    });
+    let bytes = with_post(prepared, inputs_post(control, external))?;
+    // All source POST and other fallible checks precede this final commit. A
+    // publication error still checks inputs; success has no later source check.
+    match publish_bytes(output, "report.json", &bytes) {
+        Ok(()) => Ok(()),
+        Err(error) => with_post(Err(error), inputs_post(control, external)),
+    }
+}
 fn destination(output: &Path, inputs: &[&Path]) -> Result<PathBuf, String> {
     local(output)?;
     validate_new_output_directory(output)?;
@@ -194,6 +217,30 @@ struct Original {
     file: String,
     bytes: u64,
     sha256: String,
+}
+fn join_export(
+    control: &Control,
+    originals: &[Original],
+    games: &[TeacherGame],
+) -> Result<(), String> {
+    if originals.len() != control.games.len() || games.len() != control.games.len() {
+        return Err("Exported teacher game count differs from declaration".into());
+    }
+    for ((declared, original), exported) in control.games.iter().zip(originals).zip(games) {
+        let family = seed_family_id(declared.seed);
+        if original.game != *declared
+            || original.family_id != family
+            || exported.seed != declared.seed
+            || exported.players != declared.players
+            || exported.split != declared.role
+            || exported.family_id != family
+            || exported.source_bytes != original.bytes
+            || exported.source_sha256 != original.sha256
+        {
+            return Err("Exported teacher source differs from declared saved original".into());
+        }
+    }
+    Ok(())
 }
 fn collect(control: &Control, output: &Path) -> Result<serde_json::Value, String> {
     let mut originals = Vec::new();
@@ -250,7 +297,11 @@ fn collect(control: &Control, output: &Path) -> Result<serde_json::Value, String
     // source, row, candidate and cache allocations before creating the dataset.
     // A refusal deliberately leaves every completed original in place.
     let manifest = export_semantic_playing_teacher_files(&paths, &output.join("dataset"))?;
+    join_export(control, &originals, &manifest.games)?;
     let manifest_raw = read_bounded(&output.join("dataset/manifest.json"), MAX_CONTROL)?;
+    if manifest_raw != serde_json::to_vec(&manifest).map_err(|e| e.to_string())? {
+        return Err("Published teacher manifest differs from returned export".into());
+    }
     Ok(serde_json::json!({
         "schema":"tzolkin-corn-first-v5-teacher-collection-report-v1",
         "complete":true, "originals":originals, "originalBytes":stored,
@@ -297,31 +348,14 @@ fn run(args: &[String]) -> Result<(), String> {
         control.validate(&excluded)?;
         destination(output, &[control_path, Path::new(&external.pin.path)])?;
         let mut report = collect(&control, output)?;
-        inputs_post(&control_pin, &external.pin)?;
         report["controlSha256"] = serde_json::json!(control_pin.sha256);
         report["globalExclusions"] = serde_json::json!({
             "rawSha256":external.pin.sha256,"count":external.count,
             "canonicalDigest":external.canonical_digest,"completenessAuthenticated":false
         });
-        let bytes = serde_json::to_vec(&report).map_err(|e| e.to_string())?;
-        if bytes.len() as u64 > MAX_REPORT {
-            return Err("Collector report exceeds byte cap".into());
-        }
-        local(output)?;
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(output.join("report.json"))
-            .map_err(|e| e.to_string())?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|e| e.to_string())?;
-        Ok(())
+        serde_json::to_vec(&report).map_err(|e| e.to_string())
     })();
-    with_post(
-        result,
-        inputs_post(&control_pin, &control.global_exclusions.pin),
-    )?;
+    publish_report(output, &control_pin, &control.global_exclusions.pin, result)?;
     println!(
         "Completed fixed CornFirst/V5 originals and verified semantic4 dataset; no training or strength qualification"
     );
@@ -337,7 +371,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::hash_map::RandomState, hash::BuildHasher};
+    use std::{collections::hash_map::RandomState, fs::File, hash::BuildHasher};
 
     #[test]
     fn closed_control_refusals_and_input_post() {
@@ -386,6 +420,44 @@ mod tests {
             "games":[{"players":3,"seed":train,"role":"train"}]});
         let mut control: Control = serde_json::from_value(value.clone()).unwrap();
         control.validate(&excluded).unwrap();
+        let originals = [Original {
+            game: control.games[0].clone(),
+            family_id: seed_family_id(train),
+            file: "originals/replay-00.json".into(),
+            bytes: 17,
+            sha256: "a".repeat(64),
+        }];
+        // Only a metadata join oracle, not a verified synthetic replay/dataset.
+        let exported = TeacherGame {
+            game_id: "b".repeat(64),
+            family_id: seed_family_id(train),
+            seed: train,
+            split: DatasetSplit::Train,
+            players: 3,
+            source_file: "sources/source-000000.json".into(),
+            source_bytes: 17,
+            source_sha256: "a".repeat(64),
+            row_file: "rows-000000.jsonl".into(),
+            row_bytes: 1,
+            row_sha256: "c".repeat(64),
+            counts: Default::default(),
+        };
+        join_export(&control, &originals, std::slice::from_ref(&exported)).unwrap();
+        assert!(join_export(&control, &originals, &[]).is_err());
+        assert!(join_export(&control, &[], std::slice::from_ref(&exported)).is_err());
+        for (key, replacement) in [
+            ("seed", serde_json::json!(train + 1)),
+            ("players", serde_json::json!(4)),
+            ("split", serde_json::json!("validation")),
+            ("familyId", serde_json::json!("d".repeat(64))),
+            ("sourceBytes", serde_json::json!(18)),
+            ("sourceSha256", serde_json::json!("e".repeat(64))),
+        ] {
+            let mut changed = serde_json::to_value(&exported).unwrap();
+            changed[key] = replacement;
+            let changed: TeacherGame = serde_json::from_value(changed).unwrap();
+            assert!(join_export(&control, &originals, &[changed]).is_err());
+        }
         control.games.push(control.games[0].clone());
         control.games[1].players = 4; // Same family across player counts is reused.
         assert!(control.validate(&excluded).is_err());
@@ -433,13 +505,33 @@ mod tests {
         unknown["options"] = serde_json::json!({});
         assert!(serde_json::from_value::<Control>(unknown).is_err());
         assert!(inputs_post(&pin, &pin).is_ok());
+        struct ReportDirectory(PathBuf);
+        impl Drop for ReportDirectory {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.0.join("report.json"));
+                let _ = fs::remove_file(self.0.join(".report.json.tmp"));
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+        let directory = owned.0.with_extension("report");
+        fs::create_dir(&directory).unwrap();
+        let directory = ReportDirectory(directory);
+        let report = b"{\"complete\":true}".to_vec();
         fs::write(&owned.0, b"changed").unwrap();
+        assert!(publish_report(&directory.0, &pin, &pin, Ok(report.clone())).is_err());
+        assert!(!directory.0.join("report.json").exists());
         assert!(
             with_post::<()>(Err("original failure".into()), inputs_post(&pin, &pin))
                 .unwrap_err()
                 .starts_with("original failure; Collector input POST:")
         );
         assert!(with_post(Ok(()), inputs_post(&pin, &pin)).is_err());
+        fs::write(&owned.0, &raw).unwrap();
+        publish_report(&directory.0, &pin, &pin, Ok(report.clone())).unwrap();
+        assert_eq!(fs::read(directory.0.join("report.json")).unwrap(), report);
+        assert!(publish_report(&directory.0, &pin, &pin, Ok(b"different".to_vec())).is_err());
+        assert_eq!(fs::read(directory.0.join("report.json")).unwrap(), report);
+        assert!(!directory.0.join(".report.json.tmp").exists());
         let mut count = CountBytes { bytes: 0, cap: 3 };
         count.write_all(b"abc").unwrap();
         assert!(count.write_all(b"d").is_err());

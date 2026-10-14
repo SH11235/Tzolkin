@@ -670,7 +670,9 @@ fn strata(games: &[PolicyDatasetGame]) -> Vec<PolicyDatasetStratum> {
         )
         .collect()
 }
-pub(crate) fn publish_bytes(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+/// Atomically create a new final file; staging cleanup cannot undo its commit.
+/// The caller must bound bytes and validate the local directory and filename.
+pub fn publish_bytes(directory: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     let temp = directory.join(format!(".{name}.tmp"));
     let mut created = false;
     let result = (|| {
