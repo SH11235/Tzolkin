@@ -637,6 +637,11 @@ pub(super) struct ConditionalDecision {
     pub decision: Decision,
     pub trade: Option<GuardedTradeTrace>,
     pub requested_index: usize,
+    pub opening: Option<OpeningSelection>,
+}
+pub(super) struct OpeningSelection {
+    pub placement_count: usize,
+    pub changed_move: bool,
 }
 
 // Keep the legacy public Setup composition separate from all-phase actor inference.
@@ -645,6 +650,7 @@ enum SetupRoute {
     CornFirst,
     SemanticPlayingCornFirst,
     NativeTeacherPlayingCornFirst(TeacherProfile),
+    NativeV7FundedUxmalPlayingCornFirst,
     CurrentSnapshotPlayingCornFirst,
     CheckpointPolicyPlayingCornFirst,
     NumericAllPhase(&'static str),
@@ -659,6 +665,9 @@ impl SetupRoute {
                 TeacherProfile::V5 => super::teacher::SEMANTIC_PLAYING_POLICY_VERSION,
                 TeacherProfile::V7 => super::teacher::SEMANTIC_PLAYING_V7_POLICY_VERSION,
             },
+            Self::NativeV7FundedUxmalPlayingCornFirst => {
+                super::teacher::SEMANTIC_PLAYING_V7_FUNDED_UXMAL_POLICY_VERSION
+            }
             Self::CurrentSnapshotPlayingCornFirst => super::semantic_snapshot::POLICY_VERSION,
             Self::CheckpointPolicyPlayingCornFirst => {
                 super::semantic_snapshot::CHECKPOINT_POLICY_VERSION
@@ -691,7 +700,11 @@ impl GameSession {
         policy: &super::teacher::SemanticPlayingTeacherArenaPolicy<'_>,
     ) -> Self {
         Self::with_route(
-            SetupRoute::NativeTeacherPlayingCornFirst(policy.prepared.profile()),
+            if policy.funded_uxmal_opening {
+                SetupRoute::NativeV7FundedUxmalPlayingCornFirst
+            } else {
+                SetupRoute::NativeTeacherPlayingCornFirst(policy.prepared.profile())
+            },
             &policy.identity().guard,
         )
         .expect("native teacher constructor validated guard configuration")
@@ -916,6 +929,7 @@ impl GameSession {
                         SetupRoute::CornFirst
                             | SetupRoute::SemanticPlayingCornFirst
                             | SetupRoute::NativeTeacherPlayingCornFirst(_)
+                            | SetupRoute::NativeV7FundedUxmalPlayingCornFirst
                             | SetupRoute::CurrentSnapshotPlayingCornFirst
                             | SetupRoute::CheckpointPolicyPlayingCornFirst
                     ) =>
@@ -980,6 +994,29 @@ impl GameSession {
             } else {
                 None
             };
+            // Keep the NN's single forward/raw index and Trade history intact.
+            // The existing helper accepts only a wholly funded, non-pending
+            // first-player prefix. No post-session move replacement is used.
+            let opening = if matches!(self.setup, SetupRoute::NativeV7FundedUxmalPlayingCornFirst)
+                && !is_trade(o)
+            {
+                crate::setup_policy::first_uxmal_opening(o)
+                    .map(|action| {
+                        effective = o
+                            .legal_actions
+                            .iter()
+                            .position(|a| a.r#move == action.r#move)
+                            .ok_or("Funded Uxmal selector returned no legal row")?;
+                        Ok::<_, String>(OpeningSelection {
+                            placement_count: usize::try_from(o.turn.count)
+                                .map_err(|_| "Funded Uxmal placement count")?,
+                            changed_move: effective != raw,
+                        })
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             if !scores[effective].is_finite() {
                 return Err("Nonfinite conditional decision".into());
             }
@@ -994,6 +1031,7 @@ impl GameSession {
                 },
                 trade,
                 requested_index: raw,
+                opening,
             })
         })();
         if result.is_err() {
@@ -1500,6 +1538,18 @@ mod tests {
             selected_native.policy_version,
             super::super::teacher::SEMANTIC_PLAYING_POLICY_VERSION
         );
+        let mut composite_setup = GameSession::with_route(
+            SetupRoute::NativeV7FundedUxmalPlayingCornFirst,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        composite_setup.on_callback(0, &o).unwrap();
+        let selected_composite = composite_setup
+            .choose_using(0, &o, |_| panic!("Composite must not predict Setup"))
+            .unwrap();
+        assert_eq!(selected_composite.decision.r#move, selected.r#move);
+        assert_eq!(selected_composite.decision.score, selected.score);
+        assert!(selected_composite.opening.is_none());
         assert!(
             super::super::teacher::semantic_playing_distribution(model.parameters(), scalar, &o)
                 .is_err()
@@ -1657,6 +1707,196 @@ mod tests {
             super::super::teacher::SEMANTIC_PLAYING_POLICY_VERSION
         );
         assert!(native.choose_using(0, &o, |_| unreachable!()).is_err());
+
+        // Bounded real Core prefixes, with a deliberately contrary finite NN
+        // response. Both routes invoke the predictor once and keep its raw row.
+        let playing_with = |players: usize, seed, pair: &str| {
+            let mut state = create_game(
+                (0..players).map(|i| format!("Seat {i}")).collect(),
+                seed,
+                false,
+            )
+            .unwrap();
+            state = apply_move(
+                &state,
+                tzolkin_core::GameMove::Choose {
+                    choice_id: pair.into(),
+                },
+            )
+            .unwrap();
+            while state.phase == Phase::Setup {
+                let o = observe(&state, state.current_player).unwrap();
+                state = apply_move(
+                    &state,
+                    crate::setup_policy::choose_move_with_weights(&o, &HeuristicWeights::default())
+                        .unwrap()
+                        .r#move,
+                )
+                .unwrap();
+            }
+            state
+        };
+        let predict = |o: &Observation| {
+            let target = o
+                .legal_actions
+                .iter()
+                .position(|a| {
+                    matches!(
+                        a.r#move,
+                        tzolkin_core::GameMove::Place {
+                            gear: GearId::Yaxchilan
+                        }
+                    )
+                })
+                .unwrap_or(0);
+            let mut logits = vec![-2.5; o.legal_actions.len()];
+            logits[target] = 1.25;
+            let mut probabilities = vec![0.; o.legal_actions.len()];
+            probabilities[target] = 1.;
+            Ok(NumericPolicyDistribution {
+                logits,
+                probabilities,
+            })
+        };
+        let choose = |o: &Observation, composite| {
+            let route = if composite {
+                SetupRoute::NativeV7FundedUxmalPlayingCornFirst
+            } else {
+                SetupRoute::NativeTeacherPlayingCornFirst(TeacherProfile::V7)
+            };
+            let mut game = GameSession::with_route(route, &TradeGuardConfig::default()).unwrap();
+            game.on_callback(0, o).unwrap();
+            let calls = std::cell::Cell::new(0);
+            let selected = game
+                .choose_using(0, o, |o| {
+                    calls.set(calls.get() + 1);
+                    predict(o)
+                })
+                .unwrap();
+            assert_eq!(calls.get(), 1);
+            assert!(game.choose_using(0, o, |_| unreachable!()).is_err());
+            selected
+        };
+        for players in [3, 4] {
+            for (seed, pair, workers) in [(3, "wealth:w10:w11", 3), (1, "wealth:w15:w21", 4)] {
+                let mut state = playing_with(players, seed, pair);
+                assert_eq!(state.players[0].workers, workers);
+                let mut counts = super::super::numeric::FundedUxmalOpeningDiagnostics::default();
+                for count in 0..=3 {
+                    let o = observe(&state, state.current_player).unwrap();
+                    let raw = choose(&o, false);
+                    let composite = choose(&o, true);
+                    assert_eq!(raw.requested_index, composite.requested_index);
+                    assert!(raw.opening.is_none());
+                    let opening = composite.opening.unwrap();
+                    counts.record(&opening).unwrap();
+                    assert_eq!(opening.placement_count, count);
+                    assert_eq!(
+                        opening.changed_move,
+                        raw.decision.r#move != composite.decision.r#move
+                    );
+                    assert!(composite.trade.is_none());
+                    assert_eq!(
+                        composite.decision.policy_version,
+                        super::super::teacher::SEMANTIC_PLAYING_V7_FUNDED_UXMAL_POLICY_VERSION
+                    );
+                    assert_eq!(
+                        composite.decision.score,
+                        if opening.changed_move { -2.5 } else { 1.25 }
+                    );
+                    assert_eq!(
+                        composite.decision.r#move,
+                        if count < 3 {
+                            tzolkin_core::GameMove::Place {
+                                gear: GearId::Uxmal,
+                            }
+                        } else {
+                            tzolkin_core::GameMove::EndTurn {
+                                double_advance: None,
+                            }
+                        }
+                    );
+                    state = apply_move(&state, composite.decision.r#move).unwrap();
+                }
+                assert_eq!(counts.eligible_choices, 4);
+                assert_eq!(counts.eligible_by_placement_count, [1; 4]);
+                assert_eq!(
+                    counts.changed_moves,
+                    counts.changed_by_placement_count.iter().sum::<usize>()
+                );
+                assert_eq!(tzolkin_core::available_workers(&state, 0), workers - 3);
+                let later = observe(&state, state.current_player).unwrap();
+                assert!(choose(&later, true).opening.is_none());
+            }
+        }
+        let funded = playing_with(3, 3, "wealth:w10:w11");
+        let mut poor = funded.clone();
+        poor.players[0].resources.insert(Resource::Corn, 0);
+        let nonprefix = apply_move(
+            &funded,
+            tzolkin_core::GameMove::Place {
+                gear: GearId::Yaxchilan,
+            },
+        )
+        .unwrap();
+        let mut pending = funded.clone();
+        pending.pending = Some(Pending {
+            title: "Resource".into(),
+            task: Task::Resource { remaining: 1 },
+            after: vec![],
+        });
+        for state in [
+            poor,
+            nonprefix,
+            pending,
+            playing_with(3, 17, "wealth:w01:w19"),
+        ] {
+            let o = observe(&state, state.current_player).unwrap();
+            let raw = choose(&o, false);
+            let composite = choose(&o, true);
+            assert!(composite.opening.is_none());
+            assert_eq!(raw.requested_index, composite.requested_index);
+            assert_eq!(raw.decision.r#move, composite.decision.r#move);
+            assert_eq!(raw.decision.score, composite.decision.score);
+            assert_eq!(
+                serde_json::to_value(raw.trade).unwrap(),
+                serde_json::to_value(composite.trade).unwrap()
+            );
+        }
+        let mut trading = funded;
+        trading.players[0].resources.insert(Resource::Wood, 3);
+        trading.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        let o = observe(&trading, trading.current_player).unwrap();
+        let mut raw = GameSession::with_route(
+            SetupRoute::NativeTeacherPlayingCornFirst(TeacherProfile::V7),
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        let mut composite = GameSession::with_route(
+            SetupRoute::NativeV7FundedUxmalPlayingCornFirst,
+            &TradeGuardConfig::default(),
+        )
+        .unwrap();
+        for index in 0..2 {
+            raw.on_callback(index, &o).unwrap();
+            composite.on_callback(index, &o).unwrap();
+            let a = raw.choose_using(index, &o, predict).unwrap();
+            let b = composite.choose_using(index, &o, predict).unwrap();
+            assert!(b.opening.is_none());
+            assert_eq!(a.requested_index, b.requested_index);
+            assert_eq!(a.decision.r#move, b.decision.r#move);
+            assert_eq!(
+                serde_json::to_value(a.trade).unwrap(),
+                serde_json::to_value(b.trade).unwrap()
+            );
+        }
+        let legacy =
+            serde_json::to_value(super::super::numeric::GuardDiagnostics::default()).unwrap();
+        assert!(legacy.get("fundedUxmalOpening").is_none());
     }
     #[test]
     fn conditional_trade_uses_shared_history_and_resets_on_other_actor() {

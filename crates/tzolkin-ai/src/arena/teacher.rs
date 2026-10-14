@@ -371,6 +371,8 @@ pub const SEMANTIC_PLAYING_POLICY_VERSION: &str =
     "native-v5-teacher-playing4-corn-first-guarded-argmax-v1";
 pub const SEMANTIC_PLAYING_V7_POLICY_VERSION: &str =
     "native-v7-teacher-playing4-corn-first-guarded-argmax-v1";
+pub const SEMANTIC_PLAYING_V7_FUNDED_UXMAL_POLICY_VERSION: &str =
+    "native-v7-teacher-playing4-corn-first-funded-uxmal-guarded-argmax-v1";
 pub const SEMANTIC_PLAYING_ARENA_SCHEMA: &str =
     "tzolkin-native-playing4-teacher-paired-development-arena-v1";
 
@@ -460,6 +462,7 @@ impl PreparedSemanticPlayingTeacher {
         Ok(SemanticPlayingTeacherArenaPolicy {
             prepared: self,
             v7_agreement_diagnostics: false,
+            funded_uxmal_opening: false,
             identity: SemanticPlayingTeacherArenaIdentity {
                 policy_version: policy_version.into(),
                 model_version: model_version.into(),
@@ -474,6 +477,7 @@ impl PreparedSemanticPlayingTeacher {
                 feature_count: crate::features::FEATURE_COUNT,
                 setup_policy_version: crate::setup_policy::POLICY_VERSION.into(),
                 setup_weights: crate::policy::HeuristicWeights::default(),
+                opening_selector: None,
                 backend: self.kernel.backend().into(),
                 configuration_key: guard.configuration_key()?,
                 guard,
@@ -601,6 +605,8 @@ pub struct SemanticPlayingTeacherArenaIdentity {
     pub feature_count: usize,
     pub setup_policy_version: String,
     pub setup_weights: crate::policy::HeuristicWeights,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opening_selector: Option<FundedUxmalOpeningIdentity>,
     pub backend: String,
     pub guard: TradeGuardConfig,
     pub configuration_key: String,
@@ -608,10 +614,17 @@ pub struct SemanticPlayingTeacherArenaIdentity {
     pub source_authenticated: bool,
     pub strength_measured: bool,
 }
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FundedUxmalOpeningIdentity {
+    pub selector_version: String,
+    pub scope: String,
+}
 pub struct SemanticPlayingTeacherArenaPolicy<'a> {
     pub(super) prepared: &'a PreparedSemanticPlayingTeacher,
     identity: SemanticPlayingTeacherArenaIdentity,
     pub(super) v7_agreement_diagnostics: bool,
+    pub(super) funded_uxmal_opening: bool,
 }
 impl SemanticPlayingTeacherArenaPolicy<'_> {
     pub fn identity(&self) -> &SemanticPlayingTeacherArenaIdentity {
@@ -620,10 +633,28 @@ impl SemanticPlayingTeacherArenaPolicy<'_> {
     /// Counts a pure V7 shadow on the same legal callback after the existing
     /// numeric choice. This cannot change inference, own sources or grant labels.
     pub fn with_v7_agreement_diagnostics(mut self) -> Result<Self, String> {
-        if self.prepared.profile != crate::semantic_playing_teacher_dataset::TeacherProfile::V7 {
+        if self.prepared.profile != crate::semantic_playing_teacher_dataset::TeacherProfile::V7
+            || self.funded_uxmal_opening
+        {
             return Err("V7 agreement requires the typed V7 teacher origin".into());
         }
         self.v7_agreement_diagnostics = true;
+        Ok(self)
+    }
+    /// An explicit composite, keeping the raw NN argmax and its selected-row
+    /// logit. It grants no teacher labels, training credit or App adoption.
+    pub fn with_v7_funded_uxmal_opening(mut self) -> Result<Self, String> {
+        if self.prepared.profile != crate::semantic_playing_teacher_dataset::TeacherProfile::V7
+            || self.v7_agreement_diagnostics
+        {
+            return Err("Funded Uxmal requires a plain typed V7 teacher handle".into());
+        }
+        self.funded_uxmal_opening = true;
+        self.identity.policy_version = SEMANTIC_PLAYING_V7_FUNDED_UXMAL_POLICY_VERSION.into();
+        self.identity.opening_selector = Some(FundedUxmalOpeningIdentity {
+            selector_version: crate::setup_policy::UXMAL_OPENING_POLICY_VERSION.into(),
+            scope: "base3-4pFirstPlayerWholeFundedUxmalPrefixOnly".into(),
+        });
         Ok(self)
     }
     #[cfg(test)]
