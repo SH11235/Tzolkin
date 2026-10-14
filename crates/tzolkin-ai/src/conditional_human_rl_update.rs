@@ -162,9 +162,6 @@ impl ConditionalNativeExclusions {
     pub(crate) fn contains_family(&self, family: &str) -> bool {
         self.families.contains(family)
     }
-    pub(crate) fn content_pin(&self) -> &ContentPin {
-        &self.descriptor.pin
-    }
 }
 // The declared union uses sorted UTF-8 lines, including the final LF. Its
 // descriptor and source identity are hashed separately in their own domains.

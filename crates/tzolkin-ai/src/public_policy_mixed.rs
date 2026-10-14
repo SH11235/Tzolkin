@@ -6,7 +6,8 @@ use crate::public_policy_baseline::{self, InitializedResidualBaseline, ResidualF
 use crate::public_policy_episode::AppliedActorStep;
 use crate::public_policy_paired_long::PairedRlParent;
 use crate::public_policy_update::{
-    self, Deltas, NumericReport, OneStepConfig, PhaseTimer, TimedPhase, Untimed, hash, timed,
+    self, Deltas, NumericActorStep, NumericReport, OneStepConfig, PhaseTimer, TimedPhase, Untimed,
+    hash, timed,
 };
 use crate::public_rl_artifact::InitializedPublicRlPolicy;
 use crate::public_rl_mixed_cohort::{COHORT_CONTRACT, ValidatedMixedRlCohort};
@@ -15,6 +16,7 @@ use crate::public_rl_mixed_session::ImportedMixedRlParent;
 use crate::public_state_critic::PublicStateContext;
 use crate::public_stochastic_native::numerical_target;
 use crate::replay::SeatPolicy;
+use crate::semantic_playing_rl_collection::SemanticPlayingActorStep;
 use serde::{Deserialize, Serialize};
 
 pub const ARTIFACT_SCHEMA: &str = "tzolkin-public-rl-mixed-joint-one-batch-v1";
@@ -519,12 +521,14 @@ pub(crate) fn prepare(
         residual,
     )?))
 }
-pub(crate) struct MixedNumericMember<'a> {
+pub(crate) struct NumericMember<S> {
     pub(crate) learner: usize,
     pub(crate) players: usize,
     pub(crate) coefficient: f64,
-    pub(crate) steps: Vec<AppliedActorStep<'a>>,
+    pub(crate) steps: Vec<S>,
 }
+pub(crate) type MixedNumericMember<'a> = NumericMember<AppliedActorStep<'a>>;
+pub(crate) type SemanticNumericMember<'a> = NumericMember<SemanticPlayingActorStep<'a>>;
 pub(crate) fn prepare_numeric(
     model: &PublicPolicyModel,
     residual: &[f32],
@@ -582,11 +586,11 @@ pub(crate) fn prepare_numeric_timed<T: PhaseTimer>(
 /// A numeric proposal only. The profile does not admit an original source or
 /// alter the actor-own SUM/4, frozen public384 critic or rounded-delta contract.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_numeric_timed_for_profile<T: PhaseTimer>(
+pub(crate) fn prepare_numeric_timed_for_profile<T: PhaseTimer, S: NumericActorStep>(
     profile: ConditionalFeatureProfile,
     model: &PublicPolicyModel,
     residual: &[f32],
-    members: &[MixedNumericMember<'_>; 4],
+    members: &[NumericMember<S>; 4],
     counts: [usize; 3],
     actor_config: &OneStepConfig,
     critic_config: &ResidualFitConfig,
@@ -613,7 +617,7 @@ pub(crate) fn prepare_numeric_timed_for_profile<T: PhaseTimer>(
     let mut deltas = Deltas::default();
     for e in members {
         let mut own = vec![0.0; public_model::PARAMETER_COUNT];
-        for step in e.steps.iter().map(AppliedActorStep::reborrow) {
+        for step in &e.steps {
             if step.actor() != e.learner || step.observation().players.len() != e.players {
                 return Err("Mixed update opponent/absolute learner actor mismatch".into());
             }
@@ -654,9 +658,7 @@ pub(crate) fn prepare_numeric_timed_for_profile<T: PhaseTimer>(
     let critic = timed(timer, TimedPhase::CriticFit, |_| {
         public_policy_baseline::fit_applied(
             residual,
-            members
-                .iter()
-                .flat_map(|e| e.steps.iter().map(AppliedActorStep::reborrow)),
+            members.iter().flat_map(|e| e.steps.iter()),
             counts[0],
             critic_config,
         )

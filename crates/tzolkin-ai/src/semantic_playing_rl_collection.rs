@@ -12,7 +12,9 @@ use crate::Decision;
 use crate::conditional_human_rl_update::{
     ConditionalFrozenMixRoster, ConditionalFrozenPool, ConditionalNativeExclusions,
 };
-use crate::conditional_semantic_playing_rl::{SemanticCollectionScope, SemanticPlayingRlOwner};
+use crate::conditional_semantic_playing_rl::{
+    SemanticCollectionScope, SemanticOwnerView, SemanticPlayingRlOwner,
+};
 use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
 use crate::human_initial_wealth::ContentPin;
 use crate::policy::HeuristicWeights;
@@ -403,6 +405,110 @@ impl AuditedSemanticPlayingCohort {
     pub fn credited_decisions(&self) -> u64 {
         0
     }
+    pub(crate) fn numeric_counts(&self) -> Result<[usize; 3], String> {
+        let mut counts = [0_usize; 3];
+        for episode in &self.episodes {
+            for i in 0..episode.playing_steps() {
+                let step = episode
+                    .step(i)
+                    .ok_or("Semantic sealed Playing step missing")?;
+                for (count, add) in counts.iter_mut().zip([
+                    1,
+                    step.observation().legal_actions.len(),
+                    usize::from(step.observation().legal_actions.len() == 1),
+                ]) {
+                    *count = count
+                        .checked_add(add)
+                        .ok_or("Semantic numeric count overflow")?;
+                }
+            }
+        }
+        Ok(counts)
+    }
+    pub(crate) fn seal_checksum(&self) -> Result<String, String> {
+        let mut records = Vec::new();
+        for episode in &self.episodes {
+            let mut callbacks = Vec::new();
+            for callback in &episode.record.callbacks {
+                let choice = callback
+                    .choice
+                    .as_ref()
+                    .ok_or("Semantic sealed choice missing")?;
+                let sample = if let Choice::LearnerPlaying(s) = choice {
+                    Some(hash(
+                        b"semantic-joint-applied-sample-v1\0",
+                        &(
+                            (&s.chosen, &s.decision, s.index, s.sample_index),
+                            (s.before, s.after, s.draws_before, s.raw, s.u53, s.mass),
+                            (
+                                s.nominal_bits,
+                                s.logp_bits,
+                                s.logit_bits,
+                                s.rows_before,
+                                s.rows_after,
+                            ),
+                            (&s.legal_digest, &s.logits_digest, &s.distribution_digest),
+                        ),
+                    )?)
+                } else {
+                    None
+                };
+                let role = match choice.role() {
+                    SemanticCallbackRole::LearnerSetup => 0,
+                    SemanticCallbackRole::LearnerPlaying => 1,
+                    SemanticCallbackRole::Opponent => 2,
+                };
+                callbacks.push(hash(
+                    b"semantic-joint-applied-callback-v1\0",
+                    &(
+                        callback.index,
+                        &callback.observation,
+                        &callback.before,
+                        role,
+                        choice.decision(),
+                        callback.apply_attempted,
+                        &callback.after,
+                        sample,
+                    ),
+                )?);
+            }
+            let identity = episode.config.sampling_identity();
+            records.push(hash(
+                b"semantic-joint-audited-episode-v1\0",
+                &(
+                    (
+                        episode.config.players(),
+                        episode.config.environment_seed(),
+                        identity.sampling_seed().value(),
+                        identity.episode_ordinal(),
+                        identity.replicate_ordinal(),
+                    ),
+                    (
+                        &episode.record.binding,
+                        callbacks,
+                        &episode.record.final_state,
+                        &episode.record.scores,
+                    ),
+                    (
+                        episode.record.draws,
+                        episode.record.samples,
+                        episode.record.rows,
+                        episode.rank,
+                        episode.winners,
+                    ),
+                ),
+            )?);
+        }
+        hash(
+            b"semantic-joint-audited-whole-four-v1\0",
+            &(
+                &self.parent,
+                &self.families,
+                &self.human_reservations,
+                records,
+            ),
+        )
+    }
 }
 
 /// Fixed fresh owner and explicit new allocation. This in-memory ledger burns
@@ -410,6 +516,61 @@ impl AuditedSemanticPlayingCohort {
 /// It is not a durable reservation or proof of global history completeness.
 pub struct SemanticPlayingCollectionSession<'a> {
     owner: &'a SemanticPlayingRlOwner,
+    ledger: SemanticCollectionLedger<'a>,
+}
+impl<'a> SemanticPlayingCollectionSession<'a> {
+    pub fn new(
+        owner: &'a SemanticPlayingRlOwner,
+        external: &'a ConditionalNativeExclusions,
+        history: &'a DeclaredSamplingHistory,
+        seed: SamplingSeed,
+        first: u64,
+        replicate: u64,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            owner,
+            ledger: SemanticCollectionLedger::new(external, history, seed, first, replicate)?,
+        })
+    }
+    pub fn attempts(&self) -> usize {
+        self.ledger.attempts()
+    }
+    pub fn next_episode_ordinal(&self) -> u64 {
+        self.ledger.next_episode_ordinal()
+    }
+    pub fn consumed_families(&self) -> &BTreeSet<String> {
+        self.ledger.consumed_families()
+    }
+    pub fn consumed_actor_streams(&self) -> usize {
+        self.ledger.consumed_actor_streams()
+    }
+    pub fn stopped(&self) -> bool {
+        self.ledger.stopped()
+    }
+    pub fn failed_game(&self) -> Option<&SemanticPlayingCollectedGame> {
+        self.ledger.failed_game()
+    }
+    pub fn collect_whole_four(
+        &mut self,
+        seeds: [u32; 4],
+        pool: &ConditionalFrozenPool,
+        prepared_opponent: Option<&PreparedPublicPolicy>,
+        limits: CollectionLimits,
+    ) -> Result<AuditedSemanticPlayingCohort, String> {
+        self.ledger.collect_whole_four_using(
+            &self.owner.collection_view(),
+            seeds,
+            pool,
+            prepared_opponent,
+            limits,
+            |_, cohort| Ok(cohort),
+        )
+    }
+}
+
+/// Shared allocation state, retained across recurrent semantic parameter updates.
+/// Only the closed collector creates episodes; the continuation cannot inject steps.
+pub(crate) struct SemanticCollectionLedger<'a> {
     external: &'a ConditionalNativeExclusions,
     history: &'a DeclaredSamplingHistory,
     seed: SamplingSeed,
@@ -422,9 +583,18 @@ pub struct SemanticPlayingCollectionSession<'a> {
     stopped: bool,
     failed: Option<SemanticPlayingCollectedGame>,
 }
-impl<'a> SemanticPlayingCollectionSession<'a> {
-    pub fn new(
-        owner: &'a SemanticPlayingRlOwner,
+impl<'a> SemanticCollectionLedger<'a> {
+    pub(crate) fn with_checked<R>(
+        &self,
+        owner: &SemanticOwnerView<'_>,
+        run: impl for<'scope> FnOnce(&SemanticCollectionScope<'scope>) -> Result<R, String>,
+    ) -> Result<R, String> {
+        owner.with_checked(self.external, &self.pins, run)
+    }
+    pub(crate) fn recheck(&self, owner: &SemanticOwnerView<'_>) -> Result<(), String> {
+        owner.with_checked_episode(self.external, &self.pins, || Ok(()))
+    }
+    pub(crate) fn new(
         external: &'a ConditionalNativeExclusions,
         history: &'a DeclaredSamplingHistory,
         seed: SamplingSeed,
@@ -432,10 +602,8 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
         replicate: u64,
     ) -> Result<Self, String> {
         first.checked_add(4).ok_or("Semantic ordinal overflow")?;
-        let mut pins = vec![external.content_pin().clone()];
-        pins.extend(history.pins.iter().cloned());
+        let pins = history.pins.clone();
         Ok(Self {
-            owner,
             external,
             history,
             seed,
@@ -449,47 +617,110 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
             failed: None,
         })
     }
-    pub fn attempts(&self) -> usize {
+    pub(crate) fn attempts(&self) -> usize {
         self.attempts
     }
-    pub fn next_episode_ordinal(&self) -> u64 {
+    pub(crate) fn next_episode_ordinal(&self) -> u64 {
         self.next
     }
-    pub fn consumed_families(&self) -> &BTreeSet<String> {
+    pub(crate) fn consumed_families(&self) -> &BTreeSet<String> {
         &self.spent
     }
-    pub fn consumed_actor_streams(&self) -> usize {
+    pub(crate) fn consumed_actor_streams(&self) -> usize {
         self.streams.len()
     }
-    pub fn stopped(&self) -> bool {
+    pub(crate) fn stopped(&self) -> bool {
         self.stopped
     }
-    pub fn failed_game(&self) -> Option<&SemanticPlayingCollectedGame> {
+    pub(crate) fn failed_game(&self) -> Option<&SemanticPlayingCollectedGame> {
         self.failed.as_ref()
     }
-    pub fn collect_whole_four(
+    pub(crate) fn stop(&mut self) {
+        self.stopped = true;
+    }
+    pub(crate) fn collect_whole_four_using<R>(
         &mut self,
+        owner: &SemanticOwnerView<'_>,
         seeds: [u32; 4],
         pool: &ConditionalFrozenPool,
         prepared_opponent: Option<&PreparedPublicPolicy>,
         limits: CollectionLimits,
-    ) -> Result<AuditedSemanticPlayingCohort, String> {
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.collect_using(
+            owner,
+            seeds,
+            pool,
+            prepared_opponent,
+            limits,
+            finish,
+            create,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn collect_using<R>(
+        &mut self,
+        owner: &SemanticOwnerView<'_>,
+        seeds: [u32; 4],
+        pool: &ConditionalFrozenPool,
+        prepared_opponent: Option<&PreparedPublicPolicy>,
+        limits: CollectionLimits,
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+    ) -> Result<R, String> {
         if self.stopped || self.attempts >= MAX_ATTEMPTS {
             return Err("Semantic collection stopped or attempt bound".into());
         }
-        let result = self.collect(seeds, pool, prepared_opponent, limits);
+        let result = self.collect(
+            owner,
+            seeds,
+            pool,
+            prepared_opponent,
+            limits,
+            finish,
+            create,
+        );
         if result.is_err() {
             self.stopped = true;
         }
         result
     }
-    fn collect(
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn collect_fixture_using<R>(
         &mut self,
+        owner: &SemanticOwnerView<'_>,
+        seeds: [u32; 4],
+        pool: &ConditionalFrozenPool,
+        limits: CollectionLimits,
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+    ) -> Result<R, String> {
+        self.collect_using(owner, seeds, pool, None, limits, finish, create)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn collect<R>(
+        &mut self,
+        owner: &SemanticOwnerView<'_>,
         seeds: [u32; 4],
         pool: &ConditionalFrozenPool,
         prepared_opponent: Option<&PreparedPublicPolicy>,
         limits: CollectionLimits,
-    ) -> Result<AuditedSemanticPlayingCohort, String> {
+        finish: impl for<'scope> FnOnce(
+            &SemanticCollectionScope<'scope>,
+            AuditedSemanticPlayingCohort,
+        ) -> Result<R, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+    ) -> Result<R, String> {
         let next = self
             .next
             .checked_add(4)
@@ -536,8 +767,8 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
         {
             return Err("Semantic family overlaps frozen opponent lineage".into());
         }
-        let (identity, reservations) = self.owner.collection_metadata();
-        let parent = identity.checksum().to_string();
+        let (identity, reservations) = owner.metadata();
+        let parent = identity.to_string();
         let human_reservations = reservations.clone();
         let binding = hash(
             b"tzolkin-semantic-playing-in-memory-collection-v1\0",
@@ -551,10 +782,9 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
                 HeuristicWeights::default(),
             ),
         )?;
-        let owner = self.owner;
         let pins = self.pins.clone();
-        owner.with_checked_collection(&pins, |scope| {
-            if scope.identity().checksum() != parent {
+        owner.with_checked(self.external, &pins, |scope| {
+            if scope.parent_checksum() != parent {
                 return Err("Semantic checked owner differs from collection parent".into());
             }
             self.attempts += 1;
@@ -563,7 +793,7 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
             self.streams.extend(streams);
             let mut episodes = Vec::new();
             for i in 0..4 {
-                let episode = owner.with_checked_collection_episode(&pins, || {
+                let episode = owner.with_checked_episode(self.external, &pins, || {
                     let collected = run(&configs[i], &rosters[i], scope, &binding, None, || {
                         create(&configs[i])
                     })?;
@@ -587,14 +817,15 @@ impl<'a> SemanticPlayingCollectionSession<'a> {
                 })?;
                 episodes.push(episode);
             }
-            Ok(AuditedSemanticPlayingCohort {
+            let cohort = AuditedSemanticPlayingCohort {
                 episodes: episodes
                     .try_into()
                     .map_err(|_| "Semantic whole-four shape")?,
                 parent,
                 families,
                 human_reservations,
-            })
+            };
+            finish(scope, cohort)
         })
     }
 }
@@ -648,7 +879,7 @@ fn run(
         b"tzolkin-semantic-playing-episode-binding-v1\0",
         &(
             binding,
-            scope.identity().checksum(),
+            scope.parent_checksum(),
             roster.checksum(),
             config.players(),
             config.environment_seed(),

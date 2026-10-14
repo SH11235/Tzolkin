@@ -1732,6 +1732,7 @@ mod tests {
             Some("Semantic Playing origin requires successful source load")
         );
         crate::semantic_playing_rl_collection::phase_collection_fixture(&prepared);
+        crate::semantic_playing_rl_update::joint_fixture();
         let playing = playing_observation();
         assert!(prepared.distribution(&playing).is_err());
         assert_eq!(
