@@ -1353,29 +1353,24 @@ impl<'a> SemanticCollectionLedger<'a> {
             let mut episodes = Vec::new();
             for (i, config) in batch.configs.iter().enumerate() {
                 let roster = rosters.get(i);
-                let episode = owner.with_checked_episode(self.external, &pins, || {
-                    if let Some(saved) = saved {
-                        let header = RecordHeader::new(
-                            &batch.parent,
-                            i,
-                            match pool {
-                                PoolRef::Mixture(p) => Some(p.checksum()),
-                                _ => None,
-                            },
-                            config,
-                        )?;
-                        // Raw DTOs stay private. Only this same source-owned
-                        // fresh Core audit can seal a historical learner step.
-                        return audit_bound_record(
-                            &saved[i],
-                            &header,
-                            config,
-                            roster,
-                            scope,
-                            binding,
-                            || create(config),
-                        );
-                    }
+                // Reuse the outer whole-four checked scope. Its POST runs before
+                // any prepared result leaves, including a member or finish error.
+                let episode = if let Some(saved) = saved {
+                    let header = RecordHeader::new(
+                        &batch.parent,
+                        i,
+                        match pool {
+                            PoolRef::Mixture(p) => Some(p.checksum()),
+                            _ => None,
+                        },
+                        config,
+                    )?;
+                    // Raw DTOs stay private. Only this same source-owned
+                    // fresh Core audit can seal a historical learner step.
+                    audit_bound_record(&saved[i], &header, config, roster, scope, binding, || {
+                        create(config)
+                    })?
+                } else {
                     let collected = run(config, roster, scope, binding, None, || create(config))?;
                     if !collected.complete() {
                         let error = collected
@@ -1393,8 +1388,8 @@ impl<'a> SemanticCollectionLedger<'a> {
                         config.clone(),
                         roster.learner_seat(),
                         roster.sampled_opponents(config.players()),
-                    )
-                })?;
+                    )?
+                };
                 episodes.push(episode);
             }
             let cohort = AuditedSemanticPlayingCohort {
