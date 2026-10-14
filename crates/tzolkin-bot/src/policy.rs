@@ -365,6 +365,170 @@ fn selected_action_resources(
         Some(amounts)
     }
 }
+
+/// Bounded base-game removal endpoints, as (target, prepaid corn, net utility).
+/// These are public-state heuristic previews, not legal moves or a rollout.
+/// Theology's ahead-to-free-choice chain is flattened to its eventual endpoint.
+pub fn resource_cycle_removal_payoffs(
+    o: &Observation,
+    gear: GearId,
+    position: i64,
+    w: &HeuristicWeights,
+) -> Option<Vec<(i64, i64, f64)>> {
+    let p = o.players.get(o.actor)?;
+    let slots = o.gears.get(&gear)?;
+    if o.phase != Phase::Playing
+        || !(3..=4).contains(&o.players.len())
+        || !(1..=27).contains(&o.round)
+        || o.additional_buildings
+        || o.expansion.is_some()
+        || o.private.selected_tribe.is_some()
+        || o.players.iter().any(|player| player.tribe.is_some())
+        || w.validate().is_err()
+        || p.resources.iter().any(|n| !(0..=1_000_000).contains(n))
+        || p.technologies.iter().any(|level| !(0..=3).contains(level))
+        || !(3..=6).contains(&p.workers)
+        || !(0..=p.workers).contains(&p.available_workers)
+        || !(0..=1_000_000).contains(&p.feed_workers)
+        || !(0..=1_000_000).contains(&p.feed_discount)
+        || o.skull_spaces.len() != 10
+        || !(0..=13).contains(&o.skull_supply)
+        || slots.len() != if gear == GearId::ChichenItza { 13 } else { 10 }
+        || position < 0
+        || position >= slots.len() as i64
+        || !slots
+            .get(position as usize)?
+            .as_ref()
+            .is_some_and(|worker| !worker.dummy && worker.player_id == o.actor as i64)
+        || o.legal_actions
+            .iter()
+            .filter(|row| row.action == TypedAction::Remove { gear, position })
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let max = if gear == GearId::ChichenItza { 9 } else { 5 };
+    let free_choice = position > max;
+    let mut endpoints = Vec::new();
+    let mut add = |target, cost| {
+        if endpoints.iter().any(|(p, c, _)| *p == target && *c == cost) {
+            return;
+        }
+        if let Some(payoff) = resource_cycle_endpoint_payoff(o, p, gear, target, cost, w) {
+            endpoints.push((target, cost, payoff));
+        }
+    };
+    // Core action_choices: affordable current/lower actions, or all same-gear
+    // endpoints without a fee at the free-choice positions.
+    for target in (1..=if free_choice { max } else { position }).rev() {
+        add(target, if free_choice { 0 } else { position - target });
+    }
+    if gear == GearId::ChichenItza && p.technologies[3] >= 1 && position < 10 {
+        if position == 9 {
+            for target in (1..=9).rev() {
+                add(target, 0);
+            }
+        } else {
+            add(position + 1, 0);
+        }
+    }
+    Some(endpoints)
+}
+
+fn resource_cycle_endpoint_payoff(
+    o: &Observation,
+    p: &PublicPlayer,
+    gear: GearId,
+    target: i64,
+    cost: i64,
+    w: &HeuristicWeights,
+) -> Option<f64> {
+    if cost < 0 || p.resources[0] < cost {
+        return None;
+    }
+    let revision = ScoringProfile::Historical(HeuristicRevision::V2);
+    let gain = match (gear, target) {
+        (GearId::ChichenItza, _) => {
+            if p.resources[4] == 0 || o.skull_spaces.get(target as usize) != Some(&None) {
+                return None;
+            }
+            action_value(o, p, gear, target, w, revision)
+        }
+        (GearId::Palenque, 2..=5) => {
+            let jungle = o.jungle.get(&target)?;
+            if jungle.corn == 0 && jungle.wood == 0 && p.technologies[0] < 2 {
+                return None;
+            }
+            let mut best: f64 = 0.0;
+            if jungle.corn > jungle.wood || p.technologies[0] >= 2 {
+                best = amount_value(
+                    o,
+                    p,
+                    &harvest_resources(o, p, HarvestKind::Corn, target),
+                    w,
+                    revision,
+                );
+            }
+            if target >= 3 && jungle.wood > 0 {
+                best = best.max(amount_value(
+                    o,
+                    p,
+                    &harvest_resources(o, p, HarvestKind::Wood, target),
+                    w,
+                    revision,
+                ));
+                if jungle.corn > 0 && p.temples.iter().any(|level| *level > -1) {
+                    best = best.max(
+                        amount_value(
+                            o,
+                            p,
+                            &harvest_resources(o, p, HarvestKind::Burn, target),
+                            w,
+                            revision,
+                        ) - w.temple_step,
+                    );
+                }
+            }
+            best
+        }
+        (GearId::Palenque | GearId::Yaxchilan, _) => amount_value(
+            o,
+            p,
+            &selected_action_resources(o, p, gear, target)?,
+            w,
+            revision,
+        ),
+        (GearId::Tikal, 1 | 3) => {
+            let materials: i64 = p.resources[1..4].iter().sum();
+            if !p
+                .technologies
+                .iter()
+                .any(|level| materials >= tribes::technology_step_cost(*level, false))
+            {
+                return None;
+            }
+            action_value(o, p, gear, target, w, revision)
+        }
+        (GearId::Tikal, 2 | 4) => {
+            if o.buildings.is_empty() && (target != 4 || o.monuments.is_empty()) {
+                return None;
+            }
+            action_value(o, p, gear, target, w, revision)
+        }
+        (GearId::Tikal, 5) => {
+            if p.resources[1..4].iter().all(|n| *n == 0) {
+                return None;
+            }
+            action_value(o, p, gear, target, w, revision)
+        }
+        (GearId::Uxmal, 1) if p.resources[0] < cost + 3 => return None,
+        _ => action_value(o, p, gear, target, w, revision),
+    };
+    // Non-harvest follow-up tasks keep the old endpoint utility hypothesis;
+    // entry availability does not promise a later build or technology choice.
+    Some(gain - cost as f64 * value(o, p, Resource::Corn, w, revision))
+}
 fn monument_metrics(o: &Observation, p: &PublicPlayer) -> Option<MonumentMetrics> {
     if o.phase != Phase::Playing
         || p.technologies.iter().any(|level| !(0..=3).contains(level))

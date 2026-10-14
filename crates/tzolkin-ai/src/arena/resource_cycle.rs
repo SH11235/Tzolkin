@@ -9,6 +9,7 @@ use tzolkin_core::{GearId, Phase, Resource, Task, TechnologyId};
 
 pub const POLICY_VERSION: &str = "resource-cycle-arena-v4";
 pub const V5_POLICY_VERSION: &str = "resource-cycle-arena-v5";
+pub const V6_POLICY_VERSION: &str = "resource-cycle-arena-v6";
 
 /// Changing any field requires a separately versioned hypothesis. The complete
 /// configuration is included in Numeric Arena's absolute-seat pool identity.
@@ -43,9 +44,17 @@ impl ResourceCycleConfig {
         }
     }
 
+    /// Explicit feasible-removal alternative. V4 remains the default opponent.
+    pub fn v6() -> Self {
+        Self {
+            policy_version: V6_POLICY_VERSION.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self != &Self::default() && self != &Self::v5() {
-            return Err("Resource-cycle Arena requires a frozen v4 or v5 configuration".into());
+        if self != &Self::default() && self != &Self::v5() && self != &Self::v6() {
+            return Err("Resource-cycle Arena requires a frozen v4, v5 or v6 configuration".into());
         }
         Ok(())
     }
@@ -427,6 +436,54 @@ fn v5_adjustment(
     }
 }
 
+fn v6_removal_score(
+    o: &Observation,
+    action: &TypedAction,
+    config: &ResourceCycleConfig,
+    investment: Option<&Investment>,
+    reserve: &[i64; 3],
+    urgent_food: bool,
+    market: f64,
+) -> Result<f64, String> {
+    let TypedAction::Remove { gear, position } = action else {
+        return Err("V6 removal score requires a removal".into());
+    };
+    if *position == 0 {
+        return Ok(-20.0);
+    }
+    let p = &o.players[o.actor];
+    let payoffs =
+        crate::policy::resource_cycle_removal_payoffs(o, *gear, *position, &config.weights)
+            .ok_or("V6 removal requires an owned base-game legal worker")?;
+    let mut best: f64 = 0.0; // Skip stays available; recovery is a separate term.
+    for (target, corn_cost, mut payoff) in payoffs {
+        // Harvest payoffs already include actual extraction/skull quantities.
+        // Market and investment hypotheses apply to the selected endpoint, not
+        // the worker's former position. This preview never emits a legal move.
+        if *gear == GearId::Uxmal && target == 2 {
+            payoff += market - 1.0;
+        }
+        let endpoint = TypedAction::UseAction {
+            gear: *gear,
+            position: target,
+            source: tzolkin_core::observation::ActionSource::CurrentGear,
+            corn_cost,
+        };
+        payoff += v5_adjustment(o, p, &endpoint, config, investment, reserve, urgent_food);
+        best = best.max(payoff);
+    }
+    let waiting = if *gear == GearId::Yaxchilan {
+        v5_adjustment(o, p, action, config, investment, reserve, urgent_food)
+    } else {
+        0.0
+    };
+    Ok(10.0
+        + best
+        + if *position >= 4 { 6.0 } else { 0.0 }
+        + if o.round >= 25 { 15.0 } else { 0.0 }
+        + waiting)
+}
+
 /// Select exactly one existing legal row. Setup and all other effects retain
 /// baseline scoring; there is no simulation, history, owner or Train interface.
 pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Decision, String> {
@@ -463,7 +520,9 @@ pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Deci
     let p = &o.players[o.actor];
     // Preserve V4's first-seat opening scores before considering a V5
     // resource route; the alternative still has its own replay identity.
-    let v5 = config.policy_version == V5_POLICY_VERSION && !(o.round == 1 && o.turn_index == 0);
+    let v5 = (config.policy_version == V5_POLICY_VERSION
+        || config.policy_version == V6_POLICY_VERSION)
+        && !(o.round == 1 && o.turn_index == 0);
     let target = corn_target(o, p);
     let investment = if o.phase == Phase::Playing {
         if v5 {
@@ -531,6 +590,21 @@ pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Deci
                     urgent_food,
                 );
             }
+        }
+        if o.phase == Phase::Playing
+            && v5
+            && config.policy_version == V6_POLICY_VERSION
+            && matches!(legal.action, TypedAction::Remove { .. })
+        {
+            score = v6_removal_score(
+                o,
+                &legal.action,
+                config,
+                investment.as_ref(),
+                &reserve,
+                urgent_food,
+                market,
+            )?;
         }
         if !score.is_finite() {
             return Err("Non-finite resource-cycle score".into());
@@ -754,6 +828,276 @@ mod tests {
             score_action(&o, &row.action, &config.weights)
                 + extraction_bonus(2, 3, &config.weights)
         );
+
+        // V6 previews the actual Core follow-up set without using Game in its
+        // scorer. These short synthetic positions preserve worker accounting.
+        fn removal(gear: GearId, position: i64, corn: i64, skulls: i64) -> GameState {
+            let mut state = playing(Task::Action {
+                gear,
+                position,
+                free: None,
+            });
+            state.pending = None;
+            state.round = 11;
+            state.food_days = vec![8];
+            state.turn.mode = tzolkin_core::TurnMode::Remove;
+            state.turn.count = 1;
+            state.players[1].resources.insert(Resource::Corn, corn);
+            state.players[1].resources.insert(Resource::Skull, skulls);
+            state.gears.get_mut(&gear).unwrap()[position as usize] = Some(GearWorker {
+                player_id: 1,
+                dummy: false,
+            });
+            state
+        }
+        fn endpoints(state: &GameState, gear: GearId, position: i64) -> Vec<(i64, i64, f64)> {
+            let o = observe(state, 1).unwrap();
+            let payoffs = crate::policy::resource_cycle_removal_payoffs(
+                &o,
+                gear,
+                position,
+                &HeuristicWeights::default(),
+            )
+            .unwrap();
+            let removed =
+                apply_move(state, tzolkin_core::GameMove::Remove { gear, position }).unwrap();
+            let pending = observe(&removed, 1).unwrap();
+            let mut actual = Vec::new();
+            for row in &pending.legal_actions {
+                if let TypedAction::UseAction {
+                    position: target,
+                    corn_cost,
+                    ..
+                } = row.action
+                {
+                    if target == 10 && gear == GearId::ChichenItza {
+                        let ahead = apply_move(&removed, row.r#move.clone()).unwrap();
+                        for next in observe(&ahead, 1).unwrap().legal_actions {
+                            if let TypedAction::UseAction {
+                                position: target,
+                                corn_cost: cost,
+                                ..
+                            } = next.action
+                            {
+                                actual.push((target, corn_cost + cost));
+                            }
+                        }
+                    } else {
+                        actual.push((target, corn_cost));
+                    }
+                }
+            }
+            actual.sort_unstable();
+            actual.dedup();
+            let mut preview: Vec<_> = payoffs.iter().map(|(p, c, _)| (*p, *c)).collect();
+            preview.sort_unstable();
+            preview.dedup();
+            assert_eq!(preview, actual);
+            payoffs
+        }
+        let v6 = ResourceCycleConfig::v6();
+        assert!(v6.validate().is_ok());
+        let mut unfrozen = v6.clone();
+        unfrozen.weights.corn_base += 0.01;
+        assert!(unfrozen.validate().is_err());
+        let mut occupied = removal(GearId::ChichenItza, 1, 0, 1);
+        occupied.skull_spaces[1] = Some(2);
+        assert!(endpoints(&occupied, GearId::ChichenItza, 1).is_empty());
+        let o = observe(&occupied, 1).unwrap();
+        let remove = TypedAction::Remove {
+            gear: GearId::ChichenItza,
+            position: 1,
+        };
+        assert_eq!(
+            v6_removal_score(&o, &remove, &v6, None, &[0; 3], false, 0.0).unwrap(),
+            10.0
+        );
+        assert_eq!(
+            choose_move(&o, &v6).unwrap().r#move,
+            tzolkin_core::GameMove::EndTurn {
+                double_advance: None
+            }
+        );
+        assert_eq!(
+            choose_move(&o, &ResourceCycleConfig::v5()).unwrap().r#move,
+            tzolkin_core::GameMove::Remove {
+                gear: GearId::ChichenItza,
+                position: 1
+            }
+        );
+
+        // An occupied current target is not a ban on an affordable lower one.
+        let mut lower = removal(GearId::ChichenItza, 3, 1, 1);
+        lower.skull_spaces[3] = Some(2);
+        let payoffs = endpoints(&lower, GearId::ChichenItza, 3);
+        assert_eq!(payoffs.len(), 1);
+        assert_eq!((payoffs[0].0, payoffs[0].1), (2, 1));
+        lower.players[1].resources.insert(Resource::Corn, 0);
+        assert!(endpoints(&lower, GearId::ChichenItza, 3).is_empty());
+        let mut ahead = occupied.clone();
+        ahead.players[1]
+            .technologies
+            .insert(TechnologyId::Theology, 1);
+        let payoffs = endpoints(&ahead, GearId::ChichenItza, 1);
+        assert_eq!(payoffs.len(), 1);
+        assert_eq!((payoffs[0].0, payoffs[0].1), (2, 0));
+
+        // Free choice and Theology ahead-to10 retain the real free endpoint set.
+        for position in [9, 10] {
+            let mut free = removal(GearId::ChichenItza, position, 0, 1);
+            free.skull_spaces[9] = Some(2);
+            if position == 9 {
+                free.players[1]
+                    .technologies
+                    .insert(TechnologyId::Theology, 1);
+            }
+            let payoffs = endpoints(&free, GearId::ChichenItza, position);
+            assert_eq!(payoffs.len(), 8);
+            assert!(payoffs.iter().all(|(p, cost, _)| *p < 9 && *cost == 0));
+        }
+        let mut free_yax = removal(GearId::Yaxchilan, 6, 0, 0);
+        free_yax.players[1]
+            .technologies
+            .insert(TechnologyId::Extraction, 2);
+        let payoffs = endpoints(&free_yax, GearId::Yaxchilan, 6);
+        assert_eq!(payoffs.len(), 5);
+        assert!(payoffs.iter().all(|(_, cost, _)| *cost == 0));
+        let o = observe(&free_yax, 1).unwrap();
+        assert_eq!(
+            v6_removal_score(
+                &o,
+                &TypedAction::Remove {
+                    gear: GearId::Yaxchilan,
+                    position: 6
+                },
+                &v6,
+                None,
+                &[0; 3],
+                false,
+                0.0
+            )
+            .unwrap(),
+            16.0 + payoffs
+                .iter()
+                .map(|(_, _, value)| *value)
+                .fold(0.0, f64::max)
+        );
+
+        let mut jungle = removal(GearId::Palenque, 3, 0, 0);
+        for level in jungle.players[1].temples.values_mut() {
+            *level = -1;
+        }
+        jungle.jungle.get_mut(&3).unwrap().corn = 1;
+        jungle.jungle.get_mut(&3).unwrap().wood = 1;
+        let payoffs = endpoints(&jungle, GearId::Palenque, 3);
+        assert_eq!(payoffs, vec![(3, 0, 4.0)]); // Actual wood2; no nominal corn5.
+        let removed = apply_move(
+            &jungle,
+            tzolkin_core::GameMove::Remove {
+                gear: GearId::Palenque,
+                position: 3,
+            },
+        )
+        .unwrap();
+        let pending = observe(&removed, 1).unwrap();
+        let action = pending
+            .legal_actions
+            .iter()
+            .find(|row| matches!(row.action, TypedAction::UseAction { position: 3, .. }))
+            .unwrap();
+        let harvest = apply_move(&removed, action.r#move.clone()).unwrap();
+        let row = observe(&harvest, 1)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    TypedAction::Harvest {
+                        kind: tzolkin_core::observation::HarvestKind::Wood,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let after = apply_move(&harvest, row.r#move).unwrap();
+        assert_eq!(
+            after.players[1].resources[&Resource::Wood]
+                - jungle.players[1].resources[&Resource::Wood],
+            2
+        );
+        jungle.jungle.get_mut(&3).unwrap().wood = 0;
+        jungle.jungle.get_mut(&3).unwrap().corn = 0;
+        assert!(endpoints(&jungle, GearId::Palenque, 3).is_empty());
+        jungle.players[1]
+            .technologies
+            .insert(TechnologyId::Agriculture, 2);
+        assert_eq!(
+            endpoints(&jungle, GearId::Palenque, 3),
+            vec![(3, 0, 6.0 * v6.weights.corn_when_short)]
+        );
+        let mut burn = removal(GearId::Palenque, 4, 0, 0);
+        burn.jungle.get_mut(&4).unwrap().corn = 1;
+        burn.jungle.get_mut(&4).unwrap().wood = 1;
+        burn.players[1]
+            .temples
+            .insert(tzolkin_core::TempleId::Chaac, 0);
+        assert_eq!(
+            endpoints(&burn, GearId::Palenque, 4),
+            vec![(
+                4,
+                0,
+                7.0 * v6.weights.corn_when_short - v6.weights.temple_step
+            )]
+        );
+
+        // The backward fee is prepaid before Uxmal1's separate three-corn cost.
+        for corn in [1, 3, 4] {
+            let uxmal = removal(GearId::Uxmal, 2, corn, 0);
+            let payoffs = endpoints(&uxmal, GearId::Uxmal, 2);
+            assert_eq!(
+                payoffs.iter().any(|(p, c, _)| *p == 1 && *c == 1),
+                corn == 4
+            );
+        }
+        // Recovery/endgame remains available even without a useful skull action.
+        let mut recovery = removal(GearId::ChichenItza, 4, 0, 0);
+        assert!(endpoints(&recovery, GearId::ChichenItza, 4).is_empty());
+        recovery.round = 25;
+        recovery.food_days = vec![8, 14, 21];
+        recovery.age = 2;
+        let o = observe(&recovery, 1).unwrap();
+        assert_eq!(
+            v6_removal_score(
+                &o,
+                &TypedAction::Remove {
+                    gear: GearId::ChichenItza,
+                    position: 4
+                },
+                &v6,
+                None,
+                &[0; 3],
+                false,
+                0.0
+            )
+            .unwrap(),
+            31.0
+        );
+        assert_eq!(
+            choose_move(&o, &v6).unwrap().r#move,
+            tzolkin_core::GameMove::Remove {
+                gear: GearId::ChichenItza,
+                position: 4
+            }
+        );
+        for count in [3, 4] {
+            let setup =
+                create_game((0..count).map(|i| format!("P{i}")).collect(), 17, false).unwrap();
+            let o = observe(&setup, setup.current_player).unwrap();
+            let mut old = choose_move(&o, &ResourceCycleConfig::v5()).unwrap();
+            old.policy_version = V6_POLICY_VERSION.into();
+            assert_eq!(choose_move(&o, &v6).unwrap(), old);
+        }
     }
 
     #[test]
