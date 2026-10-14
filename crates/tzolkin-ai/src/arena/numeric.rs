@@ -2212,8 +2212,18 @@ pub fn run_semantic_playing_snapshot_validation<'a>(
         SemanticPlayingSnapshotReference::SemanticHuman(policy) => Some(policy.prepared()),
         _ => None,
     };
+    let native_prepared = match &reference {
+        SemanticPlayingSnapshotReference::NativeTeacher(policy) => Some(policy.prepared),
+        _ => None,
+    };
     let result = (|| {
         snapshot.recheck()?;
+        if let Some(prepared) = native_prepared {
+            prepared.recheck_sources()?;
+        }
+        if let SemanticPlayingSnapshotReference::NativeTeacher(policy) = &reference {
+            policy.exclude_source_families(config)?;
+        }
         if let Some(prepared) = reference_prepared {
             prepared.recheck_sources()?;
             let families = prepared
@@ -2242,6 +2252,9 @@ pub fn run_semantic_playing_snapshot_validation<'a>(
             SemanticPlayingSnapshotReference::GuardedNumeric(policy) => Role::Numeric(*policy),
             SemanticPlayingSnapshotReference::SemanticHuman(policy) => {
                 Role::ConditionalSemanticPlaying(policy)
+            }
+            SemanticPlayingSnapshotReference::NativeTeacher(policy) => {
+                Role::NativePlayingTeacher(policy)
             }
         };
         let candidate = Role::SemanticSnapshot(Box::new(candidate));
@@ -2279,6 +2292,14 @@ pub fn run_semantic_playing_snapshot_validation<'a>(
         (result, Ok(())) => result,
         (result, Err(post)) => Err(format!(
             "{}; Semantic Human reference postcheck: {post}",
+            result.err().unwrap_or_default()
+        )),
+    };
+    let native_post = native_prepared.map_or(Ok(()), |p| p.recheck_sources());
+    let result = match (result, native_post) {
+        (result, Ok(())) => result,
+        (result, Err(post)) => Err(format!(
+            "{}; Native teacher reference postcheck: {post}",
             result.err().unwrap_or_default()
         )),
     };
