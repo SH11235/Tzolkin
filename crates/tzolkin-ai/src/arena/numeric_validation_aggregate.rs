@@ -56,6 +56,37 @@ struct Global {
     count: usize,
     canonical_digest: String,
 }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Target {
+    target_arch: String,
+    target_os: String,
+}
+impl Target {
+    fn validate(&self) -> Result<(), String> {
+        if [&self.target_arch, &self.target_os].into_iter().any(|s| {
+            s.is_empty()
+                || s.len() > 32
+                || !s
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        }) {
+            return Err(
+                "Aggregate targetArch/targetOs must be explicit bounded identifiers".into(),
+            );
+        }
+        Ok(())
+    }
+}
+/// A separately pinned prior stage. Its closure/target are declarations, not
+/// nested files to follow, and do not replace the current pilot stage inputs.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SelectionInput {
+    report: ContentPin,
+    global: Global,
+    target: Target,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Candidate {
@@ -95,10 +126,11 @@ struct Wire {
     purpose: Purpose,
     bootstrap_seed: u64,
     global: Global,
+    target: Target,
     populations: Vec<Population>,
     chunks: Vec<Chunk>,
     candidate: Option<Candidate>,
-    selection: Option<ContentPin>,
+    selection: Option<SelectionInput>,
 }
 /// Only pins saved reports and a caller-declared fixed protocol. This is not
 /// a policy or learning handle; it cannot load a model or run a game.
@@ -178,11 +210,22 @@ fn validate(w: &Wire) -> Result<(), String> {
         return Err("Aggregate schema/purpose/planned report bounds differ".into());
     }
     pin_shape(&w.global.pin, MAX_REPORT_BYTES)?;
+    w.target.validate()?;
     if let Some(c) = &w.candidate {
         candidate_shape(c)?;
     }
     if let Some(s) = &w.selection {
-        pin_shape(s, MAX_AGGREGATE)?;
+        pin_shape(&s.report, MAX_AGGREGATE)?;
+        pin_shape(&s.global.pin, MAX_REPORT_BYTES)?;
+        if !(1..=MAX_EXCLUDED_FAMILIES).contains(&s.global.count)
+            || !digest(&s.global.canonical_digest)
+        {
+            return Err("Selection-stage closure declaration differs".into());
+        }
+        s.target.validate()?;
+        if json!(s.target) != json!(w.target) {
+            return Err("Selection and pilot runtime targets must stay frozen".into());
+        }
     }
     let mut families = BTreeSet::new();
     for p in &w.populations {
@@ -288,6 +331,7 @@ fn validate(w: &Wire) -> Result<(), String> {
 struct BaselineMean {
     baseline: Baseline,
     mean_utility: Option<f64>,
+    utility_twelfths: Option<u64>,
     failed_games: usize,
 }
 #[derive(Serialize)]
@@ -320,6 +364,8 @@ pub struct ValidationAggregateReport {
     manifest_sha256: String,
     bootstrap_seed: u64,
     global: Global,
+    target: Target,
+    selection_stage: Option<SelectionInput>,
     inputs: Vec<ContentPin>,
     candidate_identity: Option<Value>,
     candidate_artifact: Option<ContentPin>,
@@ -479,9 +525,36 @@ fn diagnostics(
                 serde_json::from_value(role["provenance"]["config"].clone())
                     .map_err(|e| e.to_string())?;
             config.validate()?;
-            if sa + pa > MAX_GAME_CALLBACKS as u64
-                || s.atomic_steps > (sa + pa) * config.max_total_steps as u64
-                || s.attempted_worlds > (sa + pa) * u64::from(config.worlds_per_action)
+            let insufficient = s
+                .fallback_reasons
+                .get(&crate::search::FallbackReason::InsufficientCompletedWorlds)
+                .copied()
+                .unwrap_or(0);
+            let supported = s
+                .searched
+                .checked_add(insufficient)
+                .ok_or("Search count overflow")?;
+            let min_completed = s
+                .searched
+                .checked_mul(u64::from(config.min_completed_worlds))
+                .ok_or("Search count overflow")?;
+            let max_worlds = supported
+                .checked_mul(u64::from(config.worlds_per_action))
+                .ok_or("Search count overflow")?;
+            let max_steps = supported
+                .checked_mul(config.max_total_steps as u64)
+                .ok_or("Search count overflow")?;
+            if s.completed_worlds < min_completed
+                || s.attempted_worlds < supported
+                || s.atomic_steps < supported
+                || s.terminal_rollouts
+                    .checked_add(s.cutoff_rollouts)
+                    .ok_or("Search count overflow")?
+                    < s.completed_worlds
+                || (arm["error"].is_null() && s.decisions != sr + pr)
+                || sa + pa > MAX_GAME_CALLBACKS as u64
+                || s.atomic_steps > max_steps
+                || s.attempted_worlds > max_worlds
                 || s.completed_worlds
                     .checked_add(s.discarded_worlds)
                     .ok_or("Search count overflow")?
@@ -633,6 +706,8 @@ fn read_chunk(w: &Wire, c: &Chunk, p: &Population) -> Result<(Vec<Imported>, Obs
     equal(&paired["options"], &json!(GameOptions::default()))?;
     equal(&paired["rulesBaseline"], &json!(replay::RULES_BASELINE))?;
     equal(&paired["catalogHash"], &json!(replay::catalog_hash()))?;
+    equal(&paired["targetArch"], &json!(w.target.target_arch))?;
+    equal(&paired["targetOs"], &json!(w.target.target_os))?;
     equal(&paired["development"], &json!(true))?;
     for key in [
         "freshHoldoutClaimed",
@@ -745,12 +820,14 @@ fn selected_references(w: &Wire) -> Result<(), String> {
     let Some(pin) = &w.selection else {
         return Ok(());
     };
-    let v = unique_json(&pinned(pin, MAX_AGGREGATE)?, MAX_AGGREGATE)?;
+    let v = unique_json(&pinned(&pin.report, MAX_AGGREGATE)?, MAX_AGGREGATE)?;
     equal(&v["schema"], &json!(REPORT_SCHEMA))?;
     equal(&v["purpose"], &json!(Purpose::BaselineSelectionV1))?;
     equal(&v["completePlannedEvidence"], &json!(true))?;
     equal(&v["bootstrapSeed"], &json!(w.bootstrap_seed))?;
-    equal(&v["global"], &json!(w.global))?;
+    equal(&v["global"], &json!(pin.global))?;
+    equal(&v["target"], &json!(pin.target))?;
+    equal(&v["target"], &json!(w.target))?;
     for key in [
         "sourceAuthenticated",
         "sourceQualified",
@@ -784,16 +861,17 @@ fn selected_references(w: &Wire) -> Result<(), String> {
         for entry in array(&old["baselineRanking"], 4)? {
             let baseline: Baseline =
                 serde_json::from_value(entry["baseline"].clone()).map_err(|e| e.to_string())?;
-            let mean = number(&entry["meanUtility"])?;
-            if !seen.insert(baseline)
-                || !(0.0..=1.0).contains(&mean)
-                || integer(&entry["failedGames"], 0)? != 0
-            {
+            let denominator = 12 * 8 * p.players as u64;
+            let twelfths = integer(&entry["utilityTwelfths"], denominator)?;
+            let mean = twelfths as f64 / denominator as f64;
+            if !seen.insert(baseline) || integer(&entry["failedGames"], 0)? != 0 {
                 return Err("Invalid saved baseline ranking".into());
             }
+            equal(&entry["meanUtility"], &json!(mean))?;
             ranking.push(BaselineMean {
                 baseline,
                 mean_utility: Some(mean),
+                utility_twelfths: Some(twelfths),
                 failed_games: 0,
             });
         }
@@ -818,11 +896,54 @@ fn selected_references(w: &Wire) -> Result<(), String> {
 }
 fn rank_baselines(ranking: &mut [BaselineMean]) {
     ranking.sort_by(|a, b| {
-        b.mean_utility
-            .unwrap_or(f64::NEG_INFINITY)
-            .total_cmp(&a.mean_utility.unwrap_or(f64::NEG_INFINITY))
+        b.utility_twelfths
+            .cmp(&a.utility_twelfths)
             .then(a.baseline.cmp(&b.baseline))
     });
+}
+fn winner_twelfths(utility: f64) -> Result<u64, String> {
+    [(0.0, 0), (1.0, 12), (0.5, 6), (1.0 / 3.0, 4), (0.25, 3)]
+        .into_iter()
+        .find_map(|(u, ticks)| (utility == u).then_some(ticks))
+        .ok_or_else(|| "Winner utility is not a base3/4p exact share".into())
+}
+fn baseline_mean(
+    baseline: Baseline,
+    seeds: &[u32],
+    players: usize,
+    own: &BTreeMap<(Baseline, u32), Vec<SummaryArm>>,
+) -> Result<BaselineMean, String> {
+    let mut total = 0u64;
+    let mut failed = 0;
+    for seed in seeds {
+        let arms = own
+            .get(&(baseline, *seed))
+            .ok_or("Missing baseline family/seat results")?;
+        if arms.len() != players {
+            return Err("Missing baseline absolute seat".into());
+        }
+        for arm in arms {
+            if arm.error.is_some() {
+                failed += 1;
+            } else {
+                total = total
+                    .checked_add(winner_twelfths(
+                        arm.winner_utility.ok_or("Missing winner utility")?,
+                    )?)
+                    .ok_or("Winner-share overflow")?;
+            }
+        }
+    }
+    let denominator = 12 * seeds.len() as u64 * players as u64;
+    if denominator == 0 || total > denominator {
+        return Err("Invalid winner-share denominator".into());
+    }
+    Ok(BaselineMean {
+        baseline,
+        mean_utility: (failed == 0).then(|| total as f64 / denominator as f64),
+        utility_twelfths: (failed == 0).then_some(total),
+        failed_games: failed,
+    })
 }
 fn aggregate(w: &Wire, checksum: String) -> Result<ValidationAggregateReport, String> {
     selected_references(w)?;
@@ -878,26 +999,7 @@ fn aggregate(w: &Wire, checksum: String) -> Result<ValidationAggregateReport, St
         let mut ranking = Vec::new();
         if w.purpose == Purpose::BaselineSelectionV1 {
             for baseline in BASELINES {
-                let mut family_means = Vec::new();
-                let mut failed = 0;
-                for seed in &p.seeds {
-                    let arms = own
-                        .get(&(baseline, *seed))
-                        .ok_or("Missing baseline family/seat results")?;
-                    failed += arms.iter().filter(|a| a.error.is_some()).count();
-                    if arms.iter().all(|a| a.error.is_none()) {
-                        family_means.push(
-                            arms.iter().map(|a| a.winner_utility.unwrap()).sum::<f64>()
-                                / p.players as f64,
-                        );
-                    }
-                }
-                ranking.push(BaselineMean {
-                    baseline,
-                    mean_utility: (failed == 0)
-                        .then(|| family_means.iter().sum::<f64>() / p.seeds.len() as f64),
-                    failed_games: failed,
-                });
+                ranking.push(baseline_mean(baseline, &p.seeds, p.players, &own)?);
             }
             rank_baselines(&mut ranking);
         }
@@ -939,11 +1041,13 @@ fn aggregate(w: &Wire, checksum: String) -> Result<ValidationAggregateReport, St
         manifest_sha256: checksum,
         bootstrap_seed: w.bootstrap_seed,
         global: w.global.clone(),
+        target: w.target.clone(),
+        selection_stage: w.selection.clone(),
         inputs: w
             .chunks
             .iter()
             .map(|c| c.report.clone())
-            .chain(w.selection.iter().cloned())
+            .chain(w.selection.iter().map(|s| s.report.clone()))
             .collect(),
         candidate_identity: w.candidate.as_ref().map(|c| c.identity.clone()),
         candidate_artifact: w.candidate.as_ref().map(|c| c.artifact.clone()),
@@ -984,7 +1088,12 @@ pub fn aggregate_validation_reports(
         .chunks
         .iter()
         .map(|c| (&c.report, MAX_REPORT_BYTES))
-        .chain(spec.wire.selection.iter().map(|p| (p, MAX_AGGREGATE)))
+        .chain(
+            spec.wire
+                .selection
+                .iter()
+                .map(|p| (&p.report, MAX_AGGREGATE)),
+        )
     {
         if let Err(e) = pinned(pin.0, pin.1) {
             errors.push(e);
@@ -1072,11 +1181,13 @@ pub(crate) fn fixture_checks(
         BaselineMean {
             baseline: Baseline::Search,
             mean_utility: Some(0.5),
+            utility_twelfths: Some(144),
             failed_games: 0,
         },
         BaselineMean {
             baseline: Baseline::AppStandard,
             mean_utility: Some(0.5),
+            utility_twelfths: Some(144),
             failed_games: 0,
         },
     ];
@@ -1224,6 +1335,7 @@ pub(crate) fn fixture_checks(
                         "externalExclusions":{"evidenceSha256":global.pin.sha256,"excludedFamilyIds":[external_family]}},
                     "candidate":ci,"reference":ri,"opponentPool":pi,"configurationSha256":"c".repeat(64),
                     "options":GameOptions::default(),"rulesBaseline":replay::RULES_BASELINE,"catalogHash":replay::catalog_hash(),
+                    "targetArch":std::env::consts::ARCH,"targetOs":std::env::consts::OS,
                     "development":true,"freshHoldoutClaimed":false,"producerAuthenticated":false,"trainingAdmissionGranted":false,
                     "blocks":blocks,"guards":guards,"statistics":summarize_metrics(&metrics,7)},
                     "search":{"focal":observed.focal,"opponents":observed.opponents,"opponentPlayingSearchObserved":true}}});
@@ -1251,6 +1363,10 @@ pub(crate) fn fixture_checks(
         purpose: Purpose::BaselineSelectionV1,
         bootstrap_seed: 7,
         global,
+        target: Target {
+            target_arch: std::env::consts::ARCH.into(),
+            target_os: std::env::consts::OS.into(),
+        },
         populations: pops,
         chunks,
         candidate: None,
@@ -1271,6 +1387,105 @@ pub(crate) fn fixture_checks(
         output.populations[1].baseline_ranking[0].mean_utility,
         Some(0.25)
     );
+    // Equal rational wins distributed differently across families must use the fixed tie order.
+    let mut own = BTreeMap::new();
+    for (baseline, wins) in [
+        (Baseline::AppStandard, [1, 1, 1, 1, 1, 1, 0, 0]),
+        (Baseline::CornFirstSetup, [2, 1, 1, 1, 1, 0, 0, 0]),
+    ] {
+        for (seed, wins) in wins.into_iter().enumerate() {
+            own.insert(
+                (baseline, seed as u32),
+                (0..3)
+                    .map(|seat| SummaryArm {
+                        winner_utility: Some(if seat < wins { 1.0 } else { 0.0 }),
+                        score: Some(0.0),
+                        rank: Some(1),
+                        error: None,
+                    })
+                    .collect(),
+            );
+        }
+    }
+    let mut exact_tie = [
+        baseline_mean(Baseline::CornFirstSetup, &[0, 1, 2, 3, 4, 5, 6, 7], 3, &own).unwrap(),
+        baseline_mean(Baseline::AppStandard, &[0, 1, 2, 3, 4, 5, 6, 7], 3, &own).unwrap(),
+    ];
+    rank_baselines(&mut exact_tie);
+    assert_eq!(exact_tie[0].baseline, Baseline::AppStandard);
+    assert_eq!(exact_tie[0].utility_twelfths, Some(72));
+    assert_eq!(exact_tie[0].mean_utility, Some(0.25));
+    assert_eq!(winner_twelfths(1.0 / 3.0).unwrap(), 4);
+    assert_eq!(winner_twelfths(0.5).unwrap(), 6);
+
+    // Positive Searched with zero worlds/steps is impossible even with valid count sums.
+    let role = identity(&search).unwrap();
+    let zero = SearchSummary {
+        decisions: 2,
+        searched: 1,
+        fallbacks: 1,
+        fallback_reasons: [(crate::search::FallbackReason::Setup, 1)]
+            .into_iter()
+            .collect(),
+        ..SearchSummary::default()
+    };
+    let false_search = json!({"error":null,"decisions":2,"search":[zero]});
+    let routes = json!([{"setupChoicesAttempted":1,"setupChoicesReturned":1,"playingChoicesAttempted":1,"playingChoicesReturned":1}]);
+    assert!(diagnostics(&false_search, &routes, &[role], 0, &mut Observed::default()).is_err());
+
+    // Runtime target is explicit, not inferred from the reader's current machine.
+    let target_arch = wire.target.target_arch.clone();
+    wire.target.target_arch = "different_arch".into();
+    assert!(read_chunk(&wire, &wire.chunks[0], &wire.populations[0]).is_err());
+    wire.target.target_arch = target_arch;
+
+    // A pilot carries the old selection closure/target separately from its newer prior.
+    let selected_path = temp.join("selection.json");
+    let selected_raw = serde_json::to_vec(&output).unwrap();
+    std::fs::write(&selected_path, &selected_raw).unwrap();
+    wire.selection = Some(SelectionInput {
+        report: ContentPin {
+            path: selected_path.to_str().unwrap().into(),
+            bytes: selected_raw.len() as u64,
+            sha256: crate::model::digest(&selected_raw),
+        },
+        global: wire.global.clone(),
+        target: wire.target.clone(),
+    });
+    let old_seeds = wire
+        .populations
+        .iter()
+        .map(|p| p.seeds.clone())
+        .collect::<Vec<_>>();
+    let next = super::super::partition_seeds(
+        super::super::Partition::Validation,
+        seeds.last().unwrap() + 1,
+        2,
+    )
+    .unwrap();
+    for (index, p) in wire.populations.iter_mut().enumerate() {
+        p.reference = Some(Baseline::AppStandard);
+        p.seeds = vec![next[index]];
+    }
+    wire.global.count += 16;
+    wire.global.pin.sha256 = "e".repeat(64);
+    wire.global.canonical_digest = "f".repeat(64);
+    selected_references(&wire).unwrap();
+    let target_os = wire.target.target_os.clone();
+    wire.target.target_os = "different_os".into();
+    assert!(selected_references(&wire).is_err());
+    wire.target.target_os = target_os;
+    wire.selection.as_mut().unwrap().target.target_os = "different_os".into();
+    assert!(selected_references(&wire).is_err());
+    wire.selection.as_mut().unwrap().target = wire.target.clone();
+    wire.selection.as_mut().unwrap().global.count += 1;
+    assert!(selected_references(&wire).is_err());
+    wire.selection = None;
+    for (p, seeds) in wire.populations.iter_mut().zip(old_seeds) {
+        p.reference = None;
+        p.seeds = seeds;
+    }
+    std::fs::remove_file(selected_path).unwrap();
     wire.chunks[1].seeds[0] = wire.chunks[0].seeds[0];
     assert!(validate(&wire).is_err());
     for chunk in &wire.chunks {
