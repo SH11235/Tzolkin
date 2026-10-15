@@ -403,7 +403,7 @@ impl<'a> SemanticPlayingJournal<'a> {
         &mut self,
         seeds: [u32; 4],
         pool: PoolRef<'_>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<tzolkin_core::GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<tzolkin_core::GameState, String> + Sync,
     ) -> Result<SemanticJournalReturnedClose, String> {
         let result = (|| {
             self.preflight()?;
@@ -745,6 +745,39 @@ pub(crate) fn journal_fixture(
     pool: &ConditionalFrozenPool,
     limits: CollectionLimits,
 ) {
+    use crate::semantic_playing_rl_collection::SemanticCollectionComposition;
+    journal_fixture_composed(
+        root,
+        prepared,
+        external,
+        history,
+        pool,
+        limits,
+        SemanticCollectionComposition::LegacyV1,
+    );
+    let guarded = root.join("guarded-lanes");
+    fs::create_dir(&guarded).unwrap();
+    journal_fixture_composed(
+        &guarded,
+        prepared,
+        external,
+        history,
+        pool,
+        limits,
+        SemanticCollectionComposition::GuardedProposalV2,
+    );
+}
+
+#[cfg(test)]
+fn journal_fixture_composed(
+    root: &Path,
+    prepared: &crate::human_policy_training::PreparedConditionalHumanPolicy,
+    external: &crate::conditional_human_rl_update::ConditionalNativeExclusions,
+    history: &crate::semantic_playing_rl_collection::DeclaredSamplingHistory,
+    pool: &ConditionalFrozenPool,
+    limits: CollectionLimits,
+    composition: crate::semantic_playing_rl_collection::SemanticCollectionComposition,
+) {
     use crate::conditional_semantic_playing_rl::SemanticPlayingRlOwner;
     use crate::dataset::{DatasetSplit, seed_family_id, split_for_family};
     use crate::public_policy_baseline::ResidualFitConfig;
@@ -752,7 +785,7 @@ pub(crate) fn journal_fixture(
     use crate::public_stochastic::SamplingSeed;
     use crate::semantic_playing_rl_pool::SnapshotSlot;
     let make_with_seed = |critic_seed| {
-        SemanticPlayingJointSession::from_fresh(
+        SemanticPlayingJointSession::from_fresh_composed(
             SemanticPlayingRlOwner::from_prepared(prepared, critic_seed).unwrap(),
             external,
             history,
@@ -761,6 +794,7 @@ pub(crate) fn journal_fixture(
             0,
             OneStepConfig::default(),
             ResidualFitConfig::new(0.001, 0.01, 256).unwrap(),
+            composition,
         )
         .unwrap()
     };
@@ -772,7 +806,12 @@ pub(crate) fn journal_fixture(
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
+    let creating_threads = std::sync::Mutex::new(std::collections::HashSet::new());
     let create = |config: &NativeStochasticConfig| {
+        creating_threads
+            .lock()
+            .unwrap()
+            .insert(std::thread::current().id());
         let mut state = crate::conditional_human_rl_update::tests::terminal_start(
             config.players(),
             config.environment_seed(),
@@ -781,11 +820,67 @@ pub(crate) fn journal_fixture(
         state.turn.count = 0;
         Ok(state)
     };
+    use crate::semantic_playing_rl_collection::{CollectionLanes, fixture_pool_checks};
+    let comparable_close = |close: &SemanticJournalReturnedClose| {
+        let mut value = serde_json::to_value(close).unwrap();
+        // Only output namespaces differ; compare every content pin and field.
+        for key in ["head", "report"] {
+            value[key].as_object_mut().unwrap().remove("path");
+        }
+        value
+    };
+    let assert_same = |one: &SemanticPlayingJournal<'_>, two: &SemanticPlayingJournal<'_>| {
+        assert_eq!(
+            serde_json::to_value(one.status()).unwrap(),
+            serde_json::to_value(two.status()).unwrap()
+        );
+        assert_eq!(one.session.capture_ledger(), two.session.capture_ledger());
+        assert_eq!(
+            one.session.fixture_admitted(),
+            two.session.fixture_admitted()
+        );
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(one.session.actor_parameters().unwrap()),
+            bits(two.session.actor_parameters().unwrap())
+        );
+        assert_eq!(
+            bits(one.session.critic_parameters().unwrap()),
+            bits(two.session.critic_parameters().unwrap())
+        );
+        // Includes record payloads and ordered init/reserve/resolve/closed and
+        // capture entries. Equal stored bytes also bind the exact raw DTO bytes.
+        assert_eq!(
+            one.members.keys().collect::<Vec<_>>(),
+            two.members.keys().collect::<Vec<_>>()
+        );
+        for name in one.members.keys() {
+            assert_eq!(
+                fs::read(one.directory.join(name)).unwrap(),
+                fs::read(two.directory.join(name)).unwrap(),
+                "different whole-four payload {name}"
+            );
+        }
+    };
+    let mut serial =
+        SemanticPlayingJournal::start(&root.join("journal-one-lane"), make(), limits, budget)
+            .unwrap();
+    serial.session.fixture_lanes(CollectionLanes::One);
+    let checks = fixture_pool_checks();
+    let serial_close = serial
+        .update_using(seeds, PoolRef::Legacy(pool, None), create)
+        .unwrap();
+    assert_eq!(fixture_pool_checks() - checks, 2);
     let mut journal =
         SemanticPlayingJournal::start(&root.join("journal"), make(), limits, budget).unwrap();
+    let checks = fixture_pool_checks();
     let close = journal
         .update_using(seeds, PoolRef::Legacy(pool, None), create)
         .unwrap();
+    assert_eq!(fixture_pool_checks() - checks, 2);
+    assert_eq!(comparable_close(&serial_close), comparable_close(&close));
+    assert_eq!(creating_threads.lock().unwrap().len(), 2);
+    assert_same(&serial, &journal);
     assert_eq!(journal.phase, SemanticJournalPhase::Closed);
     assert!(!close.actual_process_close_verified);
     assert_eq!(journal.status().current.completed_updates(), 1);
@@ -811,6 +906,7 @@ pub(crate) fn journal_fixture(
         assert_eq!(config["players"], if i < 2 { 3 } else { 4 });
     }
     let snapshot = journal.freeze_snapshot().unwrap(); // Warm capture needs no OS-close claim.
+    let serial_snapshot = serial.freeze_snapshot().unwrap();
     let mixture =
         SemanticFrozenMixture::new(pool, vec![SnapshotSlot::new(3, 3, &snapshot).unwrap()])
             .unwrap();
@@ -833,6 +929,141 @@ pub(crate) fn journal_fixture(
     let mixed_close = journal
         .update_using(next, PoolRef::Mixture(&mixture), create)
         .unwrap();
+    let serial_mixture = SemanticFrozenMixture::new(
+        pool,
+        vec![SnapshotSlot::new(3, 3, &serial_snapshot).unwrap()],
+    )
+    .unwrap();
+    let serial_mixed_close = serial
+        .update_using(next, PoolRef::Mixture(&serial_mixture), create)
+        .unwrap();
+    assert_eq!(
+        comparable_close(&serial_mixed_close),
+        comparable_close(&mixed_close)
+    );
+    assert_same(&serial, &journal);
+    // Factory errors are incomplete diagnostic records; unwind is error-only.
+    // Both modes choose the same lowest member, keep every predeclared burn and
+    // publish exactly one zero-credit abort after joining and fresh POST.
+    for (case, failed, panic) in [
+        ("zero", 0, false),
+        ("one", 1, false),
+        ("three", 3, false),
+        ("multiple", 0, false),
+        ("unwind", 1, true),
+    ] {
+        let mut expected = None;
+        for (label, lanes) in [("one", CollectionLanes::One), ("two", CollectionLanes::Two)] {
+            let mut other = SemanticPlayingJournal::start(
+                &root.join(format!("journal-member-{case}-{label}")),
+                make(),
+                limits,
+                budget,
+            )
+            .unwrap();
+            other.session.fixture_lanes(lanes);
+            let admitted_before = other.session.fixture_admitted().clone();
+            let active = std::sync::atomic::AtomicUsize::new(0);
+            let checks = fixture_pool_checks();
+            let error = other
+                .update_using(seeds, PoolRef::Legacy(pool, None), |config| {
+                    active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    struct Leaving<'a>(&'a std::sync::atomic::AtomicUsize);
+                    impl Drop for Leaving<'_> {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    let _leaving = Leaving(&active);
+                    if config.environment_seed() == seeds[failed]
+                        || (case == "multiple" && config.environment_seed() == seeds[1])
+                    {
+                        assert!(!panic, "Synthetic member unwind");
+                        let index = seeds
+                            .iter()
+                            .position(|s| *s == config.environment_seed())
+                            .unwrap();
+                        return Err(format!("Synthetic member {index} error"));
+                    }
+                    create(config)
+                })
+                .err()
+                .unwrap();
+            assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(fixture_pool_checks() - checks, 2);
+            let diagnostic = other.session.failed_game().map(|game| {
+                (
+                    game.failure().unwrap().to_string(),
+                    game.observed_callbacks(),
+                    *game.actor_draws(),
+                )
+            });
+            if let Some((previous_error, previous_diagnostic)) = &expected {
+                assert_eq!(&error, previous_error);
+                assert_eq!(&diagnostic, previous_diagnostic);
+            } else {
+                expected = Some((error, diagnostic));
+            }
+            assert_eq!(other.phase, SemanticJournalPhase::Stopped);
+            assert_eq!(
+                (
+                    other.status().attempts,
+                    other.status().spent_families,
+                    other.status().spent_actor_streams
+                ),
+                (1, 4, 14)
+            );
+            assert_eq!(other.status().current.completed_updates(), 0);
+            assert_eq!(other.status().next_ordinal, 204);
+            assert_eq!(
+                other.session.consumed_families(),
+                &seeds.map(seed_family_id).into_iter().collect()
+            );
+            assert_eq!(other.status().current.credited_playing_decisions(), 0);
+            assert_eq!(other.session.fixture_admitted(), &admitted_before);
+            assert_eq!(other.sequence, 2);
+            let abort: Value =
+                serde_json::from_slice(&fs::read(other.directory.join("entry-0002.json")).unwrap())
+                    .unwrap();
+            assert_eq!(abort["event"]["creditedPlaying"], 0);
+            assert_eq!(abort["event"]["kind"], "resolve");
+            assert!(
+                other
+                    .members
+                    .keys()
+                    .all(|name| !name.starts_with("record-"))
+            );
+        }
+    }
+    let mut refused =
+        SemanticPlayingJournal::start(&root.join("journal-spawn-refused"), make(), limits, budget)
+            .unwrap();
+    refused.session.fixture_lanes(CollectionLanes::RefuseSpawn);
+    let entered = std::sync::atomic::AtomicUsize::new(0);
+    let checks = fixture_pool_checks();
+    let error = refused
+        .update_using(seeds, PoolRef::Legacy(pool, None), |config| {
+            entered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            create(config)
+        })
+        .err()
+        .unwrap();
+    assert!(error.starts_with("Spawn semantic collection lane:"));
+    assert_eq!(entered.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(fixture_pool_checks() - checks, 2);
+    assert_eq!(
+        (
+            refused.status().attempts,
+            refused.status().spent_families,
+            refused.status().spent_actor_streams
+        ),
+        (1, 4, 14)
+    );
+    assert_eq!(refused.status().current.credited_playing_decisions(), 0);
+    assert_eq!(refused.sequence, 2);
+    assert_eq!(refused.phase, SemanticJournalPhase::Stopped);
+    assert_eq!(refused.status().next_ordinal, 204);
+    assert!(refused.session.failed_game().is_none());
     assert_eq!(journal.status().current.completed_updates(), 2);
     assert_eq!(journal.status().spent_actor_streams, 28);
     assert!(journal.status().current.credited_playing_decisions() > credit);
@@ -1077,13 +1308,17 @@ pub(crate) fn journal_fixture(
         )
     };
     let declared = declaration("closed", &journal, 0);
+    let coordinator = std::thread::current().id();
     let restored = restore::restore_using(
         &journal.directory,
         &journal.head(),
         &declared,
         make(),
         &[pool],
-        create,
+        |config| {
+            assert_eq!(std::thread::current().id(), coordinator);
+            create(config)
+        },
     )
     .unwrap();
     let (mut restored, captures) = restored.into_journal_and_snapshots();
@@ -1104,6 +1339,12 @@ pub(crate) fn journal_fixture(
         captures[1].journal_identity().unwrap(),
         final_capture.journal_identity().unwrap()
     );
+    if composition
+        == crate::semantic_playing_rl_collection::SemanticCollectionComposition::GuardedProposalV2
+    {
+        assert_same(&journal, &restored);
+        return; // Legacy-only CLI wire fixtures below remain unchanged.
+    }
     let audit = runner::audit_report("0".repeat(64), &declared, &restored, &captures).unwrap();
     let audit = serde_json::to_value(audit).unwrap();
     assert_eq!(
@@ -1222,11 +1463,11 @@ pub(crate) fn journal_fixture(
         )
         .unwrap();
         other.fail_after_publish = Some(label);
-        let entered = std::cell::Cell::new(false);
+        let entered = std::sync::atomic::AtomicBool::new(false);
         assert!(
             other
                 .update_using(seeds, PoolRef::Legacy(pool, None), |config| {
-                    entered.set(true);
+                    entered.store(true, std::sync::atomic::Ordering::Relaxed);
                     create(config)
                 })
                 .is_err()
@@ -1236,7 +1477,10 @@ pub(crate) fn journal_fixture(
             (other.status().attempts, other.status().spent_actor_streams),
             (1, 14)
         );
-        assert_eq!(entered.get(), label == "resolve");
+        assert_eq!(
+            entered.load(std::sync::atomic::Ordering::Relaxed),
+            label == "resolve"
+        );
         assert_eq!(
             other.status().current.completed_updates(),
             u64::from(label == "resolve")

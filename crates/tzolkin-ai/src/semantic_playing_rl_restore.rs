@@ -163,7 +163,7 @@ pub(super) fn restore_using<'a>(
     close_pin: &ContentPin,
     fresh: SemanticPlayingJointSession<'a>,
     pools: &[&ConditionalFrozenPool],
-    create: impl Fn(&NativeStochasticConfig) -> Result<tzolkin_core::GameState, String>,
+    create: impl Fn(&NativeStochasticConfig) -> Result<tzolkin_core::GameState, String> + Sync,
 ) -> Result<SemanticJournalRestoration<'a>, String> {
     let directory = local(directory, false)?;
     if fresh.attempts() != 0 || fresh.stopped() {
