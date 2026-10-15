@@ -16,11 +16,11 @@ export const QUALIFICATION_SCHEMA = 'tzolkin-human-bc-qualification-v1';
 export const MAX_REPORT_BYTES = 32 * 1024 * 1024;
 export const MAX_DEPENDENCY_IDS = 100_000;
 const REPORT_SCHEMA = 'tzolkin-human-bc-audit-v1';
-const FEATURE_SOURCE_SHA256 = '7234ce4b0631ac05cb78149dbfe14b5fee5e9b5fd8354727798cacff1df4e832';
+const FEATURE_SOURCE_SHA256 = '83a2d4326d0985039a003bbb05952f7f525353f8cda49178c55729072651e21e';
 const FEATURE_SOURCE_CHAIN = [
   {
     path: 'crates/tzolkin-inference/src/features.rs',
-    sha256: '7234ce4b0631ac05cb78149dbfe14b5fee5e9b5fd8354727798cacff1df4e832',
+    sha256: '83a2d4326d0985039a003bbb05952f7f525353f8cda49178c55729072651e21e',
   },
   {
     path: 'crates/tzolkin-inference/src/lib.rs',
