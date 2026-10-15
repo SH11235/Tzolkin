@@ -1451,27 +1451,77 @@ fn play_arm_captured(
         },
     }
 }
+/// Metric-only projection shared with the saved-report importer. It never
+/// contains a policy, raw parameters, an actor step or a learning authority.
+#[derive(Clone, Debug)]
+struct SummaryArm {
+    winner_utility: Option<f64>,
+    score: Option<f64>,
+    rank: Option<usize>,
+    error: Option<String>,
+}
+impl From<&ArmResult> for SummaryArm {
+    fn from(arm: &ArmResult) -> Self {
+        Self {
+            winner_utility: arm.winner_utility,
+            score: arm.score,
+            rank: arm.rank,
+            error: arm.error.clone(),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+struct SummaryPair {
+    candidate: SummaryArm,
+    reference: SummaryArm,
+}
+#[derive(Clone, Debug)]
+struct SummaryBlock {
+    pairs: Vec<SummaryPair>,
+    complete: bool,
+    mean_utility_delta: Option<f64>,
+    mean_score_delta: Option<f64>,
+    mean_rank_improvement: Option<f64>,
+}
+impl SummaryBlock {
+    fn new(pairs: Vec<SummaryPair>) -> Self {
+        let complete = pairs
+            .iter()
+            .all(|p| p.candidate.error.is_none() && p.reference.error.is_none());
+        let mean = |value: fn(&SummaryPair) -> f64| {
+            complete.then(|| pairs.iter().map(value).sum::<f64>() / pairs.len() as f64)
+        };
+        Self {
+            mean_utility_delta: mean(|p| {
+                p.candidate.winner_utility.unwrap() - p.reference.winner_utility.unwrap()
+            }),
+            mean_score_delta: mean(|p| p.candidate.score.unwrap() - p.reference.score.unwrap()),
+            mean_rank_improvement: mean(|p| {
+                p.reference.rank.unwrap() as f64 - p.candidate.rank.unwrap() as f64
+            }),
+            complete,
+            pairs,
+        }
+    }
+}
 fn block(seed: u32, pairs: Vec<SeatPair>) -> SeedBlock {
-    let complete = pairs
-        .iter()
-        .all(|pair| pair.candidate.error.is_none() && pair.reference.error.is_none());
-    let mean = |value: fn(&SeatPair) -> f64| {
-        complete.then(|| pairs.iter().map(value).sum::<f64>() / pairs.len() as f64)
-    };
+    let summary = SummaryBlock::new(
+        pairs
+            .iter()
+            .map(|p| SummaryPair {
+                candidate: SummaryArm::from(&p.candidate),
+                reference: SummaryArm::from(&p.reference),
+            })
+            .collect(),
+    );
     SeedBlock {
         seed,
         family_id: family_id(seed),
-        mean_utility_delta: mean(|pair| {
-            pair.candidate.winner_utility.unwrap() - pair.reference.winner_utility.unwrap()
-        }),
-        mean_score_delta: mean(|pair| {
-            pair.candidate.score.unwrap() - pair.reference.score.unwrap()
-        }),
-        mean_rank_improvement: mean(|pair| {
-            pair.reference.rank.unwrap() as f64 - pair.candidate.rank.unwrap() as f64
-        }),
         pairs,
-        complete,
+        complete: summary.complete,
+        mean_utility_delta: summary.mean_utility_delta,
+        mean_score_delta: summary.mean_score_delta,
+        mean_rank_improvement: summary.mean_rank_improvement,
     }
 }
 #[derive(Clone, Debug, Serialize)]
@@ -1498,8 +1548,28 @@ pub struct PairedStatistics {
 }
 /// Percentile interval resamples entire seed blocks, retaining all seat correlations.
 fn summarize(blocks: &[SeedBlock], bootstrap_seed: u64) -> PairedStatistics {
+    let metrics = blocks
+        .iter()
+        .map(|b| SummaryBlock {
+            pairs: b
+                .pairs
+                .iter()
+                .map(|p| SummaryPair {
+                    candidate: SummaryArm::from(&p.candidate),
+                    reference: SummaryArm::from(&p.reference),
+                })
+                .collect(),
+            complete: b.complete,
+            mean_utility_delta: b.mean_utility_delta,
+            mean_score_delta: b.mean_score_delta,
+            mean_rank_improvement: b.mean_rank_improvement,
+        })
+        .collect::<Vec<_>>();
+    summarize_metrics(&metrics, bootstrap_seed)
+}
+fn summarize_metrics(blocks: &[SummaryBlock], bootstrap_seed: u64) -> PairedStatistics {
     let complete: Vec<_> = blocks.iter().filter(|block| block.complete).collect();
-    let mean = |value: fn(&SeedBlock) -> f64| {
+    let mean = |value: fn(&SummaryBlock) -> f64| {
         (!complete.is_empty())
             .then(|| complete.iter().map(|block| value(block)).sum::<f64>() / complete.len() as f64)
     };
@@ -2485,7 +2555,7 @@ mod tests {
         let failed = block(2, broken);
         assert!(!failed.complete);
         assert_eq!(failed.mean_utility_delta, None);
-        let result = summarize(&[blocks[0].clone(), failed], 0);
+        let result = summarize(&[blocks[0].clone(), failed.clone()], 0);
         assert_eq!(
             (
                 result.complete_blocks,
@@ -2501,6 +2571,7 @@ mod tests {
         assert!(result.failures_preclude_adoption);
         assert!(!result.strength_improvement_declared);
         assert_eq!(summarize(&[], 0).mean_utility_delta, None);
+        numeric::validation_aggregate::fixture_checks(&blocks, &[blocks[0].clone(), failed]);
     }
 
     #[test]

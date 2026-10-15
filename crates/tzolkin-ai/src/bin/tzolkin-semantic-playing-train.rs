@@ -1,5 +1,8 @@
 //! Finite source-owned semantic Playing learning; an outer observer owns OS closure.
 use std::path::Path;
+use tzolkin_ai::arena::numeric::validation_aggregate::{
+    ValidationAggregateSpec, aggregate_validation_reports,
+};
 use tzolkin_ai::public_rl_paired_session::read_bounded;
 use tzolkin_ai::semantic_playing_rl_journal::{
     ProceduralRosterValidationSpec, SemanticJournalAuditSpec, SemanticJournalEvaluationSpec,
@@ -21,6 +24,8 @@ const POLICY_EVALUATION_HELP: &str = "tzolkin-semantic-playing-train evaluate-po
 const POLICY_PROCEDURAL_VALIDATION_HELP: &str = "tzolkin-semantic-playing-train evaluate-policy-procedural-validation --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_EVALUATION_DIR\nSeparate closed Validation control pins a semantic Playing inference candidate, a procedural reference, the frozen procedural roster, complete caller-declared globalExternal family exclusions, players, seeds and bootstrapSeed. The candidate retains its own Corn-first Setup and fresh default TradeGuard; procedural policies retain their declared behavior. Writes evaluation.json. Exit0 requires complete paired arms and every-result input postchecks; no training, fresh Test, strength or adoption claim.\n";
 const PROCEDURAL_VALIDATION_HELP: &str = "tzolkin-semantic-playing-train evaluate-procedural-validation --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_EVALUATION_DIR\nSeparate closed Validation control pins two procedural focal policies, the frozen procedural roster, complete caller-declared globalExternal family exclusions, players, seeds and bootstrapSeed. Each policy retains its declared behavior. Writes evaluation.json. Exit0 requires complete paired arms and every-result input postchecks; no training, fresh Test, strength or adoption claim.\n";
 
+const AGGREGATE_HELP: &str = "tzolkin-semantic-playing-train aggregate-validation --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_AGGREGATE_FILE\nSaved-only closed baselineSelectionV1/semanticPilotV1 manifests. Reads at most14 pinned reports one at a time, preserving whole-family/absolute-seat pairing and failed outcomes. Baselines rank by own winner utility with fixed App/Corn/Uxmal/Search tie order; pilot confidence resamples all32 whole families once per player count. Nested model/source paths are never followed. Exit0 means exact planned completeness and declared phase/Search challenge, not strength, adoption, fresh Test or power.\n";
+
 fn run(args: &[String]) -> Result<i32, String> {
     if args.len() != 7
         || !matches!(
@@ -34,10 +39,11 @@ fn run(args: &[String]) -> Result<i32, String> {
                 | "evaluate-policy"
                 | "evaluate-policy-procedural-validation"
                 | "evaluate-procedural-validation"
+                | "aggregate-validation"
         )
     {
         return Err(
-            "Expected start|resume|continue|audit|evaluate|export-policy|evaluate-policy|evaluate-policy-procedural-validation|evaluate-procedural-validation and three flag/value pairs".into(),
+            "Expected start|resume|continue|audit|evaluate|export-policy|evaluate-policy|evaluate-policy-procedural-validation|evaluate-procedural-validation|aggregate-validation and three flag/value pairs".into(),
         );
     }
     let mut flags = std::collections::BTreeMap::new();
@@ -52,6 +58,33 @@ fn run(args: &[String]) -> Result<i32, String> {
         }
     }
     let raw = read_bounded(Path::new(flags["--control"]), 1024 * 1024)?;
+    if args[0] == "aggregate-validation" {
+        let spec = ValidationAggregateSpec::from_json(&raw, flags["--expected-sha256"])?;
+        let result = aggregate_validation_reports(spec, Path::new(flags["--output"]));
+        let post = read_bounded(Path::new(flags["--control"]), 1024 * 1024).and_then(|after| {
+            if after == raw {
+                Ok(())
+            } else {
+                Err("Aggregate control changed".into())
+            }
+        });
+        let report = match (result, post) {
+            (Ok(report), Ok(())) => report,
+            (Err(error), Ok(())) => return Err(error),
+            (result, Err(post)) => {
+                return Err(format!(
+                    "{}; aggregate control POST: {post}",
+                    result.err().unwrap_or_default()
+                ));
+            }
+        };
+        let code = report.exit_code();
+        println!(
+            "{}",
+            serde_json::json!({"schema":"tzolkin-validation-aggregate-summary-v1", "completePlannedEvidence":code == 0})
+        );
+        return Ok(code);
+    }
     if args[0] == "evaluate-policy-procedural-validation" {
         let spec = SemanticProceduralValidationSpec::from_json(&raw, flags["--expected-sha256"])?;
         let result = evaluate_semantic_playing_policy_procedural_validation(
@@ -217,7 +250,7 @@ fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--help"] {
         print!(
-            "{HELP}{AUDIT_HELP}{EVALUATION_HELP}{CHECKPOINT_HELP}{GUARDED_COLLECTION_HELP}{NATIVE_INITIALIZATION_HELP}{POLICY_HELP}{POLICY_EVALUATION_HELP}{POLICY_PROCEDURAL_VALIDATION_HELP}{PROCEDURAL_VALIDATION_HELP}"
+            "{HELP}{AUDIT_HELP}{EVALUATION_HELP}{CHECKPOINT_HELP}{GUARDED_COLLECTION_HELP}{NATIVE_INITIALIZATION_HELP}{POLICY_HELP}{POLICY_EVALUATION_HELP}{POLICY_PROCEDURAL_VALIDATION_HELP}{PROCEDURAL_VALIDATION_HELP}{AGGREGATE_HELP}"
         );
         return;
     }
