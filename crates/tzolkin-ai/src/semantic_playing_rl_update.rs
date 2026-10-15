@@ -644,6 +644,17 @@ impl<'a> SemanticPlayingJointSession<'a> {
     pub fn failed_game(&self) -> Option<&SemanticPlayingCollectedGame> {
         self.ledger.failed_game()
     }
+    #[cfg(test)]
+    pub(crate) fn fixture_lanes(
+        &mut self,
+        lanes: crate::semantic_playing_rl_collection::CollectionLanes,
+    ) {
+        self.ledger.lanes = lanes;
+    }
+    #[cfg(test)]
+    pub(crate) fn fixture_admitted(&self) -> &BTreeSet<String> {
+        self.ledger.admitted_checksums()
+    }
     pub fn freeze_snapshot(&self) -> Result<FrozenSemanticSnapshot<'a>, String> {
         self.ledger
             .freeze_snapshot(&self.state.view(self.identity.checksum()), &self.identity)
@@ -887,7 +898,8 @@ impl<'a> SemanticPlayingJointSession<'a> {
         pool: PoolRef<'_>,
         create: impl Fn(
             &crate::public_stochastic_native::NativeStochasticConfig,
-        ) -> Result<tzolkin_core::GameState, String>,
+        ) -> Result<tzolkin_core::GameState, String>
+        + Sync,
     ) -> Result<PreparedSemanticAdmission, String> {
         self.stage_records_using(batch, pool, None, create)
     }
@@ -898,7 +910,8 @@ impl<'a> SemanticPlayingJointSession<'a> {
         saved: &[Vec<u8>; 4],
         create: impl Fn(
             &crate::public_stochastic_native::NativeStochasticConfig,
-        ) -> Result<tzolkin_core::GameState, String>,
+        ) -> Result<tzolkin_core::GameState, String>
+        + Sync,
     ) -> Result<PreparedSemanticAdmission, String> {
         self.stage_records_using(batch, pool, Some(saved), create)
     }
@@ -909,7 +922,8 @@ impl<'a> SemanticPlayingJointSession<'a> {
         saved: Option<&[Vec<u8>; 4]>,
         create: impl Fn(
             &crate::public_stochastic_native::NativeStochasticConfig,
-        ) -> Result<tzolkin_core::GameState, String>,
+        ) -> Result<tzolkin_core::GameState, String>
+        + Sync,
     ) -> Result<PreparedSemanticAdmission, String> {
         let attempt = self.ledger.attempts();
         let identity = &self.identity;
@@ -1812,7 +1826,7 @@ pub(crate) fn joint_fixture() {
     let reject = |mut other: SemanticPlayingJointSession<'_>,
                   mixture: &SemanticFrozenMixture<'_>,
                   expected: &str| {
-        let entered = Cell::new(false);
+        let entered = std::sync::atomic::AtomicBool::new(false);
         let result = other.ledger.collect_mixture_fixture_using(
             &other.state.view(other.identity.checksum()),
             other_families,
@@ -1820,12 +1834,12 @@ pub(crate) fn joint_fixture() {
             limits,
             |_, _| Ok(()),
             |_| {
-                entered.set(true);
+                entered.store(true, std::sync::atomic::Ordering::Relaxed);
                 Err("Lineage refusal must precede game creation".into())
             },
         );
         assert_eq!(result.unwrap_err(), expected);
-        assert!(!entered.get());
+        assert!(!entered.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(
             (
                 other.attempts(),

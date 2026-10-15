@@ -886,6 +886,165 @@ enum RosterRef<'a> {
     Legacy(&'a ConditionalFrozenMixRoster<'a>),
     Mixture(&'a SemanticMixtureRoster<'a>),
 }
+
+/// Execution order is private, never part of a reservation or numeric identity.
+/// Saved-record restoration always uses its sequential audit path.
+#[derive(Clone, Copy)]
+pub(crate) enum CollectionLanes {
+    #[cfg(test)]
+    One,
+    Two,
+    #[cfg(test)]
+    RefuseSpawn,
+}
+
+struct MemberFailure {
+    error: String,
+    incomplete: Option<Box<SemanticPlayingCollectedGame>>,
+}
+impl From<String> for MemberFailure {
+    fn from(error: String) -> Self {
+        Self {
+            error,
+            incomplete: None,
+        }
+    }
+}
+type MemberOutcome = Result<AuditedSemanticPlayingEpisode, MemberFailure>;
+
+#[cfg(test)]
+std::thread_local! {
+    static COLLECTION_POOL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn fixture_pool_checks() -> usize {
+    COLLECTION_POOL_CHECKS.get()
+}
+
+fn collect_lane(
+    indices: &[usize],
+    collect: &(impl Fn(usize) -> MemberOutcome + Sync),
+) -> Vec<(usize, MemberOutcome)> {
+    let mut outcomes = Vec::with_capacity(indices.len());
+    let mut active = indices[0];
+    // Only private lane-local values are mutated. The ledger, owner, source
+    // checker and admission callback remain on the coordinator. Under unwind,
+    // convert a member panic to an error so joining precedes the fresh POST.
+    // panic=abort, OOM and process termination still require wrapper POSTs.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        for &index in indices {
+            active = index;
+            let outcome = collect(index);
+            let failed = outcome.is_err();
+            outcomes.push((index, outcome));
+            if failed {
+                break;
+            }
+        }
+    }));
+    if result.is_err() {
+        outcomes.push((
+            active,
+            Err(MemberFailure::from(format!(
+                "Semantic collection member {active} panicked"
+            ))),
+        ));
+    }
+    outcomes
+}
+
+fn collect_fresh_lanes(
+    lanes: CollectionLanes,
+    collect: impl Fn(usize) -> MemberOutcome + Sync,
+) -> Result<[Option<MemberOutcome>; 4], String> {
+    let outcomes = match lanes {
+        #[cfg(test)]
+        CollectionLanes::One => collect_lane(&[0, 1, 2, 3], &collect),
+        _ => std::thread::scope(|scope| {
+            let spawn = || {
+                std::thread::Builder::new()
+                    .name("tzolkin-semantic-members-1-3".into())
+                    .spawn_scoped(scope, || collect_lane(&[1, 3], &collect))
+            };
+            #[cfg(test)]
+            let worker = if matches!(lanes, CollectionLanes::RefuseSpawn) {
+                Err(std::io::Error::other(
+                    "Synthetic semantic lane spawn refusal",
+                ))
+            } else {
+                spawn()
+            };
+            #[cfg(not(test))]
+            let worker = spawn();
+            // No member starts on a spawn error, and there is no fallback.
+            let worker = worker.map_err(|e| format!("Spawn semantic collection lane: {e}"))?;
+            let mut coordinator = collect_lane(&[0, 2], &collect);
+            // Explicitly join before any result (including an error) escapes to
+            // the checked scope. A higher member may already have run when a
+            // lower member fails: it stays burned, unpublished and uncredited.
+            let other = worker
+                .join()
+                .map_err(|_| "Semantic collection lane panicked outside a member".to_string())?;
+            coordinator.extend(other);
+            Ok::<_, String>(coordinator)
+        })?,
+    };
+    let mut ordered = std::array::from_fn(|_| None);
+    for (index, outcome) in outcomes {
+        ordered[index] = Some(outcome);
+    }
+    Ok(ordered)
+}
+
+fn collect_fresh_member(
+    config: &NativeStochasticConfig,
+    roster: RosterRef<'_>,
+    scope: &SemanticCollectionScope<'_>,
+    binding: &str,
+    composition: SemanticCollectionComposition,
+    create: &impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+) -> MemberOutcome {
+    let collected = run_composed(config, roster, scope, binding, None, composition, || {
+        create(config)
+    })?;
+    if !collected.complete() {
+        return Err(MemberFailure {
+            error: collected
+                .failure
+                .clone()
+                .unwrap_or_else(|| "Semantic game incomplete".into()),
+            incomplete: Some(Box::new(SemanticPlayingCollectedGame { record: collected })),
+        });
+    }
+    let audited = run_composed(
+        config,
+        roster,
+        scope,
+        binding,
+        Some(&collected),
+        composition,
+        || create(config),
+    )?;
+    Ok(seal(
+        audited,
+        config.clone(),
+        roster.learner_seat(),
+        roster.sampled_opponents(config.players()),
+    )?)
+}
+
+#[test]
+fn scoped_collection_types_are_send_sync() {
+    fn sync<T: Sync>() {}
+    fn send<T: Send>() {}
+    sync::<SemanticCollectionScope<'static>>();
+    sync::<ConditionalFrozenMixRoster<'static>>();
+    sync::<SemanticMixtureRoster<'static>>();
+    sync::<FrozenSemanticSnapshot<'static>>();
+    sync::<NativeStochasticConfig>();
+    send::<RosterRef<'static>>();
+    send::<MemberOutcome>();
+}
 impl<'a> RosterRef<'a> {
     fn learner_seat(self) -> usize {
         match self {
@@ -981,6 +1140,8 @@ pub(crate) struct SemanticCollectionLedger<'a> {
     pins: Vec<ContentPin>,
     stopped: bool,
     failed: Option<SemanticPlayingCollectedGame>,
+    #[cfg(test)]
+    pub(crate) lanes: CollectionLanes,
 }
 impl<'a> SemanticCollectionLedger<'a> {
     pub(crate) fn record_auditor<'state>(
@@ -1187,6 +1348,8 @@ impl<'a> SemanticCollectionLedger<'a> {
             pins,
             stopped: false,
             failed: None,
+            #[cfg(test)]
+            lanes: CollectionLanes::Two,
         })
     }
     pub(crate) fn attempts(&self) -> usize {
@@ -1264,7 +1427,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             &SemanticCollectionScope<'scope>,
             AuditedSemanticPlayingCohort,
         ) -> Result<R, String>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String> + Sync,
     ) -> Result<R, String> {
         self.collect_pool(
             owner,
@@ -1286,7 +1449,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             &SemanticCollectionScope<'scope>,
             AuditedSemanticPlayingCohort,
         ) -> Result<R, String>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String> + Sync,
     ) -> Result<R, String> {
         if self.stopped || self.attempts >= MAX_ATTEMPTS {
             return Err("Semantic collection stopped or attempt bound".into());
@@ -1331,7 +1494,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             &SemanticCollectionScope<'scope>,
             AuditedSemanticPlayingCohort,
         ) -> Result<R, String>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String> + Sync,
     ) -> Result<R, String> {
         self.collect_using(owner, seeds, pool, None, limits, finish, create)
     }
@@ -1346,7 +1509,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             &SemanticCollectionScope<'scope>,
             AuditedSemanticPlayingCohort,
         ) -> Result<R, String>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String> + Sync,
     ) -> Result<R, String> {
         self.collect_pool(
             owner,
@@ -1368,7 +1531,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             &SemanticCollectionScope<'scope>,
             AuditedSemanticPlayingCohort,
         ) -> Result<R, String>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String> + Sync,
     ) -> Result<R, String> {
         let plan = self.plan(owner, seeds, pool, limits)?;
         let batch = self.reserve(plan);
@@ -1516,7 +1679,7 @@ impl<'a> SemanticCollectionLedger<'a> {
             &SemanticCollectionScope<'scope>,
             AuditedSemanticPlayingCohort,
         ) -> Result<R, String>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String> + Sync,
     ) -> Result<R, String> {
         self.collect_reserved_records(
             owner,
@@ -1539,13 +1702,17 @@ impl<'a> SemanticCollectionLedger<'a> {
             AuditedSemanticPlayingCohort,
             &Self,
         ) -> Result<R, String>,
-        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String>,
+        create: impl Fn(&NativeStochasticConfig) -> Result<GameState, String> + Sync,
     ) -> Result<R, String> {
         let pins = self.pins.clone();
         let result = owner.with_checked_pool(
             self.external,
             &pins,
-            |checked| pool.recheck_in(checked),
+            |checked| {
+                #[cfg(test)]
+                COLLECTION_POOL_CHECKS.set(COLLECTION_POOL_CHECKS.get() + 1);
+                pool.recheck_in(checked)
+            },
             |scope| {
                 if self.stopped
                     || batch.parent != scope.parent_checksum()
@@ -1581,11 +1748,13 @@ impl<'a> SemanticCollectionLedger<'a> {
                 let binding = &batch.binding;
                 let human_reservations = owner.metadata().1.clone();
                 let mut episodes = Vec::new();
-                for (i, config) in batch.configs.iter().enumerate() {
-                    let roster = rosters.get(i);
-                    // Reuse the outer whole-four checked scope. Its POST runs before
-                    // any prepared result leaves, including a member or finish error.
-                    let episode = if let Some(saved) = saved {
+                if let Some(saved) = saved {
+                    // Restoration deliberately remains sequential. No worker
+                    // can construct a seal from a saved DTO without fresh audit.
+                    for (i, config) in batch.configs.iter().enumerate() {
+                        let roster = rosters.get(i);
+                        // Reuse the outer whole-four checked scope. Its POST runs before
+                        // any prepared result leaves, including a member or finish error.
                         let header = RecordHeader::new_composed(
                             &batch.parent,
                             i,
@@ -1598,7 +1767,7 @@ impl<'a> SemanticCollectionLedger<'a> {
                         )?;
                         // Raw DTOs stay private. Only this same source-owned
                         // fresh Core audit can seal a historical learner step.
-                        audit_bound_record(
+                        episodes.push(audit_bound_record(
                             &saved[i],
                             &header,
                             config,
@@ -1606,42 +1775,33 @@ impl<'a> SemanticCollectionLedger<'a> {
                             scope,
                             binding,
                             || create(config),
-                        )?
-                    } else {
-                        let collected = run_composed(
-                            config,
-                            roster,
+                        )?);
+                    }
+                } else {
+                    #[cfg(test)]
+                    let lanes = self.lanes;
+                    #[cfg(not(test))]
+                    let lanes = CollectionLanes::Two;
+                    let composition = self.composition;
+                    let outcomes = collect_fresh_lanes(lanes, |i| {
+                        collect_fresh_member(
+                            &batch.configs[i],
+                            rosters.get(i),
                             scope,
                             binding,
-                            None,
-                            self.composition,
-                            || create(config),
-                        )?;
-                        if !collected.complete() {
-                            let error = collected
-                                .failure
-                                .clone()
-                                .unwrap_or_else(|| "Semantic game incomplete".into());
-                            self.failed = Some(SemanticPlayingCollectedGame { record: collected });
-                            return Err(error);
+                            composition,
+                            &create,
+                        )
+                    })?;
+                    for outcome in outcomes {
+                        match outcome.ok_or("Semantic member missing before an earlier failure")? {
+                            Ok(episode) => episodes.push(episode),
+                            Err(failure) => {
+                                self.failed = failure.incomplete.map(|game| *game);
+                                return Err(failure.error);
+                            }
                         }
-                        let audited = run_composed(
-                            config,
-                            roster,
-                            scope,
-                            binding,
-                            Some(&collected),
-                            self.composition,
-                            || create(config),
-                        )?;
-                        seal(
-                            audited,
-                            config.clone(),
-                            roster.learner_seat(),
-                            roster.sampled_opponents(config.players()),
-                        )?
-                    };
-                    episodes.push(episode);
+                    }
                 }
                 let cohort = AuditedSemanticPlayingCohort {
                     episodes: episodes
