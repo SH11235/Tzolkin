@@ -679,6 +679,805 @@ fn current_monument_estimate(
     })
 }
 
+/// V8 alone compares a bounded current-funded conversion in terminal VP.
+/// None means the complete decision must retain its historical fallback. These
+/// are public-state score previews, never synthetic legal actions or a Game.
+pub fn resource_cycle_v8_conversion_scores(o: &Observation) -> Option<Vec<f64>> {
+    let p = o.players.get(o.actor)?;
+    if o.phase != Phase::Playing
+        || !(3..=4).contains(&o.players.len())
+        || o.expansion.is_some()
+        || o.additional_buildings
+        || o.players.iter().any(|p| p.tribe.is_some())
+        || o.private.selected_tribe.is_some()
+        || p.resources.iter().any(|n| !(0..=1_000_000).contains(n))
+        || p.technologies.iter().any(|n| !(0..=3).contains(n))
+        || p.score_quarters.unsigned_abs() > 1_000_000_000
+        || o.legal_actions.len() > 1024
+        || o.buildings
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != o.buildings.len()
+        || o.monuments
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != o.monuments.len()
+        || o.buildings.len() > 6
+        || o.monuments.len() > 13
+        || !(1..=27).contains(&o.round)
+        || o.skull_spaces.len() != 10
+        || !(0..=13).contains(&o.skull_supply)
+        || GEAR_IDS.iter().any(|g| {
+            o.gears
+                .get(g)
+                .is_none_or(|v| v.len() != if *g == GearId::ChichenItza { 13 } else { 10 })
+        })
+    {
+        return None;
+    }
+    if p.buildings.iter().any(|id| {
+        building(id).is_some_and(|b| b.effects.iter().any(|e| matches!(e, Effect::Renovation)))
+    }) {
+        return None;
+    }
+    let context = V8Conversion { o };
+    context.potential(p).ok()?;
+    if o.pending_task.is_none() {
+        if context.monument_value(p).ok()? <= 0.0 {
+            return None;
+        }
+        let route = o.gears[&GearId::Tikal].iter().enumerate().any(|(pos,w)|
+            pos < 8 && w.as_ref().is_some_and(|w| !w.dummy && w.player_id == o.actor as i64)
+                && o.round + (4-pos as i64).max(0) <= 27)
+            || o.legal_actions.iter().any(|a| matches!(a.action, TypedAction::Place { gear: GearId::Tikal, corn_cost, .. }
+                if p.resources[0] >= corn_cost && resource_route_slot(o, GearId::Tikal).is_some_and(|pos| o.round + (4-pos as i64).max(1) <= 27)));
+        if !route {
+            return None;
+        }
+    } else if matches!(o.pending_task, Some(Task::Trade)) {
+        return None;
+    }
+    o.legal_actions
+        .iter()
+        .map(|row| context.score(&row.action).ok().filter(|v| v.is_finite()))
+        .collect()
+}
+
+struct V8Conversion<'a> {
+    o: &'a Observation,
+}
+impl V8Conversion<'_> {
+    fn stock(a: &[i64; 5]) -> f64 {
+        a.iter()
+            .zip([0.25, 0.5, 0.75, 1.0, 3.0])
+            .map(|(n, v)| *n as f64 * v)
+            .sum()
+    }
+    fn potential(&self, p: &PublicPlayer) -> Result<f64, ()> {
+        let mut m = monument_metrics(self.o, p).ok_or(())?;
+        let original = &self.o.players[self.o.actor];
+        m.all_monuments = m
+            .all_monuments
+            .checked_add(
+                p.monuments
+                    .len()
+                    .checked_sub(original.monuments.len())
+                    .ok_or(())?,
+            )
+            .ok_or(())?;
+        m.all_skulls += p.skulls_placed - original.skulls_placed;
+        Ok(p.score_quarters as f64 / 4.0
+            + Self::stock(&p.resources)
+            + p.monuments
+                .iter()
+                .map(|id| score_monument_metrics(&m, id))
+                .sum::<f64>())
+    }
+    fn pay(&self, p: &PublicPlayer, cost: &[i64; 5]) -> Option<PublicPlayer> {
+        if cost.iter().zip(p.resources).any(|(c, n)| *c < 0 || *c > n) {
+            return None;
+        }
+        let mut next = p.clone();
+        for (n, c) in next.resources.iter_mut().zip(cost) {
+            *n -= c;
+        }
+        Some(next)
+    }
+    fn gain(&self, p: &mut PublicPlayer, amounts: &[i64; 5]) -> Result<(), ()> {
+        if amounts.iter().any(|n| *n < 0) {
+            return Err(());
+        }
+        let original = &self.o.players[self.o.actor];
+        let available = (self.o.skull_supply
+            - (p.resources[4] - original.resources[4])
+            - (p.skulls_placed - original.skulls_placed))
+            .max(0);
+        for (i, n) in amounts.iter().enumerate() {
+            p.resources[i] += if i == 4 { (*n).min(available) } else { *n };
+        }
+        Ok(())
+    }
+    fn temple(&self, p: &PublicPlayer, t: TempleId, direction: i64) -> Option<PublicPlayer> {
+        let i = temple_index(t);
+        let level = p.temples[i] + direction;
+        let max = CATALOG.temple_tracks[&t].max;
+        if !(-1..=max).contains(&level)
+            || (direction > 0
+                && level == max
+                && self
+                    .o
+                    .players
+                    .iter()
+                    .any(|other| other.id != p.id && other.temples[i] == max))
+        {
+            return None;
+        }
+        let mut next = p.clone();
+        next.temples[i] = level;
+        Some(next)
+    }
+    fn temple_choices(
+        &self,
+        p: &PublicPlayer,
+        direction: i64,
+        exclude: &[TempleId],
+    ) -> Vec<PublicPlayer> {
+        TEMPLE_IDS
+            .into_iter()
+            .filter(|t| !exclude.contains(t))
+            .filter_map(|t| self.temple(p, t, direction))
+            .collect()
+    }
+    fn technology(&self, p: &PublicPlayer, t: TechnologyId) -> Result<Vec<PublicPlayer>, ()> {
+        let mut next = p.clone();
+        let i = tech_index(t);
+        if next.technologies[i] < 3 {
+            next.technologies[i] += 1;
+            return Ok(vec![next]);
+        }
+        match t {
+            TechnologyId::Agriculture => {
+                let choices = self.temple_choices(p, 1, &[]);
+                Ok(if choices.is_empty() {
+                    vec![next]
+                } else {
+                    choices
+                })
+            }
+            TechnologyId::Extraction => {
+                self.gain(&mut next, &[0, 0, 0, 2, 0])?;
+                Ok(vec![next])
+            }
+            TechnologyId::Architecture => {
+                next.score_quarters += 12;
+                Ok(vec![next])
+            }
+            TechnologyId::Theology => {
+                self.gain(&mut next, &[0, 0, 0, 0, 1])?;
+                Ok(vec![next])
+            }
+        }
+    }
+    fn effects(
+        &self,
+        mut states: Vec<PublicPlayer>,
+        effects: &[Effect],
+    ) -> Result<Vec<PublicPlayer>, ()> {
+        for effect in effects {
+            let mut out = Vec::new();
+            for mut p in states {
+                match effect {
+                    Effect::Resources { resources } => {
+                        self.gain(
+                            &mut p,
+                            &RESOURCE_IDS.map(|r| resources.get(&r).copied().unwrap_or(0)),
+                        )?;
+                        out.push(p)
+                    }
+                    Effect::Points { amount } => {
+                        p.score_quarters += 4 * amount;
+                        out.push(p)
+                    }
+                    Effect::Worker => {
+                        p.workers = (p.workers + 1).min(6);
+                        out.push(p)
+                    }
+                    // Recognized future-only effects have zero *current* terminal
+                    // delta, not an unknown competitor silently valued at zero.
+                    Effect::Feed { .. }
+                    | Effect::FeedDiscount { .. }
+                    | Effect::FoodReward { .. }
+                    | Effect::FoodRewardSwitch
+                    | Effect::Trade => out.push(p),
+                    Effect::Technology { technology, steps } => {
+                        let steps = steps.unwrap_or(1);
+                        if !(1..=2).contains(&steps) {
+                            return Err(());
+                        }
+                        let mut branch = vec![p];
+                        for _ in 0..steps {
+                            let mut next = Vec::new();
+                            for p in branch {
+                                for t in TECHNOLOGY_IDS {
+                                    if matches!(technology,Target::Specific(wanted) if *wanted!=t) {
+                                        continue;
+                                    }
+                                    next.extend(self.technology(&p, t)?);
+                                }
+                            }
+                            branch = next;
+                        }
+                        out.extend(branch);
+                    }
+                    Effect::Temple { temple, steps } => {
+                        let steps = steps.unwrap_or(1);
+                        if !(1..=2).contains(&steps) {
+                            return Err(());
+                        }
+                        let mut branch = vec![p];
+                        for _ in 0..steps {
+                            let mut next = Vec::new();
+                            for p in branch {
+                                match temple {
+                                    Target::Specific(t) => {
+                                        next.push(self.temple(&p, *t, 1).unwrap_or(p))
+                                    }
+                                    Target::Any(_) => next.extend(self.temple_choices(&p, 1, &[])),
+                                }
+                            }
+                            branch = next;
+                        }
+                        out.extend(branch);
+                    }
+                    // An additional construction/action can create immediate VP;
+                    // unlike Feed it is genuinely outside this closed preview.
+                    _ => return Err(()),
+                }
+            }
+            if out.len() > 64 {
+                return Err(());
+            }
+            states = out;
+        }
+        Ok(states)
+    }
+    fn build_states(
+        &self,
+        p: &PublicPlayer,
+        id: &str,
+        cost: &[i64; 5],
+        architecture: bool,
+    ) -> Result<Vec<PublicPlayer>, ()> {
+        let b = building(id).ok_or(())?;
+        let mut next = self.pay(p, cost).ok_or(())?;
+        next.buildings.push(id.into());
+        if architecture {
+            self.gain(&mut next, &[1, 0, 0, 0, 0])?;
+            if p.technologies[2] >= 2 {
+                next.score_quarters += 8;
+            }
+        }
+        self.effects(vec![next], &b.effects)
+    }
+    fn build_value(
+        &self,
+        p: &PublicPlayer,
+        remaining: usize,
+        corn: bool,
+        architecture_available: bool,
+        exclude: Option<&str>,
+    ) -> Result<f64, ()> {
+        let before = self.potential(p)?;
+        let mut best: f64 = 0.0;
+        for id in &self.o.buildings {
+            if exclude == Some(id.as_str()) {
+                continue;
+            }
+            let card = building(id).ok_or(())?;
+            let base = RESOURCE_IDS.map(|r| card.cost.get(&r).copied().unwrap_or(0));
+            let eligible = architecture_available && p.technologies[2] >= 1;
+            let mut modes = vec![(false, None)];
+            if eligible {
+                modes = if p.technologies[2] >= 3 {
+                    MATERIALS
+                        .into_iter()
+                        .filter(|r| base[resource_index(*r)] > 0)
+                        .map(|r| (true, Some(r)))
+                        .collect()
+                } else {
+                    vec![(true, None)]
+                };
+                if modes.is_empty() {
+                    modes.push((true, None));
+                }
+                if remaining > 1 {
+                    modes.push((false, None));
+                }
+            }
+            for (architecture, discount) in modes {
+                let mut cost = base;
+                if let Some(r) = discount {
+                    cost[resource_index(r)] -= 1;
+                }
+                if corn {
+                    cost = [
+                        2 * (base[1] + base[2] + base[3]) - 2 * i64::from(discount.is_some()),
+                        0,
+                        0,
+                        0,
+                        base[4],
+                    ];
+                }
+                if self.pay(p, &cost).is_none() {
+                    continue;
+                }
+                for after in self.build_states(p, id, &cost, architecture)? {
+                    let tail = if remaining > 1 {
+                        self.build_value(
+                            &after,
+                            1,
+                            corn,
+                            architecture_available && !architecture,
+                            Some(id),
+                        )?
+                    } else {
+                        0.0
+                    };
+                    best = best.max(self.potential(&after)? - before + tail);
+                }
+            }
+        }
+        Ok(best)
+    }
+    fn monument_net(&self, p: &PublicPlayer, id: &str, cost: &[i64; 5]) -> Result<Option<f64>, ()> {
+        if !self.o.monuments.iter().any(|m| m == id)
+            || self
+                .o
+                .players
+                .iter()
+                .any(|p| p.monuments.iter().any(|m| m == id))
+        {
+            return Err(());
+        }
+        let Some(mut next) = self.pay(p, cost) else {
+            return Ok(None);
+        };
+        next.monuments.push(id.into());
+        Ok(Some(self.potential(&next)? - self.potential(p)?))
+    }
+    fn monument_value(&self, p: &PublicPlayer) -> Result<f64, ()> {
+        let mut best: f64 = 0.0;
+        for id in &self.o.monuments {
+            let m = monument(id).ok_or(())?;
+            let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
+            if let Some(net) = self.monument_net(p, id, &cost)? {
+                best = best.max(net);
+            }
+        }
+        Ok(best)
+    }
+    fn tech_offer(
+        &self,
+        p: &PublicPlayer,
+        first: Option<TechnologyId>,
+        free: bool,
+        remaining: usize,
+    ) -> Result<f64, ()> {
+        if !(1..=2).contains(&remaining) {
+            return Err(());
+        }
+        let before = self.potential(p)?;
+        let mut best = if first.is_none() { Some(0.0) } else { None };
+        for t in TECHNOLOGY_IDS {
+            if first.is_some_and(|f| f != t) {
+                continue;
+            }
+            let count = if free {
+                0
+            } else {
+                tribes::technology_step_cost(p.technologies[tech_index(t)], false)
+            };
+            let mut cost = [0; 5];
+            let mut left = count;
+            for i in 1..=3 {
+                cost[i] = p.resources[i].min(left);
+                left -= cost[i];
+            }
+            if left > 0 {
+                continue;
+            }
+            let paid = self.pay(p, &cost).ok_or(())?;
+            for after in self.technology(&paid, t)? {
+                let tail = if remaining > 1 {
+                    self.tech_offer(&after, None, free, 1)?
+                } else {
+                    0.0
+                };
+                let value = self.potential(&after)? - before + tail;
+                best = Some(best.map_or(value, |old: f64| old.max(value)));
+            }
+        }
+        best.ok_or(())
+    }
+    fn harvest(&self, p: &PublicPlayer, kind: HarvestKind, pos: i64) -> Result<Option<f64>, ()> {
+        let Some(j) = self.o.jungle.get(&pos) else {
+            return Ok(None);
+        };
+        let valid = match kind {
+            HarvestKind::Wood => pos >= 3 && j.wood > 0,
+            HarvestKind::Corn => j.corn > j.wood,
+            HarvestKind::EmptyCorn => p.technologies[0] >= 2,
+            HarvestKind::Burn => pos >= 3 && j.wood > 0 && j.corn > 0,
+        };
+        if !valid {
+            return Ok(None);
+        }
+        let mut next = p.clone();
+        self.gain(&mut next, &harvest_resources(self.o, p, kind, pos))?;
+        match kind {
+            HarvestKind::Wood => next.wood_tiles += 1,
+            HarvestKind::Corn | HarvestKind::Burn => next.corn_tiles += 1,
+            _ => {}
+        }
+        let base = self.potential(p)?;
+        if kind == HarvestKind::Burn {
+            return Ok(self
+                .temple_choices(&next, -1, &[])
+                .iter()
+                .map(|p| self.potential(p).map(|v| v - base))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max_by(f64::total_cmp));
+        }
+        Ok(Some(self.potential(&next)? - base))
+    }
+    fn endpoint(&self, p: &PublicPlayer, g: GearId, pos: i64, fee: i64) -> Result<Option<f64>, ()> {
+        let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
+            return Ok(None);
+        };
+        let fee_vp = Self::stock(&[fee, 0, 0, 0, 0]);
+        let gain = match (g, pos) {
+            (GearId::Palenque, 2..=5) => {
+                let mut best = None;
+                for kind in [
+                    HarvestKind::Corn,
+                    HarvestKind::Wood,
+                    HarvestKind::Burn,
+                    HarvestKind::EmptyCorn,
+                ] {
+                    if let Some(v) = self.harvest(&paid, kind, pos)? {
+                        best = Some(best.map_or(v, |old: f64| old.max(v)));
+                    }
+                }
+                let Some(v) = best else { return Ok(None) };
+                v
+            }
+            (GearId::Palenque | GearId::Yaxchilan, 1..=5) => {
+                let a = selected_action_resources(self.o, &paid, g, pos).ok_or(())?;
+                let mut next = paid.clone();
+                self.gain(&mut next, &a)?;
+                self.potential(&next)? - self.potential(&paid)?
+            }
+            (GearId::Tikal, 1 | 3) => {
+                self.tech_offer(&paid, None, false, if pos == 3 { 2 } else { 1 })?
+            }
+            (GearId::Tikal, 2 | 4) => self
+                .build_value(&paid, if pos == 4 { 2 } else { 1 }, false, true, None)?
+                .max(if pos == 4 {
+                    self.monument_value(&paid)?
+                } else {
+                    0.0
+                }),
+            (GearId::Tikal, 5) => {
+                let mut best = None;
+                for i in 1..=3 {
+                    let mut c = [0; 5];
+                    c[i] = 1;
+                    let Some(p) = self.pay(&paid, &c) else {
+                        continue;
+                    };
+                    for (ti, t) in TEMPLE_IDS.into_iter().enumerate() {
+                        if let Some(first) = self.temple(&p, t, 1) {
+                            let one = self.potential(&first)? - self.potential(&paid)?;
+                            best = Some(best.map_or(one, |old: f64| old.max(one)));
+                            for other in TEMPLE_IDS.into_iter().skip(ti + 1) {
+                                if let Some(second) = self.temple(&first, other, 1) {
+                                    let v = self.potential(&second)? - self.potential(&paid)?;
+                                    best = Some(best.map_or(v, |old: f64| old.max(v)));
+                                }
+                            }
+                        }
+                    }
+                }
+                let Some(v) = best else { return Ok(None) };
+                v
+            }
+            (GearId::Uxmal, 1) => {
+                let Some(p) = self.pay(&paid, &[3, 0, 0, 0, 0]) else {
+                    return Ok(None);
+                };
+                let mut best = None;
+                for n in self.temple_choices(&p, 1, &[]) {
+                    let v = self.potential(&n)? - self.potential(&paid)?;
+                    best = Some(best.map_or(v, |old: f64| old.max(v)));
+                }
+                let Some(v) = best else { return Ok(None) };
+                v
+            }
+            (GearId::Uxmal, 2) => 0.0,
+            (GearId::Uxmal, 3) => {
+                let mut n = paid.clone();
+                n.workers = (n.workers + 1).min(6);
+                self.potential(&n)? - self.potential(&paid)?
+            }
+            (GearId::Uxmal, 4) => self.build_value(&paid, 1, true, true, None)?,
+            (GearId::Uxmal, 5) => {
+                let mut best: f64 = 0.0;
+                for g in [
+                    GearId::Palenque,
+                    GearId::Yaxchilan,
+                    GearId::Tikal,
+                    GearId::Uxmal,
+                ] {
+                    for t in 1..=5 {
+                        if g == GearId::Uxmal && t == 5 {
+                            continue;
+                        }
+                        if let Some(v) = self.endpoint(&paid, g, t, 1)? {
+                            best = best.max(v);
+                        }
+                    }
+                }
+                best
+            }
+            (GearId::ChichenItza, 1..=9) => {
+                if paid.resources[4] < 1 || self.o.skull_spaces.get(pos as usize) != Some(&None) {
+                    return Ok(None);
+                }
+                let reward = CATALOG.skull_rewards.get(&pos).ok_or(())?;
+                let mut n = paid.clone();
+                n.resources[4] -= 1;
+                n.skulls_placed += 1;
+                n.score_quarters += 4 * reward.points;
+                let mut raised = self.temple(&n, reward.temple, 1).unwrap_or(n);
+                if reward.resource {
+                    self.gain(&mut raised, &[0, 0, 0, 1, 0])?;
+                }
+                self.potential(&raised)? - self.potential(&paid)?
+            }
+            _ => return Err(()),
+        };
+        // gain is relative to paid stock; the actual entry fee is charged once.
+        Ok(Some(gain - fee_vp))
+    }
+    fn pressure(&self, id: &str, wait: i64) -> usize {
+        let Some(m) = monument(id) else { return 0 };
+        let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
+        self.o
+            .players
+            .iter()
+            .filter(|p| {
+                p.id != self.o.actor
+                    && self.o.gears[&GearId::Tikal]
+                        .iter()
+                        .enumerate()
+                        .any(|(pos, w)| {
+                            pos < 8
+                                && w.as_ref()
+                                    .is_some_and(|w| !w.dummy && w.player_id == p.id as i64)
+                                && (4 - pos as i64).max(0) <= wait
+                                && {
+                                    let mut funded_cost = cost;
+                                    funded_cost[0] +=
+                                        if pos >= 6 { 0 } else { (pos as i64 - 4).max(0) };
+                                    self.pay(p, &funded_cost).is_some()
+                                }
+                        })
+            })
+            .count()
+    }
+    fn future(&self, p: &PublicPlayer, g: GearId, pos: i64, _new: bool) -> Result<f64, ()> {
+        let mut best: f64 = 0.0;
+        let max = if g == GearId::ChichenItza { 9 } else { 5 };
+        let limit = if g == GearId::ChichenItza { 11 } else { 8 };
+        for wait in 1..=(27 - self.o.round).min(limit - 1 - pos) {
+            let arrival = pos + wait;
+            for target in 1..=max {
+                if target > arrival || (g == GearId::Tikal && target != 4) {
+                    continue;
+                }
+                let fee = if arrival >= max + 1 {
+                    0
+                } else {
+                    arrival - target
+                };
+                let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
+                    continue;
+                };
+                let value = if g == GearId::Tikal {
+                    let mut net = self.build_value(&paid, 2, false, true, None)?;
+                    for id in &self.o.monuments {
+                        let m = monument(id).ok_or(())?;
+                        let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
+                        if let Some(v) = self.monument_net(&paid, id, &cost)? {
+                            net = net.max(v / (1 + self.pressure(id, wait)) as f64);
+                        }
+                    }
+                    net - 0.25 * fee as f64
+                } else {
+                    let Some(v) = self.endpoint(p, g, target, fee)? else {
+                        continue;
+                    };
+                    v
+                };
+                best = best.max(value / (1 + wait) as f64);
+            }
+        }
+        Ok(best)
+    }
+    fn tikal_coverage(&self, p: &PublicPlayer, exclude: Option<i64>) -> Result<f64, ()> {
+        let mut best: f64 = 0.0;
+        for (pos, w) in self.o.gears[&GearId::Tikal].iter().enumerate().take(8) {
+            let pos = pos as i64;
+            if exclude == Some(pos)
+                || !w
+                    .as_ref()
+                    .is_some_and(|w| !w.dummy && w.player_id == self.o.actor as i64)
+            {
+                continue;
+            }
+            best = best.max(self.future(p, GearId::Tikal, pos, false)?);
+            if pos >= 4 {
+                let fee = if pos >= 6 { 0 } else { pos - 4 };
+                if let Some(now) = self.endpoint(p, GearId::Tikal, 4, fee)? {
+                    best = best.max(now);
+                }
+            }
+        }
+        Ok(best)
+    }
+    fn remove(&self, g: GearId, pos: i64) -> Result<f64, ()> {
+        let p = &self.o.players[self.o.actor];
+        let endpoints =
+            resource_cycle_removal_payoffs(self.o, g, pos, &HeuristicWeights::default())
+                .ok_or(())?;
+        let mut best: f64 = 0.0;
+        for (target, fee, _) in endpoints {
+            if let Some(v) = self.endpoint(p, g, target, fee)? {
+                best = best.max(v);
+            }
+        }
+        let future = self.future(p, g, pos, false)?;
+        let foregone = if g == GearId::Tikal {
+            (future - self.tikal_coverage(p, Some(pos))?).max(0.0)
+        } else {
+            future
+        };
+        Ok(best - foregone)
+    }
+    fn score(&self, a: &TypedAction) -> Result<f64, ()> {
+        let p = &self.o.players[self.o.actor];
+        let base = self.potential(p)?;
+        match a {
+            TypedAction::Place {
+                gear, corn_cost, ..
+            } => {
+                let paid = self.pay(p, &[*corn_cost, 0, 0, 0, 0]).ok_or(())?;
+                let pos = resource_route_slot(self.o, *gear).ok_or(())? as i64;
+                let future = self.future(&paid, *gear, pos, true)?;
+                let marginal = if *gear == GearId::Tikal {
+                    (future - self.tikal_coverage(&paid, None)?).max(0.0)
+                } else {
+                    future
+                };
+                Ok(marginal - 0.25 * *corn_cost as f64)
+            }
+            TypedAction::Remove { gear, position } => self.remove(*gear, *position),
+            TypedAction::EndTurn { .. } | TypedAction::Skip => Ok(0.0),
+            TypedAction::FirstPlayer { corn_cost } => {
+                Ok(0.25 * (self.o.accumulated_corn - *corn_cost) as f64)
+            }
+            TypedAction::Beg => {
+                let mut best = None;
+                for mut next in self.temple_choices(p, -1, &[]) {
+                    next.resources[0] = 3;
+                    let v = self.potential(&next)? - base;
+                    best = Some(best.map_or(v, |old: f64| old.max(v)));
+                }
+                best.ok_or(())
+            }
+            TypedAction::UseAction {
+                gear,
+                position,
+                corn_cost,
+                ..
+            } => self.endpoint(p, *gear, *position, *corn_cost)?.ok_or(()),
+            TypedAction::Monument {
+                id,
+                cost,
+                renovation: None,
+            } => self.monument_net(p, id, cost)?.ok_or(()),
+            TypedAction::Build {
+                id,
+                cost,
+                architecture,
+                renovation: None,
+                ..
+            } => {
+                let mut best = None;
+                for after in self.build_states(p, id, cost, *architecture)? {
+                    let mut v = self.potential(&after)? - base;
+                    if let Some(Task::Build {
+                        remaining,
+                        corn_payment,
+                        architecture_available,
+                        ..
+                    }) = &self.o.pending_task
+                    {
+                        if *remaining > 1 {
+                            v += self.build_value(
+                                &after,
+                                1,
+                                *corn_payment,
+                                architecture_available != &Some(false) && !architecture,
+                                Some(id),
+                            )?;
+                        }
+                    }
+                    best = Some(best.map_or(v, |old: f64| old.max(v)));
+                }
+                best.ok_or(())
+            }
+            TypedAction::Technology { technology } => {
+                let Some(Task::Technology {
+                    free, remaining, ..
+                }) = &self.o.pending_task
+                else {
+                    return Err(());
+                };
+                self.tech_offer(p, Some(*technology), *free, *remaining as usize)
+            }
+            TypedAction::Payment { resources } => {
+                let next = self.pay(p, resources).ok_or(())?;
+                if let Some(Task::PayTechnology { technology, .. }) = &self.o.pending_task {
+                    let mut best = None;
+                    for after in self.technology(&next, *technology)? {
+                        let v = self.potential(&after)? - base;
+                        best = Some(best.map_or(v, |old: f64| old.max(v)));
+                    }
+                    best.ok_or(())
+                } else {
+                    Ok(-Self::stock(resources))
+                }
+            }
+            TypedAction::Temple { temple, direction } => {
+                let mut next = self.temple(p, *temple, *direction).ok_or(())?;
+                if matches!(
+                    self.o.pending_task,
+                    Some(Task::Temple {
+                        reason: Some(TempleReason::Beg),
+                        ..
+                    })
+                ) {
+                    next.resources[0] = 3;
+                }
+                Ok(self.potential(&next)? - base)
+            }
+            TypedAction::Resource { resource } => {
+                let mut next = p.clone();
+                let mut gain = [0; 5];
+                gain[resource_index(*resource)] = 1;
+                self.gain(&mut next, &gain)?;
+                Ok(self.potential(&next)? - base)
+            }
+            TypedAction::Harvest { kind, position } => self.harvest(p, *kind, *position)?.ok_or(()),
+            _ => Err(()),
+        }
+    }
+}
+
 fn action_value(
     o: &Observation,
     p: &PublicPlayer,

@@ -11,6 +11,7 @@ pub const POLICY_VERSION: &str = "resource-cycle-arena-v4";
 pub const V5_POLICY_VERSION: &str = "resource-cycle-arena-v5";
 pub const V6_POLICY_VERSION: &str = "resource-cycle-arena-v6";
 pub const V7_POLICY_VERSION: &str = "resource-cycle-arena-v7";
+pub const V8_POLICY_VERSION: &str = "resource-cycle-arena-v8";
 
 /// Changing any field requires a separately versioned hypothesis. The complete
 /// configuration is included in Numeric Arena's absolute-seat pool identity.
@@ -61,14 +62,23 @@ impl ResourceCycleConfig {
         }
     }
 
+    /// Explicit current-funded terminal-VP conversion; historical policies stay frozen.
+    pub fn v8() -> Self {
+        Self {
+            policy_version: V8_POLICY_VERSION.into(),
+            ..Self::default()
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self != &Self::default()
             && self != &Self::v5()
             && self != &Self::v6()
             && self != &Self::v7()
+            && self != &Self::v8()
         {
             return Err(
-                "Resource-cycle Arena requires a frozen v4, v5, v6 or v7 configuration".into(),
+                "Resource-cycle Arena requires a frozen v4, v5, v6, v7 or v8 configuration".into(),
             );
         }
         Ok(())
@@ -503,6 +513,33 @@ fn v6_removal_score(
 /// baseline scoring; there is no simulation, history, owner or Train interface.
 pub fn choose_move(o: &Observation, config: &ResourceCycleConfig) -> Result<Decision, String> {
     config.validate()?;
+    if config.policy_version == V8_POLICY_VERSION {
+        let mut decision = choose_move(o, &ResourceCycleConfig::v7())?;
+        decision.policy_version = V8_POLICY_VERSION.into();
+        if let Some(scores) = crate::policy::resource_cycle_v8_conversion_scores(o) {
+            let mut best = None;
+            for (legal, score) in o.legal_actions.iter().zip(scores) {
+                if !score.is_finite() {
+                    return Err("Non-finite resource-cycle score".into());
+                }
+                if best.as_ref().is_none_or(|(_, old)| score > *old) {
+                    best = Some((legal, score));
+                }
+            }
+            let (legal, score) = best.ok_or("No legal action")?;
+            if o.legal_actions
+                .iter()
+                .filter(|row| row.r#move == legal.r#move)
+                .count()
+                != 1
+            {
+                return Err("Resource-cycle Arena requires one unique legal move".into());
+            }
+            decision.r#move = legal.r#move.clone();
+            decision.score = score;
+        }
+        return Ok(decision);
+    }
     if config.policy_version == V7_POLICY_VERSION {
         // V6 validates the schema, actor bounds and observation key before the
         // shared opening selector can index this observation. Its complete
@@ -1650,6 +1687,238 @@ mod tests {
             let mut v4 = choose_move(&o, &ResourceCycleConfig::default()).unwrap();
             v4.policy_version = V5_POLICY_VERSION.into();
             assert_eq!(choose_move(&o, &config).unwrap(), v4);
+        }
+
+        // V8 is exercised with complete Core legal sets, including all five
+        // placement gears. Known future-only Feed effects are not "unknown".
+        let v8 = ResourceCycleConfig::v8();
+        for players in [3, 4] {
+            let mut funded =
+                create_game((0..players).map(|i| format!("P{i}")).collect(), 17, false).unwrap();
+            funded.phase = Phase::Playing;
+            funded.current_player = 1;
+            funded.turn_index = 1;
+            funded.round = 18;
+            funded.age = 2;
+            funded.food_days = vec![8, 14];
+            for slots in funded.gears.values_mut() {
+                slots.fill(None);
+            }
+            funded.buildings = ["b01", "b02", "b03"].map(str::to_string).into();
+            let card = tzolkin_core::catalog::CATALOG
+                .monuments
+                .iter()
+                .find(|m| m.score_key == "technologyLevels")
+                .unwrap();
+            funded.monuments = vec![card.id.clone()];
+            for r in [
+                Resource::Corn,
+                Resource::Wood,
+                Resource::Stone,
+                Resource::Gold,
+            ] {
+                funded.players[1].resources.insert(r, 20);
+            }
+            funded.players[1]
+                .technologies
+                .insert(TechnologyId::Agriculture, 2);
+            funded.players[1]
+                .technologies
+                .insert(TechnologyId::Extraction, 2);
+            let o = observe(&funded, 1).unwrap();
+            assert_eq!(
+                o.legal_actions
+                    .iter()
+                    .filter(|r| matches!(r.action, TypedAction::Place { .. }))
+                    .count(),
+                5
+            );
+            let scores = crate::policy::resource_cycle_v8_conversion_scores(&o)
+                .expect("full five-gear funded scope activates");
+            let decision = choose_move(&o, &v8).unwrap();
+            assert_eq!(decision.policy_version, V8_POLICY_VERSION);
+            assert_eq!(
+                decision.r#move,
+                tzolkin_core::GameMove::Place {
+                    gear: GearId::Tikal
+                }
+            );
+            assert!(decision.score > 0.0);
+            assert_eq!(scores.len(), o.legal_actions.len());
+            let baseline = choose_move(&o, &ResourceCycleConfig::v7()).unwrap();
+            assert_ne!(decision.score.to_bits(), baseline.score.to_bits());
+            // An equally funded visible rival affects only future race pressure.
+            let mut contested = funded.clone();
+            contested.players[0].resources = funded.players[1].resources.clone();
+            contested.gears.get_mut(&GearId::Tikal).unwrap()[4] = Some(GearWorker {
+                player_id: 0,
+                dummy: false,
+            });
+            let co = observe(&contested, 1).unwrap();
+            let cs = crate::policy::resource_cycle_v8_conversion_scores(&co).unwrap();
+            let ti = co
+                .legal_actions
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.action,
+                        TypedAction::Place {
+                            gear: GearId::Tikal,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            assert!(cs[ti] < decision.score);
+            // Current Core costs and terminal-score changes are an independent
+            // oracle for the pending endpoint: no double fee or inventory gain.
+            let potential = |state: &GameState| {
+                let p = &state.players[1];
+                p.score
+                    + [
+                        Resource::Corn,
+                        Resource::Wood,
+                        Resource::Stone,
+                        Resource::Gold,
+                        Resource::Skull,
+                    ]
+                    .iter()
+                    .zip([0.25, 0.5, 0.75, 1.0, 3.0])
+                    .map(|(r, v)| p.resources[r] as f64 * v)
+                    .sum::<f64>()
+                    + p.monuments
+                        .iter()
+                        .map(|id| tzolkin_core::engine::score_monument(state, p, id))
+                        .sum::<f64>()
+            };
+            funded.pending = Some(Pending {
+                title: "conversion".into(),
+                task: Task::Action {
+                    gear: GearId::Tikal,
+                    position: 5,
+                    free: None,
+                },
+                after: vec![],
+            });
+            let o = observe(&funded, 1).unwrap();
+            let values = crate::policy::resource_cycle_v8_conversion_scores(&o).unwrap();
+            let i = o
+                .legal_actions
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.action,
+                        TypedAction::UseAction {
+                            gear: GearId::Tikal,
+                            position: 4,
+                            corn_cost: 1,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let build = apply_move(&funded, o.legal_actions[i].r#move.clone()).unwrap();
+            let bo = observe(&build, 1).unwrap();
+            let bv = crate::policy::resource_cycle_v8_conversion_scores(&bo).unwrap();
+            let m = bo
+                .legal_actions
+                .iter()
+                .position(|r| matches!(r.action, TypedAction::Monument { .. }))
+                .unwrap();
+            let bought = apply_move(&build, bo.legal_actions[m].r#move.clone()).unwrap();
+            assert_eq!(bv[m], potential(&bought) - potential(&build));
+            assert_eq!(values[i], potential(&bought) - potential(&funded));
+            // Two currently visible buildings compete with one monument; no
+            // unknown refill is credited. Both purchases are real Core moves.
+            let point_cards = tzolkin_core::catalog::CATALOG
+                .buildings
+                .iter()
+                .filter(|b| {
+                    b.effects.iter().all(|e| {
+                        matches!(
+                            e,
+                            tzolkin_core::Effect::Points { .. } | tzolkin_core::Effect::Worker
+                        )
+                    })
+                })
+                .take(2)
+                .map(|b| b.id.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(point_cards.len(), 2);
+            let mut two = build.clone();
+            two.buildings = point_cards;
+            let to = observe(&two, 1).unwrap();
+            let tv = crate::policy::resource_cycle_v8_conversion_scores(&to).unwrap();
+            let first = to
+                .legal_actions
+                .iter()
+                .position(|r| matches!(r.action, TypedAction::Build { .. }))
+                .unwrap();
+            let one = apply_move(&two, to.legal_actions[first].r#move.clone()).unwrap();
+            let oo = observe(&one, 1).unwrap();
+            let second = oo
+                .legal_actions
+                .iter()
+                .position(|r| matches!(r.action, TypedAction::Build { .. }))
+                .unwrap();
+            let both = apply_move(&one, oo.legal_actions[second].r#move.clone()).unwrap();
+            assert_eq!(tv[first], potential(&both) - potential(&two));
+            // Foregone Tikal1/3 conversion is marginal: a retained ready worker
+            // covers the same visible opportunity instead of charging it twice.
+            funded.pending = None;
+            funded.turn.mode = tzolkin_core::TurnMode::Remove;
+            funded.turn.count = 1;
+            for pos in [1, 3] {
+                funded.gears.get_mut(&GearId::Tikal).unwrap().fill(None);
+                funded.gears.get_mut(&GearId::Tikal).unwrap()[pos] = Some(GearWorker {
+                    player_id: 1,
+                    dummy: false,
+                });
+                let o = observe(&funded, 1).unwrap();
+                let v = crate::policy::resource_cycle_v8_conversion_scores(&o).unwrap();
+                let i=o.legal_actions.iter().position(|r|matches!(r.action,TypedAction::Remove{gear:GearId::Tikal,position} if position==pos as i64)).unwrap();
+                assert!(v[i] < 0.0);
+                funded.gears.get_mut(&GearId::Tikal).unwrap()[4] = Some(GearWorker {
+                    player_id: 1,
+                    dummy: false,
+                });
+                let covered = observe(&funded, 1).unwrap();
+                let cv = crate::policy::resource_cycle_v8_conversion_scores(&covered).unwrap();
+                let ci = covered
+                    .legal_actions
+                    .iter()
+                    .position(|r| r.r#move == o.legal_actions[i].r#move)
+                    .unwrap();
+                assert!(cv[ci] > v[i]);
+            }
+            funded.round = 27;
+            funded.pending = Some(Pending {
+                title: "last day".into(),
+                task: Task::Build {
+                    remaining: 2,
+                    allow_monument: true,
+                    corn_payment: false,
+                    architecture_available: None,
+                    mandatory: false,
+                },
+                after: vec![],
+            });
+            let last = observe(&funded, 1).unwrap();
+            assert!(crate::policy::resource_cycle_v8_conversion_scores(&last).is_some());
+            funded.pending = None;
+            funded.turn.mode = tzolkin_core::TurnMode::None;
+            funded.turn.count = 0;
+            funded.gears.get_mut(&GearId::Tikal).unwrap().fill(None);
+            assert!(
+                crate::policy::resource_cycle_v8_conversion_scores(&observe(&funded, 1).unwrap())
+                    .is_none()
+            );
+            funded.round = 18;
+            funded.players[1].resources.insert(Resource::Gold, 0);
+            let unsupported = observe(&funded, 1).unwrap();
+            let mut expected = choose_move(&unsupported, &v7).unwrap();
+            expected.policy_version = V8_POLICY_VERSION.into();
+            assert_eq!(choose_move(&unsupported, &v8).unwrap(), expected);
         }
     }
 

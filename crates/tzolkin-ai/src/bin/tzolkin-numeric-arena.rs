@@ -36,6 +36,7 @@ const FEEDING_HELP: &str = "The explicit app-feeding-diagnostic sibling requires
 const INVESTMENT_HELP: &str = "The explicit app-investment-diagnostic sibling requires schema=tzolkin-app-profile-applied-investment-diagnostic-command-v1 and the same Development consent. Applied counters are recorded only after successful legal Core moves: paid technology at payment resolution, free choices separately, track increments separately from capped actions, Uxmal3 worker increments (including zero at the cap), Uxmal2 entry separately from actual buys/sells, and Yaxchilan5 net resource changes. Unknown payment/trade origins stay separate. All four actual Feeding snapshots include Agriculture/Extraction/Architecture/Theology levels at that stage. The unchanged ordinary diagnostic report remains nested; arm or paired-block failure discards the sibling receipts. Existing finite games,32MiB output cap and watchdog rules apply; no policy input, training credit, fresh Test or zero-food-loss rule is added.\n";
 const RESOURCE_CYCLE_HELP: &str = "tzolkin-numeric-arena resource-cycle-v6-v5-validation CONFIG.json CONFIG_SHA256 NEW_REPORT.json\nBoth paths must be absolute local paths without parent traversal. Closed config: schema=tzolkin-resource-cycle-v6-v5-validation-command-v1, arena (the same NumericArenaConfig above, 1..64 Validation seeds). Candidate is exactly frozen ResourceCycle V6; reference and every absolute-seat pool role are exactly V5. All seats use shared Corn-first/default-weight Setup; Playing uses each procedural chooser without a numeric TradeGuard. No model input or conversion occurs. Complete caller-declared global exclusions and an external permanent reservation are required before execution; their completeness is not authenticated. Scores and winner-share deltas are V6 minus V5. Same bounded report/watchdog/exit conventions apply, with no training, fresh Test, strength or adoption authority.\n";
 const RESOURCE_CYCLE_V7_HELP: &str = "tzolkin-numeric-arena resource-cycle-v7-v5-validation CONFIG.json CONFIG_SHA256 NEW_REPORT.json\nBoth paths must be absolute local paths without parent traversal. Closed config: schema=tzolkin-resource-cycle-v7-v5-validation-command-v1, arena (the same NumericArenaConfig above, 1..64 Validation seeds). Candidate is exactly frozen ResourceCycle V7; reference and every absolute-seat pool role are exactly V5. All seats use shared Corn-first/default-weight Setup; Playing uses each procedural chooser without a numeric TradeGuard. No model input or conversion occurs. Complete caller-declared global exclusions and an external permanent reservation are required before execution; their completeness is not authenticated. Scores and winner-share deltas are V7 minus V5. Same bounded report/watchdog/exit conventions apply, with no training, fresh Test, strength or adoption authority.\n";
+const RESOURCE_CYCLE_V8_HELP: &str = "tzolkin-numeric-arena resource-cycle-v8-v7-validation CONFIG.json CONFIG_SHA256 NEW_REPORT.json\nBoth paths must be absolute local paths without parent traversal. Closed config: schema=tzolkin-resource-cycle-v8-v7-validation-command-v1, arena (the same NumericArenaConfig above, 1..64 Validation seeds). Candidate is exactly frozen ResourceCycle V8; reference is exactly V7 and every absolute-seat pool role is exactly V5. All seats use shared Corn-first/default-weight Setup; Playing uses each procedural chooser without a numeric TradeGuard. No model input or conversion occurs. Complete caller-declared global exclusions and an external permanent reservation are required before execution; their completeness is not authenticated. Scores and winner-share deltas are V8 minus V7. Same bounded report/watchdog/exit conventions apply, with no training, fresh Test, strength or adoption authority.\n";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -353,6 +354,7 @@ fn run(args: &[String]) -> Result<i32, String> {
     match args.first().map(String::as_str) {
         Some("resource-cycle-v6-v5-validation") => run_resource_cycle(args),
         Some("resource-cycle-v7-v5-validation") => run_resource_cycle_v7(args),
+        Some("resource-cycle-v8-v7-validation") => run_resource_cycle_v8(args),
         Some(
             "app-validation"
             | "app-diagnostic"
@@ -503,11 +505,81 @@ fn run_resource_cycle_v7(args: &[String]) -> Result<i32, String> {
     })
 }
 
+fn run_resource_cycle_v8(args: &[String]) -> Result<i32, String> {
+    if args.len() != 4 || !digest(&args[2]) {
+        return Err(
+            "Expected resource-cycle-v8-v7-validation CONFIG CONFIG_SHA256 NEW_REPORT".into(),
+        );
+    }
+    let path = Path::new(&args[1]);
+    let output_path = Path::new(&args[3]);
+    for local in [path, output_path] {
+        let text = local.to_string_lossy();
+        if !local.is_absolute()
+            || text.starts_with('\\')
+            || text.starts_with("//")
+            || text.contains("://")
+            || local.components().any(|c| match c {
+                Component::ParentDir => true,
+                Component::Prefix(p) => !matches!(p.kind(), std::path::Prefix::Disk(_)),
+                _ => false,
+            })
+        {
+            return Err(
+                "Resource-cycle paired paths must be absolute local files without traversal".into(),
+            );
+        }
+    }
+    let raw = read_bounded(path, MAX_CONFIG_BYTES)?;
+    let result = (|| {
+        let spec = numeric::ResourceCycleV8V7ArenaSpec::from_json(&raw, &args[2])?;
+        let output = new_report(output_path)?;
+        let report = numeric::run_resource_cycle_v8_v7_validation(&spec)?;
+        report.save_new(&output)?;
+        Ok::<_, String>(report)
+    })();
+    // A parse, simulator or publication error still rechecks the exact input.
+    let post = read_bounded(path, MAX_CONFIG_BYTES).and_then(|after| {
+        if after == raw {
+            Ok(())
+        } else {
+            Err("Resource-cycle paired control changed".into())
+        }
+    });
+    let report = match (result, post) {
+        (Ok(report), Ok(())) => report,
+        (Err(error), Ok(())) => return Err(error),
+        (result, Err(post)) => {
+            return Err(format!(
+                "{}; resource-cycle paired control POST: {post}",
+                result.err().unwrap_or_default()
+            ));
+        }
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema": numeric::RESOURCE_CYCLE_V8_V7_COMMAND_SCHEMA,
+            "configSha256": args[2], "reportSchema": report.schema,
+            "configurationSha256": report.configuration_sha256,
+            "plannedGames": report.statistics.planned_games,
+            "completedGames": report.statistics.completed_games,
+            "failedGames": report.statistics.failed_games,
+            "strengthImprovementDeclared": false
+        })
+    );
+    Ok(if report.statistics.failed_games == 0 {
+        0
+    } else {
+        2
+    })
+}
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--help"] {
         print!(
-            "{HELP}{APP_HELP}{FEEDING_HELP}{INVESTMENT_HELP}{RESOURCE_CYCLE_HELP}{RESOURCE_CYCLE_V7_HELP}"
+            "{HELP}{APP_HELP}{FEEDING_HELP}{INVESTMENT_HELP}{RESOURCE_CYCLE_HELP}{RESOURCE_CYCLE_V7_HELP}{RESOURCE_CYCLE_V8_HELP}"
         );
         return;
     }
