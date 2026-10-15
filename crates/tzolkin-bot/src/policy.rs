@@ -1405,7 +1405,18 @@ impl V8Conversion<'_> {
                 n.score_quarters += 4 * reward.points;
                 let mut raised = self.temple(&n, reward.temple, 1).unwrap_or(n);
                 if reward.resource {
+                    // Resource(1) is a real callback after consuming the skull.
+                    // Gold is its linear-Phi choice only while V8 still applies.
+                    self.callback_scope(&raised)?;
                     self.gain(&mut raised, &[0, 0, 0, 1, 0])?;
+                }
+                if paid.technologies[tech_index(TechnologyId::Theology)] >= 2
+                    && raised.resources[1..4].iter().any(|n| *n > 0)
+                {
+                    // Core now queues a payable Offering -> Temple choice.
+                    // Offering is not in this closed preview: the actual child
+                    // uses V7, so the parent must not silently assume Skip.
+                    return Err(());
                 }
                 self.potential(&raised)? - self.potential(&paid)?
             }

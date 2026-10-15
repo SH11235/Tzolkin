@@ -2388,6 +2388,133 @@ mod tests {
                 crate::policy::resource_cycle_v8_conversion_scores(&observe(&market, 1).unwrap())
                     .is_none()
             );
+            // A payable Theology child actually falls to V7 and spends wood:
+            // the Chichen1 chain is +0.5 Phi, not the bare +1 skull reward.
+            // Refuse its parent rather than silently predicting no offering.
+            let mut skull = active.clone();
+            skull.players[1].workers = 6;
+            skull.players[1].resources = [
+                (Resource::Corn, 20),
+                (Resource::Wood, 4),
+                (Resource::Stone, 0),
+                (Resource::Gold, 3),
+                (Resource::Skull, 1),
+            ]
+            .into();
+            for level in skull.players[1].technologies.values_mut() {
+                *level = 0;
+            }
+            skull.players[1]
+                .technologies
+                .insert(TechnologyId::Theology, 2);
+            skull.monuments = gate_loss.monuments.clone();
+            skull.skull_supply = 12;
+            skull.pending = Some(Pending {
+                title: "offering continuation".into(),
+                task: Task::Action {
+                    gear: GearId::ChichenItza,
+                    position: 1,
+                    free: Some(true),
+                },
+                after: vec![],
+            });
+            let so = observe(&skull, 1).unwrap();
+            assert!(crate::policy::resource_cycle_v8_conversion_scores(&so).is_none());
+            let use_skull = so
+                .legal_actions
+                .iter()
+                .find(|r| {
+                    matches!(
+                        r.action,
+                        TypedAction::UseAction {
+                            gear: GearId::ChichenItza,
+                            position: 1,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let offering = apply_move(&skull, use_skull.r#move.clone()).unwrap();
+            let oo = observe(&offering, 1).unwrap();
+            assert!(matches!(oo.pending_task, Some(Task::Theology { .. })));
+            let choice = choose_move(&oo, &v8).unwrap();
+            assert!(oo.legal_actions.iter().any(|r| r.r#move == choice.r#move
+                && matches!(
+                    r.action,
+                    TypedAction::Offering {
+                        resource: Resource::Wood
+                    }
+                )));
+            let temple = apply_move(&offering, choice.r#move).unwrap();
+            let to = observe(&temple, 1).unwrap();
+            let finished = apply_move(&temple, choose_move(&to, &v8).unwrap().r#move).unwrap();
+            assert!(finished.pending.is_none());
+            assert_eq!(potential(&finished) - potential(&skull), 0.5);
+            // The same real action without a queued offering stays supported.
+            skull.players[1]
+                .technologies
+                .insert(TechnologyId::Theology, 1);
+            let so = observe(&skull, 1).unwrap();
+            let sv = crate::policy::resource_cycle_v8_conversion_scores(&so).unwrap();
+            let si = so
+                .legal_actions
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.action,
+                        TypedAction::UseAction {
+                            gear: GearId::ChichenItza,
+                            position: 1,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let finished = apply_move(&skull, so.legal_actions[si].r#move.clone()).unwrap();
+            assert!(finished.pending.is_none());
+            assert_eq!(sv[si], potential(&finished) - potential(&skull));
+            assert_eq!(sv[si], 1.0);
+            // Consuming the sole skull can instead lose a funded all-skulls
+            // target before Resource1. Do not project a V8 Gold child then.
+            let resource_pos = *tzolkin_core::catalog::CATALOG
+                .skull_rewards
+                .iter()
+                .find(|(_, r)| r.resource)
+                .unwrap()
+                .0;
+            skull.monuments = vec![
+                tzolkin_core::catalog::CATALOG
+                    .monuments
+                    .iter()
+                    .find(|m| m.score_key == "allSkulls")
+                    .unwrap()
+                    .id
+                    .clone(),
+            ];
+            skull.players[1].resources.insert(Resource::Wood, 0);
+            skull.players[1].resources.insert(Resource::Gold, 4);
+            skull.players[1]
+                .technologies
+                .insert(TechnologyId::Theology, 0);
+            skull.skull_supply = 9;
+            for i in (1..=9).filter(|i| *i != resource_pos as usize).take(3) {
+                skull.skull_spaces[i] = Some(0);
+            }
+            skull.pending.as_mut().unwrap().task = Task::Action {
+                gear: GearId::ChichenItza,
+                position: resource_pos,
+                free: Some(true),
+            };
+            let so = observe(&skull, 1).unwrap();
+            assert!(crate::policy::resource_cycle_v8_conversion_scores(&so).is_none());
+            let requested=so.legal_actions.iter().find(|r|matches!(r.action,TypedAction::UseAction{gear:GearId::ChichenItza,position,..} if position==resource_pos)).unwrap();
+            let child = apply_move(&skull, requested.r#move.clone()).unwrap();
+            let co = observe(&child, 1).unwrap();
+            assert!(matches!(
+                co.pending_task,
+                Some(Task::Resource { remaining: 1 })
+            ));
+            assert!(crate::policy::resource_cycle_v8_conversion_scores(&co).is_none());
             // Core still offers upward no-op choices at a capped temple. They
             // consume the visible remaining/distinct slot without forcing V7.
             nested.pending = Some(Pending {
