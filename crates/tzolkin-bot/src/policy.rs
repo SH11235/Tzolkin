@@ -728,11 +728,9 @@ pub fn resource_cycle_v8_conversion_scores(o: &Observation) -> Option<Vec<f64>> 
     // currently funded positive monument on every callback; this is a local
     // scope predicate, not a claim that an earlier V7 action chose conversion.
     // In particular, early research/build without that target stays wholly V7.
-    if context.monument_value(p).ok()? <= 0.0 {
-        return None;
-    }
+    context.callback_scope(p).ok()?;
     if o.pending_task.is_none() {
-        let mut route = context.coverage(p, None, V8Endpoint::Monument).ok()? > 0.0;
+        let mut route = context.coverage(p, None, V8Endpoint::Monument, true).ok()? > 0.0;
         for row in &o.legal_actions {
             if let TypedAction::Place {
                 gear, corn_cost, ..
@@ -865,6 +863,7 @@ impl V8Conversion<'_> {
         if !(1..=2).contains(&remaining) {
             return Err(());
         }
+        self.callback_scope(p)?;
         let mut states = Vec::new();
         for t in TEMPLE_IDS {
             if distinct.is_some_and(|used| used.contains(&t)) {
@@ -908,17 +907,12 @@ impl V8Conversion<'_> {
                 // The bonus's Temple(1) resolves before the next Technology.
                 // Its observation has no after queue, so project exactly its
                 // stable immediate-Phi chooser, not the parent's joint optimum.
-                if self.monument_value(p)? <= 0.0 {
-                    return Err(());
-                }
                 Ok(vec![self.temple_offer(p, 1, 1, None)?])
             }
             TechnologyId::Extraction => {
                 // Resource(2) chooses gold twice: stock is linear and none of
                 // the supported monument metrics depends on retained resources.
-                if self.monument_value(p)? <= 0.0 {
-                    return Err(());
-                }
+                self.callback_scope(p)?;
                 self.gain(&mut next, &[0, 0, 0, 2, 0])?;
                 Ok(vec![next])
             }
@@ -936,8 +930,9 @@ impl V8Conversion<'_> {
         &self,
         mut states: Vec<PublicPlayer>,
         effects: &[Effect],
+        has_followup: bool,
     ) -> Result<Vec<PublicPlayer>, ()> {
-        for effect in effects {
+        for (index, effect) in effects.iter().enumerate() {
             let mut out = Vec::new();
             for mut p in states {
                 match effect {
@@ -961,22 +956,47 @@ impl V8Conversion<'_> {
                     Effect::Feed { .. }
                     | Effect::FeedDiscount { .. }
                     | Effect::FoodReward { .. }
-                    | Effect::FoodRewardSwitch
-                    | Effect::Trade => out.push(p),
+                    | Effect::FoodRewardSwitch => out.push(p),
+                    Effect::Trade => {
+                        // Normal prices preserve terminal stock VP, but V7's
+                        // market choices can change which materials remain.
+                        // A terminal Phi-only preview needs no invented trade;
+                        // a later chooser/purchase needs that unknown stock.
+                        if has_followup
+                            || effects[index + 1..].iter().any(|e| {
+                                !matches!(
+                                    e,
+                                    Effect::Resources { .. }
+                                        | Effect::Points { .. }
+                                        | Effect::Worker
+                                        | Effect::Feed { .. }
+                                        | Effect::FeedDiscount { .. }
+                                        | Effect::FoodReward { .. }
+                                        | Effect::FoodRewardSwitch
+                                )
+                            })
+                        {
+                            return Err(());
+                        }
+                        out.push(p);
+                    }
                     Effect::Technology { technology, steps } => {
                         let steps = steps.unwrap_or(1);
                         if !(1..=2).contains(&steps) {
                             return Err(());
                         }
-                        if matches!(technology, Target::Any(_)) && self.monument_value(&p)? <= 0.0 {
+                        if matches!(technology, Target::Any(_)) {
                             // The real nested chooser would fall back to V7;
                             // its hidden continuation is outside this preview.
-                            return Err(());
+                            self.callback_scope(&p)?;
                         }
                         let mut branch = vec![p];
                         for _ in 0..steps {
                             let mut next = Vec::new();
                             for p in branch {
+                                if matches!(technology, Target::Any(_)) {
+                                    self.callback_scope(&p)?;
+                                }
                                 for t in TECHNOLOGY_IDS {
                                     if matches!(technology,Target::Specific(wanted) if *wanted!=t) {
                                         continue;
@@ -997,9 +1017,6 @@ impl V8Conversion<'_> {
                         }
                         match temple {
                             Target::Any(_) => {
-                                if self.monument_value(&p)? <= 0.0 {
-                                    return Err(());
-                                }
                                 out.push(self.temple_offer(&p, 1, steps as usize, None)?);
                             }
                             Target::Specific(t) => {
@@ -1028,6 +1045,7 @@ impl V8Conversion<'_> {
         id: &str,
         cost: &[i64; 5],
         architecture: bool,
+        has_followup: bool,
     ) -> Result<Vec<PublicPlayer>, ()> {
         let b = building(id).ok_or(())?;
         let mut next = self.pay(p, cost).ok_or(())?;
@@ -1038,7 +1056,7 @@ impl V8Conversion<'_> {
                 next.score_quarters += 8;
             }
         }
-        self.effects(vec![next], &b.effects)
+        self.effects(vec![next], &b.effects, has_followup)
     }
     fn build_value(
         &self,
@@ -1048,6 +1066,7 @@ impl V8Conversion<'_> {
         architecture_available: bool,
         exclude: Option<&str>,
     ) -> Result<f64, ()> {
+        self.callback_scope(p)?;
         let before = self.potential(p)?;
         let mut best: f64 = 0.0;
         for id in &self.o.buildings {
@@ -1092,11 +1111,8 @@ impl V8Conversion<'_> {
                 if self.pay(p, &cost).is_none() {
                     continue;
                 }
-                for after in self.build_states(p, id, &cost, architecture)? {
+                for after in self.build_states(p, id, &cost, architecture, remaining > 1)? {
                     let tail = if remaining > 1 {
-                        if self.monument_value(&after)? <= 0.0 {
-                            return Err(());
-                        }
                         self.build_value(
                             &after,
                             1,
@@ -1140,6 +1156,42 @@ impl V8Conversion<'_> {
         }
         Ok(best)
     }
+    fn callback_scope(&self, p: &PublicPlayer) -> Result<(), ()> {
+        if self.monument_value(p)? > 0.0 {
+            Ok(())
+        } else {
+            // This exact public callback would run V7. A parent cannot assume
+            // a V8 continuation after an intermediate payment or effect.
+            Err(())
+        }
+    }
+    fn technology_payment(
+        &self,
+        p: &PublicPlayer,
+        t: TechnologyId,
+        amount: i64,
+    ) -> Result<Option<PublicPlayer>, ()> {
+        if !(0..=3).contains(&amount) {
+            return Err(());
+        }
+        let mut states = Vec::new();
+        // Core resource_payments order, including EVERY affordable row. The
+        // actual Payment callback compares the same post-technology Phi. Any
+        // unsupported row refuses its entire callback, never just that row.
+        for wood in 0..=amount {
+            for stone in 0..=amount - wood {
+                let cost = [0, wood, stone, amount - wood - stone, 0];
+                if let Some(paid) = self.pay(p, &cost) {
+                    states.extend(self.technology(&paid, t)?);
+                }
+            }
+        }
+        if states.is_empty() {
+            Ok(None)
+        } else {
+            self.best_state(states).map(Some)
+        }
+    }
     fn tech_offer(
         &self,
         p: &PublicPlayer,
@@ -1150,6 +1202,7 @@ impl V8Conversion<'_> {
         if !(1..=2).contains(&remaining) {
             return Err(());
         }
+        self.callback_scope(p)?;
         let before = self.potential(p)?;
         let mut best = if first.is_none() { Some(0.0) } else { None };
         for t in TECHNOLOGY_IDS {
@@ -1161,25 +1214,16 @@ impl V8Conversion<'_> {
             } else {
                 tribes::technology_step_cost(p.technologies[tech_index(t)], false)
             };
-            let mut cost = [0; 5];
-            let mut left = count;
-            for (i, amount) in cost.iter_mut().enumerate().take(4).skip(1) {
-                *amount = p.resources[i].min(left);
-                left -= *amount;
-            }
-            if left > 0 {
+            let Some(after) = self.technology_payment(p, t, count)? else {
                 continue;
-            }
-            let paid = self.pay(p, &cost).ok_or(())?;
-            for after in self.technology(&paid, t)? {
-                let tail = if remaining > 1 {
-                    self.tech_offer(&after, None, free, 1)?
-                } else {
-                    0.0
-                };
-                let value = self.potential(&after)? - before + tail;
-                best = Some(best.map_or(value, |old: f64| old.max(value)));
-            }
+            };
+            let tail = if remaining > 1 {
+                self.tech_offer(&after, None, free, 1)?
+            } else {
+                0.0
+            };
+            let value = self.potential(&after)? - before + tail;
+            best = Some(best.map_or(value, |old: f64| old.max(value)));
         }
         best.ok_or(())
     }
@@ -1423,6 +1467,7 @@ impl V8Conversion<'_> {
         p: &PublicPlayer,
         exclude: Option<(GearId, i64)>,
         scope: V8Endpoint,
+        include_now: bool,
     ) -> Result<f64, ()> {
         let mut best: f64 = 0.0;
         // Tikal2/4 and Uxmal4/5 share the same visible cards. Coverage is one
@@ -1438,6 +1483,14 @@ impl V8Conversion<'_> {
                     continue;
                 }
                 best = best.max(self.future(p, g, pos, scope)?);
+                // Base turns cannot retrieve after placing. Use the observed
+                // legal Remove itself, and explicitly omit NOW for a proposed
+                // Place: that proposal commits the hypothetical turn to Place.
+                if !include_now || self.o.turn.mode == TurnMode::Place || !self.o.legal_actions.iter().any(|row| {
+                    matches!(row.action, TypedAction::Remove {gear, position} if gear==g && position==pos)
+                }) {
+                    continue;
+                }
                 for target in 1..=5.min(pos) {
                     let fee = if pos >= 6 { 0 } else { pos - target };
                     if let Some(now) = self.endpoint_at(p, g, target, fee, None, scope)? {
@@ -1461,7 +1514,7 @@ impl V8Conversion<'_> {
         }
         let ordinary = self.future(p, g, pos, V8Endpoint::Other)?;
         let construction = self.future(p, g, pos, V8Endpoint::Construction)?;
-        let shared = self.coverage(p, Some((g, pos)), V8Endpoint::Construction)?;
+        let shared = self.coverage(p, Some((g, pos)), V8Endpoint::Construction, true)?;
         let foregone = ordinary.max((construction - shared).max(0.0));
         Ok(best - foregone)
     }
@@ -1476,7 +1529,7 @@ impl V8Conversion<'_> {
                 let pos = resource_route_slot(self.o, *gear).ok_or(())? as i64;
                 let ordinary = self.future(&paid, *gear, pos, V8Endpoint::Other)?;
                 let construction = self.future(&paid, *gear, pos, V8Endpoint::Construction)?;
-                let shared = self.coverage(&paid, None, V8Endpoint::Construction)?;
+                let shared = self.coverage(&paid, None, V8Endpoint::Construction, false)?;
                 let marginal = ordinary.max((construction - shared).max(0.0));
                 Ok(marginal - 0.25 * *corn_cost as f64)
             }
@@ -1513,7 +1566,9 @@ impl V8Conversion<'_> {
                 ..
             } => {
                 let mut best = None;
-                for after in self.build_states(p, id, cost, *architecture)? {
+                let has_followup =
+                    matches!(self.o.pending_task, Some(Task::Build {remaining,..}) if remaining>1);
+                for after in self.build_states(p, id, cost, *architecture, has_followup)? {
                     let mut v = self.potential(&after)? - base;
                     if let Some(Task::Build {
                         remaining,
@@ -1523,9 +1578,6 @@ impl V8Conversion<'_> {
                     }) = &self.o.pending_task
                         && *remaining > 1
                     {
-                        if self.monument_value(&after)? <= 0.0 {
-                            return Err(());
-                        }
                         v += self.build_value(
                             &after,
                             1,
