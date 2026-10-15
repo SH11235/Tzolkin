@@ -1828,6 +1828,42 @@ mod tests {
             let bought = apply_move(&build, bo.legal_actions[m].r#move.clone()).unwrap();
             assert_eq!(bv[m], potential(&bought) - potential(&build));
             assert_eq!(values[i], potential(&bought) - potential(&funded));
+            // A rival at5 with zero corn can wait once to free-choice6.
+            // The endpoint fee belongs inside both declared discounts.
+            let mut priced = funded.clone();
+            priced.pending = None;
+            for slot in &mut priced.gears.get_mut(&GearId::Tikal).unwrap()[..4] {
+                *slot = Some(GearWorker {
+                    player_id: -1,
+                    dummy: true,
+                });
+            }
+            priced.players[0].resources = priced.players[1].resources.clone();
+            priced.players[0].resources.insert(Resource::Corn, 0);
+            priced.gears.get_mut(&GearId::Tikal).unwrap()[5] = Some(GearWorker {
+                player_id: 0,
+                dummy: false,
+            });
+            let po = observe(&priced, 1).unwrap();
+            let pv = crate::policy::resource_cycle_v8_conversion_scores(&po).unwrap();
+            let pi = po
+                .legal_actions
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.action,
+                        TypedAction::Place {
+                            gear: GearId::Tikal,
+                            ..
+                        }
+                    )
+                })
+                .unwrap();
+            let TypedAction::Place { corn_cost, .. } = po.legal_actions[pi].action else {
+                unreachable!()
+            };
+            assert_eq!(pv[pi], (bv[m] - 0.25) / 2.0 / 2.0 - 0.25 * corn_cost as f64);
+
             // Two currently visible buildings compete with one monument; no
             // unknown refill is credited. Both purchases are real Core moves.
             let point_cards = tzolkin_core::catalog::CATALOG
@@ -1909,6 +1945,17 @@ mod tests {
             funded.turn.mode = tzolkin_core::TurnMode::None;
             funded.turn.count = 0;
             funded.gears.get_mut(&GearId::Tikal).unwrap().fill(None);
+            funded.gears.get_mut(&GearId::Tikal).unwrap()[5] = Some(GearWorker {
+                player_id: 1,
+                dummy: false,
+            });
+            funded.players[1].resources.insert(Resource::Corn, 0);
+            assert!(
+                crate::policy::resource_cycle_v8_conversion_scores(&observe(&funded, 1).unwrap())
+                    .is_none()
+            );
+            funded.gears.get_mut(&GearId::Tikal).unwrap().fill(None);
+            funded.players[1].resources.insert(Resource::Corn, 20);
             assert!(
                 crate::policy::resource_cycle_v8_conversion_scores(&observe(&funded, 1).unwrap())
                     .is_none()

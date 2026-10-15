@@ -728,11 +728,22 @@ pub fn resource_cycle_v8_conversion_scores(o: &Observation) -> Option<Vec<f64>> 
         if context.monument_value(p).ok()? <= 0.0 {
             return None;
         }
-        let route = o.gears[&GearId::Tikal].iter().enumerate().any(|(pos,w)|
-            pos < 8 && w.as_ref().is_some_and(|w| !w.dummy && w.player_id == o.actor as i64)
-                && o.round + (4-pos as i64).max(0) <= 27)
-            || o.legal_actions.iter().any(|a| matches!(a.action, TypedAction::Place { gear: GearId::Tikal, corn_cost, .. }
-                if p.resources[0] >= corn_cost && resource_route_slot(o, GearId::Tikal).is_some_and(|pos| o.round + (4-pos as i64).max(1) <= 27)));
+        let mut route = context.tikal_coverage(p, None).ok()? > 0.0;
+        for row in &o.legal_actions {
+            if let TypedAction::Place {
+                gear: GearId::Tikal,
+                corn_cost,
+                ..
+            } = row.action
+            {
+                if let Some(paid) = context.pay(p, &[corn_cost, 0, 0, 0, 0]) {
+                    let pos = resource_route_slot(o, GearId::Tikal)? as i64;
+                    route |= context.future(&paid, GearId::Tikal, pos, true).ok()?
+                        - 0.25 * corn_cost as f64
+                        > 0.0;
+                }
+            }
+        }
         if !route {
             return None;
         }
@@ -1081,9 +1092,9 @@ impl V8Conversion<'_> {
             };
             let mut cost = [0; 5];
             let mut left = count;
-            for i in 1..=3 {
-                cost[i] = p.resources[i].min(left);
-                left -= cost[i];
+            for (i, amount) in cost.iter_mut().enumerate().take(4).skip(1) {
+                *amount = p.resources[i].min(left);
+                left -= *amount;
             }
             if left > 0 {
                 continue;
@@ -1134,6 +1145,61 @@ impl V8Conversion<'_> {
         Ok(Some(self.potential(&next)? - base))
     }
     fn endpoint(&self, p: &PublicPlayer, g: GearId, pos: i64, fee: i64) -> Result<Option<f64>, ()> {
+        self.endpoint_at(p, g, pos, fee, None)
+    }
+    fn conversion(
+        &self,
+        p: &PublicPlayer,
+        fee: i64,
+        race_wait: Option<i64>,
+    ) -> Result<Option<f64>, ()> {
+        let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
+            return Ok(None);
+        };
+        let fee_vp = 0.25 * fee as f64;
+        let mut net = self.build_value(&paid, 2, false, true, None)? - fee_vp;
+        for id in &self.o.monuments {
+            let m = monument(id).ok_or(())?;
+            let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
+            if let Some(value) = self.monument_net(&paid, id, &cost)? {
+                // The whole endpoint net, including its entry fee, shares the
+                // same race discount. Actual NOW endpoints have no race term.
+                let q = race_wait.map_or(0, |wait| self.pressure(id, wait));
+                net = net.max((value - fee_vp) / (1 + q) as f64);
+            }
+        }
+        Ok(Some(net))
+    }
+    fn endpoint_at(
+        &self,
+        p: &PublicPlayer,
+        g: GearId,
+        pos: i64,
+        fee: i64,
+        race_wait: Option<i64>,
+    ) -> Result<Option<f64>, ()> {
+        if g == GearId::Tikal && pos == 4 {
+            return self.conversion(p, fee, race_wait);
+        }
+        if g == GearId::Uxmal && pos == 5 {
+            let mut best = None;
+            for g in [
+                GearId::Palenque,
+                GearId::Yaxchilan,
+                GearId::Tikal,
+                GearId::Uxmal,
+            ] {
+                for target in 1..=5 {
+                    if g == GearId::Uxmal && target == 5 {
+                        continue;
+                    }
+                    if let Some(value) = self.endpoint_at(p, g, target, fee + 1, race_wait)? {
+                        best = Some(best.map_or(value, |old: f64| old.max(value)));
+                    }
+                }
+            }
+            return Ok(best);
+        }
         let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
             return Ok(None);
         };
@@ -1163,13 +1229,7 @@ impl V8Conversion<'_> {
             (GearId::Tikal, 1 | 3) => {
                 self.tech_offer(&paid, None, false, if pos == 3 { 2 } else { 1 })?
             }
-            (GearId::Tikal, 2 | 4) => self
-                .build_value(&paid, if pos == 4 { 2 } else { 1 }, false, true, None)?
-                .max(if pos == 4 {
-                    self.monument_value(&paid)?
-                } else {
-                    0.0
-                }),
+            (GearId::Tikal, 2) => self.build_value(&paid, 1, false, true, None)?,
             (GearId::Tikal, 5) => {
                 let mut best = None;
                 for i in 1..=3 {
@@ -1213,25 +1273,6 @@ impl V8Conversion<'_> {
                 self.potential(&n)? - self.potential(&paid)?
             }
             (GearId::Uxmal, 4) => self.build_value(&paid, 1, true, true, None)?,
-            (GearId::Uxmal, 5) => {
-                let mut best: f64 = 0.0;
-                for g in [
-                    GearId::Palenque,
-                    GearId::Yaxchilan,
-                    GearId::Tikal,
-                    GearId::Uxmal,
-                ] {
-                    for t in 1..=5 {
-                        if g == GearId::Uxmal && t == 5 {
-                            continue;
-                        }
-                        if let Some(v) = self.endpoint(&paid, g, t, 1)? {
-                            best = best.max(v);
-                        }
-                    }
-                }
-                best
-            }
             (GearId::ChichenItza, 1..=9) => {
                 if paid.resources[4] < 1 || self.o.skull_spaces.get(pos as usize) != Some(&None) {
                     return Ok(None);
@@ -1253,8 +1294,8 @@ impl V8Conversion<'_> {
         Ok(Some(gain - fee_vp))
     }
     fn pressure(&self, id: &str, wait: i64) -> usize {
-        let Some(m) = monument(id) else { return 0 };
-        let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
+        let Some(card) = monument(id) else { return 0 };
+        let cost = RESOURCE_IDS.map(|r| card.cost.get(&r).copied().unwrap_or(0));
         self.o
             .players
             .iter()
@@ -1263,17 +1304,21 @@ impl V8Conversion<'_> {
                     && self.o.gears[&GearId::Tikal]
                         .iter()
                         .enumerate()
+                        .take(8)
                         .any(|(pos, w)| {
-                            pos < 8
-                                && w.as_ref()
-                                    .is_some_and(|w| !w.dummy && w.player_id == p.id as i64)
-                                && (4 - pos as i64).max(0) <= wait
-                                && {
-                                    let mut funded_cost = cost;
-                                    funded_cost[0] +=
-                                        if pos >= 6 { 0 } else { (pos as i64 - 4).max(0) };
-                                    self.pay(p, &funded_cost).is_some()
-                                }
+                            w.as_ref()
+                                .is_some_and(|w| !w.dummy && w.player_id == p.id as i64)
+                                && (0..=wait.min(27 - self.o.round).min(7 - pos as i64)).any(
+                                    |delay| {
+                                        let arrival = pos as i64 + delay;
+                                        if arrival < 4 {
+                                            return false;
+                                        }
+                                        let mut paid = cost;
+                                        paid[0] += if arrival >= 6 { 0 } else { arrival - 4 };
+                                        self.pay(p, &paid).is_some()
+                                    },
+                                )
                         })
             })
             .count()
@@ -1288,31 +1333,10 @@ impl V8Conversion<'_> {
                 if target > arrival || (g == GearId::Tikal && target != 4) {
                     continue;
                 }
-                let fee = if arrival >= max + 1 {
-                    0
-                } else {
-                    arrival - target
-                };
-                let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
-                    continue;
-                };
-                let value = if g == GearId::Tikal {
-                    let mut net = self.build_value(&paid, 2, false, true, None)?;
-                    for id in &self.o.monuments {
-                        let m = monument(id).ok_or(())?;
-                        let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
-                        if let Some(v) = self.monument_net(&paid, id, &cost)? {
-                            net = net.max(v / (1 + self.pressure(id, wait)) as f64);
-                        }
-                    }
-                    net - 0.25 * fee as f64
-                } else {
-                    let Some(v) = self.endpoint(p, g, target, fee)? else {
-                        continue;
-                    };
-                    v
-                };
-                best = best.max(value / (1 + wait) as f64);
+                let fee = if arrival > max { 0 } else { arrival - target };
+                if let Some(value) = self.endpoint_at(p, g, target, fee, Some(wait))? {
+                    best = best.max(value / (1 + wait) as f64);
+                }
             }
         }
         Ok(best)
@@ -1415,16 +1439,15 @@ impl V8Conversion<'_> {
                         architecture_available,
                         ..
                     }) = &self.o.pending_task
+                        && *remaining > 1
                     {
-                        if *remaining > 1 {
-                            v += self.build_value(
-                                &after,
-                                1,
-                                *corn_payment,
-                                architecture_available != &Some(false) && !architecture,
-                                Some(id),
-                            )?;
-                        }
+                        v += self.build_value(
+                            &after,
+                            1,
+                            *corn_payment,
+                            architecture_available != &Some(false) && !architecture,
+                            Some(id),
+                        )?;
                     }
                     best = Some(best.map_or(v, |old: f64| old.max(v)));
                 }
