@@ -3276,6 +3276,14 @@ pub(super) fn control_fixture(
         for base in [&semantic_wire, &procedural_wire] {
             for (key, value) in [
                 ("purpose", json!("other")),
+                (
+                    "reference",
+                    json!({"kind":"appStandard","profile":"heuristic"}),
+                ),
+                (
+                    "reference",
+                    json!({"kind":"cornFirstSetup","ignoredBudget":1}),
+                ),
                 ("seeds", json!([test])),
                 ("allowTest", json!(true)),
                 (

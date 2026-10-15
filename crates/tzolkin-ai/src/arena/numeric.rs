@@ -413,9 +413,9 @@ pub enum Opponent<'a> {
     deny_unknown_fields
 )]
 pub enum ProceduralValidationPolicy {
-    AppStandard,
-    CornFirstSetup,
-    CornFirstUxmalOpening,
+    AppStandard {},
+    CornFirstSetup {},
+    CornFirstUxmalOpening {},
     Search { config: crate::search::SearchConfig },
 }
 enum PreparedProceduralValidation {
@@ -427,9 +427,11 @@ enum PreparedProceduralValidation {
 impl PreparedProceduralValidation {
     fn new(policy: &ProceduralValidationPolicy) -> Result<Self, String> {
         Ok(match policy {
-            ProceduralValidationPolicy::AppStandard => Self::App,
-            ProceduralValidationPolicy::CornFirstSetup => Self::Corn(HeuristicWeights::default()),
-            ProceduralValidationPolicy::CornFirstUxmalOpening => {
+            ProceduralValidationPolicy::AppStandard {} => Self::App,
+            ProceduralValidationPolicy::CornFirstSetup {} => {
+                Self::Corn(HeuristicWeights::default())
+            }
+            ProceduralValidationPolicy::CornFirstUxmalOpening {} => {
                 Self::Uxmal(HeuristicWeights::default())
             }
             ProceduralValidationPolicy::Search { config } => {
@@ -3774,7 +3776,7 @@ pub(super) mod tests {
                             config: small.clone(),
                         }
                     } else {
-                        ProceduralValidationPolicy::AppStandard
+                        ProceduralValidationPolicy::AppStandard {}
                     }
                 })
                 .collect::<Vec<_>>();
@@ -3789,7 +3791,7 @@ pub(super) mod tests {
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();
             let focal = PreparedProceduralValidation::new(
-                &ProceduralValidationPolicy::CornFirstUxmalOpening,
+                &ProceduralValidationPolicy::CornFirstUxmalOpening {},
             )
             .unwrap();
             let mut focal = focal.role().unwrap();
@@ -3851,12 +3853,12 @@ pub(super) mod tests {
                     .flatten()
                     .any(|r| r.decisions > 0 && r.fallbacks > 0)
             );
-            let no_search = vec![ProceduralValidationPolicy::AppStandard; players];
+            let no_search = vec![ProceduralValidationPolicy::AppStandard {}; players];
             assert!(
                 run_procedural_roster_validation(
                     &config,
-                    &ProceduralValidationPolicy::AppStandard,
-                    &ProceduralValidationPolicy::CornFirstSetup,
+                    &ProceduralValidationPolicy::AppStandard {},
+                    &ProceduralValidationPolicy::CornFirstSetup {},
                     &no_search
                 )
                 .is_err()
