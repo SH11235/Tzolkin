@@ -8,6 +8,7 @@ fn kernels() -> Vec<ResolvedKernel> {
         Kernel::Sse2,
         Kernel::Neon,
         Kernel::Simd128,
+        Kernel::OrderedSse2,
     ]
     .into_iter()
     .filter_map(|kernel| kernel.resolve().ok())
@@ -32,6 +33,8 @@ fn auto_is_resolved_once_and_explicit_unsupported_backend_is_an_error() {
         Kernel::Auto.resolve().unwrap().backend()
     );
     assert_eq!(Kernel::Scalar.resolve().unwrap().backend(), "scalar");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    assert!(Kernel::OrderedSse2.resolve().is_err());
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         let expected = if std::is_x86_feature_detected!("avx2") {
@@ -44,6 +47,14 @@ fn auto_is_resolved_once_and_explicit_unsupported_backend_is_an_error() {
         assert_eq!(automatic.backend(), expected);
         assert!(Kernel::Neon.resolve().is_err());
         assert!(Kernel::Simd128.resolve().is_err());
+        if std::is_x86_feature_detected!("sse2") {
+            assert_eq!(
+                Kernel::OrderedSse2.resolve().unwrap().backend(),
+                "ordered-sse2"
+            );
+        } else {
+            assert!(Kernel::OrderedSse2.resolve().is_err());
+        }
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -180,22 +191,31 @@ fn matrix_dispatch_matches_each_dot_including_zero_columns_and_512_by_32() {
     for backend in kernels() {
         for columns in [0, 1, 3, 4, 7, 8, 9, 31, 32, 33, 511, 512, 513] {
             let vector: Vec<f32> = (0..columns).map(|i| (i % 17) as f32 / 17.0).collect();
-            let matrix: Vec<f32> = (0..columns * 32)
-                .map(|i| ((i * 13 % 31) as f32 - 15.0) / 64.0)
-                .collect();
-            let mut output = [f32::NAN; 32];
-            backend.dot_rows(&matrix, &vector, &mut output).unwrap();
-            let mut hot_output = [f32::NAN; 32];
-            backend.dot_rows_validated(&matrix, &vector, &mut hot_output);
-            for row in 0..32 {
-                assert_eq!(output[row].to_bits(), hot_output[row].to_bits());
-                assert_eq!(
-                    output[row].to_bits(),
-                    backend
-                        .dot(&matrix[row * columns..(row + 1) * columns], &vector)
-                        .unwrap()
-                        .to_bits()
-                );
+            for rows in [0, 1, 2, 3, 4, 5, 7, 8, 9, 31, 32, 33] {
+                let matrix: Vec<f32> = (0..columns * rows)
+                    .map(|i| match i % 11 {
+                        0 => -0.0,
+                        1 => f32::from_bits(1),
+                        2 => 100_000_000.0,
+                        3 => 1.0,
+                        4 => -100_000_000.0,
+                        _ => ((i * 13 % 31) as f32 - 15.0) / 64.0,
+                    })
+                    .collect();
+                let mut output = vec![f32::NAN; rows];
+                backend.dot_rows(&matrix, &vector, &mut output).unwrap();
+                let mut hot_output = vec![f32::NAN; rows];
+                backend.dot_rows_validated(&matrix, &vector, &mut hot_output);
+                for row in 0..rows {
+                    assert_eq!(output[row].to_bits(), hot_output[row].to_bits());
+                    assert_eq!(
+                        output[row].to_bits(),
+                        backend
+                            .dot(&matrix[row * columns..(row + 1) * columns], &vector)
+                            .unwrap()
+                            .to_bits()
+                    );
+                }
             }
         }
         let mut no_rows = [];
@@ -251,6 +271,14 @@ fn unfinished_prefix_continuation_matches_full_dot_bits_with_unaligned_inputs() 
                     "{} offset{offset} shift{shift}",
                     backend.backend()
                 );
+                if backend.backend() == "ordered-sse2" {
+                    Kernel::Scalar.resolve().unwrap().dot_rows_validated(
+                        matrix,
+                        vector,
+                        &mut expected,
+                    );
+                    assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
+                }
             }
         }
     }
@@ -259,6 +287,22 @@ fn unfinished_prefix_continuation_matches_full_dot_bits_with_unaligned_inputs() 
 #[test]
 fn prefix_does_not_reduce_lanes_early_or_hide_nonfinite_final_affine() {
     for backend in kernels() {
+        // Cancellation straddles the last prefix/first suffix columns. An
+        // ordered backend must resume the existing +0-based fold, not restart.
+        let mut boundary = vec![0.0; 32 * 512];
+        let vector = [1.0; 512];
+        for row in boundary.as_chunks_mut::<512>().0.iter_mut() {
+            row[382..386].copy_from_slice(&[100_000_000.0, 1.0, -100_000_000.0, 1.0]);
+        }
+        let prefix = backend.policy_prefix_validated(&boundary, &vector[..384]);
+        let mut continued = [0.0; 32];
+        let mut full = [0.0; 32];
+        prefix.continue_validated(&vector[384..], &mut continued);
+        backend.dot_rows_validated(&boundary, &vector, &mut full);
+        assert_eq!(continued.map(f32::to_bits), full.map(f32::to_bits));
+        if ["scalar", "ordered-sse2"].contains(&backend.backend()) {
+            assert_eq!(continued.map(f32::to_bits), [1.0_f32.to_bits(); 32]);
+        }
         // SIMD prefix horizontal sum overflows, but each unreduced lane can
         // cancel in the suffix. An early reduction would lose this result.
         let mut matrix = vec![0.0; 32 * 512];
@@ -273,7 +317,7 @@ fn prefix_does_not_reduce_lanes_early_or_hide_nonfinite_final_affine() {
         backend.dot_rows_validated(&matrix, &vector, &mut expected);
         cache.continue_validated(&vector[384..], &mut actual);
         assert_eq!(actual.map(f32::to_bits), expected.map(f32::to_bits));
-        if backend.backend() != "scalar" {
+        if !["scalar", "ordered-sse2"].contains(&backend.backend()) {
             assert!(actual.iter().all(|v| v.is_finite()));
         } else {
             assert!(actual.iter().all(|v| !v.is_finite()));
