@@ -735,13 +735,12 @@ pub fn resource_cycle_v8_conversion_scores(o: &Observation) -> Option<Vec<f64>> 
                 corn_cost,
                 ..
             } = row.action
+                && let Some(paid) = context.pay(p, &[corn_cost, 0, 0, 0, 0])
             {
-                if let Some(paid) = context.pay(p, &[corn_cost, 0, 0, 0, 0]) {
-                    let pos = resource_route_slot(o, GearId::Tikal)? as i64;
-                    route |= context.future(&paid, GearId::Tikal, pos, true).ok()?
-                        - 0.25 * corn_cost as f64
-                        > 0.0;
-                }
+                let pos = resource_route_slot(o, GearId::Tikal)? as i64;
+                route |= context.future(&paid, GearId::Tikal, pos, true).ok()?
+                    - 0.25 * corn_cost as f64
+                    > 0.0;
             }
         }
         if !route {
