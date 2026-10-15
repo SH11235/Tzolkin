@@ -1,6 +1,7 @@
 //! 推論用の内積カーネル。学習の順序付き Scalar 経路とは分離する。
 //!
-//! SIMD は加算順序が異なるため bit 一致を保証しない。FMA は使用しない。
+//! 従来の SIMD は加算順序が異なるため bit 一致を保証しない。FMA は使用しない。
+//! 明示指定の OrderedSse2 は独立した行を lane に割り当て、Scalar の加算順序を保つ。
 //! 解決済みハンドルをモデルの推論開始時に作り、行列は一度の dispatch で計算する。
 use std::sync::OnceLock;
 
@@ -14,6 +15,9 @@ pub enum Kernel {
     Sse2,
     Neon,
     Simd128,
+    /// Explicit experimental row-lane SIMD; dots retain Scalar's operation order.
+    /// Never selected by Auto and unavailable without an x86 SSE2 build/CPU.
+    OrderedSse2,
 }
 
 type Dot = unsafe fn(&[f32], &[f32]) -> f32;
@@ -203,6 +207,16 @@ fn available(requested: Kernel) -> Option<ResolvedKernel> {
                 continue_prefix: x86::continue_sse2,
             });
         }
+        if requested == Kernel::OrderedSse2 && std::is_x86_feature_detected!("sse2") {
+            return Some(ResolvedKernel {
+                name: "ordered-sse2",
+                // The output layer and standalone dots keep their Scalar fold.
+                dot: dot_scalar,
+                rows: x86::rows_ordered_sse2,
+                prepare_prefix: x86::prepare_ordered_sse2,
+                continue_prefix: x86::continue_ordered_sse2,
+            });
+        }
     }
     #[cfg(target_arch = "aarch64")]
     if requested == Kernel::Neon && std::arch::is_aarch64_feature_detected!("neon") {
@@ -371,6 +385,112 @@ mod x86 {
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
+
+    /// Each lane is one independent row. No feature-axis partial sums, lane
+    /// reduction, FMA, weight packing or allocation changes the Scalar fold.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn ordered_sse2_block(
+        matrix: &[f32],
+        vector: &[f32],
+        stride: usize,
+        column_start: usize,
+        first_row: usize,
+        mut sum: __m128,
+    ) -> __m128 {
+        for (column, value) in vector.iter().enumerate() {
+            let index = first_row * stride + column_start + column;
+            let weights = _mm_set_ps(
+                matrix[index + 3 * stride],
+                matrix[index + 2 * stride],
+                matrix[index + stride],
+                matrix[index],
+            );
+            sum = _mm_add_ps(sum, _mm_mul_ps(weights, _mm_set1_ps(*value)));
+        }
+        sum
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn rows_ordered_sse2(matrix: &[f32], vector: &[f32], output: &mut [f32]) {
+        if vector.is_empty() {
+            output.fill(0.0);
+            return;
+        }
+        let end = output.len() / 4 * 4;
+        for first in (0..end).step_by(4) {
+            // SAFETY: the resolved handle requires SSE2 and checks matrix =
+            // columns*rows. Four complete rows and four output cells exist.
+            unsafe {
+                let sum =
+                    ordered_sse2_block(matrix, vector, vector.len(), 0, first, _mm_setzero_ps());
+                _mm_storeu_ps(output.as_mut_ptr().add(first), sum);
+            }
+        }
+        for (row, value) in matrix[end * vector.len()..]
+            .chunks_exact(vector.len())
+            .zip(&mut output[end..])
+        {
+            *value = super::dot_scalar(row, vector);
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn prepare_ordered_sse2(
+        matrix: &[f32],
+        prefix: &[f32],
+        state: &mut super::PrefixState,
+    ) {
+        for first in (0..super::POLICY_ROWS).step_by(4) {
+            let mut lanes = [0.0_f32; 4];
+            // SAFETY: the factory checked 32x512 and prefix384. The four
+            // independent accumulators are stored unreduced, one per row.
+            unsafe {
+                let sum = ordered_sse2_block(
+                    matrix,
+                    prefix,
+                    super::POLICY_COLUMNS,
+                    0,
+                    first,
+                    _mm_setzero_ps(),
+                );
+                _mm_storeu_ps(lanes.as_mut_ptr(), sum);
+            }
+            for (saved, value) in state[first..first + 4].iter_mut().zip(lanes) {
+                saved[0] = value;
+            }
+        }
+    }
+
+    #[target_feature(enable = "sse2")]
+    pub(super) unsafe fn continue_ordered_sse2(
+        matrix: &[f32],
+        suffix: &[f32],
+        state: &super::PrefixState,
+        output: &mut [f32],
+    ) {
+        for first in (0..super::POLICY_ROWS).step_by(4) {
+            let sum = _mm_set_ps(
+                state[first + 3][0],
+                state[first + 2][0],
+                state[first + 1][0],
+                state[first][0],
+            );
+            // SAFETY: the bound cache checks suffix128/output32 and retains
+            // this exact matrix/backend. Each row resumes its own prefix fold.
+            unsafe {
+                let sum = ordered_sse2_block(
+                    matrix,
+                    suffix,
+                    super::POLICY_COLUMNS,
+                    super::PREFIX_COLUMNS,
+                    first,
+                    sum,
+                );
+                _mm_storeu_ps(output.as_mut_ptr().add(first), sum);
+            }
+        }
+    }
 
     #[inline]
     #[target_feature(enable = "avx2")]

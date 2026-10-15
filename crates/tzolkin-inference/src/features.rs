@@ -155,6 +155,14 @@ pub struct EncodedCandidate {
     values: [f32; FEATURE_COUNT],
 }
 impl EncodedCandidate {
+    #[cfg(test)]
+    pub(crate) fn for_numeric_test(feature_schema: u32, values: [f32; FEATURE_COUNT]) -> Self {
+        Self {
+            feature_schema,
+            values,
+        }
+    }
+
     pub fn feature_schema(&self) -> u32 {
         self.feature_schema
     }

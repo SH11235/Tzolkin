@@ -425,6 +425,126 @@ mod prefix_tests {
     use super::*;
 
     #[test]
+    fn ordered_row_lanes_match_scalar_synthetic_policy_and_first_error() {
+        let Ok(ordered) = crate::kernel::Kernel::OrderedSse2.resolve() else {
+            return; // Explicitly unsupported platforms have no numeric fallback.
+        };
+        let scalar = crate::kernel::Kernel::Scalar.resolve().unwrap();
+        let parameters = (0..PARAMETER_COUNT)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 256.0)
+            .collect::<Vec<_>>();
+        validate_parameters(&parameters).unwrap();
+        let bits = |v: &[f32]| v.iter().map(|n| n.to_bits()).collect::<Vec<_>>();
+        for profile in [
+            FeatureProfile::Public,
+            FeatureProfile::SemanticSetup,
+            FeatureProfile::SemanticPlaying,
+        ] {
+            let model = NumericPolicy {
+                parameters: &parameters,
+                profile,
+            };
+            for players in [3.0 / 5.0, 4.0 / 5.0] {
+                for count in [1, 2, 7, 32] {
+                    for signed_zero_fallback in [false, true] {
+                        let mut context = [0.0; FEATURE_COUNT];
+                        for (i, value) in context[..231].iter_mut().enumerate() {
+                            *value = ((i * 13 % 31) as f32 - 15.0) / 512.0;
+                        }
+                        for seat in 0..5 {
+                            context[seat * 32 + 27] = 0.0;
+                        }
+                        context[4] = 0.0;
+                        context[232] = 1.0;
+                        context[237] = players;
+                        for (i, value) in context[264..384].iter_mut().enumerate() {
+                            *value = ((i * 17 % 37) as f32 - 18.0) / 512.0;
+                        }
+                        context[383] = f32::from_bits(1);
+                        let rows = (0..count)
+                            .map(|row| {
+                                let mut values = context;
+                                values[384] = 1.0;
+                                values[389] = row as f32 / 32.0;
+                                values[400] = (row as f32 - 7.0) / 64.0;
+                                if signed_zero_fallback && row % 2 == 1 {
+                                    values[4] = -0.0;
+                                }
+                                EncodedCandidate::for_numeric_test(profile.schema(), values)
+                            })
+                            .collect::<Vec<_>>();
+                        let expected = predict_numeric(&model, scalar, &rows).unwrap();
+                        let actual = predict_numeric(&model, ordered, &rows).unwrap();
+                        assert_eq!(bits(&actual.logits), bits(&expected.logits));
+                        assert_eq!(bits(&actual.probabilities), bits(&expected.probabilities));
+                        for (row, logit) in rows.iter().zip(&actual.logits) {
+                            assert_eq!(
+                                logit.to_bits(),
+                                model.logit(row, scalar).unwrap().to_bits()
+                            );
+                        }
+
+                        // A later bad tag must not displace the earlier numeric
+                        // failure, even when it disables prefix reuse.
+                        let mut overflowing = parameters.clone();
+                        overflowing[0] = f32::MAX;
+                        let bad_model = NumericPolicy {
+                            parameters: &overflowing,
+                            profile,
+                        };
+                        let mut values = context;
+                        values[0] = 2.0;
+                        let mut failures = vec![
+                            EncodedCandidate::for_numeric_test(profile.schema(), values),
+                            EncodedCandidate::for_numeric_test(0, values),
+                        ];
+                        let expected = predict_numeric(&bad_model, scalar, &failures)
+                            .err()
+                            .unwrap();
+                        assert_eq!(expected, "Non-finite public policy hidden activation");
+                        assert_eq!(
+                            predict_numeric(&bad_model, ordered, &failures)
+                                .err()
+                                .unwrap(),
+                            expected
+                        );
+                        let mut later_bad_suffix = values;
+                        later_bad_suffix[389] = f32::NAN;
+                        failures[1] =
+                            EncodedCandidate::for_numeric_test(profile.schema(), later_bad_suffix);
+                        // Contexts still share a prefix; the later suffix guard
+                        // must not run ahead of the first row's affine failure.
+                        assert_eq!(
+                            predict_numeric(&bad_model, scalar, &failures)
+                                .err()
+                                .unwrap(),
+                            expected
+                        );
+                        assert_eq!(
+                            predict_numeric(&bad_model, ordered, &failures)
+                                .err()
+                                .unwrap(),
+                            expected
+                        );
+                        values[0] = f32::NAN;
+                        failures[0] = EncodedCandidate::for_numeric_test(profile.schema(), values);
+                        let expected = predict_numeric(&bad_model, scalar, &failures)
+                            .err()
+                            .unwrap();
+                        assert_eq!(expected, "Invalid public policy feature values");
+                        assert_eq!(
+                            predict_numeric(&bad_model, ordered, &failures)
+                                .err()
+                                .unwrap(),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn numeric_equal_signed_zero_is_ineligible_for_prefix_reuse() {
         let left = [0.0, 1.0, f32::from_bits(1)];
         let right = [-0.0, 1.0, f32::from_bits(1)];
