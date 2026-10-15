@@ -60,6 +60,10 @@ pub const RESOURCE_CYCLE_V7_V5_COMMAND_SCHEMA: &str =
     "tzolkin-resource-cycle-v7-v5-validation-command-v1";
 pub const RESOURCE_CYCLE_V7_V5_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v7-v5-shared-corn-first-validation-arena-v1";
+pub const RESOURCE_CYCLE_V8_V7_COMMAND_SCHEMA: &str =
+    "tzolkin-resource-cycle-v8-v7-validation-command-v1";
+pub const RESOURCE_CYCLE_V8_V7_ARENA_SCHEMA: &str =
+    "tzolkin-resource-cycle-v8-v7-shared-corn-first-validation-arena-v1";
 pub const OWN_SETUP_ARENA_SCHEMA: &str = "tzolkin-own-setup-composite-development-arena-v1";
 pub const RESOURCE_CYCLE_OWN_SETUP_ARENA_SCHEMA: &str =
     "tzolkin-resource-cycle-v5-own-setup-composite-development-arena-v1";
@@ -198,6 +202,39 @@ impl ResourceCycleV7V5ArenaSpec {
     }
     fn validate(&self) -> Result<(), String> {
         if self.schema != RESOURCE_CYCLE_V7_V5_COMMAND_SCHEMA || self.arena.seeds.len() > 64 {
+            return Err(
+                "Resource-cycle paired control requires its closed schema and 1..64 seeds".into(),
+            );
+        }
+        self.arena.validate()
+    }
+}
+
+/// A separate frozen V8 versus V7 comparison, with the same bounded caller declarations.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceCycleV8V7ArenaSpec {
+    schema: String,
+    arena: NumericArenaConfig,
+}
+impl ResourceCycleV8V7ArenaSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        if raw.len() > 16 * 1024 * 1024
+            || !digest(expected_sha256)
+            || format!("{:x}", Sha256::digest(raw)) != expected_sha256
+        {
+            return Err("Resource-cycle paired control pin differs".into());
+        }
+        let spec: Self = serde_json::from_value(crate::public_stochastic_record::unique_json(
+            raw,
+            16 * 1024 * 1024,
+        )?)
+        .map_err(|e| e.to_string())?;
+        spec.validate()?;
+        Ok(spec)
+    }
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != RESOURCE_CYCLE_V8_V7_COMMAND_SCHEMA || self.arena.seeds.len() > 64 {
             return Err(
                 "Resource-cycle paired control requires its closed schema and 1..64 seeds".into(),
             );
@@ -2334,6 +2371,38 @@ pub fn run_resource_cycle_v7_v5_validation(
     )
 }
 
+fn resource_cycle_v8_v7_roles(
+    players: usize,
+) -> (Role<'static>, Role<'static>, Vec<Role<'static>>) {
+    use super::resource_cycle::ResourceCycleConfig;
+    (
+        Role::ResourceCycle(ResourceCycleConfig::v8()),
+        Role::ResourceCycle(ResourceCycleConfig::v7()),
+        (0..players)
+            .map(|_| Role::ResourceCycle(ResourceCycleConfig::v5()))
+            .collect(),
+    )
+}
+
+/// Ordinary Development Validation only: V8 minus V7, fixed V5 absolute-seat
+/// opponents, and the exact shared Corn-first selector in every Setup callback.
+/// The unchanged paired engine retains all-seat arms and whole-family bootstrap;
+/// these procedural roles load no model and have no numeric TradeGuard.
+pub fn run_resource_cycle_v8_v7_validation(
+    spec: &ResourceCycleV8V7ArenaSpec,
+) -> Result<NumericArenaReport, String> {
+    spec.validate()?;
+    let (candidate, reference, pool) = resource_cycle_v8_v7_roles(spec.arena.players);
+    run_admitted_roles(
+        &spec.arena,
+        candidate,
+        reference,
+        pool,
+        RESOURCE_CYCLE_V8_V7_ARENA_SCHEMA,
+        Some(SharedCornFirstSetupIdentity::current()),
+    )
+}
+
 /// Audited learned V5 teacher, using the same paired all-seat callback/Trade
 /// engine. Source families from every partition are excluded locally. This is
 /// Development Validation, without native, training or fresh Test authority.
@@ -3373,6 +3442,82 @@ pub(super) mod tests {
 
     #[test]
     fn numeric_validation_preflight_and_failed_arm_discard_only_game_history() {
+        for players in [3, 4] {
+            let wire = json!({
+                "schema": RESOURCE_CYCLE_V8_V7_COMMAND_SCHEMA,
+                "arena": {"schema": SCHEMA, "players": players, "seeds": [3],
+                    "bootstrapSeed": 7, "externalExclusions": {
+                        "evidenceSha256": "a".repeat(64), "excludedFamilyIds": []}}
+            });
+            let parse = |value: &serde_json::Value| {
+                let raw = serde_json::to_vec(value).unwrap();
+                ResourceCycleV8V7ArenaSpec::from_json(&raw, &crate::model::digest(&raw))
+            };
+            assert!(parse(&wire).is_ok());
+            for schema in [
+                RESOURCE_CYCLE_V7_V5_COMMAND_SCHEMA,
+                RESOURCE_CYCLE_V6_V5_COMMAND_SCHEMA,
+                "unknown",
+            ] {
+                let mut wrong = wire.clone();
+                wrong["schema"] = schema.into();
+                assert!(parse(&wrong).is_err());
+            }
+            let raw = serde_json::to_vec(&wire).unwrap();
+            assert!(
+                ResourceCycleV7V5ArenaSpec::from_json(&raw, &crate::model::digest(&raw)).is_err()
+            );
+            assert!(
+                ResourceCycleV6V5ArenaSpec::from_json(&raw, &crate::model::digest(&raw)).is_err()
+            );
+            assert!(ResourceCycleV8V7ArenaSpec::from_json(&raw, &"0".repeat(64)).is_err());
+            for key in ["candidate", "reference", "opponentPool", "allowTest"] {
+                let mut unknown = wire.clone();
+                unknown[key] = true.into();
+                assert!(parse(&unknown).is_err());
+            }
+            let mut too_many = wire.clone();
+            too_many["arena"]["seeds"] = json!(vec![3; 65]);
+            assert!(parse(&too_many).is_err());
+            let mut excluded = wire.clone();
+            excluded["arena"]["externalExclusions"]["excludedFamilyIds"] = json!([family_id(3)]);
+            assert!(parse(&excluded).is_err());
+            let duplicate = format!(
+                "{{\"schema\":\"{RESOURCE_CYCLE_V8_V7_COMMAND_SCHEMA}\",\"schema\":\"duplicate\"}}"
+            );
+            assert!(
+                ResourceCycleV8V7ArenaSpec::from_json(
+                    duplicate.as_bytes(),
+                    &crate::model::digest(duplicate.as_bytes())
+                )
+                .is_err()
+            );
+            let (candidate, reference, pool) = resource_cycle_v8_v7_roles(players);
+            assert!(
+                matches!(candidate.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v8())
+            );
+            assert!(
+                matches!(reference.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v7())
+            );
+            assert_ne!(
+                serde_json::to_value(candidate.identity()).unwrap(),
+                serde_json::to_value(reference.identity()).unwrap()
+            );
+            assert_eq!(pool.len(), players);
+            assert!(pool.iter().all(
+                |role| matches!(role.identity(), PolicyIdentity::ResourceCycle { configuration }
+                if configuration == super::super::resource_cycle::ResourceCycleConfig::v5())
+            ));
+            for old_schema in [
+                SCHEMA,
+                RESOURCE_CYCLE_V7_V5_ARENA_SCHEMA,
+                RESOURCE_CYCLE_V6_V5_ARENA_SCHEMA,
+            ] {
+                assert_ne!(RESOURCE_CYCLE_V8_V7_ARENA_SCHEMA, old_schema);
+            }
+        }
         for players in [3, 4] {
             let wire = json!({
                 "schema": RESOURCE_CYCLE_V7_V5_COMMAND_SCHEMA,

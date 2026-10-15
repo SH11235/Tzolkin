@@ -679,6 +679,996 @@ fn current_monument_estimate(
     })
 }
 
+/// V8 alone compares a bounded current-funded conversion in terminal VP.
+/// None means the complete decision must retain its historical fallback. These
+/// are public-state score previews, never synthetic legal actions or a Game.
+pub fn resource_cycle_v8_conversion_scores(o: &Observation) -> Option<Vec<f64>> {
+    let p = o.players.get(o.actor)?;
+    if o.phase != Phase::Playing
+        || !(3..=4).contains(&o.players.len())
+        || o.expansion.is_some()
+        || o.additional_buildings
+        || o.players.iter().any(|p| p.tribe.is_some())
+        || o.private.selected_tribe.is_some()
+        || p.resources.iter().any(|n| !(0..=1_000_000).contains(n))
+        || p.technologies.iter().any(|n| !(0..=3).contains(n))
+        || p.score_quarters.unsigned_abs() > 1_000_000_000
+        || o.legal_actions.len() > 1024
+        || o.buildings
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != o.buildings.len()
+        || o.monuments
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            != o.monuments.len()
+        || o.buildings.len() > 6
+        || o.monuments.len() > 13
+        || !(1..=27).contains(&o.round)
+        || o.skull_spaces.len() != 10
+        || !(0..=13).contains(&o.skull_supply)
+        || GEAR_IDS.iter().any(|g| {
+            o.gears
+                .get(g)
+                .is_none_or(|v| v.len() != if *g == GearId::ChichenItza { 13 } else { 10 })
+        })
+    {
+        return None;
+    }
+    if p.buildings.iter().any(|id| {
+        building(id).is_some_and(|b| b.effects.iter().any(|e| matches!(e, Effect::Renovation)))
+    }) {
+        return None;
+    }
+    let context = V8Conversion { o };
+    context.potential(p).ok()?;
+    // Pending observations do not expose their parent/after queue. Require a
+    // currently funded positive monument on every callback; this is a local
+    // scope predicate, not a claim that an earlier V7 action chose conversion.
+    // In particular, early research/build without that target stays wholly V7.
+    context.callback_scope(p).ok()?;
+    if o.pending_task.is_none() {
+        let mut route = context.coverage(p, None, V8Endpoint::Monument, true).ok()? > 0.0;
+        for row in &o.legal_actions {
+            if let TypedAction::Place {
+                gear, corn_cost, ..
+            } = row.action
+                && matches!(gear, GearId::Tikal | GearId::Uxmal)
+                && let Some(paid) = context.pay(p, &[corn_cost, 0, 0, 0, 0])
+            {
+                let pos = resource_route_slot(o, gear)? as i64;
+                route |= context
+                    .future(&paid, gear, pos, V8Endpoint::Monument)
+                    .ok()?
+                    - 0.25 * corn_cost as f64
+                    > 0.0;
+            }
+        }
+        if !route {
+            return None;
+        }
+    } else if matches!(o.pending_task, Some(Task::Trade)) {
+        return None;
+    }
+    o.legal_actions
+        .iter()
+        .map(|row| context.score(&row.action).ok().filter(|v| v.is_finite()))
+        .collect()
+}
+
+struct V8Conversion<'a> {
+    o: &'a Observation,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V8Endpoint {
+    Any,
+    Other,
+    Construction,
+    Monument,
+}
+impl V8Conversion<'_> {
+    fn stock(a: &[i64; 5]) -> f64 {
+        a.iter()
+            .zip([0.25, 0.5, 0.75, 1.0, 3.0])
+            .map(|(n, v)| *n as f64 * v)
+            .sum()
+    }
+    fn potential(&self, p: &PublicPlayer) -> Result<f64, ()> {
+        let mut m = monument_metrics(self.o, p).ok_or(())?;
+        let original = &self.o.players[self.o.actor];
+        m.all_monuments = m
+            .all_monuments
+            .checked_add(
+                p.monuments
+                    .len()
+                    .checked_sub(original.monuments.len())
+                    .ok_or(())?,
+            )
+            .ok_or(())?;
+        m.all_skulls += p.skulls_placed - original.skulls_placed;
+        Ok(p.score_quarters as f64 / 4.0
+            + Self::stock(&p.resources)
+            + p.monuments
+                .iter()
+                .map(|id| score_monument_metrics(&m, id))
+                .sum::<f64>())
+    }
+    fn pay(&self, p: &PublicPlayer, cost: &[i64; 5]) -> Option<PublicPlayer> {
+        if cost.iter().zip(p.resources).any(|(c, n)| *c < 0 || *c > n) {
+            return None;
+        }
+        let mut next = p.clone();
+        for (n, c) in next.resources.iter_mut().zip(cost) {
+            *n -= c;
+        }
+        Some(next)
+    }
+    fn gain(&self, p: &mut PublicPlayer, amounts: &[i64; 5]) -> Result<(), ()> {
+        if amounts.iter().any(|n| *n < 0) {
+            return Err(());
+        }
+        let original = &self.o.players[self.o.actor];
+        let available = (self.o.skull_supply
+            - (p.resources[4] - original.resources[4])
+            - (p.skulls_placed - original.skulls_placed))
+            .max(0);
+        for (i, n) in amounts.iter().enumerate() {
+            p.resources[i] += if i == 4 { (*n).min(available) } else { *n };
+        }
+        Ok(())
+    }
+    fn temple(&self, p: &PublicPlayer, t: TempleId, direction: i64) -> Option<PublicPlayer> {
+        let i = temple_index(t);
+        let level = p.temples[i] + direction;
+        let max = CATALOG.temple_tracks[&t].max;
+        if direction == 1
+            && (level > max
+                || (level == max
+                    && self
+                        .o
+                        .players
+                        .iter()
+                        .any(|other| other.id != p.id && other.temples[i] == max)))
+        {
+            // Core offers these upward choices, consumes a step/distinct slot,
+            // and leaves the player unchanged when can_raise is false.
+            return Some(p.clone());
+        }
+        if !matches!(direction, -1 | 1) || !(-1..=max).contains(&level) {
+            return None;
+        }
+        let mut next = p.clone();
+        next.temples[i] = level;
+        Some(next)
+    }
+    fn best_state(&self, states: Vec<PublicPlayer>) -> Result<PublicPlayer, ()> {
+        let mut best = None;
+        for state in states {
+            let value = self.potential(&state)?;
+            if best.as_ref().is_none_or(|(_, old)| value > *old) {
+                best = Some((state, value));
+            }
+        }
+        best.map(|(state, _)| state).ok_or(())
+    }
+    fn temple_offer(
+        &self,
+        p: &PublicPlayer,
+        direction: i64,
+        remaining: usize,
+        distinct: Option<&[TempleId]>,
+    ) -> Result<PublicPlayer, ()> {
+        if !(1..=2).contains(&remaining) {
+            return Err(());
+        }
+        self.callback_scope(p)?;
+        let mut states = Vec::new();
+        for t in TEMPLE_IDS {
+            if distinct.is_some_and(|used| used.contains(&t)) {
+                continue;
+            }
+            let Some(mut next) = self.temple(p, t, direction) else {
+                continue;
+            };
+            if remaining > 1 {
+                let mut used = distinct.map(<[TempleId]>::to_vec);
+                if let Some(used) = &mut used {
+                    used.push(t);
+                }
+                next = self.temple_offer(&next, direction, remaining - 1, used.as_deref())?;
+            }
+            states.push(next);
+        }
+        self.best_state(states)
+    }
+    fn temple_choices(
+        &self,
+        p: &PublicPlayer,
+        direction: i64,
+        exclude: &[TempleId],
+    ) -> Vec<PublicPlayer> {
+        TEMPLE_IDS
+            .into_iter()
+            .filter(|t| !exclude.contains(t))
+            .filter_map(|t| self.temple(p, t, direction))
+            .collect()
+    }
+    fn technology(&self, p: &PublicPlayer, t: TechnologyId) -> Result<Vec<PublicPlayer>, ()> {
+        let mut next = p.clone();
+        let i = tech_index(t);
+        if next.technologies[i] < 3 {
+            next.technologies[i] += 1;
+            return Ok(vec![next]);
+        }
+        match t {
+            TechnologyId::Agriculture => {
+                // The bonus's Temple(1) resolves before the next Technology.
+                // Its observation has no after queue, so project exactly its
+                // stable immediate-Phi chooser, not the parent's joint optimum.
+                Ok(vec![self.temple_offer(p, 1, 1, None)?])
+            }
+            TechnologyId::Extraction => {
+                // Resource(2) chooses gold twice: stock is linear and none of
+                // the supported monument metrics depends on retained resources.
+                self.callback_scope(p)?;
+                self.gain(&mut next, &[0, 0, 0, 2, 0])?;
+                Ok(vec![next])
+            }
+            TechnologyId::Architecture => {
+                next.score_quarters += 12;
+                Ok(vec![next])
+            }
+            TechnologyId::Theology => {
+                self.gain(&mut next, &[0, 0, 0, 0, 1])?;
+                Ok(vec![next])
+            }
+        }
+    }
+    fn effects(
+        &self,
+        mut states: Vec<PublicPlayer>,
+        effects: &[Effect],
+        has_followup: bool,
+    ) -> Result<Vec<PublicPlayer>, ()> {
+        for (index, effect) in effects.iter().enumerate() {
+            let mut out = Vec::new();
+            for mut p in states {
+                match effect {
+                    Effect::Resources { resources } => {
+                        self.gain(
+                            &mut p,
+                            &RESOURCE_IDS.map(|r| resources.get(&r).copied().unwrap_or(0)),
+                        )?;
+                        out.push(p)
+                    }
+                    Effect::Points { amount } => {
+                        p.score_quarters += 4 * amount;
+                        out.push(p)
+                    }
+                    Effect::Worker => {
+                        p.workers = (p.workers + 1).min(6);
+                        out.push(p)
+                    }
+                    // Recognized future-only effects have zero *current* terminal
+                    // delta, not an unknown competitor silently valued at zero.
+                    Effect::Feed { .. }
+                    | Effect::FeedDiscount { .. }
+                    | Effect::FoodReward { .. }
+                    | Effect::FoodRewardSwitch => out.push(p),
+                    Effect::Trade => {
+                        // Normal prices preserve terminal stock VP, but V7's
+                        // market choices can change which materials remain.
+                        // A terminal Phi-only preview needs no invented trade;
+                        // a later chooser/purchase needs that unknown stock.
+                        if has_followup
+                            || effects[index + 1..].iter().any(|e| {
+                                !matches!(
+                                    e,
+                                    Effect::Resources { .. }
+                                        | Effect::Points { .. }
+                                        | Effect::Worker
+                                        | Effect::Feed { .. }
+                                        | Effect::FeedDiscount { .. }
+                                        | Effect::FoodReward { .. }
+                                        | Effect::FoodRewardSwitch
+                                )
+                            })
+                        {
+                            return Err(());
+                        }
+                        out.push(p);
+                    }
+                    Effect::Technology { technology, steps } => {
+                        let steps = steps.unwrap_or(1);
+                        if !(1..=2).contains(&steps) {
+                            return Err(());
+                        }
+                        if matches!(technology, Target::Any(_)) {
+                            // The real nested chooser would fall back to V7;
+                            // its hidden continuation is outside this preview.
+                            self.callback_scope(&p)?;
+                        }
+                        let mut branch = vec![p];
+                        for _ in 0..steps {
+                            let mut next = Vec::new();
+                            for p in branch {
+                                if matches!(technology, Target::Any(_)) {
+                                    self.callback_scope(&p)?;
+                                }
+                                for t in TECHNOLOGY_IDS {
+                                    if matches!(technology,Target::Specific(wanted) if *wanted!=t) {
+                                        continue;
+                                    }
+                                    next.extend(self.technology(&p, t)?);
+                                }
+                            }
+                            branch = next;
+                        }
+                        // A pending technology chooser sees these remaining
+                        // steps, but not the later effects/build continuation.
+                        out.push(self.best_state(branch)?);
+                    }
+                    Effect::Temple { temple, steps } => {
+                        let steps = steps.unwrap_or(1);
+                        if !(1..=2).contains(&steps) {
+                            return Err(());
+                        }
+                        match temple {
+                            Target::Any(_) => {
+                                out.push(self.temple_offer(&p, 1, steps as usize, None)?);
+                            }
+                            Target::Specific(t) => {
+                                for _ in 0..steps {
+                                    p = self.temple(&p, *t, 1).ok_or(())?;
+                                }
+                                out.push(p);
+                            }
+                        }
+                    }
+                    // An additional construction/action can create immediate VP;
+                    // unlike Feed it is genuinely outside this closed preview.
+                    _ => return Err(()),
+                }
+            }
+            if out.len() > 64 {
+                return Err(());
+            }
+            states = out;
+        }
+        Ok(states)
+    }
+    fn build_states(
+        &self,
+        p: &PublicPlayer,
+        id: &str,
+        cost: &[i64; 5],
+        architecture: bool,
+        has_followup: bool,
+    ) -> Result<Vec<PublicPlayer>, ()> {
+        let b = building(id).ok_or(())?;
+        let mut next = self.pay(p, cost).ok_or(())?;
+        next.buildings.push(id.into());
+        if architecture {
+            self.gain(&mut next, &[1, 0, 0, 0, 0])?;
+            if p.technologies[2] >= 2 {
+                next.score_quarters += 8;
+            }
+        }
+        self.effects(vec![next], &b.effects, has_followup)
+    }
+    fn build_value(
+        &self,
+        p: &PublicPlayer,
+        remaining: usize,
+        corn: bool,
+        architecture_available: bool,
+        exclude: Option<&str>,
+    ) -> Result<f64, ()> {
+        self.callback_scope(p)?;
+        let before = self.potential(p)?;
+        let mut best: f64 = 0.0;
+        for id in &self.o.buildings {
+            if exclude == Some(id.as_str()) {
+                continue;
+            }
+            let card = building(id).ok_or(())?;
+            let base = RESOURCE_IDS.map(|r| card.cost.get(&r).copied().unwrap_or(0));
+            let eligible = architecture_available && p.technologies[2] >= 1;
+            let mut modes = vec![(false, None)];
+            if eligible {
+                modes = if p.technologies[2] >= 3 {
+                    MATERIALS
+                        .into_iter()
+                        .filter(|r| base[resource_index(*r)] > 0)
+                        .map(|r| (true, Some(r)))
+                        .collect()
+                } else {
+                    vec![(true, None)]
+                };
+                if modes.is_empty() {
+                    modes.push((true, None));
+                }
+                if remaining > 1 {
+                    modes.push((false, None));
+                }
+            }
+            for (architecture, discount) in modes {
+                let mut cost = base;
+                if let Some(r) = discount {
+                    cost[resource_index(r)] -= 1;
+                }
+                if corn {
+                    cost = [
+                        2 * (base[1] + base[2] + base[3]) - 2 * i64::from(discount.is_some()),
+                        0,
+                        0,
+                        0,
+                        base[4],
+                    ];
+                }
+                if self.pay(p, &cost).is_none() {
+                    continue;
+                }
+                for after in self.build_states(p, id, &cost, architecture, remaining > 1)? {
+                    let tail = if remaining > 1 {
+                        self.build_value(
+                            &after,
+                            1,
+                            corn,
+                            architecture_available && !architecture,
+                            Some(id),
+                        )?
+                    } else {
+                        0.0
+                    };
+                    best = best.max(self.potential(&after)? - before + tail);
+                }
+            }
+        }
+        Ok(best)
+    }
+    fn monument_net(&self, p: &PublicPlayer, id: &str, cost: &[i64; 5]) -> Result<Option<f64>, ()> {
+        if !self.o.monuments.iter().any(|m| m == id)
+            || self
+                .o
+                .players
+                .iter()
+                .any(|p| p.monuments.iter().any(|m| m == id))
+        {
+            return Err(());
+        }
+        let Some(mut next) = self.pay(p, cost) else {
+            return Ok(None);
+        };
+        next.monuments.push(id.into());
+        Ok(Some(self.potential(&next)? - self.potential(p)?))
+    }
+    fn monument_value(&self, p: &PublicPlayer) -> Result<f64, ()> {
+        let mut best: f64 = 0.0;
+        for id in &self.o.monuments {
+            let m = monument(id).ok_or(())?;
+            let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
+            if let Some(net) = self.monument_net(p, id, &cost)? {
+                best = best.max(net);
+            }
+        }
+        Ok(best)
+    }
+    fn callback_scope(&self, p: &PublicPlayer) -> Result<(), ()> {
+        if self.monument_value(p)? > 0.0 {
+            Ok(())
+        } else {
+            // This exact public callback would run V7. A parent cannot assume
+            // a V8 continuation after an intermediate payment or effect.
+            Err(())
+        }
+    }
+    fn technology_payment(
+        &self,
+        p: &PublicPlayer,
+        t: TechnologyId,
+        amount: i64,
+    ) -> Result<Option<PublicPlayer>, ()> {
+        if !(0..=3).contains(&amount) {
+            return Err(());
+        }
+        let mut states = Vec::new();
+        // Core resource_payments order, including EVERY affordable row. The
+        // actual Payment callback compares the same post-technology Phi. Any
+        // unsupported row refuses its entire callback, never just that row.
+        for wood in 0..=amount {
+            for stone in 0..=amount - wood {
+                let cost = [0, wood, stone, amount - wood - stone, 0];
+                if let Some(paid) = self.pay(p, &cost) {
+                    states.extend(self.technology(&paid, t)?);
+                }
+            }
+        }
+        if states.is_empty() {
+            Ok(None)
+        } else {
+            self.best_state(states).map(Some)
+        }
+    }
+    fn tech_offer(
+        &self,
+        p: &PublicPlayer,
+        first: Option<TechnologyId>,
+        free: bool,
+        remaining: usize,
+    ) -> Result<f64, ()> {
+        if !(1..=2).contains(&remaining) {
+            return Err(());
+        }
+        self.callback_scope(p)?;
+        let before = self.potential(p)?;
+        let mut best = if first.is_none() { Some(0.0) } else { None };
+        for t in TECHNOLOGY_IDS {
+            if first.is_some_and(|f| f != t) {
+                continue;
+            }
+            let count = if free {
+                0
+            } else {
+                tribes::technology_step_cost(p.technologies[tech_index(t)], false)
+            };
+            let Some(after) = self.technology_payment(p, t, count)? else {
+                continue;
+            };
+            let tail = if remaining > 1 {
+                self.tech_offer(&after, None, free, 1)?
+            } else {
+                0.0
+            };
+            let value = self.potential(&after)? - before + tail;
+            best = Some(best.map_or(value, |old: f64| old.max(value)));
+        }
+        best.ok_or(())
+    }
+    fn harvest(&self, p: &PublicPlayer, kind: HarvestKind, pos: i64) -> Result<Option<f64>, ()> {
+        let Some(j) = self.o.jungle.get(&pos) else {
+            return Ok(None);
+        };
+        let valid = match kind {
+            HarvestKind::Wood => pos >= 3 && j.wood > 0,
+            HarvestKind::Corn => j.corn > j.wood,
+            HarvestKind::EmptyCorn => p.technologies[0] >= 2,
+            HarvestKind::Burn => pos >= 3 && j.wood > 0 && j.corn > 0,
+        };
+        if !valid {
+            return Ok(None);
+        }
+        let mut next = p.clone();
+        self.gain(&mut next, &harvest_resources(self.o, p, kind, pos))?;
+        match kind {
+            HarvestKind::Wood => next.wood_tiles += 1,
+            HarvestKind::Corn | HarvestKind::Burn => next.corn_tiles += 1,
+            _ => {}
+        }
+        let base = self.potential(p)?;
+        if kind == HarvestKind::Burn {
+            return Ok(self
+                .temple_choices(&next, -1, &[])
+                .iter()
+                .map(|p| self.potential(p).map(|v| v - base))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .max_by(f64::total_cmp));
+        }
+        Ok(Some(self.potential(&next)? - base))
+    }
+    fn endpoint(&self, p: &PublicPlayer, g: GearId, pos: i64, fee: i64) -> Result<Option<f64>, ()> {
+        self.endpoint_at(p, g, pos, fee, None, V8Endpoint::Any)
+    }
+    fn conversion(
+        &self,
+        p: &PublicPlayer,
+        fee: i64,
+        race_wait: Option<i64>,
+        scope: V8Endpoint,
+    ) -> Result<Option<f64>, ()> {
+        let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
+            return Ok(None);
+        };
+        let fee_vp = 0.25 * fee as f64;
+        let mut net = if scope == V8Endpoint::Monument {
+            f64::NEG_INFINITY
+        } else {
+            self.build_value(&paid, 2, false, true, None)? - fee_vp
+        };
+        for id in &self.o.monuments {
+            let m = monument(id).ok_or(())?;
+            let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
+            if let Some(value) = self.monument_net(&paid, id, &cost)? {
+                // The whole endpoint net, including its entry fee, shares the
+                // same race discount. Actual NOW endpoints have no race term.
+                let q = race_wait.map_or(0, |wait| self.pressure(id, wait));
+                net = net.max((value - fee_vp) / (1 + q) as f64);
+            }
+        }
+        Ok(net.is_finite().then_some(net))
+    }
+    fn endpoint_at(
+        &self,
+        p: &PublicPlayer,
+        g: GearId,
+        pos: i64,
+        fee: i64,
+        race_wait: Option<i64>,
+        scope: V8Endpoint,
+    ) -> Result<Option<f64>, ()> {
+        if g == GearId::Uxmal && pos == 5 {
+            let mut best = None;
+            for g in [
+                GearId::Palenque,
+                GearId::Yaxchilan,
+                GearId::Tikal,
+                GearId::Uxmal,
+            ] {
+                for target in 1..=5 {
+                    if g == GearId::Uxmal && target == 5 {
+                        continue;
+                    }
+                    if let Some(value) =
+                        self.endpoint_at(p, g, target, fee + 1, race_wait, scope)?
+                    {
+                        best = Some(best.map_or(value, |old: f64| old.max(value)));
+                    }
+                }
+            }
+            return Ok(best);
+        }
+        let construction = matches!((g, pos), (GearId::Tikal, 2 | 4) | (GearId::Uxmal, 4));
+        if (scope == V8Endpoint::Other && construction)
+            || (matches!(scope, V8Endpoint::Construction | V8Endpoint::Monument) && !construction)
+            || (scope == V8Endpoint::Monument && (g, pos) != (GearId::Tikal, 4))
+        {
+            return Ok(None);
+        }
+        if g == GearId::Tikal && pos == 4 {
+            return self.conversion(p, fee, race_wait, scope);
+        }
+        let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
+            return Ok(None);
+        };
+        let fee_vp = Self::stock(&[fee, 0, 0, 0, 0]);
+        let gain = match (g, pos) {
+            (GearId::Palenque, 2..=5) => {
+                let mut best = None;
+                for kind in [
+                    HarvestKind::Corn,
+                    HarvestKind::Wood,
+                    HarvestKind::Burn,
+                    HarvestKind::EmptyCorn,
+                ] {
+                    if let Some(v) = self.harvest(&paid, kind, pos)? {
+                        best = Some(best.map_or(v, |old: f64| old.max(v)));
+                    }
+                }
+                let Some(v) = best else { return Ok(None) };
+                v
+            }
+            (GearId::Palenque | GearId::Yaxchilan, 1..=5) => {
+                let a = selected_action_resources(self.o, &paid, g, pos).ok_or(())?;
+                let mut next = paid.clone();
+                self.gain(&mut next, &a)?;
+                self.potential(&next)? - self.potential(&paid)?
+            }
+            (GearId::Tikal, 1 | 3) => {
+                self.tech_offer(&paid, None, false, if pos == 3 { 2 } else { 1 })?
+            }
+            (GearId::Tikal, 2) => self.build_value(&paid, 1, false, true, None)?,
+            (GearId::Tikal, 5) => {
+                // PayResource sees no queued Temple task: its actual scorer
+                // chooses the cheapest retained material in the same VP units.
+                let Some(i) = (1..=3).find(|i| paid.resources[*i] > 0) else {
+                    return Ok(None);
+                };
+                let mut cost = [0; 5];
+                cost[i] = 1;
+                let p = self.pay(&paid, &cost).ok_or(())?;
+                if self.monument_value(&p)? <= 0.0 {
+                    return Err(());
+                }
+                let after = self.temple_offer(&p, 1, 2, Some(&[]))?;
+                self.potential(&after)? - self.potential(&paid)?
+            }
+            (GearId::Uxmal, 1) => {
+                let Some(p) = self.pay(&paid, &[3, 0, 0, 0, 0]) else {
+                    return Ok(None);
+                };
+                let mut best = None;
+                for n in self.temple_choices(&p, 1, &[]) {
+                    let v = self.potential(&n)? - self.potential(&paid)?;
+                    best = Some(best.map_or(v, |old: f64| old.max(v)));
+                }
+                let Some(v) = best else { return Ok(None) };
+                v
+            }
+            (GearId::Uxmal, 2) => 0.0,
+            (GearId::Uxmal, 3) => {
+                let mut n = paid.clone();
+                n.workers = (n.workers + 1).min(6);
+                self.potential(&n)? - self.potential(&paid)?
+            }
+            (GearId::Uxmal, 4) => self.build_value(&paid, 1, true, true, None)?,
+            (GearId::ChichenItza, 1..=9) => {
+                if paid.resources[4] < 1 || self.o.skull_spaces.get(pos as usize) != Some(&None) {
+                    return Ok(None);
+                }
+                let reward = CATALOG.skull_rewards.get(&pos).ok_or(())?;
+                let mut n = paid.clone();
+                n.resources[4] -= 1;
+                n.skulls_placed += 1;
+                n.score_quarters += 4 * reward.points;
+                let mut raised = self.temple(&n, reward.temple, 1).unwrap_or(n);
+                if reward.resource {
+                    // Resource(1) is a real callback after consuming the skull.
+                    // Gold is its linear-Phi choice only while V8 still applies.
+                    self.callback_scope(&raised)?;
+                    self.gain(&mut raised, &[0, 0, 0, 1, 0])?;
+                }
+                if paid.technologies[tech_index(TechnologyId::Theology)] >= 2
+                    && raised.resources[1..4].iter().any(|n| *n > 0)
+                {
+                    // Core now queues a payable Offering -> Temple choice.
+                    // Offering is not in this closed preview: the actual child
+                    // uses V7, so the parent must not silently assume Skip.
+                    return Err(());
+                }
+                self.potential(&raised)? - self.potential(&paid)?
+            }
+            _ => return Err(()),
+        };
+        // gain is relative to paid stock; the actual entry fee is charged once.
+        Ok(Some(gain - fee_vp))
+    }
+    fn pressure(&self, id: &str, wait: i64) -> usize {
+        let Some(card) = monument(id) else { return 0 };
+        let cost = RESOURCE_IDS.map(|r| card.cost.get(&r).copied().unwrap_or(0));
+        self.o
+            .players
+            .iter()
+            .filter(|p| {
+                p.id != self.o.actor
+                    && [GearId::Tikal, GearId::Uxmal].into_iter().any(|g| {
+                        self.o.gears[&g].iter().enumerate().take(8).any(|(pos, w)| {
+                            w.as_ref()
+                                .is_some_and(|w| !w.dummy && w.player_id == p.id as i64)
+                                && (0..=wait.min(27 - self.o.round).min(7 - pos as i64)).any(
+                                    |delay| {
+                                        let arrival = pos as i64 + delay;
+                                        let target = if g == GearId::Tikal { 4 } else { 5 };
+                                        if arrival < target {
+                                            return false;
+                                        }
+                                        let mut paid = cost;
+                                        paid[0] += if arrival >= 6 { 0 } else { arrival - target }
+                                            + i64::from(g == GearId::Uxmal);
+                                        self.pay(p, &paid).is_some()
+                                    },
+                                )
+                        })
+                    })
+            })
+            .count()
+    }
+    fn future(&self, p: &PublicPlayer, g: GearId, pos: i64, scope: V8Endpoint) -> Result<f64, ()> {
+        let mut best: f64 = 0.0;
+        let max = if g == GearId::ChichenItza { 9 } else { 5 };
+        let limit = if g == GearId::ChichenItza { 11 } else { 8 };
+        for wait in 1..=(27 - self.o.round).min(limit - 1 - pos) {
+            let arrival = pos + wait;
+            for target in 1..=max {
+                if target > arrival {
+                    continue;
+                }
+                let fee = if arrival > max { 0 } else { arrival - target };
+                if let Some(value) = self.endpoint_at(p, g, target, fee, Some(wait), scope)? {
+                    best = best.max(value / (1 + wait) as f64);
+                }
+            }
+        }
+        Ok(best)
+    }
+    fn coverage(
+        &self,
+        p: &PublicPlayer,
+        exclude: Option<(GearId, i64)>,
+        scope: V8Endpoint,
+        include_now: bool,
+    ) -> Result<f64, ()> {
+        let mut best: f64 = 0.0;
+        // Tikal2/4 and Uxmal4/5 share the same visible cards. Coverage is one
+        // maximum across both gears, never independent copies of that purchase.
+        for g in [GearId::Tikal, GearId::Uxmal] {
+            for (pos, w) in self.o.gears[&g].iter().enumerate().take(8) {
+                let pos = pos as i64;
+                if exclude == Some((g, pos))
+                    || !w
+                        .as_ref()
+                        .is_some_and(|w| !w.dummy && w.player_id == self.o.actor as i64)
+                {
+                    continue;
+                }
+                best = best.max(self.future(p, g, pos, scope)?);
+                // Base turns cannot retrieve after placing. Use the observed
+                // legal Remove itself, and explicitly omit NOW for a proposed
+                // Place: that proposal commits the hypothetical turn to Place.
+                if !include_now || self.o.turn.mode == TurnMode::Place || !self.o.legal_actions.iter().any(|row| {
+                    matches!(row.action, TypedAction::Remove {gear, position} if gear==g && position==pos)
+                }) {
+                    continue;
+                }
+                for target in 1..=5.min(pos) {
+                    let fee = if pos >= 6 { 0 } else { pos - target };
+                    if let Some(now) = self.endpoint_at(p, g, target, fee, None, scope)? {
+                        best = best.max(now);
+                    }
+                }
+            }
+        }
+        Ok(best)
+    }
+    fn remove(&self, g: GearId, pos: i64) -> Result<f64, ()> {
+        let p = &self.o.players[self.o.actor];
+        let endpoints =
+            resource_cycle_removal_payoffs(self.o, g, pos, &HeuristicWeights::default())
+                .ok_or(())?;
+        let mut best: f64 = 0.0;
+        for (target, fee, _) in endpoints {
+            if let Some(v) = self.endpoint(p, g, target, fee)? {
+                best = best.max(v);
+            }
+        }
+        let ordinary = self.future(p, g, pos, V8Endpoint::Other)?;
+        let construction = self.future(p, g, pos, V8Endpoint::Construction)?;
+        let shared = self.coverage(p, Some((g, pos)), V8Endpoint::Construction, true)?;
+        let foregone = ordinary.max((construction - shared).max(0.0));
+        Ok(best - foregone)
+    }
+    fn score(&self, a: &TypedAction) -> Result<f64, ()> {
+        let p = &self.o.players[self.o.actor];
+        let base = self.potential(p)?;
+        match a {
+            TypedAction::Place {
+                gear, corn_cost, ..
+            } => {
+                let paid = self.pay(p, &[*corn_cost, 0, 0, 0, 0]).ok_or(())?;
+                let pos = resource_route_slot(self.o, *gear).ok_or(())? as i64;
+                let ordinary = self.future(&paid, *gear, pos, V8Endpoint::Other)?;
+                let construction = self.future(&paid, *gear, pos, V8Endpoint::Construction)?;
+                let shared = self.coverage(&paid, None, V8Endpoint::Construction, false)?;
+                let marginal = ordinary.max((construction - shared).max(0.0));
+                Ok(marginal - 0.25 * *corn_cost as f64)
+            }
+            TypedAction::Remove { gear, position } => self.remove(*gear, *position),
+            TypedAction::EndTurn { .. } | TypedAction::Skip => Ok(0.0),
+            TypedAction::FirstPlayer { corn_cost } => {
+                Ok(0.25 * (self.o.accumulated_corn - *corn_cost) as f64)
+            }
+            TypedAction::Beg => {
+                let mut best = None;
+                for mut next in self.temple_choices(p, -1, &[]) {
+                    next.resources[0] = 3;
+                    let v = self.potential(&next)? - base;
+                    best = Some(best.map_or(v, |old: f64| old.max(v)));
+                }
+                best.ok_or(())
+            }
+            TypedAction::UseAction {
+                gear,
+                position,
+                corn_cost,
+                ..
+            } => self.endpoint(p, *gear, *position, *corn_cost)?.ok_or(()),
+            TypedAction::Monument {
+                id,
+                cost,
+                renovation: None,
+            } => self.monument_net(p, id, cost)?.ok_or(()),
+            TypedAction::Build {
+                id,
+                cost,
+                architecture,
+                renovation: None,
+                ..
+            } => {
+                let mut best = None;
+                let has_followup =
+                    matches!(self.o.pending_task, Some(Task::Build {remaining,..}) if remaining>1);
+                for after in self.build_states(p, id, cost, *architecture, has_followup)? {
+                    let mut v = self.potential(&after)? - base;
+                    if let Some(Task::Build {
+                        remaining,
+                        corn_payment,
+                        architecture_available,
+                        ..
+                    }) = &self.o.pending_task
+                        && *remaining > 1
+                    {
+                        v += self.build_value(
+                            &after,
+                            1,
+                            *corn_payment,
+                            architecture_available != &Some(false) && !architecture,
+                            Some(id),
+                        )?;
+                    }
+                    best = Some(best.map_or(v, |old: f64| old.max(v)));
+                }
+                best.ok_or(())
+            }
+            TypedAction::Technology { technology } => {
+                let Some(Task::Technology {
+                    free, remaining, ..
+                }) = &self.o.pending_task
+                else {
+                    return Err(());
+                };
+                self.tech_offer(p, Some(*technology), *free, *remaining as usize)
+            }
+            TypedAction::Payment { resources } => {
+                let next = self.pay(p, resources).ok_or(())?;
+                if let Some(Task::PayTechnology { technology, .. }) = &self.o.pending_task {
+                    let mut best = None;
+                    for after in self.technology(&next, *technology)? {
+                        let v = self.potential(&after)? - base;
+                        best = Some(best.map_or(v, |old: f64| old.max(v)));
+                    }
+                    best.ok_or(())
+                } else {
+                    Ok(-Self::stock(resources))
+                }
+            }
+            TypedAction::Temple { temple, direction } => {
+                let mut next = self.temple(p, *temple, *direction).ok_or(())?;
+                let Some(Task::Temple {
+                    remaining,
+                    distinct,
+                    reason,
+                    ..
+                }) = &self.o.pending_task
+                else {
+                    return Err(());
+                };
+                if !(1..=2).contains(remaining) {
+                    return Err(());
+                }
+                if *reason == Some(TempleReason::Beg) {
+                    if *remaining != 1 {
+                        return Err(());
+                    }
+                    next.resources[0] = 3;
+                } else if *remaining > 1 {
+                    let mut used = distinct.clone();
+                    if let Some(used) = &mut used {
+                        used.push(*temple);
+                    }
+                    next = self.temple_offer(
+                        &next,
+                        *direction,
+                        *remaining as usize - 1,
+                        used.as_deref(),
+                    )?;
+                }
+                Ok(self.potential(&next)? - base)
+            }
+            TypedAction::Resource { resource } => {
+                let mut next = p.clone();
+                let mut gain = [0; 5];
+                gain[resource_index(*resource)] = 1;
+                self.gain(&mut next, &gain)?;
+                Ok(self.potential(&next)? - base)
+            }
+            TypedAction::Harvest { kind, position } => self.harvest(p, *kind, *position)?.ok_or(()),
+            _ => Err(()),
+        }
+    }
+}
+
 fn action_value(
     o: &Observation,
     p: &PublicPlayer,
