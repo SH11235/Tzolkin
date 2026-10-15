@@ -403,6 +403,224 @@ pub enum Opponent<'a> {
     ResourceCycle(super::resource_cycle::ResourceCycleConfig),
 }
 
+/// Closed full-phase procedures for the explicit heterogeneous Validation routes.
+/// AppStandard is the shipped ResourceAlignedV2 selector, not HeuristicV2.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum ProceduralValidationPolicy {
+    AppStandard {},
+    CornFirstSetup {},
+    CornFirstUxmalOpening {},
+    Search { config: crate::search::SearchConfig },
+}
+enum PreparedProceduralValidation {
+    App,
+    Corn(HeuristicWeights),
+    Uxmal(HeuristicWeights),
+    Search(PreparedSearch),
+}
+impl PreparedProceduralValidation {
+    fn new(policy: &ProceduralValidationPolicy) -> Result<Self, String> {
+        Ok(match policy {
+            ProceduralValidationPolicy::AppStandard {} => Self::App,
+            ProceduralValidationPolicy::CornFirstSetup {} => {
+                Self::Corn(HeuristicWeights::default())
+            }
+            ProceduralValidationPolicy::CornFirstUxmalOpening {} => {
+                Self::Uxmal(HeuristicWeights::default())
+            }
+            ProceduralValidationPolicy::Search { config } => {
+                Self::Search(PreparedSearch::new(config)?)
+            }
+        })
+    }
+    fn role(&self) -> Result<Role<'_>, String> {
+        match self {
+            Self::App => Ok(Role::App(AppProfile::ResourceAlignedV2)),
+            Self::Corn(weights) => Role::from_opponent(Opponent::CornFirstSetup(weights)),
+            Self::Uxmal(weights) => Role::from_opponent(Opponent::CornFirstUxmalOpening(weights)),
+            Self::Search(search) => Role::from_opponent(Opponent::Search(search)),
+        }
+    }
+}
+pub const SEMANTIC_PROCEDURAL_ARENA_SCHEMA: &str =
+    "tzolkin-semantic-playing-procedural-validation-arena-v1";
+pub const PROCEDURAL_ROSTER_ARENA_SCHEMA: &str = "tzolkin-procedural-roster-validation-arena-v1";
+
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationSearchDiagnostics {
+    pub focal: SearchSummary,
+    pub opponents: SearchSummary,
+    /// Verified Searched traces occur only in supported Playing callbacks.
+    /// This flag does not turn a legitimate fallback into a failed Core game.
+    pub opponent_playing_search_observed: bool,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeterogeneousValidationReport {
+    pub paired: NumericArenaReport,
+    pub search: ValidationSearchDiagnostics,
+}
+
+/// An immutable semantic actor owns Corn-first Setup and its default guard.
+/// Every procedural reference/opponent retains its own full-phase selector.
+pub fn run_semantic_checkpoint_procedural_validation(
+    config: &NumericArenaConfig,
+    candidate: SemanticPlayingCheckpointArenaPolicy,
+    reference: &ProceduralValidationPolicy,
+    pool: &[ProceduralValidationPolicy],
+) -> Result<HeterogeneousValidationReport, String> {
+    let reference = PreparedProceduralValidation::new(reference)?;
+    let prepared = pool
+        .iter()
+        .map(PreparedProceduralValidation::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    run_heterogeneous_validation(
+        config,
+        Role::SemanticCheckpoint(Box::new(candidate)),
+        reference.role()?,
+        prepared
+            .iter()
+            .map(PreparedProceduralValidation::role)
+            .collect::<Result<Vec<_>, _>>()?,
+        SEMANTIC_PROCEDURAL_ARENA_SCHEMA,
+    )
+}
+/// Baseline selection uses the same absolute-seat procedures, without a model.
+pub fn run_procedural_roster_validation(
+    config: &NumericArenaConfig,
+    candidate: &ProceduralValidationPolicy,
+    reference: &ProceduralValidationPolicy,
+    pool: &[ProceduralValidationPolicy],
+) -> Result<HeterogeneousValidationReport, String> {
+    let candidate = PreparedProceduralValidation::new(candidate)?;
+    let reference = PreparedProceduralValidation::new(reference)?;
+    let prepared = pool
+        .iter()
+        .map(PreparedProceduralValidation::new)
+        .collect::<Result<Vec<_>, _>>()?;
+    run_heterogeneous_validation(
+        config,
+        candidate.role()?,
+        reference.role()?,
+        prepared
+            .iter()
+            .map(PreparedProceduralValidation::role)
+            .collect::<Result<Vec<_>, _>>()?,
+        PROCEDURAL_ROSTER_ARENA_SCHEMA,
+    )
+}
+fn heterogeneous_work_bounds(
+    config: &NumericArenaConfig,
+    candidate: &Role<'_>,
+    reference: &Role<'_>,
+    pool: &[Role<'_>],
+) -> Result<BorrowedArenaWorkBounds, String> {
+    let families = u64::try_from(config.seeds.len()).map_err(|e| e.to_string())?;
+    let callbacks = (MAX_GAME_CALLBACKS as u64)
+        .checked_mul(families)
+        .ok_or("Heterogeneous callback bound overflow")?;
+    let mut result = BorrowedArenaWorkBounds {
+        planned_games: 0,
+        max_callbacks: 0,
+        max_public_policy_candidate_rows: 0,
+        max_search_atomic_steps: 0,
+    };
+    for seat in 0..config.players {
+        for focal in [candidate, reference] {
+            let cap = pool
+                .iter()
+                .enumerate()
+                .map(|(i, role)| if i == seat { focal } else { role })
+                .filter_map(Role::search)
+                .map(|p| p.config().max_total_steps as u64)
+                .max()
+                .unwrap_or(0);
+            result.planned_games = result
+                .planned_games
+                .checked_add(families)
+                .ok_or("Heterogeneous game bound overflow")?;
+            result.max_callbacks = result
+                .max_callbacks
+                .checked_add(callbacks)
+                .ok_or("Heterogeneous callback bound overflow")?;
+            result.max_search_atomic_steps = result
+                .max_search_atomic_steps
+                .checked_add(
+                    callbacks
+                        .checked_mul(cap)
+                        .ok_or("Heterogeneous Search bound overflow")?,
+                )
+                .ok_or("Heterogeneous Search bound overflow")?;
+        }
+    }
+    result.max_public_policy_candidate_rows = result
+        .max_callbacks
+        .checked_mul(MAX_ROWS_PER_CALLBACK as u64)
+        .ok_or("Heterogeneous row bound overflow")?;
+    Ok(result)
+}
+fn run_heterogeneous_validation<'a>(
+    config: &NumericArenaConfig,
+    candidate: Role<'a>,
+    reference: Role<'a>,
+    pool: Vec<Role<'a>>,
+    schema: &str,
+) -> Result<HeterogeneousValidationReport, String> {
+    config.validate()?;
+    if pool.len() != config.players
+        || (0..config.players).any(|seat| {
+            !pool
+                .iter()
+                .enumerate()
+                .any(|(i, r)| i != seat && r.search().is_some())
+        })
+    {
+        return Err(
+            "Heterogeneous Validation needs an absolute pool retaining Search at every focal seat"
+                .into(),
+        );
+    }
+    let default_guard = TradeGuardConfig::default().configuration_key()?;
+    if std::iter::once(&candidate)
+        .chain(std::iter::once(&reference))
+        .chain(pool.iter())
+        .any(|r| {
+            r.guard_key()
+                .is_some_and(|key| key != default_guard.as_str())
+        })
+    {
+        return Err("Heterogeneous Validation requires the default semantic guard".into());
+    }
+    let bounds = heterogeneous_work_bounds(config, &candidate, &reference, &pool)?;
+    let mut paired = run_admitted_roles(config, candidate, reference, pool, schema, None)?;
+    paired.work_bounds = bounds;
+    let mut search = ValidationSearchDiagnostics::default();
+    for block in &paired.blocks {
+        for pair in &block.pairs {
+            for arm in [&pair.candidate, &pair.reference] {
+                for (seat, summary) in arm.search.iter().enumerate() {
+                    if let Some(summary) = summary {
+                        if seat == pair.seat {
+                            search.focal.merge(summary);
+                        } else {
+                            search.opponents.merge(summary);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    search.opponent_playing_search_observed = search.opponents.searched > 0;
+    Ok(HeterogeneousValidationReport { paired, search })
+}
+
 /// The actual App selectors, with frozen default weights in both phases.
 /// No caller-supplied version string or training roster conversion is accepted.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1284,10 +1502,18 @@ pub struct GuardDiagnostics {
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OwnRoutePair {
+    pub candidate: Vec<PhaseRouteDiagnostics>,
+    pub reference: Vec<PhaseRouteDiagnostics>,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GuardPair {
     pub seat: usize,
     pub candidate: Vec<Option<GuardDiagnostics>>,
     pub reference: Vec<Option<GuardDiagnostics>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_routes: Option<OwnRoutePair>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1701,6 +1927,33 @@ type DiagnosticArm = (
 );
 
 #[allow(clippy::too_many_arguments)]
+fn play_arm_observing_routes<'a>(
+    seed: u32,
+    seat: usize,
+    focal: &mut Role<'a>,
+    pool: &mut [Role<'a>],
+    shared_setup: Option<&SharedCornFirstSetupIdentity>,
+    collect: bool,
+    investments: bool,
+    routes: Option<&mut [PhaseRouteDiagnostics]>,
+) -> DiagnosticArm {
+    if let Some(routes) = routes {
+        let (arm, guards) = play_arm_using_with_routes(
+            seed,
+            seat,
+            focal,
+            pool,
+            None,
+            Some(routes),
+            |players, seed, decide| replay::play_unrecorded_inference(players, seed, decide),
+        );
+        (arm, guards, None, None)
+    } else {
+        play_arm_with_diagnostics(seed, seat, focal, pool, shared_setup, collect, investments)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn play_arm_with_diagnostics<'a>(
     seed: u32,
     seat: usize,
@@ -1810,6 +2063,22 @@ fn play_arm_using_with_setup<'a>(
     focal: &mut Role<'a>,
     pool: &mut [Role<'a>],
     shared_setup: Option<&SharedCornFirstSetupIdentity>,
+    play: impl FnOnce(
+        usize,
+        u32,
+        &mut ArmDecide<'_>,
+    ) -> Result<(tzolkin_core::GameState, usize), String>,
+) -> (ArmResult, Vec<Option<GuardDiagnostics>>) {
+    play_arm_using_with_routes(seed, seat, focal, pool, shared_setup, None, play)
+}
+#[allow(clippy::too_many_arguments)]
+fn play_arm_using_with_routes<'a>(
+    seed: u32,
+    seat: usize,
+    focal: &mut Role<'a>,
+    pool: &mut [Role<'a>],
+    shared_setup: Option<&SharedCornFirstSetupIdentity>,
+    mut own_routes: Option<&mut [PhaseRouteDiagnostics]>,
     play: impl FnOnce(
         usize,
         u32,
@@ -1938,7 +2207,17 @@ fn play_arm_using_with_setup<'a>(
         if start_of_play.is_none() && observation.phase == Phase::Playing {
             start_of_play = Some(InitialConditions::from_observation(observation));
         }
-        choose(
+        if let Some(routes) = own_routes.as_deref_mut() {
+            let route = routes
+                .get_mut(observation.actor)
+                .ok_or("Route actor outside roster")?;
+            match observation.phase {
+                Phase::Setup => route.setup_choices_attempted += 1,
+                Phase::Playing => route.playing_choices_attempted += 1,
+                _ => return Err("Unsupported own-route phase".into()),
+            }
+        }
+        let result = choose(
             index,
             observation,
             &roster,
@@ -1946,7 +2225,18 @@ fn play_arm_using_with_setup<'a>(
             &mut conditional_sessions,
             &mut diagnostics,
             (&mut search, shared_setup),
-        )
+        );
+        if result.is_ok()
+            && let Some(routes) = own_routes.as_deref_mut()
+        {
+            let route = &mut routes[observation.actor];
+            match observation.phase {
+                Phase::Setup => route.setup_choices_returned += 1,
+                Phase::Playing => route.playing_choices_returned += 1,
+                _ => unreachable!("phase checked before choice"),
+            }
+        }
+        result
     })
     .and_then(|(state, decisions)| {
         let public = observe(&state, state.current_player)?.players;
@@ -2975,6 +3265,10 @@ fn run_admitted_roles_with_diagnostics<'a>(
     mut feeding: Option<&mut Vec<FeedingSeedBlock>>,
     mut investments: Option<&mut Vec<InvestmentSeedBlock>>,
 ) -> Result<NumericArenaReport, String> {
+    let observe_routes = matches!(
+        schema,
+        SEMANTIC_PROCEDURAL_ARENA_SCHEMA | PROCEDURAL_ROSTER_ARENA_SCHEMA
+    );
     let identities = (
         candidate.identity(),
         reference.identity(),
@@ -2998,9 +3292,13 @@ fn run_admitted_roles_with_diagnostics<'a>(
             .as_ref()
             .map(|_| Vec::with_capacity(config.players));
         for seat in 0..config.players {
+            let mut candidate_routes =
+                observe_routes.then(|| vec![PhaseRouteDiagnostics::default(); config.players]);
+            let mut reference_routes =
+                observe_routes.then(|| vec![PhaseRouteDiagnostics::default(); config.players]);
             let (c, r) = if (index + seat) % 2 == 0 {
                 (
-                    play_arm_with_diagnostics(
+                    play_arm_observing_routes(
                         *seed,
                         seat,
                         &mut candidate,
@@ -3008,8 +3306,9 @@ fn run_admitted_roles_with_diagnostics<'a>(
                         shared_setup.as_ref(),
                         feeding.is_some(),
                         investments.is_some(),
+                        candidate_routes.as_deref_mut(),
                     ),
-                    play_arm_with_diagnostics(
+                    play_arm_observing_routes(
                         *seed,
                         seat,
                         &mut reference,
@@ -3017,10 +3316,11 @@ fn run_admitted_roles_with_diagnostics<'a>(
                         shared_setup.as_ref(),
                         feeding.is_some(),
                         investments.is_some(),
+                        reference_routes.as_deref_mut(),
                     ),
                 )
             } else {
-                let reference_result = play_arm_with_diagnostics(
+                let reference_result = play_arm_observing_routes(
                     *seed,
                     seat,
                     &mut reference,
@@ -3028,9 +3328,10 @@ fn run_admitted_roles_with_diagnostics<'a>(
                     shared_setup.as_ref(),
                     feeding.is_some(),
                     investments.is_some(),
+                    reference_routes.as_deref_mut(),
                 );
                 (
-                    play_arm_with_diagnostics(
+                    play_arm_observing_routes(
                         *seed,
                         seat,
                         &mut candidate,
@@ -3038,6 +3339,7 @@ fn run_admitted_roles_with_diagnostics<'a>(
                         shared_setup.as_ref(),
                         feeding.is_some(),
                         investments.is_some(),
+                        candidate_routes.as_deref_mut(),
                     ),
                     reference_result,
                 )
@@ -3065,6 +3367,12 @@ fn run_admitted_roles_with_diagnostics<'a>(
                 seat,
                 candidate: c.1,
                 reference: r.1,
+                own_routes: candidate_routes
+                    .zip(reference_routes)
+                    .map(|(candidate, reference)| OwnRoutePair {
+                        candidate,
+                        reference,
+                    }),
             });
         }
         let completed = block(*seed, pairs);
@@ -3442,6 +3750,135 @@ pub(super) mod tests {
 
     #[test]
     fn numeric_validation_preflight_and_failed_arm_discard_only_game_history() {
+        for players in [3, 4] {
+            let config = NumericArenaConfig {
+                schema: SCHEMA.into(),
+                players,
+                seeds: vec![3],
+                bootstrap_seed: 7,
+                external_exclusions: ExternalExclusions {
+                    evidence_sha256: "a".repeat(64),
+                    excluded_family_ids: vec![],
+                },
+            };
+            let small = crate::search::SearchConfig {
+                worlds_per_action: 1,
+                horizon_days: 1,
+                max_rollout_steps: 1,
+                max_total_steps: 4,
+                min_completed_worlds: 1,
+                sampling_salt: 0,
+            };
+            let policies = (0..players)
+                .map(|i| {
+                    if i < 2 {
+                        ProceduralValidationPolicy::Search {
+                            config: small.clone(),
+                        }
+                    } else {
+                        ProceduralValidationPolicy::AppStandard {}
+                    }
+                })
+                .collect::<Vec<_>>();
+            let prepared = policies
+                .iter()
+                .map(PreparedProceduralValidation::new)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let mut pool = prepared
+                .iter()
+                .map(PreparedProceduralValidation::role)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let focal = PreparedProceduralValidation::new(
+                &ProceduralValidationPolicy::CornFirstUxmalOpening {},
+            )
+            .unwrap();
+            let mut focal = focal.role().unwrap();
+            let search = PreparedSearch::new(&crate::search::SearchConfig {
+                max_total_steps: 9,
+                ..small
+            })
+            .unwrap();
+            let reference = Role::from_opponent(Opponent::Search(&search)).unwrap();
+            let bounds = heterogeneous_work_bounds(&config, &focal, &reference, &pool).unwrap();
+            assert_eq!(bounds.planned_games, players as u64 * 2);
+            assert_eq!(
+                bounds.max_search_atomic_steps,
+                players as u64 * MAX_GAME_CALLBACKS as u64 * (4 + 9)
+            );
+            let mut routes = vec![PhaseRouteDiagnostics::default(); players];
+            let (arm, guards) = play_arm_using_with_routes(
+                3,
+                players - 1,
+                &mut focal,
+                &mut pool,
+                None,
+                Some(&mut routes),
+                |players, seed, decide| {
+                    let mut state = tzolkin_core::create_game(
+                        (0..players).map(|i| format!("Seat {i}")).collect(),
+                        seed,
+                        false,
+                    )?;
+                    for index in 0..16 {
+                        let o = observe(&state, state.current_player)?;
+                        let decision = decide(index, &o)?;
+                        state = tzolkin_core::apply_move(&state, decision.r#move)?;
+                        if o.phase == Phase::Playing {
+                            break;
+                        }
+                    }
+                    Err("Injected heterogeneous prefix failure".into())
+                },
+            );
+            assert_eq!(
+                arm.error.as_deref(),
+                Some("Injected heterogeneous prefix failure")
+            );
+            assert!(arm.score.is_none() && arm.winner_utility.is_none());
+            assert!(guards.iter().all(Option::is_none)); // No invented numeric guards.
+            assert!(routes.iter().all(|r| r.setup_choices_attempted > 0
+                && r.setup_choices_attempted == r.setup_choices_returned));
+            assert_eq!(
+                routes
+                    .iter()
+                    .map(|r| r.playing_choices_returned)
+                    .sum::<usize>(),
+                1
+            );
+            assert!(
+                arm.search
+                    .iter()
+                    .flatten()
+                    .any(|r| r.decisions > 0 && r.fallbacks > 0)
+            );
+            let no_search = vec![ProceduralValidationPolicy::AppStandard {}; players];
+            assert!(
+                run_procedural_roster_validation(
+                    &config,
+                    &ProceduralValidationPolicy::AppStandard {},
+                    &ProceduralValidationPolicy::CornFirstSetup {},
+                    &no_search
+                )
+                .is_err()
+            );
+            let legacy = serde_json::to_value(GuardPair {
+                seat: 0,
+                candidate: vec![],
+                reference: vec![],
+                own_routes: None,
+            })
+            .unwrap();
+            assert!(legacy.get("ownRoutes").is_none());
+            for invalid in [
+                json!({"kind":"heuristic"}),
+                json!({"kind":"appStandard","weights":{}}),
+                json!({"kind":"semanticCheckpoint"}),
+            ] {
+                assert!(serde_json::from_value::<ProceduralValidationPolicy>(invalid).is_err());
+            }
+        }
         for players in [3, 4] {
             let wire = json!({
                 "schema": RESOURCE_CYCLE_V8_V7_COMMAND_SCHEMA,

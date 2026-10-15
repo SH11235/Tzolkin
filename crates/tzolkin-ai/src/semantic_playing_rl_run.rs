@@ -24,6 +24,338 @@ const AUDIT_SCHEMA: &str = "tzolkin-semantic-playing-journal-audit-v1";
 const EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-journal-evaluation-v1";
 const POLICY_EXPORT_SCHEMA: &str = "tzolkin-semantic-playing-checkpoint-policy-export-v1";
 const POLICY_EVALUATION_SCHEMA: &str = "tzolkin-semantic-playing-policy-evaluation-v1";
+
+const SEMANTIC_PROCEDURAL_SCHEMA: &str = "tzolkin-semantic-playing-policy-procedural-validation-v1";
+const PROCEDURAL_ROSTER_SCHEMA: &str = "tzolkin-procedural-roster-validation-v1";
+const SEMANTIC_PROCEDURAL_PURPOSE: &str = "semanticPilotValidationV1";
+const PROCEDURAL_ROSTER_PURPOSE: &str = "baselineSelectionValidationV1";
+use crate::arena::numeric::ProceduralValidationPolicy;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SemanticProceduralWire {
+    schema: String,
+    purpose: String,
+    candidate: ContentPin,
+    reference: ProceduralValidationPolicy,
+    opponent_pool: Vec<ProceduralValidationPolicy>,
+    global_external: External,
+    players: usize,
+    seeds: Vec<u32>,
+    bootstrap_seed: u64,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProceduralRosterWire {
+    schema: String,
+    purpose: String,
+    candidate: ProceduralValidationPolicy,
+    reference: ProceduralValidationPolicy,
+    opponent_pool: Vec<ProceduralValidationPolicy>,
+    global_external: External,
+    players: usize,
+    seeds: Vec<u32>,
+    bootstrap_seed: u64,
+}
+fn procedural_validation_config(
+    players: usize,
+    seeds: &[u32],
+    bootstrap_seed: u64,
+    external: &External,
+    families: Vec<String>,
+) -> crate::arena::numeric::NumericArenaConfig {
+    crate::arena::numeric::NumericArenaConfig {
+        schema: crate::arena::numeric::SCHEMA.into(),
+        players,
+        seeds: seeds.to_vec(),
+        bootstrap_seed,
+        external_exclusions: crate::arena::numeric::ExternalExclusions {
+            evidence_sha256: external.pin.sha256.clone(),
+            excluded_family_ids: families,
+        },
+    }
+}
+fn validate_procedural_control(
+    players: usize,
+    seeds: &[u32],
+    bootstrap_seed: u64,
+    external: &External,
+    reference: &ProceduralValidationPolicy,
+    pool: &[ProceduralValidationPolicy],
+) -> Result<(), String> {
+    procedural_validation_config(players, seeds, bootstrap_seed, external, Vec::new())
+        .validate()?;
+    if seeds.len() > 64
+        || pool.len() != players
+        || pool
+            .iter()
+            .filter(|p| matches!(p, ProceduralValidationPolicy::Search { .. }))
+            .count()
+            < 2
+    {
+        return Err("Procedural Validation requires at most64 families and Search remaining in every absolute roster".into());
+    }
+    for role in std::iter::once(reference).chain(pool.iter()) {
+        if let ProceduralValidationPolicy::Search { config } = role {
+            config.validate()?;
+        }
+    }
+    Ok(())
+}
+fn procedural_control<T: serde::de::DeserializeOwned>(
+    raw: &[u8],
+    checksum: &str,
+) -> Result<T, String> {
+    if !checkpoint_digest(checksum) || crate::model::digest(raw) != checksum {
+        return Err("Procedural Validation control pin differs".into());
+    }
+    serde_json::from_value(unique_json(raw, MAX_CONTROL)?).map_err(|e| e.to_string())
+}
+pub struct SemanticProceduralValidationSpec {
+    wire: SemanticProceduralWire,
+    checksum: String,
+}
+impl SemanticProceduralValidationSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        let wire: SemanticProceduralWire = procedural_control(raw, expected_sha256)?;
+        if wire.schema != SEMANTIC_PROCEDURAL_SCHEMA || wire.purpose != SEMANTIC_PROCEDURAL_PURPOSE
+        {
+            return Err("Semantic procedural Validation schema/purpose differs".into());
+        }
+        validate_procedural_control(
+            wire.players,
+            &wire.seeds,
+            wire.bootstrap_seed,
+            &wire.global_external,
+            &wire.reference,
+            &wire.opponent_pool,
+        )?;
+        Ok(Self {
+            wire,
+            checksum: expected_sha256.into(),
+        })
+    }
+}
+pub struct ProceduralRosterValidationSpec {
+    wire: ProceduralRosterWire,
+    checksum: String,
+}
+impl ProceduralRosterValidationSpec {
+    pub fn from_json(raw: &[u8], expected_sha256: &str) -> Result<Self, String> {
+        let wire: ProceduralRosterWire = procedural_control(raw, expected_sha256)?;
+        if wire.schema != PROCEDURAL_ROSTER_SCHEMA || wire.purpose != PROCEDURAL_ROSTER_PURPOSE {
+            return Err("Procedural roster Validation schema/purpose differs".into());
+        }
+        validate_procedural_control(
+            wire.players,
+            &wire.seeds,
+            wire.bootstrap_seed,
+            &wire.global_external,
+            &wire.reference,
+            &wire.opponent_pool,
+        )?;
+        if let ProceduralValidationPolicy::Search { config } = &wire.candidate {
+            config.validate()?;
+        }
+        Ok(Self {
+            wire,
+            checksum: expected_sha256.into(),
+        })
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProceduralValidationBody {
+    purpose: &'static str,
+    control_sha256: String,
+    global_external: crate::conditional_human_rl_update::NativeExclusionDescriptor,
+    arena: crate::arena::numeric::HeterogeneousValidationReport,
+    historical_core_replays: usize,
+    source_authenticated: bool,
+    source_qualified: bool,
+    strength_measured: bool,
+    adoption_granted: bool,
+}
+impl ProceduralValidationBody {
+    fn exit_code(&self) -> i32 {
+        // Measured Search responsiveness is an experiment criterion, not a
+        // fabricated failure of an otherwise completed procedural game.
+        if self.arena.paired.statistics.failed_games == 0
+            && self.arena.paired.blocks.iter().all(|b| b.complete)
+        {
+            0
+        } else {
+            1
+        }
+    }
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticProceduralValidation {
+    schema: &'static str,
+    candidate_artifact: ContentPin,
+    #[serde(flatten)]
+    body: ProceduralValidationBody,
+}
+impl SemanticProceduralValidation {
+    pub fn exit_code(&self) -> i32 {
+        self.body.exit_code()
+    }
+}
+#[derive(Serialize)]
+pub struct ProceduralRosterValidation {
+    schema: &'static str,
+    #[serde(flatten)]
+    body: ProceduralValidationBody,
+}
+impl ProceduralRosterValidation {
+    pub fn exit_code(&self) -> i32 {
+        self.body.exit_code()
+    }
+}
+fn procedural_output(output: &Path, inputs: &Value) -> Result<PathBuf, String> {
+    if !output.is_absolute() {
+        return Err("Procedural Validation needs an absolute output namespace".into());
+    }
+    let output = local(output, true)?;
+    if output.to_string_lossy().len() > 1024 || fs::symlink_metadata(&output).is_ok() {
+        return Err("Procedural Validation needs a fresh bounded namespace".into());
+    }
+    reject_input_namespace(&output, inputs)?;
+    Ok(output)
+}
+fn procedural_families(
+    external: &External,
+) -> Result<(ConditionalNativeExclusions, Vec<String>), String> {
+    let raw = pinned(&external.pin, 32 * 1024 * 1024)?;
+    let loaded = external.load()?;
+    let mut wire = unique_json(&raw, 32 * 1024 * 1024)?;
+    let families = serde_json::from_value(wire["families"].take()).map_err(|e| e.to_string())?;
+    Ok((loaded, families))
+}
+fn procedural_body(
+    purpose: &'static str,
+    checksum: String,
+    global: &ConditionalNativeExclusions,
+    arena: crate::arena::numeric::HeterogeneousValidationReport,
+) -> ProceduralValidationBody {
+    ProceduralValidationBody {
+        purpose,
+        control_sha256: checksum,
+        global_external: global.descriptor().clone(),
+        arena,
+        historical_core_replays: 0,
+        source_authenticated: false,
+        source_qualified: false,
+        strength_measured: false,
+        adoption_granted: false,
+    }
+}
+pub fn evaluate_semantic_playing_policy_procedural_validation(
+    spec: SemanticProceduralValidationSpec,
+    output: &Path,
+) -> Result<SemanticProceduralValidation, String> {
+    use tzolkin_inference::semantic_playing_deployment::{
+        LoadedSemanticPlayingDeployment, MAX_DEPLOYMENT_BYTES,
+    };
+    let w = &spec.wire;
+    let result = (|| {
+        let output = procedural_output(
+            output,
+            &serde_json::to_value((&w.candidate, &w.global_external)).map_err(|e| e.to_string())?,
+        )?;
+        let candidate = crate::arena::semantic_snapshot::SemanticPlayingCheckpointArenaPolicy::new(
+            LoadedSemanticPlayingDeployment::load(&pinned(&w.candidate, MAX_DEPLOYMENT_BYTES)?)?,
+        )?;
+        let (global, families) = procedural_families(&w.global_external)?;
+        let config = procedural_validation_config(
+            w.players,
+            &w.seeds,
+            w.bootstrap_seed,
+            &w.global_external,
+            families,
+        );
+        let arena = crate::arena::numeric::run_semantic_checkpoint_procedural_validation(
+            &config,
+            candidate,
+            &w.reference,
+            &w.opponent_pool,
+        )?;
+        let report = SemanticProceduralValidation {
+            schema: "tzolkin-semantic-playing-policy-procedural-validation-report-v1",
+            candidate_artifact: w.candidate.clone(),
+            body: procedural_body(
+                SEMANTIC_PROCEDURAL_PURPOSE,
+                spec.checksum.clone(),
+                &global,
+                arena,
+            ),
+        };
+        fs::create_dir(&output).map_err(|e| e.to_string())?;
+        crate::model::write_new_json_bounded(
+            &output.join("evaluation.json"),
+            &report,
+            crate::arena::numeric::MAX_REPORT_BYTES,
+        )?;
+        Ok(report)
+    })();
+    evaluation_post(
+        result,
+        [
+            pinned(&w.candidate, MAX_DEPLOYMENT_BYTES).map(|_| ()),
+            pinned(&w.global_external.pin, 32 * 1024 * 1024)
+                .and_then(|_| w.global_external.load().map(|_| ())),
+        ],
+    )
+}
+pub fn evaluate_procedural_roster_validation(
+    spec: ProceduralRosterValidationSpec,
+    output: &Path,
+) -> Result<ProceduralRosterValidation, String> {
+    let w = &spec.wire;
+    let result = (|| {
+        let output = procedural_output(
+            output,
+            &serde_json::to_value(&w.global_external).map_err(|e| e.to_string())?,
+        )?;
+        let (global, families) = procedural_families(&w.global_external)?;
+        let config = procedural_validation_config(
+            w.players,
+            &w.seeds,
+            w.bootstrap_seed,
+            &w.global_external,
+            families,
+        );
+        let arena = crate::arena::numeric::run_procedural_roster_validation(
+            &config,
+            &w.candidate,
+            &w.reference,
+            &w.opponent_pool,
+        )?;
+        let report = ProceduralRosterValidation {
+            schema: "tzolkin-procedural-roster-validation-report-v1",
+            body: procedural_body(
+                PROCEDURAL_ROSTER_PURPOSE,
+                spec.checksum.clone(),
+                &global,
+                arena,
+            ),
+        };
+        fs::create_dir(&output).map_err(|e| e.to_string())?;
+        crate::model::write_new_json_bounded(
+            &output.join("evaluation.json"),
+            &report,
+            crate::arena::numeric::MAX_REPORT_BYTES,
+        )?;
+        Ok(report)
+    })();
+    evaluation_post(
+        result,
+        [pinned(&w.global_external.pin, 32 * 1024 * 1024)
+            .and_then(|_| w.global_external.load().map(|_| ()))],
+    )
+}
+
 const ALLOCATION_SCHEMA: &str = "tzolkin-semantic-playing-invocation-allocation-v1";
 const MAX_CONTROL: usize = 1024 * 1024;
 const MAX_HISTORY_PINS: usize = 128;
@@ -2917,6 +3249,69 @@ pub(super) fn control_fixture(
             SemanticPolicyEvaluationSpec::from_json(&bytes, &crate::model::digest(&bytes))
         };
         assert!(parse(&evaluation).is_ok());
+
+        let search_role = json!({"kind":"search","config":crate::search::SearchConfig::default()});
+        let semantic_wire = json!({"schema":SEMANTIC_PROCEDURAL_SCHEMA,"purpose":SEMANTIC_PROCEDURAL_PURPOSE,
+            "candidate":evaluation["candidate"],"reference":{"kind":"appStandard"},
+            "opponentPool":[search_role,search_role,{"kind":"appStandard"}],
+            "globalExternal":evaluation["globalExternal"],"players":3,"seeds":[validation],"bootstrapSeed":7});
+        let parse_semantic = |v: &Value| {
+            let bytes = serde_json::to_vec(v).unwrap();
+            SemanticProceduralValidationSpec::from_json(&bytes, &crate::model::digest(&bytes))
+        };
+        let mut procedural_wire = semantic_wire.clone();
+        procedural_wire["schema"] = PROCEDURAL_ROSTER_SCHEMA.into();
+        procedural_wire["purpose"] = PROCEDURAL_ROSTER_PURPOSE.into();
+        procedural_wire["candidate"] = json!({"kind":"cornFirstSetup"});
+        let parse_procedural = |v: &Value| {
+            let bytes = serde_json::to_vec(v).unwrap();
+            ProceduralRosterValidationSpec::from_json(&bytes, &crate::model::digest(&bytes))
+        };
+        assert!(
+            parse_semantic(&semantic_wire).is_ok() && parse_procedural(&procedural_wire).is_ok()
+        );
+        assert!(
+            parse_semantic(&procedural_wire).is_err() && parse_procedural(&semantic_wire).is_err()
+        );
+        for base in [&semantic_wire, &procedural_wire] {
+            for (key, value) in [
+                ("purpose", json!("other")),
+                (
+                    "reference",
+                    json!({"kind":"appStandard","profile":"heuristic"}),
+                ),
+                (
+                    "reference",
+                    json!({"kind":"cornFirstSetup","ignoredBudget":1}),
+                ),
+                ("seeds", json!([test])),
+                ("allowTest", json!(true)),
+                (
+                    "opponentPool",
+                    json!(vec![json!({"kind":"appStandard"}); 3]),
+                ),
+            ] {
+                let mut bad = base.clone();
+                bad[key] = value;
+                assert!(parse_semantic(&bad).is_err() && parse_procedural(&bad).is_err());
+            }
+        }
+        let new_spec = parse_semantic(&semantic_wire).unwrap();
+        let mut corrupt = raw.clone();
+        corrupt[0] ^= 1;
+        fs::write(output.join("policy.json"), &corrupt).unwrap();
+        let error = evaluate_semantic_playing_policy_procedural_validation(
+            new_spec,
+            Path::new("relative-new-validation"),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            error.contains("absolute output")
+                && error.contains("evaluation POST")
+                && error.contains("Semantic runner input changed")
+        );
+        fs::write(output.join("policy.json"), &raw).unwrap();
         evaluation["seeds"] = json!([test]);
         assert!(parse(&evaluation).is_err());
         evaluation["seeds"] = json!([validation]);
