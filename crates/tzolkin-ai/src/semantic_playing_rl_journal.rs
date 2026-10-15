@@ -41,11 +41,14 @@ pub use restore::{
 #[path = "semantic_playing_rl_run.rs"]
 mod runner;
 pub use runner::{
-    SemanticJournalAudit, SemanticJournalAuditSpec, SemanticJournalEvaluation,
-    SemanticJournalEvaluationSpec, SemanticJournalInvocation, SemanticJournalRunSpec,
-    SemanticPolicyEvaluation, SemanticPolicyEvaluationSpec, SemanticPolicyExport,
-    SemanticPolicyExportSpec, audit_semantic_playing_journal, evaluate_semantic_playing_journal,
-    evaluate_semantic_playing_policy, export_semantic_playing_policy, run_semantic_playing_journal,
+    ProceduralRosterValidation, ProceduralRosterValidationSpec, SemanticJournalAudit,
+    SemanticJournalAuditSpec, SemanticJournalEvaluation, SemanticJournalEvaluationSpec,
+    SemanticJournalInvocation, SemanticJournalRunSpec, SemanticPolicyEvaluation,
+    SemanticPolicyEvaluationSpec, SemanticPolicyExport, SemanticPolicyExportSpec,
+    SemanticProceduralValidation, SemanticProceduralValidationSpec, audit_semantic_playing_journal,
+    evaluate_procedural_roster_validation, evaluate_semantic_playing_journal,
+    evaluate_semantic_playing_policy, evaluate_semantic_playing_policy_procedural_validation,
+    export_semantic_playing_policy, run_semantic_playing_journal,
 };
 const META_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FILES: usize = 640;

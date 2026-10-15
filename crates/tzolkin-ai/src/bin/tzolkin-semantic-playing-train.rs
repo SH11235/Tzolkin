@@ -2,9 +2,11 @@
 use std::path::Path;
 use tzolkin_ai::public_rl_paired_session::read_bounded;
 use tzolkin_ai::semantic_playing_rl_journal::{
-    SemanticJournalAuditSpec, SemanticJournalEvaluationSpec, SemanticJournalRunSpec,
-    SemanticPolicyEvaluationSpec, SemanticPolicyExportSpec, audit_semantic_playing_journal,
-    evaluate_semantic_playing_journal, evaluate_semantic_playing_policy,
+    ProceduralRosterValidationSpec, SemanticJournalAuditSpec, SemanticJournalEvaluationSpec,
+    SemanticJournalRunSpec, SemanticPolicyEvaluationSpec, SemanticPolicyExportSpec,
+    SemanticProceduralValidationSpec, audit_semantic_playing_journal,
+    evaluate_procedural_roster_validation, evaluate_semantic_playing_journal,
+    evaluate_semantic_playing_policy, evaluate_semantic_playing_policy_procedural_validation,
     export_semantic_playing_policy, run_semantic_playing_journal,
 };
 
@@ -16,6 +18,8 @@ const GUARDED_COLLECTION_HELP: &str = "A fresh start may explicitly set original
 const NATIVE_INITIALIZATION_HELP: &str = "A fresh Native start must set original.initializationKind=nativeCornFirstV5SemanticPlayingTeacher or nativeCornFirstV7SemanticPlayingTeacher and collectionComposition=guardedProposalV2, pinning the matching checkpoint and complete dataset manifest.json. The explicit profile is retained by continue/resume/audit and originalNativeTeacher evaluation; V5 and V7 roots cannot be interchanged. Omission retains Human initialization.\n";
 const POLICY_HELP: &str = "tzolkin-semantic-playing-train export-policy --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_POLICY_DIR\nSeparate closed checkpoint-policy-export-v1 control: checkpoint:{payload,closeDeclaration}. Checks the completed owned checkpoint and producing-close linkage, then writes actor-only policy.json and digest-only policy-export.json. Numeric loading supports Scalar semantic4 Playing only, with no critic, corpus, original preparation or learning owner. Setup and game-local guarding are separate composition work; no App adoption or strength claim. Inputs are rechecked on every result, including publication errors.\n";
 const POLICY_EVALUATION_HELP: &str = "tzolkin-semantic-playing-train evaluate-policy --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_EVALUATION_DIR\nSeparate policy-evaluation-v1 control pins candidate/reference actor-only inference artifacts, complete caller-declared globalExternal family exclusions, players, Validation seeds and bootstrapSeed. Both focal policies use Scalar semantic4 Playing, shared all-seat Corn-first Setup and fresh default TradeGuard against the same fixed V5 pool. No Prepared, critic, journal restore, historical Core replay or training admission. Numeric identity and family declarations do not authenticate training history. Exit0 requires complete paired arms and every-result artifact/global/control postchecks; no fresh Test, strength or adoption claim.\n";
+const POLICY_PROCEDURAL_VALIDATION_HELP: &str = "tzolkin-semantic-playing-train evaluate-policy-procedural-validation --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_EVALUATION_DIR\nSeparate closed Validation control pins a semantic Playing inference candidate, a procedural reference, the frozen procedural roster, complete caller-declared globalExternal family exclusions, players, seeds and bootstrapSeed. The candidate retains its own Corn-first Setup and fresh default TradeGuard; procedural policies retain their declared behavior. Writes evaluation.json. Exit0 requires complete paired arms and every-result input postchecks; no training, fresh Test, strength or adoption claim.\n";
+const PROCEDURAL_VALIDATION_HELP: &str = "tzolkin-semantic-playing-train evaluate-procedural-validation --control FILE --expected-sha256 LOWERCASE64HEX --output NEW_EVALUATION_DIR\nSeparate closed Validation control pins two procedural focal policies, the frozen procedural roster, complete caller-declared globalExternal family exclusions, players, seeds and bootstrapSeed. Each policy retains its declared behavior. Writes evaluation.json. Exit0 requires complete paired arms and every-result input postchecks; no training, fresh Test, strength or adoption claim.\n";
 
 fn run(args: &[String]) -> Result<i32, String> {
     if args.len() != 7
@@ -28,10 +32,12 @@ fn run(args: &[String]) -> Result<i32, String> {
                 | "evaluate"
                 | "export-policy"
                 | "evaluate-policy"
+                | "evaluate-policy-procedural-validation"
+                | "evaluate-procedural-validation"
         )
     {
         return Err(
-            "Expected start|resume|continue|audit|evaluate|export-policy|evaluate-policy and three flag/value pairs".into(),
+            "Expected start|resume|continue|audit|evaluate|export-policy|evaluate-policy|evaluate-policy-procedural-validation|evaluate-procedural-validation and three flag/value pairs".into(),
         );
     }
     let mut flags = std::collections::BTreeMap::new();
@@ -46,6 +52,65 @@ fn run(args: &[String]) -> Result<i32, String> {
         }
     }
     let raw = read_bounded(Path::new(flags["--control"]), 1024 * 1024)?;
+    if args[0] == "evaluate-policy-procedural-validation" {
+        let spec = SemanticProceduralValidationSpec::from_json(&raw, flags["--expected-sha256"])?;
+        let result = evaluate_semantic_playing_policy_procedural_validation(
+            spec,
+            Path::new(flags["--output"]),
+        );
+        let post = read_bounded(Path::new(flags["--control"]), 1024 * 1024).and_then(|after| {
+            if after == raw {
+                Ok(())
+            } else {
+                Err("Policy procedural Validation control changed".into())
+            }
+        });
+        let report = match (result, post) {
+            (Ok(report), Ok(())) => report,
+            (Err(error), Ok(())) => return Err(error),
+            (result, Err(post)) => {
+                return Err(format!(
+                    "{}; policy procedural Validation control POST: {post}",
+                    result.err().unwrap_or_default()
+                ));
+            }
+        };
+        let code = report.exit_code();
+        println!(
+            "{}",
+            serde_json::json!({"schema":"tzolkin-semantic-playing-policy-procedural-validation-summary-v1",
+                "report":"evaluation.json","complete":code == 0})
+        );
+        return Ok(code);
+    }
+    if args[0] == "evaluate-procedural-validation" {
+        let spec = ProceduralRosterValidationSpec::from_json(&raw, flags["--expected-sha256"])?;
+        let result = evaluate_procedural_roster_validation(spec, Path::new(flags["--output"]));
+        let post = read_bounded(Path::new(flags["--control"]), 1024 * 1024).and_then(|after| {
+            if after == raw {
+                Ok(())
+            } else {
+                Err("Procedural Validation control changed".into())
+            }
+        });
+        let report = match (result, post) {
+            (Ok(report), Ok(())) => report,
+            (Err(error), Ok(())) => return Err(error),
+            (result, Err(post)) => {
+                return Err(format!(
+                    "{}; procedural Validation control POST: {post}",
+                    result.err().unwrap_or_default()
+                ));
+            }
+        };
+        let code = report.exit_code();
+        println!(
+            "{}",
+            serde_json::json!({"schema":"tzolkin-procedural-roster-validation-summary-v1",
+                "report":"evaluation.json","complete":code == 0})
+        );
+        return Ok(code);
+    }
     if args[0] == "evaluate-policy" {
         let spec = SemanticPolicyEvaluationSpec::from_json(&raw, flags["--expected-sha256"])?;
         let result = evaluate_semantic_playing_policy(spec, Path::new(flags["--output"]));
@@ -152,7 +217,7 @@ fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--help"] {
         print!(
-            "{HELP}{AUDIT_HELP}{EVALUATION_HELP}{CHECKPOINT_HELP}{GUARDED_COLLECTION_HELP}{NATIVE_INITIALIZATION_HELP}{POLICY_HELP}{POLICY_EVALUATION_HELP}"
+            "{HELP}{AUDIT_HELP}{EVALUATION_HELP}{CHECKPOINT_HELP}{GUARDED_COLLECTION_HELP}{NATIVE_INITIALIZATION_HELP}{POLICY_HELP}{POLICY_EVALUATION_HELP}{POLICY_PROCEDURAL_VALIDATION_HELP}{PROCEDURAL_VALIDATION_HELP}"
         );
         return;
     }
