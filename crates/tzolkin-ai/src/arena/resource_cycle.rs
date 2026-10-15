@@ -1747,6 +1747,7 @@ mod tests {
             assert_eq!(scores.len(), o.legal_actions.len());
             let baseline = choose_move(&o, &ResourceCycleConfig::v7()).unwrap();
             assert_ne!(decision.score.to_bits(), baseline.score.to_bits());
+            let active = funded.clone();
             // An equally funded visible rival affects only future race pressure.
             let mut contested = funded.clone();
             contested.players[0].resources = funded.players[1].resources.clone();
@@ -1899,6 +1900,238 @@ mod tests {
                 .unwrap();
             let both = apply_move(&one, oo.legal_actions[second].r#move.clone()).unwrap();
             assert_eq!(tv[first], potential(&both) - potential(&two));
+            // Without a funded visible monument, even a nested early research
+            // or building decision retains the complete V7 choice and score.
+            for task in [
+                Task::Action {
+                    gear: GearId::Tikal,
+                    position: 3,
+                    free: None,
+                },
+                Task::Technology {
+                    remaining: 2,
+                    free: false,
+                    mandatory: false,
+                },
+                Task::Build {
+                    remaining: 1,
+                    allow_monument: false,
+                    corn_payment: false,
+                    architecture_available: None,
+                    mandatory: false,
+                },
+            ] {
+                let mut early = active.clone();
+                early.round = 5;
+                early.monuments.clear();
+                early.pending = Some(Pending {
+                    title: "early".into(),
+                    task,
+                    after: vec![],
+                });
+                let eo = observe(&early, 1).unwrap();
+                assert!(crate::policy::resource_cycle_v8_conversion_scores(&eo).is_none());
+                let mut expected = choose_move(&eo, &v7).unwrap();
+                expected.policy_version = V8_POLICY_VERSION.into();
+                assert_eq!(choose_move(&eo, &v8).unwrap(), expected);
+            }
+            // A cheap positive building cannot qualify a monument route whose
+            // remaining day and placement fee erase its positive endpoint net.
+            let mut building_only = active.clone();
+            building_only.round = 26;
+            building_only.buildings = two.buildings.clone();
+            building_only.players[1].resources.insert(Resource::Corn, 3);
+            for level in building_only.players[1].technologies.values_mut() {
+                *level = 0;
+            }
+            building_only.players[1]
+                .technologies
+                .insert(TechnologyId::Agriculture, 2);
+            for slot in &mut building_only.gears.get_mut(&GearId::Tikal).unwrap()[..3] {
+                *slot = Some(GearWorker {
+                    player_id: -1,
+                    dummy: true,
+                });
+            }
+            let bo = observe(&building_only, 1).unwrap();
+            assert!(bo.legal_actions.iter().any(|r| matches!(
+                r.action,
+                TypedAction::Place {
+                    gear: GearId::Tikal,
+                    corn_cost: 3,
+                    ..
+                }
+            )));
+            assert!(crate::policy::resource_cycle_v8_conversion_scores(&bo).is_none());
+            // Both gears share one visible purchase, while ordinary future
+            // alternatives retain their own current-VP comparison.
+            for (retained, ready, tested, removed) in [
+                (GearId::Uxmal, 5, GearId::Tikal, 1),
+                (GearId::Tikal, 4, GearId::Uxmal, 3),
+            ] {
+                let mut cross = active.clone();
+                let before = observe(&cross, 1).unwrap();
+                let bv = crate::policy::resource_cycle_v8_conversion_scores(&before).unwrap();
+                let pi = before
+                    .legal_actions
+                    .iter()
+                    .position(|r| matches!(r.action,TypedAction::Place{gear,..} if gear==tested))
+                    .unwrap();
+                cross.gears.get_mut(&retained).unwrap()[ready] = Some(GearWorker {
+                    player_id: 1,
+                    dummy: false,
+                });
+                let covered = observe(&cross, 1).unwrap();
+                let cv = crate::policy::resource_cycle_v8_conversion_scores(&covered).unwrap();
+                let ci = covered
+                    .legal_actions
+                    .iter()
+                    .position(|r| r.r#move == before.legal_actions[pi].r#move)
+                    .unwrap();
+                assert!(cv[ci] < bv[pi]);
+                cross.turn.mode = tzolkin_core::TurnMode::Remove;
+                cross.turn.count = 1;
+                cross.gears.get_mut(&tested).unwrap()[removed] = Some(GearWorker {
+                    player_id: 1,
+                    dummy: false,
+                });
+                let covered = observe(&cross, 1).unwrap();
+                let cv = crate::policy::resource_cycle_v8_conversion_scores(&covered).unwrap();
+                let ci=covered.legal_actions.iter().position(|r|matches!(r.action,TypedAction::Remove{gear,position} if gear==tested&&position==removed as i64)).unwrap();
+                cross.gears.get_mut(&retained).unwrap()[ready] = None;
+                let alone = observe(&cross, 1).unwrap();
+                let av = crate::policy::resource_cycle_v8_conversion_scores(&alone).unwrap();
+                let ai = alone
+                    .legal_actions
+                    .iter()
+                    .position(|r| r.r#move == covered.legal_actions[ci].r#move)
+                    .unwrap();
+                assert!(cv[ci] > av[ai]);
+            }
+            // A real basic free-two-tech building resolves each capped
+            // Agriculture Temple(1) before its next technology choice. The
+            // parent's preview must follow that local chooser, not hidden after.
+            let mut nested = active.clone();
+            nested.players[1].monuments = ["templePoints", "highestTemple"]
+                .map(|key| {
+                    tzolkin_core::catalog::CATALOG
+                        .monuments
+                        .iter()
+                        .find(|m| m.score_key == key)
+                        .unwrap()
+                        .id
+                        .clone()
+                })
+                .into();
+            for level in nested.players[1].technologies.values_mut() {
+                *level = 3;
+            }
+            for (t, n) in [
+                (tzolkin_core::TempleId::Chaac, 0),
+                (tzolkin_core::TempleId::Quetzalcoatl, 4),
+                (tzolkin_core::TempleId::Kukulkan, 5),
+            ] {
+                nested.players[1].temples.insert(t, n);
+            }
+            let free_two = tzolkin_core::catalog::CATALOG
+                .buildings
+                .iter()
+                .find(|b| {
+                    b.effects.iter().any(|e| {
+                        matches!(
+                            e,
+                            tzolkin_core::Effect::Technology {
+                                technology: tzolkin_core::Target::Any(_),
+                                steps: Some(2)
+                            }
+                        )
+                    })
+                })
+                .unwrap();
+            nested.buildings = vec![free_two.id.clone()];
+            nested.pending = Some(Pending {
+                title: "nested".into(),
+                task: Task::Build {
+                    remaining: 1,
+                    allow_monument: false,
+                    corn_payment: false,
+                    architecture_available: None,
+                    mandatory: false,
+                },
+                after: vec![],
+            });
+            let no = observe(&nested, 1).unwrap();
+            let nv = crate::policy::resource_cycle_v8_conversion_scores(&no).unwrap();
+            let ni = no
+                .legal_actions
+                .iter()
+                .position(|r| matches!(r.action, TypedAction::Build { .. }))
+                .unwrap();
+            let before = potential(&nested);
+            let mut resolved = apply_move(&nested, no.legal_actions[ni].r#move.clone()).unwrap();
+            let mut first_temple = None;
+            for _ in 0..8 {
+                if resolved.pending.is_none() {
+                    break;
+                }
+                let ro = observe(&resolved, 1).unwrap();
+                let choice = choose_move(&ro, &v8).unwrap();
+                let row = ro
+                    .legal_actions
+                    .iter()
+                    .find(|r| r.r#move == choice.r#move)
+                    .unwrap();
+                if let TypedAction::Temple { temple, .. } = row.action {
+                    first_temple.get_or_insert(temple);
+                }
+                resolved = apply_move(&resolved, choice.r#move).unwrap();
+            }
+            assert!(resolved.pending.is_none());
+            assert_eq!(first_temple, Some(tzolkin_core::TempleId::Kukulkan));
+            assert_eq!(nv[ni], potential(&resolved) - before);
+            // Core still offers upward no-op choices at a capped temple. They
+            // consume the visible remaining/distinct slot without forcing V7.
+            nested.pending = Some(Pending {
+                title: "capped".into(),
+                task: Task::Temple {
+                    remaining: 2,
+                    distinct: Some(vec![]),
+                    direction: None,
+                    reason: None,
+                },
+                after: vec![],
+            });
+            for (t, track) in &tzolkin_core::catalog::CATALOG.temple_tracks {
+                nested.players[1].temples.insert(*t, track.max);
+            }
+            let co = observe(&nested, 1).unwrap();
+            let cv = crate::policy::resource_cycle_v8_conversion_scores(&co).unwrap();
+            assert!(cv.iter().all(|v| *v == 0.0));
+            let unchanged = apply_move(&nested, choose_move(&co, &v8).unwrap().r#move).unwrap();
+            assert_eq!(unchanged.players[1].temples, nested.players[1].temples);
+            assert!(
+                matches!(unchanged.pending.as_ref().map(|p|&p.task),Some(Task::Temple{remaining:1,distinct:Some(used),..}) if used.len()==1)
+            );
+            // A genuinely unsupported affordable action effect, not just an
+            // absent target, refuses the entire otherwise-funded callback.
+            let mut unsupported = build.clone();
+            let action_card = tzolkin_core::catalog::CATALOG
+                .buildings
+                .iter()
+                .find(|b| {
+                    b.effects
+                        .iter()
+                        .any(|e| matches!(e, tzolkin_core::Effect::Action { .. }))
+                })
+                .unwrap();
+            unsupported.buildings = vec![action_card.id.clone()];
+            let uo = observe(&unsupported, 1).unwrap();
+            assert!(
+                uo.legal_actions
+                    .iter()
+                    .any(|r| matches!(&r.action,TypedAction::Build{id,..} if id==&action_card.id))
+            );
+            assert!(crate::policy::resource_cycle_v8_conversion_scores(&uo).is_none());
             // Foregone Tikal1/3 conversion is marginal: a retained ready worker
             // covers the same visible opportunity instead of charging it twice.
             funded.pending = None;

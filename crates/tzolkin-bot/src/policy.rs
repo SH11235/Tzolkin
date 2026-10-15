@@ -724,21 +724,26 @@ pub fn resource_cycle_v8_conversion_scores(o: &Observation) -> Option<Vec<f64>> 
     }
     let context = V8Conversion { o };
     context.potential(p).ok()?;
+    // Pending observations do not expose their parent/after queue. Require a
+    // currently funded positive monument on every callback; this is a local
+    // scope predicate, not a claim that an earlier V7 action chose conversion.
+    // In particular, early research/build without that target stays wholly V7.
+    if context.monument_value(p).ok()? <= 0.0 {
+        return None;
+    }
     if o.pending_task.is_none() {
-        if context.monument_value(p).ok()? <= 0.0 {
-            return None;
-        }
-        let mut route = context.tikal_coverage(p, None).ok()? > 0.0;
+        let mut route = context.coverage(p, None, V8Endpoint::Monument).ok()? > 0.0;
         for row in &o.legal_actions {
             if let TypedAction::Place {
-                gear: GearId::Tikal,
-                corn_cost,
-                ..
+                gear, corn_cost, ..
             } = row.action
+                && matches!(gear, GearId::Tikal | GearId::Uxmal)
                 && let Some(paid) = context.pay(p, &[corn_cost, 0, 0, 0, 0])
             {
-                let pos = resource_route_slot(o, GearId::Tikal)? as i64;
-                route |= context.future(&paid, GearId::Tikal, pos, true).ok()?
+                let pos = resource_route_slot(o, gear)? as i64;
+                route |= context
+                    .future(&paid, gear, pos, V8Endpoint::Monument)
+                    .ok()?
                     - 0.25 * corn_cost as f64
                     > 0.0;
             }
@@ -757,6 +762,13 @@ pub fn resource_cycle_v8_conversion_scores(o: &Observation) -> Option<Vec<f64>> 
 
 struct V8Conversion<'a> {
     o: &'a Observation,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum V8Endpoint {
+    Any,
+    Other,
+    Construction,
+    Monument,
 }
 impl V8Conversion<'_> {
     fn stock(a: &[i64; 5]) -> f64 {
@@ -813,20 +825,64 @@ impl V8Conversion<'_> {
         let i = temple_index(t);
         let level = p.temples[i] + direction;
         let max = CATALOG.temple_tracks[&t].max;
-        if !(-1..=max).contains(&level)
-            || (direction > 0
-                && level == max
-                && self
-                    .o
-                    .players
-                    .iter()
-                    .any(|other| other.id != p.id && other.temples[i] == max))
+        if direction == 1
+            && (level > max
+                || (level == max
+                    && self
+                        .o
+                        .players
+                        .iter()
+                        .any(|other| other.id != p.id && other.temples[i] == max)))
         {
+            // Core offers these upward choices, consumes a step/distinct slot,
+            // and leaves the player unchanged when can_raise is false.
+            return Some(p.clone());
+        }
+        if !matches!(direction, -1 | 1) || !(-1..=max).contains(&level) {
             return None;
         }
         let mut next = p.clone();
         next.temples[i] = level;
         Some(next)
+    }
+    fn best_state(&self, states: Vec<PublicPlayer>) -> Result<PublicPlayer, ()> {
+        let mut best = None;
+        for state in states {
+            let value = self.potential(&state)?;
+            if best.as_ref().is_none_or(|(_, old)| value > *old) {
+                best = Some((state, value));
+            }
+        }
+        best.map(|(state, _)| state).ok_or(())
+    }
+    fn temple_offer(
+        &self,
+        p: &PublicPlayer,
+        direction: i64,
+        remaining: usize,
+        distinct: Option<&[TempleId]>,
+    ) -> Result<PublicPlayer, ()> {
+        if !(1..=2).contains(&remaining) {
+            return Err(());
+        }
+        let mut states = Vec::new();
+        for t in TEMPLE_IDS {
+            if distinct.is_some_and(|used| used.contains(&t)) {
+                continue;
+            }
+            let Some(mut next) = self.temple(p, t, direction) else {
+                continue;
+            };
+            if remaining > 1 {
+                let mut used = distinct.map(<[TempleId]>::to_vec);
+                if let Some(used) = &mut used {
+                    used.push(t);
+                }
+                next = self.temple_offer(&next, direction, remaining - 1, used.as_deref())?;
+            }
+            states.push(next);
+        }
+        self.best_state(states)
     }
     fn temple_choices(
         &self,
@@ -849,14 +905,20 @@ impl V8Conversion<'_> {
         }
         match t {
             TechnologyId::Agriculture => {
-                let choices = self.temple_choices(p, 1, &[]);
-                Ok(if choices.is_empty() {
-                    vec![next]
-                } else {
-                    choices
-                })
+                // The bonus's Temple(1) resolves before the next Technology.
+                // Its observation has no after queue, so project exactly its
+                // stable immediate-Phi chooser, not the parent's joint optimum.
+                if self.monument_value(p)? <= 0.0 {
+                    return Err(());
+                }
+                Ok(vec![self.temple_offer(p, 1, 1, None)?])
             }
             TechnologyId::Extraction => {
+                // Resource(2) chooses gold twice: stock is linear and none of
+                // the supported monument metrics depends on retained resources.
+                if self.monument_value(p)? <= 0.0 {
+                    return Err(());
+                }
                 self.gain(&mut next, &[0, 0, 0, 2, 0])?;
                 Ok(vec![next])
             }
@@ -906,6 +968,11 @@ impl V8Conversion<'_> {
                         if !(1..=2).contains(&steps) {
                             return Err(());
                         }
+                        if matches!(technology, Target::Any(_)) && self.monument_value(&p)? <= 0.0 {
+                            // The real nested chooser would fall back to V7;
+                            // its hidden continuation is outside this preview.
+                            return Err(());
+                        }
                         let mut branch = vec![p];
                         for _ in 0..steps {
                             let mut next = Vec::new();
@@ -919,27 +986,29 @@ impl V8Conversion<'_> {
                             }
                             branch = next;
                         }
-                        out.extend(branch);
+                        // A pending technology chooser sees these remaining
+                        // steps, but not the later effects/build continuation.
+                        out.push(self.best_state(branch)?);
                     }
                     Effect::Temple { temple, steps } => {
                         let steps = steps.unwrap_or(1);
                         if !(1..=2).contains(&steps) {
                             return Err(());
                         }
-                        let mut branch = vec![p];
-                        for _ in 0..steps {
-                            let mut next = Vec::new();
-                            for p in branch {
-                                match temple {
-                                    Target::Specific(t) => {
-                                        next.push(self.temple(&p, *t, 1).unwrap_or(p))
-                                    }
-                                    Target::Any(_) => next.extend(self.temple_choices(&p, 1, &[])),
+                        match temple {
+                            Target::Any(_) => {
+                                if self.monument_value(&p)? <= 0.0 {
+                                    return Err(());
                                 }
+                                out.push(self.temple_offer(&p, 1, steps as usize, None)?);
                             }
-                            branch = next;
+                            Target::Specific(t) => {
+                                for _ in 0..steps {
+                                    p = self.temple(&p, *t, 1).ok_or(())?;
+                                }
+                                out.push(p);
+                            }
                         }
-                        out.extend(branch);
                     }
                     // An additional construction/action can create immediate VP;
                     // unlike Feed it is genuinely outside this closed preview.
@@ -1025,6 +1094,9 @@ impl V8Conversion<'_> {
                 }
                 for after in self.build_states(p, id, &cost, architecture)? {
                     let tail = if remaining > 1 {
+                        if self.monument_value(&after)? <= 0.0 {
+                            return Err(());
+                        }
                         self.build_value(
                             &after,
                             1,
@@ -1144,19 +1216,24 @@ impl V8Conversion<'_> {
         Ok(Some(self.potential(&next)? - base))
     }
     fn endpoint(&self, p: &PublicPlayer, g: GearId, pos: i64, fee: i64) -> Result<Option<f64>, ()> {
-        self.endpoint_at(p, g, pos, fee, None)
+        self.endpoint_at(p, g, pos, fee, None, V8Endpoint::Any)
     }
     fn conversion(
         &self,
         p: &PublicPlayer,
         fee: i64,
         race_wait: Option<i64>,
+        scope: V8Endpoint,
     ) -> Result<Option<f64>, ()> {
         let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
             return Ok(None);
         };
         let fee_vp = 0.25 * fee as f64;
-        let mut net = self.build_value(&paid, 2, false, true, None)? - fee_vp;
+        let mut net = if scope == V8Endpoint::Monument {
+            f64::NEG_INFINITY
+        } else {
+            self.build_value(&paid, 2, false, true, None)? - fee_vp
+        };
         for id in &self.o.monuments {
             let m = monument(id).ok_or(())?;
             let cost = RESOURCE_IDS.map(|r| m.cost.get(&r).copied().unwrap_or(0));
@@ -1167,7 +1244,7 @@ impl V8Conversion<'_> {
                 net = net.max((value - fee_vp) / (1 + q) as f64);
             }
         }
-        Ok(Some(net))
+        Ok(net.is_finite().then_some(net))
     }
     fn endpoint_at(
         &self,
@@ -1176,10 +1253,8 @@ impl V8Conversion<'_> {
         pos: i64,
         fee: i64,
         race_wait: Option<i64>,
+        scope: V8Endpoint,
     ) -> Result<Option<f64>, ()> {
-        if g == GearId::Tikal && pos == 4 {
-            return self.conversion(p, fee, race_wait);
-        }
         if g == GearId::Uxmal && pos == 5 {
             let mut best = None;
             for g in [
@@ -1192,12 +1267,24 @@ impl V8Conversion<'_> {
                     if g == GearId::Uxmal && target == 5 {
                         continue;
                     }
-                    if let Some(value) = self.endpoint_at(p, g, target, fee + 1, race_wait)? {
+                    if let Some(value) =
+                        self.endpoint_at(p, g, target, fee + 1, race_wait, scope)?
+                    {
                         best = Some(best.map_or(value, |old: f64| old.max(value)));
                     }
                 }
             }
             return Ok(best);
+        }
+        let construction = matches!((g, pos), (GearId::Tikal, 2 | 4) | (GearId::Uxmal, 4));
+        if (scope == V8Endpoint::Other && construction)
+            || (matches!(scope, V8Endpoint::Construction | V8Endpoint::Monument) && !construction)
+            || (scope == V8Endpoint::Monument && (g, pos) != (GearId::Tikal, 4))
+        {
+            return Ok(None);
+        }
+        if g == GearId::Tikal && pos == 4 {
+            return self.conversion(p, fee, race_wait, scope);
         }
         let Some(paid) = self.pay(p, &[fee, 0, 0, 0, 0]) else {
             return Ok(None);
@@ -1230,28 +1317,19 @@ impl V8Conversion<'_> {
             }
             (GearId::Tikal, 2) => self.build_value(&paid, 1, false, true, None)?,
             (GearId::Tikal, 5) => {
-                let mut best = None;
-                for i in 1..=3 {
-                    let mut c = [0; 5];
-                    c[i] = 1;
-                    let Some(p) = self.pay(&paid, &c) else {
-                        continue;
-                    };
-                    for (ti, t) in TEMPLE_IDS.into_iter().enumerate() {
-                        if let Some(first) = self.temple(&p, t, 1) {
-                            let one = self.potential(&first)? - self.potential(&paid)?;
-                            best = Some(best.map_or(one, |old: f64| old.max(one)));
-                            for other in TEMPLE_IDS.into_iter().skip(ti + 1) {
-                                if let Some(second) = self.temple(&first, other, 1) {
-                                    let v = self.potential(&second)? - self.potential(&paid)?;
-                                    best = Some(best.map_or(v, |old: f64| old.max(v)));
-                                }
-                            }
-                        }
-                    }
+                // PayResource sees no queued Temple task: its actual scorer
+                // chooses the cheapest retained material in the same VP units.
+                let Some(i) = (1..=3).find(|i| paid.resources[*i] > 0) else {
+                    return Ok(None);
+                };
+                let mut cost = [0; 5];
+                cost[i] = 1;
+                let p = self.pay(&paid, &cost).ok_or(())?;
+                if self.monument_value(&p)? <= 0.0 {
+                    return Err(());
                 }
-                let Some(v) = best else { return Ok(None) };
-                v
+                let after = self.temple_offer(&p, 1, 2, Some(&[]))?;
+                self.potential(&after)? - self.potential(&paid)?
             }
             (GearId::Uxmal, 1) => {
                 let Some(p) = self.pay(&paid, &[3, 0, 0, 0, 0]) else {
@@ -1300,62 +1378,71 @@ impl V8Conversion<'_> {
             .iter()
             .filter(|p| {
                 p.id != self.o.actor
-                    && self.o.gears[&GearId::Tikal]
-                        .iter()
-                        .enumerate()
-                        .take(8)
-                        .any(|(pos, w)| {
+                    && [GearId::Tikal, GearId::Uxmal].into_iter().any(|g| {
+                        self.o.gears[&g].iter().enumerate().take(8).any(|(pos, w)| {
                             w.as_ref()
                                 .is_some_and(|w| !w.dummy && w.player_id == p.id as i64)
                                 && (0..=wait.min(27 - self.o.round).min(7 - pos as i64)).any(
                                     |delay| {
                                         let arrival = pos as i64 + delay;
-                                        if arrival < 4 {
+                                        let target = if g == GearId::Tikal { 4 } else { 5 };
+                                        if arrival < target {
                                             return false;
                                         }
                                         let mut paid = cost;
-                                        paid[0] += if arrival >= 6 { 0 } else { arrival - 4 };
+                                        paid[0] += if arrival >= 6 { 0 } else { arrival - target }
+                                            + i64::from(g == GearId::Uxmal);
                                         self.pay(p, &paid).is_some()
                                     },
                                 )
                         })
+                    })
             })
             .count()
     }
-    fn future(&self, p: &PublicPlayer, g: GearId, pos: i64, _new: bool) -> Result<f64, ()> {
+    fn future(&self, p: &PublicPlayer, g: GearId, pos: i64, scope: V8Endpoint) -> Result<f64, ()> {
         let mut best: f64 = 0.0;
         let max = if g == GearId::ChichenItza { 9 } else { 5 };
         let limit = if g == GearId::ChichenItza { 11 } else { 8 };
         for wait in 1..=(27 - self.o.round).min(limit - 1 - pos) {
             let arrival = pos + wait;
             for target in 1..=max {
-                if target > arrival || (g == GearId::Tikal && target != 4) {
+                if target > arrival {
                     continue;
                 }
                 let fee = if arrival > max { 0 } else { arrival - target };
-                if let Some(value) = self.endpoint_at(p, g, target, fee, Some(wait))? {
+                if let Some(value) = self.endpoint_at(p, g, target, fee, Some(wait), scope)? {
                     best = best.max(value / (1 + wait) as f64);
                 }
             }
         }
         Ok(best)
     }
-    fn tikal_coverage(&self, p: &PublicPlayer, exclude: Option<i64>) -> Result<f64, ()> {
+    fn coverage(
+        &self,
+        p: &PublicPlayer,
+        exclude: Option<(GearId, i64)>,
+        scope: V8Endpoint,
+    ) -> Result<f64, ()> {
         let mut best: f64 = 0.0;
-        for (pos, w) in self.o.gears[&GearId::Tikal].iter().enumerate().take(8) {
-            let pos = pos as i64;
-            if exclude == Some(pos)
-                || !w
-                    .as_ref()
-                    .is_some_and(|w| !w.dummy && w.player_id == self.o.actor as i64)
-            {
-                continue;
-            }
-            best = best.max(self.future(p, GearId::Tikal, pos, false)?);
-            if pos >= 4 {
-                let fee = if pos >= 6 { 0 } else { pos - 4 };
-                if let Some(now) = self.endpoint(p, GearId::Tikal, 4, fee)? {
-                    best = best.max(now);
+        // Tikal2/4 and Uxmal4/5 share the same visible cards. Coverage is one
+        // maximum across both gears, never independent copies of that purchase.
+        for g in [GearId::Tikal, GearId::Uxmal] {
+            for (pos, w) in self.o.gears[&g].iter().enumerate().take(8) {
+                let pos = pos as i64;
+                if exclude == Some((g, pos))
+                    || !w
+                        .as_ref()
+                        .is_some_and(|w| !w.dummy && w.player_id == self.o.actor as i64)
+                {
+                    continue;
+                }
+                best = best.max(self.future(p, g, pos, scope)?);
+                for target in 1..=5.min(pos) {
+                    let fee = if pos >= 6 { 0 } else { pos - target };
+                    if let Some(now) = self.endpoint_at(p, g, target, fee, None, scope)? {
+                        best = best.max(now);
+                    }
                 }
             }
         }
@@ -1372,12 +1459,10 @@ impl V8Conversion<'_> {
                 best = best.max(v);
             }
         }
-        let future = self.future(p, g, pos, false)?;
-        let foregone = if g == GearId::Tikal {
-            (future - self.tikal_coverage(p, Some(pos))?).max(0.0)
-        } else {
-            future
-        };
+        let ordinary = self.future(p, g, pos, V8Endpoint::Other)?;
+        let construction = self.future(p, g, pos, V8Endpoint::Construction)?;
+        let shared = self.coverage(p, Some((g, pos)), V8Endpoint::Construction)?;
+        let foregone = ordinary.max((construction - shared).max(0.0));
         Ok(best - foregone)
     }
     fn score(&self, a: &TypedAction) -> Result<f64, ()> {
@@ -1389,12 +1474,10 @@ impl V8Conversion<'_> {
             } => {
                 let paid = self.pay(p, &[*corn_cost, 0, 0, 0, 0]).ok_or(())?;
                 let pos = resource_route_slot(self.o, *gear).ok_or(())? as i64;
-                let future = self.future(&paid, *gear, pos, true)?;
-                let marginal = if *gear == GearId::Tikal {
-                    (future - self.tikal_coverage(&paid, None)?).max(0.0)
-                } else {
-                    future
-                };
+                let ordinary = self.future(&paid, *gear, pos, V8Endpoint::Other)?;
+                let construction = self.future(&paid, *gear, pos, V8Endpoint::Construction)?;
+                let shared = self.coverage(&paid, None, V8Endpoint::Construction)?;
+                let marginal = ordinary.max((construction - shared).max(0.0));
                 Ok(marginal - 0.25 * *corn_cost as f64)
             }
             TypedAction::Remove { gear, position } => self.remove(*gear, *position),
@@ -1440,6 +1523,9 @@ impl V8Conversion<'_> {
                     }) = &self.o.pending_task
                         && *remaining > 1
                     {
+                        if self.monument_value(&after)? <= 0.0 {
+                            return Err(());
+                        }
                         v += self.build_value(
                             &after,
                             1,
@@ -1476,14 +1562,34 @@ impl V8Conversion<'_> {
             }
             TypedAction::Temple { temple, direction } => {
                 let mut next = self.temple(p, *temple, *direction).ok_or(())?;
-                if matches!(
-                    self.o.pending_task,
-                    Some(Task::Temple {
-                        reason: Some(TempleReason::Beg),
-                        ..
-                    })
-                ) {
+                let Some(Task::Temple {
+                    remaining,
+                    distinct,
+                    reason,
+                    ..
+                }) = &self.o.pending_task
+                else {
+                    return Err(());
+                };
+                if !(1..=2).contains(remaining) {
+                    return Err(());
+                }
+                if *reason == Some(TempleReason::Beg) {
+                    if *remaining != 1 {
+                        return Err(());
+                    }
                     next.resources[0] = 3;
+                } else if *remaining > 1 {
+                    let mut used = distinct.clone();
+                    if let Some(used) = &mut used {
+                        used.push(*temple);
+                    }
+                    next = self.temple_offer(
+                        &next,
+                        *direction,
+                        *remaining as usize - 1,
+                        used.as_deref(),
+                    )?;
                 }
                 Ok(self.potential(&next)? - base)
             }
