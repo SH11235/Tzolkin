@@ -44,6 +44,9 @@ use tzolkin_inference::own_setup_deployment::{
 };
 use tzolkin_inference::trade_guard::TradeGuardConfig;
 
+#[path = "numeric_validation_aggregate.rs"]
+pub mod validation_aggregate;
+
 pub const SCHEMA: &str = "tzolkin-numeric-deployment-validation-arena-v1";
 pub const CORN_FIRST_ARENA_SCHEMA: &str = "tzolkin-numeric-corn-first-setup-validation-arena-v1";
 pub const CORN_FIRST_CONDITIONAL_ARENA_SCHEMA: &str =
