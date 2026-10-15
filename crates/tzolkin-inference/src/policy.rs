@@ -526,7 +526,7 @@ mod prefix_tests {
                                 .unwrap(),
                             expected
                         );
-                        values[0] = f32::NAN;
+                        values[389] = f32::NAN;
                         failures[0] = EncodedCandidate::for_numeric_test(profile.schema(), values);
                         let expected = predict_numeric(&bad_model, scalar, &failures)
                             .err()
