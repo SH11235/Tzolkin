@@ -1945,7 +1945,7 @@ fn play_arm_observing_routes<'a>(
             pool,
             None,
             Some(routes),
-            replay::play_unrecorded_inference,
+            |players, seed, decide| replay::play_unrecorded_inference(players, seed, decide),
         );
         (arm, guards, None, None)
     } else {
