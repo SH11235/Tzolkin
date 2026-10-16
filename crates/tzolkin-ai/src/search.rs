@@ -158,6 +158,70 @@ pub struct SearchOutcome {
     pub candidates: Vec<CandidateResult>,
 }
 
+/// Terminal-only diagnostic ranking. `None` means keep the caller's original
+/// policy; a heuristic fallback or partially completed block is never selected.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalCandidateRanking {
+    pub selected_legal_index: Option<usize>,
+    pub stats: SearchStats,
+    pub candidates: Vec<CandidateResult>,
+}
+
+/// Compare every root move through the actual final scoring, using the existing
+/// common-world rollout loop. Each candidate/world gets a fresh continuation
+/// policy so game-local guards cannot leak between hypothetical branches.
+///
+/// This is an opt-in research API, not an application policy or trained model.
+/// The caller supplies all seats' continuation policy and keeps its normal move
+/// when ranking is unavailable. The root must be a late, non-pending decision;
+/// no real hidden deck, game seed or prior opponent moves enter the search.
+pub fn rank_terminal_candidates<Factory, Policy>(
+    o: &Observation,
+    config: &SearchConfig,
+    mut make_policy: Factory,
+) -> Result<TerminalCandidateRanking, String>
+where
+    Factory: FnMut() -> Result<Policy, String>,
+    Policy: FnMut(&Observation) -> Result<Decision, String>,
+{
+    config.validate()?;
+    if !(23..=27).contains(&o.round) || o.round + config.horizon_days < 27 {
+        return Err("Terminal ranking requires day23+ and a horizon reaching day27".into());
+    }
+    let outcome = choose_prepared_with_for_revision(
+        o,
+        config,
+        "terminal-candidate-ranking-v1",
+        HeuristicRevision::V2,
+        crate::choose_move,
+        |world, first, actor, target, config, stats, _| {
+            let mut policy = make_policy().map_err(|_| DiscardReason::SimulationError)?;
+            simulate(world, first, actor, target, config, stats, &mut policy)
+        },
+    )?;
+    // Require every requested world, not merely the historical search's minimum.
+    // Failed or budget-truncated comparisons retain the caller's normal move.
+    let complete = outcome.status == SearchStatus::Searched
+        && outcome.stats.completed_worlds == config.worlds_per_action
+        && outcome.stats.discarded_worlds.is_empty()
+        && outcome.stats.cutoff_rollouts == 0
+        && outcome.candidates.iter().all(|candidate| {
+            candidate.terminal_samples == config.worlds_per_action && candidate.cutoff_samples == 0
+        });
+    let selected_legal_index = complete.then(|| {
+        o.legal_actions
+            .iter()
+            .position(|action| action.r#move == outcome.decision.r#move)
+            .expect("searched decision belongs to the root legal set")
+    });
+    Ok(TerminalCandidateRanking {
+        selected_legal_index,
+        stats: outcome.stats,
+        candidates: outcome.candidates,
+    })
+}
+
 pub fn choose_move(o: &Observation, config: &SearchConfig) -> Result<SearchOutcome, String> {
     PreparedSearch::new(config)?.choose(o)
 }
@@ -659,6 +723,68 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use tzolkin_core::{create_game, observation::observe};
+
+    fn terminal_fixture() -> Observation {
+        let mut state = create_game(
+            vec!["A".into(), "B".into(), "C".into(), "D".into()],
+            11235,
+            false,
+        )
+        .unwrap();
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            state =
+                tzolkin_core::apply_move(&state, crate::choose_move(&o).unwrap().r#move).unwrap();
+        }
+        state.round = 27;
+        state.age = 2;
+        state.food_days = vec![8, 14, 21];
+        state.buildings = state.age2_deck.drain(..6).collect();
+        state.building_deck = std::mem::take(&mut state.age2_deck);
+        observe(&state, state.current_player).unwrap()
+    }
+
+    #[test]
+    fn terminal_ranking_completes_every_candidate_with_fresh_branch_policies() {
+        let o = terminal_fixture();
+        let config = SearchConfig {
+            horizon_days: 27,
+            ..SearchConfig::default()
+        };
+        let branches = std::cell::Cell::new(0);
+        let ranked = rank_terminal_candidates(&o, &config, || {
+            branches.set(branches.get() + 1);
+            Ok(crate::choose_move)
+        })
+        .unwrap();
+        assert!(ranked.selected_legal_index.is_some());
+        assert_eq!(ranked.stats.cutoff_rollouts, 0);
+        assert_eq!(
+            branches.get(),
+            o.legal_actions.len() * config.worlds_per_action as usize
+        );
+        assert!(
+            ranked
+                .candidates
+                .iter()
+                .all(|c| c.terminal_samples == config.worlds_per_action)
+        );
+    }
+
+    #[test]
+    fn terminal_ranking_never_selects_from_an_incomplete_budget() {
+        let config = SearchConfig {
+            horizon_days: 27,
+            max_total_steps: 1,
+            ..SearchConfig::default()
+        };
+        let ranked =
+            rank_terminal_candidates(&terminal_fixture(), &config, || Ok(crate::choose_move))
+                .unwrap();
+        assert_eq!(ranked.selected_legal_index, None);
+        assert_eq!(ranked.stats.atomic_steps, 1);
+        assert_eq!(ranked.stats.completed_worlds, 0);
+    }
 
     fn initial() -> Observation {
         let mut state =
