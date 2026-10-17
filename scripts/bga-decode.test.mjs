@@ -532,6 +532,148 @@ test('binds double-advance rights to actual same-source top-temple transitions',
   }
 });
 
+test('accepts a last-Skull notice only with its exact depleted Yaxchilan reward', () => {
+  const fixture = () => {
+    const f = rightsFixture();
+    const initial = clone(f.initial);
+    initial.snapshot.state.gears.chichenItza[3] = null;
+    initial.snapshot.state.gears.yaxchilan[6] = { playerId: 0, dummy: false };
+    initial.snapshot.state.skullSupply = 1;
+    initial.observation.legalActions = [
+      {
+        action: { type: 'remove', gear: 'yaxchilan', position: 6 },
+        move: { type: 'remove', gear: 'yaxchilan', position: 6 },
+      },
+    ];
+    const removed = clone(initial);
+    removed.snapshot.state.gears.yaxchilan[6] = null;
+    removed.snapshot.state.turn.count++;
+    removed.observation.legalActions = [
+      {
+        action: { type: 'useAction', gear: 'yaxchilan', position: 4, cornCost: 0 },
+        move: { type: 'choose', choiceId: 'yax:4' },
+      },
+    ];
+    const after = clone(removed);
+    after.snapshot.state.players[0].resources.skull++;
+    after.snapshot.state.skullSupply = 0;
+    after.observation.legalActions = [];
+    replaceEvents(f.value, [
+      [
+        6,
+        [
+          { raw_text: 'AはYaxchilan 6のワーカーを取り除き、n°4のアクションを行った' },
+          { raw_text: '水晶ドクロ1個だけがAに残されています' },
+          { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_skull' }] },
+        ],
+      ],
+    ]);
+    f.value.witness.initial = clone(initial.snapshot.state);
+    return { value: f.value, initial, removed, after };
+  };
+  const run = (f) =>
+    decode(
+      f.value,
+      dispatcher(f.initial, (q) => clone(q.move.type === 'remove' ? f.removed : f.after)),
+    );
+  assert.equal(run(fixture()).manifest.blocked, null);
+  const wrong = fixture();
+  wrong.value.witness.initial.skullSupply = 2;
+  wrong.initial.snapshot.state.skullSupply = 2;
+  wrong.removed.snapshot.state.skullSupply = 2;
+  const refused = run(wrong);
+  assert.equal(refused.manifest.blocked.actionId, 6);
+  assert.equal(refused.record.steps.length, 0);
+});
+
+test('applies one burn harvest and the explicitly named temple penalty', () => {
+  const f = rightsFixture();
+  const initial = clone(f.initial);
+  initial.snapshot.state.pending = {
+    title: 'Harvest',
+    task: { type: 'palenque', position: 4 },
+    after: [],
+  };
+  initial.observation.pendingTask = clone(initial.snapshot.state.pending.task);
+  initial.observation.legalActions = [
+    {
+      action: { type: 'harvest', kind: 'burn', position: 4 },
+      move: { type: 'choose', choiceId: 'burn' },
+    },
+  ];
+  const burned = clone(initial);
+  burned.snapshot.state.players[0].resources.corn += 10;
+  burned.snapshot.state.players[0].cornTiles++;
+  burned.snapshot.state.pending = {
+    title: 'Burn penalty',
+    task: { type: 'temple', remaining: 1, direction: -1, reason: 'burn' },
+    after: [],
+  };
+  burned.observation.pendingTask = clone(burned.snapshot.state.pending.task);
+  burned.observation.legalActions = [
+    {
+      action: { type: 'temple', temple: 'kukulkan', direction: -1 },
+      move: { type: 'choose', choiceId: 'temple' },
+    },
+  ];
+  const after = clone(burned);
+  after.snapshot.state.players[0].temples.kukulkan--;
+  after.snapshot.state.pending = null;
+  after.observation.pendingTask = null;
+  after.observation.legalActions = [];
+  replaceEvents(f.value, [
+    [
+      6,
+      [
+        { raw_text: 'AはKukulcanの信仰を1段下げることで焼き畑をしてコーンを手に入れた' },
+        { raw_text: 'Aはコーンタイルを獲得した' },
+        { raw_text: 'Aは10\nを獲得した', icons: [{ classes: 'tz_icon resource_corn' }] },
+      ],
+    ],
+  ]);
+  f.value.witness.initial = clone(initial.snapshot.state);
+  const run = (final) =>
+    decode(
+      f.value,
+      dispatcher(initial, (q) => clone(q.move.choiceId === 'burn' ? burned : final)),
+    );
+  const result = run(after);
+  assert.equal(result.manifest.blocked, null);
+  assert.equal(result.record.steps.length, 2);
+  const wrong = clone(after);
+  wrong.snapshot.state.players[0].temples.kukulkan++;
+  const refused = run(wrong);
+  assert.equal(refused.manifest.blocked.actionId, 6);
+  assert.equal(refused.record.steps.length, 0);
+});
+
+test('defers a rights announcement until its same-source named temple choice', () => {
+  const f = rightsFixture();
+  const task = { type: 'temple', remaining: 1 };
+  f.initial.snapshot.state.pending = { title: 'Temple', task, after: [] };
+  f.initial.observation.pendingTask = clone(task);
+  f.initial.observation.legalActions = [
+    {
+      action: { type: 'temple', temple: f.temple, direction: 1 },
+      move: { type: 'choose', choiceId: 'temple' },
+    },
+  ];
+  const after = clone(f.initial);
+  after.snapshot.state.players[0].temples[f.temple] = f.maximum;
+  after.snapshot.state.players[0].doubleAdvanceAvailable = true;
+  after.snapshot.state.pending = null;
+  after.observation.pendingTask = null;
+  after.observation.legalActions = [];
+  f.value.witness.initial = clone(f.initial.snapshot.state);
+  replaceEvents(f.value, [[6, [f.messages[2], f.messages[3]]]]);
+  const result = decode(
+    f.value,
+    dispatcher(f.initial, () => clone(after)),
+  );
+  assert.equal(result.manifest.blocked, null);
+  assert.equal(result.record.steps.length, 1);
+});
+
 test('refuses unestablished or duplicate double-advance rights atomically', () => {
   const changes = [
     (f) => {
@@ -564,7 +706,7 @@ test('refuses unestablished or duplicate double-advance rights atomically', () =
     replaceEvents(f.value, [[6, f.messages]]);
     const result = decode(f.value, rightsDispatcher(f));
     assert.equal(result.manifest.blocked.actionId, 6);
-    assert.match(result.manifest.blocked.reason, /doubleAdvanceAvailable|icon-free/);
+    assert.match(result.manifest.blocked.reason, /doubleAdvanceAvailable|icon-free|temple:/);
     assert.equal(result.record.steps.length, 0);
     assert.equal(result.manifest.audit.length, 0);
   }
@@ -678,6 +820,17 @@ test('binds localized food-day score captions and age-two announcements to core 
         assert.equal(rejected.record.steps.length, 0);
       }
       // A feeding penalty alone is never evidence of a negative temple score.
+      // Positive end-game awards must not hide a separately recorded track loss.
+      f.after.snapshot.state.players[3].templePoints =
+        f.initial.snapshot.state.players[3].templePoints - 2;
+      f.after.snapshot.state.players[3].score =
+        f.initial.snapshot.state.players[3].score + 10 - penalty;
+      f.scores.at(-1).raw_text = 'Dは信仰により-2点を獲得した';
+      assert.equal(run(f, messages()).manifest.blocked, null);
+      f.scores.at(-1).raw_text = 'Dは信仰により-3点を獲得した';
+      assert.match(run(f, messages()).manifest.blocked.reason, /not established/);
+      f.after.snapshot.state.players[3].templePoints =
+        f.initial.snapshot.state.players[3].templePoints;
       f.after.snapshot.state.players[3].score = f.initial.snapshot.state.players[3].score - penalty;
       f.scores.at(-1).raw_text = 'Dは信仰により-3点を獲得した';
       assert.match(run(f, messages()).manifest.blocked.reason, /temple loss is not established/);
@@ -2659,7 +2812,7 @@ function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
       player.score += 6;
       next.snapshot.state.pending = {
         title: 'Remaining building',
-        task: clone(continuation),
+        task: clone(request.state.pending.after[1]),
         after: [],
       };
       next.observation.legalActions = [
@@ -2752,6 +2905,138 @@ function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
   }
   return { value, initial, before, apply, dispatch: dispatcher(initial, apply) };
 }
+
+test('keeps the Trade rollback anchor through a final queued Skull purchase', () => {
+  const fixture = (alter = () => {}) => {
+    const f = deferredTradeFixture((v) => {
+      const payment = (resource) => ({
+        raw_text: 'Aは2\nを支払った',
+        icons: [{ classes: `tz_icon resource_${resource}` }],
+      });
+      const rows = v.raw.dom_entries
+        .filter((r) => r.action_id > 5 && r.action_id < 9)
+        .map((r) => [r.action_id, r.messages]);
+      rows.push(
+        [
+          9,
+          [
+            payment('wood'),
+            payment('stone'),
+            { raw_text: 'Aは建物を建てた' },
+            { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_skull' }] },
+          ],
+        ],
+        [10, [{ raw_text: 'Aは神学を1レベル進めた' }]],
+      );
+      const witnesses = v.witness.witnesses.slice(0, 3);
+      replaceEvents(v, rows);
+      v.witness.witnesses = [...witnesses, { actionId: 9, buildings: ['b26'] }];
+    });
+    const apply = (request) => {
+      let next;
+      if (request.move.choiceId === 'second-building') {
+        next = clone(f.initial);
+        next.snapshot.state = clone(request.state);
+        const s = next.snapshot.state;
+        s.players[0].resources.wood -= 2;
+        s.players[0].resources.stone -= 2;
+        s.players[0].buildings.push('b26');
+        s.buildings = [];
+        s.pending = {
+          title: 'Free technology',
+          task: { type: 'technology', remaining: 1, free: true },
+          after: [
+            { type: 'effects', effects: [{ type: 'resources', resources: { skull: 1 } }] },
+            {
+              type: 'build',
+              remaining: 0,
+              allowMonument: false,
+              cornPayment: false,
+              architectureAvailable: true,
+            },
+          ],
+        };
+        next.observation.legalActions = [
+          {
+            action: { type: 'technology', technology: 'theology' },
+            move: { type: 'choose', choiceId: 'tech:theology' },
+          },
+        ];
+      } else if (request.move.choiceId === 'tech:theology') {
+        next = clone(f.initial);
+        next.snapshot.state = clone(request.state);
+        next.snapshot.state.players[0].technologies.theology++;
+        next.snapshot.state.players[0].resources.skull++;
+        next.snapshot.state.skullSupply--;
+        next.snapshot.state.pending = null;
+        next.observation.legalActions = [];
+      } else {
+        next = f.apply(request);
+        next.snapshot.state.buildings = next.snapshot.state.buildings.map((id) =>
+          id === 'b01' ? 'b26' : id,
+        );
+        for (const row of next.observation.legalActions)
+          if (row.action.id === 'b01') {
+            row.action.id = 'b26';
+            row.action.cost = [0, 2, 2, 0, 0];
+          }
+      }
+      next.observation.pendingTask = clone(next.snapshot.state.pending?.task ?? null);
+      alter(next, request.move.choiceId);
+      return next;
+    };
+    return { ...f, dispatch: dispatcher(f.initial, apply) };
+  };
+  const f = fixture();
+  const result = decode(f.value, f.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.equal(
+    result.manifest.audit.find((r) => r.queuedPurchaseSourceActionId === 9).actualDelivered,
+    true,
+  );
+  const bad = fixture((next, choice) => {
+    if (choice === 'tech:theology') next.snapshot.state.players[1].score++;
+  });
+  const refused = decode(bad.value, bad.dispatch);
+  assert.equal(refused.manifest.blocked.actionId, 7);
+  assert.deepEqual(
+    refused.record.steps.map((s) => s.sourceActionIds),
+    [[6]],
+  );
+});
+
+test('separates the immediate Architecture bonus from deferred Trade points', () => {
+  const configure = (v) => {
+    const messages = v.raw.dom_entries.find((row) => row.action_id === 7).messages;
+    messages[0].raw_text = 'Aは2\nを支払った';
+    messages.splice(
+      2,
+      0,
+      { raw_text: 'Aは\nを獲得した', icons: [{ classes: 'tz_icon resource_corn' }] },
+      { raw_text: 'Aは2点を獲得した' },
+    );
+    const rows = v.witness.witnesses;
+    rows[1].expected.players[0] = { score: 7, resources: { corn: 11, stone: 3 } };
+    rows[2].expected.players[0].score = 7;
+    rows[2].expected.players[0].resources.corn = 17;
+    rows[3].expected.players[0].score = 13;
+    rows[3].expected.players[0].resources.corn = 17;
+  };
+  const f = deferredTradeFixture(configure);
+  const result = decode(f.value, f.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.equal(result.record.steps[1].move.choiceId, 'purchase:true');
+  for (const change of [
+    (v) => v.raw.dom_entries.find((row) => row.action_id === 7).messages.splice(3, 1),
+    (v) => v.witness.witnesses[1].expected.players[0].score++,
+  ]) {
+    const bad = deferredTradeFixture((v) => {
+      configure(v);
+      change(v);
+    });
+    assert.equal(decode(bad.value, bad.dispatch).manifest.blocked.actionId, 7);
+  }
+});
 
 test('defers a fixed purchase score through observed Trades and isolates the legal Build exit', () => {
   const f = deferredTradeFixture();
@@ -2972,8 +3257,9 @@ function deferredAnyActionFixture(
     f.before.snapshot.state.buildings = ['b21'];
   }
   if (nested) {
-    f.before.snapshot.state.buildings = ['b21', 'b24', 'b22'];
+    f.before.snapshot.state.buildings = ['b21', nested === 'settled' ? 'b27' : 'b24', 'b22'];
     f.before.snapshot.state.players[0].technologies.extraction = 3;
+    if (nested === 'settled') f.before.snapshot.state.players[0].resources.stone = 4;
   }
   const build = (id, cost, architecture = false, discountResource = null) => ({
     action: { type: 'build', id, cost, architecture, discountResource, renovation: null },
@@ -2999,9 +3285,14 @@ function deferredAnyActionFixture(
       !['action-purchase', 'any:tikal:4', 'monument:m01'].includes(choice) &&
       !(
         nested &&
-        ['build:b24', 'tech:extraction', 'resource:wood', 'resource:stone', 'build:b22'].includes(
-          choice,
-        )
+        [
+          'build:b24',
+          'build:b27',
+          'tech:extraction',
+          'resource:wood',
+          'resource:stone',
+          'build:b22',
+        ].includes(choice)
       )
     ) {
       next = f.apply(request);
@@ -3060,7 +3351,9 @@ function deferredAnyActionFixture(
         };
         state.pending.title = 'Build or monument';
         next.observation.legalActions = [
-          ...(nested ? [build('b24', [0, 2, 1, 0, 0])] : []),
+          ...(nested
+            ? [nested === 'settled' ? build('b27', [0, 0, 2, 0, 0]) : build('b24', [0, 2, 1, 0, 0])]
+            : []),
           {
             action: { type: 'monument', id: 'm01', cost: [0, 1, 1, 2, 0], renovation: null },
             move: { type: 'choose', choiceId: 'monument:m01' },
@@ -3068,6 +3361,21 @@ function deferredAnyActionFixture(
           { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
         ];
         stage = 'action';
+      } else if (choice === 'build:b27') {
+        own.resources.stone -= 2;
+        own.temples.chaac += 2;
+        own.score += 2;
+        own.buildings.push('b27');
+        state.buildings = state.buildings.filter((id) => id !== 'b27');
+        state.pending.task = {
+          type: 'build',
+          remaining: 1,
+          allowMonument: false,
+          cornPayment: false,
+          architectureAvailable: true,
+        };
+        next.observation.legalActions = [build('b22', [0, 1, 1, 1, 0], true, 'stone')];
+        stage = 'settledBuild';
       } else if (choice === 'build:b24') {
         own.resources.wood -= 2;
         own.resources.stone--;
@@ -3262,6 +3570,27 @@ function deferredAnyActionFixture(
       { actionId: 11, buildings: ['b24'] },
       { actionId: 15, buildings: ['b22'] },
     );
+    if (nested === 'settled') {
+      delete f.value.witness.witnesses.find((w) => w.actionId === 10).expected;
+      const first = f.value.raw.dom_entries.find((row) => row.action_id === 11);
+      first.messages = [
+        payment('stone', 2),
+        { raw_text: 'Aは建物を建てた' },
+        { raw_text: 'AはChaacの信仰を1段上げた' },
+        { raw_text: 'AはChaacの信仰を1段上げた' },
+        { raw_text: 'Aは2点を獲得した' },
+      ];
+      const retained = f.value.raw.dom_entries.filter(
+        (row) => row.action_id > 5 && ![12, 13, 14].includes(row.action_id),
+      );
+      const settledWitnesses = f.value.witness.witnesses;
+      replaceEvents(
+        f.value,
+        retained.map((row) => [row.action_id, row.messages]),
+      );
+      f.value.witness.witnesses = settledWitnesses;
+      f.value.witness.witnesses.find((w) => w.actionId === 11).buildings = ['b27'];
+    }
   }
   change(f.value);
   for (const row of f.value.raw.dom_entries) {
@@ -3275,6 +3604,48 @@ function deferredAnyActionFixture(
   }
   return { value: f.value, dispatch: dispatcher(f.initial, apply) };
 }
+
+test('retains outer Points through two immediately settled buildings', () => {
+  const f = deferredAnyActionFixture(false, undefined, undefined, 'settled');
+  const result = decode(f.value, f.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.deepEqual(
+    result.record.steps.map((s) => s.sourceActionIds),
+    [[6], [9], [10], [11], [15]],
+  );
+  assert.equal(
+    result.manifest.audit.find((row) => row.continuation === 'anyActionBuild').actionId,
+    15,
+  );
+  for (const stage of ['settledBuild', 'finalBuild']) {
+    const bad = deferredAnyActionFixture(
+      false,
+      undefined,
+      (frame, current) => {
+        if (current === stage) frame.snapshot.state.players[1].score++;
+      },
+      'settled',
+    );
+    const refused = decode(bad.value, bad.dispatch);
+    assert.equal(refused.manifest.blocked.actionId, 9);
+    assert.deepEqual(
+      refused.record.steps.map((s) => s.sourceActionIds),
+      [[6]],
+    );
+  }
+  const missing = deferredAnyActionFixture(
+    false,
+    (v) => {
+      v.raw.entries = v.raw.entries.filter((r) => r.action_id !== 15);
+      v.raw.dom_entries = v.raw.dom_entries.filter((r) => r.action_id !== 15);
+      v.raw.entry_count = v.raw.entries.length;
+      v.witness.witnesses = v.witness.witnesses.filter((w) => w.actionId !== 15);
+    },
+    undefined,
+    'settled',
+  );
+  assert.equal(decode(missing.value, missing.dispatch).manifest.blocked.actionId, 9);
+});
 
 test('retains Action plus Points through only the observed Anywhere action and monument', () => {
   for (const chained of [false, true]) {
@@ -4797,6 +5168,38 @@ test('holds queued corn until observed technology completion and preserves cappe
     );
     return f;
   };
+  const finalTheologyFixture = (change = () => {}, alter = () => {}) =>
+    fixture(
+      (v) => {
+        v.witness.witnesses = v.witness.witnesses.slice(0, 2);
+        delete v.witness.witnesses[1].expected;
+        change(v);
+      },
+      alter,
+      3,
+      'theology',
+      'stone',
+      true,
+      3,
+      false,
+      1,
+    );
+  const finalTheology = finalTheologyFixture();
+  assert.equal(decode(finalTheology.value, finalTheology.dispatch).manifest.blocked, null);
+  for (const change of [
+    (v) => v.raw.dom_entries.find((r) => r.action_id === 8).messages.pop(),
+    (v) =>
+      v.raw.dom_entries
+        .find((r) => r.action_id === 8)
+        .messages.push({ raw_text: '神学技術ボーナス: Aは追加で水晶ドクロ1個を得た', icons: [] }),
+  ]) {
+    const bad = finalTheologyFixture(change);
+    assert.equal(decode(bad.value, bad.dispatch).manifest.blocked.actionId, 7);
+  }
+  const changedFinal = finalTheologyFixture(undefined, (next, stage) => {
+    if (stage === 'technology') next.snapshot.state.players[1].score++;
+  });
+  assert.equal(decode(changedFinal.value, changedFinal.dispatch).manifest.blocked.actionId, 7);
   const materialSuccess = materialFixture();
   const materialWitnesses = clone(materialSuccess.value.witness.witnesses);
   const materialCompleted = decode(materialSuccess.value, materialSuccess.dispatch);
