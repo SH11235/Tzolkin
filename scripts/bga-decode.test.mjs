@@ -4976,6 +4976,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     architectureLevel = architectureBonus ? 3 : 2,
     renovationSibling = false,
     buildsRemaining = 2,
+    discountOverride = null,
   ) => {
     const card =
       resource === 'corn'
@@ -4994,7 +4995,8 @@ test('holds queued corn until observed technology completion and preserves cappe
     assert.ok(card);
     const amount = card.effects[1].resources[resource];
     const cost = resources.map((r) => card.cost[r] ?? 0);
-    const discount = resources.find((r, index) => index > 0 && index < 4 && cost[index] > 0);
+    const discount =
+      discountOverride ?? resources.find((r, index) => index > 0 && index < 4 && cost[index] > 0);
     const chosenCost = cost.map(
       (n, index) =>
         n - Number(architectureBonus && architectureLevel === 3 && resources[index] === discount),
@@ -5378,6 +5380,42 @@ test('holds queued corn until observed technology completion and preserves cappe
     );
     return f;
   };
+  const finalDiscountedMaterial = (duplicate = false, discount = 'stone') =>
+    fixture(
+      (v) => {
+        v.witness.witnesses = v.witness.witnesses.slice(0, 2);
+        delete v.witness.witnesses[1].expected;
+        const messages = v.raw.dom_entries.find((row) => row.action_id === 7).messages;
+        const index = messages.findIndex((message) => message.raw_text === 'Aは建物を建てた');
+        messages.splice(index, 0, { raw_text: 'Aはを支払った', icons: [] });
+        if (duplicate) messages.splice(index, 0, { raw_text: 'Aはを支払った', icons: [] });
+      },
+      undefined,
+      1,
+      'theology',
+      'gold',
+      true,
+      3,
+      false,
+      1,
+      discount,
+    );
+  const finalMaterial = finalDiscountedMaterial();
+  const finalMaterialResult = decode(finalMaterial.value, finalMaterial.dispatch);
+  assert.equal(finalMaterialResult.manifest.blocked, null);
+  assert.equal(
+    finalMaterialResult.manifest.audit.find((row) => row.queuedPurchaseSourceActionId)
+      .actualDelivered,
+    true,
+  );
+  for (const bad of [finalDiscountedMaterial(true), finalDiscountedMaterial(false, 'wood')]) {
+    const rejected = decode(bad.value, bad.dispatch);
+    assert.equal(rejected.manifest.blocked.actionId, 7);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+    );
+  }
   const finalTheologyFixture = (change = () => {}, alter = () => {}) =>
     fixture(
       (v) => {

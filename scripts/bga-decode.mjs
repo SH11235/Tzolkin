@@ -2204,7 +2204,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         { type: 'resources', resources: { [resource]: amount } },
       ]) ||
       task?.type !== 'build' ||
-      task.remaining !== (skull || continuation?.theologyCapped ? 1 : 2) ||
+      ![1, 2].includes(task.remaining) ||
+      ((skull || continuation?.theologyCapped) && task.remaining !== 1) ||
+      (task.remaining === 1 &&
+        !skull &&
+        !continuation?.theologyCapped &&
+        (!(before.technologies[continuation?.technology] < 3) || retainedTail?.length !== 0)) ||
       task.cornPayment !== false ||
       retainedTail === null ||
       continuation === null ||
@@ -2238,9 +2243,18 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const gainEvent = gains.at(-1);
     const scoreEvent = events.find((item) => fixedScoreCaption(item) === 2);
     const index = events.indexOf(event);
+    const emptyPayments = events.filter(emptyPurchasePayment);
     if (
       events.some((item) => item.actor !== event.actor) ||
-      events.slice(0, index).some((item) => item.kind !== 'resourcePayment') ||
+      emptyPayments.length > 1 ||
+      (emptyPayments.length === 1 &&
+        (!action.architecture ||
+          before.technologies.architecture !== 3 ||
+          card.cost[action.discountResource] !== 1 ||
+          cost[RESOURCES.indexOf(action.discountResource)] !== 0)) ||
+      events
+        .slice(0, index)
+        .some((item) => item.kind !== 'resourcePayment' && !emptyPayments.includes(item)) ||
       !same(
         events.slice(index),
         action.architecture ? [event, gains[0], scoreEvent, gainEvent] : [event, gainEvent],
@@ -2937,7 +2951,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (
         envelope &&
         (event.kind !== 'build' ||
-          (!settledBuild(outcome) && !witnessedTempleBuild(outcome, event, events, witness)))
+          (!settledBuild(outcome) &&
+            !witnessedTempleBuild(outcome, event, events, witness) &&
+            queuedMaterialPurchase(outcome, event, events, witness, state()) === null))
       )
         return false;
       if (task === 'technology' && cornTechnologyPair(outcome.row.action.id) !== null) {
