@@ -507,7 +507,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (!match[2].startsWith(`${name}は`)) return [];
       const tail = match[2].slice(name.length + 1);
       const amount = tail.match(
-        match[1] === '記念碑' ? /^.+から(\d+)点を獲得した$/ : /^(\d+)点を獲得した$/,
+        match[1] === '記念碑' ? /^.+(?:から|に応じて)(\d+)点を獲得した$/ : /^(\d+)点を獲得した$/,
       )?.[1];
       return amount === undefined ? [] : [{ actor, amount: Number(amount) }];
     });

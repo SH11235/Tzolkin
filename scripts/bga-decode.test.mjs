@@ -877,7 +877,27 @@ test('binds localized food-day score captions and age-two announcements to core 
     monumentCaptions: 1,
     remainingCaptions: 4,
   });
+  const templePoints = terminalCaptions.map((item) => ({
+    ...item,
+    raw_text: item.raw_text.replace('技術の合計3レベルから9点', 'それぞれの信仰に応じて9点'),
+  }));
+  assert.equal(
+    decode(
+      terminal.make([
+        ...terminal.feeding,
+        ...terminal.scores,
+        ...templePoints,
+        { raw_text: '歯車が進んだ' },
+      ]),
+      dispatcher(terminal.initial, () => clone(terminal.after)),
+    ).manifest.blocked,
+    null,
+  );
   for (const captions of [
+    templePoints.map((item) => ({
+      ...item,
+      raw_text: item.raw_text.replace('に応じて9点', 'に応じて8点'),
+    })),
     terminalCaptions.map((item) => ({
       ...item,
       raw_text: item.raw_text.replace('から9点', 'から8点'),
