@@ -8,7 +8,8 @@ use tzolkin_ai::human_policy_dataset::{
     CAPPED_EXTRACTION_LABEL_SCOPE, ConditionalHumanPolicyDataset,
     EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, INPUT_SCHEMA, INPUT_SCHEMA_V2,
     INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5, INPUT_SCHEMA_V6, INPUT_SCHEMA_V7,
-    INPUT_SCHEMA_V8, INPUT_SCHEMA_V9, OBSERVED_BUILDING_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE,
+    INPUT_SCHEMA_V8, INPUT_SCHEMA_V9, INPUT_SCHEMA_V10, OBSERVED_BUILDING_LABEL_SCOPE,
+    OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_MARKET_BUY_LABEL_SCOPE,
     OBSERVED_PENDING_CHOICE_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
@@ -1083,6 +1084,45 @@ impl Fixture {
         fixture.set_messages(vec![message]);
         fixture
     }
+    fn market_buy(resource: tzolkin_core::Resource) -> Self {
+        let mut fixture = Self::explicit_operation(false, resource);
+        let mut record: PublicReplayRecord =
+            serde_json::from_value(fixture.record.clone()).unwrap();
+        record.steps.pop();
+        let report = verify_public_replay(&record).unwrap();
+        let observation = inspect_public(&report.frames.last().unwrap().snapshot.state)
+            .unwrap()
+            .observation
+            .unwrap();
+        let choice = observation
+            .legal_actions
+            .iter()
+            .find(|row| {
+                row.action
+                    == TypedAction::Trade {
+                        resource,
+                        buy: true,
+                    }
+            })
+            .unwrap();
+        record.steps.push(PublicReplayStep {
+            actor: 0,
+            r#move: choice.r#move.clone(),
+            source_action_ids: vec![10],
+            refills: Refills::default(),
+            checkpoint: None,
+        });
+        fixture.record = json!(record);
+        fixture.audit["audit"][0]["action"] = json!(choice.action);
+        let (label, corn) = match resource {
+            tzolkin_core::Resource::Wood => ("wood", 2),
+            tzolkin_core::Resource::Stone => ("stone", 3),
+            tzolkin_core::Resource::Gold => ("gold", 4),
+            _ => unreachable!(),
+        };
+        fixture.set_messages(vec![json!({"raw_text":format!("P0は{corn}\nを1\nに交換した"),"html":format!("P0は{corn}<div class=\"tz_icon resource_corn\"></div>を1<div class=\"tz_icon resource_{label}\"></div>に交換した"),"icons":[]})]);
+        fixture
+    }
     fn pin(&self, name: &str, value: &Value) -> Value {
         let bytes = serde_json::to_vec(value).unwrap();
         fs::write(self.root.join(name), &bytes).unwrap();
@@ -1112,11 +1152,13 @@ impl Fixture {
         if let Some(scope) = scope {
             manifest["labelScope"] = scope;
         }
-        if schema == INPUT_SCHEMA_V8 || schema == INPUT_SCHEMA_V9 {
+        if schema == INPUT_SCHEMA_V8 || schema == INPUT_SCHEMA_V9 || schema == INPUT_SCHEMA_V10 {
             manifest["featureProfile"] = json!("semanticPlaying4");
         }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V9 {
+        let file = if schema == INPUT_SCHEMA_V10 {
+            "manifest-v10.json"
+        } else if schema == INPUT_SCHEMA_V9 {
             "manifest-v9.json"
         } else if schema == INPUT_SCHEMA_V8 {
             "manifest-v8.json"
@@ -1136,7 +1178,7 @@ impl Fixture {
             "manifest.json"
         };
         fs::write(self.root.join(file), &bytes).unwrap();
-        if schema == INPUT_SCHEMA_V8 || schema == INPUT_SCHEMA_V9 {
+        if schema == INPUT_SCHEMA_V8 || schema == INPUT_SCHEMA_V9 || schema == INPUT_SCHEMA_V10 {
             assert!(
                 ConditionalHumanPolicyDataset::load(
                     &self.root.join(file),
@@ -1147,17 +1189,155 @@ impl Fixture {
                 .is_err()
             );
         }
-        let load = if schema == INPUT_SCHEMA_V8 || schema == INPUT_SCHEMA_V9 {
-            ConditionalHumanPolicyDataset::load_semantic_playing
-        } else {
-            ConditionalHumanPolicyDataset::load
-        };
+        let load =
+            if schema == INPUT_SCHEMA_V8 || schema == INPUT_SCHEMA_V9 || schema == INPUT_SCHEMA_V10
+            {
+                ConditionalHumanPolicyDataset::load_semantic_playing
+            } else {
+                ConditionalHumanPolicyDataset::load
+            };
         load(
             &self.root.join(file),
             &sha(&bytes),
             manifest["nominations"]["sha256"].as_str().unwrap(),
             manifest["reservations"]["sha256"].as_str().unwrap(),
         )
+    }
+}
+
+#[test]
+fn observed_market_buy_v10_binds_direction_price_and_trade_state_without_relabelling_sales() {
+    use tzolkin_core::Resource;
+    let load = |f: &Fixture| {
+        f.load_scope(
+            INPUT_SCHEMA_V10,
+            Some(json!(OBSERVED_MARKET_BUY_LABEL_SCOPE)),
+        )
+    };
+    for resource in [Resource::Wood, Resource::Stone, Resource::Gold] {
+        let f = Fixture::market_buy(resource);
+        let d = load(&f).unwrap();
+        let report = serde_json::to_value(d.report()).unwrap();
+        assert_eq!(
+            report["schema"],
+            "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v10"
+        );
+        assert_eq!(d.samples().len(), 1);
+        assert_eq!(report["samples"][0]["sourceLabelPart"], "marketBuy");
+        assert_eq!(report["samples"][0]["valueTarget"], Value::Null);
+        assert_eq!(report["trainingReady"], false);
+        assert!(d.samples()[0].candidates().len() > 1);
+        assert!(
+            f.load_scope(INPUT_SCHEMA_V9, Some(json!(OBSERVED_BUILDING_LABEL_SCOPE)))
+                .unwrap()
+                .samples()
+                .is_empty()
+        );
+    }
+    for change in [
+        "actor",
+        "quantity",
+        "price",
+        "resource",
+        "icons",
+        "duplicateCaption",
+        "cancelled",
+        "duplicateSource",
+        "outsideTrade",
+        "insufficientCorn",
+    ] {
+        let mut f = Fixture::market_buy(Resource::Wood);
+        let mut messages = f.raw["dom_entries"][0]["messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        match change {
+            "actor" => {
+                messages[0]["raw_text"] = json!("P1は2\nを1\nに交換した");
+            }
+            "quantity" => {
+                messages[0]["raw_text"] = json!("P0は2\nを2\nに交換した");
+            }
+            "price" => {
+                messages[0]["html"] = json!(
+                    "P0は3<div class=\"tz_icon resource_corn\"></div>を1<div class=\"tz_icon resource_wood\"></div>に交換した"
+                );
+            }
+            "resource" => {
+                messages[0]["html"] = json!(
+                    "P0は2<div class=\"tz_icon resource_corn\"></div>を1<div class=\"tz_icon resource_gold\"></div>に交換した"
+                );
+            }
+            "icons" => {
+                messages[0]["icons"] = json!([{"classes":"tz_icon resource_wood"},{"classes":"tz_icon resource_corn"}]);
+            }
+            "duplicateCaption" => messages.push(messages[0].clone()),
+            "cancelled" => f.audit["audit"][0]["cancellation"] = json!(true),
+            "duplicateSource" => {
+                let s = f.record["steps"]
+                    .as_array()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .clone();
+                f.record["steps"].as_array_mut().unwrap().push(s);
+                let mut a = f.audit["audit"][0].clone();
+                a["step"] = json!(f.record["steps"].as_array().unwrap().len());
+                f.audit["audit"].as_array_mut().unwrap().push(a);
+            }
+            "outsideTrade" => {
+                let len = f.record["steps"].as_array().unwrap().len();
+                f.record["steps"].as_array_mut().unwrap().remove(len - 2);
+            }
+            "insufficientCorn" => {
+                let mut record: PublicReplayRecord =
+                    serde_json::from_value(f.record.clone()).unwrap();
+                let target = record.steps.pop().unwrap();
+                loop {
+                    let report = verify_public_replay(&record).unwrap();
+                    let o = inspect_public(&report.frames.last().unwrap().snapshot.state)
+                        .unwrap()
+                        .observation
+                        .unwrap();
+                    let Some(choice) = o.legal_actions.iter().find(|row| {
+                        row.action
+                            == TypedAction::Trade {
+                                resource: Resource::Wood,
+                                buy: true,
+                            }
+                    }) else {
+                        break;
+                    };
+                    record.steps.push(PublicReplayStep {
+                        actor: 0,
+                        r#move: choice.r#move.clone(),
+                        source_action_ids: vec![],
+                        refills: Refills::default(),
+                        checkpoint: None,
+                    });
+                }
+                record.steps.push(target);
+                f.audit["audit"][0]["step"] = json!(record.steps.len());
+                f.record = json!(record);
+            }
+            _ => unreachable!(),
+        }
+        f.set_messages(messages);
+        if let Ok(d) = load(&f) {
+            assert!(d.samples().is_empty(), "{change}");
+        }
+    }
+    for f in [
+        Fixture::explicit_operation(false, Resource::Gold),
+        Fixture::unique_price_building(false),
+    ] {
+        let old = f
+            .load_scope(INPUT_SCHEMA_V9, Some(json!(OBSERVED_BUILDING_LABEL_SCOPE)))
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(old.samples()).unwrap(),
+            serde_json::to_vec(load(&f).unwrap().samples()).unwrap()
+        );
     }
 }
 

@@ -60,6 +60,11 @@ pub const INPUT_SCHEMA_V9: &str =
 pub const DATASET_SCHEMA_V9: &str =
     "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v9";
 pub const OBSERVED_BUILDING_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTechnologyMarketSellPaidAnywhereCornBegObservedMonumentPositiveTempleCappedExtractionAndUniquePriceBuildingV9";
+pub const INPUT_SCHEMA_V10: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-source-v10";
+pub const DATASET_SCHEMA_V10: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v10";
+pub const OBSERVED_MARKET_BUY_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTechnologyMarketSellBuyPaidAnywhereCornBegObservedMonumentPositiveTempleCappedExtractionAndUniquePriceBuildingV10";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -137,8 +142,13 @@ fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
 }
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
-        if self.schema == INPUT_SCHEMA_V8 || self.schema == INPUT_SCHEMA_V9 {
-            let scope = if self.schema == INPUT_SCHEMA_V9 {
+        if self.schema == INPUT_SCHEMA_V8
+            || self.schema == INPUT_SCHEMA_V9
+            || self.schema == INPUT_SCHEMA_V10
+        {
+            let scope = if self.schema == INPUT_SCHEMA_V10 {
+                OBSERVED_MARKET_BUY_LABEL_SCOPE
+            } else if self.schema == INPUT_SCHEMA_V9 {
                 OBSERVED_BUILDING_LABEL_SCOPE
             } else {
                 CAPPED_EXTRACTION_LABEL_SCOPE
@@ -1633,6 +1643,72 @@ fn paid_anywhere_caption(message: &Value, name: &str, gear: GearId, position: i6
             .is_none_or(|icons| icons.as_array().is_some_and(Vec::is_empty))
 }
 
+// Basic market purchases have the opposite literal icon order to sales. Quote
+// price/quantity from this caption, then check the complete core transition;
+// never infer a purchase or its target from later holdings.
+fn market_buy_caption(
+    message: &Value,
+    name: &str,
+    resource: Resource,
+    current_format: bool,
+) -> bool {
+    let (label, corn) = match resource {
+        Resource::Wood => ("wood", 2),
+        Resource::Stone => ("stone", 3),
+        Resource::Gold => ("gold", 4),
+        _ => return false,
+    };
+    let prefix = format!("{name}は");
+    let Some((from, to)) = message["raw_text"]
+        .as_str()
+        .and_then(|text| text.strip_prefix(&prefix))
+        .and_then(|body| body.strip_suffix("に交換した"))
+        .and_then(|body| body.split_once('を'))
+    else {
+        return false;
+    };
+    if from.trim() != corn.to_string() || to.trim() != "1"
+        || message["html"].as_str() != Some(format!("{prefix}{corn}<div class=\"tz_icon resource_corn\"></div>を1<div class=\"tz_icon resource_{label}\"></div>に交換した").as_str())
+    { return false; }
+    let Some(icons) = message["icons"].as_array() else {
+        return false;
+    };
+    icons.is_empty()
+        || (icons.len() == 2
+            && icons.iter().zip(["corn", label]).all(|(icon, r)| {
+                icon[if current_format { "class" } else { "classes" }].as_str()
+                    == Some(format!("tz_icon resource_{r}").as_str())
+            }))
+}
+
+fn market_buy_transition(index: usize, resource: Resource, report: &PublicReplayReport) -> bool {
+    let before = &report.frames[index].snapshot.state;
+    let after = &report.frames[index + 1].snapshot.state;
+    let corn = match resource {
+        Resource::Wood => 2,
+        Resource::Stone => 3,
+        Resource::Gold => 4,
+        _ => return false,
+    };
+    let actor = before.current_player;
+    if !matches!(before.pending.as_ref().map(|p| &p.task), Some(Task::Trade))
+        || before.players[actor].resources[&Resource::Corn] < corn
+    {
+        return false;
+    }
+    let mut expected = before.clone();
+    expected.log = after.log.clone();
+    *expected.players[actor]
+        .resources
+        .get_mut(&Resource::Corn)
+        .unwrap() -= corn;
+    *expected.players[actor]
+        .resources
+        .get_mut(&resource)
+        .unwrap() += 1;
+    &expected == after
+}
+
 fn paid_technology_evidence(
     index: usize,
     technology: TechnologyId,
@@ -2356,7 +2432,9 @@ impl ConditionalHumanPolicyDataset {
         let bytes = read_pin(&manifest_pin, Path::new(""))?;
         let manifest: Manifest = parse(&bytes)?;
         manifest.scope()?;
-        if (manifest.schema == INPUT_SCHEMA_V8 || manifest.schema == INPUT_SCHEMA_V9)
+        if (manifest.schema == INPUT_SCHEMA_V8
+            || manifest.schema == INPUT_SCHEMA_V9
+            || manifest.schema == INPUT_SCHEMA_V10)
             != (feature_profile == ConditionalFeatureProfile::SemanticPlaying4)
         {
             return Err("Conditional source requires its explicit feature-profile loader".into());
@@ -2629,6 +2707,7 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
+                        | OBSERVED_MARKET_BUY_LABEL_SCOPE
                 )
             ) && matches!(row.action, TypedAction::Beg)
             {
@@ -2689,7 +2768,11 @@ impl ConditionalHumanPolicyDataset {
             }
             if matches!(
                 label_scope,
-                Some(CAPPED_EXTRACTION_LABEL_SCOPE | OBSERVED_BUILDING_LABEL_SCOPE)
+                Some(
+                    CAPPED_EXTRACTION_LABEL_SCOPE
+                        | OBSERVED_BUILDING_LABEL_SCOPE
+                        | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                )
             ) && row.action
                 == (TypedAction::Technology {
                     technology: TechnologyId::Extraction,
@@ -2805,6 +2888,7 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
+                        | OBSERVED_MARKET_BUY_LABEL_SCOPE
                 )
             ) && let TypedAction::Technology { technology } = row.action
             {
@@ -2906,12 +2990,15 @@ impl ConditionalHumanPolicyDataset {
                     OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
+                        | OBSERVED_MARKET_BUY_LABEL_SCOPE
                 )
             ) && (matches!(
                 row.action,
                 TypedAction::Monument { .. } | TypedAction::Temple { direction: 1, .. }
-            ) || (label_scope == Some(OBSERVED_BUILDING_LABEL_SCOPE)
-                && matches!(row.action, TypedAction::Build { .. })));
+            ) || (matches!(
+                label_scope,
+                Some(OBSERVED_BUILDING_LABEL_SCOPE | OBSERVED_MARKET_BUY_LABEL_SCOPE)
+            ) && matches!(row.action, TypedAction::Build { .. })));
             let pending_support = if strategic {
                 let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
                 {
@@ -2950,8 +3037,9 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
+                        | OBSERVED_MARKET_BUY_LABEL_SCOPE
                 )
-            ) && matches!(
+            ) && (matches!(
                 row.action,
                 TypedAction::Trade {
                     resource: Resource::Wood | Resource::Stone | Resource::Gold,
@@ -2961,7 +3049,15 @@ impl ConditionalHumanPolicyDataset {
                     corn_cost: 1,
                     ..
                 }
-            );
+            ) || (label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE)
+                && matches!(
+                    row.action,
+                    TypedAction::Trade {
+                        resource: Resource::Wood | Resource::Stone | Resource::Gold,
+                        buy: true
+                    }
+                )));
+
             let reason = if !factorized
                 && !explicit
                 && !strategic
@@ -3119,6 +3215,10 @@ impl ConditionalHumanPolicyDataset {
                                         - before.players[step.actor].resources[&Resource::Corn];
                                     market_sell_caption(message, name, resource, corn, sources.raw["schema_version"] == 1)
                                 }
+                                TypedAction::Trade { resource, buy: true } if label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) => {
+                                    market_buy_caption(message, name, resource, sources.raw["schema_version"] == 1)
+                                        && market_buy_transition(index, resource, &report)
+                                }
                                 TypedAction::UseAction { gear, position, .. } => paid_anywhere_caption(message, name, gear, position),
                                 _ => false,
                             }
@@ -3156,7 +3256,9 @@ impl ConditionalHumanPolicyDataset {
             } else if factorized {
                 "removalAction"
             } else if explicit {
-                if matches!(row.action, TypedAction::Trade { .. }) {
+                if matches!(row.action, TypedAction::Trade { buy: true, .. }) {
+                    "marketBuy"
+                } else if matches!(row.action, TypedAction::Trade { .. }) {
                     "marketSell"
                 } else {
                     "paidAnywhere"
@@ -3450,7 +3552,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(OBSERVED_BUILDING_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
+                DATASET_SCHEMA_V10
+            } else if self.label_scope == Some(OBSERVED_BUILDING_LABEL_SCOPE) {
                 DATASET_SCHEMA_V9
             } else if self.feature_profile == ConditionalFeatureProfile::SemanticPlaying4 {
                 DATASET_SCHEMA_V8
@@ -3481,7 +3585,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(OBSERVED_BUILDING_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
+                "originalVisibleTextAndFinalAppliedStepAuditWithUniquePriceBuildingAndExactMarketBuyChoices"
+            } else if self.label_scope == Some(OBSERVED_BUILDING_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithUniquePriceBuildingChoices"
             } else if self.label_scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithObservedCappedExtractionChoiceAndMaterials"
