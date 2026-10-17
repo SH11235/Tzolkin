@@ -2863,7 +2863,7 @@ test('binds a settled fixed Theology purchase to one capped advance and named sk
   }
 });
 
-function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
+function deferredTradeFixture(change = () => {}, alterFrame = () => {}, remaining = 2) {
   // Injected frames test atomic decoding and original checkpoints, not core rules.
   const initial = clone(saved.core.initialFrame);
   const before = clone(initial);
@@ -2872,10 +2872,11 @@ function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
   own.score = 5;
   own.technologies.architecture = 3;
   before.snapshot.state.buildings = ['b18', 'b01'];
+  if (remaining === 1) before.snapshot.state.gears.tikal[2] = { playerId: 0, dummy: false };
   before.observation.pendingTask = {
     type: 'build',
-    remaining: 2,
-    allowMonument: true,
+    remaining,
+    allowMonument: remaining > 1,
     cornPayment: false,
   };
   before.snapshot.state.pending = {
@@ -2896,7 +2897,7 @@ function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
   }));
   const continuation = {
     type: 'build',
-    remaining: 1,
+    remaining: remaining - 1,
     allowMonument: false,
     cornPayment: false,
     architectureAvailable: true,
@@ -2919,7 +2920,29 @@ function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
     const player = next.snapshot.state.players[0];
     const choice = request.move.choiceId;
     let stage;
-    if (choice.startsWith('purchase:')) {
+    if (request.move.type === 'remove') {
+      next.snapshot.state.gears.tikal[2] = null;
+      next.snapshot.state.turn.mode = 'remove';
+      next.snapshot.state.turn.count++;
+      next.snapshot.state.pending = {
+        task: { type: 'action', gear: 'tikal', position: 2 },
+        after: [],
+      };
+      next.observation.legalActions = [
+        {
+          action: { type: 'useAction', gear: 'tikal', position: 2, cornCost: 0 },
+          move: { type: 'choose', choiceId: 'following-action' },
+        },
+      ];
+      stage = 'remove';
+    } else if (choice === 'following-action') {
+      next.snapshot.state.pending = {
+        task: { type: 'build', remaining: 1, allowMonument: false, cornPayment: false },
+        after: [],
+      };
+      next.observation.legalActions = [];
+      stage = 'following-action';
+    } else if (choice.startsWith('purchase:')) {
       const bonus = choice === 'purchase:true';
       player.resources.stone -= bonus ? 2 : 3;
       player.resources.corn += Number(bonus);
@@ -2966,6 +2989,15 @@ function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
           move: { type: 'choose', choiceId: 'second-building' },
         },
       ];
+      if (remaining === 1) {
+        next.snapshot.state.pending = null;
+        next.observation.legalActions = [
+          {
+            action: { type: 'remove', gear: 'tikal', position: 2 },
+            move: { type: 'remove', gear: 'tikal', position: 2 },
+          },
+        ];
+      }
       stage = 'exit';
     } else {
       assert.equal(choice, 'second-building');
@@ -3043,6 +3075,46 @@ function deferredTradeFixture(change = () => {}, alterFrame = () => {}) {
   }
   return { value, initial, before, apply, dispatch: dispatcher(initial, apply) };
 }
+
+test('settles final-building Trade points only before a sourced owned-worker removal', () => {
+  const fixture = (position = 2, alter = () => {}) =>
+    deferredTradeFixture(
+      (v) => {
+        const row = v.raw.dom_entries.find((entry) => entry.action_id === 9);
+        row.messages = [
+          { raw_text: `AはTikal ${position}のワーカーを取り除き、n°2のアクションを行った` },
+        ];
+        const witness = v.witness.witnesses.at(-1);
+        delete witness.buildings;
+        witness.pendingTask = 'build';
+        witness.expected.players[0].resources.wood = 5;
+      },
+      alter,
+      1,
+    );
+  const f = fixture();
+  const result = decode(f.value, dispatcher(f.initial, f.apply));
+  assert.equal(result.manifest.blocked, null);
+  assert.deepEqual(
+    result.record.steps.slice(-3).map((step) => step.sourceActionIds),
+    [[9], [9], [9]],
+  );
+  assert.equal(result.manifest.audit.find((row) => row.deferredScoreSourceActionId).amount, 6);
+  assert.equal(result.manifest.trainingReady, false);
+  for (const bad of [
+    fixture(3),
+    fixture(2, (next, stage) => {
+      if (stage === 'exit') next.snapshot.state.players[0].resources.corn++;
+    }),
+  ]) {
+    const rejected = decode(bad.value, dispatcher(bad.initial, bad.apply));
+    assert.equal(rejected.manifest.blocked.actionId, 7);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+    );
+  }
+});
 
 test('keeps the Trade rollback anchor through a final queued Skull purchase', () => {
   const fixture = (alter = () => {}) => {

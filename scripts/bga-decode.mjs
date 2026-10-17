@@ -1424,7 +1424,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         { type: 'points', amount: fixedScoreCaption(scoreEvents.at(-1)) },
       ]) ||
       before?.task?.type !== 'build' ||
-      before.task.remaining !== 2 ||
+      ![1, 2].includes(before.task.remaining) ||
       !same(before.after, []) ||
       !same(next.pending?.task, { type: 'trade' }) ||
       !same(outcome.frame.observation?.pendingTask, next.pending.task) ||
@@ -1433,7 +1433,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       !same(after[0], { type: 'effects', effects: [effects[1]] }) ||
       !same(after[1], {
         type: 'build',
-        remaining: 1,
+        remaining: before.task.remaining - 1,
         allowMonument: false,
         cornPayment: before.task.cornPayment,
         architectureAvailable: before.task.architectureAvailable !== false && !action.architecture,
@@ -1487,6 +1487,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const before = state();
     const next = nextFrame.snapshot.state;
     const exit = action.type === 'skip' && context.deferredScoreExit === true;
+    const completedBuild = receipt.pending.after[1].remaining === 0;
     if (
       (!exit && action.type !== 'trade') ||
       !same(before.pending, receipt.pending) ||
@@ -1501,9 +1502,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         { ...mechanical(before), players: null, pending: null },
       ) ||
       (exit
-        ? !same(next.pending?.task, receipt.pending.after[1]) ||
-          !same(nextFrame.observation.pendingTask, receipt.pending.after[1]) ||
-          !same(next.pending?.after, [])
+        ? completedBuild
+          ? next.pending !== null || nextFrame.observation.pendingTask !== null
+          : !same(next.pending?.task, receipt.pending.after[1]) ||
+            !same(nextFrame.observation.pendingTask, receipt.pending.after[1]) ||
+            !same(next.pending?.after, [])
         : !same(next.pending, receipt.pending) ||
           !same(nextFrame.observation.pendingTask, receipt.pending.task)) ||
       next.players.some((player, id) =>
@@ -1533,7 +1536,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       fail('Deferred purchase requires its one score caption and an actual observed Trade');
     context.deferredScoreExit = true;
     try {
-      choose((action) => action.type === 'skip', 'observed Trade exit before next Build', true);
+      choose(
+        (action) => action.type === 'skip',
+        'observed Trade exit before following action',
+        true,
+      );
     } finally {
       context.deferredScoreExit = false;
     }
@@ -3156,11 +3163,20 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               'Deferred purchase requires the next observed Anywhere action and purchase choices',
             );
         } else if (!events.every((event) => event.kind === 'trade')) {
-          if (
-            events.filter((event) => event.kind === 'build').length !== 1 ||
-            events.some((event) => ['trade', 'cancellation', 'monument'].includes(event.kind)) ||
-            witness.buildings?.length !== 1
-          )
+          const nextBuild =
+            events.filter((event) => event.kind === 'build').length === 1 &&
+            !events.some((event) => ['trade', 'cancellation', 'monument'].includes(event.kind)) &&
+            witness.buildings?.length === 1;
+          const removal = events.length === 1 ? events[0] : null;
+          const worker =
+            removal?.kind === 'gearAction' && removal.detail.source === 'removal'
+              ? state().gears[removal.detail.gear]?.[removal.detail.workerPosition]
+              : null;
+          const nextRemoval =
+            deferredScore.pending.after[1].remaining === 0 &&
+            worker?.playerId === deferredScore.actor &&
+            worker.dummy === false;
+          if (!nextBuild && !nextRemoval)
             fail('Deferred purchase requires observed Trades followed by the next actual Build');
           finishDeferredScore();
         }
