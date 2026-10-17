@@ -72,6 +72,118 @@ function mechanical(state) {
   delete value.log;
   return value;
 }
+
+// A narrow retrospective proof under the declared basic rules. This establishes
+// worker continuity only; it does not claim that the intervening choices can
+// already be decoded, or that BGA's unrecorded UI states are covered by history.
+export function deriveCancellationByWorkerContinuity(events, history, actor, sourceId, proof) {
+  closed(proof, ['schema', 'actionIds'], 'derived cancellation');
+  if (
+    proof.schema !== 'tzolkin-bga-worker-continuity-cancellation-v1' ||
+    !Array.isArray(proof.actionIds) ||
+    !proof.actionIds.length ||
+    proof.actionIds.length > 8 ||
+    proof.actionIds.some(
+      (id, index) =>
+        !Number.isSafeInteger(id) || id <= (index ? proof.actionIds[index - 1] : sourceId),
+    )
+  )
+    fail('Invalid derived cancellation worker-continuity proof');
+  const end = proof.actionIds.at(-1);
+  if (end - sourceId > 16) fail('Derived cancellation source window exceeds its bound');
+  const cancellation = events.filter((event) => event.actionId === sourceId);
+  if (cancellation.length !== 1 || cancellation[0].kind !== 'cancellation')
+    fail('Derived cancellation requires a single original cancellation notification');
+  const name = cancellation[0].actor;
+  const window = events.filter((event) => event.actionId > sourceId && event.actionId <= end);
+  const ids = new Set(window.map((event) => event.actionId));
+  for (let id = sourceId + 1; id <= end; id++)
+    if (!ids.has(id)) fail('Derived cancellation has an unobserved source gap');
+  const removals = [];
+  for (const event of window) {
+    if (event.actor === name && event.kind === 'gearAction' && event.detail.source === 'removal') {
+      if (
+        !['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'].includes(event.detail.gear) ||
+        !Number.isSafeInteger(event.detail.workerPosition) ||
+        event.detail.workerPosition < 0 ||
+        event.detail.workerPosition >= (event.detail.gear === 'chichenItza' ? 13 : 10)
+      )
+        fail('Unsupported derived cancellation removal position');
+      removals.push(event);
+    } else if (
+      event.actor === name &&
+      ['resourceGain', 'resourcePayment', 'technology'].includes(event.kind)
+    ) {
+      // These notifications cannot move an existing worker under basic rules.
+    } else if (event.kind === 'unparsed' && event.iconResources.length === 0) {
+      const body = event.rawText.startsWith(`${name}は`) ? event.rawText.slice(name.length) : null;
+      if (!(
+        (event.actor === name &&
+          (/^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段(上げた|下げた)$/.test(
+            body ?? '',
+          ) ||
+            /^は(corn|コーン|wood)タイルを獲得した$/.test(body ?? ''))) ||
+        event.rawText === `農業技術ボーナス: ${name}は好きな信仰を1段上げた`
+      ))
+        fail('Unsupported intervening source in derived cancellation proof');
+    } else fail('Unsupported intervening source in derived cancellation proof');
+  }
+  if (
+    !same(
+      removals.map((event) => event.actionId),
+      proof.actionIds,
+    )
+  )
+    fail('Derived cancellation removal references do not cover the source window');
+  const groups = [];
+  for (const entry of history) {
+    if (entry.unsettledPurchase || entry.frame.snapshot.state.currentPlayer !== actor) continue;
+    let group = groups.find((row) => same(row.state, mechanical(entry.frame.snapshot.state)));
+    if (!group) {
+      if (groups.length === 128) fail('Derived cancellation candidate-state budget exceeded');
+      group = { state: mechanical(entry.frame.snapshot.state), entries: [] };
+      groups.push(group);
+    }
+    group.entries.push(entry);
+  }
+  const excluded = [];
+  const remaining = groups.filter((group) => {
+    const gears = copy(group.state.gears);
+    for (const event of removals) {
+      const { gear, workerPosition } = event.detail;
+      const worker = gears[gear]?.[workerPosition];
+      if (!worker || worker.dummy || worker.playerId !== actor) {
+        excluded.push({
+          boundarySteps: group.entries.map((entry) => entry.steps),
+          sourceActionId: event.actionId,
+          gear,
+          position: workerPosition,
+          actualWorker: worker ?? null,
+        });
+        return false;
+      }
+      gears[gear][workerPosition] = null;
+    }
+    return true;
+  });
+  if (remaining.length !== 1)
+    fail(
+      `Derived cancellation is ${remaining.length ? 'ambiguous' : 'inconsistent'} within history`,
+    );
+  return {
+    selected: remaining[0].entries.at(-1),
+    receipt: {
+      schema: proof.schema,
+      basis:
+        'declared-basic source worker continuity within decoder history; not a DOM observation',
+      sourceActionIds: copy(proof.actionIds),
+      sourceWindow: [sourceId + 1, end],
+      candidateStates: groups.length,
+      remainingStates: remaining.length,
+      excluded,
+    },
+  };
+}
 const buildingSignature = (id) =>
   Object.fromEntries(
     Object.entries(buildings.get(id)).filter(([key]) => !['id', 'name'].includes(key)),
@@ -292,6 +404,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         'buildingEquivalenceClass',
         'monuments',
         'pendingTask',
+        'derivedCancellation',
       ],
       'witness',
     );
@@ -2928,35 +3041,58 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           fail(`Unused ${field} witness without a matching source event`);
       if (events.some((event) => event.kind === 'cancellation')) {
         alignActor(events[0].actor);
-        if (
-          events.length !== 1 ||
-          !witness.expected?.gears ||
-          !Number.isSafeInteger(witness.expected?.round) ||
-          !witness.expected?.players?.every(
-            (player) => player.resources && player.workers !== undefined,
+        let selected;
+        let derivedCancellation = null;
+        if (witness.derivedCancellation !== undefined) {
+          if (
+            declaredProfile?.rules !== 'basic' ||
+            state().additionalBuildings !== false ||
+            witness.expected !== undefined ||
+            witness.pendingTask !== undefined
           )
-        )
-          fail('Cancellation requires an observed settled day/worker/resource board');
-        const alternatives = history.filter(
-          (entry) =>
-            !entry.unsettledPurchase &&
-            entry.frame.snapshot.state.currentPlayer === actorId(events[0].actor) &&
-            matches(entry.frame.snapshot.state, witness.expected) &&
-            (witness.pendingTask === undefined ||
-              (entry.frame.observation?.pendingTask?.type ?? null) === witness.pendingTask),
-        );
-        if (
-          !alternatives.length ||
-          alternatives.some(
+            fail(
+              'Derived cancellation must be separate from observations under declared basic rules',
+            );
+          const derived = deriveCancellationByWorkerContinuity(
+            normalizedEvents,
+            history,
+            actorId(events[0].actor),
+            id,
+            witness.derivedCancellation,
+          );
+          selected = derived.selected;
+          derivedCancellation = derived.receipt;
+        } else {
+          if (
+            events.length !== 1 ||
+            !witness.expected?.gears ||
+            !Number.isSafeInteger(witness.expected?.round) ||
+            !witness.expected?.players?.every(
+              (player) => player.resources && player.workers !== undefined,
+            )
+          )
+            fail('Cancellation requires an observed settled day/worker/resource board');
+          const alternatives = history.filter(
             (entry) =>
-              !same(
-                mechanical(entry.frame.snapshot.state),
-                mechanical(alternatives[0].frame.snapshot.state),
-              ),
+              !entry.unsettledPurchase &&
+              entry.frame.snapshot.state.currentPlayer === actorId(events[0].actor) &&
+              matches(entry.frame.snapshot.state, witness.expected) &&
+              (witness.pendingTask === undefined ||
+                (entry.frame.observation?.pendingTask?.type ?? null) === witness.pendingTask),
+          );
+          if (
+            !alternatives.length ||
+            alternatives.some(
+              (entry) =>
+                !same(
+                  mechanical(entry.frame.snapshot.state),
+                  mechanical(alternatives[0].frame.snapshot.state),
+                ),
+            )
           )
-        )
-          fail('Cancellation rollback is unknown/ambiguous; observe the turn and pending prompt');
-        const selected = alternatives.at(-1);
+            fail('Cancellation rollback is unknown/ambiguous; observe the turn and pending prompt');
+          selected = alternatives.at(-1);
+        }
         frame = copy(selected.frame);
         const removed = record.steps.length - selected.steps;
         const discardedSourceActionIds = [
@@ -2974,7 +3110,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           removedSteps: removed,
           retainedSteps: selected.steps,
           discardedSourceActionIds,
-          observedBoardMatched: true,
+          observedBoardMatched: derivedCancellation === null,
+          ...(derivedCancellation === null ? {} : { derivedCancellation }),
         });
       } else {
         const payments = paymentOf(events);

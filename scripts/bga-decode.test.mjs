@@ -4,7 +4,12 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import test from 'node:test';
-import { decodeConditionalPublicGame, decodePublicGame, WITNESS_SCHEMA } from './bga-decode.mjs';
+import {
+  decodeConditionalPublicGame,
+  decodePublicGame,
+  deriveCancellationByWorkerContinuity,
+  WITNESS_SCHEMA,
+} from './bga-decode.mjs';
 import { coreDispatcher } from './bga-replay.mjs';
 import {
   deriveBasicCalendar,
@@ -20,6 +25,93 @@ const saved = JSON.parse(
 );
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const clone = (value) => structuredClone(value);
+
+function continuityCase() {
+  const worker = { playerId: 0, dummy: false };
+  const history = [0, 1, 2].map((steps) => ({
+    steps,
+    frame: {
+      snapshot: {
+        state: {
+          currentPlayer: 0,
+          score: steps,
+          gears: {
+            tikal: [null, steps === 0 ? null : clone(worker)],
+            palenque: [null, null, steps === 2 ? null : clone(worker)],
+          },
+        },
+      },
+    },
+  }));
+  const event = (actionId, kind, detail = {}, rawText = '') => ({
+    actionId,
+    actor: 'A',
+    kind,
+    detail,
+    rawText,
+    iconResources: [],
+  });
+  return {
+    history,
+    events: [
+      event(10, 'cancellation'),
+      event(11, 'gearAction', { source: 'removal', gear: 'tikal', workerPosition: 1 }),
+      event(12, 'technology', { technology: 'agriculture', steps: 1 }),
+      event(12, 'unparsed', {}, '農業技術ボーナス: Aは好きな信仰を1段上げた'),
+      event(13, 'gearAction', { source: 'removal', gear: 'palenque', workerPosition: 2 }),
+    ],
+    proof: { schema: 'tzolkin-bga-worker-continuity-cancellation-v1', actionIds: [11, 13] },
+  };
+}
+
+test('derives a unique rollback from original worker continuity, without defaulting to no-op', () => {
+  const { events, history, proof } = continuityCase();
+  const result = deriveCancellationByWorkerContinuity(events, history, 0, 10, proof);
+  assert.equal(result.selected.steps, 1);
+  assert.equal(result.receipt.candidateStates, 3);
+  assert.deepEqual(
+    result.receipt.excluded.map((x) => x.sourceActionId),
+    [11, 13],
+  );
+  assert.match(result.receipt.basis, /not a DOM observation/);
+});
+
+test('keeps mechanically different matching cancellation states ambiguous', () => {
+  const { events, history, proof } = continuityCase();
+  history[2].frame.snapshot.state.gears = clone(history[1].frame.snapshot.state.gears);
+  assert.throws(
+    () => deriveCancellationByWorkerContinuity(events, history, 0, 10, proof),
+    /ambiguous/,
+  );
+});
+
+test('does not use unsupported intervening facts or missing sources to eliminate candidates', () => {
+  for (const kind of ['place', 'gearAdvanced', 'cancellation', 'unparsed']) {
+    const { events, history, proof } = continuityCase();
+    events[2] = { ...events[2], kind, rawText: 'unknown source effect' };
+    assert.throws(
+      () => deriveCancellationByWorkerContinuity(events, history, 0, 10, proof),
+      /Unsupported intervening source/,
+    );
+  }
+  const { events, history, proof } = continuityCase();
+  assert.throws(
+    () =>
+      deriveCancellationByWorkerContinuity(
+        events.filter((x) => x.actionId !== 12),
+        history,
+        0,
+        10,
+        proof,
+      ),
+    /unobserved source gap/,
+  );
+  assert.throws(
+    () =>
+      deriveCancellationByWorkerContinuity(events, history, 0, 10, { ...proof, actionIds: [13] }),
+    /references do not cover/,
+  );
+});
 // Match the recursive object-key order of native serde_json::Value transport.
 const nativeJsonShape = (value) =>
   Array.isArray(value)
