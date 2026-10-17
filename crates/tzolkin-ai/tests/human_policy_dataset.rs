@@ -9,9 +9,10 @@ use tzolkin_ai::human_policy_dataset::{
     ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
     INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5,
     INPUT_SCHEMA_V6, INPUT_SCHEMA_V7, INPUT_SCHEMA_V8, INPUT_SCHEMA_V9, INPUT_SCHEMA_V10,
-    INPUT_SCHEMA_V11, MARKET_EXIT_NOTIFICATION_ASSUMPTION, OBSERVED_BUILDING_LABEL_SCOPE,
-    OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_MARKET_BUY_LABEL_SCOPE,
-    OBSERVED_PENDING_CHOICE_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE,
+    INPUT_SCHEMA_V11, INPUT_SCHEMA_V12, MARKET_EXIT_NOTIFICATION_ASSUMPTION,
+    OBSERVED_BUILDING_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_MARKET_BUY_LABEL_SCOPE,
+    OBSERVED_PENDING_CHOICE_LABEL_SCOPE, OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE,
+    PAID_TECHNOLOGY_LABEL_SCOPE,
 };
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{
@@ -45,6 +46,423 @@ struct Fixture {
     reservations: Value,
     exit_observation: Option<Value>,
 }
+impl Fixture {
+    fn theology_series() -> Self {
+        use tzolkin_core::observation::ActionSource;
+        use tzolkin_core::{Resource, TechnologyId, TempleId};
+        // A short legal setup/turn sequence reaches the task. Do not fabricate
+        // an initial board with prior workers, resources, or technology levels.
+        let mut state = (0..1000).find_map(|seed| {
+            let mut candidate=create_game(vec!["P0".into(),"P1".into(),"P2".into()],seed,false).unwrap();
+            let row=observe(&candidate,0).unwrap().legal_actions.into_iter().find(|r|matches!(&r.action,TypedAction::ChooseWealth { ids } if ids.iter().any(|id|id=="w17")&&ids.iter().any(|id|id=="w20")))?;
+            candidate=apply_move(&candidate,row.r#move).unwrap();
+            while candidate.phase==Phase::Setup {
+                let row=observe(&candidate,candidate.current_player).unwrap().legal_actions.into_iter().next().unwrap();
+                candidate=apply_move(&candidate,row.r#move).unwrap();
+            }
+            Some(candidate)
+        }).unwrap();
+        let actor = state.current_player;
+        assert_eq!(actor, 0);
+        let initial = PublicState::from_game_state(&state).unwrap();
+        let mut steps = vec![];
+        fn play(state: &mut GameState, steps: &mut Vec<Value>, target: TypedAction) {
+            let row = observe(state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|r| r.action == target)
+                .unwrap();
+            steps.push(json!({"actor":state.current_player,"move":row.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            *state = apply_move(state, row.r#move).unwrap();
+        }
+        while state.round < 8 {
+            if state.current_player == actor && state.round == 1 {
+                play(
+                    &mut state,
+                    &mut steps,
+                    TypedAction::Place {
+                        gear: GearId::Tikal,
+                        corn_cost: 0,
+                        discount: false,
+                    },
+                );
+            } else if state.current_player == actor && state.round == 2 {
+                play(
+                    &mut state,
+                    &mut steps,
+                    TypedAction::Remove {
+                        gear: GearId::Tikal,
+                        position: 1,
+                    },
+                );
+                play(
+                    &mut state,
+                    &mut steps,
+                    TypedAction::UseAction {
+                        gear: GearId::Tikal,
+                        position: 1,
+                        source: ActionSource::CurrentGear,
+                        corn_cost: 0,
+                    },
+                );
+                play(
+                    &mut state,
+                    &mut steps,
+                    TypedAction::Technology {
+                        technology: TechnologyId::Theology,
+                    },
+                );
+                play(
+                    &mut state,
+                    &mut steps,
+                    TypedAction::Payment {
+                        resources: [0, 2, 0, 0, 0],
+                    },
+                );
+            } else if state.current_player == actor && state.round == 3 {
+                play(
+                    &mut state,
+                    &mut steps,
+                    TypedAction::Place {
+                        gear: GearId::ChichenItza,
+                        corn_cost: 0,
+                        discount: false,
+                    },
+                );
+            } else {
+                let rows = observe(&state, state.current_player).unwrap().legal_actions;
+                let choice=rows.iter().find(|r|matches!(r.action,TypedAction::Place{gear,..}if gear!=GearId::ChichenItza))
+                    .or_else(||rows.iter().find(|r|matches!(r.action,TypedAction::Remove{gear,..}if gear!=GearId::ChichenItza))).unwrap();
+                play(&mut state, &mut steps, choice.action.clone());
+            }
+            while state.pending.is_some() {
+                play(&mut state, &mut steps, TypedAction::Skip);
+            }
+            let end = observe(&state, state.current_player)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|r| {
+                    matches!(
+                        r.action,
+                        TypedAction::EndTurn {
+                            double_advance: None | Some(false)
+                        }
+                    )
+                })
+                .unwrap();
+            play(&mut state, &mut steps, end.action);
+        }
+        assert_eq!(state.current_player, actor);
+        let targets = [
+            (
+                10,
+                TypedAction::Remove {
+                    gear: GearId::ChichenItza,
+                    position: 5,
+                },
+            ),
+            (
+                10,
+                TypedAction::UseAction {
+                    gear: GearId::ChichenItza,
+                    position: 6,
+                    source: ActionSource::TheologyAhead,
+                    corn_cost: 0,
+                },
+            ),
+            (
+                11,
+                TypedAction::Resource {
+                    resource: Resource::Gold,
+                },
+            ),
+            (
+                12,
+                TypedAction::Offering {
+                    resource: Resource::Gold,
+                },
+            ),
+            (
+                13,
+                TypedAction::Temple {
+                    temple: TempleId::Chaac,
+                    direction: 1,
+                },
+            ),
+        ];
+        let mut audit = vec![];
+        for (source, target) in targets {
+            let row = observe(&state, actor)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|r| r.action == target)
+                .unwrap();
+            steps.push(json!({"actor":actor,"move":row.r#move,"sourceActionIds":[source],"refills":{},"checkpoint":null}));
+            audit.push(json!({"step":steps.len(),"actionId":source,"actor":actor,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+            state = apply_move(&state, row.r#move).unwrap();
+        }
+        let mut f = Self::new();
+        f.record["initial"] = serde_json::to_value(initial).unwrap();
+        f.record["steps"] = json!(steps);
+        f.audit["audit"] = json!(audit);
+        f.raw["dom_entries"] = json!([
+            {"action_id":10,"timestamp_display":"12:00","messages":[{"raw_text":"P0はChichen Itza 5のワーカーを取り除き、n°6のアクションを行った"}]},
+            {"action_id":11,"timestamp_display":"12:01","messages":[{"raw_text":"P0は\nを獲得した","html":"P0は<div class=\"tz_icon resource_gold\"></div>を獲得した","icons":[]}]},
+            {"action_id":12,"timestamp_display":"12:02","messages":[{"raw_text":"P0は\nを支払った","html":"P0は<div class=\"tz_icon resource_gold\"></div>を支払った","icons":[]}]},
+            {"action_id":13,"timestamp_display":"12:03","messages":[{"raw_text":"P0はChaacの信仰を1段上げた","html":"P0はChaacの信仰を1段上げた","icons":[]}]}
+        ]);
+        f.sync_entries();
+        f
+    }
+    fn sync_entries(&mut self) {
+        self.raw["entries"] = json!(self.raw["dom_entries"].as_array().unwrap().iter().map(|n| json!({"action_id":n["action_id"],"timestamp_display":n["timestamp_display"],"raw_text":n["messages"].as_array().unwrap().iter().map(|m|m["raw_text"].as_str().unwrap()).collect::<Vec<_>>().join("\n")})).collect::<Vec<_>>());
+        self.raw["entry_count"] = json!(self.raw["entries"].as_array().unwrap().len());
+    }
+}
+
+#[test]
+fn theology_series_v12_connects_observed_choices_and_preserves_current_gear_and_v10_rows() {
+    let f = Fixture::theology_series();
+    let old = f
+        .load_scope(
+            INPUT_SCHEMA_V10,
+            Some(json!(OBSERVED_MARKET_BUY_LABEL_SCOPE)),
+        )
+        .unwrap();
+    let new = f
+        .load_scope(
+            INPUT_SCHEMA_V12,
+            Some(json!(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)),
+        )
+        .unwrap();
+    assert_eq!(old.samples().len(), 2);
+    let report = serde_json::to_value(new.report()).unwrap();
+    assert_eq!(
+        report["schema"],
+        "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v12"
+    );
+    assert_eq!(new.samples().len(), 5);
+    assert!(
+        f.load_scope(
+            INPUT_SCHEMA_V12,
+            Some(json!(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE))
+        )
+        .is_err()
+    );
+    for sample in old.samples() {
+        let kept = new
+            .samples()
+            .iter()
+            .find(|s| s.sample_id() == sample.sample_id())
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(kept).unwrap(),
+            serde_json::to_value(sample).unwrap()
+        );
+    }
+    for row in report["samples"].as_array().unwrap() {
+        assert!(row["legalActions"].as_array().unwrap().len() >= 2);
+        assert_eq!(row["valueTarget"], Value::Null);
+        let chosen = &row["legalActions"][row["chosen"].as_u64().unwrap() as usize]["action"];
+        if chosen["source"] == "theologyAhead" {
+            assert_eq!(row["pairedSampleId"], report["samples"][0]["sampleId"]);
+            assert_eq!(row["sourceLabelSupport"]["removedPosition"], 5);
+            assert_eq!(row["sourceLabelSupport"]["actionPosition"], 6);
+        }
+        if row["sourceLabelPart"] == "theologyOffering" {
+            assert!(
+                row["legalActions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["action"]["type"] == "skip")
+            );
+            assert_eq!(row["legalActions"].as_array().unwrap().len(), 3);
+        }
+        if row["sourceLabelPart"] == "chichenBonusResource" {
+            assert_eq!(row["legalActions"].as_array().unwrap().len(), 3);
+        }
+    }
+    for field in [
+        "sourceQualified",
+        "sourceAuthenticated",
+        "verifiedNativePolicy",
+        "trainingReady",
+    ] {
+        assert_eq!(report[field], false);
+    }
+    let current = Fixture::paired_action(2, 1);
+    let a = current
+        .load_scope(
+            INPUT_SCHEMA_V10,
+            Some(json!(OBSERVED_MARKET_BUY_LABEL_SCOPE)),
+        )
+        .unwrap();
+    let b = current
+        .load_scope(
+            INPUT_SCHEMA_V12,
+            Some(json!(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(a.samples()).unwrap(),
+        serde_json::to_value(b.samples()).unwrap()
+    );
+}
+
+#[test]
+fn theology_series_v12_refuses_mismatched_originals_and_unrelated_payment_contexts() {
+    for change in [
+        "actor",
+        "removedPosition",
+        "actionPosition",
+        "gear",
+        "cornPrice",
+        "offeringActor",
+        "offeringQuantity",
+        "offeringResource",
+        "offeringIcons",
+        "rewardQuantity",
+        "rewardResource",
+        "rewardActor",
+        "cancelled",
+        "duplicateCaption",
+        "duplicateSource",
+        "wrongPending",
+        "auditActor",
+        "differentSource",
+    ] {
+        let mut f = Fixture::theology_series();
+        let target_start = f.record["steps"].as_array().unwrap().len() - 5;
+        let target = if change.starts_with("reward") {
+            "chichenBonusResource"
+        } else if change.starts_with("offering")
+            || [
+                "cancelled",
+                "duplicateCaption",
+                "duplicateSource",
+                "wrongPending",
+                "auditActor",
+            ]
+            .contains(&change)
+        {
+            "theologyOffering"
+        } else {
+            "removalAction"
+        };
+        match change {
+            "actor" => {
+                f.raw["dom_entries"][0]["messages"][0]["raw_text"] =
+                    json!("P1はChichen Itza 5のワーカーを取り除き、n°6のアクションを行った")
+            }
+            "removedPosition" => {
+                f.raw["dom_entries"][0]["messages"][0]["raw_text"] =
+                    json!("P0はChichen Itza 4のワーカーを取り除き、n°6のアクションを行った")
+            }
+            "actionPosition" => {
+                f.raw["dom_entries"][0]["messages"][0]["raw_text"] =
+                    json!("P0はChichen Itza 5のワーカーを取り除き、n°5のアクションを行った")
+            }
+            "gear" => {
+                f.raw["dom_entries"][0]["messages"][0]["raw_text"] =
+                    json!("P0はYaxchilan 5のワーカーを取り除き、n°6のアクションを行った")
+            }
+            "cornPrice" => {
+                f.raw["dom_entries"][0]["messages"][0]["raw_text"] = json!(
+                    "P0はChichen Itza 5のワーカーを取り除き、1コーンを支払ってn°6アクションを行った"
+                )
+            }
+            "offeringActor" => {
+                f.raw["dom_entries"][2]["messages"][0]["raw_text"] = json!("P1は\nを支払った")
+            }
+            "offeringQuantity" => {
+                f.raw["dom_entries"][2]["messages"][0]["raw_text"] = json!("P0は2\nを支払った");
+                f.raw["dom_entries"][2]["messages"][0]["html"] =
+                    json!("P0は2<div class=\"tz_icon resource_gold\"></div>を支払った");
+            }
+            "offeringResource" => {
+                f.raw["dom_entries"][2]["messages"][0]["html"] =
+                    json!("P0は<div class=\"tz_icon resource_wood\"></div>を支払った")
+            }
+            "offeringIcons" => {
+                f.raw["dom_entries"][2]["messages"][0]["icons"] =
+                    json!([{"classes":"tz_icon resource_wood"}])
+            }
+            "rewardQuantity" => {
+                f.raw["dom_entries"][1]["messages"][0]["raw_text"] = json!("P0は2\nを獲得した");
+                f.raw["dom_entries"][1]["messages"][0]["html"] =
+                    json!("P0は2<div class=\"tz_icon resource_gold\"></div>を獲得した");
+            }
+            "rewardResource" => {
+                f.raw["dom_entries"][1]["messages"][0]["html"] =
+                    json!("P0は<div class=\"tz_icon resource_stone\"></div>を獲得した")
+            }
+            "rewardActor" => {
+                f.raw["dom_entries"][1]["messages"][0]["raw_text"] = json!("P1は\nを獲得した")
+            }
+            "cancelled" => f.audit["audit"][3]["cancellation"] = json!(true),
+            "duplicateCaption" => {
+                let msg = f.raw["dom_entries"][2]["messages"][0].clone();
+                f.raw["dom_entries"][2]["messages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(msg);
+            }
+            "duplicateSource" => {
+                let event = f.raw["dom_entries"][2].clone();
+                f.raw["dom_entries"].as_array_mut().unwrap().push(event);
+            }
+            "wrongPending" => {
+                f.record["steps"]
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(target_start + 2);
+            }
+            "auditActor" => f.audit["audit"][3]["actor"] = json!(1),
+            "differentSource" => {
+                f.record["steps"][target_start + 1]["sourceActionIds"] = json!([11]);
+                f.audit["audit"][1]["actionId"] = json!(11);
+            }
+            _ => unreachable!(),
+        }
+        f.sync_entries();
+        if let Ok(data) = f.load_scope(
+            INPUT_SCHEMA_V12,
+            Some(json!(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)),
+        ) {
+            let rows = serde_json::to_value(data.samples()).unwrap();
+            assert!(
+                !rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["sourceLabelPart"] == target),
+                "{change}"
+            );
+        }
+    }
+    // General technology payments and non-Chichen automatic resource rewards
+    // do not become optional theology or bonus-resource choice labels.
+    let f = Fixture::paid_technology(3, 0, [1, 0, 0]);
+    let d = f
+        .load_scope(
+            INPUT_SCHEMA_V12,
+            Some(json!(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)),
+        )
+        .unwrap();
+    let rows = serde_json::to_value(d.samples()).unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["sourceLabelPart"] != "theologyOffering"
+                && s["sourceLabelPart"] != "chichenBonusResource")
+    );
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -1345,6 +1763,7 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V9
             || schema == INPUT_SCHEMA_V10
             || schema == INPUT_SCHEMA_V11
+            || schema == INPUT_SCHEMA_V12
         {
             manifest["featureProfile"] = json!("semanticPlaying4");
         }
@@ -1359,7 +1778,9 @@ impl Fixture {
             );
         }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V11 {
+        let file = if schema == INPUT_SCHEMA_V12 {
+            "manifest-v12.json"
+        } else if schema == INPUT_SCHEMA_V11 {
             "manifest-v11.json"
         } else if schema == INPUT_SCHEMA_V10 {
             "manifest-v10.json"
@@ -1387,6 +1808,7 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V9
             || schema == INPUT_SCHEMA_V10
             || schema == INPUT_SCHEMA_V11
+            || schema == INPUT_SCHEMA_V12
         {
             assert!(
                 ConditionalHumanPolicyDataset::load(
@@ -1402,6 +1824,7 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V9
             || schema == INPUT_SCHEMA_V10
             || schema == INPUT_SCHEMA_V11
+            || schema == INPUT_SCHEMA_V12
         {
             ConditionalHumanPolicyDataset::load_semantic_playing
         } else {

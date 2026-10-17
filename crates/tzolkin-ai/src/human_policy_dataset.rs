@@ -71,6 +71,12 @@ pub const DATASET_SCHEMA_V11: &str =
     "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v11";
 pub const CONDITIONAL_MARKET_EXIT_LABEL_SCOPE: &str =
     "ObservedV10AndConditionalOrdinaryMarketExitFromFoodBoundaryV11";
+pub const INPUT_SCHEMA_V12: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-source-v12";
+pub const DATASET_SCHEMA_V12: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v12";
+pub const OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE: &str =
+    "ObservedV10AndTheologyAheadOfferingAndChichenResourceChoicesV12";
 pub const MARKET_EXIT_NOTIFICATION_ASSUMPTION: &str = "SingleMarketIntervalWithoutUnobservedReentryAndCompleteActorResourceNotificationsThroughObservedFoodDay";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
@@ -169,8 +175,11 @@ impl Manifest {
             || self.schema == INPUT_SCHEMA_V9
             || self.schema == INPUT_SCHEMA_V10
             || self.schema == INPUT_SCHEMA_V11
+            || self.schema == INPUT_SCHEMA_V12
         {
-            let scope = if self.schema == INPUT_SCHEMA_V11 {
+            let scope = if self.schema == INPUT_SCHEMA_V12 {
+                OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+            } else if self.schema == INPUT_SCHEMA_V11 {
                 CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
             } else if self.schema == INPUT_SCHEMA_V10 {
                 OBSERVED_MARKET_BUY_LABEL_SCOPE
@@ -962,6 +971,227 @@ fn plain_caption(message: &Value, caption: &str) -> bool {
         && message
             .get("icons")
             .is_none_or(|icons| icons.as_array().is_some_and(Vec::is_empty))
+}
+
+// V12 labels a literal optional payment or reward choice, never an automatic
+// gain or the Skull paid by executing Chichen. Keep its complete state delta
+// separate from the subsequent temple choice and from general material costs.
+fn observed_theology_choice_evidence(
+    index: usize,
+    action: &TypedAction,
+    sources: &Sources,
+    report: &PublicReplayReport,
+) -> Result<Option<ObservedPendingChoiceSupport>, String> {
+    let step = &sources.record.steps[index];
+    let before = &report.frames[index].snapshot.state;
+    let after = &report.frames[index + 1].snapshot.state;
+    let Some(pending) = &before.pending else {
+        return Ok(None);
+    };
+    let observation = inspect_public(before)?;
+    let o = observation
+        .observation
+        .as_ref()
+        .ok_or("Missing theology observation")?;
+    if !matches!(before.players.len(), 3 | 4)
+        || step.refills != Default::default()
+        || o.legal_actions.len() < 2
+    {
+        return Ok(None);
+    }
+    let (resource, gain) = match action {
+        TypedAction::Offering { resource } => (*resource, false),
+        TypedAction::Resource { resource } => (*resource, true),
+        _ => return Ok(None),
+    };
+    if !matches!(resource, Resource::Wood | Resource::Stone | Resource::Gold) {
+        return Ok(None);
+    }
+    let messages = sources.raw["dom_entries"]
+        .as_array()
+        .ok_or("Missing theology source messages")?
+        .iter()
+        .find(|node| node["action_id"].as_u64() == Some(step.source_action_ids[0]))
+        .and_then(|node| node["messages"].as_array())
+        .ok_or("Missing theology choice source")?;
+    if messages.len() != 1 {
+        return Ok(None);
+    }
+    let name = &before.players[step.actor].name;
+    let mut message = messages[0].clone();
+    if gain {
+        // Reuse the bounded complete-icon parser, changing only the exact verb.
+        for field in ["raw_text", "html"] {
+            let Some(body) = message[field]
+                .as_str()
+                .and_then(|s| s.strip_suffix("を獲得した"))
+            else {
+                return Ok(None);
+            };
+            message[field] = Value::String(format!("{body}を支払った"));
+        }
+    }
+    let mut materials = [0; 5];
+    materials[RESOURCE_IDS
+        .iter()
+        .position(|r| *r == resource)
+        .ok_or("Missing material index")?] = 1;
+    if material_caption_bounded(&message, name, sources.raw["schema_version"] == 1, 1)
+        != Some(materials)
+    {
+        return Ok(None);
+    }
+    let mut expected = before.clone();
+    expected.log = after.log.clone();
+    let (kind, basis) = if gain {
+        let Some(previous_index) = index.checked_sub(1) else {
+            return Ok(None);
+        };
+        let previous = &sources.record.steps[previous_index];
+        let previous_frame = inspect_public(&report.frames[previous_index].snapshot.state)?;
+        let previous_o = previous_frame
+            .observation
+            .as_ref()
+            .ok_or("Missing Chichen origin")?;
+        let selected = previous_o
+            .legal_actions
+            .iter()
+            .find(|row| row.r#move == previous.r#move);
+        let Some(LegalAction {
+            action:
+                TypedAction::UseAction {
+                    gear: GearId::ChichenItza,
+                    position,
+                    corn_cost,
+                    ..
+                },
+            ..
+        }) = selected
+        else {
+            return Ok(None);
+        };
+        if previous.actor != step.actor
+            || previous.source_action_ids.len() != 1
+            || previous.source_action_ids[0] >= step.source_action_ids[0]
+            || previous.refills != Default::default()
+            || !matches!(pending.task, Task::Resource { remaining: 1 })
+            || !tzolkin_core::catalog::CATALOG
+                .skull_rewards
+                .get(position)
+                .is_some_and(|r| r.resource)
+            || before.skull_spaces.get(*position as usize) != Some(&Some(step.actor))
+        {
+            return Ok(None);
+        }
+        let previous_action =
+            serde_json::to_value(&selected.unwrap().action).map_err(|e| e.to_string())?;
+        let previous_audit = sources.audit["audit"]
+            .as_array()
+            .ok_or("Missing Chichen origin audit")?
+            .iter()
+            .filter(|a| {
+                a["step"].as_u64() == Some(index as u64)
+                    && a["actionId"].as_u64() == Some(previous.source_action_ids[0])
+                    && a["actor"].as_u64() == Some(step.actor as u64)
+                    && a["action"] == previous_action
+            })
+            .collect::<Vec<_>>();
+        if previous_audit.len() != 1 || !observed_audit(previous_audit[0]) {
+            return Ok(None);
+        }
+        let origin_messages = sources.raw["dom_entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["action_id"].as_u64() == Some(previous.source_action_ids[0]))
+            .and_then(|node| node["messages"].as_array())
+            .ok_or("Missing Chichen origin caption")?;
+        if origin_messages.iter().any(|m| {
+            m["raw_text"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("は行動をキャンセルした"))
+        }) || origin_messages
+            .iter()
+            .filter(|m| {
+                m["raw_text"]
+                    .as_str()
+                    .and_then(|s| removal_action_caption(s, name))
+                    .is_some_and(|c| {
+                        c.gear == GearId::ChichenItza
+                            && c.action_position == *position
+                            && c.corn_cost == *corn_cost
+                    })
+            })
+            .count()
+            != 1
+        {
+            return Ok(None);
+        }
+        expected.pending = match pending.after.as_slice() {
+            [] => None,
+            [Task::Theology { position: Some(p) }] if p == position => Some(Pending {
+                title: "神学の追加の供物（任意）".into(),
+                task: Task::Theology { position: Some(*p) },
+                after: vec![],
+            }),
+            _ => return Ok(None),
+        };
+        *expected.players[step.actor]
+            .resources
+            .get_mut(&resource)
+            .ok_or("Missing reward resource")? += 1;
+        (
+            "chichenBonusResource",
+            "oneObservedChichenBonusResourceGainAndExactTransition",
+        )
+    } else {
+        let Task::Theology {
+            position: Some(position),
+        } = pending.task
+        else {
+            return Ok(None);
+        };
+        if !pending.after.is_empty()
+            || before.skull_spaces.get(position as usize) != Some(&Some(step.actor))
+            || before.players[step.actor].technologies[&TechnologyId::Theology] < 2
+            || !o
+                .legal_actions
+                .iter()
+                .any(|row| matches!(row.action, TypedAction::Skip))
+        {
+            return Ok(None);
+        }
+        *expected.players[step.actor]
+            .resources
+            .get_mut(&resource)
+            .ok_or("Missing offering resource")? -= 1;
+        expected.pending = Some(Pending {
+            title: "神殿を上がる（残り 1 回）".into(),
+            task: Task::Temple {
+                remaining: 1,
+                distinct: None,
+                direction: None,
+                reason: None,
+            },
+            after: vec![],
+        });
+        (
+            "theologyOffering",
+            "oneObservedOptionalTheologyMaterialPaymentAndTempleTransition",
+        )
+    };
+    if &expected != after {
+        return Ok(None);
+    }
+    Ok(Some(ObservedPendingChoiceSupport {
+        kind,
+        source_message_index: 0,
+        material_message_indices: if gain { vec![] } else { vec![0] },
+        observed_materials: materials,
+        basis,
+        building_choice: None,
+        market_exit: None,
+    }))
 }
 
 // These are explicit pending choices, not automatic rewards with similar text.
@@ -2875,7 +3105,8 @@ impl ConditionalHumanPolicyDataset {
         if (manifest.schema == INPUT_SCHEMA_V8
             || manifest.schema == INPUT_SCHEMA_V9
             || manifest.schema == INPUT_SCHEMA_V10
-            || manifest.schema == INPUT_SCHEMA_V11)
+            || manifest.schema == INPUT_SCHEMA_V11
+            || manifest.schema == INPUT_SCHEMA_V12)
             != (feature_profile == ConditionalFeatureProfile::SemanticPlaying4)
         {
             return Err("Conditional source requires its explicit feature-profile loader".into());
@@ -3169,6 +3400,7 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && matches!(row.action, TypedAction::Beg)
@@ -3234,6 +3466,7 @@ impl ConditionalHumanPolicyDataset {
                     CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && row.action
@@ -3352,6 +3585,7 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && let TypedAction::Technology { technology } = row.action
@@ -3451,6 +3685,11 @@ impl ConditionalHumanPolicyDataset {
             let inferred_exit = label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)
                 && matches!(row.action, TypedAction::Skip)
                 && matches!(observation.pending_task, Some(Task::Trade));
+            let theology_choice = label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)
+                && matches!(
+                    row.action,
+                    TypedAction::Offering { .. } | TypedAction::Resource { .. }
+                );
             let strategic = matches!(
                 label_scope,
                 Some(
@@ -3458,6 +3697,7 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && (matches!(
@@ -3468,15 +3708,19 @@ impl ConditionalHumanPolicyDataset {
                 Some(
                     OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && matches!(row.action, TypedAction::Build { .. })))
-                || inferred_exit;
+                || inferred_exit
+                || theology_choice;
             let pending_support = if strategic {
                 let evidence = if teachers.contains(&actor_ids[step.actor]) && inferred_exit {
                     conditional_market_exit_evidence(index, sources, &report, &actor_ids)?
                 } else if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry) {
-                    if matches!(row.action, TypedAction::Build { .. }) {
+                    if theology_choice {
+                        observed_theology_choice_evidence(index, &row.action, sources, &report)?
+                    } else if matches!(row.action, TypedAction::Build { .. }) {
                         observed_building_evidence(index, &row.action, sources, &report)?
                     } else {
                         observed_pending_choice_evidence(index, &row.action, sources, &report)?
@@ -3509,7 +3753,15 @@ impl ConditionalHumanPolicyDataset {
                         source: ActionSource::CurrentGear,
                         ..
                     }
-                );
+                )
+                || (label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)
+                    && matches!(
+                        row.action,
+                        TypedAction::UseAction {
+                            source: ActionSource::TheologyAhead,
+                            ..
+                        }
+                    ));
             let explicit = matches!(
                 label_scope,
                 Some(
@@ -3519,6 +3771,7 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && (matches!(
@@ -3533,7 +3786,11 @@ impl ConditionalHumanPolicyDataset {
                 }
             ) || (matches!(
                 label_scope,
-                Some(OBSERVED_MARKET_BUY_LABEL_SCOPE | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)
+                Some(
+                    OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
+                )
             ) && matches!(
                 row.action,
                 TypedAction::Trade {
@@ -3610,6 +3867,10 @@ impl ConditionalHumanPolicyDataset {
                 if previous.actor != step.actor
                     || previous.source_action_ids != step.source_action_ids
                     || !matches!(observation.pending_task, Some(Task::Action { gear: g, position: p, .. }) if g == gear && p == position)
+                    || matches!(row.action, TypedAction::UseAction { source: ActionSource::TheologyAhead, gear: g, position: p, corn_cost }
+                        if g != GearId::ChichenItza || p != position + 1 || corn_cost != 0
+                        || !matches!(record.initial.players.len(), 3 | 4)
+                        || report.frames[index].snapshot.state.players[step.actor].technologies[&TechnologyId::Theology] < 1)
                 {
                     *counts
                         .excluded
@@ -3702,7 +3963,7 @@ impl ConditionalHumanPolicyDataset {
                                         - before.players[step.actor].resources[&Resource::Corn];
                                     market_sell_caption(message, name, resource, corn, sources.raw["schema_version"] == 1)
                                 }
-                                TypedAction::Trade { resource, buy: true } if matches!(label_scope, Some(OBSERVED_MARKET_BUY_LABEL_SCOPE | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)) => {
+                                TypedAction::Trade { resource, buy: true } if matches!(label_scope, Some(OBSERVED_MARKET_BUY_LABEL_SCOPE | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)) => {
                                     market_buy_caption(message, name, resource, sources.raw["schema_version"] == 1)
                                         && market_buy_transition(index, resource, &report)
                                 }
@@ -4039,7 +4300,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
+                DATASET_SCHEMA_V12
+            } else if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
                 DATASET_SCHEMA_V11
             } else if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
                 DATASET_SCHEMA_V10
@@ -4074,7 +4337,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
+                "observedV10LabelsAndExplicitTheologyAheadOfferingAndChichenBonusResourceChoices"
+            } else if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
                 "observedV10LabelsAndExplicitlyConditionalFoodAnchoredMarketExits"
             } else if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithUniquePriceBuildingAndExactMarketBuyChoices"
