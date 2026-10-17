@@ -683,6 +683,81 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           same(after.pending.after, before.after))
     );
   }
+  // An immediate Architecture bonus can precede an unresolved card choice.
+  // Admit only the observed Temple -> Build queue, with the owner's complete
+  // counters and the original outer continuation still intact.
+  function witnessedTempleBuild(outcome, event, events, witness) {
+    const previous = state();
+    const action = outcome.row.action;
+    const actor = actorId(event.actor);
+    const next = outcome.frame.snapshot.state;
+    const before = previous.pending;
+    const observed = witness.expected?.players?.[actor];
+    if (
+      witnesses.catalogHash !== catalogHash ||
+      previous.version !== 1 ||
+      previous.additionalBuildings !== false ||
+      previous.expansion != null ||
+      actor !== previous.currentPlayer ||
+      event.kind !== 'build' ||
+      action.type !== 'build' ||
+      action.architecture !== true ||
+      action.renovation !== null ||
+      previous.players[actor].technologies.architecture < 2 ||
+      !same(witness.buildings, [action.id]) ||
+      !same(buildings.get(action.id)?.effects, [
+        { type: 'temple', temple: 'any', steps: 1 },
+        { type: 'build' },
+      ]) ||
+      before?.task?.type !== 'build' ||
+      !Number.isSafeInteger(before.task.remaining) ||
+      before.task.remaining < 1 ||
+      before.task.cornPayment !== false ||
+      !Array.isArray(before.after) ||
+      witness.pendingTask !== 'temple' ||
+      !RESOURCES.every((key) => Number.isSafeInteger(observed?.resources?.[key])) ||
+      !Number.isFinite(observed?.score) ||
+      !same(typedResourceCost(action), paymentOf(events)) ||
+      !same(purchaseGains(event, events), { 'resource:corn': 1, score: 2 }) ||
+      !same(next.pending?.task, { type: 'temple', remaining: 1 }) ||
+      !same(outcome.frame.observation.pendingTask, next.pending.task) ||
+      !same(next.pending.after, [
+        { type: 'effects', effects: [{ type: 'build' }] },
+        {
+          ...before.task,
+          remaining: before.task.remaining - 1,
+          allowMonument: false,
+          architectureAvailable: false,
+        },
+        ...before.after,
+      ]) ||
+      !matches(next, witness.expected) ||
+      !same(
+        next.buildings,
+        previous.buildings.filter((id) => id !== action.id),
+      ) ||
+      !same(next.players[actor].buildings, [...previous.players[actor].buildings, action.id]) ||
+      !same(
+        { ...mechanical(next), players: null, pending: null, buildings: null },
+        { ...mechanical(previous), players: null, pending: null, buildings: null },
+      )
+    )
+      return false;
+    return next.players.every((player, id) =>
+      id === actor
+        ? player.score === previous.players[id].score + 2 &&
+          RESOURCES.every(
+            (key, i) =>
+              player.resources[key] ===
+              previous.players[id].resources[key] - action.cost[i] + Number(i === 0),
+          ) &&
+          same(
+            { ...player, resources: null, score: null, buildings: null },
+            { ...previous.players[id], resources: null, score: null, buildings: null },
+          )
+        : same(player, previous.players[id]),
+    );
+  }
   function cappedPurchaseAdvance(outcome, previous = state()) {
     const action = outcome.row.action;
     const actor = previous.currentPlayer;
@@ -2852,7 +2927,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         (item) =>
           emptyPurchasePayment(item) || architectureScoreCaption(item) || cappedWorkerCaption(item),
       );
-      if (envelope && (event.kind !== 'build' || !settledBuild(outcome))) return false;
+      if (
+        envelope &&
+        (event.kind !== 'build' ||
+          (!settledBuild(outcome) && !witnessedTempleBuild(outcome, event, events, witness)))
+      )
+        return false;
       if (task === 'technology' && cornTechnologyPair(outcome.row.action.id) !== null) {
         const receipt = queuedPurchaseShape(outcome, event, events, witness);
         return (

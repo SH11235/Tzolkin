@@ -2400,6 +2400,144 @@ function workerPurchaseFixture(remaining = 1) {
   return { initial, messages, value, frames, apply, prepare };
 }
 
+function templeBuildBonusFixture(alter = () => {}) {
+  const initial = clone(saved.core.initialFrame);
+  const before = initial.snapshot.state;
+  const own = before.players[0];
+  own.resources = { corn: 8, wood: 2, stone: 1, gold: 0, skull: 0 };
+  own.score = 7;
+  own.technologies.architecture = 3;
+  before.buildings = ['b08', 'b01'];
+  before.pending = {
+    task: {
+      type: 'build',
+      remaining: 1,
+      allowMonument: false,
+      cornPayment: false,
+      architectureAvailable: true,
+    },
+    after: [],
+  };
+  initial.observation.pendingTask = clone(before.pending.task);
+  initial.observation.legalActions = [
+    {
+      action: {
+        type: 'build',
+        id: 'b08',
+        cost: [0, 1, 0, 0, 0],
+        architecture: true,
+        discountResource: 'gold',
+        renovation: null,
+      },
+      move: { type: 'choose', choiceId: 'temple-build' },
+    },
+  ];
+  const value = input();
+  replaceEvents(value, [
+    [
+      6,
+      [
+        { raw_text: 'Aはを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+        { raw_text: 'Aはを支払った' },
+        { raw_text: 'Aは建物を建てた' },
+        { raw_text: 'Aはを獲得した', icons: [{ classes: 'tz_icon resource_corn' }] },
+        { raw_text: 'Aは2点を獲得した' },
+      ],
+    ],
+  ]);
+  value.witness.initial = clone(before);
+  value.witness.witnesses = [
+    {
+      actionId: 6,
+      buildings: ['b08'],
+      pendingTask: 'temple',
+      expected: {
+        players: [
+          { resources: { corn: 9, wood: 1, stone: 1, gold: 0, skull: 0 }, score: 9 },
+          {},
+          {},
+          {},
+        ],
+      },
+    },
+  ];
+  const apply = (request) => {
+    assert.equal(request.move.choiceId, 'temple-build');
+    const next = clone(initial);
+    next.snapshot.state = clone(request.state);
+    const state = next.snapshot.state;
+    state.players[0].resources.wood--;
+    state.players[0].resources.corn++;
+    state.players[0].score += 2;
+    state.players[0].buildings.push('b08');
+    state.buildings = ['b01'];
+    state.pending = {
+      task: { type: 'temple', remaining: 1 },
+      after: [
+        { type: 'effects', effects: [{ type: 'build' }] },
+        { ...before.pending.task, remaining: 0, architectureAvailable: false },
+      ],
+    };
+    next.observation.pendingTask = clone(state.pending.task);
+    next.observation.legalActions = [];
+    alter(next);
+    return next;
+  };
+  return { value, initial, apply };
+}
+
+test('checks the immediate Architecture bonus while Temple and Build choices remain queued', () => {
+  const f = templeBuildBonusFixture();
+  const result = decode(f.value, dispatcher(f.initial, f.apply));
+  assert.equal(result.manifest.blocked, null);
+  assert.equal(result.record.steps.length, 1);
+  assert.deepEqual(result.record.steps[0].sourceActionIds, [6]);
+  assert.equal(result.manifest.trainingReady, false);
+});
+
+test('refuses incomplete counters or changed Temple-Build continuations', () => {
+  for (const change of [
+    (value) => {
+      delete value.witness.witnesses[0].expected;
+    },
+    (value) => {
+      delete value.witness.witnesses[0].expected.players[0].resources.gold;
+    },
+  ]) {
+    const f = templeBuildBonusFixture();
+    change(f.value);
+    const result = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(result.manifest.blocked?.actionId, 6);
+    assert.equal(result.record.steps.length, 0);
+  }
+  const mutations = [
+    (next) => {
+      next.snapshot.state.pending.after[1].architectureAvailable = true;
+    },
+    (next) => {
+      next.snapshot.state.pending.after[0].effects = [{ type: 'worker' }];
+    },
+    (next) => {
+      next.snapshot.state.pending.after.push({ type: 'trade' });
+    },
+    (next) => {
+      next.snapshot.state.players[1].resources.corn++;
+    },
+    (next) => {
+      next.snapshot.state.players[0].temples.chaac++;
+    },
+    (next) => {
+      next.snapshot.state.pending.task.remaining = 2;
+    },
+  ];
+  for (const mutate of mutations) {
+    const f = templeBuildBonusFixture(mutate);
+    const result = decode(f.value, dispatcher(f.initial, f.apply));
+    assert.equal(result.manifest.blocked?.actionId, 6);
+    assert.equal(result.record.steps.length, 0);
+  }
+});
+
 test('capped worker purchase keeps its fixed score and original Build continuation', () => {
   for (const remaining of [1, 2]) {
     const f = workerPurchaseFixture(remaining);
