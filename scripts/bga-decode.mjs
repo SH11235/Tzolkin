@@ -380,6 +380,62 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   const actorId = (name) => names.indexOf(name);
   const pending = () => frame.observation?.pendingTask?.type ?? null;
 
+  function terminalAward(event) {
+    if (event.iconResources.length) fail('Terminal award caption has unexpected resource icons');
+    if (event.rawText === '最終スコア') {
+      if (context.terminalAwards.header) fail('Duplicate terminal score header');
+      context.terminalAwards.header = true;
+      return;
+    }
+    const match = event.rawText.match(/^(記念碑|残り資源): (.+)$/);
+    if (!match) fail('Malformed terminal award caption');
+    const candidates = names.flatMap((name, actor) => {
+      if (!match[2].startsWith(`${name}は`)) return [];
+      const tail = match[2].slice(name.length + 1);
+      const amount = tail.match(
+        match[1] === '記念碑' ? /^.+から(\d+)点を獲得した$/ : /^(\d+)点を獲得した$/,
+      )?.[1];
+      return amount === undefined ? [] : [{ actor, amount: Number(amount) }];
+    });
+    if (candidates.length !== 1) fail('Terminal award has no unique matching source actor');
+    const { actor, amount } = candidates[0];
+    const score = state().finalScores?.find((value) => value.playerId === actor);
+    if (!score) fail('Terminal award has no matching core final score');
+    if (!Number.isSafeInteger(amount)) fail('Invalid terminal award amount');
+    if (match[1] === '残り資源') {
+      if (context.terminalAwards.remaining.has(actor)) fail('Duplicate terminal remaining award');
+      // BGA displays the combined resource/skull conversion as whole points.
+      if (amount !== Math.floor(score.resourcePoints + score.skullPoints))
+        fail('Terminal remaining award differs from core final score');
+      context.terminalAwards.remaining.set(actor, amount);
+    } else {
+      const total = (context.terminalAwards.monuments.get(actor) ?? 0) + amount;
+      if (total > score.monumentPoints) fail('Terminal monument awards exceed core final score');
+      context.terminalAwards.monuments.set(actor, total);
+      context.terminalAwards.monumentCount++;
+    }
+  }
+
+  function verifyTerminalAwards() {
+    const claims = context.terminalAwards;
+    if (!claims.header && !claims.monumentCount && !claims.remaining.size) return;
+    // All-player remainder captions delimit a complete final-award section. A
+    // partial capture can check individual claims, but cannot establish coverage.
+    const complete = claims.header && claims.remaining.size === names.length;
+    if (complete)
+      for (const score of state().finalScores)
+        if ((claims.monuments.get(score.playerId) ?? 0) !== score.monumentPoints)
+          fail('Terminal monument award sum differs from core final score');
+    audit.push({
+      actionId: context.id,
+      terminalAwardComparison: {
+        complete,
+        monumentCaptions: claims.monumentCount,
+        remainingCaptions: claims.remaining.size,
+      },
+    });
+  }
+
   function paidBuildingClass(event, events, witness, payments) {
     const actor = actorId(event.actor);
     const task = state().pending?.task;
@@ -2783,6 +2839,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       feeding: [],
       feedingDay: null,
       foodScoreClaims: new Set(),
+      terminalAwards: {
+        header: false,
+        monuments: new Map(),
+        remaining: new Map(),
+        monumentCount: 0,
+      },
       ageAnnouncement: false,
       paymentActor: null,
       paymentOperations: 0,
@@ -3644,7 +3706,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               state().phase === 'finished' &&
               /^(最終スコア|記念碑: |残り資源: )/.test(event.rawText)
             ) {
-              // Source display annotations do not change the official core score.
+              terminalAward(event);
             } else if (/は\d+点を獲得した$/.test(event.rawText)) {
               if (deferredScore?.sourceId === id && deferredScore.scoreEvent === event) {
                 if (deferredScore.captionObserved)
@@ -3698,6 +3760,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           for (const [index, amount] of resourceAmounts(event).entries())
             if (amount) automatic(event, `resource:${RESOURCES[index]}`, amount, -1);
       }
+      verifyTerminalAwards();
       if (context.pools.currentAge.length || context.pools.age2.length)
         fail('Observed reveal pool was not consumed at this source event');
       if (Object.hasOwn(witness, 'pendingTask') && witness.pendingTask !== pending())

@@ -578,9 +578,18 @@ test('binds localized food-day score captions and age-two announcements to core 
     { raw_text: '最終スコア' },
     { raw_text: '記念碑: Aは技術の合計3レベルから9点を獲得した' },
     { raw_text: '残り資源: Aは2点を獲得した' },
+    { raw_text: '残り資源: Bは0点を獲得した' },
+    { raw_text: '残り資源: Cは0点を獲得した' },
+    { raw_text: '残り資源: Dは0点を獲得した' },
     { raw_text: 'ゲーム終了' },
   ];
   const terminal = fixture(27);
+  terminal.after.snapshot.state.finalScores = [0, 1, 2, 3].map((playerId) => ({
+    playerId,
+    monumentPoints: playerId === 0 ? 9 : 0,
+    resourcePoints: playerId === 0 ? 0.5 : 0,
+    skullPoints: playerId === 0 ? 2 : 0,
+  }));
   const terminalValue = terminal.make([
     ...terminal.feeding,
     ...terminal.scores,
@@ -601,6 +610,67 @@ test('binds localized food-day score captions and age-two announcements to core 
   assert.deepEqual(finished.record.steps[0].checkpoint.expected, terminalExpected);
   assert.equal(finished.manifest.mechanicallyFinished, true);
   assert.equal(finished.manifest.trainingReady, false);
+  assert.deepEqual(finished.manifest.audit.at(-1).terminalAwardComparison, {
+    complete: true,
+    monumentCaptions: 1,
+    remainingCaptions: 4,
+  });
+  for (const captions of [
+    terminalCaptions.map((item) => ({
+      ...item,
+      raw_text: item.raw_text.replace('から9点', 'から8点'),
+    })),
+    terminalCaptions.map((item) => ({
+      ...item,
+      raw_text: item.raw_text.replace('Aは2点', 'Aは3点'),
+    })),
+    [...terminalCaptions, terminalCaptions[2]],
+    [...terminalCaptions, terminalCaptions[0]],
+    [...terminalCaptions, { raw_text: '最終スコア unknown' }],
+    [...terminalCaptions, { raw_text: '記念碑: unknownは技術から1点を獲得した' }],
+    terminalCaptions.filter((_, index) => index !== 1),
+  ]) {
+    const refused = decode(
+      terminal.make([
+        ...terminal.feeding,
+        ...terminal.scores,
+        ...captions,
+        { raw_text: '歯車が進んだ' },
+      ]),
+      dispatcher(terminal.initial, () => clone(terminal.after)),
+    );
+    assert.match(refused.manifest.blocked.reason, /Terminal|terminal/);
+    assert.equal(refused.record.steps.length, 0);
+    assert.equal(
+      refused.manifest.audit.some((item) => item.terminalAwardComparison),
+      false,
+    );
+  }
+  const splitAwards = decode(
+    terminal.make([
+      ...terminal.feeding,
+      ...terminal.scores,
+      ...terminalCaptions.filter((_, index) => index !== 1),
+      { raw_text: '記念碑: Aは建物2件から4点を獲得した' },
+      { raw_text: '記念碑: Aは技術5レベルから5点を獲得した' },
+      { raw_text: '歯車が進んだ' },
+    ]),
+    dispatcher(terminal.initial, () => clone(terminal.after)),
+  );
+  assert.equal(splitAwards.manifest.blocked, null);
+  assert.equal(splitAwards.manifest.audit.at(-1).terminalAwardComparison.monumentCaptions, 2);
+  const partialAwards = decode(
+    terminal.make([
+      ...terminal.feeding,
+      ...terminal.scores,
+      terminalCaptions[1],
+      terminalCaptions[2],
+      { raw_text: '歯車が進んだ' },
+    ]),
+    dispatcher(terminal.initial, () => clone(terminal.after)),
+  );
+  assert.equal(partialAwards.manifest.blocked, null);
+  assert.equal(partialAwards.manifest.audit.at(-1).terminalAwardComparison.complete, false);
   for (const name of ['最終スコア D', '記念碑: D', '残り資源: D']) {
     const named = fixture(27);
     for (const frame of [named.initial, named.after]) frame.snapshot.state.players[3].name = name;
