@@ -2959,6 +2959,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         const selected = alternatives.at(-1);
         frame = copy(selected.frame);
         const removed = record.steps.length - selected.steps;
+        const discardedSourceActionIds = [
+          ...new Set(record.steps.slice(selected.steps).flatMap((step) => step.sourceActionIds)),
+        ];
         record.steps = record.steps.slice(0, selected.steps);
         history = history.filter((entry) => entry.steps <= selected.steps);
         rotationCredit = selected.rotationCredit;
@@ -2969,6 +2972,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           actionId: id,
           cancellation: true,
           removedSteps: removed,
+          retainedSteps: selected.steps,
+          discardedSourceActionIds,
           observedBoardMatched: true,
         });
       } else {
@@ -3866,7 +3871,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       sourceCoverage: report.sourceCoverage,
       sourceDerivations:
         blocked === null
-          ? verifySourceDerivations(normalizedEvents, record, report)
+          ? verifySourceDerivations(normalizedEvents, record, report, audit)
           : { status: 'unavailable', reason: 'decoder stopped before a complete source replay' },
       sourceAuthenticated: false,
       strictExporterAccepted: false,

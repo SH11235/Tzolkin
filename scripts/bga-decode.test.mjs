@@ -12,6 +12,7 @@ import {
   compareFloorRankings,
   verifyTerminalResourceFractions,
   verifySourceDerivations,
+  verifyWorkerCardLedger,
 } from './bga-source-proof.mjs';
 
 const saved = JSON.parse(
@@ -117,6 +118,15 @@ test('keeps the effective witnessed rollback prefix and stops before an unknown 
   assert.deepEqual(
     result.manifest.audit.filter((row) => row.cancellation).map((row) => row.removedSteps),
     [1, 0],
+  );
+  assert.deepEqual(
+    result.manifest.audit
+      .filter((row) => row.cancellation)
+      .map((row) => ({ retained: row.retainedSteps, discarded: row.discardedSourceActionIds })),
+    [
+      { retained: 0, discarded: [6] },
+      { retained: 1, discarded: [] },
+    ],
   );
   assert.equal(result.manifest.coreCalls, 4); // initial, two atomic attempts, one final replay
   assert.equal(result.manifest.trainingReady, false);
@@ -6836,6 +6846,159 @@ test('checks notification-side food resource flow and exposes floor-before-ranki
   assert.throws(
     () => verifyTerminalResourceFractions(counters, terminalScores),
     /incomplete terminal/,
+  );
+});
+
+test('physical ledger binds removal cells, effective rollback boundaries and card refills', () => {
+  const gears = Object.fromEntries(
+    ['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'].map((g) => [
+      g,
+      Array(g === 'chichenItza' ? 13 : 10).fill(null),
+    ]),
+  );
+  const initial = {
+    gears,
+    jungle: Object.fromEntries([2, 3, 4, 5].map((b) => [b, { corn: 3, wood: b === 2 ? 0 : 3 }])),
+    skullSpaces: Array(10).fill(null),
+    firstPlayerClaimed: null,
+    buildings: ['b01', 'b02', 'b03', 'b04', 'b05', 'b06'],
+    monuments: ['m01'],
+    players: ['A', 'B', 'C'].map((name) => ({ name, workers: 3, buildings: [], monuments: [] })),
+  };
+  const steps = [
+    { actor: 0, move: { type: 'place', gear: 'uxmal' }, sourceActionIds: [6] },
+    { actor: 0, move: { type: 'endTurn' }, sourceActionIds: [7] },
+    { actor: 0, move: { type: 'remove', gear: 'uxmal', position: 1 }, sourceActionIds: [8] },
+    { actor: 0, move: { type: 'choose', choiceId: 'build:b01:none' }, sourceActionIds: [9] },
+    {
+      actor: 0,
+      move: { type: 'endTurn' },
+      sourceActionIds: [10],
+      refills: { currentAge: ['b07'], age2: [] },
+    },
+  ];
+  const record = {
+    initial,
+    source: { actionIds: [5] },
+    initialCheckpoint: {
+      expected: { gears, players: initial.players.map((p) => ({ workers: p.workers })) },
+    },
+    steps,
+  };
+  const frames = [{ snapshot: { state: clone(initial) } }];
+  const push = (mutate) => {
+    const state = clone(frames.at(-1).snapshot.state);
+    mutate(state);
+    frames.push({ snapshot: { state } });
+  };
+  push((s) => {
+    s.gears.uxmal[0] = { playerId: 0, dummy: false };
+  });
+  push((s) => {
+    s.gears.uxmal[1] = s.gears.uxmal[0];
+    s.gears.uxmal[0] = null;
+  });
+  push((s) => {
+    s.gears.uxmal[1] = null;
+  });
+  push((s) => {
+    s.buildings.shift();
+    s.players[0].buildings.push('b01');
+  });
+  push((s) => {
+    s.buildings.push('b07');
+  });
+  const events = [
+    { actionId: 6, actor: 'A', kind: 'place', rawText: 'A places', detail: { gear: 'uxmal' } },
+    { actionId: 7, actor: null, kind: 'gearAdvanced', rawText: '歯車が進んだ' },
+    {
+      actionId: 8,
+      actor: 'A',
+      kind: 'gearAction',
+      rawText: 'A removes at 1 and selects action 0',
+      detail: { gear: 'uxmal', source: 'removal', workerPosition: 1, actionPosition: 0 },
+    },
+    { actionId: 9, actor: 'A', kind: 'build', rawText: 'A builds' },
+    { actionId: 10, actor: null, kind: 'unparsed', rawText: 'next actor boundary' },
+    { actionId: 11, actor: 'A', kind: 'cancellation', rawText: 'A cancels' },
+  ];
+  const audit = [
+    {
+      actionId: 11,
+      cancellation: true,
+      removedSteps: 0,
+      retainedSteps: 5,
+      discardedSourceActionIds: [],
+    },
+  ];
+  const calendar = [{ actionId: 7, advancedDays: 1, foodDay: null }];
+  const run = (e = events, r = record, a = audit) =>
+    verifyWorkerCardLedger(e, r, { frames }, a, calendar);
+  assert.equal(run().status, 'matched');
+  for (const mutate of [
+    (r) => {
+      r.steps[2].move.position = 0;
+    },
+    (r) => {
+      r.steps[4].refills.currentAge[0] = 'b08';
+    },
+    (r) => {
+      r.steps[4].refills.currentAge[0] = 'b01';
+    },
+  ]) {
+    const bad = clone(record);
+    mutate(bad);
+    assert.throws(() => run(events, bad), /Source derivation/);
+  }
+  const badAudit = clone(audit);
+  badAudit[0].retainedSteps = 4;
+  assert.throws(() => run(events, record, badAudit), /retained boundary/);
+  badAudit[0].removedSteps = 1;
+  assert.equal(run(events, record, badAudit).status, 'unavailable');
+  assert.equal(run(events, record, []).status, 'unavailable');
+  const duplicate = clone(events);
+  duplicate.splice(1, 0, clone(events[0]));
+  assert.throws(() => run(duplicate), /no effective replay binding/);
+  const wrongActor = clone(events);
+  wrongActor[3].actor = 'B';
+  assert.throws(() => run(wrongActor), /no unused literal source/);
+  const theologyRecord = clone(record);
+  for (const step of theologyRecord.steps)
+    if (step.move.gear === 'uxmal') step.move.gear = 'chichenItza';
+  const theologyEvents = clone(events);
+  for (const event of theologyEvents)
+    if (event.detail?.gear === 'uxmal') event.detail.gear = 'chichenItza';
+  theologyEvents[2].detail.actionPosition = 2;
+  const theologyFrames = clone(frames);
+  for (const [i, frame] of theologyFrames.entries()) {
+    const state = frame.snapshot.state;
+    state.gears.uxmal.forEach((worker, pos) => {
+      if (worker) state.gears.chichenItza[pos] = worker;
+    });
+    state.gears.uxmal.fill(null);
+    if (i >= 3) state.skullSpaces[2] = 0;
+  }
+  assert.equal(
+    verifyWorkerCardLedger(
+      theologyEvents,
+      theologyRecord,
+      { frames: theologyFrames },
+      audit,
+      calendar,
+    ).status,
+    'matched',
+  );
+  theologyEvents[2].detail.actionPosition = 1;
+  assert.throws(
+    () =>
+      verifyWorkerCardLedger(
+        theologyEvents,
+        theologyRecord,
+        { frames: theologyFrames },
+        audit,
+        calendar,
+      ),
+    /skullSpaces mismatch/,
   );
 });
 

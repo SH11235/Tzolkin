@@ -205,10 +205,277 @@ export function verifyTerminalResourceFractions(observedPlayers, scores) {
   });
 }
 
+/** A physical-piece ledger only. It consumes literal source worker operations
+ * and the decoder's source-bound card choices/reveals; it does not reimplement
+ * resource gains, technology benefits, feeding or scoring. */
+export function verifyWorkerCardLedger(events, record, report, audit, calendar) {
+  const initial = record.initial;
+  if (
+    !record.initialCheckpoint?.expected?.gears ||
+    !record.initialCheckpoint.expected.players?.every((p) => Number.isSafeInteger(p.workers))
+  )
+    return {
+      status: 'unavailable',
+      reason: 'initial worker board/count observation is incomplete',
+    };
+  if (record.steps.some((s) => s.sourceActionIds.length !== 1))
+    return {
+      status: 'unavailable',
+      reason: 'piece ledger requires single-source operation bindings',
+    };
+  const cancellations = events.filter((e) => e.kind === 'cancellation');
+  for (const event of cancellations) {
+    const receipts = audit.filter((a) => a.cancellation && a.actionId === event.actionId);
+    if (!receipts.length)
+      return { status: 'unavailable', reason: 'cancellation source-to-step receipt is missing' };
+    if (receipts.length !== 1) fail('cancellation has no unique rollback receipt');
+    if (receipts[0].removedSteps === 0 && receipts[0].discardedSourceActionIds?.length)
+      fail('no-op cancellation contains discarded source actions');
+    if (receipts[0].removedSteps !== 0)
+      return {
+        status: 'unavailable',
+        reason: `nonempty rollback at ${event.actionId} needs source-observed retained history`,
+      };
+  }
+  const gears = structuredClone(initial.gears);
+  const workers = record.initialCheckpoint.expected.players.map((p) => p.workers);
+  const buildings = [...initial.buildings];
+  const monuments = [...initial.monuments];
+  const skullSpaces = [...initial.skullSpaces];
+  const jungle = structuredClone(initial.jungle);
+  const owned = initial.players.map(() => ({ buildings: [], monuments: [] }));
+  let claimed = null;
+  let frameIndex = 0;
+  let placements = 0;
+  let removals = 0;
+  let purchases = 0;
+  let revealed = 0;
+  const boundaries = [];
+  let foodBoundary = null;
+  const forestActions = new Map();
+  const groups = new Map();
+  for (const event of events) {
+    if (event.actionId <= record.source.actionIds[0]) continue;
+    if (!groups.has(event.actionId)) groups.set(event.actionId, []);
+    groups.get(event.actionId).push(event);
+  }
+  const compare = (id) => {
+    const state = report.frames[frameIndex].snapshot.state;
+    for (const [key, value] of Object.entries({
+      gears,
+      skullSpaces,
+      jungle,
+      buildings,
+      monuments,
+      firstPlayerClaimed: claimed,
+    }))
+      if (!same(state[key], value)) fail(`piece ledger ${key} mismatch at ${id}`);
+    for (const [actor, value] of owned.entries()) {
+      if (
+        workers[actor] !== state.players[actor].workers ||
+        !same(value.buildings, state.players[actor].buildings) ||
+        !same(value.monuments, state.players[actor].monuments)
+      )
+        fail(`piece ledger ownership mismatch at ${id}`);
+    }
+  };
+  compare(record.source.actionIds[0]);
+  const fragment = () =>
+    structuredClone({
+      gears,
+      skullSpaces,
+      jungle,
+      buildings,
+      monuments,
+      firstPlayerClaimed: claimed,
+      players: owned.map((p, i) => ({ ...p, workers: workers[i] })),
+    });
+  boundaries.push({ actionId: record.source.actionIds[0], expected: fragment() });
+  for (const [id, messages] of groups) {
+    for (const event of messages.filter((e) => e.kind === 'gearAction')) {
+      if (event.detail.gear === 'palenque' && [2, 3, 4, 5].includes(event.detail.actionPosition))
+        forestActions.set(event.actor, { box: event.detail.actionPosition, actionId: id });
+      else forestActions.delete(event.actor);
+    }
+    const sourceActor = (step, event) => initial.players[step.actor]?.name === event.actor;
+    const consumed = new Set();
+    const claim = (predicate, label) => {
+      const event = messages.find((e) => !consumed.has(e) && predicate(e));
+      if (!event) fail(`${label} has no unused literal source at ${id}`);
+      consumed.add(event);
+    };
+    while (record.steps[frameIndex]?.sourceActionIds[0] === id) {
+      const step = record.steps[frameIndex];
+      const move = step.move;
+      if (move.type === 'place') {
+        claim(
+          (e) => e.kind === 'place' && sourceActor(step, e) && e.detail.gear === move.gear,
+          'placement',
+        );
+        const occupied =
+          Object.values(gears)
+            .flat()
+            .filter((w) => w && w.playerId === step.actor).length + Number(claimed === step.actor);
+        if (occupied >= workers[step.actor])
+          fail(`placement exceeds source-owned workers at ${id}`);
+        const position = gears[move.gear]?.findIndex((w) => w === null);
+        if (
+          position === undefined ||
+          position < 0 ||
+          position > (move.gear === 'chichenItza' ? 10 : 7)
+        )
+          fail(`no basic worker placement cell at ${id}`);
+        gears[move.gear][position] = { playerId: step.actor, dummy: false };
+        placements++;
+      } else if (move.type === 'remove') {
+        claim(
+          (e) =>
+            e.kind === 'gearAction' &&
+            sourceActor(step, e) &&
+            e.detail.source === 'removal' &&
+            e.detail.gear === move.gear &&
+            e.detail.workerPosition === move.position,
+          'removal physical position',
+        );
+        if (!same(gears[move.gear]?.[move.position], { playerId: step.actor, dummy: false }))
+          fail(`removal does not own the physical source cell at ${id}`);
+        gears[move.gear][move.position] = null;
+        removals++;
+      } else if (move.type === 'firstPlayer') {
+        if (claimed !== null) fail(`starting worker space is occupied at ${id}`);
+        if (
+          Object.values(gears)
+            .flat()
+            .filter((w) => w && w.playerId === step.actor).length >= workers[step.actor]
+        )
+          fail(`starting placement exceeds source-owned workers at ${id}`);
+        claim(
+          (e) =>
+            sourceActor(step, e) &&
+            /^はスタートプレイヤースペースに\d+\s*を支払ってワーカーを置いた$/.test(
+              e.rawText.slice(e.actor.length),
+            ),
+          'starting worker',
+        );
+        claimed = step.actor;
+        placements++;
+      }
+      const card =
+        move.type === 'choose' && move.choiceId.match(/^(build|monument):([^:]+)(?::|$)/);
+      if (card) {
+        const kind = card[1];
+        const cardId = card[2];
+        claim((e) => e.kind === kind && sourceActor(step, e), 'card acquisition');
+        const market = kind === 'build' ? buildings : monuments;
+        const position = market.indexOf(cardId);
+        if (position < 0) fail(`acquired card absent from public market at ${id}`);
+        market.splice(position, 1);
+        owned[step.actor][kind === 'build' ? 'buildings' : 'monuments'].push(cardId);
+        purchases++;
+      }
+      const refills = step.refills;
+      if (refills?.currentAge?.length) {
+        buildings.push(...refills.currentAge);
+        revealed += refills.currentAge.length;
+      }
+      if (refills?.age2?.length) {
+        buildings.splice(0, buildings.length, ...refills.age2);
+        revealed += refills.age2.length;
+      }
+      const publicBuildings = [...buildings, ...owned.flatMap((p) => p.buildings)];
+      if (buildings.length > 6 || new Set(publicBuildings).size !== publicBuildings.length)
+        fail(`invalid public card refill at ${id}`);
+      frameIndex++;
+    }
+    for (const event of messages)
+      if (
+        (['place', 'build', 'monument'].includes(event.kind) ||
+          (event.kind === 'gearAction' && event.detail.source === 'removal')) &&
+        !consumed.has(event)
+      )
+        fail(`source physical operation has no effective replay binding at ${id}`);
+    for (const receipt of audit.filter((a) => a.cancellation && a.actionId === id))
+      if (receipt.retainedSteps !== undefined && receipt.retainedSteps !== frameIndex)
+        fail(`cancellation retained boundary differs from effective series at ${id}`);
+    for (const event of messages.filter((e) => e.kind === 'workerGain')) {
+      const actor = initial.players.findIndex((p) => p.name === event.actor);
+      if (actor < 0 || ++workers[actor] > 6) fail(`invalid source worker increase at ${id}`);
+    }
+    for (const event of messages.filter(
+      (e) => e.kind === 'gearAction' && e.detail.gear === 'chichenItza',
+    )) {
+      const position = event.detail.actionPosition;
+      if (position < 1 || position > 9)
+        return {
+          status: 'unavailable',
+          reason: `nonliteral skull action at ${id} needs a source choice`,
+        };
+      if (skullSpaces[position] !== null) fail(`source skull cell already occupied at ${id}`);
+      const actor = initial.players.findIndex((p) => p.name === event.actor);
+      if (actor < 0) fail(`source skull actor is unknown at ${id}`);
+      skullSpaces[position] = actor;
+    }
+    for (const event of messages) {
+      if (typeof event.actor !== 'string') continue;
+      const tile = event.rawText
+        .slice(event.actor.length)
+        .match(/^は(コーン|corn|wood)タイルを獲得した$/);
+      if (!tile) continue;
+      const source = forestActions.get(event.actor);
+      if (!source) fail(`forest tile has no source box at ${id}`);
+      const box = source.box;
+      forestActions.delete(event.actor);
+      const kind = tile[1] === 'wood' ? 'wood' : 'corn';
+      if (--jungle[box][kind] < 0) fail(`source harvest exceeds remaining forest tiles at ${id}`);
+      if (jungle[box].corn < jungle[box].wood)
+        return {
+          status: 'unavailable',
+          reason: `covered-corn harvest at ${id} needs explicit burn/technology evidence`,
+        };
+    }
+    const days = calendar.find((r) => r.actionId === id)?.advancedDays ?? 0;
+    if (days) {
+      claimed = null;
+      for (let n = 0; n < days; n++)
+        for (const [gear, slots] of Object.entries(gears)) {
+          const rotated = slots.map(() => null);
+          for (const [position, worker] of slots.entries()) {
+            if (!worker) continue;
+            const next = position + 1;
+            if (worker.dummy) rotated[next % slots.length] = worker;
+            else if (next <= (gear === 'chichenItza' ? 10 : 7)) rotated[next] = worker;
+          }
+          gears[gear] = rotated;
+        }
+    }
+    compare(id);
+    const calendarReceipt = calendar.find((r) => r.actionId === id);
+    if (calendarReceipt?.foodDay != null) foodBoundary = calendarReceipt.foodDay;
+    if (foodBoundary !== null && days) {
+      boundaries.push({ actionId: id, foodDay: foodBoundary, expected: fragment() });
+      foodBoundary = null;
+    }
+  }
+  if (frameIndex !== record.steps.length)
+    fail('piece ledger did not consume the effective operation series');
+  return {
+    status: 'matched',
+    sourceMacros: groups.size,
+    placements,
+    removals,
+    purchases,
+    revealed,
+    noOpCancellationReceipts: cancellations.length,
+    boundaries,
+    limits:
+      'Card identities/reveals and no-op cancellation observations still require caller-supplied source provenance; equivalent physical copies are not identified here.',
+  };
+}
+
 /** Keep derived checks separate from the core's full-snapshot coverage contract.
  * Cancellation selection and card reveals still depend on the supplied witnesses.
  * This proof verifies a completed day-one replay only, not every unknown option. */
-export function verifySourceDerivations(events, record, report) {
+export function verifySourceDerivations(events, record, report, audit = []) {
   const last = report.frames.at(-1).snapshot.state;
   if (last.phase !== 'finished' || record.initialCheckpoint?.expected?.round !== 1)
     return {
@@ -312,6 +579,7 @@ export function verifySourceDerivations(events, record, report) {
             },
     },
     calendar: checked,
+    pieces: verifyWorkerCardLedger(events, record, report, audit, derived.receipts),
     terminalCounterConversion: record.steps
       .at(-1)
       ?.checkpoint?.expected?.players?.every(
