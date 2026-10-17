@@ -65,6 +65,13 @@ pub const INPUT_SCHEMA_V10: &str =
 pub const DATASET_SCHEMA_V10: &str =
     "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v10";
 pub const OBSERVED_MARKET_BUY_LABEL_SCOPE: &str = "PrimitivesRemovalPaidTechnologyMarketSellBuyPaidAnywhereCornBegObservedMonumentPositiveTempleCappedExtractionAndUniquePriceBuildingV10";
+pub const INPUT_SCHEMA_V11: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-source-v11";
+pub const DATASET_SCHEMA_V11: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v11";
+pub const CONDITIONAL_MARKET_EXIT_LABEL_SCOPE: &str =
+    "ObservedV10AndConditionalOrdinaryMarketExitFromFoodBoundaryV11";
+pub const MARKET_EXIT_NOTIFICATION_ASSUMPTION: &str = "SingleMarketIntervalWithoutUnobservedReentryAndCompleteActorResourceNotificationsThroughObservedFoodDay";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
 const MAX_INPUT: usize = 16 * 1024 * 1024;
@@ -129,6 +136,10 @@ struct Manifest {
     reservations: ContentPin,
     /// Captures/calibrations used by the reconstruction, retained as declarations.
     reconstruction_evidence: Vec<ContentPin>,
+    #[serde(default)]
+    market_exit_observations: Vec<ContentPin>,
+    #[serde(default)]
+    market_exit_notification_assumption: Option<String>,
 }
 fn explicit_label_scope<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -142,11 +153,26 @@ fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
 }
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
+        let exit_scope = self.schema == INPUT_SCHEMA_V11;
+        if exit_scope != !self.market_exit_observations.is_empty()
+            || self.market_exit_observations.len() > 4
+            || if exit_scope {
+                self.market_exit_notification_assumption.as_deref()
+                    != Some(MARKET_EXIT_NOTIFICATION_ASSUMPTION)
+            } else {
+                self.market_exit_notification_assumption.is_some()
+            }
+        {
+            return Err("Conditional market-exit observation/assumption contract mismatch".into());
+        }
         if self.schema == INPUT_SCHEMA_V8
             || self.schema == INPUT_SCHEMA_V9
             || self.schema == INPUT_SCHEMA_V10
+            || self.schema == INPUT_SCHEMA_V11
         {
-            let scope = if self.schema == INPUT_SCHEMA_V10 {
+            let scope = if self.schema == INPUT_SCHEMA_V11 {
+                CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
+            } else if self.schema == INPUT_SCHEMA_V10 {
                 OBSERVED_MARKET_BUY_LABEL_SCOPE
             } else if self.schema == INPUT_SCHEMA_V9 {
                 OBSERVED_BUILDING_LABEL_SCOPE
@@ -212,6 +238,7 @@ struct Sources {
     audit: Value,
     nominations: Nominations,
     reservations: Reservations,
+    exit_observations: Vec<Value>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -272,6 +299,23 @@ struct ObservedPendingChoiceSupport {
     basis: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     building_choice: Option<ObservedBuildingChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    market_exit: Option<ConditionalMarketExitSupport>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConditionalMarketExitSupport {
+    provenance: &'static str,
+    last_trade_source: u64,
+    last_trade_replay_step: usize,
+    next_observed_source: u64,
+    next_observed_actor: usize,
+    food_boundary_source: u64,
+    observed_after_food_resources: [i64; 5],
+    observed_food_payment: i64,
+    inferred_exit_resources: [i64; 5],
+    notification_assumption: &'static str,
+    silent_history_equivalence: &'static str,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1173,6 +1217,7 @@ fn observed_pending_choice_evidence(
         observed_materials: materials,
         basis: "oneObservedExplicitPendingChoiceWithExactStateTransition",
         building_choice: None,
+        market_exit: None,
     }))
 }
 
@@ -1333,6 +1378,7 @@ fn observed_building_evidence(
             architecture: *architecture,
             discount_resource: *discount_resource,
         }),
+        market_exit: None,
     }))
 }
 
@@ -1707,6 +1753,395 @@ fn market_buy_transition(index: usize, resource: Resource, report: &PublicReplay
         .get_mut(&resource)
         .unwrap() += 1;
     &expected == after
+}
+
+// Restricted inference, not a literal Skip caption. A later independently
+// supplied resource observation and one full Food Day payment invert the exit
+// resources. This assumes complete actor resource notifications after the
+// boundary. It does NOT assume a decoder-inserted Skip proves its own label.
+// Arbitrarily many silent Basic-market round trips may differ in history, but
+// conserved C+2W+3S+4G and the anchored resource vector give the same features.
+// Nested queues, intervening actor choices/cancellations and clipped feeding
+// are deliberately outside this small contract.
+fn conditional_market_exit_evidence(
+    index: usize,
+    sources: &Sources,
+    report: &PublicReplayReport,
+    actor_ids: &[String],
+) -> Result<Option<ObservedPendingChoiceSupport>, String> {
+    use tzolkin_core::public_replay::{Refills, apply_public};
+    let record = &sources.record;
+    let Some(mut previous) = index.checked_sub(1) else {
+        return Ok(None);
+    };
+    // Source-free exchange round trips may differ in history while leaving
+    // the anchored feature state unchanged. They are not additional labels.
+    while record.steps[previous].source_action_ids.is_empty() {
+        let frame = inspect_public(&report.frames[previous].snapshot.state)?;
+        let Some(o) = frame.observation else {
+            return Ok(None);
+        };
+        let Some(row) = o
+            .legal_actions
+            .iter()
+            .find(|r| r.r#move == record.steps[previous].r#move)
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            row.action,
+            TypedAction::Trade {
+                resource: Resource::Wood | Resource::Stone | Resource::Gold,
+                ..
+            }
+        ) || record.steps[previous].actor != record.steps[index].actor
+        {
+            return Ok(None);
+        }
+        let Some(prior) = previous.checked_sub(1) else {
+            return Ok(None);
+        };
+        previous = prior;
+    }
+    let Some(next_step) = record.steps.get(index + 2) else {
+        return Ok(None);
+    };
+    let before = &report.frames[index].snapshot.state;
+    let actor = before.current_player;
+    let own = &before.players[actor];
+    let Some(pending) = &before.pending else {
+        return Ok(None);
+    };
+    if !matches!(pending.task, Task::Trade)
+        || !pending.after.is_empty()
+        || own.feed_all
+        || own.feed_workers != 0
+        || own.feed_discount != 0
+        || next_step.actor == actor
+        || next_step.source_action_ids.len() != 1
+    {
+        return Ok(None);
+    }
+    let boundary = next_step.source_action_ids[0];
+    let last_source = record.steps[previous].source_action_ids.as_slice();
+    if last_source.len() != 1
+        || last_source[0] >= boundary
+        || record.steps[previous].actor != actor
+        || record.steps[index].source_action_ids != [boundary]
+        || record.steps[index + 1].source_action_ids != [boundary]
+        || [index, index + 1, index + 2]
+            .iter()
+            .any(|i| record.steps[*i].refills != Refills::default())
+    {
+        return Ok(None);
+    }
+    let last_after = &report.frames[previous + 1].snapshot.state;
+    let mut equivalent = last_after.clone();
+    equivalent.log = before.log.clone();
+    equivalent.players[actor].resources = before.players[actor].resources.clone();
+    let market_wealth = |p: &tzolkin_core::public_replay::PublicReplayPlayer| {
+        p.resources[&Resource::Corn]
+            + 2 * p.resources[&Resource::Wood]
+            + 3 * p.resources[&Resource::Stone]
+            + 4 * p.resources[&Resource::Gold]
+    };
+    if &equivalent != before
+        || last_after.players[actor].resources[&Resource::Skull] != own.resources[&Resource::Skull]
+        || market_wealth(&last_after.players[actor]) != market_wealth(own)
+    {
+        return Ok(None);
+    }
+    let observation = inspect_public(before)?
+        .observation
+        .ok_or("Missing exit observation")?;
+    if observation.legal_actions.iter().any(|row| {
+        !matches!(
+            row.action,
+            TypedAction::Skip
+                | TypedAction::Trade {
+                    resource: Resource::Wood | Resource::Stone | Resource::Gold,
+                    ..
+                }
+        )
+    }) {
+        return Ok(None);
+    }
+    let Some(skip) = observation
+        .legal_actions
+        .iter()
+        .find(|row| row.action == TypedAction::Skip)
+    else {
+        return Ok(None);
+    };
+    if observation.legal_actions.len() < 2 || skip.r#move != record.steps[index].r#move {
+        return Ok(None);
+    }
+    let skipped = apply_public(before, actor, skip.r#move.clone(), &Refills::default())?;
+    if skipped.snapshot.state.pending.is_some() {
+        return Ok(None);
+    }
+    let after_skip = skipped
+        .observation
+        .as_ref()
+        .ok_or("Missing ordinary exit continuation")?;
+    let endings = after_skip
+        .legal_actions
+        .iter()
+        .filter(|row| {
+            matches!(
+                row.action,
+                TypedAction::EndTurn {
+                    double_advance: None
+                }
+            )
+        })
+        .collect::<Vec<_>>();
+    if endings.len() != 1
+        || endings[0].r#move != record.steps[index + 1].r#move
+        || record.steps[index + 1].actor != actor
+    {
+        return Ok(None);
+    }
+    let ended = apply_public(
+        &skipped.snapshot.state,
+        actor,
+        endings[0].r#move.clone(),
+        &Refills::default(),
+    )?;
+    if ended.snapshot.state.current_player != next_step.actor
+        || ended.snapshot.state.round != before.round
+    {
+        return Ok(None);
+    }
+    let next_o = ended
+        .observation
+        .as_ref()
+        .ok_or("Missing following actor observation")?;
+    let Some(next) = next_o
+        .legal_actions
+        .iter()
+        .find(|row| row.r#move == next_step.r#move)
+    else {
+        return Ok(None);
+    };
+    let audits = array(&sources.audit, "audit")?;
+    let audit_for = |i: usize, action: &TypedAction| -> Result<Option<&Value>, String> {
+        let typed = serde_json::to_value(action).map_err(|e| e.to_string())?;
+        let rows = audits
+            .iter()
+            .filter(|a| {
+                a["step"].as_u64() == Some(i as u64 + 1)
+                    && a["actor"].as_u64() == Some(record.steps[i].actor as u64)
+                    && a["actionId"].as_u64() == record.steps[i].source_action_ids.first().copied()
+                    && a["action"] == typed
+            })
+            .collect::<Vec<_>>();
+        Ok((rows.len() == 1).then(|| rows[0]))
+    };
+    let last_o = inspect_public(&report.frames[previous].snapshot.state)?
+        .observation
+        .ok_or("Missing last Trade observation")?;
+    let Some(last) = last_o
+        .legal_actions
+        .iter()
+        .find(|row| row.r#move == record.steps[previous].r#move)
+    else {
+        return Ok(None);
+    };
+    let TypedAction::Trade { resource, buy } = last.action else {
+        return Ok(None);
+    };
+    if !audit_for(previous, &last.action)?.is_some_and(observed_audit)
+        || !audit_for(index + 2, &next.action)?.is_some_and(observed_audit)
+    {
+        return Ok(None);
+    }
+    let nodes = array(&sources.raw, "dom_entries")?;
+    if nodes.iter().any(|n| {
+        n["action_id"]
+            .as_u64()
+            .is_some_and(|s| s > last_source[0] && s < boundary)
+    }) {
+        return Ok(None);
+    }
+    let Some(last_messages) = nodes
+        .iter()
+        .find(|n| n["action_id"].as_u64() == Some(last_source[0]))
+        .and_then(|n| n["messages"].as_array())
+    else {
+        return Ok(None);
+    };
+    if last_messages.len() != 1
+        || if buy {
+            !market_buy_caption(
+                &last_messages[0],
+                &own.name,
+                resource,
+                sources.raw["schema_version"] == 1,
+            )
+        } else {
+            !market_sell_caption(
+                &last_messages[0],
+                &own.name,
+                resource,
+                match resource {
+                    Resource::Wood => 2,
+                    Resource::Stone => 3,
+                    Resource::Gold => 4,
+                    _ => return Ok(None),
+                },
+                sources.raw["schema_version"] == 1,
+            )
+        }
+    {
+        return Ok(None);
+    }
+    let Some(boundary_messages) = nodes
+        .iter()
+        .find(|n| n["action_id"].as_u64() == Some(boundary))
+        .and_then(|n| n["messages"].as_array())
+    else {
+        return Ok(None);
+    };
+    let matching = boundary_messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m["raw_text"].as_str().is_some_and(|text| {
+                observed_label(text, &before.players[next_step.actor].name, &next.action)
+            })
+        })
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Ok(None);
+    }
+    let mut supports = Vec::new();
+    for observed in &sources.exit_observations {
+        let Some(food_source) = observed["sourceActionId"].as_u64() else {
+            continue;
+        };
+        if food_source <= boundary
+            || observed["tableId"] != sources.audit["tableId"]
+            || observed["uiMove"].as_u64() != Some(food_source)
+            || observed["schema"] != "private-public-food-boundary-observation-v1"
+        {
+            continue;
+        }
+        let Some(end) = record
+            .steps
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.source_action_ids.contains(&food_source))
+            .map(|(i, _)| i + 1)
+            .last()
+        else {
+            continue;
+        };
+        let at = &report.frames[end].snapshot.state;
+        if at.food_days.len() != before.food_days.len() + 1
+            || !at.food_days.starts_with(&before.food_days)
+            || observed["uiDay"].as_i64() != Some(at.round)
+            || record.steps[index + 2..end]
+                .iter()
+                .any(|s| s.actor == actor)
+        {
+            continue;
+        }
+        let Some(players) = observed["players"].as_array() else {
+            continue;
+        };
+        let rows = players
+            .iter()
+            .filter(|p| p["id"].as_str() == Some(actor_ids[actor].as_str()))
+            .collect::<Vec<_>>();
+        if rows.len() != 1 {
+            continue;
+        }
+        let Some(values) = rows[0]["resources"].as_array().filter(|v| v.len() == 5) else {
+            continue;
+        };
+        let Some(resources) = values.iter().map(Value::as_i64).collect::<Option<Vec<_>>>() else {
+            continue;
+        };
+        if resources.iter().any(|n| !(0..=1_000_000).contains(n)) || resources[0] == 0 {
+            continue;
+        }
+        let resources: [i64; 5] = resources.try_into().unwrap();
+        let paid = own.workers * 2;
+        let prefix = format!("食料供給日: {}はワーカー{}個で ", own.name, own.workers);
+        let expected_html =
+            format!("{prefix}{paid} <div class=\"tz_icon resource_corn\"></div>を支払った");
+        let mut feeding = 0;
+        let mut refused = false;
+        for node in nodes.iter().filter(|n| {
+            n["action_id"]
+                .as_u64()
+                .is_some_and(|s| s > last_source[0] && s <= food_source)
+        }) {
+            for message in array(node, "messages")? {
+                let text = string(message, "raw_text")?;
+                if text.ends_with("は行動をキャンセルした") {
+                    refused = true;
+                    break;
+                }
+                if !text.contains(&own.name) {
+                    continue;
+                }
+                let is_food = node["action_id"].as_u64() == Some(food_source)
+                    && text
+                        .strip_prefix(&prefix)
+                        .and_then(|s| s.strip_suffix("を支払った"))
+                        .is_some_and(|s| s.trim() == paid.to_string())
+                    && message["html"].as_str() == Some(expected_html.as_str())
+                    && message["icons"].as_array().is_some_and(Vec::is_empty);
+                if is_food {
+                    feeding += 1;
+                    continue;
+                }
+                let faith_prefix = format!("{}は信仰により", own.name);
+                let score = text
+                    .strip_prefix(&faith_prefix)
+                    .and_then(|s| s.strip_suffix("点を獲得した"))
+                    .and_then(|s| s.parse::<i64>().ok());
+                if node["action_id"].as_u64() == Some(food_source)
+                    && score.is_some_and(|n| (-200..=200).contains(&n))
+                    && plain_caption(message, text)
+                {
+                    continue;
+                }
+                refused = true;
+            }
+        }
+        if refused || feeding != 1 {
+            continue;
+        }
+        let mut inferred = resources;
+        inferred[0] += paid;
+        let actual = RESOURCE_IDS.map(|r| own.resources[&r]);
+        if inferred != actual {
+            continue;
+        }
+        supports.push(ConditionalMarketExitSupport {
+            provenance:"conditionalResourceAnchoredOrdinaryMarketExitNotDirectCaption",
+            last_trade_source:last_source[0],last_trade_replay_step:previous,next_observed_source:boundary,next_observed_actor:next_step.actor,
+            food_boundary_source:food_source,observed_after_food_resources:resources,observed_food_payment:paid,inferred_exit_resources:inferred,
+            notification_assumption:MARKET_EXIT_NOTIFICATION_ASSUMPTION,
+            silent_history_equivalence:"any Basic-market history with the same anchored resource vector and unchanged non-log state; no finite-search uniqueness claim",
+        });
+    }
+    if supports.len() != 1 {
+        return Ok(None);
+    }
+    Ok(Some(ObservedPendingChoiceSupport {
+        kind: "marketExitDerived",
+        source_message_index: matching[0],
+        material_message_indices: vec![],
+        observed_materials: [0; 5],
+        basis: "independentFoodResourceObservationAndLiteralPaymentUnderExplicitCompleteActorNotificationAssumption",
+        building_choice: None,
+        market_exit: supports.pop(),
+    }))
 }
 
 fn paid_technology_evidence(
@@ -2434,7 +2869,8 @@ impl ConditionalHumanPolicyDataset {
         manifest.scope()?;
         if (manifest.schema == INPUT_SCHEMA_V8
             || manifest.schema == INPUT_SCHEMA_V9
-            || manifest.schema == INPUT_SCHEMA_V10)
+            || manifest.schema == INPUT_SCHEMA_V10
+            || manifest.schema == INPUT_SCHEMA_V11)
             != (feature_profile == ConditionalFeatureProfile::SemanticPlaying4)
         {
             return Err("Conditional source requires its explicit feature-profile loader".into());
@@ -2474,6 +2910,7 @@ impl ConditionalHumanPolicyDataset {
         ]
         .into_iter()
         .chain(manifest.reconstruction_evidence.iter().cloned())
+        .chain(manifest.market_exit_observations.iter().cloned())
         .collect::<Vec<_>>();
         let mut loaded = Vec::new();
         let mut total = 0usize;
@@ -2493,7 +2930,25 @@ impl ConditionalHumanPolicyDataset {
             audit: unique_json(&loaded[2], MAX_INPUT)?,
             nominations: parse(&loaded[3])?,
             reservations: parse(&loaded[4])?,
+            exit_observations: loaded
+                .iter()
+                .skip(5 + manifest.reconstruction_evidence.len())
+                .map(|bytes| unique_json(bytes, MAX_INPUT))
+                .collect::<Result<_, _>>()?,
         };
+        let mut exit_boundary_ids = BTreeSet::new();
+        for point in &sources.exit_observations {
+            let id = point["sourceActionId"]
+                .as_u64()
+                .ok_or("Missing market-exit resource boundary")?;
+            if point["schema"] != "private-public-food-boundary-observation-v1"
+                || point["tableId"] != manifest.table_id
+                || point["uiMove"].as_u64() != Some(id)
+                || !exit_boundary_ids.insert(id)
+            {
+                return Err("Conflicting market-exit resource observations".into());
+            }
+        }
         let public = Self::produce_using(
             &manifest,
             &sources,
@@ -2584,6 +3039,7 @@ impl ConditionalHumanPolicyDataset {
             audit,
             nominations,
             reservations,
+            ..
         } = sources;
         if nominations.schema != NOMINATION_SCHEMA
             || nominations.basis != "userNominatedHistoricalArenaTop5"
@@ -2708,6 +3164,7 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && matches!(row.action, TypedAction::Beg)
             {
@@ -2772,6 +3229,7 @@ impl ConditionalHumanPolicyDataset {
                     CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && row.action
                 == (TypedAction::Technology {
@@ -2889,6 +3347,7 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && let TypedAction::Technology { technology } = row.action
             {
@@ -2984,6 +3443,9 @@ impl ConditionalHumanPolicyDataset {
                 paid_payment_steps.insert(index + 1);
                 continue;
             }
+            let inferred_exit = label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)
+                && matches!(row.action, TypedAction::Skip)
+                && matches!(observation.pending_task, Some(Task::Trade));
             let strategic = matches!(
                 label_scope,
                 Some(
@@ -2991,17 +3453,24 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && (matches!(
                 row.action,
                 TypedAction::Monument { .. } | TypedAction::Temple { direction: 1, .. }
             ) || (matches!(
                 label_scope,
-                Some(OBSERVED_BUILDING_LABEL_SCOPE | OBSERVED_MARKET_BUY_LABEL_SCOPE)
-            ) && matches!(row.action, TypedAction::Build { .. })));
+                Some(
+                    OBSERVED_BUILDING_LABEL_SCOPE
+                        | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
+                )
+            ) && matches!(row.action, TypedAction::Build { .. })))
+                || inferred_exit;
             let pending_support = if strategic {
-                let evidence = if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry)
-                {
+                let evidence = if teachers.contains(&actor_ids[step.actor]) && inferred_exit {
+                    conditional_market_exit_evidence(index, sources, &report, &actor_ids)?
+                } else if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry) {
                     if matches!(row.action, TypedAction::Build { .. }) {
                         observed_building_evidence(index, &row.action, sources, &report)?
                     } else {
@@ -3013,7 +3482,14 @@ impl ConditionalHumanPolicyDataset {
                 let Some(evidence) = evidence else {
                     *counts
                         .excluded
-                        .entry("unobservedPendingChoice".into())
+                        .entry(
+                            if inferred_exit {
+                                "unobservedConditionalMarketExit"
+                            } else {
+                                "unobservedPendingChoice"
+                            }
+                            .into(),
+                        )
                         .or_default() += 1;
                     continue;
                 };
@@ -3038,6 +3514,7 @@ impl ConditionalHumanPolicyDataset {
                         | CAPPED_EXTRACTION_LABEL_SCOPE
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
+                        | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && (matches!(
                 row.action,
@@ -3049,14 +3526,16 @@ impl ConditionalHumanPolicyDataset {
                     corn_cost: 1,
                     ..
                 }
-            ) || (label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE)
-                && matches!(
-                    row.action,
-                    TypedAction::Trade {
-                        resource: Resource::Wood | Resource::Stone | Resource::Gold,
-                        buy: true
-                    }
-                )));
+            ) || (matches!(
+                label_scope,
+                Some(OBSERVED_MARKET_BUY_LABEL_SCOPE | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)
+            ) && matches!(
+                row.action,
+                TypedAction::Trade {
+                    resource: Resource::Wood | Resource::Stone | Resource::Gold,
+                    buy: true
+                }
+            )));
 
             let reason = if !factorized
                 && !explicit
@@ -3070,7 +3549,7 @@ impl ConditionalHumanPolicyDataset {
                 Some("outsideExplicitPrimitiveScope")
             } else if !teachers.contains(&actor_ids[step.actor]) {
                 Some("notNominated")
-            } else if entry["derivedFromVisibleBoundary"] != false {
+            } else if entry["derivedFromVisibleBoundary"] != false && !inferred_exit {
                 Some("inferredOrUnspecifiedLabel")
             } else if entry.get("cancellation").is_some() || entry.get("removedSteps").is_some() {
                 Some("cancelledOrRollbackLabel")
@@ -3191,6 +3670,9 @@ impl ConditionalHumanPolicyDataset {
                 .iter()
                 .enumerate()
                 .filter(|(message_index, text)| {
+                    if inferred_exit {
+                        return pending_support.as_ref().is_some_and(|support| *message_index == support.source_message_index);
+                    }
                     let source_actor = record
                         .initial
                         .players
@@ -3215,7 +3697,7 @@ impl ConditionalHumanPolicyDataset {
                                         - before.players[step.actor].resources[&Resource::Corn];
                                     market_sell_caption(message, name, resource, corn, sources.raw["schema_version"] == 1)
                                 }
-                                TypedAction::Trade { resource, buy: true } if label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) => {
+                                TypedAction::Trade { resource, buy: true } if matches!(label_scope, Some(OBSERVED_MARKET_BUY_LABEL_SCOPE | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)) => {
                                     market_buy_caption(message, name, resource, sources.raw["schema_version"] == 1)
                                         && market_buy_transition(index, resource, &report)
                                 }
@@ -3552,7 +4034,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
+                DATASET_SCHEMA_V11
+            } else if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
                 DATASET_SCHEMA_V10
             } else if self.label_scope == Some(OBSERVED_BUILDING_LABEL_SCOPE) {
                 DATASET_SCHEMA_V9
@@ -3585,7 +4069,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
+                "observedV10LabelsAndExplicitlyConditionalFoodAnchoredMarketExits"
+            } else if self.label_scope == Some(OBSERVED_MARKET_BUY_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithUniquePriceBuildingAndExactMarketBuyChoices"
             } else if self.label_scope == Some(OBSERVED_BUILDING_LABEL_SCOPE) {
                 "originalVisibleTextAndFinalAppliedStepAuditWithUniquePriceBuildingChoices"
