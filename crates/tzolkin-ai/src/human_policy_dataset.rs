@@ -154,7 +154,7 @@ fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
         let exit_scope = self.schema == INPUT_SCHEMA_V11;
-        if exit_scope != !self.market_exit_observations.is_empty()
+        if exit_scope == self.market_exit_observations.is_empty()
             || self.market_exit_observations.len() > 4
             || if exit_scope {
                 self.market_exit_notification_assumption.as_deref()
@@ -2034,7 +2034,7 @@ fn conditional_market_exit_evidence(
             .enumerate()
             .filter(|(_, s)| s.source_action_ids.contains(&food_source))
             .map(|(i, _)| i + 1)
-            .last()
+            .next_back()
         else {
             continue;
         };
