@@ -3454,6 +3454,7 @@ function deferredAnyActionFixture(
   change = () => {},
   alter = () => {},
   nested = false,
+  immediateResources = false,
 ) {
   const f = deferredTradeFixture();
   f.before.snapshot.state.buildings = ['b18', 'b21'];
@@ -3492,7 +3493,7 @@ function deferredAnyActionFixture(
     let next;
     let stage;
     if (
-      !['action-purchase', 'any:tikal:4', 'monument:m01'].includes(choice) &&
+      !['action-purchase', 'any:tikal:4', 'any:yaxchilan:5', 'monument:m01'].includes(choice) &&
       !(
         nested &&
         [
@@ -3550,7 +3551,20 @@ function deferredAnyActionFixture(
           },
           { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
         ];
+        if (immediateResources) {
+          next.observation.legalActions[0].action.gear = 'yaxchilan';
+          next.observation.legalActions[0].action.position = 5;
+          next.observation.legalActions[0].move.choiceId = 'any:yaxchilan:5';
+        }
         stage = 'purchase';
+      } else if (choice === 'any:yaxchilan:5') {
+        own.resources.corn += 1; // Pay one, receive two.
+        own.resources.stone++;
+        own.resources.gold++;
+        own.score += 2;
+        state.pending = null;
+        next.observation.legalActions = [];
+        stage = 'immediateResources';
       } else if (choice === 'any:tikal:4') {
         own.resources.corn--;
         state.pending.task = {
@@ -3802,6 +3816,41 @@ function deferredAnyActionFixture(
       f.value.witness.witnesses.find((w) => w.actionId === 11).buildings = ['b27'];
     }
   }
+  if (immediateResources) {
+    const retainedWitnesses = f.value.witness.witnesses.filter((w) => w.actionId < 10);
+    replaceEvents(f.value, [
+      ...rows.filter(([id]) => id < 10),
+      [
+        10,
+        [
+          { raw_text: 'Aはコーン1個を支払ってYaxchilan n°5のアクションを行った' },
+          ...[
+            ['corn', 2],
+            ['stone', 1],
+            ['gold', 1],
+          ].map(([resource, n]) => ({
+            raw_text: `Aは${n === 1 ? '' : n}\nを獲得した`,
+            icons: [{ classes: `tz_icon resource_${resource}` }],
+          })),
+        ],
+      ],
+    ]);
+    f.value.witness.witnesses = [
+      ...retainedWitnesses,
+      {
+        actionId: 10,
+        pendingTask: null,
+        expected: {
+          players: [
+            { resources: { ...resources, corn: 18, stone: 2, gold: 3 }, score: 15 },
+            {},
+            {},
+            {},
+          ],
+        },
+      },
+    ];
+  }
   change(f.value);
   for (const row of f.value.raw.dom_entries) {
     f.value.raw.entries.find((entry) => entry.action_id === row.action_id).raw_text = row.messages
@@ -3814,6 +3863,36 @@ function deferredAnyActionFixture(
   }
   return { value: f.value, dispatch: dispatcher(f.initial, apply) };
 }
+
+test('delivers outer fixed points only through the observed immediate resource action', () => {
+  const fixture = (alter = () => {}, change = () => {}) =>
+    deferredAnyActionFixture(false, change, alter, false, true);
+  const f = fixture();
+  const result = decode(f.value, f.dispatch);
+  assert.equal(result.manifest.blocked, null);
+  assert.equal(
+    result.manifest.audit.find((row) => row.continuation === 'anyActionResources').amount,
+    2,
+  );
+  for (const bad of [
+    fixture((next, stage) => {
+      if (stage === 'immediateResources') next.snapshot.state.players[1].resources.gold++;
+    }),
+    fixture((next, stage) => {
+      if (stage === 'immediateResources') next.snapshot.state.players[0].score++;
+    }),
+    fixture(undefined, (v) => {
+      v.raw.dom_entries.find((row) => row.action_id === 10).messages.pop();
+    }),
+  ]) {
+    const refused = decode(bad.value, bad.dispatch);
+    assert.equal(refused.manifest.blocked.actionId, 9);
+    assert.deepEqual(
+      refused.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+    );
+  }
+});
 
 test('retains outer Points through two immediately settled buildings', () => {
   const f = deferredAnyActionFixture(false, undefined, undefined, 'settled');

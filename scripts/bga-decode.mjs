@@ -1787,6 +1787,46 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       };
       return;
     }
+    if (
+      receipt.stage === 'anyAction' &&
+      action.type === 'useAction' &&
+      action.source === 'anywhere' &&
+      action.gear === 'yaxchilan' &&
+      action.position === 5 &&
+      action.cornCost === 1
+    ) {
+      const events = context.events;
+      const selected = events[0];
+      const gains = events.slice(1);
+      const expected = mechanical(before);
+      expected.players[receipt.actor].resources.corn--;
+      for (const gain of gains)
+        for (const [i, resource] of RESOURCES.entries())
+          expected.players[receipt.actor].resources[resource] += resourceAmounts(gain)[i];
+      expected.players[receipt.actor].score += receipt.amount;
+      expected.pending = null;
+      if (
+        selected?.kind !== 'gearAction' ||
+        selected.detail.source !== 'selectedAction' ||
+        selected.detail.gear !== action.gear ||
+        selected.detail.actionPosition !== action.position ||
+        selected.detail.cornCost !== action.cornCost ||
+        gains.length !== 3 ||
+        gains.some(
+          (event) => event.kind !== 'resourceGain' || actorId(event.actor) !== receipt.actor,
+        ) ||
+        !same(mechanical(next), expected) ||
+        nextFrame.observation.pendingTask !== null
+      )
+        fail('Deferred resource action requires its exact three gains and isolated fixed points');
+      deferredScore = {
+        ...receipt,
+        stage: 'complete',
+        continuation: 'anyActionResources',
+        pending: null,
+      };
+      return;
+    }
     const anywhere = receipt.stage === 'anyAction';
     const validAction = anywhere
       ? action.type === 'useAction' &&
@@ -3156,14 +3196,24 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           fail('Deferred purchase requires the same actor and unchanged continuation');
         if (deferredScore.kind === 'action') {
           const operation = events.find((event) => event.kind !== 'resourcePayment');
+          const immediateResources =
+            operation === events[0] &&
+            operation?.kind === 'gearAction' &&
+            operation.detail.source === 'selectedAction' &&
+            operation.detail.gear === 'yaxchilan' &&
+            operation.detail.actionPosition === 5 &&
+            operation.detail.cornCost === 1 &&
+            events.length === 4 &&
+            events.slice(1).every((event) => event.kind === 'resourceGain');
           if (
             deferredScore.stage === 'anyAction'
-              ? events.length !== 1 ||
-                operation?.kind !== 'gearAction' ||
-                operation.detail.source !== 'selectedAction' ||
-                operation.detail.gear !== 'tikal' ||
-                operation.detail.actionPosition !== 4 ||
-                operation.detail.cornCost !== 1
+              ? !immediateResources &&
+                (events.length !== 1 ||
+                  operation?.kind !== 'gearAction' ||
+                  operation.detail.source !== 'selectedAction' ||
+                  operation.detail.gear !== 'tikal' ||
+                  operation.detail.actionPosition !== 4 ||
+                  operation.detail.cornCost !== 1)
               : deferredScore.stage === 'nested'
                 ? !queuedPurchaseEvents(events)
                 : deferredScore.stage !== 'build' ||
