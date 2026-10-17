@@ -17,7 +17,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use tzolkin_core::observation::{
-    ActionSource, LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, TypedAction,
+    ActionSource, HarvestKind, LegalAction, MOVE_SCHEMA, OBSERVATION_SCHEMA, TypedAction,
 };
 use tzolkin_core::public_replay::{
     PUBLIC_RULES_VERSION, PublicReplayRecord, PublicReplayReport, inspect_public,
@@ -77,6 +77,12 @@ pub const DATASET_SCHEMA_V12: &str =
     "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v12";
 pub const OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE: &str =
     "ObservedV10AndTheologyAheadOfferingAndChichenResourceChoicesV12";
+pub const INPUT_SCHEMA_V13: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-source-v13";
+pub const DATASET_SCHEMA_V13: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v13";
+pub const OBSERVED_HARVEST_ROTATION_LABEL_SCOPE: &str =
+    "ObservedV12AndLiteralHarvestAndSourceAnchoredRotationV13";
 pub const MARKET_EXIT_NOTIFICATION_ASSUMPTION: &str = "SingleMarketIntervalWithoutUnobservedReentryAndCompleteActorResourceNotificationsThroughObservedFoodDay";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
@@ -146,6 +152,8 @@ struct Manifest {
     market_exit_observations: Vec<ContentPin>,
     #[serde(default)]
     market_exit_notification_assumption: Option<String>,
+    #[serde(default)]
+    rotation_observations: Vec<ContentPin>,
 }
 fn explicit_label_scope<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -159,6 +167,11 @@ fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
 }
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
+        if self.rotation_observations.len() > 8
+            || (self.schema != INPUT_SCHEMA_V13 && !self.rotation_observations.is_empty())
+        {
+            return Err("Rotation observations require their explicit source scope".into());
+        }
         let exit_scope = self.schema == INPUT_SCHEMA_V11;
         if exit_scope == self.market_exit_observations.is_empty()
             || self.market_exit_observations.len() > 4
@@ -176,8 +189,11 @@ impl Manifest {
             || self.schema == INPUT_SCHEMA_V10
             || self.schema == INPUT_SCHEMA_V11
             || self.schema == INPUT_SCHEMA_V12
+            || self.schema == INPUT_SCHEMA_V13
         {
-            let scope = if self.schema == INPUT_SCHEMA_V12 {
+            let scope = if self.schema == INPUT_SCHEMA_V13 {
+                OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
+            } else if self.schema == INPUT_SCHEMA_V12 {
                 OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
             } else if self.schema == INPUT_SCHEMA_V11 {
                 CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
@@ -248,6 +264,7 @@ struct Sources {
     nominations: Nominations,
     reservations: Reservations,
     exit_observations: Vec<Value>,
+    rotation_observations: Vec<Value>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -310,6 +327,18 @@ struct ObservedPendingChoiceSupport {
     building_choice: Option<ObservedBuildingChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     market_exit: Option<ConditionalMarketExitSupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    calendar_context: Option<RotationCalendarSupport>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RotationCalendarSupport {
+    before_ui_move: u64,
+    before_day: i64,
+    after_ui_move: u64,
+    after_day: i64,
+    rotation_source: u64,
+    observed_rotation_events: usize,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1191,6 +1220,423 @@ fn observed_theology_choice_evidence(
         basis,
         building_choice: None,
         market_exit: None,
+        calendar_context: None,
+    }))
+}
+
+fn literal_gain_caption(
+    message: &Value,
+    name: &str,
+    resource: &str,
+    quantity: i64,
+    current_format: bool,
+) -> bool {
+    if !(1..=32).contains(&quantity) {
+        return false;
+    }
+    let Some(text) = message["raw_text"]
+        .as_str()
+        .and_then(|s| s.strip_prefix(&format!("{name}は")))
+        .and_then(|s| s.strip_suffix("を獲得した"))
+    else {
+        return false;
+    };
+    let Some(html) = message["html"].as_str() else {
+        return false;
+    };
+    let Some(icons) = message["icons"].as_array() else {
+        return false;
+    };
+    let class = format!("tz_icon resource_{resource}");
+    let icon = format!("<div class=\"{class}\"></div>");
+    let repeated = text.trim().is_empty()
+        && html == format!("{name}は{}を獲得した", icon.repeat(quantity as usize));
+    let numbered = text.trim() == quantity.to_string()
+        && ["", " "]
+            .iter()
+            .any(|space| html == format!("{name}は{quantity}{space}{icon}を獲得した"));
+    (repeated || numbered)
+        && (icons.is_empty()
+            || (icons.len() == if repeated { quantity as usize } else { 1 }
+                && icons.iter().all(|i| {
+                    i[if current_format { "class" } else { "classes" }].as_str()
+                        == Some(class.as_str())
+                })))
+}
+
+// V13 binds literal tile harvests and source-anchored rotations. An anonymous
+// advance needs independent day bounds and a unique calendar event as well as
+// the named worker return; absence of a double-advance caption is insufficient.
+fn observed_harvest_rotation_evidence(
+    index: usize,
+    action: &TypedAction,
+    sources: &Sources,
+    report: &PublicReplayReport,
+) -> Result<Option<ObservedPendingChoiceSupport>, String> {
+    let step = &sources.record.steps[index];
+    let before = &report.frames[index].snapshot.state;
+    let after = &report.frames[index + 1].snapshot.state;
+    let Some(pending) = &before.pending else {
+        return Ok(None);
+    };
+    let frame = inspect_public(before)?;
+    let o = frame
+        .observation
+        .as_ref()
+        .ok_or("Missing harvest/rotation observation")?;
+    if !matches!(before.players.len(), 3 | 4)
+        || before.additional_buildings
+        || !pending.after.is_empty()
+        || step.refills != Default::default()
+        || o.legal_actions.len() < 2
+    {
+        return Ok(None);
+    }
+    let name = &before.players[step.actor].name;
+    let nodes = sources.raw["dom_entries"]
+        .as_array()
+        .ok_or("Missing harvest/rotation source")?;
+    let messages = nodes
+        .iter()
+        .find(|n| n["action_id"].as_u64() == Some(step.source_action_ids[0]))
+        .and_then(|n| n["messages"].as_array())
+        .ok_or("Missing harvest/rotation messages")?;
+    let mut expected = before.clone();
+    expected.log = after.log.clone();
+    let mut materials = [0; 5];
+    let mut calendar_context = None;
+    let (kind, source_message_index, material_message_indices, basis) = match action {
+        TypedAction::Harvest { kind, position } => {
+            if !matches!(pending.task, Task::Palenque { position: p } if p == *position) {
+                return Ok(None);
+            }
+            let Some(cell) = before.jungle.get(position) else {
+                return Ok(None);
+            };
+            let (resource, label, quantity) = match kind {
+                HarvestKind::Wood if cell.wood > 0 => (
+                    Resource::Wood,
+                    "wood",
+                    tzolkin_core::engine::palenque_wood_quantity(
+                        *position,
+                        before.players[step.actor].technologies[&TechnologyId::Extraction] >= 1,
+                    ),
+                ),
+                HarvestKind::Corn if cell.corn > 0 && cell.wood == 0 => (
+                    Resource::Corn,
+                    "corn",
+                    tzolkin_core::engine::palenque_corn_quantity(
+                        *position,
+                        before.players[step.actor].technologies[&TechnologyId::Agriculture],
+                    )
+                    .ok_or("Invalid corn position")?,
+                ),
+                _ => return Ok(None), // Burn/emptyCorn need different original evidence.
+            };
+            let Some(previous_index) = index.checked_sub(1) else {
+                return Ok(None);
+            };
+            let previous = &sources.record.steps[previous_index];
+            let prior_frame = inspect_public(&report.frames[previous_index].snapshot.state)?;
+            let prior_o = prior_frame
+                .observation
+                .as_ref()
+                .ok_or("Missing Palenque origin")?;
+            let Some(prior) = prior_o
+                .legal_actions
+                .iter()
+                .find(|r| r.r#move == previous.r#move)
+            else {
+                return Ok(None);
+            };
+            let TypedAction::UseAction {
+                gear: GearId::Palenque,
+                position: prior_pos,
+                corn_cost,
+                source: ActionSource::CurrentGear,
+            } = prior.action
+            else {
+                return Ok(None);
+            };
+            if previous.actor != step.actor
+                || previous.source_action_ids.len() != 1
+                || prior_pos != *position
+                || previous.refills != Default::default()
+            {
+                return Ok(None);
+            }
+            let prior_action = serde_json::to_value(&prior.action).map_err(|e| e.to_string())?;
+            let audits = sources.audit["audit"]
+                .as_array()
+                .ok_or("Missing Palenque audit")?
+                .iter()
+                .filter(|a| {
+                    a["step"].as_u64() == Some(index as u64)
+                        && a["actionId"].as_u64() == Some(previous.source_action_ids[0])
+                        && a["actor"].as_u64() == Some(step.actor as u64)
+                        && a["action"] == prior_action
+                })
+                .collect::<Vec<_>>();
+            if audits.len() != 1 || !observed_audit(audits[0]) {
+                return Ok(None);
+            }
+            let prior_messages = nodes
+                .iter()
+                .find(|n| n["action_id"].as_u64() == Some(previous.source_action_ids[0]))
+                .and_then(|n| n["messages"].as_array())
+                .ok_or("Missing Palenque caption")?;
+            let captions = prior_messages
+                .iter()
+                .filter_map(|m| m["raw_text"].as_str())
+                .filter_map(|s| removal_action_caption(s, name))
+                .filter(|c| {
+                    c.gear == GearId::Palenque
+                        && c.action_position == *position
+                        && c.corn_cost == corn_cost
+                })
+                .collect::<Vec<_>>();
+            if captions.len() != 1
+                || prior_messages.iter().any(|m| {
+                    m["raw_text"]
+                        .as_str()
+                        .is_some_and(|s| s.ends_with("は行動をキャンセルした"))
+                })
+            {
+                return Ok(None);
+            }
+            let mut tile = None;
+            let mut gain = None;
+            for (i, message) in messages.iter().enumerate() {
+                let tile_match = if resource == Resource::Wood {
+                    plain_caption(message, &format!("{name}はwoodタイルを獲得した"))
+                } else {
+                    ["corn", "コーン"].iter().any(|word| {
+                        plain_caption(message, &format!("{name}は{word}タイルを獲得した"))
+                    })
+                };
+                if tile_match {
+                    if tile.replace(i).is_some() {
+                        return Ok(None);
+                    }
+                } else if literal_gain_caption(
+                    message,
+                    name,
+                    label,
+                    quantity,
+                    sources.raw["schema_version"] == 1,
+                ) {
+                    if gain.replace(i).is_some() {
+                        return Ok(None);
+                    }
+                } else if previous.source_action_ids == step.source_action_ids
+                    && message["raw_text"]
+                        .as_str()
+                        .and_then(|s| removal_action_caption(s, name))
+                        .is_some_and(|c| {
+                            c.gear == GearId::Palenque
+                                && c.removed_position == captions[0].removed_position
+                                && c.action_position == *position
+                                && c.corn_cost == corn_cost
+                        })
+                {
+                    if i != 0 {
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            }
+            let (Some(tile), Some(gain)) = (tile, gain) else {
+                return Ok(None);
+            };
+            if tile >= gain {
+                return Ok(None);
+            }
+            if resource == Resource::Wood {
+                expected.jungle.get_mut(position).unwrap().wood -= 1;
+                expected.players[step.actor].wood_tiles += 1;
+            } else {
+                expected.jungle.get_mut(position).unwrap().corn -= 1;
+                expected.players[step.actor].corn_tiles += 1;
+            }
+            *expected.players[step.actor]
+                .resources
+                .get_mut(&resource)
+                .ok_or("Missing harvest resource")? += quantity;
+            expected.pending = None;
+            materials[RESOURCE_IDS.iter().position(|r| *r == resource).unwrap()] = quantity;
+            (
+                "harvest",
+                tile,
+                vec![gain],
+                "oneObservedLiteralHarvestTileAndGainWithExactTransition",
+            )
+        }
+        TypedAction::Rotate {
+            days: days @ (1 | 2),
+        } => {
+            if !matches!(pending.task, Task::Rotation)
+                || before.first_player_claimed != Some(step.actor)
+                || (*days == 2 && !before.players[step.actor].double_advance_available)
+                || before.round + *days > 27
+                || before.food_days.contains(&27)
+                || messages.len() != 2
+                || !plain_caption(
+                    &messages[0],
+                    &if *days == 2 {
+                        format!("{name}は歯車を高速化し2段階回した!")
+                    } else {
+                        "歯車が進んだ".into()
+                    },
+                )
+                || !plain_caption(
+                    &messages[1],
+                    &format!(
+                        "スタートプレイヤースペースに置かれているワーカーは{name}の手元に戻った"
+                    ),
+                )
+                || !o
+                    .legal_actions
+                    .iter()
+                    .any(|r| matches!(r.action, TypedAction::Rotate { days: 1 }))
+            {
+                return Ok(None);
+            }
+            if *days == 1 {
+                let mut points = sources
+                    .rotation_observations
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.get("move")
+                                .or_else(|| p.get("observedMove"))
+                                .and_then(Value::as_u64)
+                                .unwrap(),
+                            p["day"].as_i64().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if points.len() != 2 {
+                    return Ok(None);
+                }
+                points.sort_unstable();
+                let ((lo, day_before), (hi, day_after)) = (points[0], points[1]);
+                let source = step.source_action_ids[0];
+                if !(lo < source && source < hi)
+                    || day_before != before.round
+                    || day_after - day_before != 1
+                {
+                    return Ok(None);
+                }
+                // Widen one move on both sides: retained UI pointers can denote
+                // the next action or the last executed action. Either convention
+                // must still bracket exactly the same unique calendar event.
+                let calendar_nodes = nodes
+                    .iter()
+                    .filter(|n| {
+                        n["action_id"].as_u64().is_some_and(|id| {
+                            lo.saturating_sub(1) <= id && id <= hi.saturating_add(1)
+                        })
+                    })
+                    .filter(|n| {
+                        n["messages"].as_array().is_some_and(|m| {
+                            m.iter().any(|m| {
+                                m["raw_text"].as_str().is_some_and(|s| {
+                                    s == "歯車が進んだ" || s.contains("歯車を高速化し")
+                                })
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if calendar_nodes.len() != 1
+                    || calendar_nodes[0]["action_id"].as_u64() != Some(source)
+                {
+                    return Ok(None);
+                }
+                if sources.audit["audit"]
+                    .as_array()
+                    .ok_or("Missing bounded calendar audit")?
+                    .iter()
+                    .any(|a| {
+                        a["actionId"].as_u64().is_some_and(|id| {
+                            lo.saturating_sub(1) <= id && id <= hi.saturating_add(1)
+                        }) && a.get("cancellation").is_some()
+                            && (a["removedSteps"].as_u64() != Some(0)
+                                || a["observedBoardMatched"] != true)
+                    })
+                {
+                    return Ok(None);
+                }
+                calendar_context = Some(RotationCalendarSupport {
+                    before_ui_move: lo,
+                    before_day: day_before,
+                    after_ui_move: hi,
+                    after_day: day_after,
+                    rotation_source: source,
+                    observed_rotation_events: 1,
+                });
+            } else {
+                expected.players[step.actor].double_advance_available = false;
+            }
+            expected.first_player = if step.actor == before.first_player {
+                (step.actor + 1) % before.players.len()
+            } else {
+                step.actor
+            };
+            expected.first_player_claimed = None;
+            for _ in 0..*days {
+                for (gear, slots) in &mut expected.gears {
+                    let mut shifted = vec![None; slots.len()];
+                    for (pos, worker) in slots.iter().enumerate() {
+                        if let Some(worker) = worker {
+                            let next = pos + 1;
+                            if worker.dummy {
+                                shifted[next % slots.len()] = Some(worker.clone());
+                            } else if next <= tzolkin_core::engine::max_position(*gear) as usize {
+                                shifted[next] = Some(worker.clone());
+                            }
+                        }
+                    }
+                    *slots = shifted;
+                }
+            }
+            expected.round = (before.round + *days).min(27);
+            expected.pending = None;
+            expected.turn_order = (0..before.players.len())
+                .map(|offset| (expected.first_player + offset) % before.players.len())
+                .collect();
+            expected.turn_index = 0;
+            expected.current_player = expected.first_player;
+            expected.turn = tzolkin_core::Turn::default();
+            (
+                if *days == 2 {
+                    "doubleRotation"
+                } else {
+                    "ordinaryRotationFromCalendar"
+                },
+                if *days == 2 { 0 } else { 1 },
+                vec![],
+                if *days == 2 {
+                    "oneObservedExplicitActorDoubleRotationAndWorkerReturn"
+                } else {
+                    "independentObservedDayBoundsAndUniqueCalendarEventWithNamedWorkerReturn"
+                },
+            )
+        }
+        _ => return Ok(None),
+    };
+    if &expected != after {
+        return Ok(None);
+    }
+    Ok(Some(ObservedPendingChoiceSupport {
+        kind,
+        source_message_index,
+        material_message_indices,
+        observed_materials: materials,
+        basis,
+        building_choice: None,
+        market_exit: None,
+        calendar_context,
     }))
 }
 
@@ -1448,6 +1894,7 @@ fn observed_pending_choice_evidence(
         basis: "oneObservedExplicitPendingChoiceWithExactStateTransition",
         building_choice: None,
         market_exit: None,
+        calendar_context: None,
     }))
 }
 
@@ -1609,6 +2056,7 @@ fn observed_building_evidence(
             discount_resource: *discount_resource,
         }),
         market_exit: None,
+        calendar_context: None,
     }))
 }
 
@@ -2376,6 +2824,7 @@ fn conditional_market_exit_evidence(
         basis: "independentFoodResourceObservationAndLiteralPaymentUnderExplicitCompleteActorNotificationAssumption",
         building_choice: None,
         market_exit: supports.pop(),
+        calendar_context: None,
     }))
 }
 
@@ -3106,7 +3555,8 @@ impl ConditionalHumanPolicyDataset {
             || manifest.schema == INPUT_SCHEMA_V9
             || manifest.schema == INPUT_SCHEMA_V10
             || manifest.schema == INPUT_SCHEMA_V11
-            || manifest.schema == INPUT_SCHEMA_V12)
+            || manifest.schema == INPUT_SCHEMA_V12
+            || manifest.schema == INPUT_SCHEMA_V13)
             != (feature_profile == ConditionalFeatureProfile::SemanticPlaying4)
         {
             return Err("Conditional source requires its explicit feature-profile loader".into());
@@ -3147,6 +3597,7 @@ impl ConditionalHumanPolicyDataset {
         .into_iter()
         .chain(manifest.reconstruction_evidence.iter().cloned())
         .chain(manifest.market_exit_observations.iter().cloned())
+        .chain(manifest.rotation_observations.iter().cloned())
         .collect::<Vec<_>>();
         let mut loaded = Vec::new();
         let mut total = 0usize;
@@ -3169,9 +3620,33 @@ impl ConditionalHumanPolicyDataset {
             exit_observations: loaded
                 .iter()
                 .skip(5 + manifest.reconstruction_evidence.len())
+                .take(manifest.market_exit_observations.len())
                 .map(|bytes| unique_json(bytes, MAX_INPUT))
                 .collect::<Result<_, _>>()?,
+            rotation_observations: loaded
+                .iter()
+                .skip(
+                    5 + manifest.reconstruction_evidence.len()
+                        + manifest.market_exit_observations.len(),
+                )
+                .map(|b| unique_json(b, MAX_INPUT))
+                .collect::<Result<_, _>>()?,
         };
+        let mut rotation_moves = BTreeSet::new();
+        for point in &sources.rotation_observations {
+            let ui_move = match (point.get("move"), point.get("observedMove")) {
+                (Some(v), None) | (None, Some(v)) => v.as_u64(),
+                _ => None,
+            }
+            .filter(|v| (1..=100000).contains(v))
+            .ok_or("Missing unique observed calendar move")?;
+            if point["tableId"] != manifest.table_id
+                || !point["day"].as_i64().is_some_and(|d| (1..=27).contains(&d))
+                || !rotation_moves.insert(ui_move)
+            {
+                return Err("Conflicting rotation calendar observations".into());
+            }
+        }
         let mut exit_boundary_ids = BTreeSet::new();
         for point in &sources.exit_observations {
             let id = point["sourceActionId"]
@@ -3401,6 +3876,7 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
                         | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && matches!(row.action, TypedAction::Beg)
@@ -3467,6 +3943,7 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
                         | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && row.action
@@ -3586,6 +4063,7 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
                         | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && let TypedAction::Technology { technology } = row.action
@@ -3685,11 +4163,19 @@ impl ConditionalHumanPolicyDataset {
             let inferred_exit = label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)
                 && matches!(row.action, TypedAction::Skip)
                 && matches!(observation.pending_task, Some(Task::Trade));
-            let theology_choice = label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)
+            let harvest_rotation_choice = label_scope
+                == Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)
                 && matches!(
                     row.action,
-                    TypedAction::Offering { .. } | TypedAction::Resource { .. }
+                    TypedAction::Harvest { .. } | TypedAction::Rotate { days: 1 | 2 }
                 );
+            let theology_choice = matches!(
+                label_scope,
+                Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)
+            ) && matches!(
+                row.action,
+                TypedAction::Offering { .. } | TypedAction::Resource { .. }
+            );
             let strategic = matches!(
                 label_scope,
                 Some(
@@ -3698,6 +4184,7 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
                         | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && (matches!(
@@ -3709,16 +4196,20 @@ impl ConditionalHumanPolicyDataset {
                     OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
                         | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && matches!(row.action, TypedAction::Build { .. })))
                 || inferred_exit
-                || theology_choice;
+                || theology_choice
+                || harvest_rotation_choice;
             let pending_support = if strategic {
                 let evidence = if teachers.contains(&actor_ids[step.actor]) && inferred_exit {
                     conditional_market_exit_evidence(index, sources, &report, &actor_ids)?
                 } else if teachers.contains(&actor_ids[step.actor]) && observed_audit(entry) {
-                    if theology_choice {
+                    if harvest_rotation_choice {
+                        observed_harvest_rotation_evidence(index, &row.action, sources, &report)?
+                    } else if theology_choice {
                         observed_theology_choice_evidence(index, &row.action, sources, &report)?
                     } else if matches!(row.action, TypedAction::Build { .. }) {
                         observed_building_evidence(index, &row.action, sources, &report)?
@@ -3754,14 +4245,19 @@ impl ConditionalHumanPolicyDataset {
                         ..
                     }
                 )
-                || (label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)
-                    && matches!(
-                        row.action,
-                        TypedAction::UseAction {
-                            source: ActionSource::TheologyAhead,
-                            ..
-                        }
-                    ));
+                || (matches!(
+                    label_scope,
+                    Some(
+                        OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                            | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
+                    )
+                ) && matches!(
+                    row.action,
+                    TypedAction::UseAction {
+                        source: ActionSource::TheologyAhead,
+                        ..
+                    }
+                ));
             let explicit = matches!(
                 label_scope,
                 Some(
@@ -3772,6 +4268,7 @@ impl ConditionalHumanPolicyDataset {
                         | OBSERVED_BUILDING_LABEL_SCOPE
                         | OBSERVED_MARKET_BUY_LABEL_SCOPE
                         | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && (matches!(
@@ -3789,6 +4286,7 @@ impl ConditionalHumanPolicyDataset {
                 Some(
                     OBSERVED_MARKET_BUY_LABEL_SCOPE
                         | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
                         | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE
                 )
             ) && matches!(
@@ -3939,6 +4437,9 @@ impl ConditionalHumanPolicyDataset {
                     if inferred_exit {
                         return pending_support.as_ref().is_some_and(|support| *message_index == support.source_message_index);
                     }
+                    if let Some(support) = pending_support.as_ref().filter(|s| s.kind == "ordinaryRotationFromCalendar") {
+                        return *message_index == support.source_message_index;
+                    }
                     let source_actor = record
                         .initial
                         .players
@@ -3963,7 +4464,8 @@ impl ConditionalHumanPolicyDataset {
                                         - before.players[step.actor].resources[&Resource::Corn];
                                     market_sell_caption(message, name, resource, corn, sources.raw["schema_version"] == 1)
                                 }
-                                TypedAction::Trade { resource, buy: true } if matches!(label_scope, Some(OBSERVED_MARKET_BUY_LABEL_SCOPE | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)) => {
+                                TypedAction::Trade { resource, buy: true } if matches!(label_scope, Some(OBSERVED_MARKET_BUY_LABEL_SCOPE | OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
+                        | OBSERVED_HARVEST_ROTATION_LABEL_SCOPE | CONDITIONAL_MARKET_EXIT_LABEL_SCOPE)) => {
                                     market_buy_caption(message, name, resource, sources.raw["schema_version"] == 1)
                                         && market_buy_transition(index, resource, &report)
                                 }
@@ -4064,6 +4566,26 @@ impl ConditionalHumanPolicyDataset {
                 identity.push_str(part);
             }
             let sample_id = digest(identity.as_bytes());
+            let harvest_pair = pending_support
+                .as_ref()
+                .filter(|s| s.kind == "harvest")
+                .and_then(|_| {
+                    samples
+                        .last()
+                        .filter(|s| {
+                            s.replay_step_index + 1 == index
+                                && s.actor == step.actor
+                                && s.source_action_id == source_id
+                                && matches!(
+                                    s.legal_actions[s.chosen].action,
+                                    TypedAction::UseAction {
+                                        gear: GearId::Palenque,
+                                        ..
+                                    }
+                                )
+                        })
+                        .map(|s| s.sample_id.clone())
+                });
             samples.push(HumanPolicySample {
                 sample_id,
                 family_id: family.clone(),
@@ -4080,7 +4602,7 @@ impl ConditionalHumanPolicyDataset {
                 chosen,
                 value_target: (),
                 source_label_part: (factorized || explicit || strategic).then_some(part),
-                paired_sample_id: pair.map(|(id, _, _, _)| id),
+                paired_sample_id: pair.map(|(id, _, _, _)| id).or(harvest_pair),
                 source_label_support: support,
                 paid_technology_support: None,
                 corn_beg_support: None,
@@ -4300,7 +4822,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE) {
+                DATASET_SCHEMA_V13
+            } else if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
                 DATASET_SCHEMA_V12
             } else if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
                 DATASET_SCHEMA_V11
@@ -4337,7 +4861,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE) {
+                "observedV12LabelsAndLiteralHarvestAndSourceAnchoredRotationChoices"
+            } else if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
                 "observedV10LabelsAndExplicitTheologyAheadOfferingAndChichenBonusResourceChoices"
             } else if self.label_scope == Some(CONDITIONAL_MARKET_EXIT_LABEL_SCOPE) {
                 "observedV10LabelsAndExplicitlyConditionalFoodAnchoredMarketExits"

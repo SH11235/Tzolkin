@@ -9,8 +9,9 @@ use tzolkin_ai::human_policy_dataset::{
     ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
     INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5,
     INPUT_SCHEMA_V6, INPUT_SCHEMA_V7, INPUT_SCHEMA_V8, INPUT_SCHEMA_V9, INPUT_SCHEMA_V10,
-    INPUT_SCHEMA_V11, INPUT_SCHEMA_V12, MARKET_EXIT_NOTIFICATION_ASSUMPTION,
-    OBSERVED_BUILDING_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_MARKET_BUY_LABEL_SCOPE,
+    INPUT_SCHEMA_V11, INPUT_SCHEMA_V12, INPUT_SCHEMA_V13, MARKET_EXIT_NOTIFICATION_ASSUMPTION,
+    OBSERVED_BUILDING_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE,
+    OBSERVED_HARVEST_ROTATION_LABEL_SCOPE, OBSERVED_MARKET_BUY_LABEL_SCOPE,
     OBSERVED_PENDING_CHOICE_LABEL_SCOPE, OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE,
     PAID_TECHNOLOGY_LABEL_SCOPE,
 };
@@ -45,6 +46,7 @@ struct Fixture {
     audit: Value,
     reservations: Value,
     exit_observation: Option<Value>,
+    rotation_observations: Vec<Value>,
 }
 impl Fixture {
     fn theology_series() -> Self {
@@ -463,6 +465,320 @@ fn theology_series_v12_refuses_mismatched_originals_and_unrelated_payment_contex
     );
 }
 
+impl Fixture {
+    fn literal_harvest(wood: bool, shared: bool) -> Self {
+        use tzolkin_core::observation::HarvestKind;
+        let position = if wood { 3 } else { 2 };
+        let mut f = Self::paired_action_on(GearId::Palenque, position, position);
+        let record: PublicReplayRecord = serde_json::from_value(f.record.clone()).unwrap();
+        let report = verify_public_replay(&record).unwrap();
+        let state = &report.frames.last().unwrap().snapshot.state;
+        let observation = inspect_public(state).unwrap().observation.unwrap();
+        let kind = if wood {
+            HarvestKind::Wood
+        } else {
+            HarvestKind::Corn
+        };
+        let selected = observation
+            .legal_actions
+            .iter()
+            .find(|r| r.action == TypedAction::Harvest { kind, position })
+            .unwrap();
+        let label = if wood { "wood" } else { "corn" };
+        let quantity = if wood {
+            tzolkin_core::engine::palenque_wood_quantity(
+                position,
+                state.players[0].technologies[&tzolkin_core::TechnologyId::Extraction] >= 1,
+            )
+        } else {
+            tzolkin_core::engine::palenque_corn_quantity(
+                position,
+                state.players[0].technologies[&tzolkin_core::TechnologyId::Agriculture],
+            )
+            .unwrap()
+        };
+        let source = if shared { 10 } else { 11 };
+        f.record["steps"].as_array_mut().unwrap().push(json!({"actor":0,"move":selected.r#move,"sourceActionIds":[source],"refills":{},"checkpoint":null}));
+        f.audit["audit"].as_array_mut().unwrap().push(json!({"step":f.record["steps"].as_array().unwrap().len(),"actionId":source,"actor":0,"action":selected.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+        let tile = if wood { "wood" } else { "コーン" };
+        let messages = vec![
+            json!({"raw_text":format!("P0は{tile}タイルを獲得した"),"html":format!("P0は{tile}タイルを獲得した"),"icons":[]}),
+            json!({"raw_text":format!("P0は{quantity}\nを獲得した"),"html":format!("P0は{quantity} <div class=\"tz_icon resource_{label}\"></div>を獲得した"),"icons":[]}),
+        ];
+        if shared {
+            f.raw["dom_entries"][0]["messages"]
+                .as_array_mut()
+                .unwrap()
+                .extend(messages);
+        } else {
+            f.raw["dom_entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"action_id":11,"timestamp_display":"12:01","messages":messages}));
+        }
+        f.sync_entries();
+        f
+    }
+    fn explicit_rotation(days: i64) -> Self {
+        let mut state = playing_state();
+        let initial = PublicState::from_game_state(&state).unwrap();
+        let mut steps = vec![];
+        for _ in 0..3 {
+            let actor = state.current_player;
+            let choices = observe(&state, actor).unwrap();
+            let row = choices
+                .legal_actions
+                .iter()
+                .find(|r| {
+                    if actor == 0 {
+                        matches!(r.action, TypedAction::FirstPlayer { .. })
+                    } else {
+                        matches!(r.action, TypedAction::Place { .. })
+                    }
+                })
+                .unwrap();
+            steps.push(json!({"actor":actor,"move":row.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            state = apply_move(&state, row.r#move.clone()).unwrap();
+            let end = observe(&state, actor)
+                .unwrap()
+                .legal_actions
+                .into_iter()
+                .find(|r| {
+                    matches!(
+                        r.action,
+                        TypedAction::EndTurn {
+                            double_advance: None | Some(false)
+                        }
+                    )
+                })
+                .unwrap();
+            steps.push(json!({"actor":actor,"move":end.r#move,"sourceActionIds":[],"refills":{},"checkpoint":null}));
+            state = apply_move(&state, end.r#move).unwrap();
+        }
+        let row = observe(&state, 0)
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|r| r.action == TypedAction::Rotate { days })
+            .unwrap();
+        steps.push(json!({"actor":0,"move":row.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
+        let mut f = Self::new();
+        f.record["initial"] = serde_json::to_value(initial).unwrap();
+        f.record["steps"] = json!(steps);
+        f.audit["audit"] = json!([{"step":f.record["steps"].as_array().unwrap().len(),"actionId":10,"actor":0,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}]);
+        let caption = if days == 2 {
+            "P0は歯車を高速化し2段階回した!"
+        } else {
+            "歯車が進んだ"
+        };
+        f.set_messages(vec![json!({"raw_text":caption,"html":caption,"icons":[]}),json!({"raw_text":"スタートプレイヤースペースに置かれているワーカーはP0の手元に戻った","html":"スタートプレイヤースペースに置かれているワーカーはP0の手元に戻った","icons":[]})]);
+        f
+    }
+}
+
+#[test]
+fn harvest_rotation_v13_binds_literal_choices_preserves_v12_and_factors_shared_events() {
+    for wood in [false, true] {
+        for shared in [false, true] {
+            let f = Fixture::literal_harvest(wood, shared);
+            let old = f
+                .load_scope(
+                    INPUT_SCHEMA_V12,
+                    Some(json!(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE)),
+                )
+                .unwrap();
+            let new = f
+                .load_scope(
+                    INPUT_SCHEMA_V13,
+                    Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+                )
+                .unwrap();
+            assert_eq!(new.samples().len(), old.samples().len() + 1);
+            let rows = serde_json::to_value(new.samples()).unwrap();
+            for sample in old.samples() {
+                assert_eq!(
+                    serde_json::to_value(sample).unwrap(),
+                    rows.as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|r| r["sampleId"] == sample.sample_id())
+                        .unwrap()
+                        .clone()
+                );
+            }
+            let last = rows.as_array().unwrap().last().unwrap();
+            assert_eq!(last["sourceLabelPart"], "harvest");
+            assert_eq!(last.get("pairedSampleId").is_some(), shared);
+            assert!(
+                last["legalActions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["action"]["type"] == "skip")
+            );
+        }
+    }
+    for days in [1, 2] {
+        let f = Fixture::explicit_rotation(days);
+        let d = f
+            .load_scope(
+                INPUT_SCHEMA_V13,
+                Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+            )
+            .unwrap();
+        let report = serde_json::to_value(d.report()).unwrap();
+        assert_eq!(d.samples().len(), usize::from(days == 2));
+        assert_eq!(
+            report["schema"],
+            "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v13"
+        );
+        if days == 2 {
+            assert_eq!(report["samples"][0]["sourceLabelPart"], "doubleRotation");
+            assert_eq!(
+                report["samples"][0]["legalActions"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+        assert_eq!(report["trainingReady"], false);
+    }
+}
+
+#[test]
+fn harvest_rotation_v13_refuses_mixed_tiles_quantities_contexts_and_ambiguous_rotation() {
+    for change in [
+        "actor",
+        "tile",
+        "resource",
+        "quantity",
+        "duplicate",
+        "missingTile",
+        "burn",
+        "cancelled",
+        "position",
+        "pending",
+    ] {
+        let mut f = Fixture::literal_harvest(false, false);
+        match change {
+            "actor"=>f.raw["dom_entries"][1]["messages"][0]["raw_text"]=json!("P1はコーンタイルを獲得した"),
+            "tile"=>{f.raw["dom_entries"][1]["messages"][0]=json!({"raw_text":"P0はwoodタイルを獲得した","html":"P0はwoodタイルを獲得した","icons":[]});},
+            "resource"=>f.raw["dom_entries"][1]["messages"][1]["html"]=json!("P0は4 <div class=\"tz_icon resource_wood\"></div>を獲得した"),
+            "quantity"=>{f.raw["dom_entries"][1]["messages"][1]["html"]=json!("P0は3 <div class=\"tz_icon resource_corn\"></div>を獲得した");f.raw["dom_entries"][1]["messages"][1]["raw_text"]=json!("P0は3\nを獲得した");},
+            "duplicate"=>{let m=f.raw["dom_entries"][1]["messages"][1].clone();f.raw["dom_entries"][1]["messages"].as_array_mut().unwrap().push(m);},
+            "missingTile"=>{f.raw["dom_entries"][1]["messages"].as_array_mut().unwrap().remove(0);},
+            "burn"=>f.raw["dom_entries"][1]["messages"].as_array_mut().unwrap().push(json!({"raw_text":"P0はChaacの信仰を1段下げることで焼き畑をしてコーンを手に入れた"})),
+            "cancelled"=>f.audit["audit"][2]["cancellation"]=json!(true),
+            "position"=>f.audit["audit"][2]["action"]["position"]=json!(3),
+            "pending"=>{let l=f.record["steps"].as_array().unwrap().len();f.record["steps"].as_array_mut().unwrap().remove(l-2);},
+            _=>unreachable!(),
+        }
+        f.sync_entries();
+        if let Ok(d) = f.load_scope(
+            INPUT_SCHEMA_V13,
+            Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+        ) {
+            let rows = serde_json::to_value(d.samples()).unwrap();
+            assert!(
+                !rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["sourceLabelPart"] == "harvest"),
+                "{change}"
+            );
+        }
+    }
+    for change in [
+        "actor",
+        "days",
+        "return",
+        "missing",
+        "duplicate",
+        "cancelled",
+        "right",
+        "pending",
+    ] {
+        let mut f = Fixture::explicit_rotation(2);
+        match change {
+            "actor"=>f.set_messages(vec![json!({"raw_text":"P1は歯車を高速化し2段階回した!","html":"P1は歯車を高速化し2段階回した!","icons":[]})]),
+            "days"=>f.raw["dom_entries"][0]["messages"][0]=json!({"raw_text":"歯車が進んだ","html":"歯車が進んだ","icons":[]}),
+            "return"=>f.raw["dom_entries"][0]["messages"][1]=json!({"raw_text":"スタートプレイヤースペースに置かれているワーカーはP1の手元に戻った","html":"スタートプレイヤースペースに置かれているワーカーはP1の手元に戻った","icons":[]}),
+            "missing"=>{f.raw["dom_entries"][0]["messages"].as_array_mut().unwrap().remove(0);},
+            "duplicate"=>{let m=f.raw["dom_entries"][0]["messages"][0].clone();f.raw["dom_entries"][0]["messages"].as_array_mut().unwrap().push(m);},
+            "cancelled"=>f.audit["audit"][0]["cancellation"]=json!(true),
+            "right"=>f.record["initial"]["players"][0]["doubleAdvanceAvailable"]=json!(false),
+            "pending"=>{let l=f.record["steps"].as_array().unwrap().len();f.record["steps"].as_array_mut().unwrap().remove(l-2);},
+            _=>unreachable!(),
+        }
+        f.sync_entries();
+        if let Ok(d) = f.load_scope(
+            INPUT_SCHEMA_V13,
+            Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+        ) {
+            assert!(d.samples().is_empty(), "{change}");
+        }
+    }
+}
+
+#[test]
+fn normal_rotation_v13_requires_independent_bound_calendar_and_named_worker_return() {
+    for change in [
+        "valid",
+        "missing",
+        "subject",
+        "dayDelta",
+        "duplicateMove",
+        "notBracketed",
+        "extraCalendar",
+        "rollback",
+        "cancelled",
+    ] {
+        let mut f = Fixture::explicit_rotation(1);
+        f.rotation_observations = vec![
+            json!({"tableId":"123","move":9,"day":1}),
+            json!({"tableId":"123","observedMove":11,"day":2}),
+        ];
+        match change {
+            "valid"=>{},
+            "missing"=>{f.rotation_observations.pop();},
+            "subject"=>f.rotation_observations[1]["tableId"]=json!("456"),
+            "dayDelta"=>f.rotation_observations[1]["day"]=json!(3),
+            "duplicateMove"=>{f.rotation_observations[1]=json!({"tableId":"123","move":9,"day":2});},
+            "notBracketed"=>f.rotation_observations[0]["move"]=json!(10),
+            "extraCalendar"=>{f.raw["dom_entries"].as_array_mut().unwrap().push(json!({"action_id":11,"timestamp_display":"12:01","messages":[{"raw_text":"歯車が進んだ","html":"歯車が進んだ","icons":[]}]}));f.sync_entries();},
+            "rollback"=>f.audit["audit"].as_array_mut().unwrap().push(json!({"actionId":9,"cancellation":true,"removedSteps":1,"observedBoardMatched":false})),
+            "cancelled"=>f.audit["audit"][0]["cancellation"]=json!(true),
+            _=>unreachable!(),
+        }
+        let loaded = f.load_scope(
+            INPUT_SCHEMA_V13,
+            Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+        );
+        if change == "valid" {
+            let data = loaded.unwrap();
+            let report = serde_json::to_value(data.report()).unwrap();
+            assert_eq!(data.samples().len(), 1);
+            let row = &report["samples"][0];
+            assert_eq!(row["sourceLabelPart"], "ordinaryRotationFromCalendar");
+            assert_eq!(row["sourceMessageIndex"], 1);
+            assert_eq!(
+                row["observedPendingChoiceSupport"]["calendarContext"]["beforeDay"],
+                1
+            );
+            assert_eq!(
+                row["observedPendingChoiceSupport"]["calendarContext"]["afterDay"],
+                2
+            );
+            assert_eq!(row["legalActions"].as_array().unwrap().len(), 2);
+            assert_eq!(report["sourceAuthenticated"], false);
+        } else if let Ok(data) = loaded {
+            assert!(data.samples().is_empty(), "{change}");
+        }
+    }
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
@@ -546,6 +862,7 @@ impl Fixture {
             audit,
             reservations: json!({"schema":"tzolkin-human-source-table-reservations-v1","entries":[{"tableId":"123","split":"validation","basis":"prior setup held-out family"}]}),
             exit_observation: None,
+            rotation_observations: vec![],
         }
     }
     fn corn_beg(corn: i64) -> Self {
@@ -687,6 +1004,9 @@ impl Fixture {
         );
     }
     fn paired_action(removed_position: i64, action_position: i64) -> Self {
+        Self::paired_action_on(GearId::Yaxchilan, removed_position, action_position)
+    }
+    fn paired_action_on(target_gear: GearId, removed_position: i64, action_position: i64) -> Self {
         let mut state = playing_state();
         let actor = state.current_player;
         let initial = PublicState::from_game_state(&state).unwrap();
@@ -695,7 +1015,9 @@ impl Fixture {
         for turn in 0..3 * removed_position {
             let observation = observe(&state, state.current_player).unwrap();
             let gear = if turn == 0 {
-                GearId::Yaxchilan
+                target_gear
+            } else if target_gear == GearId::Palenque {
+                [GearId::Tikal, GearId::Yaxchilan, GearId::Uxmal][state.current_player]
             } else {
                 GearId::Palenque
             };
@@ -720,7 +1042,7 @@ impl Fixture {
         }
         assert_eq!(state.current_player, actor);
         let removal_step = steps.len() + 1;
-        let removal = observe(&state, actor).unwrap().legal_actions.into_iter().find(|row| matches!(row.action, TypedAction::Remove { gear: GearId::Yaxchilan, position } if position == removed_position)).unwrap();
+        let removal = observe(&state, actor).unwrap().legal_actions.into_iter().find(|row| matches!(row.action, TypedAction::Remove { gear, position } if gear == target_gear && position == removed_position)).unwrap();
         state = apply_move(&state, removal.r#move.clone()).unwrap();
         let action = observe(&state, actor).unwrap().legal_actions.into_iter().find(|row| matches!(row.action, TypedAction::UseAction { position, source: tzolkin_core::observation::ActionSource::CurrentGear, .. } if position == action_position)).unwrap();
         let TypedAction::UseAction { corn_cost, .. } = action.action else {
@@ -731,8 +1053,12 @@ impl Fixture {
         } else {
             format!("{corn_cost} コーンを支払ってn°{action_position}アクションを行った")
         };
-        let message =
-            format!("P{actor}はYaxchilan {removed_position}のワーカーを取り除き、 {tail}");
+        let label = if target_gear == GearId::Palenque {
+            "Palenque"
+        } else {
+            "Yaxchilan"
+        };
+        let message = format!("P{actor}は{label} {removed_position}のワーカーを取り除き、 {tail}");
         let mut fixture = Self::new();
         fixture.record["initial"] = serde_json::to_value(initial).unwrap();
         steps.push(json!({"actor":actor,"move":removal.r#move,"sourceActionIds":[10],"refills":{},"checkpoint":null}));
@@ -1764,8 +2090,18 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V10
             || schema == INPUT_SCHEMA_V11
             || schema == INPUT_SCHEMA_V12
+            || schema == INPUT_SCHEMA_V13
         {
             manifest["featureProfile"] = json!("semanticPlaying4");
+        }
+        if schema == INPUT_SCHEMA_V13 && !self.rotation_observations.is_empty() {
+            manifest["rotationObservations"] = json!(
+                self.rotation_observations
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| self.pin(&format!("rotation-calendar-{i}.json"), p))
+                    .collect::<Vec<_>>()
+            );
         }
         if schema == INPUT_SCHEMA_V11 {
             manifest["marketExitNotificationAssumption"] =
@@ -1778,7 +2114,9 @@ impl Fixture {
             );
         }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V12 {
+        let file = if schema == INPUT_SCHEMA_V13 {
+            "manifest-v13.json"
+        } else if schema == INPUT_SCHEMA_V12 {
             "manifest-v12.json"
         } else if schema == INPUT_SCHEMA_V11 {
             "manifest-v11.json"
@@ -1809,6 +2147,7 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V10
             || schema == INPUT_SCHEMA_V11
             || schema == INPUT_SCHEMA_V12
+            || schema == INPUT_SCHEMA_V13
         {
             assert!(
                 ConditionalHumanPolicyDataset::load(
@@ -1825,6 +2164,7 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V10
             || schema == INPUT_SCHEMA_V11
             || schema == INPUT_SCHEMA_V12
+            || schema == INPUT_SCHEMA_V13
         {
             ConditionalHumanPolicyDataset::load_semantic_playing
         } else {
