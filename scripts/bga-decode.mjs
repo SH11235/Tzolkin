@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 import { normalizeGame } from './bga-import.mjs';
 import { observedBasicUnlimitedOptions, uniqueJson } from './bga-observed-options.mjs';
+import { verifySourceDerivations } from './bga-source-proof.mjs';
 import {
   assertBasicUnlimitedOptions,
   catalogFingerprint,
@@ -3863,6 +3864,10 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       terminalDisplayComparison: report.terminalDisplayComparison ?? null,
       status: 'partial',
       sourceCoverage: report.sourceCoverage,
+      sourceDerivations:
+        blocked === null
+          ? verifySourceDerivations(normalizedEvents, record, report)
+          : { status: 'unavailable', reason: 'decoder stopped before a complete source replay' },
       sourceAuthenticated: false,
       strictExporterAccepted: false,
       trainingReady: false,

@@ -6,6 +6,13 @@ import { resolve } from 'node:path';
 import test from 'node:test';
 import { decodeConditionalPublicGame, decodePublicGame, WITNESS_SCHEMA } from './bga-decode.mjs';
 import { coreDispatcher } from './bga-replay.mjs';
+import {
+  deriveBasicCalendar,
+  verifyFoodResourceFlow,
+  compareFloorRankings,
+  verifyTerminalResourceFractions,
+  verifySourceDerivations,
+} from './bga-source-proof.mjs';
 
 const saved = JSON.parse(
   await readFile(new URL('./fixtures/bga-reconstruction-small.json', import.meta.url)),
@@ -6628,6 +6635,208 @@ test('exact building identity witnesses preserve the observed route without equi
   );
   assert.ok(result.manifest.audit.every((row) => !Object.hasOwn(row, 'physicalSelectionUnknown')));
   assert.ok(result.manifest.audit.every((row) => row.equivalentChoices === 1));
+});
+
+test('derives calendar fields without inventing payments and rejects inconsistent replay evidence', () => {
+  const events = [];
+  for (let day = 1; day <= 27; day++) {
+    const actionId = day + 5;
+    if ([8, 14, 21, 27].includes(day)) {
+      events.push({
+        actionId,
+        kind: 'feeding',
+        rawText: '食料供給日: Aはワーカー3個で 6 を支払った',
+      });
+      if (day === 14)
+        events.push({ actionId, kind: 'unparsed', rawText: '建物が第2世代になりました' });
+    }
+    events.push({ actionId, kind: 'gearAdvanced', rawText: '歯車が進んだ' });
+    if (day === 27) events.push({ actionId, kind: 'gameEnd', rawText: 'ゲーム終了' });
+  }
+  const result = deriveBasicCalendar(events, 5);
+  assert.equal(result.finished, true);
+  assert.deepEqual(result.receipts.at(-1).expected, {
+    round: 27,
+    age: 2,
+    foodDays: [8, 14, 21, 27],
+  });
+  for (const missing of [13, 19, 26, 32])
+    assert.deepEqual(
+      deriveBasicCalendar(
+        events.filter((e) => !(e.actionId === missing && e.kind === 'feeding')),
+        5,
+      ).receipts.at(-1).expected,
+      result.receipts.at(-1).expected,
+    );
+  assert.deepEqual(
+    deriveBasicCalendar(
+      events.filter((e) => e.rawText !== '建物が第2世代になりました'),
+      5,
+    ).receipts.at(-1).expected,
+    result.receipts.at(-1).expected,
+  );
+  assert.throws(
+    () => deriveBasicCalendar([{ actionId: 6, kind: 'feeding', rawText: '食料供給日: A' }], 5),
+    /unexpected food/,
+  );
+  const double = deriveBasicCalendar(
+    [{ actionId: 6, kind: 'doubleAdvance', rawText: 'Aは歯車を高速化し2段階回した!' }],
+    5,
+  );
+  assert.equal(double.receipts[0].expected.round, 3);
+  assert.equal(double.finished, false);
+  const jungle = Object.fromEntries(
+    [2, 3, 4, 5].map((box) => [box, { corn: 3, wood: box === 2 ? 0 : 3 }]),
+  );
+  const initial = {
+    phase: 'playing',
+    round: 1,
+    age: 1,
+    foodDays: [],
+    firstPlayer: 0,
+    currentPlayer: 0,
+    turnIndex: 0,
+    turnOrder: [0, 1, 2],
+    jungle,
+    players: ['A', 'B', 'C'].map((name) => ({
+      name,
+      resources: { corn: 100, wood: 0, stone: 0, gold: 0, skull: 0 },
+    })),
+  };
+  const record = {
+    source: { actionIds: [5] },
+    initialCheckpoint: { expected: { round: 1, jungle } },
+    steps: [6, 7, 8].map((id) => ({ sourceActionIds: [id] })),
+  };
+  const report = {
+    sourceCoverage: { complete: false },
+    frames: [0, 1, 2, 3].map(() => ({ snapshot: { state: clone(initial) } })),
+  };
+  const placed = ['A', 'B', 'C'].map((actor, i) => ({
+    actionId: 6 + i,
+    actor,
+    kind: 'place',
+    rawText: `${actor} places a worker`,
+  }));
+  const shifted = [
+    ...placed,
+    ...events.map((e) => ({
+      ...e,
+      actor: e.actor ?? null,
+      actionId: e.actionId + 3,
+      iconResources: ['corn'],
+    })),
+  ];
+  for (let day = 1; day <= 27; day++) {
+    const state = clone(initial);
+    state.round = Math.min(27, day + 1);
+    state.age = day >= 14 ? 2 : 1;
+    state.foodDays = [8, 14, 21, 27].filter((d) => d <= day);
+    state.players[0].resources.corn -= 6 * state.foodDays.length;
+    if (day === 27) {
+      state.phase = 'finished';
+      state.finalScores = [0, 1, 2].map((playerId) => ({ playerId, total: 0, workersOnGears: 0 }));
+    }
+    record.steps.push({ sourceActionIds: [day + 8] });
+    report.frames.push({ snapshot: { state } });
+  }
+  assert.equal(verifySourceDerivations(shifted, record, report).status, 'matched');
+  assert.throws(
+    () =>
+      verifySourceDerivations(
+        shifted.filter((e) => !(e.actionId === 16 && e.kind === 'feeding')),
+        record,
+        report,
+      ),
+    /conservation mismatch/,
+  );
+  assert.throws(() => deriveBasicCalendar([...events].reverse(), 5), /not in source order/);
+  for (const mutate of [
+    (r) => {
+      r.frames[11].snapshot.state.round = 8;
+    },
+    (r) => {
+      r.frames[11].snapshot.state.foodDays = [];
+    },
+    (r) => {
+      r.frames[11].snapshot.state.players[0].resources.corn++;
+    },
+    (r) => {
+      r.frames[4].snapshot.state.turnOrder.reverse();
+    },
+    (r) => {
+      r.frames[0].snapshot.state.jungle[3].corn = 2;
+    },
+  ]) {
+    const inconsistent = clone(report);
+    mutate(inconsistent);
+    assert.throws(
+      () => verifySourceDerivations(shifted, record, inconsistent),
+      /Source derivation/,
+    );
+  }
+  const unavailable = clone(record);
+  delete unavailable.initialCheckpoint;
+  assert.equal(verifySourceDerivations(shifted, unavailable, report).status, 'unavailable');
+});
+
+test('checks notification-side food resource flow and exposes floor-before-ranking counterexamples', () => {
+  const before = {
+    players: [{ name: 'A', resources: { corn: 8, wood: 0, stone: 0, gold: 0, skull: 0 } }],
+  };
+  const after = clone(before);
+  after.players[0].resources.corn = 2;
+  after.players[0].resources.wood = 1;
+  const feeding = {
+    actor: 'A',
+    kind: 'feeding',
+    rawText: '食料供給日: Aはワーカー3個で 6 を支払った',
+    iconResources: ['corn'],
+  };
+  const reward = {
+    actor: 'A',
+    kind: 'resourceGain',
+    rawText: 'Aは木を獲得した',
+    iconResources: ['wood'],
+    detail: { explicitAmount: 1 },
+  };
+  assert.equal(verifyFoodResourceFlow([feeding, reward], before, after).sourceClaims, 2);
+  for (const messages of [[feeding], [reward], [feeding, reward, reward]])
+    assert.throws(() => verifyFoodResourceFlow(messages, before, after), /conservation mismatch/);
+  assert.throws(
+    () => verifyFoodResourceFlow([{ ...reward, actor: 'unknown' }], before, after),
+    /unknown.*actor/,
+  );
+  const scores = [
+    { playerId: 0, total: 10.25, workersOnGears: 0 },
+    { playerId: 1, total: 10, workersOnGears: 2 },
+    { playerId: 2, total: 8, workersOnGears: 1 },
+  ];
+  const changed = compareFloorRankings(scores);
+  assert.equal(changed.sameForThisReplay, false);
+  assert.deepEqual(changed.players.slice(0, 2), [
+    { playerId: 0, nativeRank: 1, floorBeforeRanking: 2 },
+    { playerId: 1, nativeRank: 2, floorBeforeRanking: 1 },
+  ]);
+  scores[1].workersOnGears = 0;
+  assert.equal(compareFloorRankings(scores).players[1].floorBeforeRanking, 1);
+  scores[0].total = 11.25;
+  assert.equal(compareFloorRankings(scores).sameForThisReplay, true);
+  const counters = [{ resources: { corn: 2, wood: 1, stone: 1, gold: 1, skull: 1 } }];
+  const terminalScores = [{ playerId: 0, resourcePoints: 2.75, skullPoints: 3 }];
+  assert.deepEqual(verifyTerminalResourceFractions(counters, terminalScores), [
+    { playerId: 0, cornEquivalent: 11, resourcePoints: 2.75, skullPoints: 3, displayRemainder: 5 },
+  ]);
+  assert.throws(
+    () => verifyTerminalResourceFractions(counters, [{ ...terminalScores[0], resourcePoints: 2 }]),
+    /fraction differs/,
+  );
+  assert.throws(() => verifyTerminalResourceFractions([], terminalScores), /missing terminal/);
+  delete counters[0].resources.skull;
+  assert.throws(
+    () => verifyTerminalResourceFractions(counters, terminalScores),
+    /incomplete terminal/,
+  );
 });
 
 const cli =
