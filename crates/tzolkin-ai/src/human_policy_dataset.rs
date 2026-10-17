@@ -2068,6 +2068,11 @@ fn conditional_market_exit_evidence(
             continue;
         }
         let resources: [i64; 5] = resources.try_into().unwrap();
+        // Consistency guard only: the independently supplied observation is
+        // still the evidence, not a counter copied from this replay frame.
+        if RESOURCE_IDS.map(|r| at.players[actor].resources[&r]) != resources {
+            continue;
+        }
         let paid = own.workers * 2;
         let prefix = format!("食料供給日: {}はワーカー{}個で ", own.name, own.workers);
         let expected_html =
