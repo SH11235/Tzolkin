@@ -1800,6 +1800,142 @@ test('binds selected capped Architecture captions to paid choices and refuses st
   assert.equal(prefix.record.steps.length, 2);
 });
 
+test('capped Agriculture announces but does not apply the following named temple choice', () => {
+  const fixture = () => {
+    const initial = clone(saved.core.initialFrame);
+    initial.snapshot.state.players[0].technologies.agriculture = 3;
+    initial.snapshot.state.players[0].resources.wood = 2;
+    initial.observation.pendingTask = { type: 'technology', remaining: 1, free: false };
+    initial.snapshot.state.pending = { task: clone(initial.observation.pendingTask), after: [] };
+    initial.observation.legalActions = [
+      {
+        action: { type: 'technology', technology: 'agriculture' },
+        move: { type: 'choose', choiceId: 'technology:agriculture' },
+      },
+    ];
+    const messages = [
+      { raw_text: 'Aはを支払った', icons: [{ classes: 'tz_icon resource_wood' }] },
+      { raw_text: 'Aは農業を1レベル進めた' },
+      { raw_text: '農業技術ボーナス: Aは好きな信仰を1段上げた' },
+    ];
+    const selection = { raw_text: 'AはKukulcanの信仰を1段上げた' };
+    const value = input();
+    value.witness.witnesses = [];
+    const apply = (request) => {
+      const next = clone(initial);
+      next.snapshot.state = clone(request.state);
+      if (request.move.choiceId === 'technology:agriculture') {
+        next.observation.pendingTask = {
+          type: 'payTechnology',
+          technology: 'agriculture',
+          amount: 1,
+        };
+        next.observation.legalActions = [
+          {
+            action: { type: 'payment', resources: [0, 1, 0, 0, 0] },
+            move: { type: 'choose', choiceId: 'payment:wood' },
+          },
+        ];
+      } else if (request.move.choiceId === 'payment:wood') {
+        next.snapshot.state.players[0].resources.wood--;
+        next.observation.pendingTask = { type: 'temple', remaining: 1 };
+        next.observation.legalActions = [
+          {
+            action: { type: 'temple', temple: 'kukulkan', direction: 1 },
+            move: { type: 'choose', choiceId: 'temple:kukulkan' },
+          },
+        ];
+      } else {
+        assert.equal(request.move.choiceId, 'temple:kukulkan');
+        next.snapshot.state.players[0].temples.kukulkan++;
+        next.observation.pendingTask = null;
+        next.observation.legalActions = [];
+      }
+      next.snapshot.state.pending = next.observation.pendingTask
+        ? { task: clone(next.observation.pendingTask), after: [] }
+        : null;
+      return next;
+    };
+    return { initial, messages, selection, value, apply };
+  };
+  const execute = (
+    f,
+    groups = [
+      [6, f.messages],
+      [7, [f.selection]],
+    ],
+  ) => {
+    f.value.witness.initial = clone(f.initial.snapshot.state);
+    replaceEvents(f.value, groups);
+    return decode(f.value, dispatcher(f.initial, f.apply));
+  };
+  const accepted = execute(fixture());
+  assert.equal(accepted.manifest.blocked, null);
+  assert.deepEqual(
+    accepted.record.steps.map((step) => step.sourceActionIds),
+    [[6], [6], [7]],
+  );
+  assert.equal(
+    accepted.record.steps.filter((s) => s.move.choiceId === 'temple:kukulkan').length,
+    1,
+  );
+  const receipt = accepted.manifest.audit.find((row) => row.agricultureBonusAnnouncement);
+  assert.equal(receipt.appliedOperations, 0);
+  assert.equal(receipt.followingChoiceSourceActionId, 7);
+  for (const mutate of [
+    (f) => {
+      f.messages[2].raw_text = '農業技術ボーナス: Bは好きな信仰を1段上げた';
+    },
+    (f) => {
+      f.selection.raw_text = 'BはKukulcanの信仰を1段上げた';
+    },
+    (f) => {
+      f.selection.raw_text = 'AはKukulcanの信仰を1段下げた';
+    },
+    (f) => {
+      f.initial.snapshot.state.players[0].technologies.agriculture = 2;
+    },
+    (f) => {
+      f.messages.push(clone(f.messages[2]));
+    },
+    (f) => {
+      const apply = f.apply;
+      f.apply = (request) => {
+        const next = apply(request);
+        if (request.move.choiceId === 'payment:wood') {
+          next.observation.pendingTask.remaining = 2;
+          next.snapshot.state.pending.task.remaining = 2;
+        }
+        return next;
+      };
+    },
+  ]) {
+    const f = fixture();
+    mutate(f);
+    const rejected = execute(f);
+    assert.equal(rejected.manifest.blocked.actionId, 6);
+    assert.equal(rejected.record.steps.length, 0);
+  }
+  const missing = fixture();
+  assert.equal(execute(missing, [[6, missing.messages]]).record.steps.length, 0);
+  const duplicate = fixture();
+  assert.equal(
+    execute(duplicate, [
+      [6, duplicate.messages],
+      [7, [duplicate.selection, clone(duplicate.selection)]],
+    ]).record.steps.length,
+    0,
+  );
+  const stale = fixture();
+  const staleResult = execute(stale, [
+    [6, stale.messages],
+    [7, [stale.selection]],
+    [8, [stale.messages[2]]],
+  ]);
+  assert.equal(staleResult.manifest.blocked.actionId, 8);
+  assert.equal(staleResult.record.steps.length, 3);
+});
+
 test('binds a final paid capped Theology choice to its own skull caption and atomic state delta', () => {
   const fixture = (material = 'wood', explicitFalse = false, alter = () => {}) => {
     const initial = clone(saved.core.initialFrame);

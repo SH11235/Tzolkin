@@ -2964,6 +2964,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       paymentOperations: 0,
       purchase: null,
       architectureAdvance: null,
+      agricultureAdvance: null,
       theologyAdvance: null,
     };
     try {
@@ -3381,6 +3382,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 detail.technology === 'architecture' &&
                 before.players[actorId(event.actor)].technologies.architecture === 3 &&
                 pending() === 'technology';
+              const agricultureAtCap =
+                detail.technology === 'agriculture' &&
+                before.players[actorId(event.actor)].technologies.agriculture === 3 &&
+                pending() === 'technology' &&
+                queuedPurchase === null &&
+                context.purchase === null;
               const paidTheology =
                 detail.technology === 'theology' &&
                 before.players[actorId(event.actor)].technologies.theology === 3 &&
@@ -3401,6 +3408,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               );
               if (paidTheology) settlePaidTheology(before, paidTheology);
               else pay(payments);
+              if (agricultureAtCap)
+                context.agricultureAdvance = {
+                  actor: actorId(event.actor),
+                  sourceId: id,
+                  pending: copy(state().pending),
+                  claimed: false,
+                };
               if (selectedAtCap) {
                 const actor = actorId(event.actor);
                 const after = state();
@@ -3654,6 +3668,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           } else if (event.kind === 'unparsed') {
             const architectureBonus = architectureScoreCaption(event);
             const theologyBonus = theologySkullCaption(event);
+            const agricultureBonus = names.find(
+              (name) =>
+                event.iconResources.length === 0 &&
+                event.rawText === `農業技術ボーナス: ${name}は好きな信仰を1段上げた`,
+            );
             const body =
               event.actor === null ? event.rawText : event.rawText.slice(event.actor.length);
             if (cappedWorkerCaption(event)) {
@@ -3680,7 +3699,57 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               /^は(chaac|quetzalcoatl|kukulkan|kukulcan)の信仰が一番高い(?:うちの一人なので、半分の点を獲得した: (\d+)点|ので、(\d+)点を獲得した)$/,
             );
             const trackScore = body.match(/^は信仰により(-?\d+)点を獲得した$/);
-            if (body === 'は再び歯車を高速化する権利を得た') {
+            if (agricultureBonus) {
+              const receipt = context.agricultureAdvance;
+              const task = state().pending?.task;
+              const next = context.nextSource;
+              const selection = next?.[1]?.length === 1 ? next[1][0] : null;
+              const selectedTemple =
+                selection?.actor === agricultureBonus &&
+                selection.kind === 'unparsed' &&
+                selection.iconResources.length === 0
+                  ? selection.rawText
+                      .slice(agricultureBonus.length)
+                      .match(/^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段上げた$/)
+                  : null;
+              if (
+                !receipt ||
+                receipt.claimed ||
+                receipt.actor !== actorId(agricultureBonus) ||
+                receipt.sourceId !== id ||
+                events.at(-1) !== event ||
+                state().currentPlayer !== receipt.actor ||
+                state().players[receipt.actor].technologies.agriculture !== 3 ||
+                !same(state().pending, receipt.pending) ||
+                task?.type !== 'temple' ||
+                task.remaining !== 1 ||
+                task.distinct != null ||
+                task.direction != null ||
+                task.reason != null ||
+                next?.[0] !== id + 1 ||
+                !selectedTemple ||
+                !legal().some(
+                  (row) =>
+                    row.action.type === 'temple' &&
+                    row.action.temple === TEMPLES[selectedTemple[1]] &&
+                    row.action.direction === 1,
+                )
+              )
+                fail(
+                  'Agriculture bonus requires its selected capped advance and next named temple choice',
+                );
+              receipt.claimed = true;
+              // The explanation announces a pending choice. The following
+              // named notification applies it through the ordinary temple path.
+              audit.push({
+                actionId: id,
+                agricultureBonusAnnouncement: true,
+                actor: receipt.actor,
+                followingChoiceSourceActionId: next[0],
+                temple: TEMPLES[selectedTemple[1]],
+                appliedOperations: 0,
+              });
+            } else if (body === 'は再び歯車を高速化する権利を得た') {
               if (event.iconResources.length)
                 fail('Double-advance rights caption requires icon-free evidence');
               automatic(event, 'doubleAdvanceAvailable', 1);
