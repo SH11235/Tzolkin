@@ -426,6 +426,27 @@ export function verifyWorkerCardLedger(events, record, report, audit, calendar) 
       const box = source.box;
       forestActions.delete(event.actor);
       const kind = tile[1] === 'wood' ? 'wood' : 'corn';
+      const burns = messages.filter(
+        (notice) =>
+          notice.kind === 'unparsed' &&
+          notice.actor === event.actor &&
+          /^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段下げることで焼き畑をしてコーンを手に入れた$/.test(
+            notice.rawText.slice(event.actor.length),
+          ),
+      );
+      if (burns.length) {
+        if (
+          burns.length !== 1 ||
+          burns[0].iconResources.length ||
+          kind !== 'corn' ||
+          messages.indexOf(burns[0]) >= messages.indexOf(event) ||
+          jungle[box].wood < 1 ||
+          jungle[box].corn !== jungle[box].wood
+        )
+          fail(`burn has no unique covered-corn source at ${id}`);
+        // The literal burn discards the covering wood tile, not a wood gain.
+        jungle[box].wood--;
+      }
       if (--jungle[box][kind] < 0) fail(`source harvest exceeds remaining forest tiles at ${id}`);
       if (jungle[box].corn < jungle[box].wood)
         return {

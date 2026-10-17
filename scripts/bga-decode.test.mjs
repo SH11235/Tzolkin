@@ -7587,6 +7587,47 @@ test('physical ledger binds removal cells, effective rollback boundaries and car
   badAudit[0].removedSteps = 1;
   assert.equal(run(events, record, badAudit).status, 'unavailable');
   assert.equal(run(events, record, []).status, 'unavailable');
+  const burnRecord = clone(record);
+  burnRecord.steps = [
+    { actor: 0, move: { type: 'choose', choiceId: 'action:palenque:4' }, sourceActionIds: [6] },
+    { actor: 0, move: { type: 'choose', choiceId: 'burn' }, sourceActionIds: [7] },
+    { actor: 0, move: { type: 'choose', choiceId: 'temple:kukulkan' }, sourceActionIds: [7] },
+  ];
+  const burnFrames = Array.from({ length: 4 }, () => ({ snapshot: { state: clone(initial) } }));
+  for (const frame of burnFrames.slice(2)) frame.snapshot.state.jungle[4] = { corn: 2, wood: 2 };
+  const burnEvents = [
+    {
+      actionId: 6,
+      actor: 'A',
+      kind: 'gearAction',
+      rawText: 'A selects Palenque 4',
+      detail: { gear: 'palenque', actionPosition: 4, source: 'selectedAction' },
+    },
+    {
+      actionId: 7,
+      actor: 'A',
+      kind: 'unparsed',
+      rawText: 'AはKukulcanの信仰を1段下げることで焼き畑をしてコーンを手に入れた',
+      iconResources: [],
+    },
+    {
+      actionId: 7,
+      actor: 'A',
+      kind: 'unparsed',
+      rawText: 'Aはコーンタイルを獲得した',
+      iconResources: [],
+    },
+  ];
+  const burnLedger = (events = burnEvents) =>
+    verifyWorkerCardLedger(events, burnRecord, { frames: burnFrames }, [], []);
+  assert.equal(burnLedger().status, 'matched');
+  assert.equal(burnLedger(burnEvents.filter((_, i) => i !== 1)).status, 'unavailable');
+  assert.throws(
+    () => burnLedger([burnEvents[0], burnEvents[1], clone(burnEvents[1]), burnEvents[2]]),
+    /unique covered-corn/,
+  );
+  burnFrames[3].snapshot.state.jungle[4].wood++;
+  assert.throws(() => burnLedger(), /jungle mismatch/);
   const duplicate = clone(events);
   duplicate.splice(1, 0, clone(events[0]));
   assert.throws(() => run(duplicate), /no effective replay binding/);
