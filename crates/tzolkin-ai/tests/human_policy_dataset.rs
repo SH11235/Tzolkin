@@ -2179,6 +2179,192 @@ impl Fixture {
     }
 }
 
+fn timing_manifest(f: &Fixture, indices: &[usize]) -> Value {
+    f.load_scope(
+        INPUT_SCHEMA_V13,
+        Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+    )
+    .unwrap();
+    let path = f.root.join("manifest-v13.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    let evidence = f.pin(
+        "timing-observation.json",
+        &json!({"schema":"synthetic-counter-observation-v1","observed":true}),
+    );
+    let entries = indices.iter().map(|&index| {
+        let step = &f.record["steps"][index];
+        json!({"replayStepIndex":index,"sourceActionId":step["sourceActionIds"][0],
+            "actor":step["actor"],"sourceActorId":(101 + step["actor"].as_u64().unwrap()).to_string(),
+            "reason":"synthetic decision input differs from original counter","evidence":[evidence.clone()]})
+    }).collect::<Vec<_>>();
+    manifest["decisionTimeExclusions"] = f.pin(
+        "timing-exclusions.json",
+        &json!({
+        "schema":"tzolkin-human-decision-time-exclusions-v1","tableId":"123",
+        "recordSha256":manifest["record"]["sha256"],"entries":entries}),
+    );
+    manifest
+}
+fn load_timing_manifest(
+    f: &Fixture,
+    manifest: &Value,
+) -> Result<ConditionalHumanPolicyDataset, String> {
+    let bytes = serde_json::to_vec(manifest).unwrap();
+    let path = f.root.join("timed-manifest.json");
+    fs::write(&path, &bytes).unwrap();
+    ConditionalHumanPolicyDataset::load_semantic_playing(
+        &path,
+        &sha(&bytes),
+        manifest["nominations"]["sha256"].as_str().unwrap(),
+        manifest["reservations"]["sha256"].as_str().unwrap(),
+    )
+}
+
+#[test]
+fn decision_time_exclusions_preserve_later_rows_and_remove_whole_factors() {
+    let f = Fixture::theology_series();
+    let baseline = serde_json::to_value(
+        f.load_scope(
+            INPUT_SCHEMA_V13,
+            Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+        )
+        .unwrap()
+        .report(),
+    )
+    .unwrap();
+    assert!(baseline.get("decisionTimeExclusions").is_none());
+    let rows = baseline["samples"].as_array().unwrap();
+    let index = rows[0]["replayStepIndex"].as_u64().unwrap() as usize;
+    let manifest = timing_manifest(&f, &[index]);
+    let filtered =
+        serde_json::to_value(load_timing_manifest(&f, &manifest).unwrap().report()).unwrap();
+    let remaining = filtered["samples"].as_array().unwrap();
+    assert!(!remaining.is_empty());
+    assert!(
+        remaining
+            .iter()
+            .any(|r| r["replayStepIndex"].as_u64().unwrap() > index as u64)
+    );
+    for row in remaining {
+        assert_eq!(
+            rows.iter()
+                .find(|old| old["sampleId"] == row["sampleId"])
+                .unwrap(),
+            row
+        );
+    }
+    assert_eq!(
+        filtered["counts"]["replaySteps"],
+        baseline["counts"]["replaySteps"]
+    );
+    assert_eq!(
+        filtered["counts"]["checkpointsVerified"],
+        baseline["counts"]["checkpointsVerified"]
+    );
+    for f in [
+        Fixture::paired_action(2, 1),
+        Fixture::paid_technology(4, 1, [1, 1, 0]),
+    ] {
+        let baseline = serde_json::to_value(
+            f.load_scope(
+                INPUT_SCHEMA_V13,
+                Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+            )
+            .unwrap()
+            .report(),
+        )
+        .unwrap();
+        let rows = baseline["samples"].as_array().unwrap();
+        assert!(
+            !rows.is_empty(),
+            "expected observed factors: {}",
+            baseline["counts"]
+        );
+        let last = rows.last().unwrap();
+        let index = last["paidTechnologySupport"]["paymentReplayStepIndex"]
+            .as_u64()
+            .or_else(|| last["replayStepIndex"].as_u64())
+            .unwrap() as usize;
+        let result = serde_json::to_value(
+            load_timing_manifest(&f, &timing_manifest(&f, &[index]))
+                .unwrap()
+                .report(),
+        )
+        .unwrap();
+        assert!(result["samples"].as_array().unwrap().is_empty());
+        assert_eq!(
+            result["decisionTimeExclusions"]["excludedModelOperations"],
+            1
+        );
+        assert_eq!(
+            result["decisionTimeExclusions"]["removedSamples"]
+                .as_array()
+                .unwrap()
+                .len(),
+            rows.len()
+        );
+        assert!(
+            result["decisionTimeExclusions"]["removedSamples"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["propagated"] == true)
+        );
+    }
+}
+
+#[test]
+fn decision_time_exclusions_reject_bad_bindings_and_never_skip_replay_validation() {
+    let f = Fixture::new();
+    let valid = timing_manifest(&f, &[0]);
+    assert!(
+        load_timing_manifest(&f, &valid)
+            .unwrap()
+            .samples()
+            .is_empty()
+    );
+    let document: Value =
+        serde_json::from_slice(&fs::read(f.root.join("timing-exclusions.json")).unwrap()).unwrap();
+    for kind in 0..8 {
+        let mut bad = document.clone();
+        match kind {
+            0 => bad["recordSha256"] = json!("0".repeat(64)),
+            1 => {
+                bad["entries"][0]["replayStepIndex"] =
+                    json!(f.record["steps"].as_array().unwrap().len())
+            }
+            2 => bad["entries"][0]["sourceActionId"] = json!(11),
+            3 => bad["entries"][0]["actor"] = json!(99),
+            4 => bad["entries"][0]["sourceActorId"] = json!("999"),
+            5 => {
+                let duplicate = bad["entries"][0].clone();
+                bad["entries"].as_array_mut().unwrap().push(duplicate);
+            }
+            6 => bad["entries"][0]["evidence"][0]["sha256"] = json!("0".repeat(64)),
+            _ => bad["entries"][0]["evidence"] = json!([]),
+        }
+        let mut manifest = valid.clone();
+        manifest["decisionTimeExclusions"] = f.pin("bad-exclusions.json", &bad);
+        assert!(
+            load_timing_manifest(&f, &manifest).is_err(),
+            "bad contract {kind}"
+        );
+    }
+    let mut manifest = valid;
+    let mut illegal = f.record.clone();
+    illegal["steps"][0]["actor"] = json!(99);
+    manifest["record"] = f.pin("illegal-record.json", &illegal);
+    let mut document = document;
+    document["recordSha256"] = manifest["record"]["sha256"].clone();
+    document["entries"][0]["actor"] = json!(99);
+    manifest["decisionTimeExclusions"] = f.pin("illegal-exclusions.json", &document);
+    let error = load_timing_manifest(&f, &manifest).err().unwrap();
+    assert!(
+        !error.contains("Decision-time exclusion"),
+        "illegal replay must fail first: {error}"
+    );
+}
+
 #[test]
 fn conditional_market_exit_needs_independent_counter_and_refuses_missing_or_ambiguous_context() {
     let load = |f: &Fixture| {

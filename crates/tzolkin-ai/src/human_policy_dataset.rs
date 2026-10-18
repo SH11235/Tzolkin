@@ -154,6 +154,50 @@ struct Manifest {
     market_exit_notification_assumption: Option<String>,
     #[serde(default)]
     rotation_observations: Vec<ContentPin>,
+    /// Source-bound input mismatches; never changes replay execution or labels.
+    #[serde(default, deserialize_with = "explicit_exclusion_pin")]
+    decision_time_exclusions: Option<ContentPin>,
+}
+fn explicit_exclusion_pin<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ContentPin>, D::Error> {
+    ContentPin::deserialize(deserializer).map(Some)
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DecisionTimeInputExclusion {
+    replay_step_index: usize,
+    source_action_id: u64,
+    actor: usize,
+    source_actor_id: String,
+    reason: String,
+    evidence: Vec<ContentPin>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DecisionTimeExclusions {
+    schema: String,
+    table_id: String,
+    record_sha256: String,
+    entries: Vec<DecisionTimeInputExclusion>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemovedDecisionTimeSample {
+    sample_id: String,
+    replay_step_index: usize,
+    origin_replay_step_indices: Vec<usize>,
+    propagated: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DecisionTimeExclusionReport {
+    /// Feature eligibility compares the unfiltered source scopes. Counts on the
+    /// outer report describe the subsequently retained training candidates.
+    selection_stage: &'static str,
+    inputs: Vec<DecisionTimeInputExclusion>,
+    excluded_model_operations: usize,
+    removed_samples: Vec<RemovedDecisionTimeSample>,
 }
 fn explicit_label_scope<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -167,6 +211,9 @@ fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
 }
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
+        if self.decision_time_exclusions.is_some() && self.schema != INPUT_SCHEMA_V13 {
+            return Err("Decision-time exclusions require the explicit V13 source scope".into());
+        }
         if self.rotation_observations.len() > 8
             || (self.schema != INPUT_SCHEMA_V13 && !self.rotation_observations.is_empty())
         {
@@ -514,6 +561,8 @@ pub struct HumanPolicyReport<'a> {
     source_pins: &'a [ContentPin],
     counts: &'a HumanPolicyCounts,
     samples: &'a [HumanPolicySample],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision_time_exclusions: Option<&'a DecisionTimeExclusionReport>,
 }
 /// Sealed by source replay, source text and the final decoder audit. No stored
 /// float arrays or caller-supplied core report can construct this dataset.
@@ -533,6 +582,7 @@ pub struct ConditionalHumanPolicyDataset {
     pins: Vec<ContentPin>,
     counts: HumanPolicyCounts,
     samples: Vec<HumanPolicySample>,
+    decision_time_exclusions: Option<DecisionTimeExclusionReport>,
 }
 
 fn decimal(value: &str) -> Result<(), String> {
@@ -3587,7 +3637,7 @@ impl ConditionalHumanPolicyDataset {
                 return Err("Semantic Playing BC requires a reserved non-Test source table".into());
             }
         }
-        let pins = [
+        let mut pins = [
             manifest.record.clone(),
             manifest.source_log.clone(),
             manifest.decoder_audit.clone(),
@@ -3728,6 +3778,69 @@ impl ConditionalHumanPolicyDataset {
             semantic.samples = common;
             semantic
         };
+        if let Some(pin) = &manifest.decision_time_exclusions {
+            let bytes = read_pin(pin, base)?;
+            total = total
+                .checked_add(bytes.len())
+                .ok_or("Evidence budget overflow")?;
+            if total > 64 * 1024 * 1024 {
+                return Err("Total evidence exceeds64MiB".into());
+            }
+            let exclusions: DecisionTimeExclusions = parse(&bytes)?;
+            if exclusions.schema != "tzolkin-human-decision-time-exclusions-v1"
+                || exclusions.table_id != manifest.table_id
+                || exclusions.record_sha256 != manifest.record.sha256
+                || exclusions.entries.is_empty()
+                || exclusions.entries.len() > sources.record.steps.len()
+            {
+                return Err("Decision-time exclusion source binding/bound mismatch".into());
+            }
+            pins.push(pin.clone());
+            let actor_ids = roster(&sources.raw, &sources.record, &manifest.table_id)?;
+            let mut indices = BTreeSet::new();
+            let mut evidence_pins = pins
+                .iter()
+                .map(|p| (p.path.clone(), p.bytes, p.sha256.clone()))
+                .collect::<BTreeSet<_>>();
+            for input in &exclusions.entries {
+                let step = sources
+                    .record
+                    .steps
+                    .get(input.replay_step_index)
+                    .ok_or("Decision-time exclusion index outside original replay")?;
+                if !indices.insert(input.replay_step_index)
+                    || step.source_action_ids != [input.source_action_id]
+                    || step.actor != input.actor
+                    || actor_ids.get(input.actor) != Some(&input.source_actor_id)
+                    || input.reason.trim().is_empty()
+                    || input.reason.len() > 512
+                    || input.evidence.is_empty()
+                    || input.evidence.len() > 8
+                {
+                    return Err(
+                        "Decision-time exclusion index/source/actor/evidence mismatch".into(),
+                    );
+                }
+                for evidence in &input.evidence {
+                    if evidence_pins.insert((
+                        evidence.path.clone(),
+                        evidence.bytes,
+                        evidence.sha256.clone(),
+                    )) {
+                        let bytes = read_pin(evidence, base)?;
+                        total = total
+                            .checked_add(bytes.len())
+                            .ok_or("Evidence budget overflow")?;
+                        if total > 64 * 1024 * 1024 {
+                            return Err("Total evidence exceeds64MiB".into());
+                        }
+                        pins.push(evidence.clone());
+                    }
+                }
+            }
+            dataset.exclude_decision_inputs(exclusions.entries)?;
+            dataset.pins = pins.clone();
+        }
         // Re-pin all original leaves after the bounded reconstruction, not merely metadata.
         read_pin(&manifest_pin, Path::new(""))?;
         for pin in &pins {
@@ -4627,10 +4740,110 @@ impl ConditionalHumanPolicyDataset {
             pins,
             counts,
             samples,
+            decision_time_exclusions: None,
         })
     }
     pub fn samples(&self) -> &[HumanPolicySample] {
         &self.samples
+    }
+    fn exclude_decision_inputs(
+        &mut self,
+        inputs: Vec<DecisionTimeInputExclusion>,
+    ) -> Result<(), String> {
+        // The complete replay and every label have already been checked. Group
+        // factors by all contributing input steps, including forced payments
+        // which need not have their own emitted sample.
+        fn root(parents: &mut [usize], mut index: usize) -> usize {
+            while parents[index] != index {
+                parents[index] = parents[parents[index]];
+                index = parents[index];
+            }
+            index
+        }
+        fn join(parents: &mut [usize], left: usize, right: usize) {
+            let left = root(parents, left);
+            let right = root(parents, right);
+            parents[right] = left;
+        }
+        let mut parents = (0..self.samples.len()).collect::<Vec<_>>();
+        let mut by_step = BTreeMap::new();
+        let by_id = self
+            .samples
+            .iter()
+            .enumerate()
+            .map(|(i, sample)| (sample.sample_id.as_str(), i))
+            .collect::<BTreeMap<_, _>>();
+        for (index, sample) in self.samples.iter().enumerate() {
+            let mut dependencies = BTreeSet::from([sample.replay_step_index]);
+            if let Some(support) = &sample.source_label_support {
+                dependencies.insert(support.paired_replay_step_index);
+            }
+            if let Some(support) = &sample.paid_technology_support {
+                dependencies.extend([
+                    support.technology_replay_step_index,
+                    support.payment_replay_step_index,
+                ]);
+            }
+            if let Some(support) = &sample.capped_extraction_support {
+                dependencies.insert(support.technology_replay_step_index);
+                dependencies.extend(support.payment_replay_step_index);
+            }
+            if let Some(support) = &sample.corn_beg_support {
+                dependencies.extend([
+                    support.beg_replay_step_index,
+                    support.temple_replay_step_index,
+                ]);
+            }
+            for step in dependencies {
+                if let Some(previous) = by_step.insert(step, index) {
+                    join(&mut parents, previous, index);
+                }
+            }
+            if let Some(pair) = &sample.paired_sample_id {
+                let other = *by_id
+                    .get(pair.as_str())
+                    .ok_or("Missing factorized decision partner")?;
+                join(&mut parents, index, other);
+            }
+        }
+        let mut origins = BTreeMap::<usize, BTreeSet<usize>>::new();
+        for input in &inputs {
+            if let Some(&sample) = by_step.get(&input.replay_step_index) {
+                origins
+                    .entry(root(&mut parents, sample))
+                    .or_default()
+                    .insert(input.replay_step_index);
+            }
+        }
+        let mut removed_samples = Vec::new();
+        let mut retained = Vec::new();
+        for (index, sample) in self.samples.drain(..).enumerate() {
+            if let Some(causes) = origins.get(&root(&mut parents, index)) {
+                removed_samples.push(RemovedDecisionTimeSample {
+                    sample_id: sample.sample_id,
+                    replay_step_index: sample.replay_step_index,
+                    origin_replay_step_indices: causes.iter().copied().collect(),
+                    propagated: !causes.contains(&sample.replay_step_index),
+                });
+            } else {
+                retained.push(sample);
+            }
+        }
+        if !removed_samples.is_empty() {
+            self.counts
+                .excluded
+                .insert("decisionTimeInputMismatch".into(), removed_samples.len());
+        }
+        self.counts.samples = retained.len();
+        self.counts.candidates = retained.iter().map(|s| s.candidates.len()).sum();
+        self.samples = retained;
+        self.decision_time_exclusions = Some(DecisionTimeExclusionReport {
+            selection_stage: "afterFullReplayAndFeatureEligibility",
+            inputs,
+            excluded_model_operations: origins.len(),
+            removed_samples,
+        });
+        Ok(())
     }
     pub fn feature_profile(&self) -> ConditionalFeatureProfile {
         self.feature_profile
@@ -4797,6 +5010,7 @@ impl ConditionalHumanPolicyDataset {
                 observed_pending_choice_support: None,
                 capped_extraction_support: None,
             }],
+            decision_time_exclusions: None,
         };
         if profile == ConditionalFeatureProfile::SemanticPlaying4 {
             dataset.feature_eligibility = Some(FeatureEligibilityComparison {
@@ -4902,6 +5116,7 @@ impl ConditionalHumanPolicyDataset {
             source_pins: &self.pins,
             counts: &self.counts,
             samples: &self.samples,
+            decision_time_exclusions: self.decision_time_exclusions.as_ref(),
         }
     }
     pub fn publish_new(&self, output: &Path) -> Result<(), String> {
