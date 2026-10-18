@@ -112,6 +112,10 @@ function resourceVector(event) {
 /** Independent notification-side net flow, restricted to Food Day macros.
  * Before/after resources are engine evidence only on the comparison side. */
 export function verifyFoodResourceFlow(messages, before, after) {
+  return foodResourceFlow(messages, before, after);
+}
+
+function foodResourceFlow(messages, before, after, corn = null) {
   const names = before.players.map((p) => p.name);
   const deltas = names.map(() => Object.fromEntries(RESOURCES.map((r) => [r, 0])));
   let claims = 0;
@@ -139,7 +143,20 @@ export function verifyFoodResourceFlow(messages, before, after) {
         .match(/^は(\d+)\s*を歯車から獲得した$/);
       if (payout) {
         if (!same(event.iconResources, ['corn'])) fail('unreadable calendar payout');
-        add(event.actor, { corn: Number(payout[1]), wood: 0, stone: 0, gold: 0, skull: 0 }, 1);
+        const receipt = corn?.byCaption.get(event);
+        if (corn && (!receipt || receipt.index >= corn.last))
+          fail('calendar payout has no preceding verified receipt');
+        add(
+          event.actor,
+          {
+            corn: receipt && receipt.index < corn.first ? 0 : Number(payout[1]),
+            wood: 0,
+            stone: 0,
+            gold: 0,
+            skull: 0,
+          },
+          1,
+        );
       }
     }
   }
@@ -149,7 +166,201 @@ export function verifyFoodResourceFlow(messages, before, after) {
       if (expected !== after.players[i]?.resources[resource])
         fail(`food-day ${player.name} ${resource} conservation mismatch`);
     }
-  return { sourceClaims: claims, deltas };
+  return {
+    sourceClaims: claims,
+    deltas,
+    ...(corn
+      ? {
+          calendarCorn: messages
+            .filter((event) => corn.byCaption.has(event))
+            .map((event) => {
+              const receipt = corn.byCaption.get(event);
+              return {
+                ...receipt,
+                disposition:
+                  receipt.index < corn.first ? 'alreadyIncludedBeforeMacro' : 'creditedInsideMacro',
+              };
+            }),
+        }
+      : {}),
+  };
+}
+
+/** Reconstruct receipts from the retained operations and native transitions,
+ * independently of decoder calendarEvidence and rollback bookkeeping. */
+function calendarCornReceipts(events, record, report, calendar) {
+  const names =
+    record.initial?.players?.map((p) => p.name) ??
+    report.frames[0].snapshot.state.players.map((p) => p.name);
+  const initialId = record.source.actionIds[0];
+  const rounds = new Map();
+  const boundaries = new Map(calendar.map((entry) => [entry.actionId, entry]));
+  const groups = new Map();
+  let round = 1;
+  for (const event of events) {
+    if (event.actionId <= initialId) continue;
+    if (!groups.has(event.actionId)) {
+      groups.set(event.actionId, []);
+      rounds.set(event.actionId, round);
+      const boundary = boundaries.get(event.actionId);
+      if (boundary) round = boundary.expected.round;
+    }
+    groups.get(event.actionId).push(event);
+  }
+  const usedClaims = new Set();
+  const claims = new Map();
+  const receipts = [];
+  const resources = (state) => state.players.map((p) => p.resources);
+  const legal = (index, type) => {
+    const step = record.steps[index];
+    const observation = report.frames[index].observation;
+    const rows = observation?.legalActions?.filter((row) => same(row.move, step.move));
+    if (observation?.actor !== step.actor || rows?.length !== 1 || rows[0].action.type !== type)
+      fail('calendar corn operation has no exact actor/legal-action binding');
+    return rows[0].action;
+  };
+  for (const [index, step] of record.steps.entries()) {
+    const before = report.frames[index]?.snapshot.state;
+    const after = report.frames[index + 1]?.snapshot.state;
+    if (step.move?.type === 'firstPlayer') {
+      const action = legal(index, 'firstPlayer');
+      const source = step.sourceActionIds;
+      const actor = step.actor;
+      const originals = groups
+        .get(source[0])
+        ?.filter(
+          (event) =>
+            event.actor === names[actor] &&
+            event.rawText.startsWith(event.actor) &&
+            /^はスタートプレイヤースペースに\d+\s*を支払ってワーカーを置いた$/.test(
+              event.rawText.slice(event.actor.length),
+            ),
+        );
+      const expected = structuredClone(resources(before));
+      expected[actor].corn -= action.cornCost;
+      if (
+        source.length !== 1 ||
+        originals?.length !== 1 ||
+        usedClaims.has(originals[0]) ||
+        originals[0].kind !== 'unparsed' ||
+        !same(originals[0].iconResources, ['corn']) ||
+        !Number.isSafeInteger(originals[0].messageIndex) ||
+        originals[0].messageIndex < 0 ||
+        !Number.isSafeInteger(action.cornCost) ||
+        action.cornCost < 0 ||
+        Number(originals[0].rawText.slice(names[actor].length).match(/\d+/)[0]) !==
+          action.cornCost ||
+        before.currentPlayer !== actor ||
+        before.firstPlayerClaimed !== null ||
+        after.firstPlayerClaimed !== actor ||
+        before.round !== after.round ||
+        rounds.get(source[0]) !== before.round ||
+        claims.has(before.round) ||
+        before.accumulatedCorn !== after.accumulatedCorn ||
+        !same(resources(after), expected)
+      )
+        fail('calendar corn claim has no unique original operation/round transition');
+      usedClaims.add(originals[0]);
+      claims.set(before.round, { index, actor, source: source[0], event: originals[0] });
+    }
+    if (step.move?.type !== 'endTurn' || before.firstPlayerClaimed !== step.actor) continue;
+    legal(index, 'endTurn');
+    const claim = claims.get(before.round);
+    const amount = before.accumulatedCorn;
+    if (
+      !claim ||
+      claim.actor !== step.actor ||
+      claim.index >= index ||
+      before.currentPlayer !== step.actor ||
+      step.sourceActionIds.length !== 1 ||
+      rounds.get(step.sourceActionIds[0]) !== before.round ||
+      !Number.isSafeInteger(amount) ||
+      amount < 0 ||
+      after.accumulatedCorn !== 0 ||
+      (after.round !== before.round &&
+        after.round !== boundaries.get(step.sourceActionIds[0])?.expected.round) ||
+      receipts.some((receipt) => receipt.round === before.round)
+    )
+      fail('calendar corn EndTurn has no unique claim/round receipt');
+    const food = !same(before.foodDays, after.foodDays);
+    if (!food) {
+      const expected = structuredClone(resources(before));
+      expected[step.actor].corn += amount;
+      if (!same(resources(after), expected))
+        fail('calendar corn EndTurn resource transition differs');
+    } else if (
+      !same(after.foodDays.slice(0, -1), before.foodDays) ||
+      after.foodDays.length !== before.foodDays.length + 1 ||
+      !FOOD_DAYS.includes(after.foodDays.at(-1)) ||
+      (after.pending !== null && after.pending?.task?.type !== 'rotation')
+    )
+      fail('calendar corn concurrent Food Day is not an atomic supported transition');
+    receipts.push({
+      index,
+      actor: step.actor,
+      amount,
+      round: before.round,
+      sourceActionId: step.sourceActionIds[0],
+      claimIndex: claim.index,
+      claimSourceActionId: claim.source,
+      claimMessageIndex: claim.event.messageIndex,
+      food,
+    });
+  }
+  const byCaption = new Map();
+  const used = new Set();
+  const captionIds = new Set();
+  for (const event of events) {
+    if (event.actionId <= initialId) continue;
+    const literal = event.rawText.match(/^(.+)は(\d+)\s*を歯車から獲得した$/);
+    if (!literal) continue;
+    const actor = names.indexOf(event.actor);
+    const amount = Number(literal[2]);
+    const identity = `${event.actionId}:${event.messageIndex}`;
+    const matches = receipts.filter(
+      (receipt) =>
+        receipt.actor === actor &&
+        receipt.amount === amount &&
+        receipt.round === rounds.get(event.actionId) &&
+        receipt.sourceActionId <= event.actionId,
+    );
+    if (
+      event.kind !== 'unparsed' ||
+      actor < 0 ||
+      literal[1] !== event.actor ||
+      !same(event.iconResources, ['corn']) ||
+      !Number.isSafeInteger(amount) ||
+      !Number.isSafeInteger(event.messageIndex) ||
+      event.messageIndex < 0 ||
+      captionIds.has(identity) ||
+      matches.length !== 1 ||
+      used.has(matches[0])
+    )
+      fail('calendar corn caption has no unique unconsumed actor/amount/round receipt');
+    const receipt = matches[0];
+    receipt.captionSourceActionId = event.actionId;
+    receipt.captionMessageIndex = event.messageIndex;
+    byCaption.set(event, receipt);
+    used.add(receipt);
+    captionIds.add(identity);
+  }
+  for (const receipt of receipts) {
+    if (receipt.amount > 0 && !used.has(receipt))
+      fail('calendar corn positive receipt has no caption');
+    if (receipt.food) {
+      const before = report.frames[receipt.index].snapshot.state;
+      const after = report.frames[receipt.index + 1].snapshot.state;
+      const boundary = boundaries.get(receipt.sourceActionId);
+      if (!boundary || boundary.foodDay !== after.foodDays.at(-1))
+        fail('calendar corn concurrent feeding has no original Food Day boundary');
+      foodResourceFlow(groups.get(receipt.sourceActionId), before, after, {
+        byCaption,
+        first: receipt.index,
+        last: receipt.index + 1,
+      });
+    }
+  }
+  return { receipts, byCaption };
 }
 
 /** Counterfactual diagnostic only: floor scores BEFORE applying the existing
@@ -498,14 +709,29 @@ export function verifyWorkerCardLedger(events, record, report, audit, calendar) 
  * This proof verifies a completed day-one replay only, not every unknown option. */
 export function verifySourceDerivations(events, record, report, audit = []) {
   const last = report.frames.at(-1).snapshot.state;
-  if (last.phase !== 'finished' || record.initialCheckpoint?.expected?.round !== 1)
+  if (last.phase !== 'finished' || report.frames[0].snapshot.state.round !== 1)
     return {
       status: 'unavailable',
       reason: 'requires a finished replay and witnessed day-one anchor',
     };
   const initialId = record.source.actionIds[0];
   const derived = deriveBasicCalendar(events, initialId);
+  if (!derived.finished && record.initialCheckpoint?.expected?.round !== 1)
+    return {
+      status: 'unavailable',
+      reason: 'requires a complete source calendar and witnessed day-one anchor',
+    };
   if (!derived.finished) fail('finished replay has no complete source calendar');
+  const corn = calendarCornReceipts(events, record, report, derived.receipts);
+  if (record.initialCheckpoint?.expected?.round !== 1)
+    return {
+      status: 'unavailable',
+      reason: 'requires a witnessed day-one anchor for the complete source proof',
+      calendarCornReceipts: corn.receipts,
+      calendarCornBasis:
+        'original captions and retained native day-one operations; conditional anchor',
+      trainingReady: false,
+    };
   const firstRotation = derived.receipts.find((r) => r.advancedDays)?.actionId;
   const firstActors = [];
   for (const event of events)
@@ -550,6 +776,8 @@ export function verifySourceDerivations(events, record, report, audit = []) {
   for (const [i, step] of record.steps.entries())
     for (const id of step.sourceActionIds) {
       const range = ranges.get(id) ?? { first: i, last: i + 1 };
+      if (ranges.has(id) && range.last !== i)
+        fail(`source ${id} operations do not form one contiguous macro`);
       range.last = i + 1;
       ranges.set(id, range);
     }
@@ -558,6 +786,12 @@ export function verifySourceDerivations(events, record, report, audit = []) {
   for (const receipt of derived.receipts) {
     const range = ranges.get(receipt.actionId);
     if (!range) fail(`calendar source ${receipt.actionId} has no replay operation`);
+    if (
+      record.steps
+        .slice(range.first, range.last)
+        .some((step) => !same(step.sourceActionIds, [receipt.actionId]))
+    )
+      fail(`calendar source ${receipt.actionId} has an ambiguous operation boundary`);
     const state = report.frames[range.last].snapshot.state;
     for (const [key, value] of Object.entries(receipt.expected))
       if (!same(state[key], value)) fail(`${key} mismatch at source ${receipt.actionId}`);
@@ -578,10 +812,11 @@ export function verifySourceDerivations(events, record, report, audit = []) {
     }
     let resources = null;
     if (receipt.foodDay !== null)
-      resources = verifyFoodResourceFlow(
+      resources = foodResourceFlow(
         events.filter((e) => e.actionId === receipt.actionId),
         report.frames[range.first].snapshot.state,
         state,
+        { byCaption: corn.byCaption, first: range.first, last: range.last },
       );
     checked.push({ ...receipt, frame: range.last, resources, turnCycle });
   }
@@ -600,6 +835,7 @@ export function verifySourceDerivations(events, record, report, audit = []) {
             },
     },
     calendar: checked,
+    calendarCornReceipts: corn.receipts,
     pieces: verifyWorkerCardLedger(events, record, report, audit, derived.receipts),
     terminalCounterConversion: record.steps
       .at(-1)

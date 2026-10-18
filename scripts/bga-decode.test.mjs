@@ -8407,6 +8407,374 @@ test('derives calendar fields without inventing payments and rejects inconsisten
   assert.equal(verifySourceDerivations(shifted, unavailable, report).status, 'unavailable');
 });
 
+// Native-shaped evidence for the independent source proof. Legality of a full
+// game remains the separate native replay verifier's responsibility.
+function calendarCornProofFixture(initialCorn = 1) {
+  const jungle = {
+    2: { corn: 3, wood: 0 },
+    3: { corn: 3, wood: 3 },
+    4: { corn: 3, wood: 3 },
+    5: { corn: 3, wood: 3 },
+  };
+  const initial = {
+    phase: 'playing',
+    round: 1,
+    age: 1,
+    foodDays: [],
+    firstPlayer: 0,
+    currentPlayer: 0,
+    firstPlayerClaimed: null,
+    accumulatedCorn: initialCorn,
+    turnIndex: 0,
+    turnOrder: [0, 1, 2],
+    pending: null,
+    jungle,
+    players: ['A', 'B', 'C'].map((name) => ({
+      name,
+      resources: { corn: 100, wood: 0, stone: 0, gold: 0, skull: 0 },
+    })),
+  };
+  const record = {
+    source: { actionIds: [5] },
+    initial: clone(initial),
+    initialCheckpoint: { expected: { round: 1, jungle } },
+    steps: [],
+  };
+  const report = { frames: [{ snapshot: { state: clone(initial) } }] };
+  const events = [];
+  const addEvent = (actionId, kind, actor, rawText, icons = []) => {
+    events.push({
+      actionId,
+      messageIndex: events.filter((e) => e.actionId === actionId).length,
+      kind,
+      actor,
+      rawText,
+      iconResources: icons,
+    });
+  };
+  const append = (source, actor, move, action, change) => {
+    const frame = report.frames.at(-1);
+    frame.observation = { actor, legalActions: [{ move: clone(move), action }] };
+    const after = clone(frame.snapshot.state);
+    change(after);
+    record.steps.push({ actor, move, sourceActionIds: [source] });
+    report.frames.push({ snapshot: { state: after } });
+  };
+  for (const [actor, name] of ['A', 'B', 'C'].entries()) {
+    addEvent(6 + actor, 'place', name, `${name} places a worker`);
+    append(6 + actor, actor, { type: 'place', gear: 'palenque' }, { type: 'place' }, () => {});
+  }
+  const episodes = [];
+  for (let day = 1; day <= 27; day++) {
+    const source = 20 + day * 4;
+    const food = [8, 14, 21, 27].includes(day);
+    const claim = [1, 8, 13, 21, 27].includes(day);
+    const atomic = [8, 27].includes(day);
+    let amount = null,
+      claimIndex = null,
+      creditIndex = null;
+    if (claim) {
+      const before = report.frames.at(-1).snapshot.state;
+      amount = before.accumulatedCorn;
+      const actor = before.currentPlayer;
+      claimIndex = record.steps.length;
+      addEvent(
+        source,
+        'unparsed',
+        before.players[actor].name,
+        `${before.players[actor].name}はスタートプレイヤースペースに0 を支払ってワーカーを置いた`,
+        ['corn'],
+      );
+      append(source, actor, { type: 'firstPlayer' }, { type: 'firstPlayer', cornCost: 0 }, (s) => {
+        s.firstPlayerClaimed = actor;
+      });
+      if (!atomic) {
+        creditIndex = record.steps.length;
+        addEvent(source + 1, 'unparsed', null, 'ターン終了');
+        append(source + 1, actor, { type: 'endTurn' }, { type: 'endTurn' }, (s) => {
+          s.accumulatedCorn = 0;
+          s.players[actor].resources.corn += amount;
+          s.currentPlayer = (actor + 1) % 3;
+        });
+      }
+      addEvent(
+        source + 2,
+        'unparsed',
+        before.players[actor].name,
+        `${before.players[actor].name}は${amount} を歯車から獲得した`,
+        ['corn'],
+      );
+    }
+    if (food)
+      for (const name of ['A', 'B', 'C'])
+        addEvent(source + 2, 'feeding', name, `食料供給日: ${name}はワーカー3個で 6 を支払った`, [
+          'corn',
+        ]);
+    if (day === 14) addEvent(source + 2, 'unparsed', null, '建物が第2世代になりました');
+    const before = report.frames.at(-1).snapshot.state;
+    const nextFirst = claim ? (before.firstPlayer + 1) % 3 : before.firstPlayer;
+    if (claim)
+      addEvent(
+        source + 2,
+        'firstPlayer',
+        before.players[nextFirst].name,
+        `${before.players[nextFirst].name}がこのラウンドのスタートプレイヤーです`,
+      );
+    addEvent(source + 2, 'gearAdvanced', null, '歯車が進んだ');
+    if (day === 27) addEvent(source + 2, 'gameEnd', null, 'ゲーム終了');
+    if (atomic) {
+      creditIndex = record.steps.length;
+      const actor = before.currentPlayer;
+      append(source + 2, actor, { type: 'endTurn' }, { type: 'endTurn' }, (s) => {
+        s.accumulatedCorn = 0;
+        s.players[actor].resources.corn += amount;
+        for (const p of s.players) p.resources.corn -= 6;
+        s.foodDays.push(day);
+        s.pending = { task: { type: 'rotation' } };
+      });
+    }
+    append(
+      source + 2,
+      before.currentPlayer,
+      { type: 'choose', choiceId: 'rotate:1' },
+      { type: 'rotate' },
+      (s) => {
+        if (food && !atomic) {
+          s.foodDays.push(day);
+          for (const p of s.players) p.resources.corn -= 6;
+        }
+        if (!claim) s.accumulatedCorn++;
+        s.round = Math.min(27, day + 1);
+        s.age = day >= 14 ? 2 : 1;
+        s.firstPlayer = nextFirst;
+        s.currentPlayer = nextFirst;
+        s.turnOrder = [nextFirst, (nextFirst + 1) % 3, (nextFirst + 2) % 3];
+        s.firstPlayerClaimed = null;
+        s.pending = null;
+        if (day === 27) {
+          s.phase = 'finished';
+          s.finalScores = [0, 1, 2].map((playerId) => ({ playerId, total: 0, workersOnGears: 0 }));
+        }
+      },
+    );
+    if (claim)
+      episodes.push({ day, amount, atomic, claimIndex, creditIndex, captionSource: source + 2 });
+  }
+  return { events, record, report, episodes };
+}
+
+test('binds each calendar payout once to retained claim and EndTurn frames across Food Days', () => {
+  const f = calendarCornProofFixture();
+  const proof = verifySourceDerivations(f.events, f.record, f.report);
+  assert.equal(proof.status, 'matched');
+  assert.deepEqual(
+    proof.calendarCornReceipts.map((r) => r.amount),
+    [1, 6, 4, 7, 5],
+  );
+  assert.equal(proof.calendarCornReceipts.length, 5);
+  const food = proof.calendar.filter((r) => r.foodDay !== null);
+  assert.deepEqual(
+    food.map((r) => r.resources.calendarCorn.map((c) => c.disposition)),
+    [['creditedInsideMacro'], [], ['alreadyIncludedBeforeMacro'], ['creditedInsideMacro']],
+  );
+  const { creditIndex } = f.episodes[1];
+  // Credit six and feed six in the same operation: net zero is a real receipt.
+  const actor = f.record.steps[creditIndex].actor;
+  assert.equal(
+    f.report.frames[creditIndex].snapshot.state.players[actor].resources.corn,
+    f.report.frames[creditIndex + 1].snapshot.state.players[actor].resources.corn,
+  );
+  assert.equal(proof.trainingReady, false);
+  // Rechecking after a failed attempt never consumes a receipt in global state.
+  assert.deepEqual(verifySourceDerivations(f.events, f.record, f.report), proof);
+  const conditional = clone(f.record);
+  delete conditional.initialCheckpoint;
+  const partial = verifySourceDerivations(f.events, conditional, f.report);
+  assert.equal(partial.status, 'unavailable');
+  assert.deepEqual(partial.calendarCornReceipts, proof.calendarCornReceipts);
+  assert.equal(partial.trainingReady, false);
+  const zero = calendarCornProofFixture(0);
+  const noCaption = zero.events.filter((e) => e.rawText !== 'Aは0 を歯車から獲得した');
+  assert.equal(
+    verifySourceDerivations(noCaption, zero.record, zero.report).calendarCornReceipts[0].amount,
+    0,
+  );
+  assert.equal(
+    verifySourceDerivations(zero.events, zero.record, zero.report).calendarCornReceipts[0].amount,
+    0,
+  );
+});
+
+test('refuses missing duplicated displaced and forged calendar receipts without retaining failed state', () => {
+  for (const mutate of [
+    (f) => {
+      f.events = f.events.filter((e) => !e.rawText.includes('を歯車から獲得した'));
+    },
+    (f) => {
+      f.events.splice(
+        f.events.findIndex((e) => e.rawText.includes('を歯車から獲得した')),
+        0,
+        clone(f.events.find((e) => e.rawText.includes('を歯車から獲得した'))),
+      );
+    },
+    (f) => {
+      const e = f.events.find((e) => e.rawText.includes('を歯車から獲得した'));
+      e.actor = 'B';
+      e.rawText = e.rawText.replace(/^A/, 'B');
+    },
+    (f) => {
+      f.events.find((e) => e.rawText.includes('を歯車から獲得した')).rawText =
+        'Aは3 を歯車から獲得した';
+    },
+    (f) => {
+      f.events.find((e) => e.rawText.includes('を歯車から獲得した')).actionId += 4;
+    },
+    (f) => {
+      const e = f.events.find((e) => e.rawText.includes('を歯車から獲得した'));
+      e.actionId += 4;
+      e.messageIndex = 99;
+      f.events.sort((a, b) => a.actionId - b.actionId || a.messageIndex - b.messageIndex);
+    },
+    (f) => {
+      const e = clone(f.events.find((e) => e.rawText.includes('を歯車から獲得した')));
+      e.messageIndex = 99;
+      f.events.splice(
+        f.events.findIndex((x) => x.actionId === e.actionId),
+        0,
+        e,
+      );
+    },
+    (f) => {
+      f.events.find((e) => e.rawText.includes('を歯車から獲得した')).iconResources = ['wood'];
+    },
+    (f) => {
+      f.record.steps[f.episodes[0].creditIndex].actor = 1;
+    },
+    (f) => {
+      f.record.steps[f.episodes[0].creditIndex].move.type = 'place';
+    },
+    (f) => {
+      f.report.frames[f.episodes[0].creditIndex].snapshot.state.round++;
+    },
+    (f) => {
+      f.report.frames[f.episodes[0].creditIndex + 1].snapshot.state.players[0].resources.corn++;
+    },
+    (f) => {
+      f.report.frames[f.episodes[1].creditIndex + 1].snapshot.state.players[0].resources.corn++;
+    },
+    (f) => {
+      f.report.frames[f.episodes[0].claimIndex + 1].snapshot.state.firstPlayerClaimed = 2;
+    },
+    (f) => {
+      const i = f.episodes[0].creditIndex;
+      f.record.steps.splice(i, 1);
+      f.report.frames.splice(i + 1, 1);
+    },
+    (f) => {
+      const i = f.episodes[0].claimIndex;
+      f.record.steps.splice(i, 2);
+      f.report.frames.splice(i + 1, 2);
+    },
+  ]) {
+    const f = calendarCornProofFixture();
+    mutate(f);
+    assert.throws(() => verifySourceDerivations(f.events, f.record, f.report), /Source derivation/);
+    const clean = calendarCornProofFixture();
+    assert.equal(
+      verifySourceDerivations(clean.events, clean.record, clean.report).status,
+      'matched',
+    );
+  }
+});
+
+test('decodes a gross first-player credit during feeding and restores receipts after late refusal', () => {
+  const initial = clone(saved.core.initialFrame);
+  const names = initial.snapshot.state.players.map((p) => p.name);
+  const actor = names.length - 1;
+  Object.assign(initial.snapshot.state, {
+    round: 8,
+    currentPlayer: actor,
+    firstPlayer: 0,
+    firstPlayerClaimed: actor,
+    turnIndex: actor,
+    accumulatedCorn: 4,
+    foodDays: [],
+    pending: null,
+  });
+  for (const [i, p] of initial.snapshot.state.players.entries()) {
+    Object.assign(p, { workers: 3, feedWorkers: 0, feedDiscount: 0, feedAll: false });
+    p.resources.corn = i === actor ? 2 : 8;
+  }
+  initial.observation.pendingTask = null;
+  initial.observation.legalActions = [
+    { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
+  ];
+  const paid = clone(initial);
+  paid.snapshot.state.accumulatedCorn = 0;
+  paid.snapshot.state.foodDays = [8];
+  for (const [i, p] of paid.snapshot.state.players.entries()) {
+    p.resources.corn += (i === actor ? 4 : 0) - 6;
+    paid.snapshot.state.log.push(`食糧の日：${p.name} はコーン 6 を支払い`);
+  }
+  paid.observation.pendingTask = { type: 'rotation' };
+  paid.observation.legalActions = [
+    { action: { type: 'rotate', days: 1 }, move: { type: 'choose', choiceId: 'rotate:1' } },
+  ];
+  const advanced = clone(paid);
+  Object.assign(advanced.snapshot.state, {
+    round: 9,
+    firstPlayer: actor,
+    firstPlayerClaimed: null,
+    currentPlayer: actor,
+  });
+  advanced.observation.pendingTask = null;
+  advanced.observation.legalActions = [];
+  const messages = [
+    {
+      raw_text: `${names[actor]}は4 を歯車から獲得した`,
+      icons: [{ classes: 'tz_icon resource_corn' }],
+    },
+    { raw_text: `${names[actor]}がこのラウンドのスタートプレイヤーです` },
+    ...names.map((name) => ({
+      raw_text: `食料供給日: ${name}はワーカー3個で 6 を支払った`,
+      icons: [{ classes: 'tz_icon resource_corn' }],
+    })),
+    { raw_text: '歯車が進んだ' },
+    { raw_text: `スタートプレイヤースペースに置かれているワーカーは${names[actor]}の手元に戻った` },
+  ];
+  const value = () => {
+    const v = input();
+    v.witness.initial = clone(initial.snapshot.state);
+    replaceEvents(v, [[6, messages]]);
+    v.witness.witnesses = [];
+    return v;
+  };
+  const dispatch = (post = paid) =>
+    dispatcher(initial, (request) => clone(request.move.type === 'endTurn' ? post : advanced));
+  const success = decode(value(), dispatch());
+  assert.equal(success.manifest.blocked, null);
+  assert.equal(success.record.steps.length, 2);
+  for (const mutate of [
+    (v) => {
+      v.witness.witnesses = [{ actionId: 6, expected: { round: 10 } }];
+    },
+    (v) => {
+      replaceEvents(v, [[6, [...messages, messages[0]]]]);
+    },
+  ]) {
+    const v = value();
+    mutate(v);
+    const refused = decode(v, dispatch());
+    assert.equal(refused.manifest.blocked.actionId, 6);
+    assert.equal(refused.record.steps.length, 0);
+    assert.deepEqual(refused.manifest.audit, []);
+    assert.equal(decode(value(), dispatch()).manifest.blocked, null);
+  }
+  const forged = clone(paid);
+  forged.snapshot.state.players[actor].resources.corn++;
+  assert.equal(decode(value(), dispatch(forged)).record.steps.length, 0);
+});
+
 test('checks notification-side food resource flow and exposes floor-before-ranking counterexamples', () => {
   const before = {
     players: [{ name: 'A', resources: { corn: 8, wood: 0, stone: 0, gold: 0, skull: 0 } }],

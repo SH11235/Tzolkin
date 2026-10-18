@@ -923,10 +923,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     if (action.type === 'endTurn' && before.firstPlayerClaimed === before.currentPlayer) {
       const actor = before.currentPlayer;
       const amount = before.accumulatedCorn;
-      if (
-        after.accumulatedCorn !== 0 ||
-        after.players[actor].resources.corn - before.players[actor].resources.corn < amount
-      )
+      if (after.accumulatedCorn !== 0)
         fail('Accumulated corn gain is not separable from this core transition');
       calendarEvidence = {
         ...calendarEvidence,
@@ -1003,6 +1000,17 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (![8, 14, 21, 27].includes(after.foodDays.at(-1)))
         fail('Core feeding receipt has no matching public food day');
       calendarEvidence = { ...calendarEvidence, feeding };
+    }
+    if (action.type === 'endTurn' && before.firstPlayerClaimed === before.currentPlayer) {
+      const actor = before.currentPlayer;
+      // Basic Food Days have no corn rewards. Their independently parsed core
+      // payment restores the gross credit when this same EndTurn also feeds.
+      const cost = feeding.find((receipt) => receipt.actor === actor)?.cost ?? 0;
+      if (
+        after.players[actor].resources.corn - before.players[actor].resources.corn + cost !==
+        before.accumulatedCorn
+      )
+        fail('Accumulated corn gain is not separable from this core transition');
     }
     return feeding;
   }
