@@ -5212,6 +5212,7 @@ test('holds queued corn until observed technology completion and preserves cappe
     renovationSibling = false,
     buildsRemaining = 2,
     discountOverride = null,
+    cornPayment = false,
   ) => {
     const card =
       resource === 'corn'
@@ -5229,12 +5230,18 @@ test('holds queued corn until observed technology completion and preserves cappe
           );
     assert.ok(card);
     const amount = card.effects[1].resources[resource];
-    const cost = resources.map((r) => card.cost[r] ?? 0);
+    const materialCost = resources.map((r) => card.cost[r] ?? 0);
+    const payment = (cost) =>
+      cornPayment ? [2 * (cost[1] + cost[2] + cost[3]), 0, 0, 0, cost[4]] : cost;
+    const cost = payment(materialCost);
     const discount =
-      discountOverride ?? resources.find((r, index) => index > 0 && index < 4 && cost[index] > 0);
-    const chosenCost = cost.map(
-      (n, index) =>
-        n - Number(architectureBonus && architectureLevel === 3 && resources[index] === discount),
+      discountOverride ??
+      resources.find((r, index) => index > 0 && index < 4 && materialCost[index] > 0);
+    const chosenCost = payment(
+      materialCost.map(
+        (n, index) =>
+          n - Number(architectureBonus && architectureLevel === 3 && resources[index] === discount),
+      ),
     );
     const initial = clone(saved.core.initialFrame);
     const before = clone(initial);
@@ -5264,7 +5271,7 @@ test('holds queued corn until observed technology completion and preserves cappe
       type: 'build',
       remaining: buildsRemaining,
       allowMonument: buildsRemaining > 1,
-      cornPayment: false,
+      cornPayment,
     };
     before.snapshot.state.pending = {
       title: 'Two buildings',
@@ -5324,7 +5331,7 @@ test('holds queued corn until observed technology completion and preserves cappe
               type: 'build',
               remaining: buildsRemaining - 1,
               allowMonument: false,
-              cornPayment: false,
+              cornPayment,
               architectureAvailable:
                 request.state.pending.task.architectureAvailable !== false && !architecture,
             },
@@ -5700,6 +5707,236 @@ test('holds queued corn until observed technology completion and preserves cappe
       rejected.record.steps.map((step) => step.sourceActionIds),
       [[6]],
     );
+  }
+  const cornGoldFixture = (change, alter, architecture = true, level = 2, remaining = 1) => {
+    const f = fixture(
+      (v) => {
+        v.witness.witnesses = v.witness.witnesses.slice(0, 2);
+        delete v.witness.witnesses[1].expected;
+        change?.(v);
+      },
+      alter,
+      level,
+      'theology',
+      'gold',
+      architecture,
+      3,
+      false,
+      remaining,
+      null,
+      true,
+    );
+    if (architecture) {
+      const row = clone(f.before.observation.legalActions[1]);
+      assert.equal(row.action.discountResource, 'wood');
+      row.action.discountResource = 'stone';
+      row.move.choiceId = 'purchase:bonus:stone';
+      f.before.observation.legalActions.push(row);
+    } else {
+      f.before.snapshot.state.pending.task.architectureAvailable = false;
+      f.before.observation.pendingTask.architectureAvailable = false;
+      f.before.observation.legalActions = f.before.observation.legalActions.slice(0, 1);
+    }
+    return f;
+  };
+  for (const architecture of [false, true]) {
+    const f = cornGoldFixture(undefined, undefined, architecture);
+    const original = clone(f.value.witness.witnesses);
+    const completed = decode(f.value, f.dispatch);
+    assert.equal(completed.manifest.blocked, null);
+    assert.deepEqual(
+      completed.record.steps.map((s) => s.sourceActionIds),
+      [[6], [7], [8]],
+    );
+    const purchase = completed.manifest.audit.find((row) => row.cornPaidTheologyGold);
+    assert.equal(purchase.equivalentChoices, architecture ? 2 : 1);
+    assert.equal(purchase.discountSelectionUnknown, architecture);
+    assert.equal(purchase.humanPlayingBcReady, false);
+    const delivered = completed.manifest.audit.find((row) => row.queuedPurchaseSourceActionId);
+    assert.equal(delivered.continuation, 'uncappedTechnology');
+    assert.equal(delivered.resource, 'gold');
+    assert.equal(delivered.actualDelivered, true);
+    const after = completed.record.steps.reduce(
+      (frame, step) =>
+        f.dispatch({ operation: 'publicApply', state: frame.snapshot.state, ...step }),
+      clone(saved.core.initialFrame),
+    );
+    assert.equal(after.snapshot.state.players[0].resources.gold, 3);
+    assert.equal(after.snapshot.state.players[0].technologies.theology, 3);
+    assert.equal(after.snapshot.state.skullSupply, 4);
+    assert.equal(after.snapshot.state.pending, null);
+    assert.equal(after.observation.pendingTask, null);
+    assert.deepEqual(f.value.witness.witnesses, original);
+    if (architecture) {
+      const trials = f.purchaseTrials.filter((p) => p.action.architecture);
+      assert.ok(trials.length >= 2);
+      assert.deepEqual(trials[0].state, trials[1].state);
+      const continuations = trials.slice(0, 2).map((p) =>
+        f.dispatch({
+          operation: 'publicApply',
+          state: p.state,
+          move: { type: 'choose', choiceId: 'tech:theology' },
+        }),
+      );
+      assert.deepEqual(continuations[0], continuations[1]);
+    }
+  }
+  const sourceMessage = (v, id, index = 0) =>
+    v.raw.dom_entries.find((row) => row.action_id === id).messages.at(index);
+  for (const [name, change, alter, beforeChange, level, remaining] of [
+    [
+      'wrong corn cost',
+      (v) => {
+        sourceMessage(v, 7).raw_text = 'Aは3\nを支払った';
+      },
+    ],
+    [
+      'wrong payment resource',
+      (v) => {
+        sourceMessage(v, 7).icons[0].classes = 'tz_icon resource_wood';
+      },
+    ],
+    [
+      'wrong actor',
+      (v) => {
+        sourceMessage(v, 8).raw_text = 'Bは神学を1レベル進めた';
+      },
+    ],
+    [
+      'wrong technology',
+      (v) => {
+        sourceMessage(v, 8).raw_text = 'Aは農業を1レベル進めた';
+      },
+    ],
+    [
+      'missing continuation',
+      (v) => {
+        v.raw.entries = v.raw.entries.filter((r) => r.action_id !== 8);
+        v.raw.dom_entries = v.raw.dom_entries.filter((r) => r.action_id !== 8);
+        v.raw.entry_count = v.raw.entries.length;
+      },
+    ],
+    [
+      'duplicate gold caption',
+      (v) => {
+        sourceMessage(v, 7, -1).raw_text = 'Aは2\nを獲得した';
+      },
+    ],
+    [
+      'incorrect architecture caption',
+      (v) => {
+        sourceMessage(v, 7, -2).raw_text = 'Aは3点を獲得した';
+      },
+    ],
+    [
+      'insufficient corn',
+      undefined,
+      undefined,
+      (frame) => {
+        frame.snapshot.state.players[0].resources.corn = 3;
+      },
+    ],
+    ['wrong initial theology', undefined, undefined, undefined, 1],
+    ['multiple buildings', undefined, undefined, undefined, 2, 2],
+    ...[
+      [
+        'early gold',
+        'purchase',
+        (s) => {
+          s.players[0].resources.gold++;
+        },
+      ],
+      [
+        'missing gold',
+        'technology',
+        (s) => {
+          s.players[0].resources.gold--;
+        },
+      ],
+      [
+        'duplicate gold',
+        'technology',
+        (s) => {
+          s.players[0].resources.gold++;
+        },
+      ],
+      [
+        'wrong architecture corn',
+        'purchase',
+        (s) => {
+          s.players[0].resources.corn++;
+        },
+      ],
+      [
+        'changed stock',
+        'technology',
+        (s) => {
+          s.skullSupply--;
+        },
+      ],
+      [
+        'other player changed',
+        'technology',
+        (s) => {
+          s.players[1].score++;
+        },
+      ],
+      [
+        'wrong queue corn mode',
+        'purchase',
+        (s) => {
+          s.pending.after[1].cornPayment = false;
+        },
+      ],
+      [
+        'wrong remaining build',
+        'purchase',
+        (s) => {
+          s.pending.after[1].remaining = 1;
+        },
+      ],
+      [
+        'extra tail',
+        'purchase',
+        (s) => {
+          s.pending.after.push({ type: 'effects', effects: [] });
+        },
+      ],
+    ].map(([name, stage, mutate]) => [
+      name,
+      undefined,
+      (frame, actual) => {
+        if (stage === actual) mutate(frame.snapshot.state);
+      },
+    ]),
+    [
+      'unfinished zero Build',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'technology') {
+          frame.observation.pendingTask = { type: 'build', remaining: 0 };
+          frame.snapshot.state.pending = { task: clone(frame.observation.pendingTask), after: [] };
+        }
+      },
+    ],
+  ]) {
+    const f = cornGoldFixture(change, alter, true, level, remaining);
+    beforeChange?.(f.before);
+    f.value.witness.witnesses[0].expected.players[0] = clone(f.before.snapshot.state.players[0]);
+    const original = clone(f.value.witness.witnesses);
+    const rejected = decode(f.value, f.dispatch);
+    assert.equal(rejected.manifest.blocked?.actionId, 7, name);
+    assert.deepEqual(
+      rejected.record.steps.map((s) => s.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.equal(
+      rejected.manifest.audit.some((row) => row.queuedPurchaseSourceActionId),
+      false,
+      name,
+    );
+    assert.deepEqual(f.value.witness.witnesses, original, name);
   }
   const finalTheologyFixture = (change = () => {}, alter = () => {}) =>
     fixture(

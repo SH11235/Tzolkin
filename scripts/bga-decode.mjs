@@ -2247,6 +2247,15 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       retainedTail?.length === 0 &&
       continuation?.technology === 'extraction' &&
       before.technologies.extraction === 3;
+    const cornPaidTheologyGold =
+      resource === 'gold' &&
+      amount === 1 &&
+      task?.cornPayment === true &&
+      task.remaining === 1 &&
+      task.mandatory !== true &&
+      retainedTail?.length === 0 &&
+      continuation?.technology === 'theology' &&
+      before.technologies.theology === 2;
     if (
       witnesses.catalogHash !== catalogHash ||
       actor < 0 ||
@@ -2276,7 +2285,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         !continuation?.theologyCapped &&
         !continuation?.architectureCapped &&
         (!(before.technologies[continuation?.technology] < 3) || retainedTail?.length !== 0)) ||
-      task.cornPayment !== false ||
+      (task.cornPayment !== false && !cornPaidTheologyGold) ||
       retainedTail === null ||
       continuation === null ||
       (skull &&
@@ -2306,6 +2315,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (index < 1 || index > 3 || cost[index] < 1) return null;
       cost[index]--;
     } else if (action.discountResource !== null) return null;
+    if (cornPaidTheologyGold) {
+      // Convert the discounted catalog material price, never the captioned gain.
+      // Other catalog cost kinds are outside this receipt's limited scope.
+      if (cost[0] !== 0 || cost[4] !== 0) return null;
+      cost[0] = 2 * (cost[1] + cost[2] + cost[3]);
+      cost.fill(0, 1, 4);
+    }
     const gains = events.filter((item) => item.kind === 'resourceGain');
     const gainEvent = gains.at(-1);
     const scoreEvent = events.find((item) => fixedScoreCaption(item) === 2);
@@ -2334,7 +2350,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       ) ||
       !same(typedResourceCost(action), cost) ||
       !same(paymentOf(events), cost) ||
-      (skullExtractionCapped &&
+      ((skullExtractionCapped || cornPaidTheologyGold) &&
         RESOURCES.some(
           (r, i) => !Number.isSafeInteger(before.resources[r]) || before.resources[r] < cost[i],
         )) ||
@@ -2344,7 +2360,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           type: 'build',
           remaining: task.remaining - 1,
           allowMonument: false,
-          cornPayment: false,
+          cornPayment: cornPaidTheologyGold,
           architectureAvailable: task.architectureAvailable !== false && !action.architecture,
           ...(task.mandatory ? { mandatory: true } : {}),
         },
@@ -2364,6 +2380,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       ...continuation,
       kind: 'materialTechnology',
       ...(skullExtractionCapped ? { skullExtractionCapped: true } : {}),
+      ...(cornPaidTheologyGold ? { cornPaidTheologyGold: true } : {}),
       actor,
       resource,
       amount,
@@ -3875,7 +3892,28 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               receipt?.kind !== 'materialTechnology'
             )
               fail('Final technology plus Skull purchase requires its exact continuation receipt');
+            if (
+              beforePurchase.pending?.task?.type === 'build' &&
+              beforePurchase.pending.task.cornPayment === true &&
+              same(buildings.get(action.id)?.effects, [
+                { type: 'technology', technology: 'any', steps: 1 },
+                { type: 'resources', resources: { gold: 1 } },
+              ]) &&
+              receipt?.cornPaidTheologyGold !== true
+            )
+              fail('Corn-paid technology plus Gold requires its exact continuation receipt');
             if (receipt) {
+              if (receipt.cornPaidTheologyGold) {
+                // Equivalent discounts identify a replay representative, not a
+                // source-observed human TypedAction. Keep this distinction even
+                // when the continuation later proves the same full state.
+                Object.assign(audit.at(-1), {
+                  cornPaidTheologyGold: true,
+                  discountSelectionUnknown: audit.at(-1).equivalentChoices > 1,
+                  humanTypedActionObserved: false,
+                  humanPlayingBcReady: false,
+                });
+              }
               const anchoredMaterial =
                 receipt.kind === 'materialTechnology' &&
                 saved.deferredScore?.kind === 'action' &&
