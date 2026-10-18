@@ -2383,7 +2383,8 @@ fn choose_pending_with_feeding_events(
                     .into_iter()
                     .find(|o| o.id == id)
                     .ok_or("この選択は現在利用できません。")?;
-                pay(s, &o.cost, false)?;
+                // Paid skulls stay with the monument, outside the common bank.
+                pay(s, &o.cost, true)?;
                 discard_renovation(s, &o.renovation);
                 current_mut(s).monuments.push(o.monument_id.clone());
                 s.monuments.retain(|x| x != &o.monument_id);
@@ -2462,7 +2463,7 @@ fn choose_pending_with_feeding_events(
                 .into_iter()
                 .find(|o| o.id == id)
                 .ok_or("この選択は現在利用できません。")?;
-            pay(s, &o.cost, false)?;
+            pay(s, &o.cost, true)?;
             discard_renovation(s, &o.renovation);
             current_mut(s).monuments.push(o.monument_id.clone());
             s.monuments.retain(|x| x != &o.monument_id);

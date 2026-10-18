@@ -19,6 +19,210 @@ fn enabled(state: &GameState) -> Vec<GameMove> {
         .collect()
 }
 
+fn monument_payment_state(dedicated: bool, supply: i64) -> GameState {
+    let mut state = create_game((0..4).map(|i| format!("P{i}")).collect(), 42, dedicated).unwrap();
+    while state.phase == Phase::Setup {
+        let operation = enabled(&state).remove(0);
+        state = apply_move(&state, operation).unwrap();
+    }
+    if !state.monuments.iter().any(|id| id == "m13") {
+        state.monuments[0] = "m13".into();
+    }
+    for player in &mut state.players {
+        player.resources.insert(Resource::Skull, 0);
+    }
+    state.players[0].resources.insert(Resource::Skull, 1);
+    state.players[1]
+        .resources
+        .insert(Resource::Skull, 12 - supply);
+    for resource in [Resource::Corn, Resource::Wood, Resource::Stone] {
+        state.players[0].resources.insert(resource, 10);
+    }
+    state.players[0].resources.insert(Resource::Gold, 4);
+    state.skull_supply = supply;
+    state.turn.mode = TurnMode::Remove;
+    state.turn.count = 1;
+    state.pending = Some(Pending {
+        title: "Synthetic monument payment".into(),
+        task: if dedicated {
+            Task::BuildMonument
+        } else {
+            Task::Build {
+                remaining: 2,
+                allow_monument: true,
+                corn_payment: false,
+                architecture_available: None,
+                mandatory: false,
+            }
+        },
+        after: vec![],
+    });
+    assert_state(&state);
+    state
+}
+
+#[test]
+fn monument_skull_payments_stay_outside_the_bank_in_both_build_tasks() {
+    for dedicated in [false, true] {
+        for supply in [0, 4] {
+            let before = monument_payment_state(dedicated, supply);
+            let operation = GameMove::Choose {
+                choice_id: "monument:m13".into(),
+            };
+            let compact = assert_state(&before);
+            let after = assert_transition(&before, &compact, operation.clone());
+            assert_eq!(after.skull_supply, supply);
+            assert_eq!(after.players[0].resources[&Resource::Skull], 0);
+            assert_eq!(after.players[0].monuments, ["m13"]);
+            assert!(!after.monuments.iter().any(|id| id == "m13"));
+            assert_eq!(after.players[0].building_skulls, 0);
+            assert_eq!(after.players[0].skulls_placed, 0);
+            assert_eq!(score_monument(&after, &after.players[0], "m13"), 0.0);
+            assert_state(&after);
+            if !dedicated {
+                use tzolkin_core::public_replay::*;
+                let initial = PublicState::from_game_state(&before).unwrap();
+                let frame = apply_public(&initial, 0, operation, &Refills::default()).unwrap();
+                assert_eq!(frame.snapshot.state.skull_supply, supply);
+                validate_public_state(&frame.snapshot.state).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
+fn paid_monument_skulls_cannot_fund_later_harvest_or_capped_theology() {
+    let state = monument_payment_state(false, 0);
+    let mut state = apply_move(
+        &state,
+        GameMove::Choose {
+            choice_id: "monument:m13".into(),
+        },
+    )
+    .unwrap();
+    for task in [
+        Task::Action {
+            gear: GearId::Yaxchilan,
+            position: 4,
+            free: None,
+        },
+        Task::Technology {
+            remaining: 1,
+            free: true,
+            mandatory: false,
+        },
+    ] {
+        state.players[0]
+            .technologies
+            .insert(TechnologyId::Theology, 3);
+        state.pending = Some(Pending {
+            title: "Synthetic empty-bank reward".into(),
+            task,
+            after: vec![],
+        });
+        let choice = if matches!(state.pending.as_ref().unwrap().task, Task::Action { .. }) {
+            "action:4"
+        } else {
+            "tech:theology"
+        };
+        let compact = assert_state(&state);
+        state = assert_transition(
+            &state,
+            &compact,
+            GameMove::Choose {
+                choice_id: choice.into(),
+            },
+        );
+        assert_eq!(state.skull_supply, 0);
+        assert_eq!(state.players[0].resources[&Resource::Skull], 0);
+    }
+    // A real placement by a different player remains the source of allSkulls
+    // points. The monument's paid skull must never count as a city placement.
+    state.current_player = 1;
+    state.turn_index = 1;
+    state.players[1]
+        .technologies
+        .insert(TechnologyId::Theology, 0);
+    state.pending = Some(Pending {
+        title: "Synthetic city placement".into(),
+        task: Task::Action {
+            gear: GearId::ChichenItza,
+            position: 1,
+            free: None,
+        },
+        after: vec![],
+    });
+    let compact = assert_state(&state);
+    state = assert_transition(
+        &state,
+        &compact,
+        GameMove::Choose {
+            choice_id: "action:1".into(),
+        },
+    );
+    assert_eq!(state.skull_supply, 0);
+    assert_eq!(state.players[1].skulls_placed, 1);
+    assert_eq!(score_monument(&state, &state.players[0], "m13"), 3.0);
+}
+
+#[test]
+fn monument_skull_costs_preserve_strict_conservation_and_reject_legacy_saves() {
+    for dedicated in [false, true] {
+        let before = monument_payment_state(dedicated, 0);
+        let operation = GameMove::Choose {
+            choice_id: "monument:m13".into(),
+        };
+        for missing in [Resource::Gold, Resource::Skull] {
+            let mut insufficient = before.clone();
+            if missing == Resource::Gold {
+                insufficient.players[0].resources.insert(missing, 3);
+            } else {
+                insufficient.players[0].resources.insert(missing, 0);
+                insufficient.players[1].resources.insert(missing, 13);
+            }
+            assert_state(&insufficient);
+            let original = insufficient.clone();
+            assert!(apply_move(&insufficient, operation.clone()).is_err());
+            assert_eq!(insufficient, original);
+        }
+        let after = apply_move(&before, operation.clone()).unwrap();
+        for restore_to_bank in [true, false] {
+            let mut invalid = after.clone();
+            if restore_to_bank {
+                invalid.skull_supply += 1;
+            } else {
+                *invalid.players[0]
+                    .resources
+                    .get_mut(&Resource::Skull)
+                    .unwrap() += 1;
+            }
+            assert!(!validation::validate_game_state(
+                &serde_json::to_value(&invalid).unwrap()
+            ));
+        }
+        assert!(apply_move(&after, operation).is_err());
+        let mut ordinary = before;
+        if !ordinary.monuments.iter().any(|id| id == "m01") {
+            let index = ordinary
+                .monuments
+                .iter()
+                .position(|id| id == "m13")
+                .unwrap();
+            ordinary.monuments[index] = "m01".into();
+        }
+        let compact = assert_state(&ordinary);
+        let next = assert_transition(
+            &ordinary,
+            &compact,
+            GameMove::Choose {
+                choice_id: "monument:m01".into(),
+            },
+        );
+        assert_eq!(next.skull_supply, 0);
+        assert_eq!(next.players[0].resources[&Resource::Skull], 1);
+    }
+}
+
 fn assert_masks(reference: &GameState, compact: &CompactState) {
     let mut occupied = [0u16; 5];
     let mut owners = [EMPTY_OWNER; 53];
