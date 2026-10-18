@@ -9,11 +9,12 @@ use tzolkin_ai::human_policy_dataset::{
     ConditionalHumanPolicyDataset, EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE,
     INPUT_SCHEMA, INPUT_SCHEMA_V2, INPUT_SCHEMA_V3, INPUT_SCHEMA_V4, INPUT_SCHEMA_V5,
     INPUT_SCHEMA_V6, INPUT_SCHEMA_V7, INPUT_SCHEMA_V8, INPUT_SCHEMA_V9, INPUT_SCHEMA_V10,
-    INPUT_SCHEMA_V11, INPUT_SCHEMA_V12, INPUT_SCHEMA_V13, MARKET_EXIT_NOTIFICATION_ASSUMPTION,
-    OBSERVED_BUILDING_LABEL_SCOPE, OBSERVED_CORN_BEG_LABEL_SCOPE,
-    OBSERVED_HARVEST_ROTATION_LABEL_SCOPE, OBSERVED_MARKET_BUY_LABEL_SCOPE,
-    OBSERVED_PENDING_CHOICE_LABEL_SCOPE, OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE,
-    PAID_TECHNOLOGY_LABEL_SCOPE,
+    INPUT_SCHEMA_V11, INPUT_SCHEMA_V12, INPUT_SCHEMA_V13, INPUT_SCHEMA_V14,
+    MARKET_EXIT_NOTIFICATION_ASSUMPTION, OBSERVED_BUILDING_LABEL_SCOPE,
+    OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_HARVEST_ROTATION_LABEL_SCOPE,
+    OBSERVED_MARKET_BUY_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
+    OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE, PAID_TECHNOLOGY_LABEL_SCOPE, SOURCE_STOPPING_LABEL_SCOPE,
+    STOPPING_NOTIFICATION_ASSUMPTION,
 };
 use tzolkin_core::observation::{TypedAction, observe};
 use tzolkin_core::public_replay::{
@@ -2091,10 +2092,13 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V11
             || schema == INPUT_SCHEMA_V12
             || schema == INPUT_SCHEMA_V13
+            || schema == INPUT_SCHEMA_V14
         {
             manifest["featureProfile"] = json!("semanticPlaying4");
         }
-        if schema == INPUT_SCHEMA_V13 && !self.rotation_observations.is_empty() {
+        if matches!(schema, INPUT_SCHEMA_V13 | INPUT_SCHEMA_V14)
+            && !self.rotation_observations.is_empty()
+        {
             manifest["rotationObservations"] = json!(
                 self.rotation_observations
                     .iter()
@@ -2113,8 +2117,13 @@ impl Fixture {
                     .collect::<Vec<_>>()
             );
         }
+        if schema == INPUT_SCHEMA_V14 {
+            manifest["stoppingNotificationAssumption"] = json!(STOPPING_NOTIFICATION_ASSUMPTION);
+        }
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let file = if schema == INPUT_SCHEMA_V13 {
+        let file = if schema == INPUT_SCHEMA_V14 {
+            "manifest-v14.json"
+        } else if schema == INPUT_SCHEMA_V13 {
             "manifest-v13.json"
         } else if schema == INPUT_SCHEMA_V12 {
             "manifest-v12.json"
@@ -2148,6 +2157,7 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V11
             || schema == INPUT_SCHEMA_V12
             || schema == INPUT_SCHEMA_V13
+            || schema == INPUT_SCHEMA_V14
         {
             assert!(
                 ConditionalHumanPolicyDataset::load(
@@ -2165,6 +2175,7 @@ impl Fixture {
             || schema == INPUT_SCHEMA_V11
             || schema == INPUT_SCHEMA_V12
             || schema == INPUT_SCHEMA_V13
+            || schema == INPUT_SCHEMA_V14
         {
             ConditionalHumanPolicyDataset::load_semantic_playing
         } else {
@@ -2363,6 +2374,387 @@ fn decision_time_exclusions_reject_bad_bindings_and_never_skip_replay_validation
         !error.contains("Decision-time exclusion"),
         "illegal replay must fail first: {error}"
     );
+}
+
+impl Fixture {
+    fn source_stopping_round(future_gear: GearId) -> Self {
+        use tzolkin_core::public_replay::apply_public;
+        let mut f = Self::new();
+        let mut record: PublicReplayRecord = serde_json::from_value(f.record.clone()).unwrap();
+        let mut state = record.initial.clone();
+        record.steps.clear();
+        let mut audit = Vec::new();
+        let mut nodes = Vec::new();
+        for turn in 0..4 {
+            let source = if turn == 3 { 50 } else { 10 * (turn + 1) };
+            let o = inspect_public(&state).unwrap().observation.unwrap();
+            let row = o
+                .legal_actions
+                .iter()
+                .find(|r| {
+                    matches!(r.action,
+                TypedAction::Place { gear, discount: false, .. }
+                    if gear == if turn == 3 { future_gear } else { GearId::Yaxchilan })
+                })
+                .unwrap();
+            let TypedAction::Place {
+                gear, corn_cost, ..
+            } = row.action
+            else {
+                unreachable!()
+            };
+            let name = match gear {
+                GearId::Palenque => "Palenque",
+                GearId::Yaxchilan => "Yaxchilan",
+                _ => unreachable!(),
+            };
+            let caption = format!(
+                "P{}は{name}の歯車に{corn_cost} を支払ってワーカーを置いた",
+                state.current_player
+            );
+            nodes.push(json!({"action_id":source,"timestamp_display":"12:00","messages":[{"raw_text":caption}]}));
+            let actor = state.current_player;
+            record.steps.push(PublicReplayStep {
+                actor,
+                r#move: row.r#move.clone(),
+                source_action_ids: vec![source],
+                refills: Refills::default(),
+                checkpoint: None,
+            });
+            audit.push(json!({"step":record.steps.len(),"actor":actor,"actionId":source,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+            state = apply_public(&state, actor, row.r#move.clone(), &Refills::default())
+                .unwrap()
+                .snapshot
+                .state;
+            if turn == 3 {
+                break;
+            }
+            let o = inspect_public(&state).unwrap().observation.unwrap();
+            assert!(o.legal_actions.len() > 1);
+            let row = o
+                .legal_actions
+                .iter()
+                .find(|r| {
+                    r.action
+                        == TypedAction::EndTurn {
+                            double_advance: None,
+                        }
+                })
+                .unwrap();
+            let source = if turn == 2 { 40 } else { source + 10 };
+            record.steps.push(PublicReplayStep {
+                actor,
+                r#move: row.r#move.clone(),
+                source_action_ids: vec![source],
+                refills: Refills::default(),
+                checkpoint: None,
+            });
+            audit.push(json!({"step":record.steps.len(),"actor":actor,"actionId":source,"action":row.action,"derivedFromVisibleBoundary":true,"equivalentChoices":1}));
+            state = apply_public(&state, actor, row.r#move.clone(), &Refills::default())
+                .unwrap()
+                .snapshot
+                .state;
+            if turn == 2 {
+                nodes.push(json!({"action_id":40,"timestamp_display":"12:00","messages":[{"raw_text":"歯車が進んだ"}]}));
+            }
+        }
+        f.record = json!(record);
+        f.audit["audit"] = json!(audit);
+        f.raw["dom_entries"] = json!(nodes);
+        f.sync_entries();
+        f
+    }
+    fn source_stopping_market() -> Self {
+        let mut f = Self::ordinary_market_exit();
+        let last = f.audit["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["action"]["type"] == "trade")
+            .unwrap()["step"]
+            .as_u64()
+            .unwrap() as usize
+            - 1;
+        let record: PublicReplayRecord = serde_json::from_value(f.record.clone()).unwrap();
+        let report = verify_public_replay(&record).unwrap();
+        for i in [last - 2, last - 1] {
+            f.record["steps"][i]["sourceActionIds"] = json!([5]);
+            let o = inspect_public(&report.frames[i].snapshot.state)
+                .unwrap()
+                .observation
+                .unwrap();
+            let row = o
+                .legal_actions
+                .iter()
+                .find(|r| r.r#move == record.steps[i].r#move)
+                .unwrap();
+            f.audit["audit"].as_array_mut().unwrap().push(json!({"step":i+1,"actor":0,"actionId":5,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+        }
+        f.raw["dom_entries"].as_array_mut().unwrap().insert(0,json!({"action_id":5,"timestamp_display":"11:59","messages":[{"raw_text":"P0はUxmal 7のワーカーを取り除き、n°2のアクションを行った"}]}));
+        f.sync_entries();
+        f
+    }
+}
+fn stopping_report(f: &Fixture) -> Result<Value, String> {
+    f.load_scope(INPUT_SCHEMA_V14, Some(json!(SOURCE_STOPPING_LABEL_SCOPE)))
+        .map(|d| serde_json::to_value(d.report()).unwrap())
+}
+fn stops(value: &Value) -> Vec<&Value> {
+    value["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s.get("stoppingSupport").is_some())
+        .collect()
+}
+#[test]
+fn source_stopping_v14_adds_choiceful_ends_and_preserves_v13_without_future_features() {
+    let f = Fixture::source_stopping_round(GearId::Palenque);
+    let old = serde_json::to_value(
+        f.load_scope(
+            INPUT_SCHEMA_V13,
+            Some(json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)),
+        )
+        .unwrap()
+        .report(),
+    )
+    .unwrap();
+    let new = stopping_report(&f).unwrap();
+    assert_eq!(stops(&new).len(), 3);
+    for sample in old["samples"].as_array().unwrap() {
+        assert!(new["samples"].as_array().unwrap().contains(sample));
+    }
+    assert_eq!(new["trainingReady"], false);
+    assert_eq!(new["featureSchema"], SEMANTIC_PLAYING_FEATURE_SCHEMA);
+    let future = stopping_report(&Fixture::source_stopping_round(GearId::Yaxchilan)).unwrap();
+    for (left, right) in stops(&new).into_iter().zip(stops(&future)) {
+        assert_eq!(left["candidates"], right["candidates"]);
+        assert_eq!(left["observationKey"], right["observationKey"]);
+        assert_eq!(
+            left["stoppingSupport"]["futureContextUsedOnlyForLabel"],
+            true
+        );
+        assert!(left["legalActions"].as_array().unwrap().len() > 1);
+        assert_eq!(left["valueTarget"], Value::Null);
+    }
+    // A new scope remains unsupported by the legacy training identity contract.
+    let d = f
+        .load_scope(INPUT_SCHEMA_V14, Some(json!(SOURCE_STOPPING_LABEL_SCOPE)))
+        .unwrap();
+    assert!(
+        tzolkin_ai::human_policy_training::train_conditional_datasets(
+            &[d],
+            &tzolkin_ai::policy_training::PolicyBcConfig::default(),
+            None
+        )
+        .is_err()
+    );
+    let mut manifest = timing_manifest(&f, &[1]);
+    manifest["schema"] = json!(INPUT_SCHEMA_V14);
+    manifest["labelScope"] = json!(SOURCE_STOPPING_LABEL_SCOPE);
+    assert!(load_timing_manifest(&f, &manifest).is_err());
+    manifest["stoppingNotificationAssumption"] = json!(STOPPING_NOTIFICATION_ASSUMPTION);
+    let filtered =
+        serde_json::to_value(load_timing_manifest(&f, &manifest).unwrap().report()).unwrap();
+    assert_eq!(stops(&filtered).len(), 2);
+    assert!(!stops(&filtered).iter().any(|s| s["replayStepIndex"] == 1));
+    manifest["schema"] = json!(INPUT_SCHEMA_V13);
+    manifest["labelScope"] = json!(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE);
+    assert!(load_timing_manifest(&f, &manifest).is_err());
+
+    // Exhaust affordable placement choices through legal moves; an automatic
+    // one-choice continuation is not a positive human stopping decision.
+    let mut forced = Fixture::source_stopping_round(GearId::Palenque);
+    let mut record: PublicReplayRecord = serde_json::from_value(forced.record.clone()).unwrap();
+    let mut state = verify_public_replay(&record).unwrap().frames[1]
+        .snapshot
+        .state
+        .clone();
+    let mut extra = Vec::new();
+    let mut audits = Vec::new();
+    let mut nodes = Vec::new();
+    loop {
+        let o = inspect_public(&state).unwrap().observation.unwrap();
+        let row = o.legal_actions.iter().filter(|r|matches!(r.action,TypedAction::Place {gear,discount:false,..}if gear!=GearId::Yaxchilan))
+            .min_by_key(|r|if let TypedAction::Place {corn_cost,..}=r.action {corn_cost}else{unreachable!()});
+        let Some(row) = row else {
+            assert_eq!(o.legal_actions.len(), 1);
+            break;
+        };
+        let source = 11 + extra.len() as u64;
+        let TypedAction::Place {
+            gear, corn_cost, ..
+        } = row.action
+        else {
+            unreachable!()
+        };
+        let gear = match gear {
+            GearId::Palenque => "Palenque",
+            GearId::Tikal => "Tikal",
+            GearId::Uxmal => "Uxmal",
+            GearId::ChichenItza => "Chichen Itza",
+            _ => unreachable!(),
+        };
+        let caption = format!("P0は{gear}の歯車に{corn_cost} を支払ってワーカーを置いた");
+        nodes.push(json!({"action_id":source,"timestamp_display":"12:00","messages":[{"raw_text":caption}]}));
+        extra.push(PublicReplayStep {
+            actor: 0,
+            r#move: row.r#move.clone(),
+            source_action_ids: vec![source],
+            refills: Refills::default(),
+            checkpoint: None,
+        });
+        audits.push(json!({"step":1+extra.len(),"actor":0,"actionId":source,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+        state = tzolkin_core::public_replay::apply_public(
+            &state,
+            0,
+            row.r#move.clone(),
+            &Refills::default(),
+        )
+        .unwrap()
+        .snapshot
+        .state;
+    }
+    let extra_len = extra.len();
+    record.steps.splice(1..1, extra);
+    // With every worker out, the following turn starts with retrieval.
+    let mut future = record.steps.pop().unwrap();
+    let after = verify_public_replay(&record)
+        .unwrap()
+        .frames
+        .last()
+        .unwrap()
+        .snapshot
+        .state
+        .clone();
+    let future_o = inspect_public(&after).unwrap().observation.unwrap();
+    let retrieval = future_o
+        .legal_actions
+        .iter()
+        .find(|r| {
+            matches!(
+                r.action,
+                TypedAction::Remove {
+                    gear: GearId::Yaxchilan,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let TypedAction::Remove { position, .. } = retrieval.action else {
+        unreachable!()
+    };
+    future.r#move = retrieval.r#move.clone();
+    record.steps.push(future);
+    forced.record = json!(record);
+    for a in forced.audit["audit"].as_array_mut().unwrap() {
+        if a["step"].as_u64().unwrap() > 1 {
+            a["step"] = json!(a["step"].as_u64().unwrap() + extra_len as u64);
+        }
+    }
+    let audit = forced.audit["audit"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|a| a["actionId"] == 50)
+        .unwrap();
+    audit["action"] = json!(retrieval.action);
+    forced.audit["audit"].as_array_mut().unwrap().extend(audits);
+    forced.raw["dom_entries"]
+        .as_array_mut()
+        .unwrap()
+        .splice(1..1, nodes);
+    forced.raw["dom_entries"]
+        .as_array_mut()
+        .unwrap()
+        .last_mut()
+        .unwrap()["messages"] = json!([{"raw_text":format!("P0はYaxchilan {position}のワーカーを取り除き、n°{position}のアクションを行った")}]);
+    forced.sync_entries();
+    let value = stopping_report(&forced).unwrap();
+    assert!(
+        !stops(&value)
+            .iter()
+            .any(|s| s["replayStepIndex"] == 1 + extra_len)
+    );
+    assert_eq!(value["counts"]["excluded"]["forcedStopNoChoice"], 1);
+}
+#[test]
+fn source_stopping_v14_refuses_missing_cancelled_ambiguous_or_intervening_originals() {
+    for variant in 0..10 {
+        let mut f = Fixture::source_stopping_round(GearId::Palenque);
+        match variant {
+            0=>f.audit["audit"][0]["derivedFromVisibleBoundary"]=json!(true),
+            1=>f.raw["dom_entries"][1]["messages"].as_array_mut().unwrap().push(json!({"raw_text":"P1は行動をキャンセルした"})),
+            2=>f.raw["dom_entries"].as_array_mut().unwrap().insert(1,json!({"action_id":15,"timestamp_display":"12:00","messages":[{"raw_text":"unobserved intermediate choice"}]})),
+            3=>f.audit["audit"][1]["equivalentChoices"]=json!(2),
+            4=>{let row=f.audit["audit"][1].clone();f.audit["audit"].as_array_mut().unwrap().push(row);},
+            5=>f.audit["audit"][1]["actor"]=json!(2),
+            6=>f.raw["dom_entries"][1]["messages"][0]["raw_text"]=json!("P2はYaxchilanの歯車に0 を支払ってワーカーを置いた"),
+            7=>f.audit["audit"][1]["step"]=json!(999),
+            8=>{f.record["steps"][1]["sourceActionIds"]=json!([19]);f.audit["audit"][1]["actionId"]=json!(19);},
+            _=>f.record["steps"][1]["sourceActionIds"]=json!([]),
+        }
+        f.sync_entries();
+        if let Ok(result) = stopping_report(&f) {
+            assert!(
+                !stops(&result).iter().any(|s| s["replayStepIndex"] == 1),
+                "variant {variant}"
+            );
+        }
+    }
+}
+#[test]
+fn source_stopping_v14_ordinary_market_requires_complete_literal_exchanges_and_entry() {
+    let f = Fixture::source_stopping_market();
+    let value = stopping_report(&f).unwrap();
+    let markets = stops(&value)
+        .into_iter()
+        .filter(|s| s["stoppingSupport"]["kind"] == "ordinaryMarketExitFromSourceTransition")
+        .collect::<Vec<_>>();
+    assert_eq!(markets.len(), 1);
+    assert!(markets[0]["stoppingSupport"]["marketExitResources"].is_array());
+    assert_eq!(
+        markets[0]["stoppingSupport"]["marketExchangeReplaySteps"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for variant in 0..5 {
+        let mut f = Fixture::source_stopping_market();
+        match variant {
+            0=>{let row=f.audit["audit"].as_array_mut().unwrap().iter_mut().find(|a|a["action"]["type"]=="trade").unwrap();row["derivedFromVisibleBoundary"]=json!(true);},
+            1=>f.raw["dom_entries"][1]["messages"][0]["html"]=json!("wrong resource icons"),
+            2=>f.raw["dom_entries"].as_array_mut().unwrap().insert(2,json!({"action_id":15,"timestamp_display":"12:00","messages":[{"raw_text":"P0は行動をキャンセルした"}]})),
+            3=>{
+                // An unfinished market cannot be bypassed with EndTurn.
+                let index=f.audit["audit"].as_array().unwrap().iter().find(|a|a["action"]["type"]=="skip").unwrap()["step"].as_u64().unwrap() as usize-1;
+                f.record["steps"][index]["move"]=f.record["steps"][index+1]["move"].clone();
+            }
+            _=>{
+                // Unlike V11's anchored-equivalence contract, V14 never accepts
+                // an inserted silent exchange round trip, even with equal totals.
+                let index=f.audit["audit"].as_array().unwrap().iter().find(|a|a["action"]["type"]=="skip").unwrap()["step"].as_u64().unwrap() as usize-1;
+                let mut record:PublicReplayRecord=serde_json::from_value(f.record.clone()).unwrap();
+                record.steps.splice(index..index,["buy:wood","sell:wood"].into_iter().map(|id|PublicReplayStep {
+                    actor:0,r#move:tzolkin_core::GameMove::Choose {choice_id:id.into()},source_action_ids:vec![],refills:Refills::default(),checkpoint:None,
+                }));
+                for a in f.audit["audit"].as_array_mut().unwrap() {
+                    if a["step"].as_u64().unwrap() as usize>index {a["step"]=json!(a["step"].as_u64().unwrap()+2);}
+                }
+                f.record=json!(record);
+            }
+        }
+        f.sync_entries();
+        if let Ok(result) = stopping_report(&f) {
+            assert!(
+                !stops(&result)
+                    .iter()
+                    .any(|s| s["stoppingSupport"]["kind"]
+                        == "ordinaryMarketExitFromSourceTransition")
+            );
+        }
+    }
 }
 
 #[test]

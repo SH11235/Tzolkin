@@ -83,6 +83,13 @@ pub const DATASET_SCHEMA_V13: &str =
     "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v13";
 pub const OBSERVED_HARVEST_ROTATION_LABEL_SCOPE: &str =
     "ObservedV12AndLiteralHarvestAndSourceAnchoredRotationV13";
+pub const INPUT_SCHEMA_V14: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-source-v14";
+pub const DATASET_SCHEMA_V14: &str =
+    "tzolkin-conditional-basic-human-policy-semantic-playing-dataset-v14";
+pub const SOURCE_STOPPING_LABEL_SCOPE: &str = "ObservedV13AndSourceTransitionStoppingV14";
+pub const STOPPING_NOTIFICATION_ASSUMPTION: &str =
+    "CompleteRetainedActorOperationsAndMarketExchangeNotificationsBetweenSourceAnchors";
 pub const MARKET_EXIT_NOTIFICATION_ASSUMPTION: &str = "SingleMarketIntervalWithoutUnobservedReentryAndCompleteActorResourceNotificationsThroughObservedFoodDay";
 pub const RESERVATION_SCHEMA: &str = "tzolkin-human-source-table-reservations-v1";
 pub const TASK: &str = "ConditionalBasicHumanPolicy";
@@ -157,6 +164,8 @@ struct Manifest {
     /// Source-bound input mismatches; never changes replay execution or labels.
     #[serde(default, deserialize_with = "explicit_exclusion_pin")]
     decision_time_exclusions: Option<ContentPin>,
+    #[serde(default)]
+    stopping_notification_assumption: Option<String>,
 }
 fn explicit_exclusion_pin<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -211,11 +220,24 @@ fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
 }
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
-        if self.decision_time_exclusions.is_some() && self.schema != INPUT_SCHEMA_V13 {
-            return Err("Decision-time exclusions require the explicit V13 source scope".into());
+        let stopping = self.schema == INPUT_SCHEMA_V14;
+        if stopping
+            != (self.stopping_notification_assumption.as_deref()
+                == Some(STOPPING_NOTIFICATION_ASSUMPTION))
+            || (!stopping && self.stopping_notification_assumption.is_some())
+        {
+            return Err("Source stopping notification contract mismatch".into());
+        }
+        if self.decision_time_exclusions.is_some()
+            && !matches!(self.schema.as_str(), INPUT_SCHEMA_V13 | INPUT_SCHEMA_V14)
+        {
+            return Err(
+                "Decision-time exclusions require the explicit V13 or V14 source scope".into(),
+            );
         }
         if self.rotation_observations.len() > 8
-            || (self.schema != INPUT_SCHEMA_V13 && !self.rotation_observations.is_empty())
+            || (!matches!(self.schema.as_str(), INPUT_SCHEMA_V13 | INPUT_SCHEMA_V14)
+                && !self.rotation_observations.is_empty())
         {
             return Err("Rotation observations require their explicit source scope".into());
         }
@@ -237,8 +259,11 @@ impl Manifest {
             || self.schema == INPUT_SCHEMA_V11
             || self.schema == INPUT_SCHEMA_V12
             || self.schema == INPUT_SCHEMA_V13
+            || stopping
         {
-            let scope = if self.schema == INPUT_SCHEMA_V13 {
+            let scope = if stopping {
+                SOURCE_STOPPING_LABEL_SCOPE
+            } else if self.schema == INPUT_SCHEMA_V13 {
                 OBSERVED_HARVEST_ROTATION_LABEL_SCOPE
             } else if self.schema == INPUT_SCHEMA_V12 {
                 OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE
@@ -344,6 +369,38 @@ pub struct HumanPolicySample {
     observed_pending_choice_support: Option<ObservedPendingChoiceSupport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     capped_extraction_support: Option<CappedExtractionSupport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopping_support: Option<SourceStoppingSupport>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceStoppingSupport {
+    kind: &'static str,
+    basis: &'static str,
+    previous_replay_step_index: usize,
+    previous_source: u64,
+    boundary_source: u64,
+    next_replay_step_index: usize,
+    next_source: u64,
+    next_message_index: usize,
+    next_actor: usize,
+    round_before: i64,
+    round_after: i64,
+    market_exchange_replay_steps: Vec<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    market_exit_resources: Option<[i64; 5]>,
+    notification_assumption: &'static str,
+    future_context_used_only_for_label: bool,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SourceStoppingDecision {
+    replay_step_index: usize,
+    source_action_id: u64,
+    actor: usize,
+    /// Source eligibility precedes the separately reported input exclusions.
+    source_supported: bool,
+    reason: &'static str,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -474,7 +531,7 @@ impl HumanPolicySample {
     }
     /// Source label and complete legal order, deliberately independent of feature values.
     pub(crate) fn source_label_digest(&self) -> Result<String, String> {
-        let bytes = serde_json::to_vec(&(
+        let mut bytes = serde_json::to_vec(&(
             (
                 &self.sample_id,
                 &self.family_id,
@@ -502,6 +559,9 @@ impl HumanPolicySample {
             ),
         ))
         .map_err(|e| e.to_string())?;
+        if let Some(support) = &self.stopping_support {
+            bytes.extend(serde_json::to_vec(support).map_err(|e| e.to_string())?);
+        }
         if bytes.len() > MAX_INPUT {
             return Err("Conditional source label exceeds bounded legal metadata".into());
         }
@@ -563,6 +623,8 @@ pub struct HumanPolicyReport<'a> {
     samples: &'a [HumanPolicySample],
     #[serde(skip_serializing_if = "Option::is_none")]
     decision_time_exclusions: Option<&'a DecisionTimeExclusionReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopping_decisions: Option<&'a [SourceStoppingDecision]>,
 }
 /// Sealed by source replay, source text and the final decoder audit. No stored
 /// float arrays or caller-supplied core report can construct this dataset.
@@ -583,6 +645,7 @@ pub struct ConditionalHumanPolicyDataset {
     counts: HumanPolicyCounts,
     samples: Vec<HumanPolicySample>,
     decision_time_exclusions: Option<DecisionTimeExclusionReport>,
+    stopping_decisions: Vec<SourceStoppingDecision>,
 }
 
 fn decimal(value: &str) -> Result<(), String> {
@@ -935,6 +998,397 @@ fn observed_audit(entry: &Value) -> bool {
         ]
         .iter()
         .all(|field| entry.get(*field).is_none())
+}
+
+// These labels describe a source-visible transition, not a literal stop caption.
+// All future context stays in this provenance sidecar; the encoder receives only
+// the canonical pre-decision observation. No search for unlogged exchanges is used.
+fn source_stopping_evidence(
+    index: usize,
+    action: &TypedAction,
+    sources: &Sources,
+    report: &PublicReplayReport,
+    samples: &[HumanPolicySample],
+) -> Result<Result<SourceStoppingSupport, &'static str>, String> {
+    let record = &sources.record;
+    let before = &report.frames[index].snapshot.state;
+    let step = &record.steps[index];
+    let actor = step.actor;
+    let nodes = array(&sources.raw, "dom_entries")?;
+    let audits = array(&sources.audit, "audit")?;
+    let row_at = |i: usize| -> Result<LegalAction, String> {
+        inspect_public(&report.frames[i].snapshot.state)?
+            .observation
+            .and_then(|o| {
+                o.legal_actions
+                    .into_iter()
+                    .find(|r| r.r#move == record.steps[i].r#move)
+            })
+            .ok_or("Missing source stopping action".into())
+    };
+    let observed = |i: usize| -> Result<bool, String> {
+        let s = &record.steps[i];
+        if s.source_action_ids.len() != 1 || s.refills != Default::default() {
+            return Ok(false);
+        }
+        let typed = serde_json::to_value(row_at(i)?.action).map_err(|e| e.to_string())?;
+        let bound = audits
+            .iter()
+            .filter(|a| {
+                a["step"].as_u64() == Some(i as u64 + 1)
+                    && a["actor"].as_u64() == Some(s.actor as u64)
+                    && a["actionId"].as_u64() == Some(s.source_action_ids[0])
+                    && a["action"] == typed
+            })
+            .collect::<Vec<_>>();
+        Ok(bound.len() == 1 && observed_audit(bound[0]))
+    };
+    let covered = |i: usize| {
+        samples.iter().any(|s| {
+            s.actor == actor
+                && (s.replay_step_index == i
+                    || s.paid_technology_support
+                        .as_ref()
+                        .is_some_and(|p| p.payment_replay_step_index == i)
+                    || s.capped_extraction_support
+                        .as_ref()
+                        .is_some_and(|p| p.payment_replay_step_index == Some(i)))
+        })
+    };
+    let Some(previous) = index.checked_sub(1) else {
+        return Ok(Err("missingPreviousOperation"));
+    };
+    if step.source_action_ids.len() != 1
+        || step.refills != Default::default()
+        || before.phase != Phase::Playing
+        || before.current_player != actor
+        || record.steps[previous].actor != actor
+        || !covered(previous)
+    {
+        return Ok(Err("missingSourceCoveredPreviousOperation"));
+    }
+    let ordinary_market = matches!(action, TypedAction::Skip);
+    let mut exchange_steps = Vec::new();
+    let mut next_index = index + 1;
+    let mut last_original = previous;
+    if ordinary_market {
+        let Some(pending) = &before.pending else {
+            return Ok(Err("missingTradeQueue"));
+        };
+        if !matches!(pending.task, Task::Trade) || !pending.after.is_empty() {
+            return Ok(Err("nestedMarketContinuationNotSupported"));
+        }
+        // Every exchange in this visit must be a literal, retained notification.
+        let mut cursor = previous;
+        loop {
+            if !matches!(row_at(cursor)?.action, TypedAction::Trade { .. })
+                || record.steps[cursor].actor != actor
+                || !observed(cursor)?
+                || !covered(cursor)
+            {
+                return Ok(Err("incompleteOriginalExchangeSequence"));
+            }
+            exchange_steps.push(cursor);
+            let Some(prior) = cursor.checked_sub(1) else {
+                return Ok(Err("missingMarketEntry"));
+            };
+            if !matches!(row_at(prior)?.action, TypedAction::Trade { .. }) {
+                break;
+            }
+            cursor = prior;
+        }
+        exchange_steps.reverse();
+        let entry = exchange_steps[0] - 1;
+        if !matches!(
+            row_at(entry)?.action,
+            TypedAction::UseAction {
+                gear: GearId::Uxmal,
+                position: 2,
+                ..
+            }
+        ) || record.steps[entry].actor != actor
+            || !observed(entry)?
+            || !covered(entry)
+            || report.frames[index + 1].snapshot.state.pending.is_some()
+        {
+            return Ok(Err("marketEntryOrExitContinuationNotSupported"));
+        }
+        let entry_source = record.steps[entry].source_action_ids[0];
+        let first_trade_source = record.steps[exchange_steps[0]].source_action_ids[0];
+        if entry_source >= first_trade_source
+            || nodes.iter().any(|n| {
+                n["action_id"]
+                    .as_u64()
+                    .is_some_and(|s| s > entry_source && s < first_trade_source)
+            })
+        {
+            return Ok(Err("interveningOrUnobservedMarketEntry"));
+        }
+        for &trade in &exchange_steps {
+            let row = row_at(trade)?;
+            let TypedAction::Trade { resource, buy } = row.action else {
+                unreachable!()
+            };
+            let Some(messages) = nodes
+                .iter()
+                .find(|n| n["action_id"].as_u64() == Some(record.steps[trade].source_action_ids[0]))
+                .and_then(|n| n["messages"].as_array())
+            else {
+                return Ok(Err("missingOriginalExchange"));
+            };
+            let price = match resource {
+                Resource::Wood => 2,
+                Resource::Stone => 3,
+                Resource::Gold => 4,
+                _ => return Ok(Err("unsupportedExchangeResource")),
+            };
+            if messages.len() != 1
+                || if buy {
+                    !market_buy_caption(
+                        &messages[0],
+                        &before.players[actor].name,
+                        resource,
+                        sources.raw["schema_version"] == 1,
+                    ) || !market_buy_transition(trade, resource, report)
+                } else {
+                    !market_sell_caption(
+                        &messages[0],
+                        &before.players[actor].name,
+                        resource,
+                        price,
+                        sources.raw["schema_version"] == 1,
+                    )
+                }
+            {
+                return Ok(Err("exchangeCaptionOrResourcesMismatch"));
+            }
+            let start = &report.frames[trade].snapshot.state;
+            let end = &report.frames[trade + 1].snapshot.state;
+            let mut expected = start.clone();
+            expected.log = end.log.clone();
+            *expected.players[actor]
+                .resources
+                .get_mut(&resource)
+                .ok_or("Missing trade resource")? += if buy { 1 } else { -1 };
+            *expected.players[actor]
+                .resources
+                .get_mut(&Resource::Corn)
+                .ok_or("Missing trade corn")? += if buy { -price } else { price };
+            if &expected != end {
+                return Ok(Err("exchangeStateMismatch"));
+            }
+        }
+        if record
+            .steps
+            .get(next_index)
+            .is_some_and(|s| s.actor == actor)
+            && matches!(
+                row_at(next_index)?.action,
+                TypedAction::EndTurn {
+                    double_advance: None
+                }
+            )
+        {
+            if report.frames[next_index].snapshot.state.pending.is_some()
+                || record.steps[next_index].source_action_ids != step.source_action_ids
+                || record.steps[next_index].refills != Default::default()
+            {
+                return Ok(Err("invalidMarketTurnContinuation"));
+            }
+            next_index += 1;
+        }
+    } else {
+        if before.pending.is_some()
+            || !matches!(
+                action,
+                TypedAction::EndTurn {
+                    double_advance: None
+                }
+            )
+        {
+            return Ok(Err("unfinishedQueueOrUnsupportedEnd"));
+        }
+        // A previously certified ordinary exit can anchor the main-turn stop.
+        if matches!(row_at(previous)?.action, TypedAction::Skip) {
+            let Some(support) = samples
+                .iter()
+                .find(|s| s.replay_step_index == previous)
+                .and_then(|s| s.stopping_support.as_ref())
+                .filter(|s| s.kind == "ordinaryMarketExitFromSourceTransition")
+            else {
+                return Ok(Err("unprovenPrecedingMarketExit"));
+            };
+            last_original = support.previous_replay_step_index;
+        } else if !observed(previous)? {
+            return Ok(Err("unobservedPreviousOperation"));
+        }
+        // Bind the last primary operation and its entire pending continuation.
+        // Earlier completed operations are already part of the conditional input.
+        let mut cursor = last_original;
+        loop {
+            if !observed(cursor)? || !covered(cursor) {
+                return Ok(Err("unobservedOperationInTurn"));
+            }
+            let state = &report.frames[cursor].snapshot.state;
+            if state.pending.is_none()
+                && matches!(
+                    row_at(cursor)?.action,
+                    TypedAction::Place { .. }
+                        | TypedAction::Remove { .. }
+                        | TypedAction::FirstPlayer { .. }
+                )
+            {
+                break;
+            }
+            let Some(prior) = cursor.checked_sub(1) else {
+                return Ok(Err("missingTurnOrigin"));
+            };
+            if record.steps[prior].actor != actor || last_original - prior > 256 {
+                return Ok(Err("missingTurnOrigin"));
+            }
+            cursor = prior;
+        }
+        let first_source = record.steps[cursor].source_action_ids[0];
+        let last_source = record.steps[last_original].source_action_ids[0];
+        if nodes.iter().any(|n| {
+            n["action_id"].as_u64().is_some_and(|id| {
+                id >= first_source
+                    && id <= last_source
+                    && !record.steps[cursor..=last_original]
+                        .iter()
+                        .any(|s| s.source_action_ids == [id])
+            })
+        }) {
+            return Ok(Err("unaccountedOriginalOperationInTurn"));
+        }
+    }
+    let Some(next_step) = record.steps.get(next_index) else {
+        return Ok(Err("missingFollowingOriginalOperation"));
+    };
+    let next = row_at(next_index)?;
+    let after = &report.frames[next_index].snapshot.state;
+    if !observed(next_index)?
+        || after.pending.is_some()
+        || !matches!(
+            next.action,
+            TypedAction::Place { .. }
+                | TypedAction::Remove { .. }
+                | TypedAction::FirstPlayer { .. }
+        )
+        || (!ordinary_market && next_step.actor == actor && after.round == before.round)
+        || (ordinary_market && next_index == index + 1 && next_step.actor != actor)
+    {
+        return Ok(Err("followingActorOrPhaseNotSupported"));
+    }
+    let previous_source = record.steps[last_original].source_action_ids[0];
+    let boundary = step.source_action_ids[0];
+    let next_source = next_step.source_action_ids[0];
+    if previous_source >= boundary || boundary > next_source {
+        return Ok(Err("sourceBoundaryOrderingMismatch"));
+    }
+    if !nodes
+        .iter()
+        .any(|n| n["action_id"].as_u64() == Some(boundary))
+    {
+        return Ok(Err("missingOriginalStoppingBoundary"));
+    }
+    if nodes
+        .iter()
+        .filter(|n| {
+            n["action_id"]
+                .as_u64()
+                .is_some_and(|s| s >= previous_source && s <= next_source)
+        })
+        .any(|n| {
+            n["messages"].as_array().is_some_and(|ms| {
+                ms.iter().any(|m| {
+                    m["raw_text"]
+                        .as_str()
+                        .is_some_and(|s| s.ends_with("は行動をキャンセルした"))
+                })
+            })
+        })
+    {
+        return Ok(Err("cancelledSourceBoundary"));
+    }
+    let name = &after.players[next_step.actor].name;
+    let Some(next_messages) = nodes
+        .iter()
+        .find(|n| n["action_id"].as_u64() == Some(next_source))
+        .and_then(|n| n["messages"].as_array())
+    else {
+        return Ok(Err("missingFollowingCaption"));
+    };
+    let matches = next_messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            m["raw_text"]
+                .as_str()
+                .is_some_and(|text| observed_label(text, name, &next.action))
+        })
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Ok(Err("followingActorCaptionMismatch"));
+    }
+    let calendar = after.round == before.round + 1;
+    let mut calendar_count = 0;
+    for node in nodes.iter().filter(|n| {
+        n["action_id"]
+            .as_u64()
+            .is_some_and(|s| s > previous_source && s < next_source)
+    }) {
+        for message in array(node, "messages")? {
+            // This first contract deliberately withholds food/first-player/rotate
+            // subphases rather than treating any intervening caption as harmless.
+            if calendar && string(message, "raw_text")? == "歯車が進んだ" {
+                calendar_count += 1;
+            } else {
+                return Ok(Err("interveningOriginalEventOrCancellation"));
+            }
+        }
+    }
+    if calendar_count != usize::from(calendar) || (!calendar && after.round != before.round) {
+        return Ok(Err("calendarBoundaryNotUniquelySupported"));
+    }
+    if ordinary_market {
+        for pair in exchange_steps.windows(2) {
+            let left = record.steps[pair[0]].source_action_ids[0];
+            let right = record.steps[pair[1]].source_action_ids[0];
+            if left >= right
+                || nodes.iter().any(|n| {
+                    n["action_id"]
+                        .as_u64()
+                        .is_some_and(|s| s > left && s < right)
+                })
+            {
+                return Ok(Err("interveningOrUnobservedExchange"));
+            }
+        }
+    }
+    Ok(Ok(SourceStoppingSupport {
+        kind: if ordinary_market {
+            "ordinaryMarketExitFromSourceTransition"
+        } else {
+            "mainTurnEndFromSourceTransition"
+        },
+        basis: "conditionalUniqueMinimalContinuationFromRetainedOriginalOperationsNotLiteralStopCaption",
+        previous_replay_step_index: last_original,
+        previous_source,
+        boundary_source: boundary,
+        next_replay_step_index: next_index,
+        next_source,
+        next_message_index: matches[0],
+        next_actor: next_step.actor,
+        round_before: before.round,
+        round_after: after.round,
+        market_exchange_replay_steps: exchange_steps,
+        market_exit_resources: ordinary_market
+            .then(|| RESOURCE_IDS.map(|r| before.players[actor].resources[&r])),
+        notification_assumption: STOPPING_NOTIFICATION_ASSUMPTION,
+        future_context_used_only_for_label: true,
+    }))
 }
 
 // Accept only literal, bounded material icons and visible quantity. Nonempty
@@ -3409,6 +3863,7 @@ fn corn_beg_sample(
         corn_beg_support: Some(support.clone()),
         observed_pending_choice_support: None,
         capped_extraction_support: None,
+        stopping_support: None,
     })
 }
 
@@ -3474,6 +3929,7 @@ fn paid_technology_sample(
         corn_beg_support: None,
         observed_pending_choice_support: None,
         capped_extraction_support: None,
+        stopping_support: None,
     })
 }
 
@@ -3541,6 +3997,7 @@ fn capped_extraction_sample(
         corn_beg_support: None,
         observed_pending_choice_support: None,
         capped_extraction_support: Some(support.clone()),
+        stopping_support: None,
     })
 }
 
@@ -3606,7 +4063,8 @@ impl ConditionalHumanPolicyDataset {
             || manifest.schema == INPUT_SCHEMA_V10
             || manifest.schema == INPUT_SCHEMA_V11
             || manifest.schema == INPUT_SCHEMA_V12
-            || manifest.schema == INPUT_SCHEMA_V13)
+            || manifest.schema == INPUT_SCHEMA_V13
+            || manifest.schema == INPUT_SCHEMA_V14)
             != (feature_profile == ConditionalFeatureProfile::SemanticPlaying4)
         {
             return Err("Conditional source requires its explicit feature-profile loader".into());
@@ -3856,7 +4314,14 @@ impl ConditionalHumanPolicyDataset {
         pins: Vec<ContentPin>,
         feature_profile: ConditionalFeatureProfile,
     ) -> Result<Self, String> {
-        let label_scope = manifest.scope()?;
+        let declared_scope = manifest.scope()?;
+        // V14 inherits exactly V13's observed labels; stopping is an additive,
+        // separately gated source contract, not another copy of every old gate.
+        let label_scope = if declared_scope == Some(SOURCE_STOPPING_LABEL_SCOPE) {
+            Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE)
+        } else {
+            declared_scope
+        };
         let Sources {
             record,
             raw,
@@ -3933,6 +4398,7 @@ impl ConditionalHumanPolicyDataset {
             excluded: BTreeMap::new(),
         };
         let mut samples: Vec<HumanPolicySample> = Vec::new();
+        let mut stopping_decisions = Vec::new();
         let mut labels = BTreeSet::new();
         let mut paid_payment_steps = BTreeSet::new();
         let mut beg_temple_steps = BTreeSet::new();
@@ -3977,6 +4443,125 @@ impl ConditionalHumanPolicyDataset {
                 return Err("Final applied-step audit is absent or ambiguous".into());
             }
             let entry = bound[0];
+            if declared_scope == Some(SOURCE_STOPPING_LABEL_SCOPE)
+                && (matches!(
+                    row.action,
+                    TypedAction::EndTurn {
+                        double_advance: None
+                    }
+                ) || matches!(row.action, TypedAction::Skip)
+                    && matches!(observation.pending_task, Some(Task::Trade)))
+            {
+                let reason = if !teachers.contains(&actor_ids[step.actor]) {
+                    Some("notNominated")
+                } else if observation.legal_actions.len() < 2 {
+                    Some("forcedStopNoChoice")
+                } else if entry["derivedFromVisibleBoundary"].as_bool().is_none()
+                    || entry["equivalentChoices"].as_u64() != Some(1)
+                    || [
+                        "cancellation",
+                        "removedSteps",
+                        "physicalSelectionUnknown",
+                        "buildingEquivalenceClass",
+                    ]
+                    .iter()
+                    .any(|field| entry.get(*field).is_some())
+                {
+                    Some("ambiguousOrCancelledStoppingAudit")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    *counts.excluded.entry(reason.into()).or_default() += 1;
+                    continue;
+                }
+                let support =
+                    match source_stopping_evidence(index, &row.action, sources, &report, &samples)?
+                    {
+                        Ok(support) => support,
+                        Err(reason) => {
+                            stopping_decisions.push(SourceStoppingDecision {
+                                replay_step_index: index,
+                                source_action_id: source_id,
+                                actor: step.actor,
+                                source_supported: false,
+                                reason,
+                            });
+                            *counts
+                                .excluded
+                                .entry(format!("sourceStop:{reason}"))
+                                .or_default() += 1;
+                            continue;
+                        }
+                    };
+                if !labels.insert((source_id, support.next_message_index, support.kind)) {
+                    return Err("Source stopping transition consumed twice".into());
+                }
+                let encoder = feature_profile.encoder(observation)?;
+                let candidates = (0..observation.legal_actions.len())
+                    .map(|i| encoder.encode_legal_tagged(i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let candidate_count = counts
+                    .candidates
+                    .checked_add(candidates.len())
+                    .filter(|n| *n <= MAX_CANDIDATES)
+                    .ok_or("Human dataset candidate limit exceeded")?;
+                for candidate in &candidates {
+                    if candidate
+                        .values_for_schema(feature_profile.schema())?
+                        .iter()
+                        .any(|v| !v.is_finite() || v.abs() > 1024.0)
+                    {
+                        return Err("Conditional stopping features exceed finite1024 bound".into());
+                    }
+                }
+                let kind = support.kind;
+                stopping_decisions.push(SourceStoppingDecision {
+                    replay_step_index: index,
+                    source_action_id: source_id,
+                    actor: step.actor,
+                    source_supported: true,
+                    reason: "sourceSupportedBeforeInputExclusions",
+                });
+                let message_index = if support.boundary_source == support.next_source {
+                    support.next_message_index
+                } else {
+                    0
+                };
+                let sample_id = digest(
+                    format!(
+                        "{family}\0{}\0{source_id}\0{}\0{kind}",
+                        actor_ids[step.actor], message_index
+                    )
+                    .as_bytes(),
+                );
+                samples.push(HumanPolicySample {
+                    sample_id,
+                    family_id: family.clone(),
+                    split,
+                    table_id: manifest.table_id.clone(),
+                    source_actor_id: actor_ids[step.actor].clone(),
+                    source_action_id: source_id,
+                    source_message_index: message_index,
+                    replay_step_index: index,
+                    actor: step.actor,
+                    observation_key: observation.observation_key.clone(),
+                    legal_actions: observation.legal_actions.clone(),
+                    candidates,
+                    chosen,
+                    value_target: (),
+                    source_label_part: Some(kind),
+                    paired_sample_id: None,
+                    source_label_support: None,
+                    paid_technology_support: None,
+                    corn_beg_support: None,
+                    observed_pending_choice_support: None,
+                    capped_extraction_support: None,
+                    stopping_support: Some(support),
+                });
+                counts.candidates = candidate_count;
+                continue;
+            }
             if paid_payment_steps.contains(&index) || beg_temple_steps.contains(&index) {
                 continue;
             }
@@ -4721,6 +5306,7 @@ impl ConditionalHumanPolicyDataset {
                 corn_beg_support: None,
                 observed_pending_choice_support: pending_support,
                 capped_extraction_support: None,
+                stopping_support: None,
             });
         }
         counts.samples = samples.len();
@@ -4733,7 +5319,7 @@ impl ConditionalHumanPolicyDataset {
             synthetic: false,
             manifest_sha256: manifest_sha256.into(),
             basis: manifest.basis,
-            label_scope,
+            label_scope: declared_scope,
             feature_profile,
             feature_eligibility: None,
             observed_options: manifest.observed_options.clone(),
@@ -4741,6 +5327,7 @@ impl ConditionalHumanPolicyDataset {
             counts,
             samples,
             decision_time_exclusions: None,
+            stopping_decisions,
         })
     }
     pub fn samples(&self) -> &[HumanPolicySample] {
@@ -5009,8 +5596,10 @@ impl ConditionalHumanPolicyDataset {
                 corn_beg_support: None,
                 observed_pending_choice_support: None,
                 capped_extraction_support: None,
+                stopping_support: None,
             }],
             decision_time_exclusions: None,
+            stopping_decisions: Vec::new(),
         };
         if profile == ConditionalFeatureProfile::SemanticPlaying4 {
             dataset.feature_eligibility = Some(FeatureEligibilityComparison {
@@ -5036,7 +5625,9 @@ impl ConditionalHumanPolicyDataset {
     }
     pub fn report(&self) -> HumanPolicyReport<'_> {
         HumanPolicyReport {
-            schema: if self.label_scope == Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE) {
+            schema: if self.label_scope == Some(SOURCE_STOPPING_LABEL_SCOPE) {
+                DATASET_SCHEMA_V14
+            } else if self.label_scope == Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE) {
                 DATASET_SCHEMA_V13
             } else if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
                 DATASET_SCHEMA_V12
@@ -5075,7 +5666,9 @@ impl ConditionalHumanPolicyDataset {
             catalog_hash: public_catalog_hash(),
             move_schema: MOVE_SCHEMA,
             observation_schema: OBSERVATION_SCHEMA,
-            source_label_basis: if self.label_scope == Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE) {
+            source_label_basis: if self.label_scope == Some(SOURCE_STOPPING_LABEL_SCOPE) {
+                "observedV13LabelsAndConditionalSourceTransitionStoppingNotLiteralStopCaptions"
+            } else if self.label_scope == Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE) {
                 "observedV12LabelsAndLiteralHarvestAndSourceAnchoredRotationChoices"
             } else if self.label_scope == Some(OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE) {
                 "observedV10LabelsAndExplicitTheologyAheadOfferingAndChichenBonusResourceChoices"
@@ -5117,6 +5710,8 @@ impl ConditionalHumanPolicyDataset {
             counts: &self.counts,
             samples: &self.samples,
             decision_time_exclusions: self.decision_time_exclusions.as_ref(),
+            stopping_decisions: (self.label_scope == Some(SOURCE_STOPPING_LABEL_SCOPE))
+                .then_some(self.stopping_decisions.as_slice()),
         }
     }
     pub fn publish_new(&self, output: &Path) -> Result<(), String> {
