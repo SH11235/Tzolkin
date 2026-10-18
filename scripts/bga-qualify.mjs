@@ -16,11 +16,13 @@ export const QUALIFICATION_SCHEMA = 'tzolkin-human-bc-qualification-v1';
 export const MAX_REPORT_BYTES = 32 * 1024 * 1024;
 export const MAX_DEPENDENCY_IDS = 100_000;
 const REPORT_SCHEMA = 'tzolkin-human-bc-audit-v1';
-const FEATURE_SOURCE_SHA256 = '83a2d4326d0985039a003bbb05952f7f525353f8cda49178c55729072651e21e';
+// This decoder still describes schema 2 only. The full-module pin also binds
+// opt-in versions; changing it requires review of the schema-2 dependencies.
+const FEATURE_SOURCE_SHA256 = '4785bc89312c798aef9c31e5e280bfba0b49b84e77778d45b1e2473fa072dc5e';
 const FEATURE_SOURCE_CHAIN = [
   {
     path: 'crates/tzolkin-inference/src/features.rs',
-    sha256: '83a2d4326d0985039a003bbb05952f7f525353f8cda49178c55729072651e21e',
+    sha256: '4785bc89312c798aef9c31e5e280bfba0b49b84e77778d45b1e2473fa072dc5e',
   },
   {
     path: 'crates/tzolkin-inference/src/lib.rs',

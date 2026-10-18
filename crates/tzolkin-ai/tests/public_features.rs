@@ -210,6 +210,14 @@ fn tagged_outputs_serialize_together_and_cannot_be_unwrapped_for_v1_models() {
     assert!(candidate.values_for_schema(99).is_err());
     artifact.feature_schema = PUBLIC_FEATURE_SCHEMA;
     assert!(artifact.validate().is_err());
+    let ordered = FeatureEncoder::new_ordered_building_playing(&o)
+        .unwrap()
+        .encode_legal_tagged(0)
+        .unwrap();
+    artifact.feature_schema = FEATURE_SCHEMA;
+    assert!(ordered.values_for_schema(artifact.feature_schema).is_err());
+    artifact.feature_schema = tzolkin_ai::features::ORDERED_BUILDING_PLAYING_FEATURE_SCHEMA;
+    assert!(artifact.validate().is_err());
 }
 
 #[test]

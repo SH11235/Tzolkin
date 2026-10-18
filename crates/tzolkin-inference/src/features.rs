@@ -19,6 +19,9 @@ pub const PUBLIC_FEATURE_SCHEMA: u32 = 2;
 pub const SEMANTIC_SETUP_FEATURE_SCHEMA: u32 = 3;
 /// Opt-in operation descriptors for base 3-4p Playing, without model/source admission.
 pub const SEMANTIC_PLAYING_FEATURE_SCHEMA: u32 = 4;
+/// Opt-in schema-4 descriptors plus hashed public owned-building order.
+/// No model, trainer, source or application admission is provided.
+pub const ORDERED_BUILDING_PLAYING_FEATURE_SCHEMA: u32 = 5;
 pub const FEATURE_COUNT: usize = 512;
 pub const MAX_LEGAL_ACTIONS: usize = 4096;
 /// Schema 3, ChooseWealth only: raw pair resources (RESOURCE_IDS order), worker,
@@ -29,6 +32,10 @@ pub const SETUP_PAIR_FEATURE_COUNT: usize = 14;
 const STATE_HASH_START: usize = 264;
 const STATE_HASH_END: usize = 384;
 const ACTION_START: usize = 384;
+
+#[cfg(test)]
+#[path = "ordered_building_tests.rs"]
+mod ordered_building_tests;
 
 fn scaled(value: f64, scale: f64) -> f32 {
     (value / (value.abs() + scale)) as f32
@@ -134,6 +141,20 @@ pub fn encode_semantic_playing_action(
     encoder.encode_legal_tagged(index)
 }
 
+/// Explicit schema-5 encoding; existing consumers must reject its tag.
+pub fn encode_ordered_building_playing_action(
+    o: &Observation,
+    action: &TypedAction,
+) -> Result<EncodedCandidate, String> {
+    let encoder = FeatureEncoder::new_ordered_building_playing(o)?;
+    let index = o
+        .legal_actions
+        .iter()
+        .position(|a| a.action == *action)
+        .ok_or("Non-legal feature action")?;
+    encoder.encode_legal_tagged(index)
+}
+
 /// Schema and values are inseparable at this boundary. There is no untagged
 /// conversion, Deref, or Deserialize implementation; consumers must name their
 /// supported schema before borrowing the array.
@@ -216,6 +237,41 @@ impl<'a> FeatureEncoder<'a> {
         encoder.feature_schema = SEMANTIC_PLAYING_FEATURE_SCHEMA;
         Ok(encoder)
     }
+    /// Schema 5 retains schema 4 and adds order-sensitive owned-building tokens
+    /// to columns 264..384, alongside the existing unordered catalog context.
+    /// Each token hashes its own domain, actor-relative owner seat, zero-based
+    /// acquisition index (u64 LE), and public card ID, with weight +/-0.125.
+    /// This bounded hash can collide; it neither reconstructs pending rewards
+    /// nor assumes that the last building is the current operation's origin.
+    /// Only this constructor admits schema 5; old constructors/defaults do not.
+    pub fn new_ordered_building_playing(observation: &'a Observation) -> Result<Self, String> {
+        let mut encoder = Self::new_semantic_playing(observation)?;
+        for seat in 0..observation.players.len() {
+            let player =
+                &observation.players[(observation.actor + seat) % observation.players.len()];
+            for (index, id) in player.buildings.iter().enumerate() {
+                let key = hash(
+                    hash(
+                        hash(
+                            hash(0xcbf29ce484222325, b"ordered-owned-building-v1"),
+                            &[seat as u8],
+                        ),
+                        &(index as u64).to_le_bytes(),
+                    ),
+                    id.as_bytes(),
+                );
+                token(
+                    &mut encoder.context,
+                    STATE_HASH_START,
+                    STATE_HASH_END,
+                    key,
+                    0.125,
+                );
+            }
+        }
+        encoder.feature_schema = ORDERED_BUILDING_PLAYING_FEATURE_SCHEMA;
+        Ok(encoder)
+    }
     pub fn new_with_schema(observation: &'a Observation, schema: u32) -> Result<Self, String> {
         if ![FEATURE_SCHEMA, PUBLIC_FEATURE_SCHEMA].contains(&schema) {
             return Err("Unsupported feature schema".into());
@@ -274,7 +330,11 @@ impl<'a> FeatureEncoder<'a> {
             .get(index)
             .ok_or("Invalid legal feature index")?
             .action;
-        let semantic_playing = self.feature_schema == SEMANTIC_PLAYING_FEATURE_SCHEMA;
+        let semantic_playing = [
+            SEMANTIC_PLAYING_FEATURE_SCHEMA,
+            ORDERED_BUILDING_PLAYING_FEATURE_SCHEMA,
+        ]
+        .contains(&self.feature_schema);
         let mut values =
             candidate_features(self.observation, action, self.context, semantic_playing)?;
         if self.feature_schema == SEMANTIC_SETUP_FEATURE_SCHEMA
@@ -297,7 +357,7 @@ impl<'a> FeatureEncoder<'a> {
             values[SETUP_PAIR_FEATURE_START..SETUP_PAIR_FEATURE_START + SETUP_PAIR_FEATURE_COUNT]
                 .copy_from_slice(&pair);
         }
-        if self.feature_schema == SEMANTIC_PLAYING_FEATURE_SCHEMA {
+        if semantic_playing {
             values[PLAYING_SEMANTIC_FEATURE_START..]
                 .copy_from_slice(&playing_semantics::encode(self.observation, action)?);
             validate_semantic_playing_values(&values)?;

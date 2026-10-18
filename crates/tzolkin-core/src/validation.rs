@@ -878,12 +878,25 @@ fn valid_components(value: &Value, scope: ValidationScope) -> bool {
         return false;
     }
     let skull_spaces = value["skullSpaces"].as_array().unwrap();
+    // Every monument acquisition pays its catalog skull cost; renovation only
+    // discounts wood, stone and gold. Ownership therefore retains this exact
+    // count without adding it to buildingSkulls or Chichen scoring.
+    let monument_skulls: f64 = players
+        .iter()
+        .flat_map(|player| player["monuments"].as_array().unwrap())
+        .map(|id| {
+            component("MONUMENTS", id.as_str().unwrap()).unwrap()["cost"]["skull"]
+                .as_f64()
+                .unwrap_or(0.0)
+        })
+        .sum();
     let skull_total = number(&value["skullSupply"])
         + players
             .iter()
             .map(|player| number(&player["resources"]["skull"]) + number(&player["buildingSkulls"]))
             .sum::<f64>()
-        + skull_spaces.iter().filter(|id| !id.is_null()).count() as f64;
+        + skull_spaces.iter().filter(|id| !id.is_null()).count() as f64
+        + monument_skulls;
     if skull_total != 13.0 {
         return false;
     }
@@ -1136,6 +1149,18 @@ mod tests {
         state["players"][0]["skullsPlaced"] = json!(1);
         state["skullSupply"] = json!(12);
         assert!(validate_game_state(&state));
+        let mut with_monument = state.clone();
+        with_monument["players"][0]["monuments"] = json!(["m13"]);
+        with_monument["monuments"].as_array_mut().unwrap().remove(0);
+        with_monument["skullSupply"] = json!(11);
+        assert!(validate_game_state(&with_monument));
+        let saved: GameState = serde_json::from_value(with_monument.clone()).unwrap();
+        assert_eq!(
+            crate::engine::score_monument(&saved, &saved.players[0], "m13"),
+            3.0
+        );
+        with_monument["skullSupply"] = json!(12);
+        assert!(!validate_game_state(&with_monument));
         state["additionalBuildings"] = json!(false);
         assert!(!validate_game_state(&state));
         state["additionalBuildings"] = json!(true);
