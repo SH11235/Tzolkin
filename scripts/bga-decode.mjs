@@ -2220,6 +2220,25 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
         theologyCapped: true,
         bonusClaimed: false,
       };
+    if (
+      continuation === null &&
+      actor >= 0 &&
+      resource !== 'skull' &&
+      task?.remaining === 1 &&
+      before.technologies.architecture === 3 &&
+      nextEvents?.length === 2 &&
+      nextEvents[0].kind === 'technology' &&
+      nextEvents[0].detail.technology === 'architecture' &&
+      nextEvents[0].detail.steps === 1 &&
+      actorId(nextEvents[0].actor) === actor &&
+      architectureScoreCaption(nextEvents[1])?.actor === event.actor &&
+      architectureScoreCaption(nextEvents[1])?.amount === 3
+    )
+      continuation = {
+        technology: 'architecture',
+        technologySourceId: nextSourceId,
+        architectureCapped: true,
+      };
     const retainedTail = same(previous.pending?.after, []) ? [] : retainedActionTail(previous);
     const skull = resource === 'skull';
     if (
@@ -2249,6 +2268,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       (task.remaining === 1 &&
         !skull &&
         !continuation?.theologyCapped &&
+        !continuation?.architectureCapped &&
         (!(before.technologies[continuation?.technology] < 3) || retainedTail?.length !== 0)) ||
       task.cornPayment !== false ||
       retainedTail === null ||
@@ -2502,7 +2522,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       if (receipt.theologyCapped) {
         uncapped.players[actor].resources.skull++;
         uncapped.skullSupply--;
-      } else uncapped.players[actor].technologies[technology]++;
+      } else if (receipt.architectureCapped) uncapped.players[actor].score += 3;
+      else uncapped.players[actor].technologies[technology]++;
       uncapped.players[actor].resources[receipt.resource] += receipt.amount;
       if (finishedSkull) uncapped.skullSupply -= receipt.amount;
       uncapped.pending = copy(next.pending);
@@ -2521,8 +2542,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
           !sameReceipt(frame.observation.pendingTask, expected) ||
           !sameReceipt(next.pending?.after, receipt.retainedTail ?? [])) ||
       next.players[actor].technologies[technology] !==
-        before.players[actor].technologies[technology] + Number(!corn && !receipt.theologyCapped) ||
+        before.players[actor].technologies[technology] +
+          Number(!corn && !receipt.theologyCapped && !receipt.architectureCapped) ||
       (receipt.theologyCapped && !receipt.bonusClaimed) ||
+      (receipt.architectureCapped &&
+        (!context.architectureAdvance?.claimed || context.architectureAdvance.actor !== actor)) ||
       next.players.some((player, id) =>
         RESOURCES.some(
           (resource) =>
@@ -2537,7 +2561,8 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
                 : 0),
         ),
       ) ||
-      next.players[actor].score !== before.players[actor].score ||
+      next.players[actor].score !==
+        before.players[actor].score + 3 * Number(Boolean(receipt.architectureCapped)) ||
       (uncapped !== null && !sameReceipt(mechanical(next), uncapped)) ||
       (corn &&
         (!receipt.bonusClaimed ||
@@ -2568,7 +2593,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       ...(uncapped
         ? {
             technologySourceActionId: receipt.technologySourceId,
-            continuation: 'uncappedTechnology',
+            continuation: receipt.architectureCapped ? 'cappedArchitecture' : 'uncappedTechnology',
             humanPlayingBcReady: false,
           }
         : {}),
@@ -2673,6 +2698,13 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       return false;
     const level = state().players[queuedPurchase.actor].technologies[first.detail.technology];
     if (level < 3) return events.length === 1;
+    if (queuedPurchase.kind === 'materialTechnology' && queuedPurchase.architectureCapped)
+      return (
+        first.detail.technology === 'architecture' &&
+        events.length === 2 &&
+        architectureScoreCaption(events[1])?.actor === first.actor &&
+        architectureScoreCaption(events[1])?.amount === 3
+      );
     if (queuedPurchase.kind === 'materialTechnology' && queuedPurchase.theologyCapped)
       return (
         first.detail.technology === 'theology' &&
@@ -3182,6 +3214,44 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     };
     try {
       if (!events.length) fail('Raw source action has no observed messages');
+      if (deferredScore && deferredScore.kind !== 'action') {
+        const next = events[0];
+        const actor = actorId(next.actor);
+        const worker =
+          next.kind === 'gearAction' && next.detail.source === 'removal'
+            ? state().gears[next.detail.gear]?.[next.detail.workerPosition]
+            : null;
+        // A final building's optional Trade may end at the next player's
+        // observed removal. Require its owned worker and an independently
+        // observed complete resource/worker board; the later checkpoint still
+        // verifies the isolated score exit, turn handoff and actual removal.
+        if (
+          actor >= 0 &&
+          actor !== deferredScore.actor &&
+          events.every((item) => item.actor === next.actor) &&
+          deferredScore.pending.after[1].remaining === 0 &&
+          same(state().pending, deferredScore.pending) &&
+          worker?.playerId === actor &&
+          worker.dummy === false &&
+          witness.expected?.gears &&
+          Object.keys(state().gears).every(
+            (gear) =>
+              Array.isArray(witness.expected.gears[gear]) &&
+              witness.expected.gears[gear].length === state().gears[gear].length &&
+              witness.expected.gears[gear].every(
+                (cell) => cell === null || Number.isSafeInteger(cell?.playerId),
+              ),
+          ) &&
+          Number.isSafeInteger(witness.expected.round) &&
+          witness.expected.players?.length === names.length &&
+          witness.expected.players.every(
+            (player) =>
+              Number.isSafeInteger(player.workers) &&
+              RESOURCES.every((resource) => Number.isSafeInteger(player.resources?.[resource])),
+          )
+        )
+          finishDeferredScore();
+      }
       if (deferredScore) {
         if (
           (deferredScore.kind === 'action' && deferredScore.stage === 'nested'
@@ -4300,6 +4370,14 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               )
                 fail('Worker return has no matching actor/claimed-worker core receipt');
               calendarEvidence = { ...calendarEvidence, rotation: { ...receipt, consumed: true } };
+              // Some replay versions announce a double rotation and its worker
+              // return without a separate generic gear-advanced notification.
+              // The validated return completes that same-source rotation; do
+              // not carry its two-day declaration into the next calendar day.
+              if (double && !events.some((item) => item.kind === 'gearAdvanced')) {
+                calendar(declaredRotation);
+                declaredRotation = null;
+              }
               syncHistory();
             } else if (accumulatedCornPayout(event) !== null) {
               const amount = accumulatedCornPayout(event);

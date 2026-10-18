@@ -445,6 +445,72 @@ function replaceEvents(value, rows) {
   value.witness.witnesses = [];
 }
 
+test('completes a double rotation at its named return before the next ordinary rotation', () => {
+  const initial = clone(saved.core.initialFrame);
+  Object.assign(initial.snapshot.state, {
+    round: 3,
+    currentPlayer: 0,
+    firstPlayer: 1,
+    firstPlayerClaimed: 0,
+    turnOrder: [1, 2, 3, 0],
+    turnIndex: 3,
+  });
+  initial.observation.pendingTask = { type: 'rotation' };
+  initial.observation.legalActions = [
+    { action: { type: 'rotate', days: 2 }, move: { type: 'choose', choiceId: 'rotate:2' } },
+  ];
+  const advanced = clone(initial);
+  Object.assign(advanced.snapshot.state, { round: 5, firstPlayer: 0, firstPlayerClaimed: null });
+  advanced.observation.pendingTask = null;
+  advanced.observation.legalActions = clone(saved.core.initialFrame.observation.legalActions);
+  const placed = clone(advanced);
+  placed.snapshot.state.gears = clone(saved.core.afterFrame.snapshot.state.gears);
+  placed.observation.legalActions = [
+    { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
+  ];
+  const rotating = clone(placed);
+  rotating.observation.pendingTask = { type: 'rotation' };
+  rotating.observation.legalActions = [
+    { action: { type: 'rotate', days: 1 }, move: { type: 'choose', choiceId: 'rotate:1' } },
+  ];
+  const finished = clone(rotating);
+  finished.snapshot.state.round = 6;
+  finished.observation.pendingTask = null;
+  finished.observation.legalActions = [];
+  const fixture = (returned = 'A', repeat = false) => {
+    const value = input();
+    value.witness.initial = clone(initial.snapshot.state);
+    const notice = {
+      raw_text: `スタートプレイヤースペースに置かれているワーカーは${returned}の手元に戻った`,
+    };
+    replaceEvents(value, [
+      [6, [{ raw_text: 'Aは歯車を高速化し2段階回した!' }, notice, ...(repeat ? [notice] : [])]],
+      [7, [{ raw_text: 'AはPalenqueの歯車に0\nを支払ってワーカーを置いた' }]],
+      [8, [{ raw_text: '歯車が進んだ' }]],
+    ]);
+    return value;
+  };
+  const dispatch = dispatcher(initial, (request) => {
+    if (request.move.type === 'place') return clone(placed);
+    if (request.move.type === 'endTurn') return clone(rotating);
+    if (request.move.choiceId === 'rotate:2') return clone(advanced);
+    assert.equal(request.move.choiceId, 'rotate:1');
+    return clone(finished);
+  });
+  const success = decode(fixture(), dispatch);
+  assert.equal(success.manifest.blocked, null);
+  assert.deepEqual(
+    success.record.steps.map((step) => step.sourceActionIds),
+    [[6], [7], [8], [8]],
+  );
+  for (const value of [fixture('B'), fixture('A', true)]) {
+    const refused = decode(value, dispatch);
+    assert.equal(refused.manifest.blocked.actionId, 6);
+    assert.match(refused.manifest.blocked.reason, /Worker return has no matching/);
+    assert.equal(refused.record.steps.length, 0);
+  }
+});
+
 function rightsFixture(temple = 'kukulkan') {
   const initial = clone(saved.core.initialFrame);
   const before = initial.snapshot.state;
@@ -3136,6 +3202,76 @@ test('settles final-building Trade points only before a sourced owned-worker rem
   }
 });
 
+test('settles final Trade points at a witnessed next-player owned-worker removal', () => {
+  const fixture = (owner = 1, completeBoard = true, changedExit = false) => {
+    const f = deferredTradeFixture(
+      (v) => {
+        v.raw.dom_entries.find((entry) => entry.action_id === 9).messages = [
+          { raw_text: 'BはTikal 2のワーカーを取り除き、n°2のアクションを行った' },
+        ];
+        const witness = v.witness.witnesses.at(-1);
+        delete witness.buildings;
+        witness.pendingTask = 'build';
+        witness.expected.players[0].resources.wood = 5;
+      },
+      (next, stage) => {
+        if (stage === 'exit' && changedExit) next.snapshot.state.players[0].resources.corn++;
+      },
+      1,
+    );
+    f.before.snapshot.state.gears.tikal[2].playerId = owner;
+    const expected = f.value.witness.witnesses.at(-1).expected;
+    const own = clone(expected.players[0]);
+    expected.players = f.before.snapshot.state.players.map((player) => ({
+      resources: clone(player.resources),
+      workers: player.workers,
+    }));
+    Object.assign(expected.players[0].resources, own.resources);
+    expected.players[0].resources.stone = 2;
+    expected.players[0].score = own.score;
+    expected.round = f.before.snapshot.state.round;
+    if (completeBoard) {
+      expected.gears = clone(f.before.snapshot.state.gears);
+      expected.gears.tikal[2] = null;
+    }
+    const apply = (request) => {
+      if (request.move.type !== 'endTurn') {
+        const next = f.apply(request);
+        if (request.move.choiceId === 'skip')
+          next.observation.legalActions = [
+            { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
+          ];
+        return next;
+      }
+      const next = clone(f.before);
+      next.snapshot.state = clone(request.state);
+      next.snapshot.state.currentPlayer = 1;
+      next.observation.pendingTask = null;
+      next.observation.legalActions = [
+        {
+          action: { type: 'remove', gear: 'tikal', position: 2 },
+          move: { type: 'remove', gear: 'tikal', position: 2 },
+        },
+      ];
+      return next;
+    };
+    return { value: f.value, dispatch: dispatcher(f.initial, apply) };
+  };
+  const good = fixture();
+  const success = decode(good.value, good.dispatch);
+  assert.equal(success.manifest.blocked, null);
+  assert.equal(success.manifest.audit.find((row) => row.deferredScoreSourceActionId).amount, 6);
+  assert.deepEqual(
+    success.record.steps.slice(-4).map((step) => step.sourceActionIds),
+    [[9], [9], [9], [9]],
+  );
+  for (const bad of [fixture(0), fixture(1, false), fixture(1, true, true)]) {
+    const refused = decode(bad.value, bad.dispatch);
+    assert.equal(refused.manifest.blocked.actionId, 7);
+    assert.equal(refused.record.steps.length, 1);
+  }
+});
+
 test('keeps the Trade rollback anchor through a final queued Skull purchase', () => {
   const fixture = (alter = () => {}) => {
     const f = deferredTradeFixture((v) => {
@@ -5479,6 +5615,47 @@ test('holds queued corn until observed technology completion and preserves cappe
     );
     return f;
   };
+  const cappedArchitectureMaterial = (bonusAmount = 3, changed = false) =>
+    fixture(
+      (v) => {
+        v.witness.witnesses = v.witness.witnesses.slice(0, 3);
+        delete v.witness.witnesses[1].expected;
+        delete v.witness.witnesses[2].expected;
+        v.witness.witnesses[2].pendingTask = null;
+        v.raw.dom_entries.find((row) => row.action_id === 8).messages = [
+          { raw_text: 'Aは建築を1レベル進めた', icons: [] },
+          { raw_text: `建築技術ボーナス: Aは${bonusAmount}点を獲得した`, icons: [] },
+        ];
+      },
+      (next, stage) => {
+        if (stage === 'technology') {
+          next.snapshot.state.players[0].technologies.architecture = 3;
+          next.snapshot.state.players[0].score += 3;
+          if (changed) next.snapshot.state.players[1].resources.wood++;
+        }
+      },
+      3,
+      'architecture',
+      'gold',
+      true,
+      3,
+      false,
+      1,
+      'stone',
+    );
+  const cappedArchitecture = cappedArchitectureMaterial();
+  const cappedArchitectureResult = decode(cappedArchitecture.value, cappedArchitecture.dispatch);
+  assert.equal(cappedArchitectureResult.manifest.blocked, null);
+  assert.equal(
+    cappedArchitectureResult.manifest.audit.find((row) => row.queuedPurchaseSourceActionId)
+      .continuation,
+    'cappedArchitecture',
+  );
+  for (const bad of [cappedArchitectureMaterial(2), cappedArchitectureMaterial(3, true)]) {
+    const refused = decode(bad.value, bad.dispatch);
+    assert.equal(refused.manifest.blocked.actionId, 7);
+    assert.equal(refused.record.steps.length, 1);
+  }
   const finalDiscountedMaterial = (duplicate = false, discount = 'stone') =>
     fixture(
       (v) => {
