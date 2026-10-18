@@ -1051,12 +1051,17 @@ fn source_stopping_evidence_v1(
     let nodes = array(&sources.raw, "dom_entries")?;
     let audits = array(&sources.audit, "audit")?;
     let row_at = |i: usize| -> Result<LegalAction, String> {
-        inspect_public(&report.frames[i].snapshot.state)?
+        let step = record.steps.get(i).ok_or("Missing source stopping step")?;
+        let frame = report
+            .frames
+            .get(i)
+            .ok_or("Missing source stopping frame")?;
+        inspect_public(&frame.snapshot.state)?
             .observation
             .and_then(|o| {
                 o.legal_actions
                     .into_iter()
-                    .find(|r| r.r#move == record.steps[i].r#move)
+                    .find(|r| r.r#move == step.r#move)
             })
             .ok_or("Missing source stopping action".into())
     };

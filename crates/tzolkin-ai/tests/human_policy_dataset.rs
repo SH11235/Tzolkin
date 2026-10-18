@@ -2861,6 +2861,40 @@ fn source_stopping_v14_refuses_missing_cancelled_ambiguous_or_intervening_origin
     }
 }
 #[test]
+fn source_stopping_market_prefix_keeps_other_rows_without_inventing_a_followup() {
+    let full = Fixture::source_stopping_market();
+    let full_report = stopping_report(&full).unwrap();
+    let exit = stops(&full_report)
+        .into_iter()
+        .find(|s| s["stoppingSupport"]["kind"] == "ordinaryMarketExitFromSourceTransition")
+        .unwrap()["replayStepIndex"]
+        .as_u64()
+        .unwrap() as usize;
+    for retained_steps in [exit + 1, exit + 2] {
+        let mut f = Fixture::source_stopping_market();
+        f.record["steps"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(retained_steps);
+        f.audit["audit"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a["step"].as_u64().unwrap() <= retained_steps as u64);
+        let prefix = stopping_report(&f).unwrap();
+        assert!(!prefix["samples"].as_array().unwrap().is_empty());
+        assert!(!stops(&prefix).iter().any(|s| s["replayStepIndex"] == exit));
+        assert!(prefix["stoppingDecisions"].as_array().unwrap().iter().any(
+            |d| d["replayStepIndex"] == exit
+                && d["sourceSupported"] == false
+                && d["reason"] == "missingFollowingOriginalOperation"
+        ));
+        for sample in prefix["samples"].as_array().unwrap() {
+            assert!(full_report["samples"].as_array().unwrap().contains(sample));
+        }
+    }
+}
+
+#[test]
 fn source_stopping_v14_ordinary_market_requires_complete_literal_exchanges_and_entry() {
     let f = Fixture::source_stopping_market();
     let value = stopping_report(&f).unwrap();

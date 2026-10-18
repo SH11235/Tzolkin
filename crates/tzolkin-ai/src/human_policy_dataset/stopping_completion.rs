@@ -25,12 +25,21 @@ pub(super) struct CompletionSupport {
     basis: &'static str,
 }
 fn action_at(i: usize, s: &Sources, r: &PublicReplayReport) -> Result<LegalAction, String> {
-    inspect_public(&r.frames[i].snapshot.state)?
+    let step = s
+        .record
+        .steps
+        .get(i)
+        .ok_or("Missing stopping continuation step")?;
+    let frame = r
+        .frames
+        .get(i)
+        .ok_or("Missing stopping continuation frame")?;
+    inspect_public(&frame.snapshot.state)?
         .observation
         .and_then(|o| {
             o.legal_actions
                 .into_iter()
-                .find(|a| a.r#move == s.record.steps[i].r#move)
+                .find(|a| a.r#move == step.r#move)
         })
         .ok_or("Missing stopping continuation action".into())
 }
@@ -1424,12 +1433,16 @@ pub(super) fn complete(
         {
             return Ok(Err("ordinaryMarketOriginMismatch"));
         }
-        if matches!(
-            action_at(next, s, r)?.action,
-            TypedAction::EndTurn {
-                double_advance: None
-            }
-        ) && s.record.steps[next].actor == actor
+        if s.record
+            .steps
+            .get(next)
+            .is_some_and(|step| step.actor == actor)
+            && matches!(
+                action_at(next, s, r)?.action,
+                TypedAction::EndTurn {
+                    double_advance: None
+                }
+            )
         {
             if s.record.steps[next].source_action_ids != step.source_action_ids
                 || r.frames[next].snapshot.state.pending.is_some()
@@ -2145,6 +2158,40 @@ mod tests {
         );
         temp
     }
+    #[test]
+    fn nested_trade_exit_prefix_requires_a_recorded_following_operation() {
+        let (mut s, mut r) = building_trade("b26");
+        assert!(
+            source_stopping_evidence(2, &TypedAction::Skip, &s, &r, &[])
+                .unwrap()
+                .is_ok()
+        );
+        s.record.steps.truncate(3);
+        r.frames.truncate(4);
+        s.audit["audit"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a["step"].as_u64().unwrap() <= 3);
+        assert!(
+            r.frames[3]
+                .observation
+                .as_ref()
+                .unwrap()
+                .legal_actions
+                .iter()
+                .any(|a| matches!(a.action, TypedAction::Build { .. }))
+        );
+        assert_eq!(
+            source_stopping_evidence(2, &TypedAction::Skip, &s, &r, &[])
+                .unwrap()
+                .unwrap_err(),
+            "missingFollowingOriginalOperation"
+        );
+        assert!(action_at(3, &s, &r).is_err());
+        r.frames.clear();
+        assert!(action_at(0, &s, &r).is_err());
+    }
+
     #[test]
     fn nested_trade_uses_origin_and_queue_and_keeps_future_build_out_of_inputs() {
         let (s, r) = building_trade("b26");
