@@ -48,6 +48,31 @@ fn owned_order_is_visible_for_each_owner_without_changing_descriptors() {
                     assert_eq!(before[STATE_HASH_END..], after[STATE_HASH_END..]);
                 }
             }
+            let mut a = observe(&state, actor).unwrap();
+            for player in &mut a.players {
+                player.buildings = ["b01", "b04", "b09"].map(String::from).to_vec();
+            }
+            let mut b = a.clone();
+            a.players[actor].buildings.swap(0, 1);
+            b.players[(actor + 1) % count].buildings.swap(0, 1);
+            a.observation_key = observation_key(&a).unwrap();
+            b.observation_key = observation_key(&b).unwrap();
+            // Same unordered holdings per seat; only the owner of the reordered
+            // sequence differs. Dropping owner from the new tokens must fail.
+            assert_eq!(
+                bits(&FeatureEncoder::new_semantic_playing(&a).unwrap(), 0),
+                bits(&FeatureEncoder::new_semantic_playing(&b).unwrap(), 0)
+            );
+            assert_ne!(
+                bits(
+                    &FeatureEncoder::new_ordered_building_playing(&a).unwrap(),
+                    0
+                ),
+                bits(
+                    &FeatureEncoder::new_ordered_building_playing(&b).unwrap(),
+                    0
+                )
+            );
         }
     }
 }
