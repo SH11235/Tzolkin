@@ -5325,7 +5325,8 @@ test('holds queued corn until observed technology completion and preserves cappe
               remaining: buildsRemaining - 1,
               allowMonument: false,
               cornPayment: false,
-              architectureAvailable: !architecture,
+              architectureAvailable:
+                request.state.pending.task.architectureAvailable !== false && !architecture,
             },
           ],
         };
@@ -5377,15 +5378,23 @@ test('holds queued corn until observed technology completion and preserves cappe
         assert.ok(['wood', 'stone', 'gold'].includes(selectedResource));
         player.resources[selectedResource]++;
         const remaining = request.state.pending.task.remaining - 1;
-        if (remaining === 0) player.resources[resource] += amount;
-        next.observation.pendingTask = remaining
-          ? { type: 'resource', remaining }
-          : clone(request.state.pending.after.at(-1));
-        next.snapshot.state.pending = {
-          title: remaining ? 'Materials' : 'Remaining building',
-          task: clone(next.observation.pendingTask),
-          after: remaining ? clone(request.state.pending.after) : [],
-        };
+        if (remaining === 0) {
+          player.resources[resource] += amount;
+          if (resource === 'skull') next.snapshot.state.skullSupply -= amount;
+        }
+        const finished = remaining === 0 && buildsRemaining === 1;
+        next.observation.pendingTask = finished
+          ? null
+          : remaining
+            ? { type: 'resource', remaining }
+            : clone(request.state.pending.after.at(-1));
+        next.snapshot.state.pending = finished
+          ? null
+          : {
+              title: remaining ? 'Materials' : 'Remaining building',
+              task: clone(next.observation.pendingTask),
+              after: remaining ? clone(request.state.pending.after) : [],
+            };
         next.observation.legalActions = remaining
           ? ['wood', 'stone', 'gold'].map((resource) => ({
               action: { type: 'resource', resource },
@@ -5519,7 +5528,7 @@ test('holds queued corn until observed technology completion and preserves cappe
         .join('\n');
       for (const message of row.messages) message.html = message.raw_text;
     }
-    return { value, dispatch: dispatcher(initial, apply), purchaseTrials, renovation };
+    return { value, before, dispatch: dispatcher(initial, apply), purchaseTrials, renovation };
   };
   const success = fixture();
   const originals = clone(success.value.witness.witnesses);
@@ -5891,6 +5900,222 @@ test('holds queued corn until observed technology completion and preserves cappe
       false,
       name,
     );
+  }
+  const cappedSkullFixture = (
+    change = () => {},
+    alter = () => {},
+    level = 3,
+    architecture = false,
+  ) => {
+    const f = fixture(
+      (v) => {
+        v.witness.witnesses = v.witness.witnesses.slice(0, 2);
+        delete v.witness.witnesses[1].expected;
+        change(v);
+      },
+      alter,
+      level,
+      'extraction',
+      'skull',
+      architecture,
+      architecture ? 3 : 2,
+      false,
+      1,
+    );
+    if (!architecture) {
+      f.before.snapshot.state.pending.task.architectureAvailable = false;
+      f.before.observation.pendingTask.architectureAvailable = false;
+      f.before.observation.legalActions = f.before.observation.legalActions.filter(
+        (row) => !row.action.architecture,
+      );
+    }
+    return f;
+  };
+  for (const architecture of [false, true]) {
+    const f = cappedSkullFixture(
+      (v) => {
+        if (architecture)
+          v.raw.dom_entries.find((row) => row.action_id === 10).messages[0].icons[0].classes =
+            'tz_icon resource_wood';
+      },
+      undefined,
+      3,
+      architecture,
+    );
+    const originals = clone(f.value.witness.witnesses);
+    const completed = decode(f.value, f.dispatch);
+    assert.equal(completed.manifest.blocked, null);
+    assert.deepEqual(
+      completed.record.steps.map((step) => step.sourceActionIds),
+      [[6], [7], [8], [9], [10]],
+    );
+    const actual = completed.manifest.audit.find((row) => row.queuedPurchaseSourceActionId);
+    assert.equal(actual.resource, 'skull');
+    assert.equal(actual.amount, 1);
+    assert.equal(actual.continuation, 'cappedExtraction');
+    assert.deepEqual(actual.resourceChoiceSourceActionIds, [9, 10]);
+    assert.equal(actual.actualDelivered, true);
+    assert.equal(actual.humanPlayingBcReady, false);
+    assert.equal(completed.manifest.trainingReady, false);
+    assert.deepEqual(f.value.witness.witnesses, originals);
+    const final = completed.record.steps.reduce(
+      (frame, step) =>
+        f.dispatch({ operation: 'publicApply', state: frame.snapshot.state, ...step }),
+      clone(saved.core.initialFrame),
+    );
+    assert.equal(final.snapshot.state.skullSupply, 3);
+    assert.equal(final.snapshot.state.players[0].resources.skull, 1);
+    assert.equal(final.snapshot.state.pending, null);
+    assert.equal(final.observation.pendingTask, null);
+  }
+  for (const [name, change, alter, level, beforeChange] of [
+    ['uncapped Extraction', undefined, undefined, 2],
+    [
+      'insufficient stock',
+      undefined,
+      undefined,
+      3,
+      (frame) => {
+        frame.snapshot.state.skullSupply = 0;
+      },
+    ],
+    [
+      'insufficient purchase materials',
+      undefined,
+      undefined,
+      3,
+      (frame) => {
+        frame.snapshot.state.players[0].resources.wood = 1;
+      },
+    ],
+    [
+      'wrong source actor',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 9).messages[0].raw_text =
+          'Bは\nを獲得した';
+      },
+    ],
+    [
+      'missing last material choice',
+      (v) => {
+        v.raw.entries = v.raw.entries.filter((row) => row.action_id !== 10);
+        v.raw.dom_entries = v.raw.dom_entries.filter((row) => row.action_id !== 10);
+        v.raw.entry_count = v.raw.entries.length;
+      },
+    ],
+    [
+      'extra material quantity',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 10).messages[0].raw_text =
+          'Aは2\nを獲得した';
+      },
+    ],
+    [
+      'extra fixed Skull caption',
+      (v) => {
+        v.raw.dom_entries.find((row) => row.action_id === 7).messages.at(-1).raw_text =
+          'Aは2\nを獲得した';
+      },
+    ],
+    [
+      'wrong reward remaining',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'technology') {
+          frame.snapshot.state.pending.task.remaining = 3;
+          frame.observation.pendingTask.remaining = 3;
+        }
+      },
+    ],
+    [
+      'changed retained queue',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:1')
+          frame.snapshot.state.pending.after[1].effects[0].resources.skull++;
+      },
+    ],
+    [
+      'early Skull at purchase cannot bypass the receipt',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'purchase') {
+          frame.snapshot.state.players[0].resources.skull++;
+          frame.snapshot.state.skullSupply--;
+        }
+      },
+    ],
+    [
+      'early Skull delivery',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:1') {
+          frame.snapshot.state.players[0].resources.skull++;
+          frame.snapshot.state.skullSupply--;
+        }
+      },
+    ],
+    ...[
+      ['unchanged stock', 1],
+      ['double stock decrement', -1],
+    ].map(([name, delta]) => [
+      name,
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:0') frame.snapshot.state.skullSupply += delta;
+      },
+    ]),
+    [
+      'extra delivered Skull',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:0') frame.snapshot.state.players[0].resources.skull++;
+      },
+    ],
+    [
+      'changed other player',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:1') frame.snapshot.state.players[1].resources.wood++;
+      },
+    ],
+    [
+      'changed actor at completion',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:0') frame.snapshot.state.currentPlayer = 1;
+      },
+    ],
+    [
+      'zero Build not consumed',
+      undefined,
+      (frame, stage) => {
+        if (stage === 'resource:0') {
+          frame.observation.pendingTask = { type: 'build', remaining: 0 };
+          frame.snapshot.state.pending = { task: clone(frame.observation.pendingTask), after: [] };
+        }
+      },
+    ],
+  ]) {
+    const f = cappedSkullFixture(change, alter, level);
+    if (beforeChange) {
+      beforeChange(f.before);
+      f.value.witness.witnesses[0].expected.players[0] = clone(f.before.snapshot.state.players[0]);
+    }
+    const originals = clone(f.value.witness.witnesses);
+    const rejected = decode(f.value, f.dispatch);
+    assert.equal(rejected.manifest.blocked?.actionId, 7, name);
+    assert.deepEqual(
+      rejected.record.steps.map((step) => step.sourceActionIds),
+      [[6]],
+      name,
+    );
+    assert.equal(
+      rejected.manifest.audit.some((row) => row.resource === 'skull' && row.actualDelivered),
+      false,
+      name,
+    );
+    assert.deepEqual(f.value.witness.witnesses, originals, name);
   }
   const sameFee = materialFixture(
     () => {},

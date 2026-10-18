@@ -2241,6 +2241,12 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       };
     const retainedTail = same(previous.pending?.after, []) ? [] : retainedActionTail(previous);
     const skull = resource === 'skull';
+    const skullExtractionCapped =
+      skull &&
+      task?.remaining === 1 &&
+      retainedTail?.length === 0 &&
+      continuation?.technology === 'extraction' &&
+      before.technologies.extraction === 3;
     if (
       witnesses.catalogHash !== catalogHash ||
       actor < 0 ||
@@ -2276,10 +2282,11 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       (skull &&
         (amount !== 1 ||
           retainedTail.length !== 0 ||
-          continuation.technology !== 'theology' ||
-          !Number.isSafeInteger(before.technologies.theology) ||
-          before.technologies.theology < 0 ||
-          before.technologies.theology >= 3 ||
+          (!skullExtractionCapped &&
+            (continuation.technology !== 'theology' ||
+              !Number.isSafeInteger(before.technologies.theology) ||
+              before.technologies.theology < 0 ||
+              before.technologies.theology >= 3)) ||
           !Number.isSafeInteger(previous.skullSupply) ||
           previous.skullSupply < amount)) ||
       (action.architecture &&
@@ -2327,6 +2334,10 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
       ) ||
       !same(typedResourceCost(action), cost) ||
       !same(paymentOf(events), cost) ||
+      (skullExtractionCapped &&
+        RESOURCES.some(
+          (r, i) => !Number.isSafeInteger(before.resources[r]) || before.resources[r] < cost[i],
+        )) ||
       !isDeepStrictEqual(next.pending.after, [
         { type: 'effects', effects: [effects[1]] },
         {
@@ -2352,6 +2363,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     return {
       ...continuation,
       kind: 'materialTechnology',
+      ...(skullExtractionCapped ? { skullExtractionCapped: true } : {}),
       actor,
       resource,
       amount,
@@ -2611,6 +2623,9 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     const remaining = receipt.pending.task.remaining - 1;
     const values = resourceAmounts(event);
     const resource = RESOURCES[values.findIndex((amount) => amount === 1)];
+    // This final Build has remaining=0: after both observed Extraction choices,
+    // the fixed Skull is delivered and the native queue must be fully consumed.
+    const finishedSkull = receipt.skullExtractionCapped === true && remaining === 0;
     const expected = mechanical(before);
     expected.players[receipt.actor].resources[resource]++;
     if (remaining === 0) {
@@ -2621,15 +2636,20 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
     if (
       record.steps.length !== receipt.stepCount + 1 ||
       !sameReceipt(mechanical(next), expected) ||
-      !sameReceipt(next.pending?.task, frame.observation.pendingTask) ||
-      !sameReceipt(
-        next.pending?.task,
-        remaining ? { type: 'resource', remaining } : receipt.pending.after[2],
-      ) ||
-      !sameReceipt(
-        next.pending?.after,
-        remaining ? receipt.pending.after : (receipt.retainedTail ?? []),
-      ) ||
+      (finishedSkull
+        ? receipt.pending.after[2]?.remaining !== 0 ||
+          receipt.retainedTail.length !== 0 ||
+          next.pending !== null ||
+          frame.observation.pendingTask !== null
+        : !sameReceipt(next.pending?.task, frame.observation.pendingTask) ||
+          !sameReceipt(
+            next.pending?.task,
+            remaining ? { type: 'resource', remaining } : receipt.pending.after[2],
+          ) ||
+          !sameReceipt(
+            next.pending?.after,
+            remaining ? receipt.pending.after : (receipt.retainedTail ?? []),
+          )) ||
       extractionReward?.originActionId !== receipt.technologySourceId ||
       extractionReward.captionActionId !== receipt.technologySourceId ||
       extractionReward.remaining !== remaining ||
@@ -3843,6 +3863,18 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
               fail(
                 'Corn plus technology purchase requires its exact observed continuation receipt',
               );
+            // Also require the final Skull receipt for a unique legal outcome:
+            // an early counter change must not bypass its whole-chain rollback.
+            if (
+              beforePurchase.pending?.task?.type === 'build' &&
+              beforePurchase.pending.task.remaining === 1 &&
+              same(buildings.get(action.id)?.effects, [
+                { type: 'technology', technology: 'any', steps: 1 },
+                { type: 'resources', resources: { skull: 1 } },
+              ]) &&
+              receipt?.kind !== 'materialTechnology'
+            )
+              fail('Final technology plus Skull purchase requires its exact continuation receipt');
             if (receipt) {
               const anchoredMaterial =
                 receipt.kind === 'materialTechnology' &&
