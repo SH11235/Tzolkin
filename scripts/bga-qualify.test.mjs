@@ -469,6 +469,7 @@ test(
   () => {
     const input = causalFixture();
     const report = audit(input);
+    assert.equal(report.featureSchema, 2);
     assert.deepEqual(report.counts, {
       candidates: 5,
       accepted: 2,
