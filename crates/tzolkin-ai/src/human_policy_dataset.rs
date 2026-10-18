@@ -27,6 +27,7 @@ use tzolkin_core::{
     GameOptions, GearId, Pending, Phase, RESOURCE_IDS, Resource, TEMPLE_IDS, Task, TechnologyId,
     TempleId, TempleReason,
 };
+mod stopping_completion;
 
 pub const INPUT_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-source-v1";
 pub const DATASET_SCHEMA: &str = "tzolkin-conditional-basic-human-policy-dataset-v1";
@@ -166,6 +167,8 @@ struct Manifest {
     decision_time_exclusions: Option<ContentPin>,
     #[serde(default)]
     stopping_notification_assumption: Option<String>,
+    #[serde(default)]
+    stopping_observations: Vec<ContentPin>,
 }
 fn explicit_exclusion_pin<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -221,6 +224,11 @@ fn explicit_feature_profile<'de, D: serde::Deserializer<'de>>(
 impl Manifest {
     fn scope(&self) -> Result<Option<&'static str>, String> {
         let stopping = self.schema == INPUT_SCHEMA_V14;
+        if self.stopping_observations.len() > 4
+            || (!stopping && !self.stopping_observations.is_empty())
+        {
+            return Err("Stopping observations require the explicit V14 scope".into());
+        }
         if stopping
             != (self.stopping_notification_assumption.as_deref()
                 == Some(STOPPING_NOTIFICATION_ASSUMPTION))
@@ -337,6 +345,9 @@ struct Sources {
     reservations: Reservations,
     exit_observations: Vec<Value>,
     rotation_observations: Vec<Value>,
+    stopping_observations: Vec<Value>,
+    stopping_state_proofs: std::cell::RefCell<BTreeMap<usize, stopping_completion::StateProof>>,
+    stopping_public_applies: std::cell::Cell<usize>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -391,6 +402,8 @@ struct SourceStoppingSupport {
     market_exit_resources: Option<[i64; 5]>,
     notification_assumption: &'static str,
     future_context_used_only_for_label: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion: Option<stopping_completion::CompletionSupport>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -625,6 +638,10 @@ pub struct HumanPolicyReport<'a> {
     decision_time_exclusions: Option<&'a DecisionTimeExclusionReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stopping_decisions: Option<&'a [SourceStoppingDecision]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopping_state_proofs: Option<&'a [stopping_completion::StateProof]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopping_public_applies: Option<usize>,
 }
 /// Sealed by source replay, source text and the final decoder audit. No stored
 /// float arrays or caller-supplied core report can construct this dataset.
@@ -646,6 +663,8 @@ pub struct ConditionalHumanPolicyDataset {
     samples: Vec<HumanPolicySample>,
     decision_time_exclusions: Option<DecisionTimeExclusionReport>,
     stopping_decisions: Vec<SourceStoppingDecision>,
+    stopping_state_proofs: Vec<stopping_completion::StateProof>,
+    stopping_public_applies: usize,
 }
 
 fn decimal(value: &str) -> Result<(), String> {
@@ -1004,6 +1023,23 @@ fn observed_audit(entry: &Value) -> bool {
 // All future context stays in this provenance sidecar; the encoder receives only
 // the canonical pre-decision observation. No search for unlogged exchanges is used.
 fn source_stopping_evidence(
+    index: usize,
+    action: &TypedAction,
+    sources: &Sources,
+    report: &PublicReplayReport,
+    samples: &[HumanPolicySample],
+    complete_results: bool,
+) -> Result<Result<SourceStoppingSupport, &'static str>, String> {
+    let original = source_stopping_evidence_v1(index, action, sources, report, samples)?;
+    match original {
+        Ok(support) => Ok(Ok(support)),
+        Err(reason) if complete_results => {
+            stopping_completion::complete(index, action, sources, report, samples, reason)
+        }
+        Err(reason) => Ok(Err(reason)),
+    }
+}
+fn source_stopping_evidence_v1(
     index: usize,
     action: &TypedAction,
     sources: &Sources,
@@ -1388,6 +1424,7 @@ fn source_stopping_evidence(
             .then(|| RESOURCE_IDS.map(|r| before.players[actor].resources[&r])),
         notification_assumption: STOPPING_NOTIFICATION_ASSUMPTION,
         future_context_used_only_for_label: true,
+        completion: None,
     }))
 }
 
@@ -4106,6 +4143,7 @@ impl ConditionalHumanPolicyDataset {
         .chain(manifest.reconstruction_evidence.iter().cloned())
         .chain(manifest.market_exit_observations.iter().cloned())
         .chain(manifest.rotation_observations.iter().cloned())
+        .chain(manifest.stopping_observations.iter().cloned())
         .collect::<Vec<_>>();
         let mut loaded = Vec::new();
         let mut total = 0usize;
@@ -4137,8 +4175,20 @@ impl ConditionalHumanPolicyDataset {
                     5 + manifest.reconstruction_evidence.len()
                         + manifest.market_exit_observations.len(),
                 )
+                .take(manifest.rotation_observations.len())
                 .map(|b| unique_json(b, MAX_INPUT))
                 .collect::<Result<_, _>>()?,
+            stopping_observations: loaded
+                .iter()
+                .skip(
+                    5 + manifest.reconstruction_evidence.len()
+                        + manifest.market_exit_observations.len()
+                        + manifest.rotation_observations.len(),
+                )
+                .map(|b| unique_json(b, MAX_INPUT))
+                .collect::<Result<_, _>>()?,
+            stopping_state_proofs: std::cell::RefCell::new(BTreeMap::new()),
+            stopping_public_applies: std::cell::Cell::new(0),
         };
         let mut rotation_moves = BTreeSet::new();
         for point in &sources.rotation_observations {
@@ -4475,25 +4525,32 @@ impl ConditionalHumanPolicyDataset {
                     *counts.excluded.entry(reason.into()).or_default() += 1;
                     continue;
                 }
-                let support =
-                    match source_stopping_evidence(index, &row.action, sources, &report, &samples)?
-                    {
-                        Ok(support) => support,
-                        Err(reason) => {
-                            stopping_decisions.push(SourceStoppingDecision {
-                                replay_step_index: index,
-                                source_action_id: source_id,
-                                actor: step.actor,
-                                source_supported: false,
-                                reason,
-                            });
-                            *counts
-                                .excluded
-                                .entry(format!("sourceStop:{reason}"))
-                                .or_default() += 1;
-                            continue;
-                        }
-                    };
+                let support = match source_stopping_evidence(
+                    index,
+                    &row.action,
+                    sources,
+                    &report,
+                    &samples,
+                    // The schema-2 comparison stays the prior sealed baseline;
+                    // V14 result/phase proofs are explicit semantic-4 additions.
+                    feature_profile == ConditionalFeatureProfile::SemanticPlaying4,
+                )? {
+                    Ok(support) => support,
+                    Err(reason) => {
+                        stopping_decisions.push(SourceStoppingDecision {
+                            replay_step_index: index,
+                            source_action_id: source_id,
+                            actor: step.actor,
+                            source_supported: false,
+                            reason,
+                        });
+                        *counts
+                            .excluded
+                            .entry(format!("sourceStop:{reason}"))
+                            .or_default() += 1;
+                        continue;
+                    }
+                };
                 if !labels.insert((source_id, support.next_message_index, support.kind)) {
                     return Err("Source stopping transition consumed twice".into());
                 }
@@ -5328,6 +5385,13 @@ impl ConditionalHumanPolicyDataset {
             samples,
             decision_time_exclusions: None,
             stopping_decisions,
+            stopping_state_proofs: sources
+                .stopping_state_proofs
+                .borrow()
+                .values()
+                .cloned()
+                .collect(),
+            stopping_public_applies: sources.stopping_public_applies.get(),
         })
     }
     pub fn samples(&self) -> &[HumanPolicySample] {
@@ -5600,6 +5664,8 @@ impl ConditionalHumanPolicyDataset {
             }],
             decision_time_exclusions: None,
             stopping_decisions: Vec::new(),
+            stopping_state_proofs: Vec::new(),
+            stopping_public_applies: 0,
         };
         if profile == ConditionalFeatureProfile::SemanticPlaying4 {
             dataset.feature_eligibility = Some(FeatureEligibilityComparison {
@@ -5712,6 +5778,10 @@ impl ConditionalHumanPolicyDataset {
             decision_time_exclusions: self.decision_time_exclusions.as_ref(),
             stopping_decisions: (self.label_scope == Some(SOURCE_STOPPING_LABEL_SCOPE))
                 .then_some(self.stopping_decisions.as_slice()),
+            stopping_state_proofs: (self.label_scope == Some(SOURCE_STOPPING_LABEL_SCOPE))
+                .then_some(self.stopping_state_proofs.as_slice()),
+            stopping_public_applies: (self.label_scope == Some(SOURCE_STOPPING_LABEL_SCOPE))
+                .then_some(self.stopping_public_applies),
         }
     }
     pub fn publish_new(&self, output: &Path) -> Result<(), String> {
