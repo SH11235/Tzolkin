@@ -2679,6 +2679,163 @@ fn source_stopping_v14_adds_choiceful_ends_and_preserves_v13_without_future_feat
     assert_eq!(value["counts"]["excluded"]["forcedStopNoChoice"], 1);
 }
 #[test]
+fn source_stopping_completion_survives_profile_comparison_without_predecessor_label() {
+    use tzolkin_core::public_replay::apply_public;
+    let mut f = Fixture::paid_technology(3, 0, [1, 0, 0]);
+    let mut record: PublicReplayRecord = serde_json::from_value(f.record.clone()).unwrap();
+    // Retain a second worker so ending after the technology is a real choice.
+    let placed = verify_public_replay(&record).unwrap().frames[1]
+        .snapshot
+        .state
+        .clone();
+    let extra = inspect_public(&placed)
+        .unwrap()
+        .observation
+        .unwrap()
+        .legal_actions
+        .into_iter()
+        .find(|a| {
+            matches!(
+                a.action,
+                TypedAction::Place {
+                    gear: GearId::Palenque,
+                    discount: false,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    record.steps.insert(
+        1,
+        PublicReplayStep {
+            actor: 0,
+            r#move: extra.r#move,
+            source_action_ids: vec![],
+            refills: Refills::default(),
+            checkpoint: None,
+        },
+    );
+    for audit in f.audit["audit"].as_array_mut().unwrap() {
+        audit["step"] = json!(audit["step"].as_u64().unwrap() + 1);
+    }
+    let report = verify_public_replay(&record).unwrap();
+    for i in [7, 8] {
+        let row = inspect_public(&report.frames[i].snapshot.state)
+            .unwrap()
+            .observation
+            .unwrap()
+            .legal_actions
+            .into_iter()
+            .find(|a| a.r#move == record.steps[i].r#move)
+            .unwrap();
+        record.steps[i].source_action_ids = vec![9];
+        f.audit["audit"].as_array_mut().unwrap().push(json!({"step":i+1,"actionId":9,"actor":0,"action":row.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+    }
+    f.raw["dom_entries"].as_array_mut().unwrap().insert(0,json!({"action_id":9,"timestamp_display":"11:59","messages":[{"raw_text":"P0はTikal 1のワーカーを取り除き、n°1のアクションを行った"}]}));
+    let stop_index = record.steps.len();
+    let before = report.frames.last().unwrap().snapshot.state.clone();
+    let end = inspect_public(&before)
+        .unwrap()
+        .observation
+        .unwrap()
+        .legal_actions
+        .into_iter()
+        .find(|a| {
+            a.action
+                == TypedAction::EndTurn {
+                    double_advance: None,
+                }
+        })
+        .unwrap();
+    record.steps.push(PublicReplayStep {
+        actor: 0,
+        r#move: end.r#move.clone(),
+        source_action_ids: vec![11],
+        refills: Refills::default(),
+        checkpoint: None,
+    });
+    f.audit["audit"].as_array_mut().unwrap().push(json!({"step":record.steps.len(),"actionId":11,"actor":0,"action":end.action,"derivedFromVisibleBoundary":true,"equivalentChoices":1}));
+    let after = apply_public(&before, 0, end.r#move, &Refills::default())
+        .unwrap()
+        .snapshot
+        .state;
+    let next = inspect_public(&after)
+        .unwrap()
+        .observation
+        .unwrap()
+        .legal_actions
+        .into_iter()
+        .find(|a| {
+            matches!(
+                a.action,
+                TypedAction::Place {
+                    gear: GearId::Palenque,
+                    discount: false,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let TypedAction::Place { corn_cost, .. } = next.action else {
+        unreachable!()
+    };
+    record.steps.push(PublicReplayStep {
+        actor: after.current_player,
+        r#move: next.r#move,
+        source_action_ids: vec![11],
+        refills: Refills::default(),
+        checkpoint: None,
+    });
+    f.audit["audit"].as_array_mut().unwrap().push(json!({"step":record.steps.len(),"actionId":11,"actor":after.current_player,"action":next.action,"derivedFromVisibleBoundary":false,"equivalentChoices":1}));
+    f.raw["dom_entries"].as_array_mut().unwrap().push(json!({"action_id":11,"timestamp_display":"12:01","messages":[{"raw_text":format!("P{}はPalenqueの歯車に{corn_cost} を支払ってワーカーを置いた",after.current_player)}]}));
+    f.record = json!(record);
+    f.sync_entries();
+    let output = stopping_report(&f).unwrap();
+    let stop = stops(&output)
+        .into_iter()
+        .find(|s| s["replayStepIndex"] == stop_index)
+        .unwrap_or_else(|| {
+            panic!(
+                "source-supported end must survive comparison: decisions={} proofs={}",
+                output["stoppingDecisions"], output["stoppingStateProofs"]
+            )
+        });
+    assert!(stop["stoppingSupport"]["completion"].is_object());
+    assert!(
+        !output["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["replayStepIndex"] == stop_index - 1)
+    );
+    assert_eq!(output["featureEligibility"]["semanticOnlySamples"], 0);
+    assert_eq!(
+        output["featureEligibility"]["public2"]["samples"],
+        output["counts"]["samples"]
+    );
+    assert_eq!(
+        output["featureEligibility"]["semanticPlaying4"]["samples"],
+        output["counts"]["samples"]
+    );
+    assert!(
+        output["stoppingDecisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["replayStepIndex"] == stop_index && d["sourceSupported"] == true)
+    );
+    f.raw["dom_entries"][1]["messages"][0]["html"] = json!("wrong resource");
+    f.sync_entries();
+    if let Ok(rejected) = stopping_report(&f) {
+        assert!(
+            !stops(&rejected)
+                .iter()
+                .any(|s| s["replayStepIndex"] == stop_index)
+        );
+    }
+}
+
+#[test]
 fn source_stopping_v14_refuses_missing_cancelled_ambiguous_or_intervening_originals() {
     for variant in 0..10 {
         let mut f = Fixture::source_stopping_round(GearId::Palenque);
