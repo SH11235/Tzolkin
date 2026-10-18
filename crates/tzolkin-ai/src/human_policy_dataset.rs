@@ -1028,15 +1028,13 @@ fn source_stopping_evidence(
     sources: &Sources,
     report: &PublicReplayReport,
     samples: &[HumanPolicySample],
-    complete_results: bool,
 ) -> Result<Result<SourceStoppingSupport, &'static str>, String> {
     let original = source_stopping_evidence_v1(index, action, sources, report, samples)?;
     match original {
         Ok(support) => Ok(Ok(support)),
-        Err(reason) if complete_results => {
+        Err(reason) => {
             stopping_completion::complete(index, action, sources, report, samples, reason)
         }
-        Err(reason) => Ok(Err(reason)),
     }
 }
 fn source_stopping_evidence_v1(
@@ -4525,32 +4523,25 @@ impl ConditionalHumanPolicyDataset {
                     *counts.excluded.entry(reason.into()).or_default() += 1;
                     continue;
                 }
-                let support = match source_stopping_evidence(
-                    index,
-                    &row.action,
-                    sources,
-                    &report,
-                    &samples,
-                    // The schema-2 comparison stays the prior sealed baseline;
-                    // V14 result/phase proofs are explicit semantic-4 additions.
-                    feature_profile == ConditionalFeatureProfile::SemanticPlaying4,
-                )? {
-                    Ok(support) => support,
-                    Err(reason) => {
-                        stopping_decisions.push(SourceStoppingDecision {
-                            replay_step_index: index,
-                            source_action_id: source_id,
-                            actor: step.actor,
-                            source_supported: false,
-                            reason,
-                        });
-                        *counts
-                            .excluded
-                            .entry(format!("sourceStop:{reason}"))
-                            .or_default() += 1;
-                        continue;
-                    }
-                };
+                let support =
+                    match source_stopping_evidence(index, &row.action, sources, &report, &samples)?
+                    {
+                        Ok(support) => support,
+                        Err(reason) => {
+                            stopping_decisions.push(SourceStoppingDecision {
+                                replay_step_index: index,
+                                source_action_id: source_id,
+                                actor: step.actor,
+                                source_supported: false,
+                                reason,
+                            });
+                            *counts
+                                .excluded
+                                .entry(format!("sourceStop:{reason}"))
+                                .or_default() += 1;
+                            continue;
+                        }
+                    };
                 if !labels.insert((source_id, support.next_message_index, support.kind)) {
                     return Err("Source stopping transition consumed twice".into());
                 }

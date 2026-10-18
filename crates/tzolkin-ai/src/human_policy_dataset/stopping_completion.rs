@@ -1037,8 +1037,16 @@ fn rotation_arrival(
             || bound.get("cancellation").is_some()
             || bound.get("removedSteps").is_some()
             || s.record.steps.get(i + 1).is_none()
-            || s.record.steps[i + 1].source_action_ids != s.record.steps[i].source_action_ids
-            || primary_caption(i + 1, s, r)?.is_none()
+        {
+            continue;
+        }
+        let ordinary_receipt = s.record.steps[i + 1].source_action_ids
+            == s.record.steps[i].source_action_ids
+            && primary_caption(i + 1, s, r)?.is_some();
+        // A subsequent actor's cancellation can also retain the claim payout.
+        // It needs the same independently bound original board as other ends.
+        if !ordinary_receipt
+            && !retained_cancellation(s.record.steps[i].source_action_ids[0], claimed, i + 1, s, r)?
         {
             continue;
         }
@@ -2263,6 +2271,21 @@ mod tests {
             ]),
         );
         assert!(rotation_arrival(5, 6, &s, &r).unwrap().is_some());
+        let ordinary = s.raw["dom_entries"][1]["messages"].clone();
+        s.record.steps[2].source_action_ids = vec![3];
+        s.audit["audit"][2]["actionId"] = json!(3);
+        s.raw["dom_entries"][1]["messages"] = json!([plain("P1は行動をキャンセルした")]);
+        s.audit["audit"].as_array_mut().unwrap().push(json!({"actionId":2,"cancellation":true,"removedSteps":0,"retainedSteps":2,"discardedSourceActionIds":[],"observedBoardMatched":true}));
+        let at = &r.frames[2].snapshot.state;
+        s.stopping_observations.push(json!({"schema":"tzolkin-bga-public-witnesses-v1","tableId":"123","rawSha256":"synthetic","catalogHash":public_catalog_hash(),"witnesses":[{"actionId":2,"expected":{"round":at.round,"players":at.players.iter().map(|p|json!({"resources":p.resources,"workers":p.workers,"score":p.score as i64})).collect::<Vec<_>>(),"gears":at.gears},"pendingTask":null}]}));
+        assert!(rotation_arrival(5, 6, &s, &r).unwrap().is_some());
+        s.stopping_observations[0]["witnesses"][0]["expected"]["players"][0]["resources"]["corn"] =
+            json!(999);
+        assert!(rotation_arrival(5, 6, &s, &r).unwrap().is_none());
+        s.stopping_observations.clear();
+        s.raw["dom_entries"][1]["messages"] = ordinary;
+        s.record.steps[2].source_action_ids = vec![2];
+        s.audit["audit"][2]["actionId"] = json!(2);
         s.raw["dom_entries"][2]["messages"][1] = plain("P0がこのラウンドのスタートプレイヤーです");
         assert!(rotation_arrival(5, 6, &s, &r).unwrap().is_none());
         s.raw["dom_entries"][2]["messages"][1] = plain("P1がこのラウンドのスタートプレイヤーです");
