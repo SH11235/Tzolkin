@@ -9,7 +9,7 @@ use crate::human_policy_dataset::{
     CAPPED_EXTRACTION_LABEL_SCOPE, ConditionalFeatureProfile, ConditionalHumanPolicyDataset,
     EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE, FACTORIZED_LABEL_SCOPE, HumanPolicySample,
     OBSERVED_CORN_BEG_LABEL_SCOPE, OBSERVED_PENDING_CHOICE_LABEL_SCOPE,
-    PAID_TECHNOLOGY_LABEL_SCOPE, TASK,
+    PAID_TECHNOLOGY_LABEL_SCOPE, SOURCE_STOPPING_LABEL_SCOPE, TASK,
 };
 use crate::kernel::{Kernel, ResolvedKernel};
 use crate::model::{Random, digest};
@@ -407,7 +407,10 @@ impl ConditionalDatasetIdentity {
 
 fn training_scope_supported(scope: Option<&str>, profile: ConditionalFeatureProfile) -> bool {
     if profile == ConditionalFeatureProfile::SemanticPlaying4 {
-        return scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE);
+        return matches!(
+            scope,
+            Some(CAPPED_EXTRACTION_LABEL_SCOPE | SOURCE_STOPPING_LABEL_SCOPE)
+        );
     }
     scope.is_none_or(|scope| {
         matches!(
@@ -1604,6 +1607,84 @@ fn train_using_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn v14_training_identity_requires_matching_train_validation_without_models() {
+        let make = |table, split, scope| {
+            ConditionalHumanPolicyDataset::training_fixture_scope(table, split, 0, scope)
+        };
+        let train = make("123", DatasetSplit::Train, SOURCE_STOPPING_LABEL_SCOPE);
+        let validation = make("124", DatasetSplit::Validation, SOURCE_STOPPING_LABEL_SCOPE);
+        let profile = ConditionalFeatureProfile::SemanticPlaying4;
+        assert!(audit_partition_using(std::slice::from_ref(&train), false, profile).is_err());
+        let data = [train, validation];
+        let before = data
+            .iter()
+            .map(|d| d.fingerprint().unwrap())
+            .collect::<Vec<_>>();
+        let identity = audit_partition_using(&data, false, profile).unwrap();
+        assert_eq!(
+            identity.label_scope.as_deref(),
+            Some(SOURCE_STOPPING_LABEL_SCOPE)
+        );
+        assert_eq!(identity.samples, [1, 1, 0]);
+        assert!(
+            !identity.source_authenticated
+                && !identity.source_qualified
+                && !identity.verified_native_policy
+        );
+        let inspection = inspect_semantic_playing_datasets(&data).unwrap();
+        assert!(inspection.training_scope_supported && inspection.validation_samples_present);
+        assert!(inspection.training_identity_validation_error.is_none());
+        assert!(!inspection.training_ready && !inspection.model_created);
+        assert_eq!(
+            (inspection.model_forward_calls, inspection.optimizer_steps),
+            (0, 0)
+        );
+        assert_eq!(
+            before,
+            data.iter()
+                .map(|d| d.fingerprint().unwrap())
+                .collect::<Vec<_>>()
+        );
+
+        let supported = [
+            make("123", DatasetSplit::Train, CAPPED_EXTRACTION_LABEL_SCOPE),
+            make(
+                "124",
+                DatasetSplit::Validation,
+                CAPPED_EXTRACTION_LABEL_SCOPE,
+            ),
+        ];
+        assert!(audit_partition_using(&supported, false, profile).is_ok());
+        for scope in [
+            CAPPED_EXTRACTION_LABEL_SCOPE,
+            crate::human_policy_dataset::OBSERVED_BUILDING_LABEL_SCOPE,
+            crate::human_policy_dataset::OBSERVED_MARKET_BUY_LABEL_SCOPE,
+            crate::human_policy_dataset::CONDITIONAL_MARKET_EXIT_LABEL_SCOPE,
+            crate::human_policy_dataset::OBSERVED_THEOLOGY_SERIES_LABEL_SCOPE,
+            crate::human_policy_dataset::OBSERVED_HARVEST_ROTATION_LABEL_SCOPE,
+        ] {
+            let mixed = [
+                make("123", DatasetSplit::Train, SOURCE_STOPPING_LABEL_SCOPE),
+                make("124", DatasetSplit::Validation, scope),
+            ];
+            assert!(audit_partition_using(&mixed, false, profile).is_err());
+            if scope != CAPPED_EXTRACTION_LABEL_SCOPE {
+                let unsupported = [
+                    make("123", DatasetSplit::Train, scope),
+                    make("124", DatasetSplit::Validation, scope),
+                ];
+                assert!(audit_partition_using(&unsupported, false, profile).is_err());
+            }
+        }
+        let test = make("125", DatasetSplit::Test, SOURCE_STOPPING_LABEL_SCOPE);
+        assert!(audit_partition_using(&[test], false, profile).is_err());
+        assert!(!training_scope_supported(
+            Some(SOURCE_STOPPING_LABEL_SCOPE),
+            ConditionalFeatureProfile::Public2
+        ));
+    }
+
     #[test]
     fn read_only_playing_inspection_preserves_inputs_without_training_admission() {
         let train = ConditionalHumanPolicyDataset::harvest_rotation_inspection_fixture(
