@@ -568,6 +568,21 @@ pub(crate) struct Draw {
     pub(crate) draws_before: u64,
     pub(crate) draws_after: u64,
 }
+
+/// Sample ordered full-mask logits with the same numeric sampler used by collection.
+/// Returns `(index, next_actor_state, next_actor_draw_count)` without mutating state.
+/// Even a singleton consumes one draw. This numeric operation does not authenticate
+/// a model or create a collection trace, admitted step, or training eligibility.
+pub fn sample_logits_tick53(
+    logits: &[f32],
+    actor_state: u64,
+    actor_draw_count: u64,
+) -> Result<(usize, u64, u64), String> {
+    let distribution = TickDistribution::new(logits)?;
+    let draw = draw_tick53(actor_state, actor_draw_count, &distribution)?;
+    Ok((draw.index, draw.state_after, draw.draws_after))
+}
+
 /// Compute a draw without mutating or admitting a policy/session. Callers commit
 /// their owned stream and counters only after this numeric operation succeeds.
 pub(crate) fn draw_tick53(
@@ -1306,6 +1321,31 @@ mod tests {
     fn rekey(o: &mut Observation) {
         o.observation_key = observation_key(o).unwrap();
     }
+    #[test]
+    fn numeric_sampling_entry_matches_collection_draw_and_rejections() {
+        for logits in [vec![-0.0], vec![0.0, 0.0], vec![-100.0, 2.0, 100.0]] {
+            let distribution = TickDistribution::new(&logits).unwrap();
+            for state in [0, 1, u64::MAX] {
+                for draws in [0, 7, u64::MAX - 1] {
+                    let expected = draw_tick53(state, draws, &distribution).unwrap();
+                    assert_eq!(
+                        sample_logits_tick53(&logits, state, draws).unwrap(),
+                        (expected.index, expected.state_after, expected.draws_after)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            sample_logits_tick53(&[-0.0], 0, 0).unwrap(),
+            (0, 0x9e3779b97f4a7c15, 1)
+        );
+        assert!(sample_logits_tick53(&[0.0], 0, u64::MAX).is_err());
+        for logits in [vec![], vec![f32::NAN], vec![f32::INFINITY]] {
+            assert!(TickDistribution::new(&logits).is_err());
+            assert!(sample_logits_tick53(&logits, 0, 0).is_err());
+        }
+    }
+
     #[test]
     fn tick_boundaries_equal_the_strict_float_grid_selection() {
         let d = TickDistribution::new(&[0.0, 0.0]).unwrap();
