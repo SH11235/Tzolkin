@@ -20,6 +20,7 @@ use crate::kernel::{Kernel, ResolvedKernel};
 use crate::public_model::{PublicPolicyModel, ValueValidity, predict_semantic_playing_numeric};
 use crate::public_policy_update::hash;
 use crate::public_state_critic as critic;
+use crate::semantic_playing_research::ResearchOrigin;
 use crate::semantic_playing_teacher_dataset::TeacherProfile;
 
 /// Invocation-only custody for already-owned values from the complete V7 loader.
@@ -181,17 +182,20 @@ impl NativeOrigin {
 enum TrainingOrigin {
     Human(Box<SemanticPlayingRlOrigin>),
     Native(Arc<NativeOrigin>),
+    Research(Arc<ResearchOrigin>),
 }
 #[derive(Clone, Copy)]
 enum OriginRef<'a> {
     Human(&'a SemanticPlayingRlOrigin),
     Native(&'a Arc<NativeOrigin>),
+    Research(&'a Arc<ResearchOrigin>),
 }
 impl TrainingOrigin {
     fn view(&self) -> OriginRef<'_> {
         match self {
             Self::Human(o) => OriginRef::Human(o),
             Self::Native(o) => OriginRef::Native(o),
+            Self::Research(o) => OriginRef::Research(o),
         }
     }
 }
@@ -200,12 +204,14 @@ impl OriginRef<'_> {
         match self {
             Self::Human(o) => o.recheck_sources(),
             Self::Native(o) => o.recheck_backing(),
+            Self::Research(o) => o.recheck(),
         }
     }
     fn tables(&self) -> &BTreeMap<String, DatasetSplit> {
         match self {
             Self::Human(o) => &o.table_reservations,
             Self::Native(o) => &o.tables,
+            Self::Research(o) => &o.tables,
         }
     }
     fn recheck_in(&self, checked: &mut SemanticSourceCheckPass<'_>) -> Result<(), String> {
@@ -217,12 +223,19 @@ impl OriginRef<'_> {
                 Ok(())
             }
             Self::Native(o) => o.recheck_in(checked),
+            Self::Research(o) => o.recheck_in(checked),
         }
     }
 }
 /// Closed internal initialization; only successful typed loaders supply owners.
 pub(crate) enum SemanticFreshOwner {
     Human(Box<SemanticPlayingRlOwner>),
+    Research {
+        origin: Arc<ResearchOrigin>,
+        actor: PublicPolicyModel,
+        critic: Vec<f32>,
+        identity: SemanticPlayingRlIdentity,
+    },
     Native {
         origin: Arc<NativeOrigin>,
         actor: PublicPolicyModel,
@@ -231,6 +244,71 @@ pub(crate) enum SemanticFreshOwner {
     },
 }
 impl SemanticFreshOwner {
+    pub(crate) fn research(
+        origin: Arc<ResearchOrigin>,
+        actor: PublicPolicyModel,
+        seed: u64,
+    ) -> Result<Self, String> {
+        origin.recheck()?;
+        actor.validate()?;
+        let critic = crate::public_policy_baseline::zero_output_parameters(seed);
+        let actor_checksum = parameter_checksum(
+            b"tzolkin-semantic-playing-rl-actor-bits-v1\0",
+            actor.parameters(),
+        );
+        let critic_checksum = hash(
+            b"semantic-research-fresh-critic-v1\0",
+            &(
+                &origin.checksum,
+                CRITIC_INIT_VERSION,
+                critic::MODEL_VERSION,
+                critic::CONTEXT_CONTRACT,
+                (
+                    critic::CONTEXT_SCHEMA,
+                    PUBLIC_FEATURE_SCHEMA,
+                    critic::CONTEXT_COUNT,
+                ),
+                seed,
+                parameter_checksum(b"tzolkin-semantic-playing-rl-critic-bits-v1\0", &critic),
+            ),
+        )?;
+        let checksum = hash(
+            b"semantic-research-fresh-identity-v1\0",
+            &(
+                crate::semantic_playing_research::POLICY_VERSION,
+                crate::semantic_playing_research::INPUT_CONTRACT,
+                SEMANTIC_PLAYING_FEATURE_SCHEMA,
+                &origin.checksum,
+                &actor_checksum,
+                &critic_checksum,
+                seed,
+                (
+                    "scalar",
+                    0_u64,
+                    false,
+                    false,
+                    false,
+                    ValueValidity::UnavailablePolicyOnly,
+                ),
+            ),
+        )?;
+        let identity = SemanticPlayingRlIdentity {
+            origin_checksum: origin.checksum.clone(),
+            actor_checksum,
+            critic_checksum,
+            critic_seed: seed,
+            checksum,
+            native: None,
+            research: true,
+        };
+        Ok(Self::Research {
+            origin,
+            actor,
+            critic,
+            identity,
+        })
+    }
+
     pub(crate) fn native(
         prepared: Arc<PreparedSemanticPlayingTeacher>,
         seed: u64,
@@ -285,6 +363,12 @@ impl SemanticFreshOwner {
                 critic,
                 identity,
             } => (TrainingOrigin::Native(origin), actor, critic, identity),
+            Self::Research {
+                origin,
+                actor,
+                critic,
+                identity,
+            } => (TrainingOrigin::Research(origin), actor, critic, identity),
         }
     }
 }
@@ -375,12 +459,16 @@ pub struct SemanticPlayingRlIdentity {
     critic_seed: u64,
     checksum: String,
     native: Option<TeacherProfile>,
+    research: bool,
 }
 impl SemanticPlayingRlIdentity {
     pub fn checksum(&self) -> &str {
         &self.checksum
     }
     pub fn policy_version(&self) -> &'static str {
+        if self.research {
+            return crate::semantic_playing_research::POLICY_VERSION;
+        }
         match self.native {
             None => POLICY_VERSION,
             Some(TeacherProfile::V5) => NATIVE_POLICY_VERSION,
@@ -388,6 +476,9 @@ impl SemanticPlayingRlIdentity {
         }
     }
     pub fn input_contract(&self) -> &'static str {
+        if self.research {
+            return crate::semantic_playing_research::INPUT_CONTRACT;
+        }
         match self.native {
             None => INPUT_CONTRACT,
             Some(TeacherProfile::V5) => NATIVE_INPUT_CONTRACT,
@@ -568,6 +659,7 @@ fn fresh_identity(
             critic_seed,
             checksum,
             native,
+            research: false,
         },
     ))
 }
@@ -660,6 +752,9 @@ impl SemanticOwnerView<'_> {
             OriginRef::Native(origin) => {
                 serde_json::json!({"checksum":origin.checksum,"nativeTeacher":origin.description})
             }
+            OriginRef::Research(origin) => {
+                serde_json::json!({"checksum":origin.checksum,"researchActor":origin.description})
+            }
         }
     }
     pub(crate) fn root_checksum(&self) -> &str {
@@ -672,12 +767,21 @@ impl SemanticOwnerView<'_> {
                 pins: origin.source_pins.clone(),
                 reservations: origin.table_reservations.clone(),
                 native: None,
+                research: None,
             },
             OriginRef::Native(origin) => SemanticOriginCustody {
                 checksum: origin.checksum.clone(),
                 pins: Vec::new(),
                 reservations: BTreeMap::new(),
                 native: Some(Arc::clone(origin)),
+                research: None,
+            },
+            OriginRef::Research(origin) => SemanticOriginCustody {
+                checksum: origin.checksum.clone(),
+                pins: Vec::new(),
+                reservations: BTreeMap::new(),
+                native: None,
+                research: Some(Arc::clone(origin)),
             },
         }
     }
@@ -730,6 +834,9 @@ impl SemanticOwnerView<'_> {
                 if let OriginRef::Native(origin) = self.origin {
                     origin.check_external(external)?;
                 }
+                if let OriginRef::Research(origin) = self.origin {
+                    origin.check_external(external)?;
+                }
                 for pin in pins {
                     checked.pin(pin)?;
                 }
@@ -755,6 +862,7 @@ pub(crate) struct SemanticOriginCustody {
     pins: Vec<ContentPin>,
     reservations: BTreeMap<String, DatasetSplit>,
     native: Option<Arc<NativeOrigin>>,
+    research: Option<Arc<ResearchOrigin>>,
 }
 impl SemanticOriginCustody {
     pub(crate) fn recheck_in(
@@ -767,6 +875,9 @@ impl SemanticOriginCustody {
         if let Some(native) = &self.native {
             native.recheck_in(checked)?;
         }
+        if let Some(research) = &self.research {
+            research.recheck_in(checked)?;
+        }
         Ok(())
     }
     pub(crate) fn recheck(&self) -> Result<(), String> {
@@ -776,9 +887,18 @@ impl SemanticOriginCustody {
         if let Some(native) = &self.native {
             native.recheck_backing()?;
         }
+        if let Some(research) = &self.research {
+            research.recheck()?;
+        }
         Ok(())
     }
     pub(crate) fn binding(&self) -> Result<String, String> {
+        if let Some(research) = &self.research {
+            return hash(
+                b"semantic-research-frozen-origin-custody-v1\0",
+                &(&self.checksum, &research.description),
+            );
+        }
         if let Some(native) = &self.native {
             hash(
                 match native.prepared.profile() {
@@ -859,6 +979,7 @@ pub(crate) fn with_collection_numeric_fixture<R>(
         critic_seed: 11,
         checksum: "synthetic-no-source-qualification".into(),
         native: None,
+        research: false,
     };
     let scope = SemanticCollectionScope {
         actor: &prepared.model().model,

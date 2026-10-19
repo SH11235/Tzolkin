@@ -80,6 +80,7 @@ pub struct NativeExclusionDescriptor {
     canonical_digest: String,
 }
 /// Only checked raw input emits this closure; a descriptor cannot reserve work.
+#[derive(Clone)]
 pub struct ConditionalNativeExclusions {
     descriptor: NativeExclusionDescriptor,
     families: BTreeSet<String>,
@@ -152,6 +153,9 @@ impl ConditionalNativeExclusions {
             },
             families: wire.families.into_iter().collect(),
         })
+    }
+    pub(crate) fn is_subset_of(&self, other: &Self) -> bool {
+        self.families.is_subset(&other.families)
     }
     pub fn descriptor(&self) -> &NativeExclusionDescriptor {
         &self.descriptor
