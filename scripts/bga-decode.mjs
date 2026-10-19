@@ -99,35 +99,7 @@ export function deriveCancellationByWorkerContinuity(events, history, actor, sou
   const ids = new Set(window.map((event) => event.actionId));
   for (let id = sourceId + 1; id <= end; id++)
     if (!ids.has(id)) fail('Derived cancellation has an unobserved source gap');
-  const removals = [];
-  for (const event of window) {
-    if (event.actor === name && event.kind === 'gearAction' && event.detail.source === 'removal') {
-      if (
-        !['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'].includes(event.detail.gear) ||
-        !Number.isSafeInteger(event.detail.workerPosition) ||
-        event.detail.workerPosition < 0 ||
-        event.detail.workerPosition >= (event.detail.gear === 'chichenItza' ? 13 : 10)
-      )
-        fail('Unsupported derived cancellation removal position');
-      removals.push(event);
-    } else if (
-      event.actor === name &&
-      ['resourceGain', 'resourcePayment', 'technology'].includes(event.kind)
-    ) {
-      // These notifications cannot move an existing worker under basic rules.
-    } else if (event.kind === 'unparsed' && event.iconResources.length === 0) {
-      const body = event.rawText.startsWith(`${name}は`) ? event.rawText.slice(name.length) : null;
-      if (!(
-        (event.actor === name &&
-          (/^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段(上げた|下げた)$/.test(
-            body ?? '',
-          ) ||
-            /^は(corn|コーン|wood)タイルを獲得した$/.test(body ?? ''))) ||
-        event.rawText === `農業技術ボーナス: ${name}は好きな信仰を1段上げた`
-      ))
-        fail('Unsupported intervening source in derived cancellation proof');
-    } else fail('Unsupported intervening source in derived cancellation proof');
-  }
+  const removals = workerContinuityRemovals(window, name);
   if (
     !same(
       removals.map((event) => event.actionId),
@@ -183,6 +155,82 @@ export function deriveCancellationByWorkerContinuity(events, history, actor, sou
       excluded,
     },
   };
+}
+
+function workerContinuityRemovals(window, name) {
+  const removals = [];
+  for (const event of window) {
+    if (event.actor === name && event.kind === 'gearAction' && event.detail.source === 'removal') {
+      if (
+        !['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'].includes(event.detail.gear) ||
+        !Number.isSafeInteger(event.detail.workerPosition) ||
+        event.detail.workerPosition < 0 ||
+        event.detail.workerPosition >= (event.detail.gear === 'chichenItza' ? 13 : 10)
+      )
+        fail('Unsupported derived cancellation removal position');
+      removals.push(event);
+    } else if (
+      event.actor === name &&
+      ['resourceGain', 'resourcePayment', 'technology'].includes(event.kind)
+    ) {
+      // These notifications cannot move an existing worker under basic rules.
+    } else if (event.kind === 'unparsed' && event.iconResources.length === 0) {
+      const body = event.rawText.startsWith(`${name}は`) ? event.rawText.slice(name.length) : null;
+      if (!(
+        (event.actor === name &&
+          (/^は(Chaac|Quetzalcoatl|Kukulkan|Kukulcan)の信仰を1段(上げた|下げた)$/.test(
+            body ?? '',
+          ) ||
+            /^は(corn|コーン|wood)タイルを獲得した$/.test(body ?? ''))) ||
+        event.rawText === `農業技術ボーナス: ${name}は好きな信仰を1段上げた`
+      ))
+        fail('Unsupported intervening source in derived cancellation proof');
+    } else fail('Unsupported intervening source in derived cancellation proof');
+  }
+  return removals;
+}
+
+// Read the complete bounded same-actor interval, never an early successful
+// prefix. Only another player's explicit placement/removal closes the interval;
+// This narrow path requires contiguous source IDs; noncontiguity does not by
+// itself establish that a meaningful BGA notification is missing.
+export function deriveAutomaticCancellationByWorkerContinuity(events, history, actor, sourceId) {
+  const cancellation = events.filter((event) => event.actionId === sourceId);
+  if (cancellation.length !== 1 || cancellation[0].kind !== 'cancellation')
+    fail('Automatic cancellation requires a single original cancellation notification');
+  const name = cancellation[0].actor;
+  const window = [];
+  let boundary = null;
+  for (let id = sourceId + 1; id <= sourceId + 17; id++) {
+    const group = events.filter((event) => event.actionId === id);
+    if (!group.length)
+      fail('Automatic cancellation evidence interval is open or source IDs are noncontiguous');
+    const first = group[0];
+    if (
+      first.actor !== name &&
+      typeof first.actor === 'string' &&
+      group.every((event) => event.actor === first.actor) &&
+      (first.kind === 'place' || (first.kind === 'gearAction' && first.detail.source === 'removal'))
+    ) {
+      boundary = { actionId: id, actor: first.actor, kind: first.kind };
+      break;
+    }
+    if (id > sourceId + 16) fail('Automatic cancellation source window exceeds its bound');
+    window.push(...group);
+    // Validate each whole source group, including facts after the final removal.
+    workerContinuityRemovals(group, name);
+  }
+  if (boundary === null) fail('Automatic cancellation has no closed bounded evidence interval');
+  const actionIds = workerContinuityRemovals(window, name).map((event) => event.actionId);
+  const proof = { schema: 'tzolkin-bga-worker-continuity-cancellation-v1', actionIds };
+  const result = deriveCancellationByWorkerContinuity(events, history, actor, sourceId, proof);
+  result.receipt.automaticEvidence = {
+    sourceWindow: [sourceId + 1, boundary.actionId - 1],
+    boundary,
+    proof,
+    basis: 'complete same-actor source interval ending before another actor placement/removal',
+  };
+  return result;
 }
 const buildingSignature = (id) =>
   Object.fromEntries(
@@ -3407,6 +3455,23 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
             actorId(events[0].actor),
             id,
             witness.derivedCancellation,
+          );
+          selected = derived.selected;
+          derivedCancellation = derived.receipt;
+        } else if (
+          declaredProfile?.rules === 'basic' &&
+          state().version === 1 &&
+          state().additionalBuildings === false &&
+          state().expansion == null &&
+          events.length === 1 &&
+          witness.expected === undefined &&
+          witness.pendingTask === undefined
+        ) {
+          const derived = deriveAutomaticCancellationByWorkerContinuity(
+            normalizedEvents,
+            history,
+            actorId(events[0].actor),
+            id,
           );
           selected = derived.selected;
           derivedCancellation = derived.receipt;

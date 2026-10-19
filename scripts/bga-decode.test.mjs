@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   decodeConditionalPublicGame,
   decodePublicGame,
+  deriveAutomaticCancellationByWorkerContinuity,
   deriveCancellationByWorkerContinuity,
   WITNESS_SCHEMA,
 } from './bga-decode.mjs';
@@ -82,6 +83,141 @@ test('keeps mechanically different matching cancellation states ambiguous', () =
   assert.throws(
     () => deriveCancellationByWorkerContinuity(events, history, 0, 10, proof),
     /ambiguous/,
+  );
+});
+
+function automaticContinuityCase() {
+  const value = continuityCase();
+  value.events.push({
+    actionId: 14,
+    actor: 'B',
+    kind: 'place',
+    detail: {},
+    rawText: '',
+    iconResources: [],
+  });
+  return value;
+}
+
+test('automatically collects the complete interval and agrees with the explicit proof', () => {
+  const { events, history, proof } = automaticContinuityCase();
+  const explicit = deriveCancellationByWorkerContinuity(events, history, 0, 10, proof);
+  const automatic = deriveAutomaticCancellationByWorkerContinuity(events, history, 0, 10);
+  const { automaticEvidence, ...receipt } = automatic.receipt;
+  assert.deepEqual(automatic.selected, explicit.selected);
+  assert.deepEqual(receipt, explicit.receipt);
+  assert.deepEqual(automaticEvidence.proof, proof);
+  assert.deepEqual(automaticEvidence.sourceWindow, [11, 13]);
+  assert.equal(automaticEvidence.boundary.actionId, 14);
+  // Duplicate equivalent history states remain equivalent, not arbitrary pruning.
+  history.push(clone(history[1]));
+  assert.equal(
+    deriveAutomaticCancellationByWorkerContinuity(events, history, 0, 10).selected.steps,
+    1,
+  );
+});
+
+test('automatic cancellation retains ambiguity and inconsistent worker histories', () => {
+  const ambiguous = automaticContinuityCase();
+  ambiguous.history[2].frame.snapshot.state.gears = clone(
+    ambiguous.history[1].frame.snapshot.state.gears,
+  );
+  assert.throws(
+    () => deriveAutomaticCancellationByWorkerContinuity(ambiguous.events, ambiguous.history, 0, 10),
+    /ambiguous/,
+  );
+  const inconsistent = automaticContinuityCase();
+  inconsistent.history.splice(1, 1);
+  assert.throws(
+    () =>
+      deriveAutomaticCancellationByWorkerContinuity(
+        inconsistent.events,
+        inconsistent.history,
+        0,
+        10,
+      ),
+    /inconsistent/,
+  );
+});
+
+test('automatic cancellation does not truncate a successful prefix before later contradictions', () => {
+  const { events, history } = automaticContinuityCase();
+  events.at(-1).actionId = 16;
+  events.push({ ...clone(events[1]), actionId: 14 }); // The same worker cannot be removed twice.
+  events.push({ ...clone(events[2]), actionId: 15 });
+  assert.throws(
+    () => deriveAutomaticCancellationByWorkerContinuity(events, history, 0, 10),
+    /inconsistent/,
+  );
+  events.at(-1).kind = 'place'; // Unsupported facts after the last removal cannot be dropped.
+  assert.throws(
+    () => deriveAutomaticCancellationByWorkerContinuity(events, history, 0, 10),
+    /Unsupported intervening source/,
+  );
+});
+
+test('automatic cancellation rejects gaps, unsupported boundaries and open intervals', () => {
+  for (const mutate of [
+    (events) => events.splice(2, 2),
+    (events) => events.pop(),
+    (events) => {
+      events.at(-1).kind = 'resourceGain';
+    },
+    (events) => {
+      events.at(-1).actor = null;
+    },
+    (events) => {
+      events[2].kind = 'cancellation';
+    },
+  ]) {
+    const { events, history } = automaticContinuityCase();
+    mutate(events);
+    assert.throws(
+      () => deriveAutomaticCancellationByWorkerContinuity(events, history, 0, 10),
+      /interval is open|source IDs are noncontiguous|Unsupported intervening source/,
+    );
+  }
+});
+
+test('automatic cancellation validates trailing facts and preserves all three bounds', () => {
+  const { events, history } = automaticContinuityCase();
+  events.at(-1).actionId = 27;
+  for (let id = 14; id <= 26; id++) events.push({ ...clone(events[2]), actionId: id });
+  assert.deepEqual(
+    deriveAutomaticCancellationByWorkerContinuity(events, history, 0, 10).receipt.automaticEvidence
+      .sourceWindow,
+    [11, 26],
+  );
+  events.find((event) => event.actionId === 27).actionId = 28;
+  events.push({ ...clone(events[2]), actionId: 27 });
+  assert.throws(
+    () => deriveAutomaticCancellationByWorkerContinuity(events, history, 0, 10),
+    /source window exceeds/,
+  );
+  const many = automaticContinuityCase();
+  many.events = [
+    many.events[0],
+    ...Array.from({ length: 9 }, (_, index) => ({
+      ...clone(many.events[1]),
+      actionId: 11 + index,
+    })),
+    { ...many.events.at(-1), actionId: 20 },
+  ];
+  assert.throws(
+    () => deriveAutomaticCancellationByWorkerContinuity(many.events, many.history, 0, 10),
+    /Invalid derived cancellation/,
+  );
+  const states = automaticContinuityCase();
+  states.history = Array.from({ length: 129 }, (_, steps) => ({
+    ...clone(states.history[1]),
+    steps,
+    frame: {
+      snapshot: { state: { ...clone(states.history[1].frame.snapshot.state), score: steps } },
+    },
+  }));
+  assert.throws(
+    () => deriveAutomaticCancellationByWorkerContinuity(states.events, states.history, 0, 10),
+    /candidate-state budget/,
   );
 });
 
@@ -444,6 +580,42 @@ function replaceEvents(value, rows) {
   value.raw.entry_count = value.raw.entries.length;
   value.witness.witnesses = [];
 }
+
+test('conditional automatic cancellation never replaces an explicit or malformed witness', () => {
+  const profile = {
+    schema: 'tzolkin-bga-declared-mechanical-profile-v1',
+    rules: 'basic',
+    market: 'unlimited',
+    sourceOptions: 'unknown',
+  };
+  const run = (value, declared = profile) =>
+    decode(
+      value,
+      dispatcher(saved.core.initialFrame, () => clone(saved.core.afterFrame)),
+      null,
+      declared,
+    );
+  const ordinary = run(input(), null);
+  const conditional = run(input());
+  assert.deepEqual(conditional.record, ordinary.record);
+  assert.deepEqual(conditional.manifest.audit, ordinary.manifest.audit);
+  const malformed = input();
+  malformed.witness.witnesses[0].derivedCancellation = {
+    schema: 'tzolkin-bga-worker-continuity-cancellation-v1',
+    actionIds: [],
+  };
+  assert.match(run(malformed).manifest.blocked.reason, /must be separate from observations/);
+  const partial = input();
+  partial.witness.witnesses[0] = { actionId: 7, expected: { round: 1 } };
+  assert.match(run(partial).manifest.blocked.reason, /requires an observed settled/);
+  const unobserved = input();
+  unobserved.witness.witnesses[0] = { actionId: 7 };
+  assert.match(
+    run(clone(unobserved), null).manifest.blocked.reason,
+    /requires an observed settled/,
+  );
+  assert.match(run(unobserved).manifest.blocked.reason, /Unsupported intervening source/);
+});
 
 test('completes a double rotation at its named return before the next ordinary rotation', () => {
   const initial = clone(saved.core.initialFrame);
