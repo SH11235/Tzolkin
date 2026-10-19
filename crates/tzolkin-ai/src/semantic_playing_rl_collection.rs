@@ -138,6 +138,21 @@ impl DeclaredSamplingHistory {
     pub(crate) fn pins(&self) -> &[ContentPin] {
         &self.pins
     }
+    pub(crate) fn declared_ranges(&self) -> Vec<[u64; 6]> {
+        self.ranges
+            .iter()
+            .map(|r| {
+                [
+                    r.prefix[0],
+                    r.prefix[1],
+                    r.prefix[2],
+                    r.prefix[3],
+                    r.first,
+                    r.next,
+                ]
+            })
+            .collect()
+    }
     pub(crate) fn checksum(&self) -> &str {
         &self.checksum
     }
