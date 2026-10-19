@@ -5675,6 +5675,22 @@ impl ConditionalHumanPolicyDataset {
         dataset
     }
     #[cfg(test)]
+    pub(crate) fn harvest_rotation_inspection_fixture(
+        table: &str,
+        split: DatasetSplit,
+        chosen: usize,
+    ) -> Self {
+        let mut dataset = Self::training_fixture_using(
+            table,
+            split,
+            chosen,
+            ConditionalFeatureProfile::SemanticPlaying4,
+            true,
+        );
+        dataset.label_scope = Some(OBSERVED_HARVEST_ROTATION_LABEL_SCOPE);
+        dataset
+    }
+    #[cfg(test)]
     pub(crate) fn factorized_training_fixture(
         table: &str,
         split: DatasetSplit,

@@ -135,6 +135,90 @@ pub fn train_semantic_playing_collection_manifest(
     }
     Ok(outcome)
 }
+
+/// Reconstruct and inspect sealed Playing inputs without creating a model or optimizer.
+/// Successful inspection does not admit a new label scope or replace Train/Validation
+/// requirements of the training entry point.
+pub fn inspect_semantic_playing_collection_manifest(
+    path: &Path,
+) -> Result<ConditionalPolicyInputInspection, String> {
+    let input = read_local_json::<CollectionInput>(path)?;
+    let (input, datasets) =
+        load_collection_input_using(path, input, ConditionalFeatureProfile::SemanticPlaying4)?;
+    let inspection = inspect_semantic_playing_datasets(&datasets)?;
+    if read_local_json::<CollectionInput>(path)? != input {
+        return Err("Conditional inspection collection changed during loading".into());
+    }
+    Ok(inspection)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionalPolicyInputInspection {
+    mode: &'static str,
+    feature_schema: u32,
+    label_scope: Option<String>,
+    tables: Vec<ConditionalTableIdentity>,
+    samples: [usize; 3],
+    candidates: [usize; 3],
+    samples_by_phase: [usize; 4],
+    inspected_sources_fingerprint: String,
+    training_scope_supported: bool,
+    validation_samples_present: bool,
+    training_identity_validation_error: Option<String>,
+    training_ready: bool,
+    model_created: bool,
+    model_forward_calls: usize,
+    optimizer_steps: usize,
+}
+
+fn inspect_semantic_playing_datasets(
+    datasets: &[ConditionalHumanPolicyDataset],
+) -> Result<ConditionalPolicyInputInspection, String> {
+    let profile = ConditionalFeatureProfile::SemanticPlaying4;
+    // The same source, split, candidate and feature checks used by training run
+    // before inspection reports its separate training-identity compatibility.
+    let identity = audit_partition_rows_using(datasets, false, profile)?;
+    let training_identity_validation_error =
+        identity.validate_partition_using(false, profile).err();
+    let mut samples_by_phase = [0; 4];
+    for dataset in datasets {
+        for sample in dataset.samples() {
+            let values = sample.candidates()[0].values_for_schema(profile.schema())?;
+            if values[231..234] != [0.0, 1.0, 0.0] {
+                return Err("Read-only Playing inspection requires Playing inputs".into());
+            }
+            let phase = match &values[255..258] {
+                [0.0, 0.0, 0.0] => 0,
+                [1.0, 0.0, 0.0] => 1,
+                [1.0, 1.0, 0.0] => 2,
+                [1.0, 1.0, 1.0] => 3,
+                _ => return Err("Invalid Playing food-day phase features".into()),
+            };
+            samples_by_phase[phase] += 1;
+        }
+    }
+    Ok(ConditionalPolicyInputInspection {
+        mode: "readOnlySemanticPlayingInputs",
+        feature_schema: profile.schema(),
+        training_scope_supported: training_scope_supported(
+            identity.label_scope.as_deref(),
+            profile,
+        ),
+        validation_samples_present: identity.samples[1] > 0,
+        label_scope: identity.label_scope,
+        tables: identity.tables,
+        samples: identity.samples,
+        candidates: identity.candidates,
+        samples_by_phase,
+        inspected_sources_fingerprint: identity.fingerprint,
+        training_identity_validation_error,
+        training_ready: false,
+        model_created: false,
+        model_forward_calls: 0,
+        optimizer_steps: 0,
+    })
+}
 fn load_collection(
     path: &Path,
 ) -> Result<(CollectionInput, Vec<ConditionalHumanPolicyDataset>), String> {
@@ -262,17 +346,8 @@ impl ConditionalDatasetIdentity {
     ) -> Result<(), String> {
         if self.task != TASK
             || self.input_contract != profile.input_contract()
-            || self.label_scope.as_deref().is_some_and(|scope| {
-                scope != FACTORIZED_LABEL_SCOPE
-                    && scope != PAID_TECHNOLOGY_LABEL_SCOPE
-                    && scope != EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
-                    && scope != OBSERVED_CORN_BEG_LABEL_SCOPE
-                    && scope != OBSERVED_PENDING_CHOICE_LABEL_SCOPE
-                    && scope != CAPPED_EXTRACTION_LABEL_SCOPE
-            })
+            || !training_scope_supported(self.label_scope.as_deref(), profile)
             || self.feature_schema != profile.schema()
-            || (profile == ConditionalFeatureProfile::SemanticPlaying4
-                && self.label_scope.as_deref() != Some(CAPPED_EXTRACTION_LABEL_SCOPE))
             || self.feature_count != FEATURE_COUNT
             || self.rules_version != tzolkin_core::public_replay::PUBLIC_RULES_VERSION
             || self.catalog_hash != tzolkin_core::public_replay::public_catalog_hash()
@@ -329,6 +404,23 @@ impl ConditionalDatasetIdentity {
         Ok(())
     }
 }
+
+fn training_scope_supported(scope: Option<&str>, profile: ConditionalFeatureProfile) -> bool {
+    if profile == ConditionalFeatureProfile::SemanticPlaying4 {
+        return scope == Some(CAPPED_EXTRACTION_LABEL_SCOPE);
+    }
+    scope.is_none_or(|scope| {
+        matches!(
+            scope,
+            FACTORIZED_LABEL_SCOPE
+                | PAID_TECHNOLOGY_LABEL_SCOPE
+                | EXPLICIT_MARKET_ANYWHERE_LABEL_SCOPE
+                | OBSERVED_CORN_BEG_LABEL_SCOPE
+                | OBSERVED_PENDING_CHOICE_LABEL_SCOPE
+                | CAPPED_EXTRACTION_LABEL_SCOPE
+        )
+    })
+}
 #[cfg(test)]
 fn audit(datasets: &[ConditionalHumanPolicyDataset]) -> Result<ConditionalDatasetIdentity, String> {
     audit_partition(datasets, false)
@@ -345,6 +437,16 @@ fn audit_partition(
     )
 }
 fn audit_partition_using(
+    datasets: &[ConditionalHumanPolicyDataset],
+    validation_only: bool,
+    profile: ConditionalFeatureProfile,
+) -> Result<ConditionalDatasetIdentity, String> {
+    let identity = audit_partition_rows_using(datasets, validation_only, profile)?;
+    identity.validate_partition_using(validation_only, profile)?;
+    Ok(identity)
+}
+
+fn audit_partition_rows_using(
     datasets: &[ConditionalHumanPolicyDataset],
     validation_only: bool,
     profile: ConditionalFeatureProfile,
@@ -451,7 +553,6 @@ fn audit_partition_using(
     }
     identity.tables.sort_by(|a, b| a.table_id.cmp(&b.table_id));
     identity.fingerprint = identity.expected_fingerprint()?;
-    identity.validate_partition_using(validation_only, profile)?;
     Ok(identity)
 }
 /// Conditional provenance is separate from the native public-policy artifact wire format.
@@ -1503,6 +1604,103 @@ fn train_using_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn read_only_playing_inspection_preserves_inputs_without_training_admission() {
+        let train = ConditionalHumanPolicyDataset::harvest_rotation_inspection_fixture(
+            "123",
+            DatasetSplit::Train,
+            0,
+        );
+        let before = train.fingerprint().unwrap();
+        let report = inspect_semantic_playing_datasets(std::slice::from_ref(&train)).unwrap();
+        assert_eq!(report.samples, [1, 0, 0]);
+        assert_eq!(report.samples_by_phase, [1, 0, 0, 0]);
+        assert!(!report.training_scope_supported);
+        assert!(!report.validation_samples_present);
+        assert!(report.training_identity_validation_error.is_some());
+        assert!(!report.training_ready);
+        assert!(!report.model_created);
+        assert_eq!((report.model_forward_calls, report.optimizer_steps), (0, 0));
+        assert_eq!(train.fingerprint().unwrap(), before);
+        let profile = ConditionalFeatureProfile::SemanticPlaying4;
+        assert!(audit_partition_using(std::slice::from_ref(&train), false, profile).is_err());
+        let validation = ConditionalHumanPolicyDataset::harvest_rotation_inspection_fixture(
+            "124",
+            DatasetSplit::Validation,
+            0,
+        );
+        assert!(audit_partition_using(&[train, validation], false, profile).is_err());
+        let supported_train = ConditionalHumanPolicyDataset::training_fixture_using(
+            "123",
+            DatasetSplit::Train,
+            0,
+            profile,
+            true,
+        );
+        assert!(
+            audit_partition_using(std::slice::from_ref(&supported_train), false, profile).is_err()
+        );
+        let supported_validation = ConditionalHumanPolicyDataset::training_fixture_using(
+            "124",
+            DatasetSplit::Validation,
+            0,
+            profile,
+            true,
+        );
+        assert!(
+            audit_partition_using(&[supported_train, supported_validation], false, profile).is_ok()
+        );
+    }
+
+    #[test]
+    fn read_only_playing_inspection_uses_training_row_split_and_scope_checks() {
+        let invalid = ConditionalHumanPolicyDataset::harvest_rotation_inspection_fixture(
+            "123",
+            DatasetSplit::Train,
+            usize::MAX,
+        );
+        let inspected =
+            inspect_semantic_playing_datasets(std::slice::from_ref(&invalid)).unwrap_err();
+        let training = audit_partition_using(
+            &[invalid],
+            false,
+            ConditionalFeatureProfile::SemanticPlaying4,
+        )
+        .unwrap_err();
+        assert_eq!(inspected, training);
+        assert!(inspected.contains("sealed conditional sample"));
+        let one = || {
+            ConditionalHumanPolicyDataset::harvest_rotation_inspection_fixture(
+                "123",
+                DatasetSplit::Train,
+                0,
+            )
+        };
+        assert!(inspect_semantic_playing_datasets(&[one(), one()]).is_err());
+        let test = ConditionalHumanPolicyDataset::harvest_rotation_inspection_fixture(
+            "125",
+            DatasetSplit::Test,
+            0,
+        );
+        assert!(
+            inspect_semantic_playing_datasets(&[test])
+                .unwrap_err()
+                .contains("Test tables")
+        );
+        let other_scope = ConditionalHumanPolicyDataset::training_fixture_using(
+            "124",
+            DatasetSplit::Validation,
+            0,
+            ConditionalFeatureProfile::SemanticPlaying4,
+            true,
+        );
+        assert!(
+            inspect_semantic_playing_datasets(&[one(), other_scope])
+                .unwrap_err()
+                .contains("cannot mix label scopes")
+        );
+    }
+
     fn datasets(train: usize, validation: usize) -> Vec<ConditionalHumanPolicyDataset> {
         vec![
             ConditionalHumanPolicyDataset::training_fixture("123", DatasetSplit::Train, train),
