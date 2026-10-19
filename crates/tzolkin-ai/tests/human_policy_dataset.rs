@@ -2537,7 +2537,7 @@ fn source_stopping_v14_adds_choiceful_ends_and_preserves_v13_without_future_feat
         assert!(left["legalActions"].as_array().unwrap().len() > 1);
         assert_eq!(left["valueTarget"], Value::Null);
     }
-    // A new scope remains unsupported by the legacy training identity contract.
+    // The legacy Public2 training entry still rejects semantic4 source inputs.
     let d = f
         .load_scope(INPUT_SCHEMA_V14, Some(json!(SOURCE_STOPPING_LABEL_SCOPE)))
         .unwrap();
