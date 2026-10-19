@@ -192,6 +192,7 @@ impl PreparedResearchActor {
         Ok(ResearchSession {
             session,
             history,
+            external,
             origin: Arc::clone(&self.origin),
             actor_config: actor,
             critic_config: critic,
@@ -230,7 +231,7 @@ impl PreparedResearchActor {
         self.origin.check_external(external)?;
         external.recheck()?;
         history.recheck()?;
-        if saved.schema != "research-semantic-playing-checkpoint-v1"
+        if saved.schema != "research-semantic-playing-checkpoint-v2"
             || saved.origin != self.origin.checksum
             || saved.source_authenticated
             || saved.source_qualified
@@ -249,6 +250,12 @@ impl PreparedResearchActor {
                 .any(|p| !history.pins().contains(p))
         {
             return Err("Research checkpoint origin, configuration or exclusions differ".into());
+        }
+        let retained_external = saved.effective_external.load()?;
+        if !retained_external.is_subset_of(external) {
+            return Err(
+                "Research checkpoint external exclusions omit a previously declared family".into(),
+            );
         }
         for r in &saved.source_history.ranges {
             if !(3..=4).contains(&r[2])
@@ -349,10 +356,12 @@ impl PreparedResearchActor {
                 )?
             }
         };
+        retained_external.recheck()?;
         crate::human_policy_dataset::recheck_absolute_pin(checkpoint)?;
         Ok(ResearchSession {
             session,
             history,
+            external,
             origin: Arc::clone(&self.origin),
             actor_config: actor,
             critic_config: critic,
@@ -406,6 +415,31 @@ struct ResearchHistory {
     ranges: Vec<[u64; 6]>,
     pins: Vec<ContentPin>,
 }
+/// A descriptor alone grants no exclusion custody. Restoration resolves its
+/// complete raw file through the typed loader before comparing family sets.
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResearchExclusions {
+    pin: ContentPin,
+    count: usize,
+    canonical_digest: String,
+}
+impl ResearchExclusions {
+    fn capture(external: &ConditionalNativeExclusions) -> Result<Self, String> {
+        serde_json::from_value(
+            serde_json::to_value(external.descriptor()).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())
+    }
+    fn load(&self) -> Result<ConditionalNativeExclusions, String> {
+        ConditionalNativeExclusions::load(
+            std::path::Path::new(&self.pin.path),
+            &self.pin,
+            self.count,
+            &self.canonical_digest,
+        )
+    }
+}
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ResearchCheckpoint {
@@ -417,6 +451,7 @@ struct ResearchCheckpoint {
     families: BTreeSet<String>,
     ranges: Vec<StreamRange>,
     source_history: ResearchHistory,
+    effective_external: ResearchExclusions,
     source_authenticated: bool,
     source_qualified: bool,
     verified_native_policy: bool,
@@ -428,6 +463,7 @@ struct ResearchCheckpoint {
 pub struct ResearchSession<'a> {
     session: SemanticPlayingJointSession<'a>,
     history: &'a DeclaredSamplingHistory,
+    external: &'a ConditionalNativeExclusions,
     origin: Arc<ResearchOrigin>,
     actor_config: OneStepConfig,
     critic_config: ResidualFitConfig,
@@ -477,7 +513,7 @@ impl<'a> ResearchSession<'a> {
             return Err("Research checkpoint sampling range bound".into());
         }
         let saved = ResearchCheckpoint {
-            schema: "research-semantic-playing-checkpoint-v1".into(),
+            schema: "research-semantic-playing-checkpoint-v2".into(),
             origin: self.origin.checksum.clone(),
             actor_config: serde_json::to_value(self.actor_config).map_err(|e| e.to_string())?,
             critic_config: serde_json::to_value(self.critic_config).map_err(|e| e.to_string())?,
@@ -488,6 +524,7 @@ impl<'a> ResearchSession<'a> {
                 ranges: self.history.declared_ranges(),
                 pins: self.history.pins().to_vec(),
             },
+            effective_external: ResearchExclusions::capture(self.external)?,
             source_authenticated: false,
             source_qualified: false,
             verified_native_policy: false,
@@ -592,6 +629,101 @@ mod tests {
             "schema":"tzolkin-conditional-human-mixed-frozen-pool-v1", "weights":crate::policy::HeuristicWeights::default(),
             "rosters":[[null,opponent,opponent],[opponent,null,opponent],
                 [null,opponent,opponent,opponent],[opponent,null,opponent,opponent]]})).unwrap()).unwrap()
+    }
+    #[test]
+    fn research_checkpoint_retains_effective_unconsumed_exclusions() {
+        let f = Files::new();
+        let initial = seed_family_id(42);
+        let extra: Vec<_> = (0..1000)
+            .filter(|s| {
+                *s != 42 && split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Train
+            })
+            .take(3)
+            .map(seed_family_id)
+            .collect();
+        let (e0, pin0) = f.exclusions("e0.json", BTreeSet::from([initial.clone()]));
+        let families = |n| {
+            std::iter::once(initial.clone())
+                .chain(extra[..n].iter().cloned())
+                .collect()
+        };
+        let (e1, _) = f.exclusions("e1.json", families(1));
+        let (e2, _) = f.exclusions("e2.json", families(2));
+        let (e3, _) = f.exclusions("e3.json", families(3));
+        let history = DeclaredSamplingHistory::declare_complete(vec![], vec![pin0]).unwrap();
+        let (input, _) = f.actor();
+        let prepared = PreparedResearchActor::load(input, &e0).unwrap();
+        let session = prepared
+            .fresh_session(
+                &e1,
+                &history,
+                SamplingSeed::new(19),
+                0,
+                0,
+                OneStepConfig::default(),
+                critic(),
+            )
+            .unwrap();
+        let checkpoint1 = f.write("checkpoint1.json", &session.checkpoint_bytes().unwrap());
+        let restore = |checkpoint: &ContentPin, external| {
+            prepared.restore_session(
+                checkpoint,
+                external,
+                &history,
+                SamplingSeed::new(19),
+                0,
+                0,
+                OneStepConfig::default(),
+                critic(),
+            )
+        };
+        assert!(session.session.consumed_families().is_empty());
+        assert!(
+            restore(&checkpoint1, &e0)
+                .err()
+                .unwrap()
+                .contains("external exclusions")
+        );
+        assert!(restore(&checkpoint1, &e1).is_ok());
+        let resumed = restore(&checkpoint1, &e2).unwrap();
+        assert_eq!(
+            session.session.identity().unwrap().checksum(),
+            resumed.session.identity().unwrap().checksum()
+        );
+        // The second save must capture E2, rather than replaying E1 from the
+        // restored payload or only checking the original preparation's E0.
+        let checkpoint2 = f.write("checkpoint2.json", &resumed.checkpoint_bytes().unwrap());
+        assert!(resumed.session.consumed_families().is_empty());
+        assert!(
+            restore(&checkpoint2, &e1)
+                .err()
+                .unwrap()
+                .contains("external exclusions")
+        );
+        assert!(restore(&checkpoint2, &e2).is_ok());
+        assert!(restore(&checkpoint2, &e3).is_ok());
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&checkpoint2.path).unwrap()).unwrap();
+        assert_eq!(raw["schema"], "research-semantic-playing-checkpoint-v2");
+        assert_eq!(raw["effectiveExternal"]["count"], 3);
+        assert_eq!(raw["numerics"]["current"]["updates"], 0);
+        assert!(raw["families"].as_array().unwrap().is_empty());
+        let mut legacy = raw.clone();
+        legacy["schema"] = json!("research-semantic-playing-checkpoint-v1");
+        legacy.as_object_mut().unwrap().remove("effectiveExternal");
+        assert!(restore(&f.json("legacy.json", &legacy), &e3).is_err());
+        let mut wrong_descriptor = raw;
+        wrong_descriptor["effectiveExternal"]["canonicalDigest"] = json!("0".repeat(64));
+        assert!(restore(&f.json("wrong-descriptor.json", &wrong_descriptor), &e3).is_err());
+        // The descriptor's raw input must actually be read and checked, even
+        // though it is not one of the sampling-history evidence pins.
+        f.write("e2.json", b"changed");
+        assert!(
+            restore(&checkpoint2, &e3)
+                .err()
+                .unwrap()
+                .contains("External exclusions raw pin differs")
+        );
     }
     #[test]
     fn research_fresh_bits_and_pinned_input_refusals() {
