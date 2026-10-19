@@ -252,6 +252,15 @@ pub struct SemanticPlayingJointReport {
     guarded_proposals: Option<[usize; 4]>,
 }
 impl SemanticPlayingJointReport {
+    /// Read-only measurements from this exact update pass. This performs no
+    /// collection, model evaluation or RNG draws and cannot create actor steps.
+    pub fn signal_diagnostics(&self) -> Result<Option<serde_json::Value>, String> {
+        self.signals
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| e.to_string())
+    }
     pub fn parent_checksum(&self) -> &str {
         &self.parent
     }

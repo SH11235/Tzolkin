@@ -17,6 +17,7 @@ use crate::public_stochastic_native::CollectionLimits;
 use crate::semantic_playing_rl_collection::{
     DeclaredSamplingHistory, SemanticCollectionComposition,
 };
+use crate::semantic_playing_rl_pool::SemanticFrozenMixture;
 use crate::semantic_playing_rl_update::{
     SemanticCheckpointState, SemanticPlayingJointReport, SemanticPlayingJointSession,
 };
@@ -486,6 +487,16 @@ impl<'a> ResearchSession<'a> {
         self.session
             .collect_and_update_whole_four(seeds, pool, prepared_opponent, limits)
     }
+    /// Uses the common same-chain snapshot, source, ancestor and burn checks.
+    pub fn collect_and_update_mixed_whole_four(
+        &mut self,
+        seeds: [u32; 4],
+        mixture: &SemanticFrozenMixture<'_>,
+        limits: CollectionLimits,
+    ) -> Result<SemanticPlayingJointReport, String> {
+        self.session
+            .collect_and_update_mixed_whole_four(seeds, mixture, limits)
+    }
     /// Only admitted state can be saved. A failed or burned-but-unadmitted
     /// attempt is rejected, rather than dropping consumption on restoration.
     pub fn checkpoint_bytes(&self) -> Result<Vec<u8>, String> {
@@ -883,6 +894,14 @@ mod tests {
             .unwrap();
         let before = session.session.identity().unwrap().clone();
         let pool = pool();
+        let fixed = session.session.freeze_snapshot().unwrap();
+        let fixed_actor = fixed.identity().unwrap().actor_checksum().to_string();
+        let fixed_identity = fixed.identity().unwrap().checksum().to_string();
+        let slots = [(0, 1), (0, 2), (1, 0), (2, 1), (2, 2), (3, 0), (3, 2)]
+            .into_iter()
+            .map(|(m, a)| crate::semantic_playing_rl_pool::SnapshotSlot::new(m, a, &fixed).unwrap())
+            .collect();
+        let mixture = SemanticFrozenMixture::new(&pool, slots).unwrap();
         let limits = CollectionLimits::new(64, 65536, 8 * 1024 * 1024, 1024 * 1024).unwrap();
         let seeds: Vec<_> = (0..1000)
             .filter(|s| {
@@ -894,7 +913,7 @@ mod tests {
             .session
             .plan_reserved(
                 seeds.clone().try_into().unwrap(),
-                PoolRef::Legacy(&pool, None),
+                PoolRef::Mixture(&mixture),
                 limits,
             )
             .unwrap();
@@ -903,7 +922,7 @@ mod tests {
         // entrance delegates normal production game creation to the collector.
         let proposal = session
             .session
-            .stage_reserved_using(&reservation, PoolRef::Legacy(&pool, None), |config| {
+            .stage_reserved_using(&reservation, PoolRef::Mixture(&mixture), |config| {
                 let mut state = crate::conditional_human_rl_update::tests::terminal_start(
                     config.players(),
                     config.environment_seed(),
@@ -913,7 +932,49 @@ mod tests {
                 Ok(state)
             })
             .unwrap();
-        session.session.commit_prepared(proposal);
+        let report = session.session.commit_prepared(proposal);
+        assert!(report.signal_diagnostics().unwrap().is_some());
+        assert_eq!(fixed.identity().unwrap().actor_checksum(), fixed_actor);
+        assert_eq!(fixed.identity().unwrap().checksum(), fixed_identity);
+        let mut foreign_input = input.clone();
+        foreign_input.critic_seed += 1;
+        let foreign_prepared = PreparedResearchActor::load(foreign_input, &external).unwrap();
+        let foreign = foreign_prepared
+            .fresh_session(
+                &external,
+                &history,
+                SamplingSeed::new(23),
+                0,
+                0,
+                OneStepConfig::default(),
+                critic(),
+            )
+            .unwrap();
+        let foreign_snapshot = foreign.session.freeze_snapshot().unwrap();
+        let foreign_mixture = SemanticFrozenMixture::new(
+            &pool,
+            vec![
+                crate::semantic_playing_rl_pool::SnapshotSlot::new(0, 1, &foreign_snapshot)
+                    .unwrap(),
+            ],
+        )
+        .unwrap();
+        let fresh_seeds: Vec<_> = (1000..2000)
+            .filter(|s| split_for_family(&seed_family_id(*s)).unwrap() == DatasetSplit::Train)
+            .take(4)
+            .collect();
+        assert!(
+            session
+                .session
+                .plan_reserved(
+                    fresh_seeds.try_into().unwrap(),
+                    PoolRef::Mixture(&foreign_mixture),
+                    limits
+                )
+                .err()
+                .unwrap()
+                .contains("foreign fresh root")
+        );
         let after = session.session.identity().unwrap();
         assert_eq!(
             (
