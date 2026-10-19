@@ -175,6 +175,146 @@ impl<'a> SemanticPlayingConditionalPolicy<'a> {
     }
 }
 
+/// One preregistered requested choice in a development-only diagnostic game.
+/// The existing Trade guard can still replace this request with Skip.
+pub struct SemanticPlayingDiagnosticIntervention {
+    pub callback_index: usize,
+    pub actor: usize,
+    pub observation_key: String,
+    pub requested_index: usize,
+}
+impl SemanticPlayingDiagnosticIntervention {
+    fn validate_for(&self, index: usize, o: &Observation, actor: usize) -> Result<(), String> {
+        if self.callback_index != index
+            || self.actor != actor
+            || o.actor != actor
+            || o.phase != Phase::Playing
+            || self.observation_key != o.observation_key
+            || self.requested_index >= o.legal_actions.len()
+        {
+            return Err("Diagnostic intervention must match one legal Playing callback".into());
+        }
+        Ok(())
+    }
+}
+
+/// Diagnostic output only; this does not grant replay or training qualification.
+pub struct SemanticPlayingDiagnosticDecision {
+    pub decision: Decision,
+    pub model_requested_index: usize,
+    pub requested_index: usize,
+    pub effective_index: usize,
+    pub intervention_applied: bool,
+    pub trade: Option<GuardedTradeTrace>,
+}
+
+/// A single actor's existing callback/Trade session, with at most one intervention.
+/// Notify this session of every callback, including Setup and other actors.
+/// Call `choose_move` only for this actor's Playing choices; use the existing
+/// shared Corn-first selector for every actor during Setup, as the Arena does.
+/// Callers retain responsibility for source rechecks and complete-game recording,
+/// and must check `intervention_applied` at termination when an intervention was set.
+pub struct SemanticPlayingDiagnosticSession<'a> {
+    policy: SemanticPlayingConditionalPolicy<'a>,
+    session: GameSession,
+    actor: usize,
+    intervention: Option<SemanticPlayingDiagnosticIntervention>,
+    intervention_applied: bool,
+}
+impl<'a> SemanticPlayingDiagnosticSession<'a> {
+    pub fn new(
+        policy: SemanticPlayingConditionalPolicy<'a>,
+        actor: usize,
+        intervention: Option<SemanticPlayingDiagnosticIntervention>,
+    ) -> Result<Self, String> {
+        if actor >= 4
+            || intervention
+                .as_ref()
+                .is_some_and(|i| i.actor != actor || i.callback_index >= MAX_GAME_CALLBACKS)
+        {
+            return Err("Diagnostic actor or intervention callback exceeds game bounds".into());
+        }
+        let session = GameSession::new_semantic_playing(&policy);
+        Ok(Self {
+            policy,
+            session,
+            actor,
+            intervention,
+            intervention_applied: false,
+        })
+    }
+
+    pub fn on_callback(&mut self, index: usize, o: &Observation) -> Result<(), String> {
+        let result = (|| {
+            if !(3..=4).contains(&o.players.len()) || self.actor >= o.players.len() {
+                return Err("Diagnostic actor outside roster".into());
+            }
+            if let Some(intervention) = &self.intervention {
+                if index == intervention.callback_index {
+                    intervention.validate_for(index, o, self.actor)?;
+                } else if index > intervention.callback_index && !self.intervention_applied {
+                    return Err("Diagnostic intervention callback was not consumed".into());
+                }
+            }
+            self.session.on_callback(index, o)
+        })();
+        if result.is_err() {
+            self.session.invalidate();
+        }
+        result
+    }
+
+    pub fn intervention_applied(&self) -> bool {
+        self.intervention_applied
+    }
+
+    pub fn choose_move(
+        &mut self,
+        index: usize,
+        o: &Observation,
+    ) -> Result<SemanticPlayingDiagnosticDecision, String> {
+        let result = (|| {
+            if o.actor != self.actor || o.phase != Phase::Playing {
+                return Err("Diagnostic choice requires its actor's Playing callback".into());
+            }
+            let requested = match &self.intervention {
+                Some(intervention) if index == intervention.callback_index => {
+                    intervention.validate_for(index, o, self.actor)?;
+                    if self.intervention_applied {
+                        return Err("Diagnostic intervention can be applied only once".into());
+                    }
+                    Some(intervention.requested_index)
+                }
+                _ => None,
+            };
+            let selected = self.session.choose_using_requested(
+                index,
+                o,
+                |o| self.policy.prepared.distribution_semantic_playing(o),
+                requested,
+            )?;
+            let effective_index = o
+                .legal_actions
+                .iter()
+                .position(|a| a.r#move == selected.decision.r#move)
+                .ok_or("Diagnostic effective decision is not legal")?;
+            self.intervention_applied |= requested.is_some();
+            Ok(SemanticPlayingDiagnosticDecision {
+                decision: selected.decision,
+                model_requested_index: selected.model_requested_index,
+                requested_index: selected.requested_index,
+                effective_index,
+                intervention_applied: requested.is_some(),
+                trade: selected.trade,
+            })
+        })();
+        if result.is_err() {
+            self.session.invalidate();
+        }
+        result
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionalMixedArenaIdentity {
@@ -637,6 +777,7 @@ pub(super) struct ConditionalDecision {
     pub decision: Decision,
     pub trade: Option<GuardedTradeTrace>,
     pub requested_index: usize,
+    pub model_requested_index: usize,
     pub opening: Option<OpeningSelection>,
 }
 pub(super) struct OpeningSelection {
@@ -906,6 +1047,15 @@ impl GameSession {
         o: &Observation,
         predict: impl FnOnce(&Observation) -> Result<NumericPolicyDistribution, String>,
     ) -> Result<ConditionalDecision, String> {
+        self.choose_using_requested(index, o, predict, None)
+    }
+    fn choose_using_requested(
+        &mut self,
+        index: usize,
+        o: &Observation,
+        predict: impl FnOnce(&Observation) -> Result<NumericPolicyDistribution, String>,
+        requested_override: Option<usize>,
+    ) -> Result<ConditionalDecision, String> {
         let result = (|| {
             if self.failed
                 || self.chosen
@@ -965,7 +1115,11 @@ impl GameSession {
                 }
                 _ => return Err("Conditional policy requires Setup or Playing".into()),
             };
-            let mut effective = raw;
+            if requested_override.is_some_and(|i| o.phase != Phase::Playing || i >= scores.len()) {
+                return Err("Diagnostic requested choice is not a legal Playing index".into());
+            }
+            let requested = requested_override.unwrap_or(raw);
+            let mut effective = requested;
             let trade = if is_trade(o) {
                 let skip = skip_index(o)?;
                 let bytes = public_bytes(o)?;
@@ -973,7 +1127,7 @@ impl GameSession {
                     use sha2::{Digest, Sha256};
                     format!("{:x}", Sha256::digest(&bytes))
                 };
-                let transition = self.history.transition(index, bytes, raw == skip)?;
+                let transition = self.history.transition(index, bytes, requested == skip)?;
                 if transition.force_exit {
                     effective = skip;
                 }
@@ -1030,7 +1184,8 @@ impl GameSession {
                     score: scores[effective],
                 },
                 trade,
-                requested_index: raw,
+                requested_index: requested,
+                model_requested_index: raw,
                 opening,
             })
         })();
@@ -1049,6 +1204,101 @@ mod tests {
 
     fn session() -> GameSession {
         GameSession::with_config(ConditionalSetup::CornFirst, &TradeGuardConfig::default()).unwrap()
+    }
+    #[test]
+    fn diagnostic_request_preserves_default_choice_and_runs_before_trade_history() {
+        let mut state = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            state = apply_move(&state, o.legal_actions[0].r#move.clone()).unwrap();
+        }
+        state.players[state.current_player]
+            .resources
+            .insert(Resource::Corn, 3);
+        state.players[state.current_player]
+            .resources
+            .insert(Resource::Wood, 3);
+        state.pending = Some(Pending {
+            title: "Trade".into(),
+            task: Task::Trade,
+            after: vec![],
+        });
+        let o = observe(&state, state.current_player).unwrap();
+        let skip = skip_index(&o).unwrap();
+        let trade = o
+            .legal_actions
+            .iter()
+            .position(|a| matches!(a.action, TypedAction::Trade { .. }))
+            .unwrap();
+        let predict = |o: &Observation| {
+            let mut logits = vec![0.; o.legal_actions.len()];
+            logits[skip] = 1.;
+            Ok(NumericPolicyDistribution {
+                logits,
+                probabilities: vec![1. / o.legal_actions.len() as f32; o.legal_actions.len()],
+            })
+        };
+        let mut ordinary = session();
+        let mut diagnostic = session();
+        ordinary.on_callback(0, &o).unwrap();
+        diagnostic.on_callback(0, &o).unwrap();
+        let a = ordinary.choose_using(0, &o, predict).unwrap();
+        let b = diagnostic
+            .choose_using_requested(0, &o, predict, None)
+            .unwrap();
+        assert_eq!(a.decision.r#move, b.decision.r#move);
+        assert_eq!(a.decision.score.to_bits(), b.decision.score.to_bits());
+        assert_eq!(
+            a.trade.unwrap().trade_count_after,
+            b.trade.unwrap().trade_count_after
+        );
+
+        let mut changed = session();
+        changed.on_callback(0, &o).unwrap();
+        let first = changed
+            .choose_using_requested(0, &o, predict, Some(trade))
+            .unwrap();
+        assert_eq!(first.model_requested_index, skip);
+        assert_eq!(first.requested_index, trade);
+        assert_eq!(first.decision.r#move, o.legal_actions[trade].r#move);
+        assert_eq!(first.trade.unwrap().trade_count_after, 1);
+        changed.on_callback(1, &o).unwrap();
+        let repeated = changed
+            .choose_using_requested(1, &o, predict, Some(trade))
+            .unwrap();
+        assert_eq!(repeated.decision.r#move, o.legal_actions[skip].r#move);
+        assert!(repeated.trade.unwrap().overridden);
+        assert!(
+            changed
+                .choose_using_requested(1, &o, predict, Some(trade))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostic_intervention_binds_actor_callback_key_phase_and_legal_index() {
+        let mut state = create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        let setup = observe(&state, state.current_player).unwrap();
+        while state.phase == Phase::Setup {
+            let o = observe(&state, state.current_player).unwrap();
+            state = apply_move(&state, o.legal_actions[0].r#move.clone()).unwrap();
+        }
+        let o = observe(&state, state.current_player).unwrap();
+        let mut request = SemanticPlayingDiagnosticIntervention {
+            callback_index: 7,
+            actor: o.actor,
+            observation_key: o.observation_key.clone(),
+            requested_index: 0,
+        };
+        assert!(request.validate_for(7, &o, o.actor).is_ok());
+        assert!(request.validate_for(8, &o, o.actor).is_err());
+        assert!(request.validate_for(7, &o, (o.actor + 1) % 3).is_err());
+        assert!(request.validate_for(7, &setup, o.actor).is_err());
+        request.observation_key.push('x');
+        assert!(request.validate_for(7, &o, o.actor).is_err());
+        request.observation_key = o.observation_key.clone();
+        request.requested_index = o.legal_actions.len();
+        assert!(request.validate_for(7, &o, o.actor).is_err());
     }
     #[test]
     fn phase_routed_experts_keep_numeric_playing_and_trade_parity() {
