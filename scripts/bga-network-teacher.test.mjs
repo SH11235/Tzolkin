@@ -204,6 +204,28 @@ test('literal final display keeps original IDs and refuses missing or contradict
     () => originalDomTerminalDisplay(wrongTable, f.derived.sourceActorIds),
     /identify this table/,
   );
+  for (const history of [
+    '#123\nNo result here\n#999\n' + f.raw.metadata.history_text.slice(5),
+    f.raw.metadata.history_text + '\n' + f.raw.metadata.history_text,
+  ]) {
+    const mixed = structuredClone(f.raw);
+    mixed.metadata.history_text = history;
+    assert.throws(
+      () => originalDomTerminalDisplay(mixed, f.derived.sourceActorIds),
+      /uniquely identify/,
+    );
+  }
+  const contradictory = structuredClone(f.raw);
+  contradictory.metadata.players.forEach((p, i) => {
+    p.rank = `${i + 1}位`;
+    p.score = String(40 - i * 10);
+  });
+  originalDomTerminalDisplay(contradictory, f.derived.sourceActorIds);
+  contradictory.metadata.players[0].score = '999';
+  assert.throws(
+    () => originalDomTerminalDisplay(contradictory, f.derived.sourceActorIds),
+    /Explicit and history/,
+  );
   assert.throws(() => originalDomTerminalDisplay(f.raw, ['99', '12', '13', '14']), /ID is absent/);
   const { put, root } = await temporary(t);
   const dom = await put('dom.json', f.raw),

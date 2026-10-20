@@ -95,8 +95,13 @@ export function originalDomTerminalDisplay(raw, actors) {
   const history = raw.metadata.history_text ?? raw.metadata.historyRowText;
   const explicit = players.some((p) => p.rank !== undefined || p.score !== undefined);
   if (!explicit && typeof history !== 'string') return null;
-  if (!explicit && !new RegExp(`(?:^|\\n)#${raw.table_id}[ \\t]*(?:\\r?\\n|$)`).test(history))
-    throw new Error('Original final history row does not identify this table');
+  let historyBody = null;
+  if (typeof history === 'string') {
+    const markers = [...history.matchAll(/(?:^|\n)#([1-9]\d*)[ \t]*(?=\r?\n|$)/g)];
+    if (markers.length !== 1 || markers[0][1] !== raw.table_id)
+      throw new Error('Original final history row must uniquely identify this table');
+    historyBody = history.slice(markers[0].index + markers[0][0].length);
+  }
   const observed = new Map();
   for (const p of players) {
     const id = sourcePlayerId(p),
@@ -108,10 +113,11 @@ export function originalDomTerminalDisplay(raw, actors) {
       if (!r || !/^-?\d+$/.test(s)) throw new Error('Incomplete original final rank/score fields');
       rank = Number(r[1]);
       score = Number(s);
-    } else {
+    }
+    if (historyBody !== null) {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const matches = [
-        ...history.matchAll(
+        ...historyBody.matchAll(
           new RegExp(
             `(?:^|\\n)([1-4])位[ \\t]*\\r?\\n${escaped}[ \\t]*\\r?\\n(-?\\d+)[ \\t]*(?=\\r?\\n|$)`,
             'g',
@@ -119,8 +125,12 @@ export function originalDomTerminalDisplay(raw, actors) {
         ),
       ];
       if (matches.length !== 1) throw new Error('Original history result is missing or ambiguous');
-      rank = Number(matches[0][1]);
-      score = Number(matches[0][2]);
+      const historyRank = Number(matches[0][1]),
+        historyScore = Number(matches[0][2]);
+      if (explicit && (rank !== historyRank || score !== historyScore))
+        throw new Error('Explicit and history final results disagree');
+      rank = historyRank;
+      score = historyScore;
     }
     if (!Number.isSafeInteger(score)) throw new Error('Original final score is out of bounds');
     observed.set(id, { total: score, rank });
