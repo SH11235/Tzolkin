@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { uniqueJson } from './bga-observed-options.mjs';
+import { declinedRemovalCaption } from './bga-network-chichen.mjs';
 
 const MAX_BYTES = 16 * 1024 * 1024;
 const LEGACY_STUDIOS = new Set([
@@ -292,6 +293,20 @@ export function parseNetworkReplay(bytes) {
       )
         fail('unknown/invalid/duplicate notification');
       seen.add(n.uid);
+      let declinedActionCaption = null;
+      if (n.type === 'pickUpWorker' && n.log === declinedRemovalCaption) {
+        keys(
+          n.args,
+          ['player_id', 'player_name', 'worker_id', 'city', 'position'],
+          'declined removal',
+        );
+        const player = initial.players[String(n.args.player_id)];
+        if (!player || n.args.player_name !== player.name || typeof n.args.city !== 'string')
+          fail('declined removal actor/city does not match its original caption');
+        integer(n.args.worker_id, 'declined worker ID', 1);
+        integer(n.args.position, 'declined worker position');
+        declinedActionCaption = n.log;
+      }
       if (n.type === 'timeJokerUsed') {
         keys(n.args, ['player_name', 'nb_days'], 'holiday clock caption');
         if (
@@ -373,6 +388,7 @@ export function parseNetworkReplay(bytes) {
         visible,
         beforeCheckpoint: packetId <= checkpoint,
         channel: packet.channel,
+        ...(declinedActionCaption ? { declinedActionCaption } : {}),
       });
       if (entries.length > 20000) fail('notification limit');
     }

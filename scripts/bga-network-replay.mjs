@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
+import { declinedRemovalWitness, proveEquivalentChichenRoutes } from './bga-network-chichen.mjs';
 import {
   appendRewardFence,
   bindNewFixedReward,
@@ -1027,7 +1028,7 @@ export function initialSourceBoardCheckpoint(index, ledger, sourceToNative) {
 }
 
 /** Distinguish the observed paid target from a free theology route without fitting final resources. */
-export function observedChichenRoute(rows, position, corn) {
+export function observedChichenRoute(rows, position, corn, proveEquivalence = null) {
   const direct = rows.filter(
     (r) =>
       r.action.type === 'useAction' &&
@@ -1046,6 +1047,7 @@ export function observedChichenRoute(rows, position, corn) {
             r.action.cornCost === 0,
         )
       : [];
+  if (direct.length === 1 && ahead.length === 1 && proveEquivalence) return proveEquivalence();
   if (direct.length + ahead.length !== 1)
     fail('observed Chichen action has ambiguous or unavailable legal routes');
   return direct.length === 1 ? 'direct' : 'theologyAhead';
@@ -1550,11 +1552,26 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               'Chichen Itza': 'chichenItza',
             }[a.city];
             if (!gear) fail('unknown source city');
+            const declined = declinedRemovalWitness(
+              group,
+              n,
+              ledger.workers.get(String(a.worker_id)),
+              gear,
+            );
             applyWhere(
               (x) => x.type === 'remove' && x.gear === gear && x.position === Number(a.position),
               'observed worker removal',
             );
+            if (declined) {
+              const choices = actions();
+              if (choices.length !== 1 || choices[0].action.type !== 'skip')
+                fail('explicit declined removal lacks its unique legal skip');
+              applyWhere((x) => x.type === 'skip', 'explicit original declined action');
+              audit.at(-1).declinedRemovalEvidence = declined;
+              continue;
+            }
             let observedCorn = null;
+            let routeEquivalence = null;
             if (gear === 'chichenItza') {
               const paid = group.entries
                 .filter(
@@ -1571,10 +1588,28 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
                 (paid > 0 && paid !== observedCorn)
               )
                 fail('Chichen action corn receipt mismatch');
-              if (
-                observedChichenRoute(actions(), Number(a.action_number), observedCorn) ===
-                'theologyAhead'
-              ) {
+              const route = observedChichenRoute(
+                actions(),
+                Number(a.action_number),
+                observedCorn,
+                () =>
+                  proveEquivalentChichenRoutes({
+                    rows: actions(),
+                    position: Number(a.action_number),
+                    corn: observedCorn,
+                    state: native(),
+                    actor: frame.observation.actor,
+                    refills,
+                    source: group.entries,
+                    sourceActorId: String(a.player_id),
+                    dispatch: (request) => {
+                      if (++calls > 4000) fail('native call bound');
+                      return dispatch(request);
+                    },
+                  }),
+              );
+              if (typeof route === 'object') routeEquivalence = route.proof;
+              if (route === 'theologyAhead') {
                 applyWhere(
                   (x) =>
                     x.type === 'useAction' &&
@@ -1601,6 +1636,15 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               'observed gear action',
               refills,
             );
+            if (routeEquivalence) {
+              const selected = audit.at(-1);
+              selected.equivalentChoices = 2;
+              selected.derivedFromVisibleBoundary = null;
+              selected.sourceLabelBindingUnavailable = true;
+              selected.sourceLabelBindingReason =
+                'Complete native route equivalence does not identify the original human route.';
+              selected.chichenRouteEquivalence = routeEquivalence;
+            }
           } else if (n.type === 'selectAction') {
             assertActor(n);
             const gear = {

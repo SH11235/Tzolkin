@@ -8,6 +8,11 @@ import {
   reconcileRewardFences,
   trackRewardQueues,
 } from './bga-network-rewards.mjs';
+import {
+  declinedRemovalCaption,
+  declinedRemovalWitness,
+  proveEquivalentChichenRoutes,
+} from './bga-network-chichen.mjs';
 import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +47,209 @@ const {
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
+
+test('explicit declined removal requires its original worker and exact no-effect boundary', () => {
+  const entry = {
+    uid: 'pickup',
+    type: 'pickUpWorker',
+    declinedActionCaption: declinedRemovalCaption,
+    args: { player_id: '1', worker_id: '9', position: '9' },
+  };
+  const group = {
+    entries: [
+      entry,
+      { uid: 'transient', type: 'gameStateChange', args: { id: 9, active_player: '1' } },
+      {
+        uid: 'working',
+        type: 'gameStateChange',
+        args: { id: 7, active_player: '1', args: { workers: [] } },
+      },
+    ],
+  };
+  const worker = { id: '9', player: '1', place: 'chichenItza', position: 9 };
+  assert.equal(declinedRemovalWitness(group, entry, worker, 'chichenItza').workerId, '9');
+  assert.equal(
+    declinedRemovalWitness(
+      group,
+      { ...entry, declinedActionCaption: undefined },
+      worker,
+      'chichenItza',
+    ),
+    null,
+  );
+  for (const mutate of [
+    (w) => (w.id = '8'),
+    (w) => (w.player = '2'),
+    (w) => (w.place = 'uxmal'),
+    (w) => (w.position = 8),
+  ]) {
+    const bad = structuredClone(worker);
+    mutate(bad);
+    assert.throws(
+      () => declinedRemovalWitness(group, entry, bad, 'chichenItza'),
+      /original worker/,
+    );
+  }
+  for (const mutate of [
+    (g) => g.entries.push({ type: 'takeGoods', args: { type: 'corn', quantity: 1 } }),
+    (g) => (g.entries[2].args.active_player = '2'),
+    (g) => g.entries[2].args.args.workers.push({ id: '8' }),
+  ]) {
+    const bad = structuredClone(group);
+    mutate(bad);
+    assert.throws(
+      () => declinedRemovalWitness(bad, bad.entries[0], worker, 'chichenItza'),
+      /no-effect boundary/,
+    );
+  }
+});
+
+function chichenEquivalenceFixture() {
+  const row = (position, source = 'currentGear', choiceId = `action:${position}`) => ({
+    action: { type: 'useAction', gear: 'chichenItza', position, source, cornCost: 0 },
+    move: { type: 'choose', choiceId },
+  });
+  const rows = [
+    row(9),
+    row(10, 'theologyAhead', 'ahead:10'),
+    { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
+  ];
+  const state = {
+    currentPlayer: 0,
+    corn: 5,
+    pending: {
+      title: 'Action',
+      task: { type: 'action', gear: 'chichenItza', position: 9 },
+      after: [],
+    },
+  };
+  const intermediate = {
+    index: 0,
+    sourceActionIds: [],
+    snapshot: {
+      state: {
+        ...structuredClone(state),
+        pending: {
+          title: 'Action',
+          task: { type: 'action', gear: 'chichenItza', position: 10, free: true },
+          after: [],
+        },
+      },
+    },
+    observation: { actor: 0, legalActions: [row(9)] },
+  };
+  const endpoint = {
+    index: 0,
+    sourceActionIds: [],
+    snapshot: {
+      state: {
+        currentPlayer: 0,
+        corn: 5,
+        skullSpaces: [9],
+        pending: { task: { type: 'resource', remaining: 1 }, after: [] },
+      },
+    },
+    observation: {
+      actor: 0,
+      legalActions: [
+        {
+          move: { type: 'choose', choiceId: 'resource:wood' },
+          action: { type: 'resource', resource: 'wood' },
+        },
+      ],
+    },
+  };
+  const source = [
+    {
+      uid: 'pickup',
+      type: 'pickUpWorker',
+      args: { player_id: '1', city: 'Chichen Itza', position: '9', action_number: '9' },
+    },
+    {
+      uid: 'payment',
+      type: 'payGoods',
+      args: { player_id: '1', type: 'skull', quantity: 1, target: null },
+    },
+    { uid: 'skull', type: 'skullplace', args: { player_id: '1', place: '9' } },
+  ];
+  return {
+    rows,
+    state,
+    position: 9,
+    corn: 0,
+    actor: 0,
+    refills: { currentAge: [], age2: [] },
+    source,
+    sourceActorId: '1',
+    intermediate,
+    endpoint,
+  };
+}
+
+test('Chichen route equivalence compares complete endpoints and rejects omitted or divergent routes', () => {
+  const run = (f, alterResponse = () => {}) => {
+    const dispatch = (request) => {
+      const phase =
+        request.move.choiceId === 'ahead:10'
+          ? 'intermediate'
+          : request.state.pending.task.position === 10
+            ? 'continued'
+            : 'direct';
+      const response = structuredClone(phase === 'intermediate' ? f.intermediate : f.endpoint);
+      alterResponse(phase, response);
+      return response;
+    };
+    return proveEquivalentChichenRoutes({ ...f, dispatch });
+  };
+  const accepted = run(chichenEquivalenceFixture());
+  assert.equal(accepted.kind, 'direct');
+  assert.equal(accepted.proof.completeResponseEquivalent, true);
+  assert.equal(accepted.proof.humanRouteObserved, false);
+  assert.deepEqual(
+    accepted.proof.candidateRoutes.map((r) => r.length),
+    [1, 2],
+  );
+  for (const mutate of [
+    (f) =>
+      f.rows.push({
+        ...structuredClone(f.rows[0]),
+        action: { ...f.rows[0].action, source: 'unknown' },
+      }),
+    (f) => (f.source[1].args.quantity = 2),
+    (f) => (f.source[1].args.quantity = true),
+    (f) => (f.source[2].args.place = '8'),
+    (f) => (f.source[2].args.player_id = '2'),
+    (f) =>
+      f.intermediate.observation.legalActions.push(
+        structuredClone(f.intermediate.observation.legalActions[0]),
+      ),
+  ]) {
+    const bad = chichenEquivalenceFixture();
+    mutate(bad);
+    assert.throws(() => run(bad), /Chichen source:/);
+  }
+  for (const corrupt of [
+    (r) => (r.snapshot.state.skullSpaces = [8]),
+    (r) => (r.snapshot.state.corn = 4),
+    (r) => (r.snapshot.state.pending.task.remaining = 2),
+    (r) => r.observation.legalActions.push({ move: { type: 'choose', choiceId: 'extra' } }),
+  ]) {
+    assert.throws(
+      () =>
+        run(chichenEquivalenceFixture(), (phase, r) => {
+          if (phase === 'continued') corrupt(r);
+        }),
+      /different complete outcomes/,
+    );
+  }
+  assert.throws(
+    () =>
+      run(chichenEquivalenceFixture(), (phase, r) => {
+        if (phase === 'intermediate') r.snapshot.state.corn--;
+      }),
+    /intermediate changed/,
+  );
+});
 
 function terminalCalendarFixture(priorDay = 25, playingDay = 27, twice = 1) {
   const groups = [],

@@ -9,6 +9,7 @@ import {
   validInitialNetworkWorkers,
 } from './bga-network.mjs';
 import { networkCardMapper, replayNetworkPrefix } from './bga-network-replay.mjs';
+import { declinedRemovalCaption } from './bga-network-chichen.mjs';
 
 const bytes = (x) => Buffer.from(JSON.stringify(x));
 
@@ -169,6 +170,42 @@ test('board flips retain their state meaning and reject unknown actors or sides'
   );
   n.args.side = 2;
   assert.throws(() => parseNetworkReplay(bytes(f)), /invalid double-advance/);
+});
+
+test('declined removal keeps only an exact original caption and never invents an action number', () => {
+  const f = fixture();
+  const entry = {
+    uid: 'decline',
+    type: 'pickUpWorker',
+    log: declinedRemovalCaption,
+    args: {
+      player_id: '1',
+      player_name: 'P1',
+      worker_id: '1',
+      city: 'Chichen Itza',
+      position: '9',
+    },
+  };
+  f.gameLogs.data.data.at(-1).data.push(entry);
+  const parsed = parseNetworkReplay(bytes(f)).entries.find((n) => n.uid === 'decline');
+  assert.equal(parsed.declinedActionCaption, declinedRemovalCaption);
+  assert.equal(Object.hasOwn(parsed.args, 'action_number'), false);
+  entry.log = 'Unreviewed removal';
+  assert.equal(
+    parseNetworkReplay(bytes(f)).entries.find((n) => n.uid === 'decline').declinedActionCaption,
+    undefined,
+  );
+  entry.log = declinedRemovalCaption;
+  for (const mutate of [
+    (n) => (n.args.action_number = 9),
+    (n) => (n.args.player_name = 'Other'),
+    (n) => (n.args.worker_id = null),
+    (n) => (n.args.position = false),
+  ]) {
+    const bad = structuredClone(f);
+    mutate(bad.gameLogs.data.data.at(-1).data.at(-1));
+    assert.throws(() => parseNetworkReplay(bytes(bad)), /declined/);
+  }
 });
 
 test('isolated holiday clock captions retain source evidence and reject unreviewed payloads', () => {
