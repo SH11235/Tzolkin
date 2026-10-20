@@ -7,6 +7,94 @@ import { createHash } from 'node:crypto';
 import { readPinnedNetworkInput } from './bga-network-pipeline.mjs';
 import { networkEvidenceReport } from './bga-network-report.mjs';
 import { networkCorpusLedger } from './bga-network-corpus.mjs';
+import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
+
+function feedingFixture() {
+  let uid = 0;
+  const n = (type, args) => ({
+    type,
+    args,
+    uid: String(++uid),
+    packetIndex: 0,
+    notificationIndex: uid,
+  });
+  return {
+    rawSha256: 'original',
+    initial: { day: 0, players: { 1: { name: 'P1' }, 2: { name: 'P2' }, 3: { name: 'P3' } } },
+    groups: [
+      { moveId: 1, entries: [n('rotateWheel', { day: 7, twice: 0 })] },
+      {
+        moveId: 2,
+        entries: [
+          n('gameStateChange', { id: 92 }),
+          n('payGoods', {
+            type: 'corn',
+            quantity: 8,
+            target: null,
+            player_id: '1',
+            player_name: null,
+          }),
+          n('foodDayCost', { cost: 8, nbr: 4, player_id: '1', player_name: 'P1' }),
+          n('updateScore', { points: -3, player_id: '1' }),
+          n('foodDayCost', { points: 3, nbr: 1, player_id: '1', player_name: 'P1' }),
+          n('gameStateChange', { id: 93 }),
+          n('takeGoods', { type: 'corn', quantity: 2, player_id: '1' }),
+        ],
+      },
+    ],
+  };
+}
+
+test('feeding binds literal payment/loss before rewards and keeps absent individual receipts null', () => {
+  const index = feedingFixture(),
+    event = sourceFeedingWitnesses(index)[0];
+  assert.equal(event.eligible, true);
+  assert.equal(event.scheduledDay, 8);
+  assert.equal(event.sourceActualRound, 8);
+  assert.equal(event.receipts[0].paidCorn, 8);
+  assert.equal(event.receipts[0].penaltyPoints, 3);
+  assert.equal(event.receipts[1].paidCorn, null);
+  assert.equal(event.receipts[1].state, 'noIndividualReceipt');
+  assert.equal(event.receipts[0].nativeIndividualReceiptMatch, 'notConnected');
+  const second = structuredClone(index.groups[1]);
+  second.moveId = 4;
+  second.entries.find((n) => n.type === 'gameStateChange' && n.args.id === 93).args.id = 94;
+  index.groups.push(
+    { moveId: 3, entries: [{ type: 'rotateWheel', args: { day: 14, twice: 0 } }] },
+    second,
+  );
+  const late = sourceFeedingWitnesses(index)[1];
+  assert.equal(late.scheduledDay, 14);
+  assert.equal(late.sourceActualRound, 15);
+});
+
+test('feeding refuses actor/amount/order contradictions and leaves missing source sides unconnected', () => {
+  for (const change of [
+    (es) => (es[1].args.quantity = 9),
+    (es) => (es[1].args.player_id = '99'),
+    (es) => (es[2].args.cost = false),
+    (es) => (es[3].args.points = 3),
+    (es) => es.splice(1, 2, es[2], es[1]),
+    (es) => es.splice(2, 0, { ...es[2], uid: 'duplicate' }),
+    (es) =>
+      es.splice(1, 0, { type: 'takeGoods', args: { player_id: '1', type: 'corn', quantity: 1 } }),
+    (es) => es.shift(),
+  ]) {
+    const index = feedingFixture();
+    change(index.groups[1].entries);
+    assert.throws(() => sourceFeedingWitnesses(index), /Source feeding/);
+  }
+  for (const remove of [1, 2]) {
+    const index = feedingFixture();
+    index.groups[1].entries.splice(remove, 1);
+    const event = sourceFeedingWitnesses(index)[0];
+    assert.equal(event.eligible, false);
+    assert.equal(event.classification, 'sourceMissing');
+  }
+  const wrongEnd = feedingFixture();
+  wrongEnd.groups[1].entries[5].args.id = 95;
+  assert.equal(sourceFeedingWitnesses(wrongEnd)[0].classification, 'unsupportedBoundary');
+});
 
 test('pinned inputs reject modified content even when length is unchanged', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'network-input-'));

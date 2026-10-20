@@ -30,6 +30,7 @@ const {
   proveEquivalentCornBuilds,
   terminalPlayingCalendarWitness,
   bindTerminalCalendarTransition,
+  feedingSourceBoardCheckpoint,
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
@@ -262,6 +263,63 @@ function initialCoverageFixture() {
   };
   return { index, ledger, sourceToNative };
 }
+
+test('feeding board checkpoint uses the source post-rotation phase and never a native counter', () => {
+  const f = initialCoverageFixture(),
+    event = {
+      eligible: true,
+      scheduledDay: 8,
+      moveId: 7,
+      sourcePhysicalDay: 7,
+      sourceActualRound: 8,
+      start: { uid: 'meal-start' },
+      end: { uid: 'meal-end' },
+    };
+  Object.assign(f.ledger, {
+    pendingFeeding: event,
+    feedingWitnesses: [event],
+    foodDays: [8],
+    age: 1,
+    ageSource: { field: 'originalMarket.type' },
+    day: 9,
+    lastRotation: { moveId: 8, day: 9, twice: 1 },
+  });
+  f.ledger.workers.get('3').place = 'uxmal';
+  f.ledger.workers.get('3').position = '0';
+  const boundary = { operationType: 'rotate', unresolvedTimingFence: false };
+  const full = feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary);
+  assert.equal(full.expected.round, 10);
+  assert.deepEqual(full.expected.foodDays, [8]);
+  assert.deepEqual(full.expected.gears.uxmal[0], { playerId: 0, dummy: false });
+  assert.equal(full.evidence.sourceActualRound, 8);
+  assert.equal(full.evidence.comparisonSourceDay, 9);
+  assert.equal(
+    feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, {
+      ...boundary,
+      unresolvedTimingFence: true,
+    }),
+    null,
+  );
+  assert.equal(
+    feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, {
+      ...boundary,
+      operationType: 'place',
+    }),
+    null,
+  );
+  f.ledger.players['3'].resources.corn = 99;
+  assert.equal(
+    feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary).expected.players[0]
+      .resources.corn,
+    99,
+  );
+  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 9, boundary), null);
+  f.ledger.pendingFeeding.eligible = false;
+  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary), null);
+  f.ledger.pendingFeeding.eligible = true;
+  f.ledger.pendingFeeding.scheduledDay = 27;
+  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary), null);
+});
 
 test('initial full-board claims use post-wealth source counters and original actor/order evidence', () => {
   const f = initialCoverageFixture();
