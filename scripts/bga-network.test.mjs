@@ -190,13 +190,44 @@ test('isolated holiday clock captions retain source evidence and reject unreview
     ],
   };
   f.gameLogs.data.data.push(packet);
-  const entry = parseNetworkReplay(bytes(f)).groups.at(-1).entries[0];
+  const index = parseNetworkReplay(bytes(f));
+  const entry = index.clockCaptionEntries[0];
   assert.equal(entry.classification, 'clock');
   assert.equal(entry.packetIndex, 6);
   assert.equal(entry.notificationIndex, 0);
   assert.equal(entry.uid, 'holiday');
   assert.equal(entry.moveId, 6);
   assert.deepEqual(entry.args, packet.data[0].args);
+  assert.deepEqual(index.groups, parseNetworkReplay(bytes(fixture())).groups);
+  assert.equal(
+    index.entries.find((n) => n.uid === 'holiday'),
+    entry,
+  );
+  const rotation = structuredClone(f);
+  rotation.gameLogs.data.data.at(-2).data[0].args.id = 95;
+  rotation.gameLogs.data.data.push({
+    ...packet,
+    packet_id: '11',
+    move_id: '7',
+    data: [{ uid: 'rotation', type: 'rotateWheel', log: '', args: { day: 1, twice: 0 } }],
+  });
+  const rotationIndex = parseNetworkReplay(bytes(rotation));
+  assert.deepEqual(
+    rotationIndex.groups.slice(-2).map((g) => g.moveId),
+    [5, 7],
+  );
+  assert.equal(rotationIndex.groups.at(-2).entries[0].args.id, 95);
+  assert.equal(rotationIndex.groups.at(-1).entries[0].type, 'rotateWheel');
+  const sameMove = structuredClone(f);
+  sameMove.gameLogs.data.data.push({
+    ...packet,
+    packet_id: '11',
+    data: [{ uid: 'state', type: 'gameStateChange', log: '', args: { id: 4, active_player: '1' } }],
+  });
+  const sameMoveIndex = parseNetworkReplay(bytes(sameMove));
+  assert.equal(sameMoveIndex.groups.at(-1).moveId, 6);
+  assert.equal(sameMoveIndex.groups.at(-1).entries[0].uid, 'state');
+  assert.equal(sameMoveIndex.clockCaptionEntries[0].uid, 'holiday');
   assert.throws(
     () => assertNetworkClockContract(parseNetworkReplay(bytes(f)), { studioSha256: 'legacy' }),
     /requires a reviewed legacy client contract/,

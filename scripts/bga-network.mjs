@@ -140,7 +140,9 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
 }
 
 export function assertNetworkClockContract(index, contract) {
-  if (!index.entries.some((n) => n.type === 'timeJokerUsed')) return;
+  const entries = index.entries ?? index.groups.flatMap((group) => group.entries);
+  if (!entries.some((n) => n.type === 'timeJokerUsed') && !index.clockCaptionEntries?.length)
+    return;
   if (!validatedContracts.has(contract) || !LEGACY_STUDIOS.has(contract.studioSha256))
     fail('holiday clock caption requires a reviewed legacy client contract');
 }
@@ -403,8 +405,10 @@ export function parseNetworkReplay(bytes) {
   const visibleEntries = entries.filter(
     (n) => n.visible && !n.beforeCheckpoint && !n.administrative,
   );
+  const clockCaptionEntries = visibleEntries.filter((n) => n.type === 'timeJokerUsed');
   const groups = [];
   for (const n of visibleEntries) {
+    if (n.type === 'timeJokerUsed') continue;
     if (groups.at(-1)?.moveId !== n.moveId) groups.push({ moveId: n.moveId, entries: [] });
     groups.at(-1).entries.push(n);
   }
@@ -420,6 +424,7 @@ export function parseNetworkReplay(bytes) {
     counts,
     entries,
     administrativeEntries: entries.filter((n) => n.administrative),
+    ...(clockCaptionEntries.length ? { clockCaptionEntries } : {}),
     groups,
   };
 }

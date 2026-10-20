@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
-import { inspectCancellationClusters } from './bga-network.mjs';
+import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import { catalogFingerprint } from './bga-replay.mjs';
 
@@ -1167,6 +1167,7 @@ export function proveCalendarDesignation(state, observation, entries, sourceToNa
 
 /** Strict bounded prefix decoding. Unknown decisions or first mismatch stop without state repairs. */
 export function replayNetworkPrefix(index, { initial, initialMoveId, clientContract }, dispatch) {
+  assertNetworkClockContract(index, clientContract);
   const clusters = inspectCancellationClusters(index, clientContract);
   if (
     initial.phase !== 'playing' ||
@@ -2137,6 +2138,9 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         timingFences,
         calendarTransitions,
         feedingSourceEvidence: feedingEvents,
+        ...(index.clockCaptionEntries?.length
+          ? { clockCaptionEvidence: index.clockCaptionEntries }
+          : {}),
         ...(terminalCalendar
           ? { terminalCalendarProjection: terminalCalendar, terminalCalendarChecks }
           : {}),
@@ -2171,6 +2175,9 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     timingFences,
     calendarTransitions,
     feedingSourceEvidence: feedingEvents,
+    ...(index.clockCaptionEntries?.length
+      ? { clockCaptionEvidence: index.clockCaptionEntries }
+      : {}),
     ...(terminalCalendar
       ? { terminalCalendarProjection: terminalCalendar, terminalCalendarChecks }
       : {}),
