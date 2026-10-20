@@ -211,6 +211,16 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
       throw new Error('No nominated source player at this table');
     if (prefix.rawSha256 !== index.rawSha256 || prefix.tableId !== index.tableId)
       throw new Error('Native/source response binding mismatch');
+    if (
+      prefix.timingFences?.some((f) => f.finalScoringProof) &&
+      (prefix.blocked ||
+        !prefix.finished ||
+        prefix.timingFences.some((f) => f.finalScoringProof && f.resolvedMoveId == null) ||
+        !prefix.record.terminalDisplayCheckpoint)
+    )
+      throw new Error(
+        'Final scoring receipts did not resolve through the original terminal boundary',
+      );
     if (nativeReport.frames.at(-1).snapshot.state.phase !== 'finished') {
       status.producer.reason = 'Native replay stopped before terminal; no manifest generated';
     } else {

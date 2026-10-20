@@ -277,6 +277,56 @@ test('literal final display keeps original IDs and refuses missing or contradict
   assert.equal(result.status.producer.state, 'notRun');
 });
 
+test('final receipt fences cannot publish a manifest after an unresolved or rejected terminal', async (t) => {
+  for (const kind of ['unresolved', 'blocked', 'unfinished', 'missingTerminal'])
+    await t.test(kind, async (sub) => {
+      const { put, root } = await temporary(sub),
+        f = rosterFixture();
+      const dom = await put('dom.json', f.raw);
+      const nominations = await put('nominations.json', {
+        schema: 'tzolkin-human-player-nomination-v1',
+        basis: 'userNominatedHistoricalArenaTop5',
+        playerIds: ['11'],
+      });
+      const reservations = await put('reservations.json', {
+        entries: [{ tableId: '123', split: 'validation' }],
+      });
+      const prefix = {
+        tableId: '123',
+        rawSha256: 'source',
+        record: f.record,
+        finished: true,
+        timingFences: [{ finalScoringProof: {}, startMoveId: 1, resolvedMoveId: 2 }],
+      };
+      prefix.record.terminalDisplayCheckpoint = { mode: 'floorTotal', scores: [] };
+      if (kind === 'unresolved') prefix.timingFences[0].resolvedMoveId = null;
+      if (kind === 'blocked') prefix.blocked = { moveId: 2 };
+      if (kind === 'unfinished') prefix.finished = false;
+      if (kind === 'missingTerminal') delete prefix.record.terminalDisplayCheckpoint;
+      const result = await buildNetworkTeacher(
+        {
+          ...f,
+          receipt: { split: 'validation', reservations },
+          prefix,
+          nativeReport: terminalReport(),
+          output: root,
+        },
+        {
+          schema: 'tzolkin-bga-network-teacher-inputs-v1',
+          domSource: dom,
+          nominations,
+          reservations,
+        },
+        { core: 'absent', producer: 'absent', loader: 'absent' },
+      );
+      assert.match(result.error.reason, /Final scoring receipts did not resolve/);
+      assert.equal(result.status.manifest.state, 'notGenerated');
+      assert.equal(result.status.producer.state, 'notRun');
+      assert.equal(result.dataset, null);
+      assert.ok(!(await readdir(root)).includes('teacher-manifest.json'));
+    });
+});
+
 test('rejected generated artifacts do not leak samples or readiness into common evidence', async (t) => {
   for (const kind of ['manifest', 'counts', 'inspection', 'initialCoverage'])
     await t.test(kind, async (sub) => {

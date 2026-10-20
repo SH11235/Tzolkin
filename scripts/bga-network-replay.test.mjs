@@ -5,7 +5,11 @@ import {
   bindSkullShortageOutcome,
   skullShortageCaption,
 } from './bga-network-awards.mjs';
-import { assertNetworkClockContract, parseNetworkReplay } from './bga-network.mjs';
+import {
+  assertNetworkClockContract,
+  parseNetworkReplay,
+  originalFinalScoringCaption,
+} from './bga-network.mjs';
 import {
   appendRewardFence,
   bindNewFixedReward,
@@ -31,6 +35,7 @@ mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
   namedExports: {
     assertNetworkClockContract,
     parseNetworkReplay,
+    originalFinalScoringCaption,
     inspectCancellationClusters: () => [],
     inspectArchiveClient: (studio, game) => {
       assert.equal(studio.toString(), 'synthetic studio');
