@@ -7,6 +7,8 @@ const MAX_BYTES = 16 * 1024 * 1024;
 const REVIEWED_CLIENT_PAIRS = new Set([
   'bb384177730e85653781f3b193f65b1df88c5624439d12d3dae6a22473f19334:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   '8cec9fefd73a8abdfbd539ad1c547e1e92ee8db4ebc0acabeeb8ee87ebdb0b41:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
+  'baefe213893a46474a278e315243e16daaf2cc0ffe46396e6c0782d6f38faf47:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
+  'b020a816c96ad050c9b96ff29a6b8e14efdda44132f2daa0c29893ecf596b5eb:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
 ]);
 const validatedContracts = new WeakSet();
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -56,6 +58,7 @@ const CLASSIFICATION = {
   extractionMax: 'technologyCaption',
   agricultureMax: 'technologyCaption',
   architectureMax: 'technologyCaption',
+  theologyMax: 'technologyCaption',
   middleOfAgeRewards: 'awardCaption',
   templeLeader: 'awardCaption',
   templeScore: 'awardCaption',
@@ -64,6 +67,7 @@ const CLASSIFICATION = {
   simpleNote: 'initialColorPreferenceCaption',
   flipBoard: 'doubleAdvanceAvailability',
   updateReflexionTime: 'clock',
+  wakeupPlayers: 'administrativeWakeup',
 };
 
 /** Verify only the observed client's archive dispatch contract, not server undo semantics. */
@@ -76,6 +80,8 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
     fail('unreviewed archive client version');
   const studio = studioBytes.toString('utf8');
   const game = gameBytes.toString('utf8');
+  if (/subscribe\("wakeupPlayers"|ntf_wakeupPlayers/.test(studio) || game.includes('wakeupPlayers'))
+    fail('unreviewed wakeup state handler');
   const requirements = [
     'initArchiveIndex:function()',
     '.packet_id)>toint(this.notifqueue.last_packet_id)',
@@ -206,6 +212,7 @@ export function parseNetworkReplay(bytes) {
     checkpointPackets: 0,
     visibleNotifications: 0,
     hiddenNotifications: 0,
+    administrativeNotifications: 0,
   };
   for (const [pi, packet] of packets.entries()) {
     keys(
@@ -214,18 +221,23 @@ export function parseNetworkReplay(bytes) {
       'packet',
     );
     const packetId = integer(packet.packet_id, 'packet ID', 1);
-    const moveId = integer(packet.move_id, 'move ID', 1);
+    const administrative =
+      packet.move_id === null &&
+      Array.isArray(packet.data) &&
+      packet.data.length === 1 &&
+      packet.data[0]?.type === 'wakeupPlayers';
+    const moveId = administrative ? null : integer(packet.move_id, 'move ID', 1);
     if (
       String(packet.table_id) !== tableId ||
       packetId <= previousPacket ||
-      moveId < previousMove ||
+      (moveId !== null && moveId < previousMove) ||
       !Array.isArray(packet.data) ||
       !packet.data.length ||
       packet.data.length > 2000
     )
       fail('invalid packet identity/order');
     previousPacket = packetId;
-    previousMove = moveId;
+    if (moveId !== null) previousMove = moveId;
     if (
       packet.channel !== `/table/t${tableId}` &&
       !playerIds.some((id) => packet.channel === `/player/p${id}`)
@@ -247,13 +259,34 @@ export function parseNetworkReplay(bytes) {
       )
         fail('unknown/invalid/duplicate notification');
       seen.add(n.uid);
+      if (n.type === 'wakeupPlayers') {
+        if (
+          !administrative ||
+          packet.channel !== `/table/t${tableId}` ||
+          n.log !== '' ||
+          !Array.isArray(n.args) ||
+          n.args.length !== 0
+        )
+          fail('unsupported administrative wakeup packet');
+        counts.administrativeNotifications++;
+      }
+      if (n.type === 'theologyMax') {
+        keys(n.args, ['player_name'], 'theology caption');
+        if (
+          n.log !== 'Theology bonus: ${player_name} takes a skull' ||
+          !Object.values(initial.players).some((p) => p.name === n.args.player_name)
+        )
+          fail('unsupported theology caption');
+      }
       if (n.type === 'simpleNote') {
         keys(n.args, ['players', 'change_preferences'], 'color preference caption');
         const link = n.args.change_preferences;
         if (
           packetId > checkpoint ||
-          n.log !==
-            'Color of ${players} has been chosen according to his/her preferences. ${change_preferences}' ||
+          ![
+            'Color of ${players} has been chosen according to his/her preferences. ${change_preferences}',
+            'Colors of ${players} have been chosen according to their preferences. ${change_preferences}',
+          ].includes(n.log) ||
           typeof n.args.players !== 'string' ||
           !object(link) ||
           link.log !==
@@ -263,9 +296,15 @@ export function parseNetworkReplay(bytes) {
           fail('unsupported simpleNote; only checkpoint color-preference caption is reviewed');
       }
       if (n.type === 'flipBoard') {
-        keys(n.args, ['player_id', 'side'], 'board flip');
+        keys(n.args, ['player_id', 'side', 'player_name'], 'board flip');
         if (!playerIds.includes(String(n.args.player_id)) || ![0, 1].includes(n.args.side))
           fail('invalid double-advance availability notification');
+        if (
+          n.args.side === 0 &&
+          (n.log !== '${player_name} flips his board lighter side up' ||
+            n.args.player_name !== initial.players[String(n.args.player_id)].name)
+        )
+          fail('unsupported speed-up renewal caption');
       }
       counts[visible ? 'visibleNotifications' : 'hiddenNotifications']++;
       entries.push({
@@ -273,6 +312,7 @@ export function parseNetworkReplay(bytes) {
         notificationIndex: ni,
         packetId,
         moveId,
+        administrative,
         uid: n.uid,
         type: n.type,
         classification: CLASSIFICATION[n.type],
@@ -309,7 +349,9 @@ export function parseNetworkReplay(bytes) {
     )
   )
     fail('unsupported initial checkpoint contents');
-  const visibleEntries = entries.filter((n) => n.visible && !n.beforeCheckpoint);
+  const visibleEntries = entries.filter(
+    (n) => n.visible && !n.beforeCheckpoint && !n.administrative,
+  );
   const groups = [];
   for (const n of visibleEntries) {
     if (groups.at(-1)?.moveId !== n.moveId) groups.push({ moveId: n.moveId, entries: [] });
@@ -326,6 +368,7 @@ export function parseNetworkReplay(bytes) {
     checkpointMove,
     counts,
     entries,
+    administrativeEntries: entries.filter((n) => n.administrative),
     groups,
   };
 }
