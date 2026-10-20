@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   inspectArchiveClient,
   inspectCancellationClusters,
+  inspectCancellationSequence,
   parseNetworkReplay,
 } from './bga-network.mjs';
 import { networkCardMapper, replayNetworkPrefix } from './bga-network-replay.mjs';
@@ -90,7 +91,6 @@ const studio = Buffer.from(
     'ntf_undoRestorePoint:function(t){globalThis.g_archive_mode||',
   ].join('\n'),
 );
-const contract = () => inspectArchiveClient(studio, Buffer.from('define(function(){})'));
 
 test('saved index preserves ordering, skips checkpoint and filters other player packets', () => {
   const result = parseNetworkReplay(bytes(fixture()));
@@ -161,9 +161,9 @@ test('unknown notifications, channels, duplicates and out of order packets fail 
   assert.throws(() => parseNetworkReplay(Buffer.from(text)), /duplicate/i);
 });
 
-test('cancellation contract is client bound and requires actor-matched start or repeated caption', () => {
+test('cancellation sequence diagnostics require actor-matched starts or repeated captions', () => {
   const index = parseNetworkReplay(bytes(fixture()));
-  const clusters = inspectCancellationClusters(index, contract());
+  const clusters = inspectCancellationSequence(index);
   assert.deepEqual(
     clusters.map((c) => c.moves),
     [[3, 4]],
@@ -186,15 +186,18 @@ test('cancellation contract is client bound and requires actor-matched start or 
   ]) {
     const f = fixture();
     mutate(f);
-    assert.throws(() => inspectCancellationClusters(parseNetworkReplay(bytes(f)), contract()));
+    assert.throws(() => inspectCancellationSequence(parseNetworkReplay(bytes(f))));
   }
 });
 
 test('other undo handlers and client move overrides do not inherit display-only treatment', () => {
-  assert.throws(() => inspectArchiveClient(studio, Buffer.from('undoRestoreDISAB')), /overrides/);
+  assert.throws(
+    () => inspectArchiveClient(studio, Buffer.from('undoRestoreDISAB')),
+    /unreviewed archive client version/,
+  );
   assert.throws(
     () => inspectArchiveClient(studio, Buffer.from('onMove:function(){}')),
-    /overrides/,
+    /unreviewed archive client version/,
   );
   assert.throws(
     () =>
@@ -204,7 +207,7 @@ test('other undo handlers and client move overrides do not inherit display-only 
         ),
         Buffer.from(''),
       ),
-    /dispatch/,
+    /unreviewed archive client version/,
   );
   const f = fixture();
   f.gameLogs.data.data[2].data[0].type = 'undoRestorePoint';
@@ -242,127 +245,43 @@ test('card mapping compares category and full effects, and preserves duplicate p
   );
 });
 
-test('a native prefix stops at the first counter or actor mismatch without repairing native state', () => {
-  function setup(payment = false, wrongActor = false) {
-    const raw = fixture();
-    Object.assign(raw.initialState, {
-      buildings: [],
-      monuments: [],
-      constructions: {},
-      wealthTiles: {},
-      cornOnWheel: '0',
-      remainingSkulls: '13',
-      jungle: {},
-      gears: { uxmal: { teethnbr: 10 } },
-    });
-    for (const p of Object.values(raw.initialState.players)) {
-      p.corn_tile = '0';
-      p.wood_tile = '0';
-    }
-    const packet = (id, data) => ({
-      channel: '/table/t123',
-      table_id: 123,
-      packet_id: String(id),
-      packet_type: 'resend',
-      move_id: String(id),
-      time: '1',
-      data,
-    });
-    const nt = (uid, type, args) => ({ uid, type, log: '', args });
-    raw.gameLogs.data.data = [
-      raw.gameLogs.data.data[0],
-      packet(2, [
-        nt('10', 'wealthTiles', {}),
-        nt('11', 'gameStateChange', { id: 4, active_player: '1' }),
-      ]),
-      packet(3, [
-        ...(payment ? [nt('12', 'payGoods', { player_id: '1', type: 'corn', quantity: 1 })] : []),
-        nt('13', 'placeWorker', {
-          player_id: wrongActor ? '2' : '1',
-          worker_id: '1',
-          place: 'uxmal',
-          position: '0',
-          corn: 0,
-        }),
-        nt('14', 'gameStateChange', { id: 6, active_player: '1' }),
-      ]),
-    ];
-    raw.initialState.gamestates[4] = { type: 'activeplayer' };
-    raw.initialState.gamestates[6] = { type: 'activeplayer' };
-    const initial = {
-      version: 1,
-      additionalBuildings: false,
-      phase: 'playing',
-      round: 1,
-      currentPlayer: 0,
-      firstPlayer: 0,
-      firstPlayerClaimed: null,
-      accumulatedCorn: 0,
-      pending: null,
-      turn: { mode: 'none', count: 0, begged: false },
-      buildings: [],
-      monuments: [],
-      jungle: {},
-      skullSupply: 13,
-      skullSpaces: Array(10).fill(null),
-      gears: { uxmal: Array(10).fill(null) },
-      players: Object.values(raw.initialState.players).map((p, id) => ({
-        id,
-        name: p.name,
-        resources: { corn: 0, wood: 0, stone: 0, gold: 0, skull: 0 },
-        score: 0,
-        workers: 1,
-        technologies: { agriculture: 0, extraction: 0, architecture: 0, theology: 0 },
-        temples: { chaac: 0, quetzalcoatl: 0, kukulkan: 0 },
-        wealth: [],
-        buildings: [],
-        monuments: [],
-        feedWorkers: 0,
-        feedDiscount: 0,
-        cornTiles: 0,
-        woodTiles: 0,
-        skullsPlaced: 0,
-      })),
-    };
-    const frame = (state) => ({
-      snapshot: { state },
-      observation: {
-        actor: 0,
-        legalActions: [
-          {
-            action: { type: 'place', gear: 'uxmal', cornCost: 0, discount: false },
-            move: { type: 'place', gear: 'uxmal' },
+test('forged contracts cannot authorize cancellation inspection or native replay', () => {
+  const index = parseNetworkReplay(bytes(fixture()));
+  const forged = {
+    schema: 'tzolkin-bga-archive-client-contract-v1',
+    studioSha256: '0'.repeat(64),
+    gameSha256: '1'.repeat(64),
+    cancellationType: 'undoRestoreDISAB',
+    scope: 'unchanged archive start-turn captions only; no server deletion claim',
+  };
+  const copiedReviewedMetadata = {
+    ...forged,
+    studioSha256: 'bb384177730e85653781f3b193f65b1df88c5624439d12d3dae6a22473f19334',
+    gameSha256: 'e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
+  };
+  let nativeCalls = 0;
+  for (const contract of [forged, copiedReviewedMetadata]) {
+    assert.throws(() => inspectCancellationClusters(index, contract), /client contract/);
+    assert.throws(
+      () =>
+        replayNetworkPrefix(
+          index,
+          { initial: {}, initialMoveId: 2, clientContract: contract },
+          () => {
+            nativeCalls++;
           },
-        ],
-      },
-    });
-    const dispatch = (request) => {
-      const state = structuredClone(request.state);
-      if (request.operation === 'publicApply') {
-        state.gears.uxmal[0] = { playerId: 0, dummy: false };
-        state.turn = { mode: 'place', count: 1, begged: false };
-      }
-      return frame(state);
-    };
-    const original = structuredClone(initial);
-    const result = replayNetworkPrefix(
-      parseNetworkReplay(bytes(raw)),
-      { initial, initialMoveId: 2, clientContract: contract() },
-      dispatch,
+        ),
+      /client contract/,
     );
-    assert.deepEqual(initial, original);
-    return result;
   }
-  const clean = setup();
-  assert.equal(clean.blocked, null);
-  assert.equal(clean.record.steps.length, 1);
-  assert.equal(clean.teacherCertified, false);
-  const counter = setup(true);
-  assert.equal(counter.blocked.moveId, 3);
-  assert.match(counter.blocked.reason, /public state mismatch/);
-  assert.equal(counter.blocked.afterState.players[0].resources.corn, 0);
-  const actor = setup(false, true);
-  assert.equal(actor.blocked.moveId, 3);
-  assert.match(actor.blocked.reason, /actor mismatch/);
-  assert.equal(actor.record.steps.length, 0);
+  assert.equal(nativeCalls, 0);
+  // Retaining every recognized dispatch fragment cannot approve a different source revision.
+  assert.throws(
+    () =>
+      inspectArchiveClient(
+        Buffer.concat([studio, Buffer.from(' modified')]),
+        Buffer.from('define(function(){})'),
+      ),
+    /unreviewed archive client version/,
+  );
 });

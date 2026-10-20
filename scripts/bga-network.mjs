@@ -3,6 +3,11 @@ import { isDeepStrictEqual } from 'node:util';
 import { uniqueJson } from './bga-observed-options.mjs';
 
 const MAX_BYTES = 16 * 1024 * 1024;
+// New client revisions require independent review before they can authorize decoding.
+const REVIEWED_CLIENT_PAIRS = new Set([
+  'bb384177730e85653781f3b193f65b1df88c5624439d12d3dae6a22473f19334:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
+]);
+const validatedContracts = new WeakSet();
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const object = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const fail = (message) => {
@@ -62,6 +67,10 @@ const CLASSIFICATION = {
 export function inspectArchiveClient(studioBytes, gameBytes) {
   for (const b of [studioBytes, gameBytes])
     if (!Buffer.isBuffer(b) || b.length > 4 * MAX_BYTES) fail('invalid client source bytes');
+  const studioSha256 = sha(studioBytes);
+  const gameSha256 = sha(gameBytes);
+  if (!REVIEWED_CLIENT_PAIRS.has(`${studioSha256}:${gameSha256}`))
+    fail('unreviewed archive client version');
   const studio = studioBytes.toString('utf8');
   const game = gameBytes.toString('utf8');
   const requirements = [
@@ -85,13 +94,15 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
     !studio.includes('ntf_undoRestorePoint:function(t){globalThis.g_archive_mode||')
   )
     fail('unsupported undo dispatch contract');
-  return {
+  const contract = Object.freeze({
     schema: 'tzolkin-bga-archive-client-contract-v1',
-    studioSha256: sha(studioBytes),
-    gameSha256: sha(gameBytes),
+    studioSha256,
+    gameSha256,
     cancellationType: 'undoRestoreDISAB',
     scope: 'unchanged archive start-turn captions only; no server deletion claim',
-  };
+  });
+  validatedContracts.add(contract);
+  return contract;
 }
 
 /** Read a saved response extract; no browser requests, credential loading or code evaluation. */
@@ -294,12 +305,19 @@ export function parseNetworkReplay(bytes) {
 /** Check client-bound display-only cancellation clusters; never reconstruct missing trials. */
 export function inspectCancellationClusters(index, contract) {
   if (
+    !object(contract) ||
+    !validatedContracts.has(contract) ||
     contract?.schema !== 'tzolkin-bga-archive-client-contract-v1' ||
     contract.cancellationType !== 'undoRestoreDISAB' ||
     !/^[a-f\d]{64}$/.test(contract.studioSha256) ||
     !/^[a-f\d]{64}$/.test(contract.gameSha256)
   )
     fail('cancellation needs an observed archive client contract');
+  return inspectCancellationSequence(index).map((cluster) => ({ ...cluster, client: contract }));
+}
+
+/** Structural diagnostics only; this does not authorize display-only cancellation handling. */
+export function inspectCancellationSequence(index) {
   const clusters = [];
   let state = null;
   let previousWasCancellation = false;
@@ -327,7 +345,6 @@ export function inspectCancellationClusters(index, contract) {
           startStateId: 4,
           moves: [],
           notifications: [],
-          client: contract,
         });
       clusters.at(-1).moves.push(group.moveId);
       clusters.at(-1).notifications.push({
