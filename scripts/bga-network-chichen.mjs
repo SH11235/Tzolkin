@@ -17,7 +17,7 @@ const sourceNumber = (value, expected) =>
   /^(0|[1-9]\d*)$/.test(String(value)) &&
   Number(value) === expected;
 
-export function declinedRemovalWitness(group, entry, worker, gear) {
+export function declinedRemovalWitness(group, entry, worker, gear, context = null) {
   if (entry.declinedActionCaption !== declinedRemovalCaption) return null;
   const actor = String(entry.args.player_id);
   const states = group.entries.filter((n) => n.type === 'gameStateChange');
@@ -28,8 +28,6 @@ export function declinedRemovalWitness(group, entry, worker, gear) {
     Number(states[0].args.id) !== 9 ||
     Number(states[1].args.id) !== 7 ||
     states.some((n) => String(n.args.active_player) !== actor) ||
-    !Array.isArray(states[1].args.args?.workers) ||
-    states[1].args.args.workers.length !== 0 ||
     !worker ||
     String(worker.id) !== String(entry.args.worker_id) ||
     String(worker.player) !== actor ||
@@ -37,7 +35,7 @@ export function declinedRemovalWitness(group, entry, worker, gear) {
     Number(worker.position) !== Number(entry.args.position)
   )
     fail('declined removal lacks its original worker and no-effect boundary');
-  return {
+  const proof = {
     caption: entry.declinedActionCaption,
     source: ref(entry),
     sourceActorId: actor,
@@ -45,6 +43,188 @@ export function declinedRemovalWitness(group, entry, worker, gear) {
     gear,
     position: Number(entry.args.position),
     states: states.map(ref),
+  };
+  const remaining = states[1].args.args?.workers;
+  if (Array.isArray(remaining) && remaining.length === 0) return proof;
+  const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (!object(remaining) || Object.keys(remaining).length === 0)
+    fail('declined removal lacks its original worker and no-effect boundary');
+  if (
+    !context ||
+    !context.sourceStateMatched ||
+    context.unresolvedTiming ||
+    !(context.workers instanceof Map) ||
+    !(context.sourceToNative instanceof Map) ||
+    context.sourceToNative.get(actor) !== context.nativeActor ||
+    !context.before ||
+    context.before.pending !== null ||
+    context.before.currentPlayer !== context.nativeActor ||
+    !isDeepStrictEqual(context.before.gears[gear]?.[Number(entry.args.position)], {
+      playerId: context.nativeActor,
+      dummy: false,
+    })
+  )
+    fail('remaining workers lack synchronized source/native context');
+  const expected = [...context.workers.values()].filter(
+    (w) => String(w.player) === actor && w.place !== null && String(w.id) !== proof.workerId,
+  );
+  if (
+    !isDeepStrictEqual(Object.keys(remaining).sort(), expected.map((w) => String(w.id)).sort()) ||
+    Object.hasOwn(remaining, proof.workerId)
+  )
+    fail('remaining worker identity set differs from the original ledger');
+  for (const w of expected) {
+    const value = remaining[String(w.id)];
+    if (
+      !object(value) ||
+      !isDeepStrictEqual(Object.keys(value).sort(), ['actions', 'id', 'place', 'position']) ||
+      !/^[1-9]\d*$/.test(String(w.id)) ||
+      !Number.isSafeInteger(Number(w.id)) ||
+      value.id !== String(w.id) ||
+      !['uxmal', 'yaxchilan', 'tikal'].includes(value.place) ||
+      value.place !== w.place ||
+      !sourceNumber(value.position, Number(w.position)) ||
+      Number(value.position) < 1 ||
+      Number(value.position) > 5 ||
+      !isDeepStrictEqual(context.before.gears[value.place]?.[Number(value.position)], {
+        playerId: context.nativeActor,
+        dummy: false,
+      }) ||
+      !object(value.actions) ||
+      !isDeepStrictEqual(Object.keys(value.actions), [value.place])
+    )
+      fail('unsupported remaining worker schema, ownership or position');
+    const prices = value.actions[value.place],
+      position = Number(value.position);
+    if (
+      !object(prices) ||
+      !isDeepStrictEqual(
+        Object.keys(prices).sort(),
+        Array.from({ length: position }, (_, i) => String(i + 1)),
+      ) ||
+      Object.entries(prices).some(
+        ([target, price]) =>
+          typeof price !== 'number' ||
+          !Number.isSafeInteger(price) ||
+          price !== position - Number(target),
+      )
+    )
+      fail('remaining clickable rows do not match the bounded distance-price table');
+  }
+  return {
+    ...proof,
+    remainingWorkers: structuredClone(remaining),
+    remainingSource: ref(states[1]),
+    nativeActor: context.nativeActor,
+    beforeStateSha256: sha(context.before),
+    sourceBackendMask: 'notEstablished',
+  };
+}
+
+export function bindDeclinedRemainingWorkers(
+  proof,
+  { before, afterRemoval, afterSkip, dispatch, refills },
+) {
+  if (!proof.remainingWorkers) return proof;
+  const actor = proof.nativeActor;
+  if (
+    sha(before) !== proof.beforeStateSha256 ||
+    afterRemoval.observation?.actor !== actor ||
+    !isDeepStrictEqual(afterRemoval.snapshot.state.pending?.task, {
+      type: 'action',
+      gear: proof.gear,
+      position: proof.position,
+    }) ||
+    !isDeepStrictEqual(afterRemoval.snapshot.state.pending?.after, []) ||
+    afterRemoval.observation.legalActions.length !== 1 ||
+    afterRemoval.observation.legalActions[0].action.type !== 'skip' ||
+    afterSkip.observation?.actor !== actor ||
+    afterSkip.snapshot.state.pending !== null
+  )
+    fail('declined worker does not retain its original pending, skip and actor');
+  const expected = structuredClone(before);
+  expected.gears[proof.gear][proof.position] = null;
+  expected.turn.mode = 'remove';
+  expected.turn.count++;
+  const removalExpected = structuredClone(expected);
+  removalExpected.pending = structuredClone(afterRemoval.snapshot.state.pending);
+  removalExpected.log = structuredClone(afterRemoval.snapshot.state.log);
+  expected.log = structuredClone(afterSkip.snapshot.state.log);
+  if (
+    !isDeepStrictEqual(removalExpected, afterRemoval.snapshot.state) ||
+    !isDeepStrictEqual(expected, afterSkip.snapshot.state)
+  )
+    fail('declined worker changed state beyond removal and turn bookkeeping');
+  const rows = afterSkip.observation.legalActions;
+  const removals = rows.filter((r) => r.action.type === 'remove');
+  const key = (gear, position) => `${gear}:${position}`;
+  const original = Object.values(proof.remainingWorkers);
+  if (
+    rows.some((r) => !['remove', 'endTurn'].includes(r.action.type)) ||
+    rows.filter((r) => r.action.type === 'endTurn').length !== 1 ||
+    !isDeepStrictEqual(
+      removals.map((r) => key(r.action.gear, r.action.position)).sort(),
+      original.map((w) => key(w.place, Number(w.position))).sort(),
+    )
+  )
+    fail('native remaining removal set differs from the original clickable workers');
+  const menus = [];
+  for (const w of original) {
+    const row = removals.find(
+      (r) => r.action.gear === w.place && r.action.position === Number(w.position),
+    );
+    const response = dispatch({
+      operation: 'publicApply',
+      state: afterSkip.snapshot.state,
+      actor,
+      move: row.move,
+      refills,
+    });
+    const state = response.snapshot?.state;
+    if (
+      response.error ||
+      !state ||
+      response.observation?.actor !== actor ||
+      !isDeepStrictEqual(state.pending?.task, {
+        type: 'action',
+        gear: w.place,
+        position: Number(w.position),
+      }) ||
+      !isDeepStrictEqual(state.pending?.after, []) ||
+      !Array.isArray(response.observation.legalActions)
+    )
+      fail('remaining worker lacks its own native action boundary');
+    const expectedCounter = structuredClone(afterSkip.snapshot.state);
+    expectedCounter.gears[w.place][Number(w.position)] = null;
+    expectedCounter.turn.count++;
+    expectedCounter.pending = structuredClone(state.pending);
+    expectedCounter.log = structuredClone(state.log);
+    if (!isDeepStrictEqual(expectedCounter, state))
+      fail('remaining-worker probe changed unrelated public state');
+    const legal = response.observation.legalActions;
+    if (
+      legal.some(
+        ({ action: a }) =>
+          a.type !== 'skip' &&
+          (a.type !== 'useAction' ||
+            a.gear !== w.place ||
+            !Object.hasOwn(w.actions[w.place], String(a.position)) ||
+            w.actions[w.place][String(a.position)] !== a.cornCost),
+      )
+    )
+      fail('native valid row is outside the original clickable price table');
+    menus.push({
+      workerId: w.id,
+      originalClickableRows: structuredClone(w.actions),
+      nativeValidRows: legal.map((r) => structuredClone(r.action)),
+      nativeSubsetVerified: true,
+    });
+  }
+  return {
+    ...proof,
+    completeRemainingSetVerified: true,
+    completeStateDeltaVerified: true,
+    remainingMenus: menus,
   };
 }
 
