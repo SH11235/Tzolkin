@@ -5,6 +5,7 @@ import { uniqueJson } from './bga-observed-options.mjs';
 const MAX_BYTES = 16 * 1024 * 1024;
 // New client revisions require independent review before they can authorize decoding.
 const REVIEWED_CLIENT_PAIRS = new Set([
+  '1b4b05a634195c41d0ddc12de065f0f432185f4d6494cb3870b27042108e92ff:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   'bb384177730e85653781f3b193f65b1df88c5624439d12d3dae6a22473f19334:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   '8cec9fefd73a8abdfbd539ad1c547e1e92ee8db4ebc0acabeeb8ee87ebdb0b41:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   'baefe213893a46474a278e315243e16daaf2cc0ffe46396e6c0782d6f38faf47:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
@@ -353,7 +354,7 @@ export function parseNetworkReplay(bytes) {
     ) ||
     !activeUpdate ||
     !isDeepStrictEqual(activeUpdate.args, initial.gamestate.multiactive) ||
-    initial.workers.some((w) => w.place !== null || w.position !== null) ||
+    !validInitialNetworkWorkers(initial, playerIds) ||
     Object.values(initial.players).some((p) =>
       ['corn', 'wood', 'stone', 'gold', 'skull'].some((k) => Number(p[k]) !== 0),
     )
@@ -381,6 +382,33 @@ export function parseNetworkReplay(bytes) {
     administrativeEntries: entries.filter((n) => n.administrative),
     groups,
   };
+}
+
+/** A null source owner denotes a neutral gear worker, never an additional seat. */
+export function validInitialNetworkWorkers(initial, playerIds) {
+  const ids = new Set(),
+    occupied = new Set();
+  return initial.workers.every((w) => {
+    if (typeof w.id !== 'string' || !/^[1-9]\d*$/.test(w.id) || ids.has(w.id)) return false;
+    ids.add(w.id);
+    if (w.player !== null)
+      return playerIds.includes(String(w.player)) && w.place === null && w.position === null;
+    const teeth = Number(initial.gears?.[w.place]?.teethnbr);
+    if (
+      playerIds.length !== 3 ||
+      !['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'].includes(w.place) ||
+      !Number.isSafeInteger(teeth) ||
+      teeth < 1 ||
+      !['number', 'string'].includes(typeof w.position) ||
+      !/^(0|[1-9]\d*)$/.test(String(w.position)) ||
+      Number(w.position) >= teeth
+    )
+      return false;
+    const slot = `${w.place}:${Number(w.position)}`;
+    if (occupied.has(slot)) return false;
+    occupied.add(slot);
+    return true;
+  });
 }
 
 /** Check client-bound display-only cancellation clusters; never reconstruct missing trials. */
