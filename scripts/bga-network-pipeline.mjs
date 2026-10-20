@@ -2,7 +2,7 @@ import { readFile, mkdir, writeFile, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { exportNetworkPrefix } from './bga-network-cli.mjs';
+import { convertNetworkInputs } from './bga-network-cli.mjs';
 import { parseNetworkReplay } from './bga-network.mjs';
 import { coreDispatcher } from './bga-replay.mjs';
 import { networkEvidenceReport } from './bga-network-report.mjs';
@@ -80,15 +80,17 @@ export async function runNetworkHandoff({ handoff, core, output }) {
     nativeReport = null,
     error = null;
   try {
-    prefix = await exportNetworkPrefix({
-      input: receipt.raw.path,
-      witnesses: receipt.witnesses.path,
-      'client-studio': receipt.studio.path,
-      'client-game': receipt.game.path,
-      core,
-      output: join(output, 'prefix.json'),
-      'record-output': join(output, 'record.json'),
-    });
+    prefix = convertNetworkInputs(
+      {
+        bytes: inputs.raw,
+        studioBytes: inputs.studio,
+        gameBytes: inputs.game,
+        witnessesBytes: inputs.witnesses,
+      },
+      coreDispatcher(core),
+    );
+    await put('prefix.json', prefix);
+    await put('record.json', prefix.record);
     nativeReport = coreDispatcher(core)({ operation: 'publicReplay', replay: prefix.record });
     if (nativeReport.error) throw new Error(nativeReport.error);
     await put('native-report.json', nativeReport);

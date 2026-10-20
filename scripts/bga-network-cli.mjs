@@ -31,15 +31,37 @@ export async function exportNetworkPrefix(flags) {
     ((flags.mode ?? 'replay') === 'replay' && !flags.witnesses)
   )
     throw new Error('Expected input, witnesses, client-studio, client-game, core and output flags');
-  const bytes = await boundedRead(flags.input);
-  const clientContract = inspectArchiveClient(
-    await boundedRead(flags['client-studio'], 64 * 1024 * 1024),
-    await boundedRead(flags['client-game'], 64 * 1024 * 1024),
+  const result = convertNetworkInputs(
+    {
+      bytes: await boundedRead(flags.input),
+      studioBytes: await boundedRead(flags['client-studio'], 64 * 1024 * 1024),
+      gameBytes: await boundedRead(flags['client-game'], 64 * 1024 * 1024),
+      witnessesBytes: flags.witnesses ? await boundedRead(flags.witnesses) : null,
+      mode: flags.mode ?? 'replay',
+    },
+    coreDispatcher(flags.core),
   );
+  await writeFile(flags.output, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
+  if (flags['record-output']) {
+    if (!result.record) throw new Error('Record output requires replay mode');
+    await writeFile(flags['record-output'], JSON.stringify(result.record, null, 2) + '\n', {
+      flag: 'wx',
+    });
+  }
+  return result;
+}
+
+/** Convert only retained inputs. No source path is reopened after pin verification. */
+export function convertNetworkInputs(
+  { bytes, studioBytes, gameBytes, witnessesBytes, mode = 'replay' },
+  dispatch,
+) {
+  if (!['prepare', 'replay'].includes(mode)) throw new Error('Unsupported conversion mode');
+  const clientContract = inspectArchiveClient(studioBytes, gameBytes);
   const index = parseNetworkReplay(bytes);
-  if (flags.mode === 'prepare') {
+  if (mode === 'prepare') {
     const prepared = deriveNetworkInitial(index);
-    const inspected = coreDispatcher(flags.core)({
+    const inspected = dispatch({
       operation: 'publicInspect',
       state: prepared.witnesses.initial,
     });
@@ -50,28 +72,21 @@ export async function exportNetworkPrefix(flags) {
       observationKey: inspected.observation?.observationKey,
       legalActionCount: inspected.observation?.legalActions.length,
     };
-    await writeFile(flags.output, JSON.stringify(prepared, null, 2) + '\n', { flag: 'wx' });
     return prepared;
   }
-  const witnesses = JSON.parse(await boundedRead(flags.witnesses));
+  const witnesses = JSON.parse(witnessesBytes);
   if (witnesses.schema !== 'tzolkin-bga-public-witnesses-v1' || !witnesses.initial)
     throw new Error('Expected prepared initial witnesses');
   if (witnesses.tableId !== index.tableId) throw new Error('Witness/source table mismatch');
-  const result = replayNetworkPrefix(
+  return replayNetworkPrefix(
     index,
     {
       initial: witnesses.initial,
       initialMoveId: witnesses.initialActionId,
       clientContract,
     },
-    coreDispatcher(flags.core),
+    dispatch,
   );
-  await writeFile(flags.output, JSON.stringify(result, null, 2) + '\n', { flag: 'wx' });
-  if (flags['record-output'])
-    await writeFile(flags['record-output'], JSON.stringify(result.record, null, 2) + '\n', {
-      flag: 'wx',
-    });
-  return result;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
