@@ -10,6 +10,7 @@ import {
 } from './bga-network.mjs';
 import { networkCardMapper, replayNetworkPrefix } from './bga-network-replay.mjs';
 import { declinedRemovalCaption } from './bga-network-chichen.mjs';
+import { skullShortageCaption } from './bga-network-awards.mjs';
 
 const bytes = (x) => Buffer.from(JSON.stringify(x));
 
@@ -170,6 +171,20 @@ test('board flips retain their state meaning and reject unknown actors or sides'
   );
   n.args.side = 2;
   assert.throws(() => parseNetworkReplay(bytes(f)), /invalid double-advance/);
+});
+
+test('skull shortage retains the exact caption and rejects extra or untyped payloads', () => {
+  const f = fixture();
+  f.gameLogs.data.data
+    .at(-1)
+    .data.push({ uid: 'shortage', type: 'noskulltoday', log: skullShortageCaption, args: [] });
+  const parsed = parseNetworkReplay(bytes(f)).entries.find((n) => n.uid === 'shortage');
+  assert.equal(parsed.skullShortageCaption, skullShortageCaption);
+  for (const mutate of [(n) => (n.log = 'unknown'), (n) => (n.args = {}), (n) => n.args.push(1)]) {
+    const bad = structuredClone(f);
+    mutate(bad.gameLogs.data.data.at(-1).data.at(-1));
+    assert.throws(() => parseNetworkReplay(bytes(bad)), /shortage/);
+  }
 });
 
 test('declined removal keeps only an exact original caption and never invents an action number', () => {

@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import { declinedRemovalWitness, proveEquivalentChichenRoutes } from './bga-network-chichen.mjs';
+import { sourceSkullShortageWitness, bindSkullShortageOutcome } from './bga-network-awards.mjs';
 import {
   appendRewardFence,
   bindNewFixedReward,
@@ -1373,6 +1374,14 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     const stepsBefore = record.steps.length;
     let constructionTransition = null;
     try {
+      const skullShortage = sourceSkullShortageWitness({
+        ledger,
+        group,
+        before,
+        catalog,
+        sourceToNative,
+        unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
+      });
       for (const caption of group.entries.filter((n) => n.type === 'workerLimit')) {
         assertActor(caption);
         const actor = getActor(caption),
@@ -1892,6 +1901,9 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             applyWhere((x) => x.type === 'skip', 'observed return to worker selection', refills);
       }
       for (const n of group.entries) updateLedger(ledger, n, mapper);
+      const skullShortageEvidence = bindSkullShortageOutcome(skullShortage, before, native());
+      if (skullShortageEvidence)
+        audit.push({ moveId: group.moveId, skullShortageEvidence, teacherCertified: false });
       if (native().phase === 'finished') {
         const result = group.entries.find(
           (n) => n.type === 'gameStateChange' && Number(n.args.id) === 99,
