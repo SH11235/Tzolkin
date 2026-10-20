@@ -170,6 +170,49 @@ test('board flips retain their state meaning and reject unknown actors or sides'
   assert.throws(() => parseNetworkReplay(bytes(f)), /invalid double-advance/);
 });
 
+test('isolated holiday clock captions retain source evidence and reject unreviewed payloads', () => {
+  const f = fixture();
+  const packet = {
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: '10',
+    packet_type: 'resend',
+    move_id: '6',
+    time: '1',
+    data: [
+      {
+        uid: 'holiday',
+        type: 'timeJokerUsed',
+        log: '${player_name} uses a holiday time joker (+${nb_days} days thinking time)',
+        args: { player_name: 'P3', nb_days: 4 },
+      },
+    ],
+  };
+  f.gameLogs.data.data.push(packet);
+  const entry = parseNetworkReplay(bytes(f)).groups.at(-1).entries[0];
+  assert.equal(entry.classification, 'clock');
+  assert.equal(entry.packetIndex, 6);
+  assert.equal(entry.notificationIndex, 0);
+  assert.equal(entry.uid, 'holiday');
+  assert.equal(entry.moveId, 6);
+  assert.deepEqual(entry.args, packet.data[0].args);
+  for (const mutate of [
+    (p) => (p.data[0].args.nb_days = '4'),
+    (p) => (p.data[0].args.nb_days = 3),
+    (p) => (p.data[0].args.nb_days = null),
+    (p) => delete p.data[0].args.nb_days,
+    (p) => (p.data[0].args.corn = 4),
+    (p) => (p.data[0].args.player_name = 'Unknown'),
+    (p) => (p.data[0].log = 'Advance the game by four days'),
+    (p) => (p.channel = '/player/p1'),
+    (p) => p.data.push({ uid: 'extra', type: 'updateReflexionTime', log: '', args: {} }),
+  ]) {
+    const bad = structuredClone(f);
+    mutate(bad.gameLogs.data.data.at(-1));
+    assert.throws(() => parseNetworkReplay(bytes(bad)), /holiday clock caption/);
+  }
+});
+
 test('theology bonus caption only accepts its reviewed template and a known source actor', () => {
   const f = fixture(),
     n = {
