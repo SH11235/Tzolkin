@@ -3,6 +3,11 @@ import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import {
+  finalScoringWitness,
+  bindFinalScoringProjections,
+  assertFinalScoringResolutionGroup,
+} from './bga-network-final-scoring.mjs';
+import {
   declinedRemovalWitness,
   bindDeclinedRemainingWorkers,
   proveEquivalentChichenRoutes,
@@ -1375,6 +1380,9 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
   for (const group of index.groups.filter((g) => g.moveId > initialMoveId)) {
     current = group;
     const before = copy(native());
+    const scoresBeforeGroup = Object.fromEntries(
+      Object.entries(ledger.players).map(([id, player]) => [id, player.score]),
+    );
     const stepsBefore = record.steps.length;
     let constructionTransition = null;
     try {
@@ -1472,6 +1480,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       }
       if (openRotationFence && !group.entries.some((n) => n.type === 'rotateWheel'))
         fail('deferred first-player boundary did not immediately resolve by rotation');
+      if (openRotationFence?.finalScoringProof) assertFinalScoringResolutionGroup(group);
       if (
         openCornFence &&
         group.entries.some(
@@ -2121,14 +2130,33 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         }
       }
       if (diff.length) {
+        if (openRotationFence?.finalScoringProof)
+          fail(`final scoring rotation did not resolve full public state ${JSON.stringify(diff)}`);
         const claimed = native().firstPlayerClaimed;
+        const scoreBoundary = group.entries.some((n) => n.type === 'finalScoring');
+        const finalWitness = scoreBoundary
+          ? finalScoringWitness({
+              group,
+              before,
+              state: native(),
+              observation: frame.observation,
+              sourceToNative,
+              scoresBeforeGroup,
+              sourceBoard: sourceCheckpoint(ledger, sourceToNative),
+              differences: diff,
+              unresolvedTiming: !!openCornFence || openRewardFences.length > 0,
+              catalog,
+            })
+          : null;
         const allowed =
           stateId() === 95 &&
           native().pending?.task.type === 'rotation' &&
           claimed !== null &&
-          diff.length === 1 &&
-          diff.some((d) => d.field === 'firstPlayer' && d.native === before.firstPlayer);
+          (finalWitness ||
+            (diff.length === 1 &&
+              diff.some((d) => d.field === 'firstPlayer' && d.native === before.firstPlayer)));
         if (!allowed) fail(`public state mismatch ${JSON.stringify(diff)}`);
+        const responses = [];
         const proof = proveCalendarDesignation(
           native(),
           frame.observation,
@@ -2136,26 +2164,39 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
           sourceToNative,
           (request) => {
             if (++calls > 4000) fail('native call bound');
-            return dispatch(request);
+            const response = dispatch(request);
+            if (finalWitness) responses.push(response);
+            return response;
           },
         );
         openRotationFence = {
           startMoveId: group.moveId,
-          reason: 'source changes first-player designation before native rotation choice',
+          reason: finalWitness
+            ? 'source final receipts precede the legal native final rotation'
+            : 'source changes first-player designation before native rotation choice',
           differences: diff,
           resolvedMoveId: null,
           proof,
+          ...(finalWitness
+            ? { finalScoringProof: bindFinalScoringProjections(finalWitness, native(), responses) }
+            : {}),
         };
         timingFences.push(openRotationFence);
         audit.push({
           moveId: group.moveId,
           publicStateMatched: false,
           deferredFirstPlayer: true,
+          ...(finalWitness ? { deferredFinalScores: true } : {}),
           teacherCertified: false,
         });
         continue;
       }
       if (openRotationFence) {
+        if (
+          openRotationFence.finalScoringProof &&
+          (native().phase !== 'finished' || !record.terminalDisplayCheckpoint)
+        )
+          fail('final receipt fence did not reach the original terminal checkpoint');
         openRotationFence.resolvedMoveId = group.moveId;
         openRotationFence = null;
       }

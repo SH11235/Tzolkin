@@ -11,6 +11,247 @@ import {
 import { networkCardMapper, replayNetworkPrefix } from './bga-network-replay.mjs';
 import { declinedRemovalCaption } from './bga-network-chichen.mjs';
 import { skullShortageCaption } from './bga-network-awards.mjs';
+import { readFileSync } from 'node:fs';
+import {
+  finalScoringWitness,
+  bindFinalScoringProjections,
+  assertFinalScoringResolutionGroup,
+} from './bga-network-final-scoring.mjs';
+
+function finalScoreFixture(mutate = () => {}) {
+  const raw = fixture();
+  let uid = 100;
+  const n = (type, args, log = '') => ({ type, args, log, uid: String(++uid) });
+  const state = (id, active_player) => n('gameStateChange', { id, active_player });
+  const pair = (player_id, points, nbr, suffix) => [
+    n('updateScore', { player_id, player_name: null, points }),
+    n(
+      'finalScoring',
+      {
+        player_id,
+        player_name: `P${player_id}`,
+        points,
+        ...(nbr === undefined ? {} : { nbr }),
+      },
+      nbr === undefined
+        ? 'Remaining resources: ${player_name} scores ${points} points'
+        : 'Monument: ${player_name} scores ${points} for ${nbr} ' + suffix,
+    ),
+  ];
+  const data = [
+    state(90, '3'),
+    state(91, '1'),
+    state(92, '2'),
+    state(94, '2'),
+    n('finalScoring', [], 'Final scoring!'),
+    ...pair('1', 6, '4', 'workers in play'),
+    ...pair('1', 4, 1, 'Corn Harvest Tile'),
+    ...pair('1', 0),
+    ...pair('2', 0),
+    ...pair('3', 0),
+    state(95, '2'),
+  ];
+  mutate(data);
+  raw.gameLogs.data.data.at(-1).data = data;
+  const group = parseNetworkReplay(bytes(raw)).groups.at(-1);
+  const players = [0, 1, 2].map((id) => ({
+    id,
+    score: 10,
+    buildingSkulls: 0,
+    buildings: [],
+    monuments: id === 0 ? ['m09', 'm03'] : [],
+    workers: id === 0 ? 4 : 3,
+    cornTiles: id === 0 ? 1 : 0,
+    woodTiles: 0,
+    technologies: { agriculture: 0, extraction: 0, architecture: 0, theology: 0 },
+    temples: { chaac: 0, quetzalcoatl: 0, kukulkan: 0 },
+    resources: { corn: 0, wood: 0, stone: 0, gold: 0, skull: 0 },
+  }));
+  const pending = {
+    phase: 'playing',
+    round: 27,
+    additionalBuildings: false,
+    expansion: null,
+    players,
+    skullSpaces: [null],
+    foodDays: [8, 14, 21, 27],
+    pending: { task: { type: 'rotation' }, after: [] },
+    firstPlayerClaimed: 1,
+  };
+  const sourceBoard = structuredClone(pending);
+  sourceBoard.players[0].score = 20;
+  return {
+    group,
+    state: pending,
+    before: {
+      phase: 'playing',
+      round: 27,
+      pending: null,
+      foodDays: [8, 14, 21],
+      currentPlayer: 2,
+      firstPlayer: 0,
+    },
+    observation: { actor: 1, legalActions: [{ action: { type: 'rotate', days: 1 } }] },
+    sourceToNative: new Map([
+      ['1', 0],
+      ['2', 1],
+      ['3', 2],
+    ]),
+    scoresBeforeGroup: { 1: 10, 2: 10, 3: 10 },
+    sourceBoard,
+    differences: [{ field: 'player.1.score', observed: 20, native: 10 }],
+    unresolvedTiming: false,
+    catalog: JSON.parse(
+      readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+    ),
+  };
+}
+
+test('final receipts bind original captions, exact owned monuments and zero resource receipts', () => {
+  const input = finalScoreFixture(),
+    witness = finalScoringWitness(input);
+  assert.equal(witness.players[0].total, 20);
+  assert.deepEqual(
+    witness.players.map((p) => p.resource.points),
+    [0, 0, 0],
+  );
+  const after = structuredClone(input.state);
+  after.phase = 'finished';
+  after.finalScores = witness.players.map((p) => ({
+    playerId: p.actor,
+    pointsBeforeFinal: p.before,
+    monumentPoints: p.monuments.reduce((sum, r) => sum + r.points, 0),
+    resourcePoints: 0,
+    skullPoints: 0,
+    total: p.total,
+  }));
+  const response = { snapshot: { state: after } };
+  assert.equal(bindFinalScoringProjections(witness, input.state, [response, response]), witness);
+  after.finalScores[0].monumentPoints++;
+  assert.throws(() => bindFinalScoringProjections(witness, input.state, [response]), /individual/);
+});
+
+test('final receipt corruption fails even when offsetting errors preserve the total', () => {
+  const mutations = [
+    (d) => {
+      d[5].args.points++;
+      d[6].args.points++;
+      d[7].args.points--;
+      d[8].args.points--;
+    },
+    (d) => d.splice(9, 2),
+    (d) => d.splice(9, 0, structuredClone(d[7]), structuredClone(d[8])),
+    (d) => {
+      d[6].args.player_name = 'P2';
+    },
+    (d) => {
+      d[6].args.player_id = '2';
+    },
+    (d) => {
+      d[6].log = 'Unknown monument';
+    },
+    (d) => {
+      d[4].log = 'Unknown header';
+    },
+    (d) => {
+      d[6].args.nbr = '';
+    },
+    (d) => {
+      d[6].args.nbr = null;
+    },
+    (d) => {
+      d[6].args.nbr = true;
+    },
+    (d) => {
+      d[6].args.nbr = '04';
+    },
+    (d) => {
+      d[6].args.points = Number.MAX_SAFE_INTEGER + 1;
+    },
+    (d) => {
+      [d[11], d[13]] = [d[13], d[11]];
+      [d[12], d[14]] = [d[14], d[12]];
+    },
+    (d) => {
+      d[4].args = [0];
+    },
+    (d) =>
+      d.splice(5, 0, {
+        type: 'takeGoods',
+        uid: 'foreign',
+        log: '',
+        args: { player_id: '1', type: 'corn', quantity: 1 },
+      }),
+  ];
+  for (const mutate of mutations)
+    assert.throws(() => finalScoringWitness(finalScoreFixture(mutate)));
+  for (const mutate of [
+    (x) => {
+      x.state.players[0].buildingSkulls = 1;
+    },
+    (x) => {
+      x.state.players[0].monuments.push('m09');
+    },
+    (x) => {
+      x.state.players[0].monuments.push('m01');
+      x.sourceBoard.players[0].monuments.push('m01');
+    },
+    (x) => {
+      x.state.players[0].monuments = ['m13'];
+      x.sourceBoard.players[0].monuments = ['m13'];
+    },
+    (x) => {
+      x.state.players[0].workers++;
+    },
+    (x) => {
+      x.state.pending.after.push({ type: 'effects' });
+    },
+    (x) => {
+      x.observation.actor = 2;
+    },
+    (x) => {
+      x.observation.legalActions.push({ action: { type: 'skip' } });
+    },
+    (x) => {
+      x.unresolvedTiming = true;
+    },
+    (x) => {
+      x.group.entries[6].args.nbr = 5;
+    },
+    (x) => {
+      x.group.entries[6].notificationIndex++;
+    },
+    (x) => {
+      x.group.entries = structuredClone(x.group.entries);
+    },
+  ]) {
+    const input = finalScoreFixture();
+    mutate(input);
+    assert.throws(() => finalScoringWitness(input));
+  }
+});
+
+test('final receipt resolution requires the immediate original rotation and terminal without extra effects', () => {
+  const group = {
+    entries: [
+      { type: 'rotateWheel', args: { twice: 0 } },
+      { type: 'gameStateChange', args: { id: 99 } },
+    ],
+  };
+  assert.doesNotThrow(() => assertFinalScoringResolutionGroup(group));
+  for (const mutate of [
+    (g) => g.entries.pop(),
+    (g) => g.entries.reverse(),
+    (g) => g.entries.push({ type: 'updateScore', args: {} }),
+    (g) => g.entries.push({ type: 'takeGoods', args: {} }),
+    (g) => g.entries.push({ type: 'rotateWheel', args: { twice: 1 } }),
+    (g) => g.entries.push({ type: 'pickUpWorker', args: { city: 'Tikal' } }),
+  ]) {
+    const bad = structuredClone(group);
+    mutate(bad);
+    assert.throws(() => assertFinalScoringResolutionGroup(bad));
+  }
+});
 
 const bytes = (x) => Buffer.from(JSON.stringify(x));
 

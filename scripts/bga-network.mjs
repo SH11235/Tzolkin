@@ -30,6 +30,13 @@ const REVIEWED_CLIENT_PAIRS = new Set([
   'd56aab925f1744ac59d759a10e3cd10b0ea332fa80db6550994267fd6eed36e5:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
 ]);
 const validatedContracts = new WeakSet();
+const finalScoringCaptions = new WeakMap();
+
+export function originalFinalScoringCaption(entry) {
+  const bound = finalScoringCaptions.get(entry);
+  if (!bound || !isDeepStrictEqual(entry, bound.entry)) return null;
+  return { caption: bound.caption, playerName: bound.playerName };
+}
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const object = (x) => x !== null && typeof x === 'object' && !Array.isArray(x);
 const fail = (message) => {
@@ -388,7 +395,7 @@ export function parseNetworkReplay(bytes) {
           fail('unsupported speed-up renewal caption');
       }
       counts[visible ? 'visibleNotifications' : 'hiddenNotifications']++;
-      entries.push({
+      const entry = {
         packetIndex: pi,
         notificationIndex: ni,
         packetId,
@@ -403,7 +410,14 @@ export function parseNetworkReplay(bytes) {
         channel: packet.channel,
         ...(declinedActionCaption ? { declinedActionCaption } : {}),
         ...(n.type === 'noskulltoday' ? { skullShortageCaption: n.log } : {}),
-      });
+      };
+      entries.push(entry);
+      if (n.type === 'finalScoring')
+        finalScoringCaptions.set(entry, {
+          entry: structuredClone(entry),
+          caption: n.log,
+          playerName: initial.players[String(n.args?.player_id)]?.name,
+        });
       if (entries.length > 20000) fail('notification limit');
     }
   }
