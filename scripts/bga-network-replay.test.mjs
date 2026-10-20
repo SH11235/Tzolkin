@@ -82,7 +82,7 @@ function fixture() {
     },
   };
 }
-function setup(payment = false, wrongActor = false) {
+function setup(payment = false, wrongActor = false, flip = false) {
   const raw = fixture();
   Object.assign(raw.initialState, {
     buildings: [],
@@ -183,6 +183,10 @@ function setup(payment = false, wrongActor = false) {
     }
     return frame(state);
   };
+  if (flip)
+    raw.gameLogs.data.data
+      .at(-1)
+      .data.push({ uid: 'flip', type: 'flipBoard', log: '', args: { player_id: '1', side: 1 } });
   const original = structuredClone(initial);
   const result = replayNetworkPrefix(
     parseNetworkReplay(bytes(raw)),
@@ -213,4 +217,11 @@ test('actor mismatch stops before applying an operation', () => {
   assert.equal(result.blocked.moveId, 3);
   assert.match(result.blocked.reason, /actor mismatch/);
   assert.equal(result.record.steps.length, 0);
+});
+
+test('speed-up availability is never silently treated as a cosmetic board flip', () => {
+  const result = setup(false, false, true);
+  assert.equal(result.record.steps.length, 0);
+  assert.match(result.blocked.reason, /double-advance availability/);
+  assert.ok(result.blocked.source.some((n) => n.type === 'flipBoard'));
 });

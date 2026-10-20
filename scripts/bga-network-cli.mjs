@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coreDispatcher } from './bga-replay.mjs';
 import { inspectArchiveClient, parseNetworkReplay } from './bga-network.mjs';
-import { replayNetworkPrefix } from './bga-network-replay.mjs';
+import { deriveNetworkInitial, replayNetworkPrefix } from './bga-network-replay.mjs';
 
 async function boundedRead(path, limit = 16 * 1024 * 1024) {
   if ((await stat(path)).size > limit) throw new Error('Input exceeds byte bound');
@@ -22,22 +22,41 @@ export async function exportNetworkPrefix(flags) {
     'core',
     'output',
     'record-output',
+    'mode',
   ];
   if (
     Object.keys(flags).some((k) => !allowed.includes(k)) ||
-    allowed.slice(0, 6).some((k) => !flags[k])
+    ['input', 'client-studio', 'client-game', 'core', 'output'].some((k) => !flags[k]) ||
+    !['prepare', 'replay'].includes(flags.mode ?? 'replay') ||
+    ((flags.mode ?? 'replay') === 'replay' && !flags.witnesses)
   )
     throw new Error('Expected input, witnesses, client-studio, client-game, core and output flags');
   const bytes = await boundedRead(flags.input);
-  const witnesses = JSON.parse(await boundedRead(flags.witnesses));
-  if (witnesses.schema !== 'tzolkin-bga-public-witnesses-v1' || !witnesses.initial)
-    throw new Error('Expected prepared initial witnesses');
-  const index = parseNetworkReplay(bytes);
-  if (witnesses.tableId !== index.tableId) throw new Error('Witness/source table mismatch');
   const clientContract = inspectArchiveClient(
     await boundedRead(flags['client-studio'], 64 * 1024 * 1024),
     await boundedRead(flags['client-game'], 64 * 1024 * 1024),
   );
+  const index = parseNetworkReplay(bytes);
+  if (flags.mode === 'prepare') {
+    const prepared = deriveNetworkInitial(index);
+    const inspected = coreDispatcher(flags.core)({
+      operation: 'publicInspect',
+      state: prepared.witnesses.initial,
+    });
+    if (inspected.error) throw new Error(inspected.error);
+    prepared.clientContract = clientContract;
+    prepared.nativeInitial = {
+      accepted: true,
+      observationKey: inspected.observation?.observationKey,
+      legalActionCount: inspected.observation?.legalActions.length,
+    };
+    await writeFile(flags.output, JSON.stringify(prepared, null, 2) + '\n', { flag: 'wx' });
+    return prepared;
+  }
+  const witnesses = JSON.parse(await boundedRead(flags.witnesses));
+  if (witnesses.schema !== 'tzolkin-bga-public-witnesses-v1' || !witnesses.initial)
+    throw new Error('Expected prepared initial witnesses');
+  if (witnesses.tableId !== index.tableId) throw new Error('Witness/source table mismatch');
   const result = replayNetworkPrefix(
     index,
     {
@@ -71,7 +90,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         terminalReached: result.terminalReached,
         semanticReplayVerified: result.semanticReplayVerified,
         teacherCompleteness: result.teacherCompleteness,
-        steps: result.record.steps.length,
+        steps: result.record?.steps.length,
+        prepared: result.schema === 'tzolkin-bga-network-initial-preparation-v1',
         blockedMoveId: result.blocked?.moveId ?? null,
         reason: result.blocked?.reason ?? null,
       }) + '\n',
