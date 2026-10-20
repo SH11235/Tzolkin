@@ -313,6 +313,8 @@ export function parseNetworkReplay(bytes) {
       if (n.type === 'noSkullsLeft') {
         keys(n.args, ['player_name'], 'single-skull caption');
         if (
+          packet.packet_type !== 'resend' ||
+          packet.channel !== `/table/t${tableId}` ||
           n.log !== singleSkullCaption ||
           typeof n.args.player_name !== 'string' ||
           Object.values(initial.players).filter((p) => p.name === n.args.player_name).length !== 1

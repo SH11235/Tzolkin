@@ -549,6 +549,14 @@ test('single-skull parser retains only the exact original caption and one roster
     mutate(bad.gameLogs.data.data.at(-1).data.at(-1));
     assert.throws(() => parseNetworkReplay(bytes(bad)), /single-skull/);
   }
+  for (const type of ['history', 'sequence', 'unknown']) {
+    const bad = structuredClone(raw);
+    bad.gameLogs.data.data.at(-1).packet_type = type;
+    assert.throws(() => parseNetworkReplay(bytes(bad)), /single-skull/);
+  }
+  const privatePacket = structuredClone(raw);
+  privatePacket.gameLogs.data.data.at(-1).channel = '/player/p1';
+  assert.throws(() => parseNetworkReplay(bytes(privatePacket)), /single-skull/);
 });
 
 test('null-owned three-player neutral slots are separate from real seats and reject corrupt identity/geometry', () => {
