@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
 import { mock, test } from 'node:test';
+import {
+  sourceSkullShortageWitness,
+  bindSkullShortageOutcome,
+  skullShortageCaption,
+} from './bga-network-awards.mjs';
 import { assertNetworkClockContract, parseNetworkReplay } from './bga-network.mjs';
 import {
   appendRewardFence,
@@ -1375,4 +1380,97 @@ test('conversion consumes retained verified bytes after the backing file is repl
   assert.equal(result.blocked, null);
   assert.equal(result.record.steps.length, 1);
   assert.match(readFileSync(path, 'utf8'), /unreviewedReplacement/);
+});
+function skullAwardFixture() {
+  const sourceToNative = new Map([
+    ['1', 0],
+    ['2', 1],
+    ['3', 2],
+  ]);
+  const players = Object.fromEntries(
+    [...sourceToNative].map(([id, actor]) => [id, { temples: { kukulkan: actor < 2 ? 1 : -1 } }]),
+  );
+  const ledger = { day: 20, skullSupply: 1, players };
+  const before = {
+    round: 21,
+    phase: 'playing',
+    pending: null,
+    skullSupply: 1,
+    foodDays: [8, 14],
+    players: Object.values(players).map((p) => ({
+      temples: structuredClone(p.temples),
+      resources: { skull: 0 },
+      buildings: [],
+    })),
+  };
+  const entries = [
+    ...[90, 91, 92, 93].map((id) => ({ type: 'gameStateChange', args: { id } })),
+    { type: 'middleOfAgeRewards', args: [] },
+    { type: 'noskulltoday', args: [], skullShortageCaption },
+    ...['1', '2'].map((id) => ({
+      type: 'takeGoods',
+      args: { player_id: id, type: 'wood', quantity: 1, origin: 'temple_kukulcan_step_1' },
+    })),
+    { type: 'gameStateChange', args: { id: 95 } },
+  ].map((n, i) => ({ ...n, uid: 'n' + i, packetIndex: 1, notificationIndex: i }));
+  const group = { moveId: 10, entries };
+  const catalog = {
+    BUILDINGS: [{ id: 'switch', effects: [{ type: 'foodRewardSwitch' }] }],
+    TEMPLE_TRACKS: { kukulkan: { resourceRewards: [{}, { wood: 1 }, { skull: 1 }] } },
+  };
+  return { ledger, before, group, catalog, sourceToNative, unresolvedTiming: false };
+}
+
+test('source shortage binds every reward and its synchronized pre-award state', () => {
+  const f = skullAwardFixture(),
+    proof = sourceSkullShortageWitness(f);
+  assert.equal(proof.totalSkullDemand, 2);
+  assert.equal(proof.sourceSkullSupply, 1);
+  assert.equal(proof.sourcePhysicalDay, 20);
+  assert.equal(proof.scheduledDay, 21);
+  assert.equal(proof.receipts.length, 2);
+  const after = structuredClone(f.before);
+  after.foodDays.push(21);
+  assert.equal(bindSkullShortageOutcome(proof, f.before, after).individualSkullsUnchanged, true);
+  assert.equal(sourceSkullShortageWitness({ ...f, group: { entries: [] } }), null);
+  for (const mutate of [
+    (f) => (f.group.entries[5].skullShortageCaption = 'unknown'),
+    (f) => f.group.entries[5].args.push('unexpected'),
+    (f) => (f.group.entries[4].type = 'unknown'),
+    (f) => (f.group.entries[3].args.id = 94),
+    (f) => (f.group.entries[8].args.id = 94),
+    (f) => (f.group.entries[6].packetIndex = 2),
+    (f) => (f.group.entries[6].args.type = 'skull'),
+    (f) => (f.group.entries[6].args.player_id = '3'),
+    (f) => (f.group.entries[6].args.origin = 'temple_kukulcan_step_2'),
+    (f) => (f.group.entries[6].args.quantity = true),
+    (f) => f.group.entries.splice(6, 1),
+    (f) => (f.ledger.skullSupply = 2),
+    (f) => (f.before.skullSupply = 0),
+    (f) => (f.before.round = 20),
+    (f) => f.before.foodDays.push(21),
+    (f) => (f.before.players[0].temples.kukulkan = 0),
+    (f) => f.before.players[0].buildings.push('switch'),
+    (f) => (f.before.pending = { task: { type: 'foodDay' } }),
+    (f) => (f.unresolvedTiming = true),
+    (f) =>
+      (f.group.entries[1] = {
+        ...f.group.entries[1],
+        type: 'takeGoods',
+        args: { type: 'skull', quantity: 1 },
+      }),
+  ]) {
+    const bad = skullAwardFixture();
+    mutate(bad);
+    assert.throws(() => sourceSkullShortageWitness(bad), /Skull award:/);
+  }
+  for (const mutate of [
+    (a) => a.foodDays.pop(),
+    (a) => (a.skullSupply = 0),
+    (a) => (a.players[0].resources.skull = 1),
+  ]) {
+    const bad = structuredClone(after);
+    mutate(bad);
+    assert.throws(() => bindSkullShortageOutcome(proof, f.before, bad), /Skull award:/);
+  }
 });
