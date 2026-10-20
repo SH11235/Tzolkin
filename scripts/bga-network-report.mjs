@@ -146,6 +146,7 @@ export function networkEvidenceReport({
       rawSha256: index?.rawSha256 ?? null,
       client: prefix?.clientContract ?? prepared?.clientContract ?? null,
       counts: index?.counts ?? null,
+      administrativeNotifications: index?.administrativeEntries ?? [],
       scope: 'Saved normal replay response; content binding does not authenticate source options.',
     },
     initial: {

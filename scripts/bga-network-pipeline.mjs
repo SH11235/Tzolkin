@@ -25,8 +25,8 @@ export async function readPinnedNetworkInput(pin) {
   return bytes;
 }
 
-/** Continue a normal preparation handoff offline. This entry grants no teacher admission. */
-export async function runNetworkHandoff({ handoff, core, output }) {
+/** Retain verified inputs for all later stages; no source path is reopened for replay. */
+export async function loadNetworkHandoff(handoff, beforePayload = null) {
   const receipt = JSON.parse(await readFile(handoff, 'utf8'));
   if (
     receipt.schema !== 'network-prepared-replay-input-v1' ||
@@ -34,6 +34,7 @@ export async function runNetworkHandoff({ handoff, core, output }) {
     receipt.qualificationRaised !== false
   )
     throw new Error('Expected unmodified normal network preparation handoff');
+  if (beforePayload) await beforePayload(receipt);
   const inputs = {};
   for (const key of [
     'case',
@@ -73,12 +74,26 @@ export async function runNetworkHandoff({ handoff, core, output }) {
     !isDeepStrictEqual(derived.witnesses, witnesses)
   )
     throw new Error('Prepared source/handoff mismatch');
+  return { receipt, inputs, index, prepared, derived };
+}
+
+/** Continue a normal preparation handoff offline. This entry grants no teacher admission. */
+export async function runNetworkHandoff({
+  handoff,
+  core,
+  output,
+  onReplay = null,
+  beforePayload = null,
+}) {
+  const context = await loadNetworkHandoff(handoff, beforePayload);
+  const { inputs, index, prepared } = context;
   await mkdir(output); // Create only: never overwrite a previous run.
   const put = async (name, value) =>
     writeFile(join(output, name), JSON.stringify(value, null, 2) + '\n', { flag: 'wx' });
   let prefix = null,
     nativeReport = null,
-    error = null;
+    error = null,
+    teacher = null;
   try {
     prefix = convertNetworkInputs(
       {
@@ -94,6 +109,7 @@ export async function runNetworkHandoff({ handoff, core, output }) {
     nativeReport = coreDispatcher(core)({ operation: 'publicReplay', replay: prefix.record });
     if (nativeReport.error) throw new Error(nativeReport.error);
     await put('native-report.json', nativeReport);
+    if (onReplay) teacher = await onReplay({ ...context, prefix, nativeReport, output });
   } catch (e) {
     error = { code: 'pipelineStopped', reason: e.message };
   }
@@ -102,9 +118,18 @@ export async function runNetworkHandoff({ handoff, core, output }) {
     index,
     prepared,
     prefix,
-    nativeReport,
-    error,
+    nativeReport: teacher?.nativeReport ?? nativeReport,
+    error: teacher?.error ?? error,
+    dataset: teacher?.dataset ?? null,
+    loader: teacher?.loader ?? null,
   });
+  if (teacher) {
+    report.teacherPipeline = teacher.status;
+    if (teacher.status.loader.state === 'rejected')
+      report.candidates.loaderState = 'existingReadOnlyLoaderRejected';
+    if (teacher.status.producer.state === 'accepted' && !teacher.dataset)
+      report.candidates.state = 'withheldAfterArtifactOrLoaderRejection';
+  }
   await put('evidence-report.json', report);
   return report;
 }

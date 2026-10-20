@@ -20,7 +20,12 @@ mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
     },
   },
 });
-const { replayNetworkPrefix, proveCalendarDesignation } = await import('./bga-network-replay.mjs');
+const {
+  replayNetworkPrefix,
+  proveCalendarDesignation,
+  queuedBuildingResources,
+  observedChichenRoute,
+} = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
 
@@ -95,7 +100,7 @@ function fixture() {
     },
   };
 }
-function setup(payment = false, wrongActor = false, flip = false, capture = null) {
+function setup(payment = false, wrongActor = false, flip = false, capture = null, finish = false) {
   const raw = fixture();
   Object.assign(raw.initialState, {
     buildings: [],
@@ -193,6 +198,10 @@ function setup(payment = false, wrongActor = false, flip = false, capture = null
     if (request.operation === 'publicApply') {
       state.gears.uxmal[0] = { playerId: 0, dummy: false };
       state.turn = { mode: 'place', count: 1, begged: false };
+      if (finish) {
+        state.phase = 'finished';
+        state.players[0].score = 1.25;
+      }
     }
     return frame(state);
   };
@@ -200,6 +209,26 @@ function setup(payment = false, wrongActor = false, flip = false, capture = null
     raw.gameLogs.data.data
       .at(-1)
       .data.push({ uid: 'flip', type: 'flipBoard', log: '', args: { player_id: '1', side: 1 } });
+  if (finish)
+    raw.gameLogs.data.data.at(-1).data.push(
+      { uid: 'score', type: 'updateScore', log: '', args: { player_id: '1', points: 1 } },
+      {
+        uid: 'end',
+        type: 'gameStateChange',
+        log: '',
+        args: {
+          id: 99,
+          active_player: '1',
+          args: {
+            result: [1, 2, 3].map((id) => ({
+              id: String(id),
+              score: id === 1 ? 1 : 0,
+              rank: id === 1 ? 1 : 2,
+            })),
+          },
+        },
+      },
+    );
   const original = structuredClone(initial);
   const result = capture
     ? convertNetworkInputs(
@@ -233,6 +262,29 @@ test('prefix applies a uniquely observed legal operation and retains source chec
   assert.equal(result.teacherCertified, false);
 });
 
+test('terminal integer display uses the existing floor contract and never becomes an exact fractional checkpoint', () => {
+  const result = setup(false, false, false, null, true);
+  assert.equal(result.blocked, null);
+  assert.equal(result.terminalReached, true);
+  assert.equal(result.record.steps[0].checkpoint, undefined);
+  assert.equal(result.record.terminalDisplayCheckpoint.mode, 'floorTotal');
+  assert.equal(result.record.terminalDisplayCheckpoint.scores[0].total, 1);
+  const wrong = setup(
+    false,
+    false,
+    false,
+    (rawBytes) => {
+      const raw = JSON.parse(rawBytes),
+        data = raw.gameLogs.data.data.at(-1).data;
+      data.find((n) => n.uid === 'score').args.points = 2;
+      data.find((n) => n.uid === 'end').args.args.result[0].score = 2;
+      return bytes(raw);
+    },
+    true,
+  );
+  assert.match(wrong.blocked.reason, /public state mismatch/);
+});
+
 test('counter mismatch stops at the original move without repairing the native state', () => {
   const result = setup(true);
   assert.equal(result.blocked.moveId, 3);
@@ -245,6 +297,21 @@ test('actor mismatch stops before applying an operation', () => {
   assert.equal(result.blocked.moveId, 3);
   assert.match(result.blocked.reason, /actor mismatch/);
   assert.equal(result.record.steps.length, 0);
+});
+
+test('worker cap captions cannot create points without the owned-six-worker receipt', () => {
+  const worker = setup(false, false, false, (rawBytes) => {
+    const raw = JSON.parse(rawBytes);
+    raw.gameLogs.data.data.at(-1).data.push({
+      uid: 'cap',
+      type: 'workerLimit',
+      log: '${player_name} already have 6 workers',
+      args: { player_name: 'P1' },
+    });
+    return bytes(raw);
+  });
+  assert.match(worker.blocked.reason, /worker cap caption lacks/);
+  assert.equal(worker.record.steps.length, 0);
 });
 
 test('speed-up availability is never silently treated as a cosmetic board flip', () => {
@@ -324,7 +391,16 @@ test('calendar contradictions in days, consumption actor and unobserved renewal 
       ],
       /same-source double rotation/,
     ],
-    [[{ type: 'flipBoard', args: { player_id: '1', side: 0 } }], /renewal lacks/],
+    [
+      [
+        {
+          type: 'flipBoard',
+          log: '${player_name} flips his board lighter side up',
+          args: { player_id: '1', player_name: 'P1', side: 0 },
+        },
+      ],
+      /renewal lacks/,
+    ],
     [
       [
         { type: 'flipBoard', args: { player_id: '1', side: 1 } },
@@ -337,12 +413,74 @@ test('calendar contradictions in days, consumption actor and unobserved renewal 
       const raw = JSON.parse(rawBytes);
       raw.gameLogs.data.data
         .at(-1)
-        .data.push(...extra.map((n, i) => ({ ...n, log: '', uid: 'calendar-' + i })));
+        .data.push(...extra.map((n, i) => ({ log: '', ...n, uid: 'calendar-' + i })));
       return bytes(raw);
     });
     assert.match(result.blocked.reason, reason);
     assert.equal(result.blocked.afterState.round, 1);
   }
+});
+
+test('automatic building goods must match the same actor, building and queued resource effect', () => {
+  const entries = [
+    { type: 'construct', args: { player_id: '1', building: { id: '9', type: 'building_age_1' } } },
+    {
+      type: 'takeGoods',
+      args: { player_id: '1', origin: 'building_age_1_b9', type: 'corn', quantity: 1 },
+    },
+  ];
+  const pending = {
+    task: { type: 'resource', remaining: 2 },
+    after: [{ type: 'effects', effects: [{ type: 'resources', resources: { corn: 1 } }] }],
+  };
+  assert.deepEqual(queuedBuildingResources(entries, pending, '1').resources, { corn: 1 });
+  for (const mutate of [
+    (e) => (e[1].args.player_id = '2'),
+    (e) => (e[1].args.origin = 'technology_extraction_level_4'),
+    (e) => (e[1].args.quantity = 2),
+  ]) {
+    const bad = structuredClone(entries);
+    mutate(bad);
+    assert.equal(queuedBuildingResources(bad, pending, '1'), null);
+  }
+  const result = setup(false, false, false, (rawBytes) => {
+    const raw = JSON.parse(rawBytes);
+    raw.gameLogs.data.data.at(-1).data.push({
+      uid: 'caption',
+      type: 'theologyMax',
+      log: 'Theology bonus: ${player_name} takes a skull',
+      args: { player_name: 'P1' },
+    });
+    return bytes(raw);
+  });
+  assert.match(result.blocked.reason, /theology caption lacks/);
+  assert.equal(result.record.steps.length, 0);
+});
+
+test('Chichen route is selected by the observed fee and rejects multiple surviving paths', () => {
+  const paid = {
+    action: {
+      type: 'useAction',
+      gear: 'chichenItza',
+      position: 1,
+      source: 'currentGear',
+      cornCost: 8,
+    },
+  };
+  const ahead = {
+    action: {
+      type: 'useAction',
+      gear: 'chichenItza',
+      position: 10,
+      source: 'theologyAhead',
+      cornCost: 0,
+    },
+  };
+  assert.equal(observedChichenRoute([paid, ahead], 1, 8), 'direct');
+  assert.equal(observedChichenRoute([paid, ahead], 1, 0), 'theologyAhead');
+  assert.throws(() => observedChichenRoute([paid], 1, 0), /unavailable/);
+  const free = { action: { ...paid.action, cornCost: 0 } };
+  assert.throws(() => observedChichenRoute([free, ahead], 1, 0), /ambiguous/);
 });
 
 test('conversion consumes retained verified bytes after the backing file is replaced', (t) => {

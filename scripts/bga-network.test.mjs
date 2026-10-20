@@ -121,6 +121,9 @@ test('only the reviewed pre-checkpoint color preference caption is accepted', ()
   };
   f.gameLogs.data.data[0].data.push(note);
   assert.equal(parseNetworkReplay(bytes(f)).groups.length, 4);
+  note.log =
+    'Colors of ${players} have been chosen according to their preferences. ${change_preferences}';
+  assert.equal(parseNetworkReplay(bytes(f)).groups.length, 4);
   const late = structuredClone(f);
   late.gameLogs.data.data[0].data.pop();
   late.gameLogs.data.data[1].data.push(note);
@@ -139,6 +142,50 @@ test('board flips retain their state meaning and reject unknown actors or sides'
   );
   n.args.side = 2;
   assert.throws(() => parseNetworkReplay(bytes(f)), /invalid double-advance/);
+});
+
+test('theology bonus caption only accepts its reviewed template and a known source actor', () => {
+  const f = fixture(),
+    n = {
+      uid: 'theology',
+      type: 'theologyMax',
+      log: 'Theology bonus: ${player_name} takes a skull',
+      args: { player_name: 'P1' },
+    };
+  f.gameLogs.data.data.at(-1).data.push(n);
+  assert.equal(
+    parseNetworkReplay(bytes(f)).groups.at(-1).entries.at(-1).classification,
+    'technologyCaption',
+  );
+  n.args.player_name = 'Unknown';
+  assert.throws(() => parseNetworkReplay(bytes(f)), /unsupported theology caption/);
+});
+
+test('empty wakeup packets keep their null move and original order outside game decisions', () => {
+  const f = fixture(),
+    wake = {
+      channel: '/table/t123',
+      table_id: 123,
+      packet_id: '3',
+      packet_type: 'resend',
+      move_id: null,
+      time: '1',
+      data: [{ uid: 'wake', type: 'wakeupPlayers', log: '', args: [] }],
+    };
+  f.gameLogs.data.data.splice(2, 0, wake);
+  const result = parseNetworkReplay(bytes(f));
+  assert.deepEqual(
+    result.groups.map((g) => g.moveId),
+    [2, 3, 4, 5],
+  );
+  assert.equal(result.administrativeEntries[0].moveId, null);
+  assert.equal(result.administrativeEntries[0].packetIndex, 2);
+  assert.equal(result.entries.find((n) => n.packetId === 5).packetIndex, 3);
+  wake.data[0].args = { player_id: '1' };
+  assert.throws(() => parseNetworkReplay(bytes(f)), /administrative wakeup/);
+  wake.data[0].args = [];
+  wake.data[0].type = 'gameStateChange';
+  assert.throws(() => parseNetworkReplay(bytes(f)), /move ID/);
 });
 
 test('checkpoint must describe actual pre-distribution contents, not just a packet number', () => {

@@ -284,6 +284,7 @@ export function deriveNetworkInitial(index) {
     schema: 'tzolkin-bga-network-initial-preparation-v1',
     tableId: index.tableId,
     sourceRawSha256: index.rawSha256,
+    sourceActorIds: ring,
     sourceAnchor: {
       moveId: distribution.moveId,
       notifications: distribution.entries.map((n) => ({
@@ -597,6 +598,66 @@ function sourceCheckpoint(ledger, sourceToNative) {
   };
 }
 
+/** Distinguish the observed paid target from a free theology route without fitting final resources. */
+export function observedChichenRoute(rows, position, corn) {
+  const direct = rows.filter(
+    (r) =>
+      r.action.type === 'useAction' &&
+      r.action.gear === 'chichenItza' &&
+      r.action.position === position &&
+      r.action.cornCost === corn,
+  );
+  const ahead =
+    corn === 0 && position < 10
+      ? rows.filter(
+          (r) =>
+            r.action.type === 'useAction' &&
+            r.action.gear === 'chichenItza' &&
+            r.action.position === 10 &&
+            r.action.source === 'theologyAhead' &&
+            r.action.cornCost === 0,
+        )
+      : [];
+  if (direct.length + ahead.length !== 1)
+    fail('observed Chichen action has ambiguous or unavailable legal routes');
+  return direct.length === 1 ? 'direct' : 'theologyAhead';
+}
+
+/** Match source automatic building goods to an exact queued native effect, not a resource choice. */
+export function queuedBuildingResources(entries, pending, sourceId) {
+  const construct = entries.filter(
+    (n) => n.type === 'construct' && String(n.args.player_id) === sourceId,
+  );
+  const delayed = pending?.after?.[0];
+  if (
+    construct.length !== 1 ||
+    delayed?.type !== 'effects' ||
+    delayed.effects.length !== 1 ||
+    delayed.effects[0].type !== 'resources'
+  )
+    return null;
+  const b = construct[0].args.building;
+  const rewards = entries.filter(
+    (n) =>
+      n.type === 'takeGoods' &&
+      String(n.args.player_id) === sourceId &&
+      n.args.origin === `${b.type}_b${b.id}`,
+  );
+  const resources = {};
+  for (const n of rewards) {
+    if (
+      !R.includes(n.args.type) ||
+      !Number.isSafeInteger(Number(n.args.quantity)) ||
+      Number(n.args.quantity) < 1
+    )
+      return null;
+    resources[n.args.type] = (resources[n.args.type] ?? 0) + Number(n.args.quantity);
+  }
+  return rewards.length && key(resources) === key(delayed.effects[0].resources)
+    ? { resources, rewards }
+    : null;
+}
+
 /** Prove an early source designation against every currently legal native rotation. */
 export function proveCalendarDesignation(state, observation, entries, sourceToNative, dispatch) {
   const claimed = state.firstPlayerClaimed;
@@ -787,6 +848,58 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     const before = copy(native());
     const stepsBefore = record.steps.length;
     try {
+      for (const caption of group.entries.filter((n) => n.type === 'workerLimit')) {
+        assertActor(caption);
+        const actor = getActor(caption),
+          sourceId = [...sourceToNative].find(([, id]) => id === actor)?.[0];
+        const workerBuilding = group.entries.some(
+          (n) =>
+            n.type === 'construct' &&
+            getActor(n) === actor &&
+            catalog.BUILDINGS.find((b) => b.id === mapper.bind(n.args.building))?.effects.some(
+              (e) => e.type === 'worker',
+            ),
+        );
+        if (
+          native().players[actor].workers !== 6 ||
+          ledger.players[sourceId].workers !== 6 ||
+          !workerBuilding ||
+          group.entries.filter(
+            (n) => n.type === 'updateScore' && getActor(n) === actor && Number(n.args.points) === 6,
+          ).length !== 1
+        )
+          fail('worker cap caption lacks its owned-six-worker building and score receipt');
+      }
+      for (const caption of group.entries.filter((n) => n.type === 'theologyMax')) {
+        assertActor(caption);
+        const actor = getActor(caption),
+          sameActor = (n) => getActor(n) === actor;
+        if (
+          group.entries.filter(
+            (n) =>
+              n.type === 'increaseTechnology' &&
+              n.args.technology_id === 'theology' &&
+              Number(n.args.level) === 4 &&
+              sameActor(n),
+          ).length !== 1 ||
+          group.entries.filter(
+            (n) =>
+              n.type === 'decreaseTechnology' &&
+              n.args.technology_id === 'theology' &&
+              Number(n.args.level) === 3 &&
+              sameActor(n),
+          ).length !== 1 ||
+          group.entries.filter(
+            (n) =>
+              n.type === 'takeGoods' &&
+              n.args.type === 'skull' &&
+              Number(n.args.quantity) === 1 &&
+              n.args.origin === 'technology_theology_level_4' &&
+              sameActor(n),
+          ).length !== 1
+        )
+          fail('theology caption lacks its capped advance and skull receipt');
+      }
       const rotations = group.entries.filter((n) => n.type === 'rotateWheel');
       const flips = group.entries.filter((n) => n.type === 'flipBoard');
       const payouts = group.entries.filter((n) => n.type === 'firstPlayerCorn');
@@ -918,9 +1031,50 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               (x) => x.type === 'remove' && x.gear === gear && x.position === Number(a.position),
               'observed worker removal',
             );
+            let observedCorn = null;
+            if (gear === 'chichenItza') {
+              const paid = group.entries
+                .filter(
+                  (e) =>
+                    e.type === 'payGoods' &&
+                    e.args.type === 'corn' &&
+                    String(e.args.player_id) === String(a.player_id),
+                )
+                .reduce((sum, e) => sum + Number(e.args.quantity), 0);
+              observedCorn = Number(a.corn ?? paid);
+              if (
+                !Number.isSafeInteger(observedCorn) ||
+                observedCorn < 0 ||
+                (paid > 0 && paid !== observedCorn)
+              )
+                fail('Chichen action corn receipt mismatch');
+              if (
+                observedChichenRoute(actions(), Number(a.action_number), observedCorn) ===
+                'theologyAhead'
+              ) {
+                applyWhere(
+                  (x) =>
+                    x.type === 'useAction' &&
+                    x.gear === gear &&
+                    x.position === 10 &&
+                    x.source === 'theologyAhead' &&
+                    x.cornCost === 0,
+                  'observed zero-cost Chichen target requires the legal theology-ahead continuation',
+                  refills,
+                );
+                const structural = audit.at(-1);
+                structural.derivedFromVisibleBoundary = null;
+                structural.sourceLabelBindingUnavailable = true;
+                structural.sourceLabelBindingReason =
+                  'Structural theology-ahead route; only the final Chichen target is observed.';
+              }
+            }
             applyWhere(
               (x) =>
-                x.type === 'useAction' && x.gear === gear && x.position === Number(a.action_number),
+                x.type === 'useAction' &&
+                x.gear === gear &&
+                x.position === Number(a.action_number) &&
+                (observedCorn === null || x.cornCost === observedCorn),
               'observed gear action',
               refills,
             );
@@ -977,6 +1131,18 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
                   ),
               'observed temple choice',
             );
+          } else if (
+            n.type === 'takeGoods' &&
+            native().pending?.task.type === 'resource' &&
+            queuedBuildingResources(
+              group.entries,
+              native().pending,
+              String(a.player_id),
+            )?.rewards.includes(n)
+          ) {
+            assertActor(n);
+            // Source already displays these goods; native queues them after the resource choice.
+            continue;
           } else if (n.type === 'takeGoods' && native().pending?.task.type === 'resource') {
             assertActor(n);
             for (let i = 0; i < Number(a.quantity); i++)
@@ -1018,6 +1184,42 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               );
           } else if (n.type === 'construct') {
             assertActor(n);
+            if (
+              native().pending?.task.type === 'trade' &&
+              native().pending.after?.some((t) => t.type === 'build' && t.remaining > 0)
+            ) {
+              applyWhere(
+                (x) => x.type === 'skip',
+                'observed next construction closes prior optional market',
+                refills,
+              );
+              if (native().pending?.task.type !== 'build')
+                fail('market exit did not reach the witnessed construction');
+              if (openRewardFence) {
+                const f = openRewardFence,
+                  id = sourceToNative.get(f.sourceId),
+                  observed = ledger.players[f.sourceId],
+                  actual = native().players[id];
+                const outstanding = f.points
+                  ? [{ type: 'points', amount: f.points }]
+                  : [{ type: 'resources', resources: f.resources }];
+                const queued = native().pending.after?.some(
+                  (t) => t.type === 'effects' && key(t.effects) === key(outstanding),
+                );
+                if (
+                  id === frame.observation.actor &&
+                  !queued &&
+                  Object.entries(f.resources).every(
+                    ([r]) => observed.resources[r] === actual.resources[r],
+                  ) &&
+                  (!f.resources.skull || ledger.skullSupply === native().skullSupply) &&
+                  (!f.points || observed.score === Math.floor(actual.score))
+                ) {
+                  f.resolvedMoveId = group.moveId;
+                  openRewardFence = null;
+                }
+              }
+            }
             const id = mapper.bind(a.building);
             const candidates = actions().filter(
               (x) => ['build', 'monument'].includes(x.action.type) && x.action.id === id,
@@ -1103,13 +1305,36 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             applyWhere((x) => x.type === 'skip', 'observed return to worker selection', refills);
       }
       for (const n of group.entries) updateLedger(ledger, n, mapper);
+      if (native().phase === 'finished') {
+        const result = group.entries.find(
+          (n) => n.type === 'gameStateChange' && Number(n.args.id) === 99,
+        )?.args.args?.result;
+        if (Array.isArray(result))
+          record.terminalDisplayCheckpoint = {
+            source: { reference: index.sourceUrl, actionIds: [group.moveId] },
+            mode: 'floorTotal',
+            scores: result.map((p) => ({
+              playerId: sourceToNative.get(String(p.id)),
+              total: Number(p.score),
+              rank: Number(p.rank),
+            })),
+          };
+      }
       let diff = differences(ledger, native(), sourceToNative);
       const originalDiff = copy(diff);
+      const sourceActor = [...sourceToNative].find(
+        ([, id]) => id === frame.observation?.actor,
+      )?.[0];
+      const queuedResourceReceipt =
+        native().pending?.task.type === 'resource'
+          ? queuedBuildingResources(group.entries, native().pending, sourceActor)
+          : null;
       if (
         !openRewardFence &&
         group.entries.some((n) => n.type === 'construct') &&
         ((native().pending?.task.type === 'technology' && native().pending.task.free === true) ||
-          ['trade', 'anyAction'].includes(native().pending?.task.type))
+          ['trade', 'anyAction'].includes(native().pending?.task.type) ||
+          queuedResourceReceipt !== null)
       ) {
         const delayed = native().pending.after?.[0];
         const rewards = group.entries.filter(
@@ -1136,8 +1361,9 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               points: 0,
               resolvedMoveId: null,
               excludedMoveIds: [],
-              reason:
-                'source building resources precede free technology; native effects task follows it',
+              reason: queuedResourceReceipt
+                ? 'source building resources precede its resource choice; native queued effects follow it'
+                : 'source building resources precede free technology; native effects task follows it',
             };
             timingFences.push(openRewardFence);
           }
@@ -1287,7 +1513,13 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         openRotationFence.resolvedMoveId = group.moveId;
         openRotationFence = null;
       }
-      if (originalDiff.length === 0 && record.steps.length > stepsBefore)
+      // Finished BGA scores are integer display totals, not exact native fractional scores.
+      // The existing floorTotal terminal contract above retains that measurement without promotion.
+      if (
+        originalDiff.length === 0 &&
+        record.steps.length > stepsBefore &&
+        native().phase !== 'finished'
+      )
         record.steps.at(-1).checkpoint = {
           source: { reference: index.sourceUrl, actionIds: [group.moveId] },
           expected: sourceCheckpoint(ledger, sourceToNative),
