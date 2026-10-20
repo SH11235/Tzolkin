@@ -8,6 +8,7 @@ export function networkEvidenceReport({
   dataset = null,
   loader = null,
   error = null,
+  sourcePin = null,
 }) {
   const reasons = [];
   if (error)
@@ -154,6 +155,16 @@ export function networkEvidenceReport({
       sourceAnchor: prepared?.sourceAnchor ?? null,
       fullSourceCoverage:
         coverage === null ? 'notEvaluated' : coverage.initial ? 'passed' : 'notEstablished',
+      sourceCoverageCheck: prefix?.initialCoverageEvidence
+        ? {
+            ...prefix.initialCoverageEvidence,
+            sourceInput: sourcePin,
+            state: coverage === null ? 'notEvaluated' : coverage.initial ? 'passed' : 'failed',
+            nativeCheck: 'publicReplay.initialCheckpoint/covers_source_board',
+            nativeFrameIndex: 0,
+            qualificationRaised: false,
+          }
+        : { state: 'notConnected' },
     },
     native: {
       state: prefix ? (terminal?.phase === 'finished' ? 'terminalReached' : 'stopped') : 'notRun',

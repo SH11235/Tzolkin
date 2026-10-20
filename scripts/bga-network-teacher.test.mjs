@@ -10,6 +10,7 @@ import { networkEvidenceReport } from './bga-network-report.mjs';
 let artifactCase = null;
 const terminalReport = () => ({
   frames: [{ snapshot: { state: { phase: 'finished', foodDays: [] } } }],
+  ...(artifactCase === 'initialCoverage' ? { sourceCoverage: { initial: false } } : {}),
 });
 // Isolated native tool doubles exercise publication failures, not source authentication.
 mock.module(new URL('./bga-replay.mjs', import.meta.url).href, {
@@ -267,7 +268,7 @@ test('literal final display keeps original IDs and refuses missing or contradict
 });
 
 test('rejected generated artifacts do not leak samples or readiness into common evidence', async (t) => {
-  for (const kind of ['manifest', 'counts', 'inspection'])
+  for (const kind of ['manifest', 'counts', 'inspection', 'initialCoverage'])
     await t.test(kind, async (sub) => {
       artifactCase = kind;
       const { put, root } = await temporary(sub),
@@ -293,6 +294,7 @@ test('rejected generated artifacts do not leak samples or readiness into common 
         timingFences: [],
         blocked: null,
         clientContract: {},
+        ...(kind === 'initialCoverage' ? { initialCoverageEvidence: {} } : {}),
       };
       const result = await buildNetworkTeacher(
         {
@@ -319,7 +321,10 @@ test('rejected generated artifacts do not leak samples or readiness into common 
         loader: result.loader,
         error: result.error,
       });
-      assert.equal(result.status.producer.state, 'accepted');
+      assert.equal(
+        result.status.producer.state,
+        kind === 'initialCoverage' ? 'notRun' : 'accepted',
+      );
       assert.equal(result.loader, null);
       assert.equal(report.candidates.trainingReady, null);
       assert.equal(result.dataset, null);
@@ -328,6 +333,12 @@ test('rejected generated artifacts do not leak samples or readiness into common 
       if (kind === 'inspection') {
         assert.equal(result.status.loader.state, 'rejected');
         assert.match(result.error.reason, /Read-only loader contract violated/);
+      }
+      if (kind === 'initialCoverage') {
+        assert.equal(result.status.manifest.state, 'notGenerated');
+        assert.equal(result.status.loader.state, 'notRun');
+        assert.equal(result.error.code, 'canonicalNativeReplayRejected');
+        assert.match(result.error.reason, /initial board checkpoint is not fully covered/);
       }
     });
 });

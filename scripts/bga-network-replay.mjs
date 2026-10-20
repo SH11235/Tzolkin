@@ -598,6 +598,117 @@ function sourceCheckpoint(ledger, sourceToNative) {
   };
 }
 
+/** Complete only the untouched four-player boundary from independent source facts.
+ * Later checkpoints have different calendar/turn timing and deliberately stay partial.
+ */
+export function initialSourceBoardCheckpoint(index, ledger, sourceToNative) {
+  const source = index.initial;
+  const distribution = index.groups.find((g) => g.entries.some((n) => n.type === 'wealthTiles'));
+  const boundary = distribution?.entries.findLast(
+    (n) => n.type === 'gameStateChange' && Number(n.args.id) === 4,
+  );
+  if (
+    sourceToNative.size !== 4 ||
+    Number(source.day) !== 0 ||
+    Number(source.nextFoodDay) !== 7 ||
+    Number(source.gamestate.id) !== 2 ||
+    ledger.day !== 0 ||
+    ledger.stateId !== 4 ||
+    !boundary ||
+    String(boundary.args.active_player) !== ledger.firstPlayer ||
+    ledger.activePlayer !== ledger.firstPlayer ||
+    !Array.isArray(source.skulls) ||
+    source.skulls.length !== 0 ||
+    source.buildings.length === 0 ||
+    source.buildings.some((c) => c.type !== 'building_age_1') ||
+    new Set(source.workers.map((w) => String(w.id))).size !== source.workers.length ||
+    [...sourceToNative.keys()].some(
+      (id) => source.workers.filter((w) => String(w.player) === id).length !== 3,
+    ) ||
+    [...ledger.workers.values()].some(
+      (w) => !sourceToNative.has(String(w.player)) || w.place !== null || w.position !== null,
+    ) ||
+    Object.values(ledger.players).some((p) => p.wealth.length !== 2) ||
+    index.groups
+      .filter((g) => g.moveId <= distribution.moveId)
+      .some((g) =>
+        g.entries.some((n) => ['rotateWheel', 'foodDayCost', 'placeWorker'].includes(n.type)),
+      )
+  )
+    fail('initial source coverage requires untouched post-wealth Playing boundary');
+  const expected = sourceCheckpoint(ledger, sourceToNative);
+  const first = source.playerorder.findIndex((id) => String(id) === ledger.firstPlayer);
+  const order = [...source.playerorder.slice(first), ...source.playerorder.slice(0, first)].map(
+    (id) => sourceToNative.get(String(id)),
+  );
+  if (first < 0 || order.some((id) => id === undefined)) fail('initial source turn order');
+  Object.assign(expected, {
+    round: Number(source.day) + 1,
+    age: 1,
+    foodDays: [],
+    currentPlayer: sourceToNative.get(String(boundary.args.active_player)),
+    turnOrder: order,
+    turnIndex: order.indexOf(sourceToNative.get(String(boundary.args.active_player))),
+  });
+  // Every source worker belongs to a real roster member, with no neutral placement.
+  // Initial gear slots are empty; no native slot or inferred worker is copied here.
+  return {
+    expected,
+    evidence: {
+      state: 'connected',
+      sourceRawSha256: index.rawSha256,
+      moveId: distribution.moveId,
+      boundary: {
+        packetIndex: boundary.packetIndex,
+        notificationIndex: boundary.notificationIndex,
+        uid: boundary.uid,
+        type: boundary.type,
+        field: 'args.id/active_player',
+      },
+      sourceFields: [
+        'initialState.day',
+        'initialState.nextFoodDay',
+        'initialState.gamestate.id',
+        'initialState.playerorder',
+        'initialState.firstPlayer',
+        'initialState.players',
+        'initialState.workers',
+        'initialState.gears',
+        'initialState.jungle',
+        'initialState.skulls',
+        'initialState.remainingSkulls',
+        'initialState.cornOnWheel',
+        'initialState.buildings',
+        'initialState.monuments',
+        'initialState.wealthTiles',
+        'initialState.constructions',
+      ],
+      notifications: index.groups
+        .filter((g) => g.moveId <= distribution.moveId)
+        .flatMap((g) =>
+          g.entries.map((n) => ({
+            packetIndex: n.packetIndex,
+            notificationIndex: n.notificationIndex,
+            uid: n.uid,
+            type: n.type,
+          })),
+        ),
+      comparedFields: Object.keys(expected),
+      interpretations: {
+        round: 'initialState.day + 1, with day=0 and no earlier rotation',
+        age: 'day=0 and every original visible building is building_age_1',
+        foodDays: 'day=0, original nextFoodDay=7, and no earlier feeding or rotation',
+        turnOrder: 'initialState.playerorder rotated to original firstPlayer, mapped by roster IDs',
+        turnIndex: 'position of the last original state4 active_player in that order',
+        gears: 'original workers all have null place/position, with no placement before state4',
+        skullSpaces: 'original skull placement list is empty, with no play before state4',
+      },
+      scope:
+        'First Playing after two wealth tiles per actor; calendar interpretation uses the declared basic profile, not authenticated options. Initial board/counters are from the source ledger, never native output.',
+    },
+  };
+}
+
 /** Distinguish the observed paid target from a free theology route without fitting final resources. */
 export function observedChichenRoute(rows, position, corn) {
   const direct = rows.filter(
@@ -762,6 +873,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     source: copy(record.source),
     expected: sourceCheckpoint(ledger, sourceToNative),
   };
+  let initialCoverageEvidence = null;
+  if (sourceToNative.size === 4) {
+    const connected = initialSourceBoardCheckpoint(index, ledger, sourceToNative);
+    record.initialCheckpoint.expected = connected.expected;
+    initialCoverageEvidence = connected.evidence;
+  }
   let frame = dispatch({ operation: 'publicInspect', state: initial });
   if (frame.error) fail(frame.error);
   let calls = 1;
@@ -1563,6 +1680,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         audit,
         calls,
         clientContract,
+        initialCoverageEvidence,
         cancellationClusters: clusters,
         timingFences,
         calendarTransitions,
@@ -1592,6 +1710,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     audit,
     calls,
     clientContract,
+    initialCoverageEvidence,
     cancellationClusters: clusters,
     timingFences,
     calendarTransitions,

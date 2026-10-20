@@ -109,6 +109,8 @@ export async function runNetworkHandoff({
     nativeReport = coreDispatcher(core)({ operation: 'publicReplay', replay: prefix.record });
     if (nativeReport.error) throw new Error(nativeReport.error);
     await put('native-report.json', nativeReport);
+    if (prefix.initialCoverageEvidence && nativeReport.sourceCoverage?.initial !== true)
+      throw new Error('Original initial board checkpoint is not fully covered');
     if (onReplay) teacher = await onReplay({ ...context, prefix, nativeReport, output });
   } catch (e) {
     error = { code: 'pipelineStopped', reason: e.message };
@@ -118,6 +120,7 @@ export async function runNetworkHandoff({
     index,
     prepared,
     prefix,
+    sourcePin: context.receipt.raw,
     nativeReport: teacher?.nativeReport ?? nativeReport,
     error: teacher?.error ?? error,
     dataset: teacher?.dataset ?? null,
