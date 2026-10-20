@@ -13,6 +13,12 @@ const TEMPLE = ['chaac', 'quetzalcoatl', 'kukulcan'];
 const temple = (x) => (x === 'kukulcan' ? 'kukulkan' : x);
 const category = (x) => ({ tomb: 'graveyard', civic: 'municipal' })[x] ?? x;
 const copy = structuredClone;
+const sourcePosition = (value, teeth) =>
+  ['number', 'string'].includes(typeof value) &&
+  /^(0|[1-9]\d*)$/.test(String(value)) &&
+  Number.isSafeInteger(Number(value)) &&
+  Number.isSafeInteger(teeth) &&
+  Number(value) < teeth;
 const fail = (message) => {
   throw new Error(`Network native: ${message}`);
 };
@@ -187,8 +193,12 @@ export function networkCardMapper(initial, seed = null) {
 /** Direct first-Playing projection; source options and teacher qualification remain separate. */
 export function deriveNetworkInitial(index) {
   const source = index.initial;
-  if (Object.keys(source.players).length !== 4)
-    fail('unconnected three-player neutral setup evidence');
+  const playerCount = Object.keys(source.players).length;
+  if (
+    ![3, 4].includes(playerCount) ||
+    source.workers.filter((w) => w.player === null).length !== (4 - playerCount) * 6
+  )
+    fail('source neutral setup count does not match the original roster');
   const distribution = index.groups.find((g) => g.entries.some((n) => n.type === 'wealthTiles'));
   if (!distribution) fail('missing original wealth distribution');
   const mapper = networkCardMapper(source);
@@ -240,7 +250,8 @@ export function deriveNetworkInitial(index) {
     };
   });
   for (const slots of Object.values(geometry.gears))
-    for (let i = 0; i < slots.length; i++) if (slots[i]) slots[i].dummy = false;
+    for (let i = 0; i < slots.length; i++)
+      if (slots[i] && slots[i].playerId !== -1) slots[i].dummy = false;
   const total = (age) => {
     const values = Object.values(source.constructions[`building_age_${age}`]);
     for (const def of values) {
@@ -352,6 +363,22 @@ function initialLedger(index) {
   };
 }
 
+export function validateNeutralNetworkRotation(workers, gears, args) {
+  for (const old of workers.values()) {
+    if (old.player !== null) continue;
+    const observed = args.workers.filter((w) => String(w.id) === String(old.id));
+    const teeth = Number(gears[old.place]?.teethnbr);
+    if (
+      observed.length !== 1 ||
+      observed[0].player !== null ||
+      observed[0].place !== old.place ||
+      !sourcePosition(observed[0].position, teeth) ||
+      Number(observed[0].position) !== (Number(old.position) + 1 + args.twice) % teeth
+    )
+      fail('neutral rotation identity/position differs from the original gear advance');
+  }
+}
+
 function updateLedger(ledger, entry, mapper) {
   const a = entry.args;
   const playerId = a.player_id === undefined ? null : String(a.player_id);
@@ -414,15 +441,14 @@ function updateLedger(ledger, entry, mapper) {
       Number(a.day) !== ledger.day + 1 + a.twice
     )
       fail('unsupported calendar advance');
+    validateNeutralNetworkRotation(ledger.workers, ledger.initial.gears, a);
     ledger.day = Number(a.day);
     for (const w of a.workers) {
       const old = ledger.workers.get(String(w.id));
       if (!old || String(old.player) !== String(w.player)) fail('rotation worker identity');
       if (
         !Object.hasOwn(ledger.initial.gears, w.place) ||
-        !Number.isSafeInteger(Number(w.position)) ||
-        Number(w.position) < 0 ||
-        Number(w.position) >= Number(ledger.initial.gears[w.place].teethnbr)
+        !sourcePosition(w.position, Number(ledger.initial.gears[w.place].teethnbr))
       )
         fail('rotation worker position');
       ledger.workers.set(String(w.id), copy(w));
@@ -529,7 +555,9 @@ function differences(ledger, state, sourceToNative) {
   for (const [gear, slots] of Object.entries(state.gears)) {
     const observed = Array.from({ length: slots.length }, () => null);
     for (const w of ledger.workers.values())
-      if (w.place === gear) observed[Number(w.position)] = sourceToNative.get(String(w.player));
+      if (w.place === gear)
+        observed[Number(w.position)] =
+          w.player === null ? -1 : sourceToNative.get(String(w.player));
     check(
       `gear.${gear}`,
       observed,
@@ -582,7 +610,10 @@ function sourceCheckpoint(ledger, sourceToNative) {
   );
   for (const w of ledger.workers.values())
     if (w.place && w.place !== 'startingPlayer')
-      gears[w.place][Number(w.position)] = { playerId: sourceToNative.get(String(w.player)) };
+      gears[w.place][Number(w.position)] =
+        w.player === null
+          ? { playerId: -1, dummy: true }
+          : { playerId: sourceToNative.get(String(w.player)) };
   const claimed = [...ledger.workers.values()].find((w) => w.place === 'startingPlayer');
   return {
     players,
@@ -598,7 +629,7 @@ function sourceCheckpoint(ledger, sourceToNative) {
   };
 }
 
-/** Complete only the untouched four-player boundary from independent source facts.
+/** Complete only the untouched base-game boundary from independent source facts.
  * Later checkpoints have different calendar/turn timing and deliberately stay partial.
  */
 export function initialSourceBoardCheckpoint(index, ledger, sourceToNative) {
@@ -608,7 +639,7 @@ export function initialSourceBoardCheckpoint(index, ledger, sourceToNative) {
     (n) => n.type === 'gameStateChange' && Number(n.args.id) === 4,
   );
   if (
-    sourceToNative.size !== 4 ||
+    ![3, 4].includes(sourceToNative.size) ||
     Number(source.day) !== 0 ||
     Number(source.nextFoodDay) !== 7 ||
     Number(source.gamestate.id) !== 2 ||
@@ -622,11 +653,14 @@ export function initialSourceBoardCheckpoint(index, ledger, sourceToNative) {
     source.buildings.length === 0 ||
     source.buildings.some((c) => c.type !== 'building_age_1') ||
     new Set(source.workers.map((w) => String(w.id))).size !== source.workers.length ||
+    source.workers.filter((w) => w.player === null).length !== (4 - sourceToNative.size) * 6 ||
     [...sourceToNative.keys()].some(
       (id) => source.workers.filter((w) => String(w.player) === id).length !== 3,
     ) ||
-    [...ledger.workers.values()].some(
-      (w) => !sourceToNative.has(String(w.player)) || w.place !== null || w.position !== null,
+    [...ledger.workers.values()].some((w) =>
+      w.player === null
+        ? sourceToNative.size !== 3 || !Object.hasOwn(source.gears, w.place)
+        : !sourceToNative.has(String(w.player)) || w.place !== null || w.position !== null,
     ) ||
     Object.values(ledger.players).some((p) => p.wealth.length !== 2) ||
     index.groups
@@ -650,8 +684,7 @@ export function initialSourceBoardCheckpoint(index, ledger, sourceToNative) {
     turnOrder: order,
     turnIndex: order.indexOf(sourceToNative.get(String(boundary.args.active_player))),
   });
-  // Every source worker belongs to a real roster member, with no neutral placement.
-  // Initial gear slots are empty; no native slot or inferred worker is copied here.
+  // Original null-owned workers retain their own source gear positions and neutral marker.
   return {
     expected,
     evidence: {
@@ -700,7 +733,8 @@ export function initialSourceBoardCheckpoint(index, ledger, sourceToNative) {
         foodDays: 'day=0, original nextFoodDay=7, and no earlier feeding or rotation',
         turnOrder: 'initialState.playerorder rotated to original firstPlayer, mapped by roster IDs',
         turnIndex: 'position of the last original state4 active_player in that order',
-        gears: 'original workers all have null place/position, with no placement before state4',
+        gears:
+          'owned source workers are unplaced; null-owned neutral workers retain original gear positions, with no placement before state4',
         skullSpaces: 'original skull placement list is empty, with no play before state4',
       },
       scope:
@@ -767,6 +801,41 @@ export function queuedBuildingResources(entries, pending, sourceId) {
   return rewards.length && key(resources) === key(delayed.effects[0].resources)
     ? { resources, rewards }
     : null;
+}
+
+/** Corn-payment discount names may be indistinguishable; prove every complete outcome equal. */
+export function proveEquivalentCornBuilds(rows, task, apply) {
+  const comparable = (row) => {
+    const rest = { ...row.action };
+    delete rest.discountResource;
+    return rest;
+  };
+  if (
+    task?.type !== 'build' ||
+    task.cornPayment !== true ||
+    rows.length < 2 ||
+    rows.length > 3 ||
+    rows.some(
+      (r) =>
+        r.action.type !== 'build' ||
+        r.action.architecture !== true ||
+        !['wood', 'stone', 'gold'].includes(r.action.discountResource) ||
+        r.action.cost.slice(1).some((n) => n !== 0) ||
+        !isDeepStrictEqual(comparable(r), comparable(rows[0])),
+    ) ||
+    new Set(rows.map((r) => r.action.discountResource)).size !== rows.length
+  )
+    fail('construction alternatives lack the same observed corn-payment contract');
+  const ordered = rows
+    .slice()
+    .sort((a, b) => R.indexOf(a.action.discountResource) - R.indexOf(b.action.discountResource));
+  const responses = ordered.map(apply);
+  if (
+    responses.some((r) => r.error || !r.snapshot?.state || !r.observation) ||
+    responses.slice(1).some((r) => !isDeepStrictEqual(r, responses[0]))
+  )
+    fail('construction alternatives have different complete native outcomes');
+  return { row: ordered[0], response: responses[0], equivalentChoices: rows.length };
 }
 
 /** Prove an early source designation against every currently legal native rotation. */
@@ -874,7 +943,13 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     expected: sourceCheckpoint(ledger, sourceToNative),
   };
   let initialCoverageEvidence = null;
-  if (sourceToNative.size === 4) {
+  // Full board coverage needs canonical source geometry; reduced structural projections remain partial.
+  if (
+    sourceToNative.size === 4 ||
+    ['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'].every((g) =>
+      Object.hasOwn(index.initial.gears, g),
+    )
+  ) {
     const connected = initialSourceBoardCheckpoint(index, ledger, sourceToNative);
     record.initialCheckpoint.expected = connected.expected;
     initialCoverageEvidence = connected.evidence;
@@ -891,19 +966,39 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
   let current = null;
   const native = () => frame.snapshot.state;
   const actions = () => frame.observation?.legalActions ?? [];
-  function applyWhere(predicate, reason, refills = { currentAge: [], age2: [] }) {
+  function applyWhere(
+    predicate,
+    reason,
+    refills = { currentAge: [], age2: [] },
+    cornEquivalent = false,
+  ) {
     const rows = actions().filter((row) => predicate(row.action));
-    if (rows.length !== 1) fail(`${reason}: expected one legal action, found ${rows.length}`);
-    if (++calls > 4000) fail('native call bound');
-    const row = rows[0],
-      actor = frame.observation.actor;
-    const response = dispatch({
-      operation: 'publicApply',
-      state: native(),
-      actor,
-      move: row.move,
-      refills,
-    });
+    const actor = frame.observation.actor,
+      preState = native();
+    const apply = (row) => {
+      if (++calls > 4000) fail('native call bound');
+      return dispatch({
+        operation: 'publicApply',
+        state: preState,
+        actor,
+        move: row.move,
+        refills,
+      });
+    };
+    let row,
+      response,
+      equivalentChoices = 1;
+    if (rows.length !== 1) {
+      if (!cornEquivalent) fail(`${reason}: expected one legal action, found ${rows.length}`);
+      ({ row, response, equivalentChoices } = proveEquivalentCornBuilds(
+        rows,
+        native().pending?.task,
+        apply,
+      ));
+    } else {
+      row = rows[0];
+      response = apply(row);
+    }
     if (response.error) fail(response.error);
     record.steps.push({
       actor,
@@ -918,8 +1013,19 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       actor,
       reason,
       action: copy(row.action),
-      equivalentChoices: 1,
-      derivedFromVisibleBoundary: row.action.type === 'endTurn' || row.action.type === 'skip',
+      equivalentChoices,
+      ...(equivalentChoices > 1
+        ? {
+            equivalentCandidateMoves: rows.map((r) => copy(r.move)),
+            equivalenceReason:
+              'Every original legal candidate has the same complete native response from one pre-state/actor/refill input.',
+            sourceLabelBindingUnavailable: true,
+            sourceLabelBindingReason:
+              'Corn discount names are not observed; all complete native outcomes are identical.',
+          }
+        : {}),
+      derivedFromVisibleBoundary:
+        equivalentChoices > 1 ? null : row.action.type === 'endTurn' || row.action.type === 'skip',
       source: current.entries.map((n) => ({
         packetIndex: n.packetIndex,
         notificationIndex: n.notificationIndex,
@@ -1363,6 +1469,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
                   x.architecture === architectureCorn),
               'observed construction cost and architecture bonus',
               refills,
+              true,
             );
           } else if (n.type === 'gameStateChange' && Number(a.id) === 90) {
             for (let i = 0; native().pending && i < 4; i++)

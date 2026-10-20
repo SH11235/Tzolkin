@@ -26,6 +26,8 @@ const {
   queuedBuildingResources,
   observedChichenRoute,
   initialSourceBoardCheckpoint,
+  validateNeutralNetworkRotation,
+  proveEquivalentCornBuilds,
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
@@ -125,6 +127,143 @@ test('initial full-board claims use post-wealth source counters and original act
       .corn,
     4,
   );
+});
+
+test('three-player initial coverage retains six source neutral slots without adding a player', () => {
+  const f = initialCoverageFixture(),
+    source = f.index.initial;
+  f.sourceToNative = new Map([
+    ['3', 0],
+    ['1', 1],
+    ['2', 2],
+  ]);
+  source.playerorder = [1, 2, 3];
+  source.workers = source.workers.filter((w) => w.player !== '4');
+  delete f.ledger.players['4'];
+  for (const [i, position] of [0, 1, 2, 5, 6, 7].entries())
+    source.workers.push({
+      id: String(10 + i),
+      player: null,
+      place: 'uxmal',
+      position: String(position),
+    });
+  f.ledger.workers = new Map(source.workers.map((w) => [w.id, w]));
+  const result = initialSourceBoardCheckpoint(f.index, f.ledger, f.sourceToNative);
+  assert.equal(result.expected.players.length, 3);
+  assert.equal(result.expected.gears.uxmal.filter((w) => w?.dummy).length, 6);
+  assert.ok(result.expected.gears.uxmal.filter(Boolean).every((w) => w.playerId === -1));
+  for (const count of [5, 7]) {
+    const bad = structuredClone(f);
+    bad.index.initial.workers = bad.index.initial.workers
+      .filter((w) => w.player !== null)
+      .concat(
+        Array.from({ length: count }, (_, i) => ({
+          id: String(30 + i),
+          player: null,
+          place: 'uxmal',
+          position: String(i),
+        })),
+      );
+    assert.throws(
+      () => initialSourceBoardCheckpoint(bad.index, bad.ledger, bad.sourceToNative),
+      /untouched post-wealth/,
+    );
+  }
+});
+
+test('three-player source neutral slots keep null ownership and wrap by the original gear geometry', () => {
+  const workers = new Map([
+    ['10', { id: '10', player: null, place: 'tikal', position: '9' }],
+    ['11', { id: '11', player: null, place: 'chichenItza', position: '12' }],
+  ]);
+  const gears = { tikal: { teethnbr: 10 }, chichenItza: { teethnbr: 13 } };
+  const args = {
+    twice: 1,
+    workers: [
+      { id: '10', player: null, place: 'tikal', position: '1' },
+      { id: '11', player: null, place: 'chichenItza', position: '1' },
+    ],
+  };
+  validateNeutralNetworkRotation(workers, gears, args);
+  const wrap = { twice: 0, workers: args.workers.map((w) => ({ ...w, position: '0' })) };
+  validateNeutralNetworkRotation(workers, gears, wrap);
+  for (const invalidZero of [null, '', false]) {
+    const bad = structuredClone(wrap);
+    bad.workers[0].position = invalidZero;
+    assert.throws(
+      () => validateNeutralNetworkRotation(workers, gears, bad),
+      /neutral rotation identity/,
+    );
+  }
+  for (const change of [
+    (a) => a.workers.pop(),
+    (a) => a.workers.push({ ...a.workers[0] }),
+    (a) => (a.workers[0].player = '1'),
+    (a) => (a.workers[0].position = '0'),
+    (a) => (a.workers[0].place = 'chichenItza'),
+  ]) {
+    const bad = structuredClone(args);
+    change(bad);
+    assert.throws(
+      () => validateNeutralNetworkRotation(workers, gears, bad),
+      /neutral rotation identity/,
+    );
+  }
+});
+
+test('corn-only construction variants need identical descriptors and complete outcomes, with a stable unlabelled representative', () => {
+  const rows = ['gold', 'wood'].map((discountResource) => ({
+    action: {
+      type: 'build',
+      id: 'b1',
+      cost: [4, 0, 0, 0, 0],
+      architecture: true,
+      discountResource,
+      renovation: null,
+    },
+    move: { type: 'choose', choiceId: `build:b1:${discountResource}` },
+  }));
+  const task = { type: 'build', cornPayment: true };
+  const response = {
+    snapshot: { state: { pending: null, resources: { corn: 2 } } },
+    observation: { actor: 0, legalActions: [] },
+  };
+  const proof = proveEquivalentCornBuilds(rows, task, () => structuredClone(response));
+  assert.equal(proof.row.action.discountResource, 'wood');
+  assert.equal(proof.equivalentChoices, 2);
+  for (const change of [
+    (r) => (r[0].action.renovation = 'another-building'),
+    (r) => r[0].action.cost[0]++,
+    (r) => (r[0].action.id = 'b2'),
+    (r) => (r[0].action.architecture = false),
+  ]) {
+    const bad = structuredClone(rows);
+    change(bad);
+    assert.throws(
+      () => proveEquivalentCornBuilds(bad, task, () => response),
+      /corn-payment contract/,
+    );
+  }
+  assert.throws(
+    () => proveEquivalentCornBuilds(rows, { ...task, cornPayment: false }, () => response),
+    /corn-payment contract/,
+  );
+  for (const change of [
+    (r) => r.snapshot.state.resources.corn++,
+    (r) => (r.snapshot.state.pending = { remaining: 1 }),
+    (r) => (r.observation.actor = 1),
+  ]) {
+    let call = 0;
+    assert.throws(
+      () =>
+        proveEquivalentCornBuilds(rows, task, () => {
+          const result = structuredClone(response);
+          if (call++) change(result);
+          return result;
+        }),
+      /different complete native outcomes/,
+    );
+  }
 });
 
 test('initial coverage refuses missing source calendar, actor contradictions and later boundaries', () => {

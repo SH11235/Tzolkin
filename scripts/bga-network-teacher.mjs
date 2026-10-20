@@ -60,12 +60,12 @@ export function validateTeacherRoster(index, derived, raw, record) {
   const ids = derived.sourceActorIds;
   if (
     !Array.isArray(ids) ||
-    ids.length !== 4 ||
-    new Set(ids).size !== 4 ||
+    ![3, 4].includes(ids.length) ||
+    new Set(ids).size !== ids.length ||
     !isDeepStrictEqual(record.initial, derived.witnesses.initial)
   )
     throw new Error('Native initial state/source seat binding mismatch');
-  if (raw.table_id !== index.tableId || raw.metadata?.players?.length !== 4)
+  if (raw.table_id !== index.tableId || raw.metadata?.players?.length !== ids.length)
     throw new Error('Original DOM table/roster mismatch');
   const byId = new Map(),
     names = new Set();
@@ -132,7 +132,8 @@ export function originalDomTerminalDisplay(raw, actors) {
       rank = historyRank;
       score = historyScore;
     }
-    if (!Number.isSafeInteger(score)) throw new Error('Original final score is out of bounds');
+    if (!Number.isSafeInteger(score) || rank > actors.length)
+      throw new Error('Original final score/rank is out of bounds');
     observed.set(id, { total: score, rank });
   }
   const scores = actors.map((id, playerId) => {

@@ -5,10 +5,36 @@ import {
   inspectCancellationClusters,
   inspectCancellationSequence,
   parseNetworkReplay,
+  validInitialNetworkWorkers,
 } from './bga-network.mjs';
 import { networkCardMapper, replayNetworkPrefix } from './bga-network-replay.mjs';
 
 const bytes = (x) => Buffer.from(JSON.stringify(x));
+
+test('null-owned three-player neutral slots are separate from real seats and reject corrupt identity/geometry', () => {
+  const initial = {
+    workers: [
+      { id: '1', player: '11', place: null, position: null },
+      { id: '2', player: null, place: 'uxmal', position: '8' },
+    ],
+    gears: { uxmal: { teethnbr: 10 } },
+  };
+  const roster = ['11', '12', '13'];
+  assert.equal(validInitialNetworkWorkers(initial, roster), true);
+  assert.equal(validInitialNetworkWorkers(initial, [...roster, '14']), false);
+  for (const mutate of [
+    (s) => (s.workers[1].id = '1'),
+    (s) => (s.workers[1].player = '99'),
+    (s) => (s.workers[1].player = '11'),
+    (s) => (s.workers[1].position = '10'),
+    (s) => (s.workers[1].place = 'startingPlayer'),
+    (s) => s.workers.push({ ...s.workers[1], id: '3' }),
+  ]) {
+    const bad = structuredClone(initial);
+    mutate(bad);
+    assert.equal(validInitialNetworkWorkers(bad, roster), false);
+  }
+});
 function fixture() {
   const players = Object.fromEntries(
     ['1', '2', '3'].map((id) => [

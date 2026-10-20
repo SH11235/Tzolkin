@@ -118,6 +118,16 @@ test('source IDs and native seat order are corroborated even when DOM roster ord
   const changed = structuredClone(f.record);
   changed.initial.players.reverse();
   assert.throws(() => validateTeacherRoster(f.index, f.derived, f.raw, changed), /seat binding/);
+  const three = rosterFixture();
+  three.derived.sourceActorIds.pop();
+  three.record.initial.players.pop();
+  three.raw.metadata.players.pop();
+  delete three.index.initial.players['14'];
+  assert.deepEqual(validateTeacherRoster(three.index, three.derived, three.raw, three.record), [
+    '11',
+    '12',
+    '13',
+  ]);
 });
 
 async function temporary(t) {
