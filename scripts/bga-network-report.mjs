@@ -87,7 +87,9 @@ export function networkEvidenceReport({
                 ? 'matched'
                 : compared
                   ? 'fencedOrMismatch'
-                  : 'notReached',
+                  : prefix?.blocked?.moveId === group.moveId
+                    ? 'stoppedAtBoundary'
+                    : 'notReached',
             individualFeedingReceiptMatch: {
               state: 'notConnected',
               reason:
