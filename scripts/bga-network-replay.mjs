@@ -899,7 +899,8 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               points: amount,
               resolvedMoveId: null,
               excludedMoveIds: [],
-              reason: 'source building fixed points precede trade; native effects task follows it',
+              reason:
+                'source building fixed points precede its pending choice; native effects follow',
             };
             timingFences.push(openRewardFence);
           }
