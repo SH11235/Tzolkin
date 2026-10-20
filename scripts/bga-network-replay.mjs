@@ -2,7 +2,11 @@ import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
-import { declinedRemovalWitness, proveEquivalentChichenRoutes } from './bga-network-chichen.mjs';
+import {
+  declinedRemovalWitness,
+  bindDeclinedRemainingWorkers,
+  proveEquivalentChichenRoutes,
+} from './bga-network-chichen.mjs';
 import { sourceSkullShortageWitness, bindSkullShortageOutcome } from './bga-network-awards.mjs';
 import {
   appendRewardFence,
@@ -1561,22 +1565,41 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               'Chichen Itza': 'chichenItza',
             }[a.city];
             if (!gear) fail('unknown source city');
+            const beforeDecline = copy(native());
             const declined = declinedRemovalWitness(
               group,
               n,
               ledger.workers.get(String(a.worker_id)),
               gear,
+              {
+                workers: ledger.workers,
+                sourceToNative,
+                nativeActor: getActor(n),
+                before: beforeDecline,
+                sourceStateMatched: differences(ledger, beforeDecline, sourceToNative).length === 0,
+                unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
+              },
             );
             applyWhere(
               (x) => x.type === 'remove' && x.gear === gear && x.position === Number(a.position),
               'observed worker removal',
             );
             if (declined) {
+              const afterRemoval = frame;
               const choices = actions();
               if (choices.length !== 1 || choices[0].action.type !== 'skip')
                 fail('explicit declined removal lacks its unique legal skip');
               applyWhere((x) => x.type === 'skip', 'explicit original declined action');
-              audit.at(-1).declinedRemovalEvidence = declined;
+              audit.at(-1).declinedRemovalEvidence = bindDeclinedRemainingWorkers(declined, {
+                before: beforeDecline,
+                afterRemoval,
+                afterSkip: frame,
+                refills,
+                dispatch: (request) => {
+                  if (++calls > 4000) fail('operation limit');
+                  return dispatch(request);
+                },
+              });
               continue;
             }
             let observedCorn = null;

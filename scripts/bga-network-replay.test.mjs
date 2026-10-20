@@ -16,6 +16,7 @@ import {
 import {
   declinedRemovalCaption,
   declinedRemovalWitness,
+  bindDeclinedRemainingWorkers,
   proveEquivalentChichenRoutes,
 } from './bga-network-chichen.mjs';
 import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
@@ -52,6 +53,165 @@ const {
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
+
+function remainingDeclineFixture() {
+  const worker = { id: '2', player: '1', place: 'chichenItza', position: '2' };
+  const other = { id: '1', player: '1', place: 'uxmal', position: '2' };
+  const before = {
+    currentPlayer: 0,
+    pending: null,
+    turn: { mode: 'none', count: 0, begged: false },
+    gears: {
+      chichenItza: [null, null, { playerId: 0, dummy: false }],
+      uxmal: [null, null, { playerId: 0, dummy: false }],
+    },
+    players: [{ resources: { corn: 3 } }],
+    log: [],
+  };
+  const entry = {
+    uid: 'pickup',
+    type: 'pickUpWorker',
+    declinedActionCaption: declinedRemovalCaption,
+    args: { player_id: '1', worker_id: '2', position: '2' },
+  };
+  const remaining = {
+    1: { id: '1', place: 'uxmal', position: '2', actions: { uxmal: { 1: 1, 2: 0 } } },
+  };
+  const group = {
+    entries: [
+      entry,
+      { uid: '9', type: 'gameStateChange', args: { id: 9, active_player: '1' } },
+      {
+        uid: '7',
+        type: 'gameStateChange',
+        args: { id: 7, active_player: '1', args: { workers: remaining } },
+      },
+    ],
+  };
+  const skip = { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } };
+  const remove = {
+    action: { type: 'remove', gear: 'uxmal', position: 2 },
+    move: { type: 'remove', gear: 'uxmal', position: 2 },
+  };
+  const afterRemoval = {
+    snapshot: { state: structuredClone(before) },
+    observation: { actor: 0, legalActions: [skip] },
+  };
+  afterRemoval.snapshot.state.gears.chichenItza[2] = null;
+  afterRemoval.snapshot.state.turn = { mode: 'remove', count: 1, begged: false };
+  afterRemoval.snapshot.state.pending = {
+    title: 'Action',
+    task: { type: 'action', gear: 'chichenItza', position: 2 },
+    after: [],
+  };
+  afterRemoval.snapshot.state.log = ['remove'];
+  const afterSkip = {
+    snapshot: { state: structuredClone(afterRemoval.snapshot.state) },
+    observation: {
+      actor: 0,
+      legalActions: [remove, { action: { type: 'endTurn' }, move: { type: 'endTurn' } }],
+    },
+  };
+  afterSkip.snapshot.state.pending = null;
+  afterSkip.snapshot.state.log.push('skip');
+  return {
+    worker,
+    other,
+    before,
+    entry,
+    remaining,
+    group,
+    afterRemoval,
+    afterSkip,
+    context: {
+      workers: new Map([
+        ['2', worker],
+        ['1', other],
+      ]),
+      sourceToNative: new Map([['1', 0]]),
+      nativeActor: 0,
+      before,
+      sourceStateMatched: true,
+      unresolvedTiming: false,
+    },
+  };
+}
+
+test('declined retrieval binds the full remaining worker set, clickable rows and complete state delta', () => {
+  const run = (f, alter = () => {}) => {
+    const proof = declinedRemovalWitness(f.group, f.entry, f.worker, 'chichenItza', f.context);
+    return bindDeclinedRemainingWorkers(proof, {
+      before: f.before,
+      afterRemoval: f.afterRemoval,
+      afterSkip: f.afterSkip,
+      refills: { currentAge: [], age2: [] },
+      dispatch: (request) => {
+        assert.deepEqual(request.state, f.afterSkip.snapshot.state);
+        assert.deepEqual(request.move, { type: 'remove', gear: 'uxmal', position: 2 });
+        const state = structuredClone(request.state);
+        state.gears.uxmal[2] = null;
+        state.turn.count++;
+        state.pending = {
+          title: 'Action',
+          task: { type: 'action', gear: 'uxmal', position: 2 },
+          after: [],
+        };
+        state.log.push('probe');
+        const response = {
+          snapshot: { state },
+          observation: {
+            actor: 0,
+            legalActions: [
+              { action: { type: 'useAction', gear: 'uxmal', position: 2, cornCost: 0 } },
+              { action: { type: 'skip' } },
+            ],
+          },
+        };
+        alter(response);
+        return response;
+      },
+    });
+  };
+  const accepted = run(remainingDeclineFixture());
+  assert.equal(accepted.completeRemainingSetVerified, true);
+  assert.equal(accepted.completeStateDeltaVerified, true);
+  assert.equal(accepted.sourceBackendMask, 'notEstablished');
+  assert.deepEqual(accepted.remainingWorkers['1'].actions, { uxmal: { 1: 1, 2: 0 } });
+  for (const mutate of [
+    (f) => f.group.entries.push({ type: 'takeGoods', args: { type: 'corn', quantity: 1 } }),
+    (f) => (f.group.entries[1].args.active_player = '2'),
+    (f) => delete f.remaining['1'],
+    (f) => (f.remaining['4'] = { ...f.remaining['1'], id: '4' }),
+    (f) => (f.remaining['1'].id = 1),
+    (f) => (f.remaining['1'].place = 'palenque'),
+    (f) => (f.remaining['1'].position = '1'),
+    (f) => (f.remaining['1'].extra = true),
+    (f) => delete f.remaining['1'].actions.uxmal['1'],
+    (f) => (f.remaining['1'].actions.uxmal['3'] = 0),
+    (f) => (f.remaining['1'].actions.uxmal['1'] = '1'),
+    (f) => (f.remaining['1'].actions.other = { 1: 0 }),
+    (f) => (f.other.player = '2'),
+    (f) => (f.context.sourceStateMatched = false),
+    (f) => (f.context.unresolvedTiming = true),
+    (f) => (f.before.pending = { task: { type: 'action' } }),
+    (f) => (f.afterRemoval.snapshot.state.pending.task.position = 3),
+    (f) => f.afterRemoval.observation.legalActions.push({ action: { type: 'useAction' } }),
+    (f) => (f.afterSkip.observation.actor = 1),
+    (f) => f.afterSkip.snapshot.state.players[0].resources.corn++,
+    (f) => f.afterSkip.observation.legalActions.pop(),
+    (f) => (f.afterSkip.observation.legalActions[0].action.position = 1),
+  ]) {
+    const bad = remainingDeclineFixture();
+    mutate(bad);
+    assert.throws(() => run(bad), /Chichen source:/);
+  }
+  for (const alter of [
+    (r) => r.snapshot.state.players[0].resources.corn++,
+    (r) => (r.observation.legalActions[0].action.cornCost = 1),
+    (r) => r.observation.legalActions.push({ action: { type: 'unknown' } }),
+  ])
+    assert.throws(() => run(remainingDeclineFixture(), alter), /Chichen source:/);
+});
 
 test('explicit declined removal requires its original worker and exact no-effect boundary', () => {
   const entry = {
