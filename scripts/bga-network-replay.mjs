@@ -839,10 +839,12 @@ function sourceCheckpoint(ledger, sourceToNative) {
 }
 
 /** Only the first source Playing boundary after the feeding's own calendar movement. */
-export function feedingSourceBoardCheckpoint(ledger, sourceToNative, moveId) {
+export function feedingSourceBoardCheckpoint(ledger, sourceToNative, moveId, boundary) {
   const event = ledger.pendingFeeding;
   if (
     !event ||
+    boundary?.unresolvedTimingFence !== false ||
+    !['endTurn', 'rotate'].includes(boundary?.operationType) ||
     !event.eligible ||
     event.scheduledDay === 27 ||
     ledger.stateId !== 4 ||
@@ -895,6 +897,7 @@ export function feedingSourceBoardCheckpoint(ledger, sourceToNative, moveId) {
         gears: 'Original worker owner: null is neutral/dummy; a roster ID is a real worker.',
       },
       nativeIndividualReceiptMatch: 'notConnected',
+      nativeOperationType: boundary.operationType,
       scope:
         'Complete source-derived board after feeding and source calendar rotation, before the next actor operation. This is not an intermediate native feeding receipt.',
     },
@@ -2073,7 +2076,13 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
           source: { reference: index.sourceUrl, actionIds: [group.moveId] },
           expected: sourceCheckpoint(ledger, sourceToNative),
         };
-        const full = feedingSourceBoardCheckpoint(ledger, sourceToNative, group.moveId);
+        const operation = audit.findLast((row) => row.step === record.steps.length)?.action.type;
+        const full = feedingSourceBoardCheckpoint(ledger, sourceToNative, group.moveId, {
+          operationType: operation,
+          unresolvedTimingFence: timingFences.some(
+            (f) => f.startMoveId <= group.moveId && f.resolvedMoveId == null,
+          ),
+        });
         if (full) {
           record.steps.at(-1).checkpoint.expected = full.expected;
           ledger.pendingFeeding.boardCheckpoint = {

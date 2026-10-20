@@ -286,23 +286,39 @@ test('feeding board checkpoint uses the source post-rotation phase and never a n
   });
   f.ledger.workers.get('3').place = 'uxmal';
   f.ledger.workers.get('3').position = '0';
-  const full = feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8);
+  const boundary = { operationType: 'rotate', unresolvedTimingFence: false };
+  const full = feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary);
   assert.equal(full.expected.round, 10);
   assert.deepEqual(full.expected.foodDays, [8]);
   assert.deepEqual(full.expected.gears.uxmal[0], { playerId: 0, dummy: false });
   assert.equal(full.evidence.sourceActualRound, 8);
   assert.equal(full.evidence.comparisonSourceDay, 9);
+  assert.equal(
+    feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, {
+      ...boundary,
+      unresolvedTimingFence: true,
+    }),
+    null,
+  );
+  assert.equal(
+    feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, {
+      ...boundary,
+      operationType: 'place',
+    }),
+    null,
+  );
   f.ledger.players['3'].resources.corn = 99;
   assert.equal(
-    feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8).expected.players[0].resources.corn,
+    feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary).expected.players[0]
+      .resources.corn,
     99,
   );
-  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 9), null);
+  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 9, boundary), null);
   f.ledger.pendingFeeding.eligible = false;
-  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8), null);
+  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary), null);
   f.ledger.pendingFeeding.eligible = true;
   f.ledger.pendingFeeding.scheduledDay = 27;
-  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8), null);
+  assert.equal(feedingSourceBoardCheckpoint(f.ledger, f.sourceToNative, 8, boundary), null);
 });
 
 test('initial full-board claims use post-wealth source counters and original actor/order evidence', () => {
