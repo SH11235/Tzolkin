@@ -10,7 +10,12 @@ import {
 } from './bga-network.mjs';
 import { networkCardMapper, replayNetworkPrefix } from './bga-network-replay.mjs';
 import { declinedRemovalCaption } from './bga-network-chichen.mjs';
-import { skullShortageCaption } from './bga-network-awards.mjs';
+import {
+  skullShortageCaption,
+  singleSkullCaption,
+  sourceSingleSkullWitness,
+  bindSingleSkullOutcome,
+} from './bga-network-awards.mjs';
 import { readFileSync } from 'node:fs';
 import {
   finalScoringWitness,
@@ -265,6 +270,294 @@ test('final receipt resolution requires the immediate original rotation and term
 });
 
 const bytes = (x) => Buffer.from(JSON.stringify(x));
+
+function singleSkullFixture() {
+  const players = [0, 1, 2].map((id) => ({
+    id,
+    name: `P${id + 1}`,
+    resources: { corn: 4, wood: 0, stone: 0, gold: 0, skull: 0 },
+    technologies: { agriculture: 0, extraction: 0, architecture: 0, theology: id === 0 ? 3 : 0 },
+  }));
+  const before = {
+    phase: 'playing',
+    additionalBuildings: false,
+    expansion: null,
+    currentPlayer: 0,
+    skullSupply: 1,
+    players,
+    pending: { task: { type: 'anyAction', cost: 1, excludeSkulls: true }, after: [] },
+    log: [],
+  };
+  const args = [
+    {
+      type: 'corn',
+      resources: '',
+      name: 'corn',
+      player_id: '1',
+      player_name: null,
+      quantity: 1,
+      target: null,
+    },
+    { player_name: 'P1', city: 'Yaxchilan', action_number: '4' },
+    { player_name: 'P1' },
+    {
+      type: 'skull',
+      resources: '',
+      player_id: '1',
+      player_name: 'P1',
+      quantity: '1',
+      origin: 'action_yaxchilan_4',
+    },
+    { id: 9, active_player: '1' },
+    { id: 7, active_player: '1' },
+  ];
+  const types = [
+    'payGoods',
+    'selectAction',
+    'noSkullsLeft',
+    'takeGoods',
+    'gameStateChange',
+    'gameStateChange',
+  ];
+  const group = {
+    moveId: 20,
+    entries: types.map((type, i) => ({
+      type,
+      args: args[i],
+      uid: `grant-${i}`,
+      packetIndex: 21,
+      notificationIndex: i,
+      moveId: 20,
+      ...(i === 2 ? { singleSkullCaption } : {}),
+    })),
+  };
+  const move = { type: 'choose', choiceId: 'any:yaxchilan:4' };
+  const input = {
+    group,
+    before,
+    sourceToNative: new Map([
+      ['1', 0],
+      ['2', 1],
+      ['3', 2],
+    ]),
+    sourceStateMatched: true,
+    unresolvedTiming: false,
+    ledger: {
+      initial: {
+        players: Object.fromEntries(players.map((p) => [String(p.id + 1), { name: p.name }])),
+      },
+      players: Object.fromEntries(players.map((p) => [String(p.id + 1), structuredClone(p)])),
+      skullSupply: 1,
+      stateId: 45,
+      activePlayer: '1',
+    },
+    observation: {
+      actor: 0,
+      legalActions: [
+        {
+          move,
+          action: {
+            type: 'useAction',
+            gear: 'yaxchilan',
+            position: 4,
+            source: 'anywhere',
+            cornCost: 1,
+          },
+        },
+      ],
+    },
+  };
+  const after = structuredClone(before);
+  after.pending = null;
+  after.skullSupply = 0;
+  after.players[0].resources.corn--;
+  after.players[0].resources.skull++;
+  after.log.push('grant');
+  return {
+    input,
+    after,
+    steps: [{ actor: 0, move, sourceActionIds: [20], refills: { currentAge: [], age2: [] } }],
+  };
+}
+
+test('single-skull warning requires the closed original paid action and its exact native outcome', () => {
+  const f = singleSkullFixture(),
+    proof = sourceSingleSkullWitness(f.input);
+  assert.equal(bindSingleSkullOutcome(proof, f.input.before, f.after, f.steps).nativePoolAfter, 0);
+  assert.equal(proof.nominalSkulls, 2);
+  assert.equal(proof.actualSkulls, 1);
+  for (const mutate of [
+    (x) => {
+      x.input.group.entries[2].singleSkullCaption = 'No skulls';
+    },
+    (x) => {
+      x.input.group.entries[2].args.player_id = '1';
+    },
+    (x) => {
+      x.input.group.entries[2].args.player_name = 'P2';
+    },
+    (x) => {
+      x.input.ledger.initial.players['2'].name = 'P1';
+    },
+    (x) => {
+      x.input.ledger.activePlayer = '2';
+    },
+    (x) => {
+      x.input.ledger.stateId = 7;
+    },
+    (x) => {
+      x.input.before.currentPlayer = 1;
+    },
+    (x) => {
+      x.input.observation.actor = 1;
+    },
+    (x) => {
+      x.input.before.skullSupply = 0;
+    },
+    (x) => {
+      x.input.before.skullSupply = 2;
+    },
+    (x) => {
+      x.input.ledger.skullSupply = 2;
+    },
+    (x) => {
+      x.input.before.players[0].technologies.theology = 2;
+    },
+    (x) => {
+      x.input.ledger.players['1'].technologies.theology = 2;
+    },
+    (x) => {
+      x.input.group.entries[3].args.quantity = '2';
+    },
+    (x) => {
+      x.input.group.entries[3].args.quantity = true;
+    },
+    (x) => {
+      x.input.group.entries[3].args.origin = 'action_yaxchilan_3';
+    },
+    (x) => {
+      x.input.group.entries[3].args.player_id = '2';
+    },
+    (x) => {
+      x.input.group.entries[0].args.quantity = 0;
+    },
+    (x) => {
+      x.input.group.entries.reverse();
+    },
+    (x) => {
+      x.input.group.entries[3].packetIndex++;
+    },
+    (x) => {
+      x.input.group.entries.push({ ...x.input.group.entries[3] });
+    },
+    (x) => {
+      x.input.group.entries[0].type = 'pickUpWorker';
+    },
+    (x) => {
+      x.input.before.pending.task.type = 'action';
+    },
+    (x) => {
+      x.input.before.pending.task.cost = 0;
+    },
+    (x) => {
+      x.input.before.pending.after.push({ type: 'effects' });
+    },
+    (x) => {
+      x.input.observation.legalActions = [];
+    },
+    (x) => {
+      x.input.observation.legalActions.push(x.input.observation.legalActions[0]);
+    },
+    (x) => {
+      x.input.unresolvedTiming = true;
+    },
+    (x) => {
+      x.input.sourceStateMatched = false;
+    },
+  ]) {
+    const bad = singleSkullFixture();
+    mutate(bad);
+    assert.throws(() => sourceSingleSkullWitness(bad.input));
+  }
+  for (const mutate of [
+    (x) => {
+      x.after.skullSupply = 1;
+    },
+    (x) => {
+      x.after.pending = { task: { type: 'anyAction' } };
+    },
+    (x) => {
+      x.after.players[0].resources.skull++;
+    },
+    (x) => {
+      x.after.players[0].resources.corn++;
+    },
+    (x) => {
+      x.after.players[1].resources.wood++;
+    },
+    (x) => {
+      x.after.players[0].technologies.theology = 2;
+    },
+    (x) => {
+      x.after.currentPlayer = 1;
+    },
+    (x) => {
+      x.steps[0].actor = 1;
+    },
+    (x) => {
+      x.steps.push(x.steps[0]);
+    },
+    (x) => {
+      x.steps[0].move = { type: 'choose', choiceId: 'any:yaxchilan:3' };
+    },
+  ]) {
+    const bad = singleSkullFixture(),
+      w = sourceSingleSkullWitness(bad.input);
+    mutate(bad);
+    assert.throws(() => bindSingleSkullOutcome(w, bad.input.before, bad.after, bad.steps));
+  }
+});
+
+test('single-skull parser retains only the exact original caption and one roster name', () => {
+  const raw = fixture(),
+    caption = {
+      uid: 'single',
+      type: 'noSkullsLeft',
+      log: singleSkullCaption,
+      args: { player_name: 'P1' },
+    };
+  raw.gameLogs.data.data.at(-1).data.push(caption);
+  assert.equal(
+    parseNetworkReplay(bytes(raw)).entries.at(-1).singleSkullCaption,
+    singleSkullCaption,
+  );
+  for (const mutate of [
+    (n) => {
+      n.log = 'Unknown';
+    },
+    (n) => {
+      n.args.player_name = 'Unknown';
+    },
+    (n) => {
+      n.args = {};
+    },
+    (n) => {
+      n.args.player_id = '1';
+    },
+  ]) {
+    const bad = structuredClone(raw);
+    mutate(bad.gameLogs.data.data.at(-1).data.at(-1));
+    assert.throws(() => parseNetworkReplay(bytes(bad)), /single-skull/);
+  }
+  for (const type of ['history', 'sequence', 'unknown']) {
+    const bad = structuredClone(raw);
+    bad.gameLogs.data.data.at(-1).packet_type = type;
+    assert.throws(() => parseNetworkReplay(bytes(bad)), /single-skull/);
+  }
+  const privatePacket = structuredClone(raw);
+  privatePacket.gameLogs.data.data.at(-1).channel = '/player/p1';
+  assert.throws(() => parseNetworkReplay(bytes(privatePacket)), /single-skull/);
+});
 
 test('null-owned three-player neutral slots are separate from real seats and reject corrupt identity/geometry', () => {
   const initial = {

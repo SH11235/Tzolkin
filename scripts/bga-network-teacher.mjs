@@ -211,6 +211,8 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
       throw new Error('No nominated source player at this table');
     if (prefix.rawSha256 !== index.rawSha256 || prefix.tableId !== index.tableId)
       throw new Error('Native/source response binding mismatch');
+    if (prefix.blocked?.source?.some((n) => n.type === 'noSkullsLeft'))
+      throw new Error('Single-skull receipt was rejected; no teacher manifest generated');
     if (
       prefix.timingFences?.some((f) => f.finalScoringProof) &&
       (prefix.blocked ||
