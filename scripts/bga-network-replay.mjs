@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { inspectCancellationClusters } from './bga-network.mjs';
+import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import { catalogFingerprint } from './bga-replay.mjs';
 
 const catalogBytes = readFileSync(
@@ -347,6 +348,12 @@ function initialLedger(index) {
     day: Number(s.day),
     activePlayer: String(s.gamestate.active_player),
     stateId: Number(s.gamestate.id),
+    age: 1,
+    foodDays: [],
+    feedingWitnesses: [],
+    pendingFeeding: null,
+    lastRotation: null,
+    ageSource: { field: 'initialState.buildings[].type', value: 'building_age_1' },
     firstPlayer: String(s.firstPlayer),
     accumulatedCorn: Number(s.cornOnWheel),
     jungle: Object.fromEntries(
@@ -453,6 +460,14 @@ function updateLedger(ledger, entry, mapper) {
         fail('rotation worker position');
       ledger.workers.set(String(w.id), copy(w));
     }
+    ledger.lastRotation = {
+      moveId: entry.moveId,
+      packetIndex: entry.packetIndex,
+      notificationIndex: entry.notificationIndex,
+      uid: entry.uid,
+      day: Number(a.day),
+      twice: a.twice,
+    };
   } else if (entry.type === 'flipBoard') {
     if (!p || ![0, 1].includes(a.side)) fail('invalid speed-up rights');
     p.doubleAdvanceAvailable = a.side === 0;
@@ -464,6 +479,13 @@ function updateLedger(ledger, entry, mapper) {
   else if (entry.type === 'gameStateChange') {
     ledger.activePlayer = String(a.active_player);
     ledger.stateId = Number(a.id);
+    if (ledger.stateId === 92) {
+      const event = ledger.feedingWitnesses.find((e) => e.start.uid === entry.uid);
+      if (event) {
+        ledger.foodDays.push(event.scheduledDay);
+        ledger.pendingFeeding = event;
+      }
+    }
   } else if (entry.type === 'takeTile') {
     if (p && a.type === 'corn_tile') p.cornTiles++;
     if (p && a.type === 'wood_tile') p.woodTiles++;
@@ -494,9 +516,20 @@ function updateLedger(ledger, entry, mapper) {
     p.feedWorkers += Number(def.farm ?? 0);
     p.feedDiscount += Number(def.bigFarm ?? 0);
   } else if (entry.type === 'pickBuilding') ledger.buildings.push(mapper.bind(a.building));
-  else if (entry.type === 'resetAllBuildings')
+  else if (entry.type === 'resetAllBuildings') {
     ledger.buildings = a.buildings.map((c) => mapper.bind(c));
-  else if (entry.type === 'wealthTiles') {
+    if (!a.buildings.length || a.buildings.some((c) => c.type !== 'building_age_2'))
+      fail('source age switch lacks an explicit age-II market');
+    ledger.age = 2;
+    ledger.ageSource = {
+      moveId: entry.moveId,
+      packetIndex: entry.packetIndex,
+      notificationIndex: entry.notificationIndex,
+      uid: entry.uid,
+      field: 'args.buildings[].type',
+      value: 'building_age_2',
+    };
+  } else if (entry.type === 'wealthTiles') {
     for (const tile of Object.values(a)) {
       const owner = ledger.players[String(tile.location_arg)],
         def = ledger.initial.wealthTiles[tile.type_arg];
@@ -805,6 +838,69 @@ function sourceCheckpoint(ledger, sourceToNative) {
   };
 }
 
+/** Only the first source Playing boundary after the feeding's own calendar movement. */
+export function feedingSourceBoardCheckpoint(ledger, sourceToNative, moveId) {
+  const event = ledger.pendingFeeding;
+  if (
+    !event ||
+    !event.eligible ||
+    event.scheduledDay === 27 ||
+    ledger.stateId !== 4 ||
+    ledger.activePlayer !== ledger.firstPlayer ||
+    ledger.lastRotation?.moveId !== moveId ||
+    ledger.lastRotation.moveId < event.moveId
+  )
+    return null;
+  const expected = sourceCheckpoint(ledger, sourceToNative);
+  const start = ledger.initial.playerorder.findIndex((id) => String(id) === ledger.firstPlayer);
+  if (start < 0) fail('source post-feeding starter is not in the original seat order');
+  const order = [
+    ...ledger.initial.playerorder.slice(start),
+    ...ledger.initial.playerorder.slice(0, start),
+  ].map((id) => sourceToNative.get(String(id)));
+  if (order.some((id) => id === undefined)) fail('source post-feeding seat binding is incomplete');
+  for (const slots of Object.values(expected.gears))
+    for (const worker of slots) if (worker && worker.playerId !== -1) worker.dummy = false;
+  Object.assign(expected, {
+    round: ledger.day + 1,
+    age: ledger.age,
+    foodDays: copy(ledger.foodDays),
+    currentPlayer: sourceToNative.get(ledger.activePlayer),
+    turnOrder: order,
+    turnIndex: order.indexOf(sourceToNative.get(ledger.activePlayer)),
+  });
+  return {
+    expected,
+    evidence: {
+      scheduledDay: event.scheduledDay,
+      sourceStart: event.start,
+      sourceEnd: event.end,
+      sourcePhysicalDay: event.sourcePhysicalDay,
+      sourceActualRound: event.sourceActualRound,
+      sourceRotation: copy(ledger.lastRotation),
+      comparisonSourceDay: ledger.day,
+      comparisonRound: ledger.day + 1,
+      ageSource: copy(ledger.ageSource),
+      foodHistory: ledger.feedingWitnesses
+        .filter((e) => e.moveId <= event.moveId)
+        .map((e) => ({ scheduledDay: e.scheduledDay, start: e.start })),
+      fields: Object.keys(expected),
+      derivations: {
+        round: 'Source calendar day + 1 at post-rotation Playing, not the scheduled feeding day.',
+        age: 'Original age-I market, then explicit resetAllBuildings age-II types.',
+        foodDays:
+          'Ordinal explicit original state92 feeding markers under the declared basic profile.',
+        turnOrder:
+          'Original playerorder rotated to the observed source firstPlayer; current actor from state4.',
+        gears: 'Original worker owner: null is neutral/dummy; a roster ID is a real worker.',
+      },
+      nativeIndividualReceiptMatch: 'notConnected',
+      scope:
+        'Complete source-derived board after feeding and source calendar rotation, before the next actor operation. This is not an intermediate native feeding receipt.',
+    },
+  };
+}
+
 /** Complete only the untouched base-game boundary from independent source facts.
  * Later checkpoints have different calendar/turn timing and deliberately stay partial.
  */
@@ -1095,6 +1191,10 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     }),
   );
   const ledger = initialLedger(index);
+  const feedingEvents = sourceFeedingWitnesses(index);
+  if (feedingEvents.some((e) => e.moveId <= initialMoveId))
+    fail('source feeding precedes completed setup');
+  ledger.feedingWitnesses = feedingEvents;
   ledger.buildings = index.initial.buildings.map((c) => mapper.bind(c));
   ledger.monuments = index.initial.monuments.map((c) => mapper.bind(c));
   const firstGroups = index.groups.filter((g) => g.moveId <= initialMoveId);
@@ -1968,11 +2068,22 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         originalDiff.length === 0 &&
         record.steps.length > stepsBefore &&
         native().phase !== 'finished'
-      )
+      ) {
         record.steps.at(-1).checkpoint = {
           source: { reference: index.sourceUrl, actionIds: [group.moveId] },
           expected: sourceCheckpoint(ledger, sourceToNative),
         };
+        const full = feedingSourceBoardCheckpoint(ledger, sourceToNative, group.moveId);
+        if (full) {
+          record.steps.at(-1).checkpoint.expected = full.expected;
+          ledger.pendingFeeding.boardCheckpoint = {
+            ...full.evidence,
+            replayStepIndex: record.steps.length - 1,
+            checkpointSource: copy(record.steps.at(-1).checkpoint.source),
+          };
+          ledger.pendingFeeding = null;
+        }
+      }
       audit.push({
         moveId: group.moveId,
         publicStateMatched: originalDiff.length === 0,
@@ -2016,6 +2127,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         cancellationClusters: clusters,
         timingFences,
         calendarTransitions,
+        feedingSourceEvidence: feedingEvents,
         ...(terminalCalendar
           ? { terminalCalendarProjection: terminalCalendar, terminalCalendarChecks }
           : {}),
@@ -2049,6 +2161,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     cancellationClusters: clusters,
     timingFences,
     calendarTransitions,
+    feedingSourceEvidence: feedingEvents,
     ...(terminalCalendar
       ? { terminalCalendarProjection: terminalCalendar, terminalCalendarChecks }
       : {}),

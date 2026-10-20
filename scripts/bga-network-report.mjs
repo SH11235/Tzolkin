@@ -73,6 +73,9 @@ export function networkEvidenceReport({
           const scheduledDay = [8, 14, 21, 27][meals.length] ?? null;
           const captions = group.entries.filter((n) => n.type === 'foodDayCost');
           const compared = projection.find((p) => p.moveId === group.moveId);
+          const sourceFeeding = prefix?.feedingSourceEvidence?.find(
+            (e) => e.start.uid === entry.uid,
+          );
           meals.push({
             scheduledDay,
             sourceActualRound,
@@ -102,6 +105,26 @@ export function networkEvidenceReport({
               reason:
                 'Net public counters are compared; separate per-player native feeding receipts are not bound by this report.',
             },
+            sourceReceiptBinding: sourceFeeding ?? { classification: 'notConnected' },
+            sourceBoardCoverage: sourceFeeding?.boardCheckpoint
+              ? {
+                  state: nativeReport?.sourceCoverage?.foodDays?.includes(scheduledDay)
+                    ? 'matched'
+                    : 'notEstablished',
+                  ...sourceFeeding.boardCheckpoint,
+                  sourceInput: sourcePin,
+                }
+              : {
+                  state: sourceFeeding?.missing?.length
+                    ? sourceFeeding.classification
+                    : scheduledDay === 27
+                      ? 'unsupportedAtomicBoundary'
+                      : 'notConnected',
+                  reason:
+                    scheduledDay === 27
+                      ? 'The native operation includes feeding, terminal scoring and rotation; no independent full source intermediate board is bound. Terminal corn/display comparisons remain separate.'
+                      : 'No complete source post-feeding calendar boundary was bound.',
+                },
           });
         }
       }
