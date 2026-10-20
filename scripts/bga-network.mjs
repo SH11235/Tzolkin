@@ -12,6 +12,8 @@ const LEGACY_STUDIOS = new Set([
   'd7b42ea97100c7bb3f44d769deb34607fbd457bdadba3154a20a6b1f04fd53b0',
   '6fa811122585839d696834c32d89136bbc500e240a3bc89b53608ac3f9e8d090',
   '684dae21c6710db763374fa366fc0c8267b36afcfffbb6648fbb9e65909e24b5',
+  '79598faf70819525033768a2e062cf619c3dc75ed9d5eef7c4fa7cefebc39279',
+  '85bb4afe09c8dc93fa729f43a4b42db4b964901834220c510c95d52f5d9a0499',
 ]);
 // New client revisions require independent review before they can authorize decoding.
 const REVIEWED_CLIENT_PAIRS = new Set([
@@ -25,6 +27,7 @@ const REVIEWED_CLIENT_PAIRS = new Set([
   'b020a816c96ad050c9b96ff29a6b8e14efdda44132f2daa0c29893ecf596b5eb:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   '8e4f493ad56c2a4b9e79d7c5d5c853cca4fe48f2e0c76547bd6d03f62cdca3f1:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   '1778aef53d4bacf565d79d53d9d7556a61834480406c215aa78b428ae8ad094f:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
+  'd56aab925f1744ac59d759a10e3cd10b0ea332fa80db6550994267fd6eed36e5:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
 ]);
 const validatedContracts = new WeakSet();
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
