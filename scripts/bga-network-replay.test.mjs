@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { mock, test } from 'node:test';
 import { assertNetworkClockContract, parseNetworkReplay } from './bga-network.mjs';
+import {
+  appendRewardFence,
+  bindNewFixedReward,
+  proveFixedBuildingPoints,
+  reconcileRewardFences,
+  trackRewardQueues,
+} from './bga-network-rewards.mjs';
 import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -911,6 +918,168 @@ test('calendar contradictions in days, consumption actor and unobserved renewal 
     assert.match(result.blocked.reason, reason);
     assert.equal(result.blocked.afterState.round, 1);
   }
+});
+
+function nestedRewardFixture() {
+  const point = { type: 'effects', effects: [{ type: 'points', amount: 2 }] };
+  const stone = { type: 'effects', effects: [{ type: 'resources', resources: { stone: 1 } }] };
+  const build = { type: 'build', remaining: 0, allowMonument: false, cornPayment: false };
+  const outerPending = { task: { type: 'anyAction' }, after: [point, build] };
+  const pending = {
+    task: { type: 'technology', free: true },
+    after: [stone, { ...build, remaining: 1 }, point, build],
+  };
+  const outer = {
+    startMoveId: 1,
+    sourceId: '1',
+    points: 2,
+    resources: {},
+    resolvedMoveId: null,
+    excludedMoveIds: [],
+    pointReceiptProof: {},
+    queueBinding: bindNewFixedReward(null, outerPending, point.effects[0]),
+  };
+  const inner = {
+    startMoveId: 2,
+    sourceId: '1',
+    points: 0,
+    resources: { stone: 1 },
+    resolvedMoveId: null,
+    excludedMoveIds: [],
+    queueBinding: bindNewFixedReward(outerPending, pending, stone.effects[0]),
+  };
+  return { point, stone, build, pending, outerPending, outer, inner };
+}
+
+test('nested independent rewards resolve separately and preserve unrelated public differences', () => {
+  const f = nestedRewardFixture(),
+    active = [f.outer];
+  appendRewardFence(active, f.inner, f.pending, null);
+  const points = { field: 'player.1.score', observed: 10, native: 8 };
+  const stone = { field: 'player.1.resources.stone', observed: 1, native: 0 };
+  const unrelated = { field: 'player.1.resources.gold', observed: 2, native: 1 };
+  let result = reconcileRewardFences(active, [points, stone, unrelated], f.pending, 2);
+  assert.deepEqual(result.differences, [unrelated]);
+  assert.equal(result.active.length, 2);
+  const afterInner = { task: { ...f.build, remaining: 1 }, after: [f.point, f.build] };
+  trackRewardQueues(active, f.pending, afterInner, 5);
+  result = reconcileRewardFences(active, [points], afterInner, 3);
+  assert.equal(f.inner.resolvedMoveId, 3);
+  assert.equal(f.outer.resolvedMoveId, null);
+  assert.deepEqual(result.active, [f.outer]);
+  trackRewardQueues(result.active, afterInner, null, 6);
+  result = reconcileRewardFences(result.active, [], null, 4);
+  assert.equal(result.active.length, 0);
+  assert.equal(f.outer.resolvedMoveId, 4);
+  assert.equal(f.inner.queueBinding.consumedAtStep, 5);
+  assert.equal(f.outer.queueBinding.consumedAtStep, 6);
+  const coveredMoves = [1, 2, 3, 4, 5].filter((move) =>
+    [f.outer, f.inner].some((x) => move >= x.startMoveId && move <= x.resolvedMoveId),
+  );
+  assert.deepEqual(coveredMoves, [1, 2, 3, 4]);
+});
+
+test('nested reward admission rejects overlapping identities, unknown queues and false reconciliation', () => {
+  for (const mutate of [
+    (f) => (f.inner.sourceId = '2'),
+    (f) => (f.inner.points = 2),
+    (f) => (f.outer.resources.stone = 1),
+    (f) => (f.pending.task.free = false),
+    (f) => f.pending.after.shift(),
+    (f) => f.pending.after.push(structuredClone(f.point)),
+    (f) => (f.pending.after[1].remaining = -1),
+    (f) => (f.pending.after[1].unreviewed = true),
+  ]) {
+    const f = nestedRewardFixture();
+    mutate(f);
+    assert.throws(() => appendRewardFence([f.outer], f.inner, f.pending, null), /Building reward:/);
+  }
+  const f = nestedRewardFixture();
+  assert.throws(() => reconcileRewardFences([f.inner], [], f.pending, 2), /still queued/);
+  assert.throws(
+    () => reconcileRewardFences([f.inner], [], null, 2),
+    /consumption was not observed/,
+  );
+  assert.throws(
+    () =>
+      reconcileRewardFences(
+        [f.inner],
+        [{ field: 'player.1.resources.stone', observed: 2, native: 0 }],
+        f.pending,
+        2,
+      ),
+    /exact outstanding/,
+  );
+  const corn = { ...f.inner, resources: { corn: 1 } };
+  assert.throws(
+    () => appendRewardFence([], corn, f.pending, { sourceId: '1' }),
+    /overlaps a calendar corn/,
+  );
+});
+
+test('fixed building point evidence binds receipt multiplicity and a newly queued catalog effect', () => {
+  const f = nestedRewardFixture();
+  const entries = [
+    { uid: 'build', type: 'construct', args: { player_id: '1', building: { id: '9' } } },
+    ...['architecture', 'fixed'].map((uid) => ({
+      uid,
+      type: 'updateScore',
+      args: { player_id: '1', points: 2 },
+    })),
+  ];
+  const card = { id: 'synthetic', effects: [{ type: 'action' }, { type: 'points', amount: 2 }] };
+  const transition = {
+    action: { architecture: true },
+    architectureLevel: 3,
+    beforeScore: 5,
+    afterScore: 7,
+    beforePending: null,
+    afterPending: f.outerPending,
+  };
+  const proof = proveFixedBuildingPoints(entries, card, '1', transition);
+  assert.equal(proof.amount, 2);
+  assert.equal(proof.proof.scoreReceipts.length, 2);
+  assert.equal(proof.proof.individualReceiptAssignment, 'notIdentified');
+  for (const [level, architecture, bonus] of [
+    [1, true, 0],
+    [2, true, 2],
+    [3, true, 2],
+    [3, false, 0],
+  ]) {
+    const receipts = [entries[0], entries[1], ...(bonus ? [entries[2]] : [])];
+    const boundary = proveFixedBuildingPoints(receipts, card, '1', {
+      ...transition,
+      action: { architecture },
+      architectureLevel: level,
+      afterScore: 5 + bonus,
+    });
+    assert.equal(boundary.proof.immediateArchitectureBonus, bonus);
+    assert.equal(boundary.proof.aggregateResidual, 2);
+  }
+  for (const mutate of [
+    (e) => e.pop(),
+    (e) => e.push({ ...e[1], uid: 'third' }),
+    (e) => (e[1].args.player_id = '2'),
+    (e) => (e[1].args.points = 3),
+    (e) => (e[1].args.origin = 'unreviewed'),
+    (e) => (e[2].uid = e[1].uid),
+  ]) {
+    const bad = structuredClone(entries);
+    mutate(bad);
+    assert.throws(() => proveFixedBuildingPoints(bad, card, '1', transition), /multiplicity/);
+  }
+  assert.throws(
+    () =>
+      proveFixedBuildingPoints(entries, card, '1', {
+        ...transition,
+        beforePending: f.outerPending,
+      }),
+    /already queued/,
+  );
+  assert.throws(
+    () => proveFixedBuildingPoints(entries, card, '1', { ...transition, afterPending: null }),
+    /missing or ambiguous/,
+  );
 });
 
 test('automatic building goods must match the same actor, building and queued resource effect', () => {

@@ -2,6 +2,14 @@ import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
+import {
+  appendRewardFence,
+  bindNewFixedReward,
+  proveFixedBuildingPoints,
+  reconcileRewardFences,
+  rewardFields,
+  trackRewardQueues,
+} from './bga-network-rewards.mjs';
 import { catalogFingerprint } from './bga-replay.mjs';
 
 const catalogBytes = readFileSync(
@@ -1068,7 +1076,8 @@ export function queuedBuildingResources(entries, pending, sourceId) {
     if (
       !R.includes(n.args.type) ||
       !Number.isSafeInteger(Number(n.args.quantity)) ||
-      Number(n.args.quantity) < 1
+      Number(n.args.quantity) < 1 ||
+      Object.hasOwn(resources, n.args.type)
     )
       return null;
     resources[n.args.type] = (resources[n.args.type] ?? 0) + Number(n.args.quantity);
@@ -1246,7 +1255,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
   const terminalCalendarChecks = [];
   let openRotationFence = null;
   let openCornFence = null;
-  let openRewardFence = null;
+  let openRewardFences = [];
   let current = null;
   const native = () => frame.snapshot.state;
   const actions = () => frame.observation?.legalActions ?? [];
@@ -1284,6 +1293,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       response = apply(row);
     }
     if (response.error) fail(response.error);
+    trackRewardQueues(
+      openRewardFences,
+      preState.pending,
+      response.snapshot.state.pending,
+      record.steps.length + 1,
+    );
     record.steps.push({
       actor,
       move: copy(row.move),
@@ -1354,6 +1369,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     current = group;
     const before = copy(native());
     const stepsBefore = record.steps.length;
+    let constructionTransition = null;
     try {
       for (const caption of group.entries.filter((n) => n.type === 'workerLimit')) {
         assertActor(caption);
@@ -1702,30 +1718,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               );
               if (native().pending?.task.type !== 'build')
                 fail('market exit did not reach the witnessed construction');
-              if (openRewardFence) {
-                const f = openRewardFence,
-                  id = sourceToNative.get(f.sourceId),
-                  observed = ledger.players[f.sourceId],
-                  actual = native().players[id];
-                const outstanding = f.points
-                  ? [{ type: 'points', amount: f.points }]
-                  : [{ type: 'resources', resources: f.resources }];
-                const queued = native().pending.after?.some(
-                  (t) => t.type === 'effects' && key(t.effects) === key(outstanding),
-                );
-                if (
-                  id === frame.observation.actor &&
-                  !queued &&
-                  Object.entries(f.resources).every(
-                    ([r]) => observed.resources[r] === actual.resources[r],
-                  ) &&
-                  (!f.resources.skull || ledger.skullSupply === native().skullSupply) &&
-                  (!f.points || observed.score === Math.floor(actual.score))
-                ) {
-                  f.resolvedMoveId = group.moveId;
-                  openRewardFence = null;
-                }
-              }
+              openRewardFences = reconcileRewardFences(
+                openRewardFences,
+                differences(ledger, native(), sourceToNative, terminalCalendar),
+                native().pending,
+                group.moveId,
+              ).active;
             }
             const id = mapper.bind(a.building);
             const candidates = actions().filter(
@@ -1743,7 +1741,15 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
                 String(e.args.player_id) === String(a.player_id),
             );
             const paid = payment();
-            applyWhere(
+            const actor = frame.observation.actor;
+            if (constructionTransition) fail('multiple construction transitions in one boundary');
+            constructionTransition = {
+              nativeId: id,
+              beforePending: copy(native().pending),
+              beforeScore: native().players[actor].score,
+              architectureLevel: native().players[actor].technologies.architecture,
+            };
+            const selected = applyWhere(
               (x) =>
                 ['build', 'monument'].includes(x.type) &&
                 x.id === id &&
@@ -1755,6 +1761,11 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               refills,
               true,
             );
+            Object.assign(constructionTransition, {
+              action: selected,
+              afterPending: copy(native().pending),
+              afterScore: native().players[actor].score,
+            });
           } else if (n.type === 'gameStateChange' && Number(a.id) === 90) {
             for (let i = 0; native().pending && i < 4; i++)
               applyWhere((x) => x.type === 'skip', 'observed exit from optional task', refills);
@@ -1878,103 +1889,100 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       const sourceActor = [...sourceToNative].find(
         ([, id]) => id === frame.observation?.actor,
       )?.[0];
-      const queuedResourceReceipt =
-        native().pending?.task.type === 'resource'
-          ? queuedBuildingResources(group.entries, native().pending, sourceActor)
-          : null;
+      const queuedResourceReceipt = queuedBuildingResources(
+        group.entries,
+        native().pending,
+        sourceActor,
+      );
       if (
-        !openRewardFence &&
-        group.entries.some((n) => n.type === 'construct') &&
+        constructionTransition &&
         ((native().pending?.task.type === 'technology' && native().pending.task.free === true) ||
           ['trade', 'anyAction'].includes(native().pending?.task.type) ||
           queuedResourceReceipt !== null)
       ) {
         const delayed = native().pending.after?.[0];
-        const rewards = group.entries.filter(
-          (n) => n.type === 'takeGoods' && /^building_age_[12]_b\d+$/.test(n.args.origin ?? ''),
-        );
+        const card = catalog.BUILDINGS.find((b) => b.id === constructionTransition.nativeId);
+        const construct = group.entries.find((n) => n.type === 'construct');
+        let candidate = null;
         if (
           delayed?.type === 'effects' &&
           delayed.effects.length === 1 &&
-          delayed.effects[0].type === 'resources' &&
-          rewards.length
+          delayed.effects[0].type === 'resources'
         ) {
-          const amounts = Object.fromEntries(
-            rewards.map((n) => [n.args.type, Number(n.args.quantity)]),
-          );
-          const sourceId = String(rewards[0].args.player_id);
+          const fixed = card?.effects.filter((e) => e.type === 'resources');
           if (
-            key(amounts) === key(delayed.effects[0].resources) &&
-            rewards.every((n) => String(n.args.player_id) === sourceId)
-          ) {
-            openRewardFence = {
-              startMoveId: group.moveId,
-              sourceId,
-              resources: amounts,
-              points: 0,
-              resolvedMoveId: null,
-              excludedMoveIds: [],
-              reason: queuedResourceReceipt
+            !queuedResourceReceipt ||
+            fixed?.length !== 1 ||
+            !isDeepStrictEqual(fixed[0], delayed.effects[0])
+          )
+            fail('building resources lack an exact source, catalog and queue binding');
+          candidate = {
+            startMoveId: group.moveId,
+            sourceId: sourceActor,
+            resources: queuedResourceReceipt.resources,
+            points: 0,
+            resolvedMoveId: null,
+            excludedMoveIds: [],
+            queueBinding: bindNewFixedReward(
+              constructionTransition.beforePending,
+              constructionTransition.afterPending,
+              fixed[0],
+            ),
+            resourceReceiptProof: {
+              sourceBuilding: copy(construct.args.building),
+              nativeBuilding: card.id,
+              catalogEffect: copy(fixed[0]),
+              receipts: queuedResourceReceipt.rewards.map((n) => ({
+                uid: n.uid,
+                packetIndex: n.packetIndex,
+                notificationIndex: n.notificationIndex,
+                origin: n.args.origin,
+                resource: n.args.type,
+                amount: Number(n.args.quantity),
+              })),
+            },
+            reason:
+              native().pending.task.type === 'resource'
                 ? 'source building resources precede its resource choice; native queued effects follow it'
                 : 'source building resources precede free technology; native effects task follows it',
-            };
-            timingFences.push(openRewardFence);
-          }
+          };
         }
         if (
           delayed?.type === 'effects' &&
           delayed.effects.length === 1 &&
-          delayed.effects[0].type === 'points'
+          delayed.effects[0].type === 'points' &&
+          card?.effects.some((e) => e.type === 'points')
         ) {
-          const amount = delayed.effects[0].amount;
-          const award = group.entries.find(
-            (n) => n.type === 'updateScore' && Number(n.args.points) === amount,
+          const proof = proveFixedBuildingPoints(
+            group.entries,
+            card,
+            sourceActor,
+            constructionTransition,
           );
-          if (award) {
-            openRewardFence = {
-              startMoveId: group.moveId,
-              sourceId: String(award.args.player_id),
-              resources: {},
-              points: amount,
-              resolvedMoveId: null,
-              excludedMoveIds: [],
-              reason:
-                'source building fixed points precede its pending choice; native effects follow',
-            };
-            timingFences.push(openRewardFence);
-          }
+          candidate = {
+            startMoveId: group.moveId,
+            sourceId: sourceActor,
+            resources: {},
+            points: proof.amount,
+            resolvedMoveId: null,
+            excludedMoveIds: [],
+            queueBinding: proof.binding,
+            pointReceiptProof: proof.proof,
+            reason:
+              'source building fixed points precede its pending choice; native effects follow',
+          };
+        }
+        if (candidate) {
+          appendRewardFence(openRewardFences, candidate, native().pending, openCornFence);
+          timingFences.push(candidate);
         }
       }
-      if (openRewardFence) {
-        const f = openRewardFence;
-        if (group.moveId - f.startMoveId > 64)
-          fail('building effect timing fence did not resolve within bound');
-        const owed = Object.entries(f.resources).map(([r, amount]) => ({
-          field: `player.${f.sourceId}.resources.${r}`,
-          amount,
-        }));
-        if (f.resources.skull) owed.push({ field: 'skullSupply', amount: -f.resources.skull });
-        if (f.points) owed.push({ field: `player.${f.sourceId}.score`, amount: f.points });
-        const matches = owed.map((o) => ({ o, d: diff.find((d) => d.field === o.field) }));
-        if (matches.every(({ d }) => d === undefined)) {
-          const outstanding = f.points
-            ? [{ type: 'points', amount: f.points }]
-            : [{ type: 'resources', resources: f.resources }];
-          if (
-            native().pending?.after?.some(
-              (task) => task.type === 'effects' && key(task.effects) === key(outstanding),
-            )
-          )
-            fail('building effect still queued despite apparent counter reconciliation');
-          f.resolvedMoveId = group.moveId;
-          openRewardFence = null;
-        } else {
-          if (matches.some(({ o, d }) => !d || d.observed !== d.native + o.amount))
-            fail('building resource timing fence differs from exact outstanding effects');
-          f.excludedMoveIds.push(group.moveId);
-          diff = diff.filter((d) => !matches.some((m) => m.d === d));
-        }
-      }
+      ({ differences: diff, active: openRewardFences } = reconcileRewardFences(
+        openRewardFences,
+        diff,
+        native().pending,
+        group.moveId,
+      ));
       if (
         !openCornFence &&
         before.firstPlayerClaimed === before.currentPlayer &&
@@ -1999,6 +2007,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             reason: 'native pays accumulated corn at claimant turn end; source pays at round end',
             excludedMoveIds: [],
           };
+          if (
+            openRewardFences.some((f) =>
+              rewardFields(f).includes(`player.${sourceId}.resources.corn`),
+            )
+          )
+            fail('calendar corn overlaps an outstanding building resource');
           timingFences.push(openCornFence);
         }
       }
@@ -2098,7 +2112,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         moveId: group.moveId,
         publicStateMatched: originalDiff.length === 0,
         deferredCorn: !!openCornFence,
-        deferredBuildingResources: !!openRewardFence,
+        deferredBuildingResources: openRewardFences.length > 0,
         teacherCertified: false,
         differences: originalDiff,
         nativeSteps: record.steps.length - stepsBefore,
@@ -2161,7 +2175,10 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     tableId: index.tableId,
     rawSha256: index.rawSha256,
     finished:
-      native().phase === 'finished' && !openRotationFence && !openCornFence && !openRewardFence,
+      native().phase === 'finished' &&
+      !openRotationFence &&
+      !openCornFence &&
+      !openRewardFences.length,
     terminalReached: native().phase === 'finished',
     semanticReplayVerified: false,
     teacherCompleteness: false,
