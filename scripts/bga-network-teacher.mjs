@@ -89,6 +89,61 @@ export function validateTeacherRoster(index, derived, raw, record) {
   return ids;
 }
 
+/** Read literal original UI result fields; never derive rank or score from native output. */
+export function originalDomTerminalDisplay(raw, actors) {
+  const players = raw.metadata.players;
+  const history = raw.metadata.history_text ?? raw.metadata.historyRowText;
+  const explicit = players.some((p) => p.rank !== undefined || p.score !== undefined);
+  if (!explicit && typeof history !== 'string') return null;
+  if (!explicit && !new RegExp(`(?:^|\\n)#${raw.table_id}[ \\t]*(?:\\r?\\n|$)`).test(history))
+    throw new Error('Original final history row does not identify this table');
+  const observed = new Map();
+  for (const p of players) {
+    const id = sourcePlayerId(p),
+      name = p.name ?? p.text;
+    let rank, score;
+    if (explicit) {
+      const r = /^([1-4])位$/.exec(String(p.rank ?? '').trim());
+      const s = String(p.score ?? '').trim();
+      if (!r || !/^-?\d+$/.test(s)) throw new Error('Incomplete original final rank/score fields');
+      rank = Number(r[1]);
+      score = Number(s);
+    } else {
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const matches = [
+        ...history.matchAll(
+          new RegExp(
+            `(?:^|\\n)([1-4])位[ \\t]*\\r?\\n${escaped}[ \\t]*\\r?\\n(-?\\d+)[ \\t]*(?=\\r?\\n|$)`,
+            'g',
+          ),
+        ),
+      ];
+      if (matches.length !== 1) throw new Error('Original history result is missing or ambiguous');
+      rank = Number(matches[0][1]);
+      score = Number(matches[0][2]);
+    }
+    if (!Number.isSafeInteger(score)) throw new Error('Original final score is out of bounds');
+    observed.set(id, { total: score, rank });
+  }
+  const scores = actors.map((id, playerId) => {
+    const v = observed.get(id);
+    if (!v) throw new Error('Original result ID is absent');
+    return { playerId, ...v };
+  });
+  return {
+    field: explicit
+      ? 'metadata.players.rank/score'
+      : raw.metadata.history_text !== undefined
+        ? 'metadata.history_text'
+        : 'metadata.historyRowText',
+    checkpoint: {
+      source: { reference: raw.source_url, actionIds: [] },
+      mode: 'floorTotal',
+      scores,
+    },
+  };
+}
+
 /** Only ordinary V14 inputs are generated. Existing producer and loader decide acceptance. */
 export async function buildNetworkTeacher(context, spec, { core, producer, loader }) {
   const { receipt, index, derived, prefix, nativeReport, output } = context;
@@ -102,7 +157,8 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
   };
   let dataset = null,
     inspection = null,
-    error = null;
+    error = null,
+    verifiedNativeReport = null;
   const put = async (name, value) => {
     const bytes = Buffer.isBuffer(value)
       ? value
@@ -159,11 +215,37 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
         throw new Error('Original DOM source reference mismatch');
       const record = structuredClone(prefix.record);
       record.source.reference = raw.source_url;
+      const finalDisplay = originalDomTerminalDisplay(raw, actors);
+      let displayEvidencePin = null;
+      if (finalDisplay) {
+        if (
+          record.terminalDisplayCheckpoint &&
+          !isDeepStrictEqual(
+            record.terminalDisplayCheckpoint.scores.slice().sort((a, b) => a.playerId - b.playerId),
+            finalDisplay.checkpoint.scores,
+          )
+        )
+          throw new Error('Network and original DOM final results disagree');
+        record.terminalDisplayCheckpoint ??= finalDisplay.checkpoint;
+        displayEvidencePin = await put('teacher-terminal-display-evidence.json', {
+          schema: 'tzolkin-original-dom-terminal-display-evidence-v1',
+          sourceLog: spec.domSource,
+          field: finalDisplay.field,
+          checkpoint: finalDisplay.checkpoint,
+          scope:
+            'Literal original UI final results, mapped by original player IDs; no synthetic move or native-derived result.',
+        });
+      }
       const recordPin = await put('teacher-record.json', record);
       const canonicalReport = coreDispatcher(core)({ operation: 'publicReplay', replay: record });
       if (canonicalReport.error) throw new Error(canonicalReport.error);
       if (canonicalReport.frames.at(-1).snapshot.state.phase !== 'finished')
         throw new Error('Canonical native record is not terminal');
+      verifiedNativeReport = canonicalReport;
+      status.terminalDisplay = {
+        state: canonicalReport.terminalDisplayComparison ? 'compared' : 'notConnected',
+        evidence: displayEvidencePin,
+      };
       const reportPin = await put('teacher-native-report.json', canonicalReport);
       const domIds = new Set(raw.dom_entries.map((n) => n.action_id));
       const rows = prefix.audit
@@ -266,7 +348,13 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
         decoderAudit: auditPin,
         nominations: spec.nominations,
         reservations: spec.reservations,
-        reconstructionEvidence: [evidencePin, receipt.raw, receipt.sourceBinding, prefixPin],
+        reconstructionEvidence: [
+          evidencePin,
+          receipt.raw,
+          receipt.sourceBinding,
+          prefixPin,
+          ...(displayEvidencePin ? [displayEvidencePin] : []),
+        ],
         stoppingNotificationAssumption:
           'CompleteRetainedActorOperationsAndMarketExchangeNotificationsBetweenSourceAnchors',
         stoppingObservations: [],
@@ -302,10 +390,10 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
       if (produced.length > 64 * 1024 * 1024)
         throw new Error('Produced dataset exceeds byte bound');
       // Native producer output contains dense feature vectors; source JSON retains its stricter parser.
-      dataset = JSON.parse(produced);
+      const verifiedDataset = JSON.parse(produced);
       if (
-        dataset.manifestSha256 !== manifestPin.sha256 ||
-        dataset.counts.samples !== dataset.samples.length
+        verifiedDataset.manifestSha256 !== manifestPin.sha256 ||
+        verifiedDataset.counts.samples !== verifiedDataset.samples.length
       )
         throw new Error('Produced dataset/manifest binding mismatch');
       const loaderInput = {
@@ -330,13 +418,15 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
         maxBuffer: 4 * 1024 * 1024,
       });
       await put('teacher-loader.stdout', Buffer.from(loaderOutput));
-      inspection = parse(Buffer.from(loaderOutput));
+      const verifiedInspection = parse(Buffer.from(loaderOutput));
       if (
-        inspection.modelCreated !== false ||
-        inspection.modelForwardCalls !== 0 ||
-        inspection.optimizerSteps !== 0
+        verifiedInspection.modelCreated !== false ||
+        verifiedInspection.modelForwardCalls !== 0 ||
+        verifiedInspection.optimizerSteps !== 0
       )
         throw new Error('Read-only loader contract violated');
+      inspection = verifiedInspection;
+      dataset = verifiedDataset;
       status.loader = {
         state: 'accepted',
         trainingReady: inspection.trainingReady,
@@ -352,7 +442,7 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
       status.loader = { state: 'rejected', reason: error.reason };
   }
   await put('teacher-result.json', status);
-  return { dataset, loader: inspection, status, error };
+  return { dataset, loader: inspection, status, error, nativeReport: verifiedNativeReport };
 }
 
 export async function runNetworkTeacher({ handoff, inputs, core, producer, loader, output }) {

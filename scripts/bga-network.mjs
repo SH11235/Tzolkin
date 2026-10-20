@@ -9,6 +9,7 @@ const REVIEWED_CLIENT_PAIRS = new Set([
   '8cec9fefd73a8abdfbd539ad1c547e1e92ee8db4ebc0acabeeb8ee87ebdb0b41:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   'baefe213893a46474a278e315243e16daaf2cc0ffe46396e6c0782d6f38faf47:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   'b020a816c96ad050c9b96ff29a6b8e14efdda44132f2daa0c29893ecf596b5eb:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
+  '8e4f493ad56c2a4b9e79d7c5d5c853cca4fe48f2e0c76547bd6d03f62cdca3f1:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
 ]);
 const validatedContracts = new WeakSet();
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -59,6 +60,7 @@ const CLASSIFICATION = {
   agricultureMax: 'technologyCaption',
   architectureMax: 'technologyCaption',
   theologyMax: 'technologyCaption',
+  workerLimit: 'workerCapCaption',
   middleOfAgeRewards: 'awardCaption',
   templeLeader: 'awardCaption',
   templeScore: 'awardCaption',
@@ -277,6 +279,14 @@ export function parseNetworkReplay(bytes) {
           !Object.values(initial.players).some((p) => p.name === n.args.player_name)
         )
           fail('unsupported theology caption');
+      }
+      if (n.type === 'workerLimit') {
+        keys(n.args, ['player_name'], 'worker cap caption');
+        if (
+          n.log !== '${player_name} already have 6 workers' ||
+          !Object.values(initial.players).some((p) => p.name === n.args.player_name)
+        )
+          fail('unsupported worker cap caption');
       }
       if (n.type === 'simpleNote') {
         keys(n.args, ['players', 'change_preferences'], 'color preference caption');

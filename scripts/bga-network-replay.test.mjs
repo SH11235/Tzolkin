@@ -299,6 +299,21 @@ test('actor mismatch stops before applying an operation', () => {
   assert.equal(result.record.steps.length, 0);
 });
 
+test('worker cap captions cannot create points without the owned-six-worker receipt', () => {
+  const worker = setup(false, false, false, (rawBytes) => {
+    const raw = JSON.parse(rawBytes);
+    raw.gameLogs.data.data.at(-1).data.push({
+      uid: 'cap',
+      type: 'workerLimit',
+      log: '${player_name} already have 6 workers',
+      args: { player_name: 'P1' },
+    });
+    return bytes(raw);
+  });
+  assert.match(worker.blocked.reason, /worker cap caption lacks/);
+  assert.equal(worker.record.steps.length, 0);
+});
+
 test('speed-up availability is never silently treated as a cosmetic board flip', () => {
   const result = setup(false, false, true);
   assert.equal(result.record.steps.length, 0);

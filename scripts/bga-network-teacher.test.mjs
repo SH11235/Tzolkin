@@ -1,15 +1,53 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
-import { mkdtemp, writeFile, unlink, rmdir } from 'node:fs/promises';
+import { test, mock } from 'node:test';
+import { mkdtemp, writeFile, unlink, rmdir, readdir } from 'node:fs/promises';
+import { writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import {
+import * as realReplay from './bga-replay.mjs';
+import { networkEvidenceReport } from './bga-network-report.mjs';
+let artifactCase = null;
+const terminalReport = () => ({
+  frames: [{ snapshot: { state: { phase: 'finished', foodDays: [] } } }],
+});
+// Isolated native tool doubles exercise publication failures, not source authentication.
+mock.module(new URL('./bga-replay.mjs', import.meta.url).href, {
+  namedExports: { ...realReplay, coreDispatcher: () => terminalReport },
+});
+mock.module('node:child_process', {
+  namedExports: {
+    execFileSync: (exe, args) => {
+      if (exe === 'synthetic-producer') {
+        const manifest = args[args.indexOf('--manifest-sha256') + 1];
+        writeFileSync(
+          args[args.indexOf('--output') + 1],
+          JSON.stringify({
+            manifestSha256: artifactCase === 'manifest' ? 'wrong' : manifest,
+            counts: { samples: artifactCase === 'counts' ? 2 : 1, candidates: 1 },
+            samples: [{ sourceActorId: '11', sourceActionId: 1, sourceMessageIndex: 0 }],
+          }),
+        );
+        return JSON.stringify({ samples: 1, candidates: 1 });
+      }
+      if (exe === 'synthetic-loader')
+        return JSON.stringify({
+          modelCreated: true,
+          modelForwardCalls: 0,
+          optimizerSteps: 0,
+          trainingReady: true,
+        });
+      throw new Error('Unexpected synthetic tool invocation');
+    },
+  },
+});
+const {
   validateTeacherInputSpec,
   validateTeacherRoster,
   runNetworkTeacher,
   buildNetworkTeacher,
-} from './bga-network-teacher.mjs';
+  originalDomTerminalDisplay,
+} = await import('./bga-network-teacher.mjs');
 
 function rosterFixture() {
   const ids = ['11', '12', '13', '14'];
@@ -85,7 +123,7 @@ async function temporary(t) {
   const root = await mkdtemp(join(tmpdir(), 'network-teacher-')),
     files = [];
   t.after(async () => {
-    for (const p of files) await unlink(p);
+    for (const name of await readdir(root)) await unlink(join(root, name));
     await rmdir(root);
   });
   const put = async (name, value) => {
@@ -127,6 +165,149 @@ test('heldout Test is refused before a table payload or native executable is ope
     }),
     /reserved non-Test/,
   );
+});
+
+test('literal final display keeps original IDs and refuses missing or contradictory results', async (t) => {
+  const f = rosterFixture();
+  f.raw.source_url = 'https://boardgamearena.com/gamereview?table=123';
+  f.raw.metadata.history_text = [
+    '#123',
+    '1位',
+    'P11',
+    '40 ',
+    '2位',
+    'P12',
+    '30 ',
+    '3位',
+    'P13',
+    '20 ',
+    '4位',
+    'P14',
+    '10 ',
+  ].join('\n');
+  const display = originalDomTerminalDisplay(f.raw, ['14', '13', '12', '11']);
+  assert.deepEqual(display.checkpoint.source.actionIds, []);
+  assert.deepEqual(
+    display.checkpoint.scores.map((s) => s.total),
+    [10, 20, 30, 40],
+  );
+  assert.deepEqual(
+    display.checkpoint.scores.map((s) => s.rank),
+    [4, 3, 2, 1],
+  );
+  const missing = structuredClone(f.raw);
+  missing.metadata.history_text = missing.metadata.history_text.replace('4位\nP14\n10 ', '');
+  assert.throws(() => originalDomTerminalDisplay(missing, f.derived.sourceActorIds), /missing/);
+  const wrongTable = structuredClone(f.raw);
+  wrongTable.metadata.history_text = wrongTable.metadata.history_text.replace('#123', '#999');
+  assert.throws(
+    () => originalDomTerminalDisplay(wrongTable, f.derived.sourceActorIds),
+    /identify this table/,
+  );
+  assert.throws(() => originalDomTerminalDisplay(f.raw, ['99', '12', '13', '14']), /ID is absent/);
+  const { put, root } = await temporary(t);
+  const dom = await put('dom.json', f.raw),
+    nominations = await put('nominations.json', {
+      schema: 'tzolkin-human-player-nomination-v1',
+      basis: 'userNominatedHistoricalArenaTop5',
+      playerIds: ['11'],
+    });
+  const reservations = await put('reservations.json', {
+    entries: [{ tableId: '123', split: 'validation' }],
+  });
+  f.record.source = { reference: f.raw.source_url };
+  f.record.steps = [];
+  f.record.terminalDisplayCheckpoint = originalDomTerminalDisplay(
+    f.raw,
+    f.derived.sourceActorIds,
+  ).checkpoint;
+  f.record.terminalDisplayCheckpoint.scores[0].total = 999;
+  const result = await buildNetworkTeacher(
+    {
+      ...f,
+      receipt: { split: 'validation', reservations },
+      prefix: {
+        tableId: '123',
+        rawSha256: 'source',
+        record: f.record,
+        audit: [],
+        timingFences: [],
+      },
+      nativeReport: terminalReport(),
+      output: root,
+    },
+    { schema: 'tzolkin-bga-network-teacher-inputs-v1', domSource: dom, nominations, reservations },
+    { core: 'synthetic-core', producer: 'synthetic-producer', loader: 'synthetic-loader' },
+  );
+  assert.match(result.error.reason, /Network and original DOM final results disagree/);
+  assert.equal(result.dataset, null);
+  assert.equal(result.status.producer.state, 'notRun');
+});
+
+test('rejected generated artifacts do not leak samples or readiness into common evidence', async (t) => {
+  for (const kind of ['manifest', 'counts', 'inspection'])
+    await t.test(kind, async (sub) => {
+      artifactCase = kind;
+      const { put, root } = await temporary(sub),
+        f = rosterFixture();
+      f.raw.source_url = 'https://boardgamearena.com/gamereview?table=123';
+      f.raw.dom_entries = [];
+      f.record.source = { reference: f.raw.source_url };
+      f.record.steps = [];
+      const dom = await put('dom.json', f.raw),
+        nominations = await put('nominations.json', {
+          schema: 'tzolkin-human-player-nomination-v1',
+          basis: 'userNominatedHistoricalArenaTop5',
+          playerIds: ['11'],
+        });
+      const reservations = await put('reservation.json', {
+        entries: [{ tableId: '123', split: 'validation' }],
+      });
+      const prefix = {
+        tableId: '123',
+        rawSha256: 'source',
+        record: f.record,
+        audit: [],
+        timingFences: [],
+        blocked: null,
+        clientContract: {},
+      };
+      const result = await buildNetworkTeacher(
+        {
+          ...f,
+          receipt: { split: 'validation', reservations },
+          prefix,
+          nativeReport: terminalReport(),
+          output: root,
+        },
+        {
+          schema: 'tzolkin-bga-network-teacher-inputs-v1',
+          domSource: dom,
+          nominations,
+          reservations,
+        },
+        { core: 'synthetic-core', producer: 'synthetic-producer', loader: 'synthetic-loader' },
+      );
+      const report = networkEvidenceReport({
+        tableId: '123',
+        prepared: {},
+        prefix,
+        nativeReport: terminalReport(),
+        dataset: result.dataset,
+        loader: result.loader,
+        error: result.error,
+      });
+      assert.equal(result.status.producer.state, 'accepted');
+      assert.equal(result.loader, null);
+      assert.equal(report.candidates.trainingReady, null);
+      assert.equal(result.dataset, null);
+      assert.equal(report.candidates.rows, 0);
+      assert.equal(report.candidates.state, 'notProduced');
+      if (kind === 'inspection') {
+        assert.equal(result.status.loader.state, 'rejected');
+        assert.match(result.error.reason, /Read-only loader contract violated/);
+      }
+    });
 });
 
 test('a stopped native prefix reports producer not run rather than a fabricated rejection', async (t) => {

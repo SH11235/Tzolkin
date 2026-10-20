@@ -118,7 +118,7 @@ export async function runNetworkHandoff({
     index,
     prepared,
     prefix,
-    nativeReport,
+    nativeReport: teacher?.nativeReport ?? nativeReport,
     error: teacher?.error ?? error,
     dataset: teacher?.dataset ?? null,
     loader: teacher?.loader ?? null,
@@ -127,6 +127,8 @@ export async function runNetworkHandoff({
     report.teacherPipeline = teacher.status;
     if (teacher.status.loader.state === 'rejected')
       report.candidates.loaderState = 'existingReadOnlyLoaderRejected';
+    if (teacher.status.producer.state === 'accepted' && !teacher.dataset)
+      report.candidates.state = 'withheldAfterArtifactOrLoaderRejection';
   }
   await put('evidence-report.json', report);
   return report;

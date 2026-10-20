@@ -848,6 +848,28 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     const before = copy(native());
     const stepsBefore = record.steps.length;
     try {
+      for (const caption of group.entries.filter((n) => n.type === 'workerLimit')) {
+        assertActor(caption);
+        const actor = getActor(caption),
+          sourceId = [...sourceToNative].find(([, id]) => id === actor)?.[0];
+        const workerBuilding = group.entries.some(
+          (n) =>
+            n.type === 'construct' &&
+            getActor(n) === actor &&
+            catalog.BUILDINGS.find((b) => b.id === mapper.bind(n.args.building))?.effects.some(
+              (e) => e.type === 'worker',
+            ),
+        );
+        if (
+          native().players[actor].workers !== 6 ||
+          ledger.players[sourceId].workers !== 6 ||
+          !workerBuilding ||
+          group.entries.filter(
+            (n) => n.type === 'updateScore' && getActor(n) === actor && Number(n.args.points) === 6,
+          ).length !== 1
+        )
+          fail('worker cap caption lacks its owned-six-worker building and score receipt');
+      }
       for (const caption of group.entries.filter((n) => n.type === 'theologyMax')) {
         assertActor(caption);
         const actor = getActor(caption),
