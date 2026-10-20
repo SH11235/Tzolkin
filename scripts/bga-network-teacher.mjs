@@ -247,8 +247,11 @@ export async function buildNetworkTeacher(context, spec, { core, producer, loade
         });
       }
       const recordPin = await put('teacher-record.json', record);
+      stage = 'canonicalNativeReplayRejected';
       const canonicalReport = coreDispatcher(core)({ operation: 'publicReplay', replay: record });
       if (canonicalReport.error) throw new Error(canonicalReport.error);
+      if (prefix.initialCoverageEvidence && canonicalReport.sourceCoverage?.initial !== true)
+        throw new Error('Canonical original initial board checkpoint is not fully covered');
       if (canonicalReport.frames.at(-1).snapshot.state.phase !== 'finished')
         throw new Error('Canonical native record is not terminal');
       verifiedNativeReport = canonicalReport;

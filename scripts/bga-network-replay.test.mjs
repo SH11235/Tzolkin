@@ -25,9 +25,149 @@ const {
   proveCalendarDesignation,
   queuedBuildingResources,
   observedChichenRoute,
+  initialSourceBoardCheckpoint,
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
+
+function initialCoverageFixture() {
+  const ids = ['1', '2', '3', '4'];
+  const source = {
+    day: '0',
+    nextFoodDay: '7',
+    gamestate: { id: 2 },
+    skulls: [],
+    firstPlayer: '3',
+    playerorder: [1, 2, 3, 4],
+    buildings: [{ type: 'building_age_1' }],
+    gears: { uxmal: { teethnbr: 10 } },
+    workers: ids.flatMap((id) =>
+      Array.from({ length: 3 }, (_, i) => ({
+        id: `${id}-${i}`,
+        player: id,
+        place: null,
+        position: null,
+      })),
+    ),
+  };
+  const sourceToNative = new Map(['3', '4', '1', '2'].map((id, i) => [id, i]));
+  const ledger = {
+    initial: source,
+    day: 0,
+    stateId: 4,
+    activePlayer: '3',
+    firstPlayer: '3',
+    players: Object.fromEntries(
+      ids.map((id) => [
+        id,
+        {
+          resources: { corn: Number(id), wood: 0, stone: 0, gold: 0, skull: 0 },
+          score: 0,
+          workers: 3,
+          temples: {},
+          technologies: {},
+          buildings: [],
+          monuments: [],
+          wealth: ['second', 'first'],
+          feedWorkers: 0,
+          feedDiscount: 0,
+          cornTiles: 0,
+          woodTiles: 0,
+          skullsPlaced: 0,
+        },
+      ]),
+    ),
+    workers: new Map(ids.map((id) => [id, { player: id, place: null, position: null }])),
+    jungle: {},
+    skullSupply: 13,
+    skullSpaces: Array(10).fill(null),
+    buildings: ['source-card'],
+    monuments: [],
+    accumulatedCorn: 0,
+  };
+  const index = {
+    initial: source,
+    rawSha256: 'original-bytes',
+    groups: [
+      {
+        moveId: 5,
+        entries: [
+          { type: 'wealthTiles', args: {} },
+          {
+            type: 'gameStateChange',
+            args: { id: 4, active_player: '3' },
+            packetIndex: 7,
+            notificationIndex: 9,
+            uid: 'original-boundary',
+          },
+        ],
+      },
+    ],
+  };
+  return { index, ledger, sourceToNative };
+}
+
+test('initial full-board claims use post-wealth source counters and original actor/order evidence', () => {
+  const f = initialCoverageFixture();
+  const { expected, evidence } = initialSourceBoardCheckpoint(f.index, f.ledger, f.sourceToNative);
+  assert.deepEqual(expected.turnOrder, [0, 1, 2, 3]);
+  assert.equal(expected.currentPlayer, 0);
+  assert.equal(expected.players[0].resources.corn, 3);
+  assert.deepEqual(expected.players[0].wealth, ['first', 'second']);
+  assert.deepEqual(expected.gears.uxmal, Array(10).fill(null));
+  assert.deepEqual(expected.foodDays, []);
+  assert.equal(evidence.boundary.uid, 'original-boundary');
+  assert.equal(evidence.sourceRawSha256, 'original-bytes');
+  // Source counter changes must change the claim, rather than copying a cached native value.
+  f.ledger.players['3'].resources.corn++;
+  assert.equal(
+    initialSourceBoardCheckpoint(f.index, f.ledger, f.sourceToNative).expected.players[0].resources
+      .corn,
+    4,
+  );
+});
+
+test('initial coverage refuses missing source calendar, actor contradictions and later boundaries', () => {
+  for (const change of [
+    (f) => {
+      delete f.index.initial.nextFoodDay;
+    },
+    (f) => {
+      delete f.index.initial.skulls;
+    },
+    (f) => {
+      f.index.initial.workers[0].id = f.index.initial.workers[1].id;
+    },
+    (f) => {
+      f.index.initial.nextFoodDay = '14';
+    },
+    (f) => {
+      f.index.groups[0].entries[1].args.active_player = '1';
+    },
+    (f) => {
+      f.index.groups[0].entries[1].args.id = 6;
+    },
+    (f) => {
+      f.ledger.day = 1;
+    },
+    (f) => {
+      f.ledger.workers.get('1').place = 'uxmal';
+    },
+    (f) => {
+      f.ledger.players['3'].wealth.pop();
+    },
+    (f) => {
+      f.index.groups[0].entries.unshift({ type: 'foodDayCost', args: {} });
+    },
+  ]) {
+    const f = initialCoverageFixture();
+    change(f);
+    assert.throws(
+      () => initialSourceBoardCheckpoint(f.index, f.ledger, f.sourceToNative),
+      /untouched post-wealth Playing boundary/,
+    );
+  }
+});
 
 function fixture() {
   const players = Object.fromEntries(
