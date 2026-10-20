@@ -52,6 +52,13 @@ function finalScoreFixture(mutate = () => {}) {
     state(95, '2'),
   ];
   mutate(data);
+  data.splice(
+    2,
+    0,
+    n('takeGoods', { player_id: '2', type: 'corn', quantity: '0' }),
+    n('firstPlayerCorn', { player_id: '2', corn: '0' }),
+    n('firstPlayer', { player_id: '2' }),
+  );
   raw.gameLogs.data.data.at(-1).data = data;
   const group = parseNetworkReplay(bytes(raw)).groups.at(-1);
   const players = [0, 1, 2].map((id) => ({
@@ -90,6 +97,8 @@ function finalScoreFixture(mutate = () => {}) {
       foodDays: [8, 14, 21],
       currentPlayer: 2,
       firstPlayer: 0,
+      turnIndex: 2,
+      turnOrder: [0, 1, 2],
     },
     observation: { actor: 1, legalActions: [{ action: { type: 'rotate', days: 1 } }] },
     sourceToNative: new Map([
@@ -216,10 +225,12 @@ test('final receipt corruption fails even when offsetting errors preserve the to
       x.unresolvedTiming = true;
     },
     (x) => {
-      x.group.entries[6].args.nbr = 5;
+      x.group.entries.find((n) => n.type === 'finalScoring' && n.args.nbr !== undefined).args.nbr =
+        5;
     },
     (x) => {
-      x.group.entries[6].notificationIndex++;
+      x.group.entries.find((n) => n.type === 'finalScoring' && n.args.nbr !== undefined)
+        .notificationIndex++;
     },
     (x) => {
       x.group.entries = structuredClone(x.group.entries);

@@ -92,6 +92,7 @@ export function finalScoringWitness({
     before.phase !== 'playing' ||
     before.round !== 27 ||
     before.pending !== null ||
+    before.turnIndex !== before.turnOrder.length - 1 ||
     !isDeepStrictEqual(before.foodDays, [8, 14, 21]) ||
     state.phase !== 'playing' ||
     state.additionalBuildings !== false ||
@@ -152,6 +153,66 @@ export function finalScoringWitness({
     entries.slice(entries.indexOf(end) + 1).some((n) => !clockTypes.has(n.type))
   )
     fail('foreign effects surround final receipts');
+  const gamePrefix = prefix.filter((n) => !clockTypes.has(n.type));
+  const payout = gamePrefix[3];
+  if (
+    !isDeepStrictEqual(
+      gamePrefix.slice(0, 6).map((n) => n.type),
+      [
+        'gameStateChange',
+        'gameStateChange',
+        'takeGoods',
+        'firstPlayerCorn',
+        'firstPlayer',
+        'gameStateChange',
+      ],
+    ) ||
+    gamePrefix[2].args.type !== 'corn' ||
+    sourceToNative.get(String(gamePrefix[2].args.player_id)) !== claimed ||
+    sourceToNative.get(String(payout?.args.player_id)) !== claimed ||
+    sourceToNative.get(String(gamePrefix[4].args.player_id)) !== claimed ||
+    integer(gamePrefix[2].args.quantity) !== integer(payout.args.corn)
+  )
+    fail('final food day lacks its closed original corn payout');
+  const foodEnd = gamePrefix.indexOf(states[3]);
+  const feeding = gamePrefix.slice(6, foodEnd);
+  const temple = gamePrefix.slice(foodEnd + 1);
+  for (const [section, phase] of [
+    [feeding, 'feeding'],
+    [temple, 'temple'],
+  ]) {
+    if (section.length % 2) fail('unpaired food-day effect');
+    for (let i = 0; i < section.length; i += 2) {
+      const effect = section[i],
+        caption = section[i + 1];
+      if (
+        !sourceToNative.has(String(effect.args.player_id)) ||
+        String(effect.args.player_id) !== String(caption.args.player_id) ||
+        effect.notificationIndex + 1 !== caption.notificationIndex
+      )
+        fail('food-day effect and caption actors differ');
+      if (phase === 'feeding') {
+        if (caption.type !== 'foodDayCost') fail('unknown feeding receipt');
+        if (effect.type === 'payGoods') {
+          if (
+            effect.args.type !== 'corn' ||
+            integer(effect.args.quantity) !== integer(caption.args.cost)
+          )
+            fail('foreign resource effect in final feeding');
+        } else if (
+          effect.type !== 'updateScore' ||
+          !Number.isSafeInteger(effect.args.points) ||
+          effect.args.points !== -integer(caption.args.points)
+        )
+          fail('feeding penalty differs from original receipt');
+      } else if (
+        effect.type !== 'updateScore' ||
+        !['templeLeader', 'templeScore'].includes(caption.type) ||
+        integer(effect.args.points) !== integer(caption.args.points)
+      )
+        fail('temple effect differs from original receipt');
+    }
+  }
   const scores = structuredClone(scoresBeforeGroup);
   for (const n of prefix.filter((n) => n.type === 'updateScore')) {
     const id = String(n.args.player_id);
