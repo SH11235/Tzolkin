@@ -53,7 +53,7 @@ export function proveFixedBuildingPoints(entries, card, sourceId, transition) {
   const amount = fixed[0].amount;
   if (!Number.isSafeInteger(amount) || amount <= 0) fail('invalid fixed point effect');
   const bonus =
-    transition.action.architecture === true && transition.architectureLevel >= 3 ? 2 : 0;
+    transition.action.architecture === true && transition.architectureLevel >= 2 ? 2 : 0;
   const receipts = entries.filter((n) => n.type === 'updateScore');
   const expected = [amount, ...(bonus ? [bonus] : [])].sort((a, b) => a - b);
   if (

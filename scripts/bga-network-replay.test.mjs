@@ -1040,6 +1040,22 @@ test('fixed building point evidence binds receipt multiplicity and a newly queue
   assert.equal(proof.amount, 2);
   assert.equal(proof.proof.scoreReceipts.length, 2);
   assert.equal(proof.proof.individualReceiptAssignment, 'notIdentified');
+  for (const [level, architecture, bonus] of [
+    [1, true, 0],
+    [2, true, 2],
+    [3, true, 2],
+    [3, false, 0],
+  ]) {
+    const receipts = [entries[0], entries[1], ...(bonus ? [entries[2]] : [])];
+    const boundary = proveFixedBuildingPoints(receipts, card, '1', {
+      ...transition,
+      action: { architecture },
+      architectureLevel: level,
+      afterScore: 5 + bonus,
+    });
+    assert.equal(boundary.proof.immediateArchitectureBonus, bonus);
+    assert.equal(boundary.proof.aggregateResidual, 2);
+  }
   for (const mutate of [
     (e) => e.pop(),
     (e) => e.push({ ...e[1], uid: 'third' }),
