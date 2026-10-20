@@ -1,0 +1,1103 @@
+import { readFileSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
+import { inspectCancellationClusters } from './bga-network.mjs';
+import { catalogFingerprint } from './bga-replay.mjs';
+
+const catalogBytes = readFileSync(
+  new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url),
+);
+const catalog = JSON.parse(catalogBytes);
+const R = ['corn', 'wood', 'stone', 'gold', 'skull'];
+const TECH = ['agriculture', 'extraction', 'architecture', 'theology'];
+const TEMPLE = ['chaac', 'quetzalcoatl', 'kukulcan'];
+const temple = (x) => (x === 'kukulcan' ? 'kukulkan' : x);
+const category = (x) => ({ tomb: 'graveyard', civic: 'municipal' })[x] ?? x;
+const copy = structuredClone;
+const fail = (message) => {
+  throw new Error(`Network native: ${message}`);
+};
+const amounts = (x) => R.map((k) => Number(x?.[k] ?? 0));
+const canonical = (x) =>
+  Array.isArray(x)
+    ? x.map(canonical)
+    : x && typeof x === 'object'
+      ? Object.fromEntries(
+          Object.entries(x)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([k, v]) => [k, canonical(v)]),
+        )
+      : x;
+const key = (x) => JSON.stringify(canonical(x));
+
+function effectsSignature(effects) {
+  const counts = {};
+  const add = (k, n = 1) => {
+    counts[k] = (counts[k] ?? 0) + n;
+  };
+  for (const e of effects) {
+    if (e.type === 'technology') add(`technology:${e.technology}`, e.steps);
+    else if (e.type === 'temple') add(`temple:${e.temple}`, e.steps);
+    else if (e.type === 'resources')
+      for (const [r, n] of Object.entries(e.resources)) add(`resource:${r}`, n);
+    else if (e.type === 'points') add('points', e.amount);
+    else if (e.type === 'feed') add('feed', e.workers);
+    else if (e.type === 'feedDiscount') add('feedDiscount', e.amount);
+    else if (['worker', 'build', 'trade', 'action'].includes(e.type)) add(e.type);
+    else fail(`unsupported native effect ${e.type}`);
+  }
+  return key(counts);
+}
+
+function sourceEffects(def) {
+  const effects = [];
+  const known = new Set([
+    'cost',
+    'quantity',
+    'kind',
+    'description',
+    'dummyWorkers',
+    'actions',
+    'farm',
+    'bigFarm',
+    'points',
+    'worker',
+    ...R,
+    ...TECH,
+    ...TEMPLE,
+  ]);
+  if (Object.keys(def).some((k) => !known.has(k))) fail('unsupported source definition effect');
+  for (const k of ['quantity', 'farm', 'bigFarm', 'points', 'worker', ...R, ...TECH, ...TEMPLE])
+    if (def[k] !== undefined && (!Number.isSafeInteger(def[k]) || def[k] < 0 || def[k] > 32))
+      fail('invalid source effect amount');
+  if (def.actions !== undefined && (!Array.isArray(def.actions) || def.actions.length > 4))
+    fail('unsupported source action list');
+  for (const k of TECH)
+    if (def[k]) effects.push({ type: 'technology', technology: k, steps: Number(def[k]) });
+  for (const k of TEMPLE)
+    if (def[k]) effects.push({ type: 'temple', temple: temple(k), steps: Number(def[k]) });
+  const resources = Object.fromEntries(R.filter((k) => def[k]).map((k) => [k, Number(def[k])]));
+  if (Object.keys(resources).length) effects.push({ type: 'resources', resources });
+  if (def.farm) effects.push({ type: 'feed', workers: Number(def.farm) });
+  if (def.bigFarm) effects.push({ type: 'feedDiscount', amount: Number(def.bigFarm) });
+  if (def.points) effects.push({ type: 'points', amount: Number(def.points) });
+  if (def.worker)
+    effects.push(...Array.from({ length: Number(def.worker) }, () => ({ type: 'worker' })));
+  for (const a of def.actions ?? []) {
+    if (a === 'freeTechnology') effects.push({ type: 'technology', technology: 'any', steps: 1 });
+    else if (a === 'templeReward') effects.push({ type: 'temple', temple: 'any', steps: 1 });
+    else if (a === 'construct') effects.push({ type: 'build' });
+    else if (a === 'anyAction') effects.push({ type: 'action' });
+    else if (a === 'trade') effects.push({ type: 'trade' });
+    else fail(`unsupported source action ${a}`);
+  }
+  return effectsSignature(effects);
+}
+
+function monumentKey(def) {
+  if (typeof def.description !== 'string') fail('missing monument scoring description');
+  const s = def.description.toLowerCase();
+  const rules = [
+    ['cornTiles', s.includes('corn harvest tile')],
+    ['woodTiles', s.includes('wood harvest tile')],
+    ['allMonuments', s.includes('regardless of who')],
+    ['graveyards', s.includes('gray-bordered')],
+    ['municipals', s.includes('green-bordered')],
+    ['shrines', s.includes('blue-bordered')],
+    ['workers', s.includes('number of workers')],
+    ['technologyLevels', s.includes('each level of technology')],
+    ['maxTechnologies', s.includes('third level')],
+    ['highestTemple', s.includes('choose one temple')],
+    ['templePoints', s.includes('in each temple')],
+    ['allSkulls', s.includes('each skull placed')],
+    ['constructions', s.includes('each building you constructed')],
+  ].filter(([, v]) => v);
+  if (rules.length !== 1) fail('unknown/ambiguous monument definition');
+  return rules[0][0];
+}
+
+/** Preserve physical instances while matching full cost/category/effect semantics. */
+export function networkCardMapper(initial, seed) {
+  const assigned = new Map();
+  const used = new Set();
+  function candidates(card) {
+    const def = initial.constructions?.[card.type]?.[card.type_arg];
+    if (!def) fail('unknown card definition');
+    if (card.type === 'monument')
+      return catalog.MONUMENTS.filter(
+        (n) =>
+          category(def.kind) === n.category &&
+          key(amounts(def.cost)) === key(amounts(n.cost)) &&
+          monumentKey(def) === n.scoreKey,
+      );
+    const age = { building_age_1: 1, building_age_2: 2 }[card.type];
+    if (!age) fail('unknown card type');
+    return catalog.BUILDINGS.filter(
+      (n) =>
+        n.age === age &&
+        category(def.kind) === n.category &&
+        key(amounts(def.cost)) === key(amounts(n.cost)) &&
+        sourceEffects(def) === effectsSignature(n.effects),
+    );
+  }
+  function bind(card, preferred = null) {
+    const id = String(card.id);
+    const signature = key({ type: card.type, typeArg: String(card.type_arg) });
+    if (assigned.has(id)) {
+      const old = assigned.get(id);
+      if (old.signature !== signature || (preferred && old.nativeId !== preferred))
+        fail('card instance rebound');
+      return old.nativeId;
+    }
+    const matches = candidates(card).filter((n) => !used.has(n.id));
+    const selected = preferred
+      ? matches.find((n) => n.id === preferred)
+      : matches.sort((a, b) => a.id.localeCompare(b.id))[0];
+    if (!selected) fail('card effect/instance mapping mismatch');
+    // Multiple candidates are accepted only if identical complete native definitions except ID/name.
+    const semantics = (n) =>
+      key({
+        age: n.age,
+        category: n.category,
+        cost: amounts(n.cost),
+        effects: n.effects && effectsSignature(n.effects),
+        scoreKey: n.scoreKey,
+      });
+    if (matches.some((n) => semantics(n) !== semantics(selected)))
+      fail('ambiguous non-equivalent card mapping');
+    assigned.set(id, {
+      nativeId: selected.id,
+      signature,
+      sourceType: card.type,
+      typeArg: String(card.type_arg),
+    });
+    used.add(selected.id);
+    return selected.id;
+  }
+  for (const [cards, ids] of [
+    [initial.buildings, seed.buildings],
+    [initial.monuments, seed.monuments],
+  ]) {
+    if (!Array.isArray(cards) || cards.length !== ids.length)
+      fail('initial market length mismatch');
+    for (let i = 0; i < cards.length; i++) bind(cards[i], ids[i]);
+  }
+  return { bind, entries: () => Object.fromEntries(assigned) };
+}
+
+function initialLedger(index) {
+  const s = index.initial;
+  return {
+    players: Object.fromEntries(
+      Object.entries(s.players).map(([id, p]) => [
+        id,
+        {
+          resources: Object.fromEntries(R.map((k) => [k, Number(p[k])])),
+          score: Number(p.score),
+          technologies: Object.fromEntries(TECH.map((k) => [k, Number(p[k])])),
+          temples: Object.fromEntries(TEMPLE.map((k) => [temple(k), Number(p[k]) - 1])),
+          workers: s.workers.filter((w) => String(w.player) === id).length,
+          cornTiles: Number(p.corn_tile),
+          woodTiles: Number(p.wood_tile),
+          buildings: [],
+          monuments: [],
+          wealth: [],
+          feedWorkers: 0,
+          feedDiscount: 0,
+          skullsPlaced: 0,
+        },
+      ]),
+    ),
+    workers: new Map(s.workers.map((w) => [String(w.id), copy(w)])),
+    day: Number(s.day),
+    activePlayer: String(s.gamestate.active_player),
+    stateId: Number(s.gamestate.id),
+    firstPlayer: String(s.firstPlayer),
+    accumulatedCorn: Number(s.cornOnWheel),
+    jungle: Object.fromEntries(
+      Object.entries(s.jungle).map(([k, v]) => [
+        k,
+        { corn: Number(v.corn) + Number(v.wood), wood: Number(v.wood) },
+      ]),
+    ),
+    skullSupply: Number(s.remainingSkulls),
+    skullSpaces: Array.from({ length: 10 }, () => null),
+    buildings: [],
+    monuments: [],
+    initial: s,
+  };
+}
+
+function updateLedger(ledger, entry, mapper) {
+  const a = entry.args;
+  const playerId = a.player_id === undefined ? null : String(a.player_id);
+  const p = ledger.players[playerId];
+  if (entry.type === 'takeGoods' || entry.type === 'payGoods') {
+    if (
+      !p ||
+      !R.includes(a.type) ||
+      !Number.isSafeInteger(Number(a.quantity)) ||
+      Number(a.quantity) < 0
+    )
+      fail('invalid resource effect');
+    p.resources[a.type] += Number(a.quantity) * (entry.type === 'takeGoods' ? 1 : -1);
+    if (entry.type === 'takeGoods' && a.type === 'skull') ledger.skullSupply -= Number(a.quantity);
+  } else if (entry.type === 'updateScore') {
+    if (!p || !Number.isFinite(Number(a.points))) fail('invalid score effect');
+    p.score += Number(a.points);
+  } else if (entry.type === 'increaseTechnology' || entry.type === 'decreaseTechnology') {
+    if (!p || !TECH.includes(a.technology_id)) fail('invalid technology effect');
+    p.technologies[a.technology_id] = Number(a.level);
+  } else if (entry.type === 'alterTemple') {
+    if (!p || !TEMPLE.includes(a.temple_id)) fail('invalid temple effect');
+    p.temples[temple(a.temple_id)] = Number(a.step) - 1;
+  } else if (entry.type === 'placeWorker') {
+    const id = String(a.worker_id);
+    const old = ledger.workers.get(id);
+    if (!p || (old && (String(old.player) !== playerId || old.place !== null)))
+      fail('worker placement identity');
+    const teeth =
+      a.place === 'startingPlayer' ? 1 : Number(ledger.initial.gears[a.place]?.teethnbr);
+    if (
+      !Number.isSafeInteger(Number(a.position)) ||
+      Number(a.position) < 0 ||
+      Number(a.position) >= teeth ||
+      !Number.isFinite(teeth)
+    )
+      fail('worker placement position');
+    ledger.workers.set(id, { id, player: playerId, place: a.place, position: Number(a.position) });
+  } else if (entry.type === 'pickUpWorker') {
+    const old = ledger.workers.get(String(a.worker_id));
+    if (
+      !p ||
+      !old ||
+      String(old.player) !== playerId ||
+      old.place === null ||
+      (a.position === undefined
+        ? old.place !== 'startingPlayer'
+        : Number(old.position) !== Number(a.position))
+    )
+      fail('worker removal identity');
+    old.place = null;
+    old.position = null;
+  } else if (entry.type === 'newWorker') {
+    if (!p) fail('new worker player');
+    p.workers++;
+  } else if (entry.type === 'rotateWheel') {
+    if (a.twice !== 0 || !Array.isArray(a.workers) || Number(a.day) !== ledger.day + 1)
+      fail('unsupported calendar advance');
+    ledger.day = Number(a.day);
+    for (const w of a.workers) {
+      const old = ledger.workers.get(String(w.id));
+      if (!old || String(old.player) !== String(w.player)) fail('rotation worker identity');
+      if (
+        !Object.hasOwn(ledger.initial.gears, w.place) ||
+        !Number.isSafeInteger(Number(w.position)) ||
+        Number(w.position) < 0 ||
+        Number(w.position) >= Number(ledger.initial.gears[w.place].teethnbr)
+      )
+        fail('rotation worker position');
+      ledger.workers.set(String(w.id), copy(w));
+    }
+  } else if (entry.type === 'firstPlayer') {
+    if (!p) fail('first player identity');
+    ledger.firstPlayer = playerId;
+    ledger.accumulatedCorn = 0;
+  } else if (entry.type === 'cornOnWheel') ledger.accumulatedCorn++;
+  else if (entry.type === 'gameStateChange') {
+    ledger.activePlayer = String(a.active_player);
+    ledger.stateId = Number(a.id);
+  } else if (entry.type === 'takeTile') {
+    if (p && a.type === 'corn_tile') p.cornTiles++;
+    if (p && a.type === 'wood_tile') p.woodTiles++;
+    const box = ledger.jungle[a.action];
+    if (!box || !['corn_tile', 'wood_tile'].includes(a.type)) fail('invalid jungle tile effect');
+    box[a.type === 'corn_tile' ? 'corn' : 'wood']--;
+  } else if (entry.type === 'skullplace') {
+    const position = Number(a.place);
+    if (
+      !p ||
+      !Number.isInteger(position) ||
+      position < 1 ||
+      position >= 10 ||
+      ledger.skullSpaces[position] !== null
+    )
+      fail('invalid skull placement');
+    ledger.skullSpaces[position] = playerId;
+    p.skullsPlaced++;
+  } else if (entry.type === 'construct') {
+    if (!p) fail('construction owner');
+    const c = a.building,
+      id = mapper.bind(c),
+      field = c.type === 'monument' ? 'monuments' : 'buildings';
+    if (!ledger[field].includes(id)) fail('construction absent from public market');
+    ledger[field] = ledger[field].filter((x) => x !== id);
+    p[field].push(id);
+    const def = ledger.initial.constructions[c.type][c.type_arg];
+    p.feedWorkers += Number(def.farm ?? 0);
+    p.feedDiscount += Number(def.bigFarm ?? 0);
+  } else if (entry.type === 'pickBuilding') ledger.buildings.push(mapper.bind(a.building));
+  else if (entry.type === 'resetAllBuildings')
+    ledger.buildings = a.buildings.map((c) => mapper.bind(c));
+  else if (entry.type === 'wealthTiles') {
+    for (const tile of Object.values(a)) {
+      const owner = ledger.players[String(tile.location_arg)],
+        def = ledger.initial.wealthTiles[tile.type_arg];
+      if (!owner || !def) fail('initial wealth identity');
+      const matches = catalog.STARTING_WEALTH.filter(
+        (w) =>
+          w.gear === def.dummyWorkers.gear &&
+          w.position === Number(def.dummyWorkers.position) &&
+          sourceEffects(def) ===
+            effectsSignature([...w.effects, { type: 'resources', resources: w.resources }]),
+      );
+      if (matches.length !== 1) fail('initial wealth semantic mapping');
+      owner.wealth.push(matches[0].id);
+      owner.feedWorkers += Number(def.farm ?? 0);
+    }
+  }
+}
+
+function differences(ledger, state, sourceToNative) {
+  const out = [];
+  const check = (field, observed, native) => {
+    if (!isDeepStrictEqual(observed, native)) out.push({ field, observed, native });
+  };
+  for (const [id, p] of Object.entries(ledger.players)) {
+    const q = state.players[sourceToNative.get(id)];
+    for (const k of R) check(`player.${id}.resources.${k}`, p.resources[k], q.resources[k]);
+    for (const k of TECH)
+      check(`player.${id}.technology.${k}`, p.technologies[k], q.technologies[k]);
+    for (const k of Object.keys(p.temples))
+      check(`player.${id}.temple.${k}`, p.temples[k], q.temples[k]);
+    check(`player.${id}.workers`, p.workers, q.workers);
+    check(`player.${id}.score`, p.score, Math.floor(q.score));
+    const occupied = [...ledger.workers.values()].filter(
+      (w) => String(w.player) === id && w.place !== null,
+    ).length;
+    const placed =
+      Object.values(state.gears)
+        .flat()
+        .filter((w) => w?.playerId === q.id).length + (state.firstPlayerClaimed === q.id ? 1 : 0);
+    check(`player.${id}.available`, p.workers - occupied, q.workers - placed);
+    check(`player.${id}.cornTiles`, p.cornTiles, q.cornTiles);
+    check(`player.${id}.woodTiles`, p.woodTiles, q.woodTiles);
+    check(`player.${id}.buildings`, p.buildings, q.buildings);
+    check(`player.${id}.monuments`, p.monuments, q.monuments);
+    check(`player.${id}.wealth`, [...p.wealth].sort(), [...q.wealth].sort());
+    check(`player.${id}.feedWorkers`, p.feedWorkers, q.feedWorkers);
+    check(`player.${id}.feedDiscount`, p.feedDiscount, q.feedDiscount);
+    check(`player.${id}.skullsPlaced`, p.skullsPlaced, q.skullsPlaced);
+  }
+  for (const [gear, slots] of Object.entries(state.gears)) {
+    const observed = Array.from({ length: slots.length }, () => null);
+    for (const w of ledger.workers.values())
+      if (w.place === gear) observed[Number(w.position)] = sourceToNative.get(String(w.player));
+    check(
+      `gear.${gear}`,
+      observed,
+      slots.map((w) => w?.playerId ?? null),
+    );
+  }
+  check('firstPlayer', sourceToNative.get(ledger.firstPlayer), state.firstPlayer);
+  check('accumulatedCorn', ledger.accumulatedCorn, state.accumulatedCorn);
+  check('jungle', ledger.jungle, state.jungle);
+  check('skullSupply', ledger.skullSupply, state.skullSupply);
+  check(
+    'skullSpaces',
+    ledger.skullSpaces.map((id) => (id === null ? null : sourceToNative.get(id))),
+    state.skullSpaces,
+  );
+  check('buildings', ledger.buildings, state.buildings);
+  check('monuments', ledger.monuments, state.monuments);
+  if (state.phase === 'playing') {
+    check('round', ledger.day + 1, state.round);
+    if (ledger.initial.gamestates[ledger.stateId]?.type === 'activeplayer')
+      check('activePlayer', sourceToNative.get(ledger.activePlayer), state.currentPlayer);
+  }
+  return out;
+}
+
+function sourceCheckpoint(ledger, sourceToNative) {
+  const players = Array.from({ length: sourceToNative.size });
+  for (const [id, p] of Object.entries(ledger.players))
+    players[sourceToNative.get(id)] = {
+      id: sourceToNative.get(id),
+      resources: copy(p.resources),
+      score: p.score,
+      workers: p.workers,
+      temples: copy(p.temples),
+      technologies: copy(p.technologies),
+      buildings: copy(p.buildings),
+      monuments: copy(p.monuments),
+      wealth: [...p.wealth].sort(),
+      feedWorkers: p.feedWorkers,
+      feedDiscount: p.feedDiscount,
+      cornTiles: p.cornTiles,
+      woodTiles: p.woodTiles,
+      skullsPlaced: p.skullsPlaced,
+    };
+  const gears = Object.fromEntries(
+    Object.entries(ledger.initial.gears).map(([gear, def]) => [
+      gear,
+      Array.from({ length: Number(def.teethnbr) }, () => null),
+    ]),
+  );
+  for (const w of ledger.workers.values())
+    if (w.place && w.place !== 'startingPlayer')
+      gears[w.place][Number(w.position)] = { playerId: sourceToNative.get(String(w.player)) };
+  const claimed = [...ledger.workers.values()].find((w) => w.place === 'startingPlayer');
+  return {
+    players,
+    gears,
+    jungle: copy(ledger.jungle),
+    skullSupply: ledger.skullSupply,
+    skullSpaces: ledger.skullSpaces.map((id) => (id === null ? null : sourceToNative.get(id))),
+    buildings: copy(ledger.buildings),
+    monuments: copy(ledger.monuments),
+    firstPlayer: sourceToNative.get(ledger.firstPlayer),
+    firstPlayerClaimed: claimed ? sourceToNative.get(String(claimed.player)) : null,
+    accumulatedCorn: ledger.accumulatedCorn,
+  };
+}
+
+/** Strict bounded prefix decoding. Unknown decisions or first mismatch stop without state repairs. */
+export function replayNetworkPrefix(index, { initial, initialMoveId, clientContract }, dispatch) {
+  const clusters = inspectCancellationClusters(index, clientContract);
+  if (
+    initial.phase !== 'playing' ||
+    initial.version !== 1 ||
+    initial.additionalBuildings !== false ||
+    initial.expansion != null
+  )
+    fail('unsupported initial profile');
+  const distribution = index.groups.find((g) => g.entries.some((n) => n.type === 'wealthTiles'));
+  if (
+    !Number.isSafeInteger(initialMoveId) ||
+    distribution?.moveId !== initialMoveId ||
+    initial.pending !== null ||
+    initial.turn.mode !== 'none' ||
+    initial.turn.count !== 0 ||
+    initial.turn.begged
+  )
+    fail('initial boundary must be the original completed wealth distribution');
+  const mapper = networkCardMapper(index.initial, initial);
+  const sourceToNative = new Map(
+    Object.values(index.initial.players).map((p) => {
+      const match = initial.players.filter((n) => n.name === p.name);
+      if (match.length !== 1) fail('initial player mapping');
+      return [p.id, match[0].id];
+    }),
+  );
+  const ledger = initialLedger(index);
+  ledger.buildings = index.initial.buildings.map((c) => mapper.bind(c));
+  ledger.monuments = index.initial.monuments.map((c) => mapper.bind(c));
+  const firstGroups = index.groups.filter((g) => g.moveId <= initialMoveId);
+  if (!firstGroups.some((g) => g.entries.some((n) => n.type === 'wealthTiles')))
+    fail('missing initial distribution');
+  for (const group of firstGroups) for (const n of group.entries) updateLedger(ledger, n, mapper);
+  const initialDiff = differences(ledger, initial, sourceToNative);
+  if (initialDiff.length) fail(`initial boundary mismatch ${JSON.stringify(initialDiff)}`);
+  const record = {
+    schema: 'tzolkin-public-replay-v1',
+    rulesVersion: 1,
+    catalogHash: catalogFingerprint(catalogBytes),
+    market: 'unlimited',
+    source: { reference: index.sourceUrl, actionIds: [initialMoveId] },
+    initial: copy(initial),
+    initialCheckpoint: null,
+    steps: [],
+    terminalCheckpoint: null,
+  };
+  record.initialCheckpoint = {
+    source: copy(record.source),
+    expected: sourceCheckpoint(ledger, sourceToNative),
+  };
+  let frame = dispatch({ operation: 'publicInspect', state: initial });
+  if (frame.error) fail(frame.error);
+  let calls = 1;
+  const audit = [];
+  const timingFences = [];
+  let openRotationFence = null;
+  let openCornFence = null;
+  let openRewardFence = null;
+  let current = null;
+  const native = () => frame.snapshot.state;
+  const actions = () => frame.observation?.legalActions ?? [];
+  function applyWhere(predicate, reason, refills = { currentAge: [], age2: [] }) {
+    const rows = actions().filter((row) => predicate(row.action));
+    if (rows.length !== 1) fail(`${reason}: expected one legal action, found ${rows.length}`);
+    if (++calls > 4000) fail('native call bound');
+    const row = rows[0],
+      actor = frame.observation.actor;
+    const response = dispatch({
+      operation: 'publicApply',
+      state: native(),
+      actor,
+      move: row.move,
+      refills,
+    });
+    if (response.error) fail(response.error);
+    record.steps.push({
+      actor,
+      move: copy(row.move),
+      refills: copy(refills),
+      sourceActionIds: [current.moveId],
+    });
+    audit.push({
+      moveId: current.moveId,
+      actionId: current.moveId,
+      step: record.steps.length,
+      actor,
+      reason,
+      action: copy(row.action),
+      equivalentChoices: 1,
+      derivedFromVisibleBoundary: row.action.type === 'endTurn' || row.action.type === 'skip',
+      source: current.entries.map((n) => ({
+        packetIndex: n.packetIndex,
+        notificationIndex: n.notificationIndex,
+        uid: n.uid,
+      })),
+      teacherCertified: false,
+    });
+    frame = response;
+    return row.action;
+  }
+  const getActor = (n) =>
+    sourceToNative.get(
+      String(
+        n.args.player_id ??
+          Object.values(index.initial.players).find((p) => p.name === n.args.player_name)?.id,
+      ),
+    );
+  function assertActor(n) {
+    if (getActor(n) !== frame.observation?.actor) fail(`${n.type}: source/native actor mismatch`);
+  }
+  const stateId = () =>
+    Number(current.entries.filter((n) => n.type === 'gameStateChange').at(-1)?.args.id);
+  const payment = () =>
+    amounts(
+      Object.fromEntries(
+        R.map((r) => [
+          r,
+          current.entries
+            .filter((n) => n.type === 'payGoods' && n.args.type === r)
+            .reduce((a, n) => a + Number(n.args.quantity), 0),
+        ]),
+      ),
+    );
+  function applyPayment() {
+    const paid = payment();
+    applyWhere(
+      (a) => a.type === 'payment' && isDeepStrictEqual(a.resources, paid),
+      'observed payment',
+    );
+  }
+  for (const group of index.groups.filter((g) => g.moveId > initialMoveId)) {
+    current = group;
+    const before = copy(native());
+    const stepsBefore = record.steps.length;
+    try {
+      if (openRotationFence && !group.entries.some((n) => n.type === 'rotateWheel'))
+        fail('deferred first-player boundary did not immediately resolve by rotation');
+      if (
+        openCornFence &&
+        group.entries.some(
+          (n) =>
+            (['placeWorker', 'trade', 'construct', 'selectAction'].includes(n.type) ||
+              (n.type === 'pickUpWorker' && n.args.city !== undefined)) &&
+            getActor(n) === openCornFence.actor,
+        )
+      )
+        fail('corn timing mismatch reached claimant decision');
+      if (group.entries.some((n) => n.type === 'undoRestoreDISAB')) {
+        const cancel = group.entries[0];
+        assertActor(cancel);
+        if (
+          native().pending ||
+          native().turn.mode !== 'none' ||
+          native().turn.count !== 0 ||
+          native().turn.begged
+        )
+          fail('caption cancellation is not an untouched native start turn');
+      } else {
+        const refillCards = group.entries
+          .filter((n) => n.type === 'pickBuilding')
+          .map((n) => n.args.building);
+        const reset =
+          group.entries.find((n) => n.type === 'resetAllBuildings')?.args.buildings ?? [];
+        const refills = {
+          currentAge: refillCards.map((c) => mapper.bind(c)),
+          age2: reset.map((c) => mapper.bind(c)),
+        };
+        const nextRemoval = group.entries.find(
+          (n) => n.type === 'pickUpWorker' && n.args.city !== undefined,
+        );
+        if (nextRemoval && native().pending) {
+          assertActor(nextRemoval);
+          for (let i = 0; native().pending && i < 4; i++)
+            applyWhere(
+              (x) => x.type === 'skip',
+              'observed next worker closes optional previous action',
+              refills,
+            );
+        }
+        for (const n of group.entries) {
+          const a = n.args;
+          if (
+            n.type === 'alterTemple' &&
+            Number.isInteger(a.corn) &&
+            a.corn > 0 &&
+            a.corn <= 3 &&
+            native().pending === null &&
+            group.entries.some(
+              (e) =>
+                e.type === 'takeGoods' &&
+                e.args.type === 'corn' &&
+                Number(e.args.quantity) === a.corn &&
+                String(e.args.player_id) === String(a.player_id),
+            )
+          ) {
+            assertActor(n);
+            applyWhere((x) => x.type === 'beg', 'observed begging before temple descent');
+          }
+          if (n.type === 'placeWorker') {
+            assertActor(n);
+            if (a.place === 'startingPlayer')
+              applyWhere(
+                (x) => x.type === 'firstPlayer' && x.cornCost === Number(a.corn),
+                'observed first-player placement',
+              );
+            else
+              applyWhere(
+                (x) => x.type === 'place' && x.gear === a.place && x.cornCost === Number(a.corn),
+                'observed worker placement',
+              );
+          } else if (n.type === 'pickUpWorker') {
+            assertActor(n);
+            if (
+              a.city === undefined &&
+              a.position === undefined &&
+              group.entries.some((e) => e.type === 'rotateWheel')
+            )
+              continue;
+            const gear = {
+              Palenque: 'palenque',
+              Yaxchilan: 'yaxchilan',
+              Tikal: 'tikal',
+              Uxmal: 'uxmal',
+              'Chichen Itza': 'chichenItza',
+            }[a.city];
+            if (!gear) fail('unknown source city');
+            applyWhere(
+              (x) => x.type === 'remove' && x.gear === gear && x.position === Number(a.position),
+              'observed worker removal',
+            );
+            applyWhere(
+              (x) =>
+                x.type === 'useAction' && x.gear === gear && x.position === Number(a.action_number),
+              'observed gear action',
+              refills,
+            );
+          } else if (n.type === 'selectAction') {
+            assertActor(n);
+            const gear = {
+              Palenque: 'palenque',
+              Yaxchilan: 'yaxchilan',
+              Tikal: 'tikal',
+              Uxmal: 'uxmal',
+              'Chichen Itza': 'chichenItza',
+            }[a.city];
+            applyWhere(
+              (x) =>
+                x.type === 'useAction' && x.gear === gear && x.position === Number(a.action_number),
+              'observed any action',
+              refills,
+            );
+          } else if (
+            n.type === 'increaseTechnology' &&
+            native().pending?.task.type === 'technology'
+          ) {
+            assertActor(n);
+            applyWhere(
+              (x) => x.type === 'technology' && x.technology === a.technology_id,
+              'observed technology',
+            );
+            if (native().pending?.task.type === 'payTechnology') applyPayment();
+          } else if (n.type === 'payGoods' && native().pending?.task.type === 'payResource') {
+            applyPayment();
+          } else if (
+            n.type === 'payGoods' &&
+            native().pending?.task.type === 'theology' &&
+            a.target === 'technology_theology_level_2'
+          ) {
+            assertActor(n);
+            if (Number(a.quantity) !== 1 || !['wood', 'stone', 'gold'].includes(a.type))
+              fail('unsupported theology offering');
+            applyWhere(
+              (x) => x.type === 'offering' && x.resource === a.type,
+              'observed theology offering',
+            );
+          } else if (n.type === 'alterTemple' && native().pending?.task.type === 'temple') {
+            assertActor(n);
+            applyWhere(
+              (x) =>
+                x.type === 'temple' &&
+                x.temple === temple(a.temple_id) &&
+                x.direction ===
+                  Math.sign(
+                    Number(a.step) -
+                      1 -
+                      native().players[frame.observation.actor].temples[temple(a.temple_id)],
+                  ),
+              'observed temple choice',
+            );
+          } else if (n.type === 'takeGoods' && native().pending?.task.type === 'resource') {
+            assertActor(n);
+            for (let i = 0; i < Number(a.quantity); i++)
+              applyWhere(
+                (x) => x.type === 'resource' && x.resource === a.type,
+                'observed resource choice',
+              );
+          } else if (
+            n.type === 'takeGoods' &&
+            native().pending?.task.type === 'palenque' &&
+            a.type === 'corn' &&
+            /^action_palenque_\d+$/.test(a.origin ?? '') &&
+            !group.entries.some((e) => e.type === 'takeTile')
+          ) {
+            assertActor(n);
+            applyWhere(
+              (x) => x.type === 'harvest' && x.kind === 'emptyCorn',
+              'observed agricultural harvest without tile',
+            );
+          } else if (n.type === 'takeTile' && native().pending?.task.type === 'palenque') {
+            assertActor(n);
+            const kind = a.type === 'wood_tile' ? 'wood' : 'corn';
+            applyWhere((x) => x.type === 'harvest' && x.kind === kind, 'observed harvest');
+          } else if (n.type === 'trade') {
+            assertActor(n);
+            const resource1 = /resource_(corn|wood|stone|gold|skull)\b/.exec(a.resource1)?.[1];
+            const resource2 = /resource_(corn|wood|stone|gold|skull)\b/.exec(a.resource2)?.[1];
+            const buy = resource1 === 'corn',
+              resource = buy ? resource2 : resource1;
+            if (!['wood', 'stone', 'gold'].includes(resource) || (!buy && resource2 !== 'corn'))
+              fail('unsupported trade');
+            const quantity = Number(buy ? a.quantity2 : a.quantity1);
+            if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 100)
+              fail('trade quantity bound');
+            for (let i = 0; i < quantity; i++)
+              applyWhere(
+                (x) => x.type === 'trade' && x.resource === resource && x.buy === buy,
+                'observed market exchange',
+              );
+          } else if (n.type === 'construct') {
+            assertActor(n);
+            const id = mapper.bind(a.building);
+            const candidates = actions().filter(
+              (x) => ['build', 'monument'].includes(x.action.type) && x.action.id === id,
+            );
+            if (
+              candidates.length > 1 &&
+              native().players[frame.observation.actor].technologies.architecture === 0
+            )
+              fail('architecture variants at zero level need an independent continuation contract');
+            const architectureCorn = group.entries.some(
+              (e) =>
+                e.type === 'takeGoods' &&
+                e.args.origin === 'technology_architecture_level_1' &&
+                String(e.args.player_id) === String(a.player_id),
+            );
+            const paid = payment();
+            applyWhere(
+              (x) =>
+                ['build', 'monument'].includes(x.type) &&
+                x.id === id &&
+                isDeepStrictEqual(x.cost, paid) &&
+                (candidates.length === 1 ||
+                  x.type === 'monument' ||
+                  x.architecture === architectureCorn),
+              'observed construction cost and architecture bonus',
+              refills,
+            );
+          } else if (n.type === 'gameStateChange' && Number(a.id) === 90) {
+            for (let i = 0; native().pending && i < 4; i++)
+              applyWhere((x) => x.type === 'skip', 'observed exit from optional task', refills);
+            applyWhere(
+              (x) =>
+                x.type === 'endTurn' && (x.doubleAdvance === null || x.doubleAdvance === false),
+              'observed turn end',
+              refills,
+            );
+          } else if (n.type === 'rotateWheel' && native().pending?.task.type === 'rotation') {
+            if (a.twice !== 0) fail('unsupported double rotation');
+            applyWhere(
+              (x) => x.type === 'rotate' && x.days === 1,
+              'observed one-day rotation',
+              refills,
+            );
+          }
+        }
+        // A source transition to worker removal ends the preceding optional subtask.
+        if ([4, 7].includes(stateId()) && native().pending)
+          for (let i = 0; native().pending && i < 4; i++)
+            applyWhere((x) => x.type === 'skip', 'observed return to worker selection', refills);
+      }
+      for (const n of group.entries) updateLedger(ledger, n, mapper);
+      let diff = differences(ledger, native(), sourceToNative);
+      const originalDiff = copy(diff);
+      if (
+        !openRewardFence &&
+        group.entries.some((n) => n.type === 'construct') &&
+        ((native().pending?.task.type === 'technology' && native().pending.task.free === true) ||
+          ['trade', 'anyAction'].includes(native().pending?.task.type))
+      ) {
+        const delayed = native().pending.after?.[0];
+        const rewards = group.entries.filter(
+          (n) => n.type === 'takeGoods' && /^building_age_[12]_b\d+$/.test(n.args.origin ?? ''),
+        );
+        if (
+          delayed?.type === 'effects' &&
+          delayed.effects.length === 1 &&
+          delayed.effects[0].type === 'resources' &&
+          rewards.length
+        ) {
+          const amounts = Object.fromEntries(
+            rewards.map((n) => [n.args.type, Number(n.args.quantity)]),
+          );
+          const sourceId = String(rewards[0].args.player_id);
+          if (
+            key(amounts) === key(delayed.effects[0].resources) &&
+            rewards.every((n) => String(n.args.player_id) === sourceId)
+          ) {
+            openRewardFence = {
+              startMoveId: group.moveId,
+              sourceId,
+              resources: amounts,
+              points: 0,
+              resolvedMoveId: null,
+              excludedMoveIds: [],
+              reason:
+                'source building resources precede free technology; native effects task follows it',
+            };
+            timingFences.push(openRewardFence);
+          }
+        }
+        if (
+          delayed?.type === 'effects' &&
+          delayed.effects.length === 1 &&
+          delayed.effects[0].type === 'points'
+        ) {
+          const amount = delayed.effects[0].amount;
+          const award = group.entries.find(
+            (n) => n.type === 'updateScore' && Number(n.args.points) === amount,
+          );
+          if (award) {
+            openRewardFence = {
+              startMoveId: group.moveId,
+              sourceId: String(award.args.player_id),
+              resources: {},
+              points: amount,
+              resolvedMoveId: null,
+              excludedMoveIds: [],
+              reason:
+                'source building fixed points precede its pending choice; native effects follow',
+            };
+            timingFences.push(openRewardFence);
+          }
+        }
+      }
+      if (openRewardFence) {
+        const f = openRewardFence;
+        if (group.moveId - f.startMoveId > 64)
+          fail('building effect timing fence did not resolve within bound');
+        const owed = Object.entries(f.resources).map(([r, amount]) => ({
+          field: `player.${f.sourceId}.resources.${r}`,
+          amount,
+        }));
+        if (f.resources.skull) owed.push({ field: 'skullSupply', amount: -f.resources.skull });
+        if (f.points) owed.push({ field: `player.${f.sourceId}.score`, amount: f.points });
+        const matches = owed.map((o) => ({ o, d: diff.find((d) => d.field === o.field) }));
+        if (matches.every(({ d }) => d === undefined)) {
+          const outstanding = f.points
+            ? [{ type: 'points', amount: f.points }]
+            : [{ type: 'resources', resources: f.resources }];
+          if (
+            native().pending?.after?.some(
+              (task) => task.type === 'effects' && key(task.effects) === key(outstanding),
+            )
+          )
+            fail('building effect still queued despite apparent counter reconciliation');
+          f.resolvedMoveId = group.moveId;
+          openRewardFence = null;
+        } else {
+          if (matches.some(({ o, d }) => !d || d.observed !== d.native + o.amount))
+            fail('building resource timing fence differs from exact outstanding effects');
+          f.excludedMoveIds.push(group.moveId);
+          diff = diff.filter((d) => !matches.some((m) => m.d === d));
+        }
+      }
+      if (
+        !openCornFence &&
+        before.firstPlayerClaimed === before.currentPlayer &&
+        ledger.accumulatedCorn > 0 &&
+        native().accumulatedCorn === 0 &&
+        group.entries.some((n) => n.type === 'gameStateChange' && Number(n.args.id) === 90)
+      ) {
+        const sourceId = [...sourceToNative].find(([, id]) => id === before.currentPlayer)?.[0];
+        const amount = ledger.accumulatedCorn;
+        if (
+          diff.some(
+            (d) =>
+              d.field === `player.${sourceId}.resources.corn` && d.native === d.observed + amount,
+          )
+        ) {
+          openCornFence = {
+            startMoveId: group.moveId,
+            actor: before.currentPlayer,
+            sourceId,
+            amount,
+            resolvedMoveId: null,
+            reason: 'native pays accumulated corn at claimant turn end; source pays at round end',
+            excludedMoveIds: [],
+          };
+          timingFences.push(openCornFence);
+        }
+      }
+      if (openCornFence) {
+        const f = openCornFence;
+        const payout = group.entries.find(
+          (n) => n.type === 'firstPlayerCorn' && String(n.args.player_id) === f.sourceId,
+        );
+        if (payout) {
+          if (Number(payout.args.corn) !== f.amount)
+            fail('source accumulated corn payout differs from timing fence');
+          f.resolvedMoveId = group.moveId;
+          openCornFence = null;
+        } else {
+          const corn = diff.find((d) => d.field === `player.${f.sourceId}.resources.corn`);
+          const accumulated = diff.find((d) => d.field === 'accumulatedCorn');
+          if (
+            !corn ||
+            corn.native !== corn.observed + f.amount ||
+            !accumulated ||
+            accumulated.observed !== f.amount ||
+            accumulated.native !== 0
+          )
+            fail('corn timing fence no longer describes exact observed difference');
+          f.excludedMoveIds.push(group.moveId);
+          diff = diff.filter((d) => d !== corn && d !== accumulated);
+        }
+      }
+      if (diff.length) {
+        const claimed = native().firstPlayerClaimed;
+        const allowed =
+          stateId() === 95 &&
+          native().pending?.task.type === 'rotation' &&
+          claimed !== null &&
+          sourceToNative.get(ledger.firstPlayer) === claimed &&
+          diff.length === 1 &&
+          diff.some(
+            (d) =>
+              d.field === 'firstPlayer' &&
+              d.observed === claimed &&
+              d.native === before.firstPlayer,
+          );
+        if (!allowed) fail(`public state mismatch ${JSON.stringify(diff)}`);
+        openRotationFence = {
+          startMoveId: group.moveId,
+          reason: 'source changes first-player designation before native rotation choice',
+          differences: diff,
+          resolvedMoveId: null,
+        };
+        timingFences.push(openRotationFence);
+        audit.push({
+          moveId: group.moveId,
+          publicStateMatched: false,
+          deferredFirstPlayer: true,
+          teacherCertified: false,
+        });
+        continue;
+      }
+      if (openRotationFence) {
+        openRotationFence.resolvedMoveId = group.moveId;
+        openRotationFence = null;
+      }
+      if (originalDiff.length === 0 && record.steps.length > stepsBefore)
+        record.steps.at(-1).checkpoint = {
+          source: { reference: index.sourceUrl, actionIds: [group.moveId] },
+          expected: sourceCheckpoint(ledger, sourceToNative),
+        };
+      audit.push({
+        moveId: group.moveId,
+        publicStateMatched: originalDiff.length === 0,
+        deferredCorn: !!openCornFence,
+        deferredBuildingResources: !!openRewardFence,
+        teacherCertified: false,
+        differences: originalDiff,
+        nativeSteps: record.steps.length - stepsBefore,
+        cancellation: group.entries[0].type === 'undoRestoreDISAB',
+      });
+    } catch (error) {
+      if (native().phase === 'finished') {
+        const result = group.entries.find(
+          (n) => n.type === 'gameStateChange' && Number(n.args.id) === 99,
+        )?.args.args?.result;
+        if (Array.isArray(result))
+          record.terminalDisplayCheckpoint = {
+            source: { reference: index.sourceUrl, actionIds: [group.moveId] },
+            mode: 'floorTotal',
+            scores: result.map((p) => ({
+              playerId: sourceToNative.get(String(p.id)),
+              total: Number(p.score),
+              rank: Number(p.rank),
+            })),
+          };
+      }
+      return {
+        schema: 'tzolkin-bga-network-prefix-v1',
+        tableId: index.tableId,
+        rawSha256: index.rawSha256,
+        finished: false,
+        terminalReached: native().phase === 'finished',
+        semanticReplayVerified: false,
+        teacherCompleteness: false,
+        teacherCertified: false,
+        record,
+        audit,
+        calls,
+        clientContract,
+        cancellationClusters: clusters,
+        timingFences,
+        blocked: {
+          moveId: group.moveId,
+          source: group.entries,
+          reason: error.message,
+          beforeState: before,
+          afterState: native(),
+          legalActions: actions(),
+        },
+        cardMappings: mapper.entries(),
+      };
+    }
+  }
+  return {
+    schema: 'tzolkin-bga-network-prefix-v1',
+    tableId: index.tableId,
+    rawSha256: index.rawSha256,
+    finished:
+      native().phase === 'finished' && !openRotationFence && !openCornFence && !openRewardFence,
+    terminalReached: native().phase === 'finished',
+    semanticReplayVerified: false,
+    teacherCompleteness: false,
+    teacherCertified: false,
+    record,
+    audit,
+    calls,
+    clientContract,
+    cancellationClusters: clusters,
+    timingFences,
+    blocked: null,
+    cardMappings: mapper.entries(),
+    terminal: native(),
+  };
+}
