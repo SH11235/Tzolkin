@@ -67,12 +67,16 @@ export function networkEvidenceReport({
   for (const group of index?.groups ?? [])
     for (const entry of group.entries) {
       if (entry.type === 'gameStateChange' && Number(entry.args.id) === 92) {
-        const scheduledDay = day + 1;
-        if (!meals.some((m) => m.scheduledDay === scheduledDay)) {
+        const sourceActualRound = day + 1;
+        if (!meals.some((m) => m.sourceActualRound === sourceActualRound)) {
+          const scheduledDay = [8, 14, 21, 27][meals.length] ?? null;
           const captions = group.entries.filter((n) => n.type === 'foodDayCost');
           const compared = projection.find((p) => p.moveId === group.moveId);
           meals.push({
             scheduledDay,
+            sourceActualRound,
+            scheduleBasis:
+              'Declared basic mechanical profile; scheduled day is separate from the observed round after a double advance.',
             moveId: group.moveId,
             sourceNotifications: captions.map((n) => ({
               packetIndex: n.packetIndex,
@@ -82,6 +86,8 @@ export function networkEvidenceReport({
             sourceCostCaptions: captions.filter((n) => Object.hasOwn(n.args, 'cost')).length,
             sourcePenaltyCaptions: captions.filter((n) => Object.hasOwn(n.args, 'points')).length,
             nativeReached: terminal?.foodDays.includes(scheduledDay) ?? false,
+            nativeReachedScope:
+              'By the end of this replay prefix, not a separate feeding-receipt proof at this boundary.',
             selectedProjectionAtBoundary:
               compared?.publicStateMatched === true
                 ? 'matched'
@@ -162,6 +168,24 @@ export function networkEvidenceReport({
       strictStatus: nativeReport?.status ?? 'notRun',
     },
     feeding: meals,
+    calendar: {
+      explicitNativeRotations: prefix?.calendarTransitions ?? [],
+      sourceRotationNotifications:
+        index?.groups.flatMap((g) =>
+          g.entries
+            .filter((n) => n.type === 'rotateWheel')
+            .map((n) => ({
+              moveId: g.moveId,
+              packetIndex: n.packetIndex,
+              notificationIndex: n.notificationIndex,
+              uid: n.uid,
+              day: n.args.day,
+              twice: n.args.twice,
+            })),
+        ) ?? [],
+      scope:
+        'Explicit native choices retain claimant/next-starter, rights and feeding history. Automatic one-day advances remain checked by the public projection; notification counts are not human choices.',
+    },
     terminal: {
       state: terminal?.phase === 'finished' ? 'reached' : 'notReached',
       exactSourceMatched: nativeReport?.terminalMatched ?? null,

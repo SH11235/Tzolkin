@@ -20,7 +20,7 @@ mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
     },
   },
 });
-const { replayNetworkPrefix } = await import('./bga-network-replay.mjs');
+const { replayNetworkPrefix, proveCalendarDesignation } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
 
@@ -250,8 +250,99 @@ test('actor mismatch stops before applying an operation', () => {
 test('speed-up availability is never silently treated as a cosmetic board flip', () => {
   const result = setup(false, false, true);
   assert.equal(result.record.steps.length, 0);
-  assert.match(result.blocked.reason, /double-advance availability/);
+  assert.match(result.blocked.reason, /speed-up consumption/);
   assert.ok(result.blocked.source.some((n) => n.type === 'flipBoard'));
+});
+
+test('early designation binds claimant and rotation selector separately from the projected next starter', () => {
+  const state = {
+    firstPlayer: 1,
+    firstPlayerClaimed: 1,
+    round: 6,
+    pending: { task: { type: 'rotation' } },
+  };
+  const observation = {
+    actor: 1,
+    legalActions: [1, 2].map((days) => ({
+      action: { type: 'rotate', days },
+      move: { type: 'rotate', days },
+    })),
+  };
+  const entries = [
+    { type: 'firstPlayer', args: { player_id: '3' } },
+    { type: 'firstPlayerCorn', args: { player_id: '2', corn: '2' } },
+    { type: 'gameStateChange', args: { id: 95, active_player: '2' } },
+  ];
+  const ids = new Map([
+    ['1', 0],
+    ['2', 1],
+    ['3', 2],
+  ]);
+  const dispatch = (r) => ({
+    snapshot: {
+      state: {
+        firstPlayer: 2,
+        firstPlayerClaimed: null,
+        round: 6 + r.move.days,
+        players: [{}, { doubleAdvanceAvailable: r.move.days === 1 }],
+      },
+    },
+  });
+  const proof = proveCalendarDesignation(state, observation, entries, ids, dispatch);
+  assert.equal(proof.cornRecipient, 1);
+  assert.equal(proof.rotationSelector, 1);
+  assert.equal(proof.nextFirstPlayer, 2);
+  assert.deepEqual(
+    proof.projections.map((p) => p.days),
+    [1, 2],
+  );
+  for (const index of [0, 1, 2]) {
+    const bad = structuredClone(entries);
+    if (index === 0) bad[0].args.player_id = '2';
+    if (index === 1) bad[1].args.player_id = '3';
+    if (index === 2) bad[2].args.active_player = '3';
+    assert.throws(
+      () => proveCalendarDesignation(state, observation, bad, ids, dispatch),
+      /calendar|next starter/,
+    );
+  }
+  assert.throws(
+    () =>
+      proveCalendarDesignation(state, observation, entries, ids, (r) =>
+        r.move.days === 2 ? { error: 'spent right' } : dispatch(r),
+      ),
+    /spent right/,
+  );
+});
+
+test('calendar contradictions in days, consumption actor and unobserved renewal stop replay', () => {
+  for (const [extra, reason] of [
+    [
+      [
+        { type: 'flipBoard', args: { player_id: '1', side: 1 } },
+        { type: 'rotateWheel', args: { player_id: '2', twice: 1, day: 2, workers: [] } },
+      ],
+      /same-source double rotation/,
+    ],
+    [[{ type: 'flipBoard', args: { player_id: '1', side: 0 } }], /renewal lacks/],
+    [
+      [
+        { type: 'flipBoard', args: { player_id: '1', side: 1 } },
+        { type: 'rotateWheel', args: { player_id: '1', twice: 1, day: 1, workers: [] } },
+      ],
+      /calendar advance/,
+    ],
+  ]) {
+    const result = setup(false, false, false, (rawBytes) => {
+      const raw = JSON.parse(rawBytes);
+      raw.gameLogs.data.data
+        .at(-1)
+        .data.push(...extra.map((n, i) => ({ ...n, log: '', uid: 'calendar-' + i })));
+      return bytes(raw);
+    });
+    assert.match(result.blocked.reason, reason);
+    assert.equal(result.blocked.afterState.round, 1);
+  }
 });
 
 test('conversion consumes retained verified bytes after the backing file is replaced', (t) => {

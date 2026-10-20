@@ -327,6 +327,7 @@ function initialLedger(index) {
           feedWorkers: 0,
           feedDiscount: 0,
           skullsPlaced: 0,
+          doubleAdvanceAvailable: p.flipped === undefined ? null : Number(p.flipped) === 0,
         },
       ]),
     ),
@@ -406,7 +407,11 @@ function updateLedger(ledger, entry, mapper) {
     if (!p) fail('new worker player');
     p.workers++;
   } else if (entry.type === 'rotateWheel') {
-    if (a.twice !== 0 || !Array.isArray(a.workers) || Number(a.day) !== ledger.day + 1)
+    if (
+      ![0, 1].includes(a.twice) ||
+      !Array.isArray(a.workers) ||
+      Number(a.day) !== ledger.day + 1 + a.twice
+    )
       fail('unsupported calendar advance');
     ledger.day = Number(a.day);
     for (const w of a.workers) {
@@ -421,6 +426,9 @@ function updateLedger(ledger, entry, mapper) {
         fail('rotation worker position');
       ledger.workers.set(String(w.id), copy(w));
     }
+  } else if (entry.type === 'flipBoard') {
+    if (!p || ![0, 1].includes(a.side)) fail('invalid speed-up rights');
+    p.doubleAdvanceAvailable = a.side === 0;
   } else if (entry.type === 'firstPlayer') {
     if (!p) fail('first player identity');
     ledger.firstPlayer = playerId;
@@ -510,6 +518,12 @@ function differences(ledger, state, sourceToNative) {
     check(`player.${id}.feedWorkers`, p.feedWorkers, q.feedWorkers);
     check(`player.${id}.feedDiscount`, p.feedDiscount, q.feedDiscount);
     check(`player.${id}.skullsPlaced`, p.skullsPlaced, q.skullsPlaced);
+    if (p.doubleAdvanceAvailable !== null)
+      check(
+        `player.${id}.doubleAdvanceAvailable`,
+        p.doubleAdvanceAvailable,
+        q.doubleAdvanceAvailable,
+      );
   }
   for (const [gear, slots] of Object.entries(state.gears)) {
     const observed = Array.from({ length: slots.length }, () => null);
@@ -583,6 +597,58 @@ function sourceCheckpoint(ledger, sourceToNative) {
   };
 }
 
+/** Prove an early source designation against every currently legal native rotation. */
+export function proveCalendarDesignation(state, observation, entries, sourceToNative, dispatch) {
+  const claimed = state.firstPlayerClaimed;
+  const designation = entries.filter((n) => n.type === 'firstPlayer');
+  const payout = entries.filter((n) => n.type === 'firstPlayerCorn');
+  const selection = entries.filter((n) => n.type === 'gameStateChange' && Number(n.args.id) === 95);
+  if (
+    state.pending?.task.type !== 'rotation' ||
+    claimed === null ||
+    observation?.actor !== claimed ||
+    designation.length !== 1 ||
+    payout.length !== 1 ||
+    selection.length !== 1 ||
+    sourceToNative.get(String(payout[0].args.player_id)) !== claimed ||
+    sourceToNative.get(String(selection[0].args.active_player)) !== claimed
+  )
+    fail('calendar claimant, corn recipient and rotation selector are not bound');
+  const rows = observation.legalActions.filter((r) => r.action.type === 'rotate');
+  if (!rows.length) fail('calendar has no legal native rotation');
+  const projections = rows.map((row) => {
+    const response = dispatch({
+      operation: 'publicApply',
+      state,
+      actor: claimed,
+      move: row.move,
+      refills: { currentAge: [], age2: [] },
+    });
+    if (response.error) fail(response.error);
+    const after = response.snapshot.state;
+    if (
+      after.firstPlayerClaimed !== null ||
+      after.firstPlayer !== sourceToNative.get(String(designation[0].args.player_id))
+    )
+      fail('source next starter differs from legal native rotation result');
+    return {
+      days: row.action.days,
+      nextFirstPlayer: after.firstPlayer,
+      round: after.round,
+      doubleAdvanceAvailable: after.players[claimed].doubleAdvanceAvailable,
+    };
+  });
+  return {
+    claimant: claimed,
+    cornRecipient: claimed,
+    rotationSelector: claimed,
+    priorFirstPlayer: state.firstPlayer,
+    nextFirstPlayer: projections[0].nextFirstPlayer,
+    priorRound: state.round,
+    projections,
+  };
+}
+
 /** Strict bounded prefix decoding. Unknown decisions or first mismatch stop without state repairs. */
 export function replayNetworkPrefix(index, { initial, initialMoveId, clientContract }, dispatch) {
   const clusters = inspectCancellationClusters(index, clientContract);
@@ -640,6 +706,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
   let calls = 1;
   const audit = [];
   const timingFences = [];
+  const calendarTransitions = [];
   let openRotationFence = null;
   let openCornFence = null;
   let openRewardFence = null;
@@ -720,12 +787,38 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     const before = copy(native());
     const stepsBefore = record.steps.length;
     try {
-      // The observed client marks the once-per-game speed-up as unavailable.
-      // Do not treat this as a cosmetic board flip or silently retain native availability.
-      if (group.entries.some((n) => n.type === 'flipBoard'))
-        fail(
-          'double-advance availability change requires explicit native continuation; flipBoard is not display-only',
-        );
+      const rotations = group.entries.filter((n) => n.type === 'rotateWheel');
+      const flips = group.entries.filter((n) => n.type === 'flipBoard');
+      const payouts = group.entries.filter((n) => n.type === 'firstPlayerCorn');
+      if (
+        payouts.length > 1 ||
+        payouts.some(
+          (n) =>
+            Number(n.args.corn) !== ledger.accumulatedCorn ||
+            getActor(n) !== before.firstPlayerClaimed,
+        )
+      )
+        fail('calendar corn receipt differs from source accumulation or native claimant');
+      if (rotations.length > 1) fail('multiple calendar rotations in one source boundary');
+      for (const n of flips) {
+        if (n.args.side === 1) {
+          if (
+            flips.filter((f) => f.args.side === 1).length !== 1 ||
+            rotations.length !== 1 ||
+            rotations[0].args.twice !== 1 ||
+            String(rotations[0].args.player_id) !== String(n.args.player_id)
+          )
+            fail('speed-up consumption lacks its same-source double rotation');
+        } else if (
+          !group.entries.some(
+            (e) =>
+              e.type === 'alterTemple' &&
+              String(e.args.player_id) === String(n.args.player_id) &&
+              Number(e.args.step) - 1 === catalog.TEMPLE_TRACKS[temple(e.args.temple_id)]?.max,
+          )
+        )
+          fail('speed-up renewal lacks a source top-temple transition');
+      }
       if (openRotationFence && !group.entries.some((n) => n.type === 'rotateWheel'))
         fail('deferred first-player boundary did not immediately resolve by rotation');
       if (
@@ -802,13 +895,17 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
                 'observed worker placement',
               );
           } else if (n.type === 'pickUpWorker') {
-            assertActor(n);
             if (
               a.city === undefined &&
               a.position === undefined &&
               group.entries.some((e) => e.type === 'rotateWheel')
-            )
+            ) {
+              const worker = ledger.workers.get(String(a.worker_id));
+              if (!worker || worker.place === null || String(worker.player) !== String(a.player_id))
+                fail('calendar returned worker identity');
               continue;
+            }
+            assertActor(n);
             const gear = {
               Palenque: 'palenque',
               Yaxchilan: 'yaxchilan',
@@ -958,12 +1055,46 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               refills,
             );
           } else if (n.type === 'rotateWheel' && native().pending?.task.type === 'rotation') {
-            if (a.twice !== 0) fail('unsupported double rotation');
+            const actor = frame.observation.actor;
+            if (
+              actor !== native().firstPlayerClaimed ||
+              (a.twice === 1 &&
+                (getActor(n) !== actor ||
+                  flips.filter((f) => f.args.side === 1 && getActor(f) === actor).length !== 1))
+            )
+              fail('calendar rotation actor or consumed right mismatch');
+            const start = copy(native());
             applyWhere(
-              (x) => x.type === 'rotate' && x.days === 1,
-              'observed one-day rotation',
+              (x) => x.type === 'rotate' && x.days === 1 + a.twice,
+              a.twice === 1 ? 'observed two-day rotation' : 'observed one-day rotation',
               refills,
             );
+            if (
+              openRotationFence &&
+              (actor !== openRotationFence.proof.rotationSelector ||
+                native().firstPlayer !== openRotationFence.proof.nextFirstPlayer)
+            )
+              fail('calendar designation did not resolve through its legal rotation');
+            calendarTransitions.push({
+              moveId: group.moveId,
+              actor,
+              days: 1 + a.twice,
+              priorFirstPlayer: start.firstPlayer,
+              nextFirstPlayer: native().firstPlayer,
+              priorRound: start.round,
+              round: native().round,
+              rightsBefore: start.players.map((p) => p.doubleAdvanceAvailable),
+              rightsAfter: native().players.map((p) => p.doubleAdvanceAvailable),
+              foodDaysBefore: copy(start.foodDays),
+              foodDaysAfter: copy(native().foodDays),
+              source: group.entries
+                .filter((e) => ['flipBoard', 'rotateWheel', 'pickUpWorker'].includes(e.type))
+                .map((e) => ({
+                  packetIndex: e.packetIndex,
+                  notificationIndex: e.notificationIndex,
+                  uid: e.uid,
+                })),
+            });
           }
         }
         // A source transition to worker removal ends the preceding optional subtask.
@@ -1123,20 +1254,25 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
           stateId() === 95 &&
           native().pending?.task.type === 'rotation' &&
           claimed !== null &&
-          sourceToNative.get(ledger.firstPlayer) === claimed &&
           diff.length === 1 &&
-          diff.some(
-            (d) =>
-              d.field === 'firstPlayer' &&
-              d.observed === claimed &&
-              d.native === before.firstPlayer,
-          );
+          diff.some((d) => d.field === 'firstPlayer' && d.native === before.firstPlayer);
         if (!allowed) fail(`public state mismatch ${JSON.stringify(diff)}`);
+        const proof = proveCalendarDesignation(
+          native(),
+          frame.observation,
+          group.entries,
+          sourceToNative,
+          (request) => {
+            if (++calls > 4000) fail('native call bound');
+            return dispatch(request);
+          },
+        );
         openRotationFence = {
           startMoveId: group.moveId,
           reason: 'source changes first-player designation before native rotation choice',
           differences: diff,
           resolvedMoveId: null,
+          proof,
         };
         timingFences.push(openRotationFence);
         audit.push({
@@ -1197,6 +1333,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         clientContract,
         cancellationClusters: clusters,
         timingFences,
+        calendarTransitions,
         blocked: {
           moveId: group.moveId,
           source: group.entries,
@@ -1225,6 +1362,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     clientContract,
     cancellationClusters: clusters,
     timingFences,
+    calendarTransitions,
     blocked: null,
     cardMappings: mapper.entries(),
     terminal: native(),
