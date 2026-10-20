@@ -28,9 +28,163 @@ const {
   initialSourceBoardCheckpoint,
   validateNeutralNetworkRotation,
   proveEquivalentCornBuilds,
+  terminalPlayingCalendarWitness,
+  bindTerminalCalendarTransition,
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
+
+function terminalCalendarFixture(priorDay = 25, playingDay = 27, twice = 1) {
+  const groups = [],
+    entry = (type, args) => ({ type, args, uid: `n${groups.length}-${type}` });
+  for (let day = 1; day <= priorDay; day++)
+    groups.push({
+      moveId: day,
+      entries: [
+        ...([8, 14, 21].includes(day)
+          ? [entry('gameStateChange', { id: 92, active_player: '1' })]
+          : []),
+        entry('rotateWheel', { day, twice: 0 }),
+      ],
+    });
+  groups.push({
+    moveId: 30,
+    entries: [
+      entry('rotateWheel', { day: playingDay, twice }),
+      entry('gameStateChange', { id: 4, active_player: '2' }),
+    ],
+  });
+  groups.push({
+    moveId: 31,
+    entries: [
+      entry('gameStateChange', { id: 90, active_player: '2' }),
+      entry('gameStateChange', { id: 4, active_player: '3' }),
+    ],
+  });
+  groups.push({
+    moveId: 32,
+    entries: [
+      entry('gameStateChange', { id: 90, active_player: '3' }),
+      entry('gameStateChange', { id: 4, active_player: '1' }),
+    ],
+  });
+  groups.push({
+    moveId: 33,
+    entries: [
+      entry('gameStateChange', { id: 90, active_player: '1' }),
+      entry('gameStateChange', { id: 91, active_player: '2' }),
+      entry('gameStateChange', { id: 92, active_player: '2' }),
+      entry('finalScoring', {}),
+      entry('rotateWheel', { day: playingDay + 1, twice: 0 }),
+      entry('gameStateChange', { id: 99, active_player: '2' }),
+      entry('simpleNode', {}),
+    ],
+  });
+  return { rawSha256: 'original-source', initial: { day: 0, playerorder: [1, 2, 3] }, groups };
+}
+
+test('terminal calendar witness retains physical ticks and verifies a unique final actor cycle', () => {
+  const witness = terminalPlayingCalendarWitness(terminalCalendarFixture());
+  assert.equal(witness.sourcePlayingActualRound, 28);
+  assert.equal(witness.nativePlayingRound, 27);
+  assert.deepEqual(witness.sourceActorOrder, ['2', '3', '1']);
+  assert.equal(witness.priorFeeding.length, 3);
+  for (const args of [
+    [25, 26, 0],
+    [24, 26, 1],
+    [6, 8, 1],
+  ])
+    assert.equal(terminalPlayingCalendarWitness(terminalCalendarFixture(...args)), null);
+  for (const mutate of [
+    (x) => x.groups.at(-1).entries.splice(2, 1),
+    (x) =>
+      x.groups
+        .at(-1)
+        .entries.splice(2, 0, { type: 'gameStateChange', args: { id: 92, active_player: '2' } }),
+    (x) => x.groups.at(-1).entries.unshift(x.groups.at(-1).entries.splice(2, 1)[0]),
+    (x) => (x.groups.at(-2).entries[1].args.active_player = '3'),
+    (x) => x.groups.splice(-2, 1),
+    (x) =>
+      x.groups
+        .at(-1)
+        .entries.unshift({ type: 'gameStateChange', args: { id: 4, active_player: '1' } }),
+    (x) =>
+      x.groups
+        .at(-1)
+        .entries.unshift({ type: 'gameStateChange', args: { id: 99, active_player: '2' } }),
+    (x) => (x.groups.at(-1).entries.at(-3).args.day = 29),
+    (x) => (x.groups.at(-1).entries.at(-3).args.twice = 1),
+    (x) =>
+      x.groups
+        .at(-1)
+        .entries.push({ type: 'gameStateChange', args: { id: 4, active_player: '2' } }),
+    (x) => x.groups[7].entries.shift(),
+  ]) {
+    const bad = terminalCalendarFixture();
+    mutate(bad);
+    assert.throws(() => terminalPlayingCalendarWitness(bad), /terminal calendar/);
+  }
+});
+
+test('terminal source witness cannot override native prior round, feeding, actor or rights', () => {
+  const witness = terminalPlayingCalendarWitness(terminalCalendarFixture());
+  const before = {
+    phase: 'playing',
+    round: 26,
+    pending: { task: { type: 'rotation' } },
+    foodDays: [8, 14, 21],
+    firstPlayerClaimed: 1,
+    players: Array.from({ length: 3 }, () => ({ doubleAdvanceAvailable: true })),
+  };
+  const after = {
+    phase: 'playing',
+    round: 27,
+    pending: null,
+    foodDays: [8, 14, 21],
+    firstPlayerClaimed: null,
+    firstPlayer: 1,
+    currentPlayer: 1,
+    turnIndex: 0,
+    turnOrder: [1, 2, 0],
+    players: [
+      { doubleAdvanceAvailable: true },
+      { doubleAdvanceAvailable: false },
+      { doubleAdvanceAvailable: true },
+    ],
+  };
+  const seats = new Map([
+    ['1', 0],
+    ['2', 1],
+    ['3', 2],
+  ]);
+  assert.equal(
+    bindTerminalCalendarTransition(witness, 25, before, after, seats)
+      .decisionTimeFeatureEquivalence,
+    'notEstablished',
+  );
+  for (const mutate of [
+    (b) => (b.round = 25),
+    (b) => b.foodDays.push(27),
+    (b) => b.foodDays.pop(),
+    (b) => (b.firstPlayerClaimed = 0),
+    (b) => (b.players[1].doubleAdvanceAvailable = false),
+    (b, a) => (a.players[1].doubleAdvanceAvailable = true),
+    (b, a) => (a.firstPlayer = 2),
+    (b, a) => a.turnOrder.reverse(),
+  ]) {
+    const b = structuredClone(before),
+      a = structuredClone(after);
+    mutate(b, a);
+    assert.throws(
+      () => bindTerminalCalendarTransition(witness, 25, b, a, seats),
+      /terminal calendar/,
+    );
+  }
+  assert.throws(
+    () => bindTerminalCalendarTransition(witness, 24, before, after, seats),
+    /terminal calendar/,
+  );
+});
 
 function initialCoverageFixture() {
   const ids = ['1', '2', '3', '4'];

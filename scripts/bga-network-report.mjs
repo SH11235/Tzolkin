@@ -181,6 +181,8 @@ export function networkEvidenceReport({
     },
     feeding: meals,
     calendar: {
+      terminalProjection: prefix?.terminalCalendarProjection ?? null,
+      terminalProjectionChecks: prefix?.terminalCalendarChecks ?? [],
       explicitNativeRotations: prefix?.calendarTransitions ?? [],
       sourceRotationNotifications:
         index?.groups.flatMap((g) =>
