@@ -116,7 +116,7 @@ function monumentKey(def) {
 }
 
 /** Preserve physical instances while matching full cost/category/effect semantics. */
-export function networkCardMapper(initial, seed) {
+export function networkCardMapper(initial, seed = null) {
   const assigned = new Map();
   const used = new Set();
   function candidates(card) {
@@ -174,14 +174,137 @@ export function networkCardMapper(initial, seed) {
     return selected.id;
   }
   for (const [cards, ids] of [
-    [initial.buildings, seed.buildings],
-    [initial.monuments, seed.monuments],
+    [initial.buildings, seed?.buildings],
+    [initial.monuments, seed?.monuments],
   ]) {
-    if (!Array.isArray(cards) || cards.length !== ids.length)
+    if (!Array.isArray(cards) || (ids && cards.length !== ids.length))
       fail('initial market length mismatch');
-    for (let i = 0; i < cards.length; i++) bind(cards[i], ids[i]);
+    for (let i = 0; i < cards.length; i++) bind(cards[i], ids?.[i] ?? null);
   }
   return { bind, entries: () => Object.fromEntries(assigned) };
+}
+
+/** Direct first-Playing projection; source options and teacher qualification remain separate. */
+export function deriveNetworkInitial(index) {
+  const source = index.initial;
+  if (Object.keys(source.players).length !== 4)
+    fail('unconnected three-player neutral setup evidence');
+  const distribution = index.groups.find((g) => g.entries.some((n) => n.type === 'wealthTiles'));
+  if (!distribution) fail('missing original wealth distribution');
+  const mapper = networkCardMapper(source);
+  const ledger = initialLedger(index);
+  ledger.buildings = source.buildings.map((c) => mapper.bind(c));
+  ledger.monuments = source.monuments.map((c) => mapper.bind(c));
+  for (const group of index.groups.filter((g) => g.moveId <= distribution.moveId))
+    for (const entry of group.entries) updateLedger(ledger, entry, mapper);
+  if (ledger.stateId !== 4 || ledger.day !== 0 || ledger.activePlayer !== ledger.firstPlayer)
+    fail('initial source is not the first untouched Playing boundary');
+  const start = source.playerorder.findIndex((id) => String(id) === ledger.firstPlayer);
+  if (start < 0) fail('starting player absent from source seat ring');
+  const ring = [...source.playerorder.slice(start), ...source.playerorder.slice(0, start)].map(
+    String,
+  );
+  const identities = new Map(ring.map((id, i) => [id, i]));
+  const geometry = sourceCheckpoint(ledger, identities);
+  const players = ring.map((id, i) => {
+    const original = source.players[id],
+      p = ledger.players[id];
+    if (
+      !/^[a-f\d]{6}$/i.test(original.color) ||
+      Number(original.flipped) !== 0 ||
+      p.workers < 3 ||
+      p.workers > 4
+    )
+      fail('unsupported initial player counters');
+    return {
+      id: i,
+      name: original.name,
+      color: `#${original.color}`,
+      resources: copy(p.resources),
+      score: p.score,
+      workers: p.workers,
+      temples: copy(p.temples),
+      technologies: copy(p.technologies),
+      buildings: copy(p.buildings),
+      monuments: copy(p.monuments),
+      wealth: [...p.wealth].sort(),
+      feedWorkers: p.feedWorkers,
+      feedAll: false,
+      feedDiscount: p.feedDiscount,
+      cornTiles: p.cornTiles,
+      woodTiles: p.woodTiles,
+      skullsPlaced: p.skullsPlaced,
+      buildingSkulls: 0,
+      doubleAdvanceAvailable: true,
+      templePoints: 0,
+    };
+  });
+  for (const slots of Object.values(geometry.gears))
+    for (let i = 0; i < slots.length; i++) if (slots[i]) slots[i].dummy = false;
+  const total = (age) => {
+    const values = Object.values(source.constructions[`building_age_${age}`]);
+    for (const def of values) {
+      sourceEffects(def);
+      if (def.quantity !== undefined && def.quantity < 1) fail('invalid card multiplicity');
+    }
+    const count = values.reduce((n, d) => n + Number(d.quantity ?? 1), 0);
+    if (count !== catalog.BUILDINGS.filter((c) => c.age === age).length)
+      fail('source/native deck multiplicities differ');
+    return count;
+  };
+  const initial = {
+    version: 1,
+    additionalBuildings: false,
+    phase: 'playing',
+    round: 1,
+    age: 1,
+    players,
+    currentPlayer: 0,
+    firstPlayer: 0,
+    turnOrder: ring.map((_, i) => i),
+    turnIndex: 0,
+    turn: { mode: 'none', count: 0, begged: false },
+    gears: geometry.gears,
+    jungle: geometry.jungle,
+    skullSupply: ledger.skullSupply,
+    skullSpaces: geometry.skullSpaces,
+    firstPlayerClaimed: geometry.firstPlayerClaimed,
+    accumulatedCorn: ledger.accumulatedCorn,
+    buildings: geometry.buildings,
+    buildingDeckCount: total(1) - geometry.buildings.length,
+    age2DeckCount: total(2),
+    monuments: geometry.monuments,
+    pending: null,
+    log: [],
+    foodDays: [],
+    finalScores: [],
+    hidden: { seed: 'unknown', setupOffers: 'unknown', deckOrder: 'unknown' },
+  };
+  return {
+    schema: 'tzolkin-bga-network-initial-preparation-v1',
+    tableId: index.tableId,
+    sourceRawSha256: index.rawSha256,
+    sourceAnchor: {
+      moveId: distribution.moveId,
+      notifications: distribution.entries.map((n) => ({
+        packetIndex: n.packetIndex,
+        notificationIndex: n.notificationIndex,
+        uid: n.uid,
+      })),
+    },
+    cardMappings: mapper.entries(),
+    sourceCountersModified: false,
+    qualificationRaised: false,
+    witnesses: {
+      schema: 'tzolkin-bga-public-witnesses-v1',
+      tableId: index.tableId,
+      rawSha256: index.rawSha256,
+      catalogHash: catalogFingerprint(catalogBytes),
+      initialActionId: distribution.moveId,
+      initial,
+      witnesses: [],
+    },
+  };
 }
 
 function initialLedger(index) {
@@ -597,6 +720,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     const before = copy(native());
     const stepsBefore = record.steps.length;
     try {
+      // The observed client marks the once-per-game speed-up as unavailable.
+      // Do not treat this as a cosmetic board flip or silently retain native availability.
+      if (group.entries.some((n) => n.type === 'flipBoard'))
+        fail(
+          'double-advance availability change requires explicit native continuation; flipBoard is not display-only',
+        );
       if (openRotationFence && !group.entries.some((n) => n.type === 'rotateWheel'))
         fail('deferred first-player boundary did not immediately resolve by rotation');
       if (

@@ -6,6 +6,7 @@ const MAX_BYTES = 16 * 1024 * 1024;
 // New client revisions require independent review before they can authorize decoding.
 const REVIEWED_CLIENT_PAIRS = new Set([
   'bb384177730e85653781f3b193f65b1df88c5624439d12d3dae6a22473f19334:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
+  '8cec9fefd73a8abdfbd539ad1c547e1e92ee8db4ebc0acabeeb8ee87ebdb0b41:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
 ]);
 const validatedContracts = new WeakSet();
 const sha = (bytes) => createHash('sha256').update(bytes).digest('hex');
@@ -60,6 +61,8 @@ const CLASSIFICATION = {
   templeScore: 'awardCaption',
   finalScoring: 'awardCaption',
   simpleNode: 'terminalCaption',
+  simpleNote: 'initialColorPreferenceCaption',
+  flipBoard: 'doubleAdvanceAvailability',
   updateReflexionTime: 'clock',
 };
 
@@ -244,6 +247,26 @@ export function parseNetworkReplay(bytes) {
       )
         fail('unknown/invalid/duplicate notification');
       seen.add(n.uid);
+      if (n.type === 'simpleNote') {
+        keys(n.args, ['players', 'change_preferences'], 'color preference caption');
+        const link = n.args.change_preferences;
+        if (
+          packetId > checkpoint ||
+          n.log !==
+            'Color of ${players} has been chosen according to his/her preferences. ${change_preferences}' ||
+          typeof n.args.players !== 'string' ||
+          !object(link) ||
+          link.log !==
+            '<a href="https://boardgamearena.com/preferences" target="_blank">${label}</a>' ||
+          link.args?.label !== 'Change my preferences.'
+        )
+          fail('unsupported simpleNote; only checkpoint color-preference caption is reviewed');
+      }
+      if (n.type === 'flipBoard') {
+        keys(n.args, ['player_id', 'side'], 'board flip');
+        if (!playerIds.includes(String(n.args.player_id)) || ![0, 1].includes(n.args.side))
+          fail('invalid double-advance availability notification');
+      }
       counts[visible ? 'visibleNotifications' : 'hiddenNotifications']++;
       entries.push({
         packetIndex: pi,
@@ -271,7 +294,12 @@ export function parseNetworkReplay(bytes) {
     integer(initial.gamestate.id, 'initial state ID') !== 2 ||
     before.some(
       (n) =>
-        !['gameStateChange', 'gameStateMultipleActiveUpdate', 'chooseWealthTiles'].includes(n.type),
+        ![
+          'gameStateChange',
+          'gameStateMultipleActiveUpdate',
+          'chooseWealthTiles',
+          'simpleNote',
+        ].includes(n.type),
     ) ||
     !activeUpdate ||
     !isDeepStrictEqual(activeUpdate.args, initial.gamestate.multiactive) ||

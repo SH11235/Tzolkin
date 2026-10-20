@@ -1,14 +1,27 @@
 import assert from 'node:assert/strict';
 import { mock, test } from 'node:test';
 import { parseNetworkReplay } from './bga-network.mjs';
+import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 
-// Node's test runner isolates this file. Only cancellation authentication is stubbed;
+// Node's test runner isolates this file. Client/cancellation authentication is stubbed;
 // the production allowlist and real-contract rejection tests remain unchanged.
 mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
   // Keep the option supported by the declared Node 24.0 minimum.
-  namedExports: { inspectCancellationClusters: () => [] },
+  namedExports: {
+    parseNetworkReplay,
+    inspectCancellationClusters: () => [],
+    inspectArchiveClient: (studio, game) => {
+      assert.equal(studio.toString(), 'synthetic studio');
+      assert.equal(game.toString(), 'synthetic game');
+      return {};
+    },
+  },
 });
 const { replayNetworkPrefix } = await import('./bga-network-replay.mjs');
+const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
 
 function fixture() {
@@ -82,7 +95,7 @@ function fixture() {
     },
   };
 }
-function setup(payment = false, wrongActor = false) {
+function setup(payment = false, wrongActor = false, flip = false, capture = null) {
   const raw = fixture();
   Object.assign(raw.initialState, {
     buildings: [],
@@ -183,12 +196,31 @@ function setup(payment = false, wrongActor = false) {
     }
     return frame(state);
   };
+  if (flip)
+    raw.gameLogs.data.data
+      .at(-1)
+      .data.push({ uid: 'flip', type: 'flipBoard', log: '', args: { player_id: '1', side: 1 } });
   const original = structuredClone(initial);
-  const result = replayNetworkPrefix(
-    parseNetworkReplay(bytes(raw)),
-    { initial, initialMoveId: 2, clientContract: {} },
-    dispatch,
-  );
+  const result = capture
+    ? convertNetworkInputs(
+        {
+          bytes: capture(bytes(raw)),
+          studioBytes: Buffer.from('synthetic studio'),
+          gameBytes: Buffer.from('synthetic game'),
+          witnessesBytes: bytes({
+            schema: 'tzolkin-bga-public-witnesses-v1',
+            tableId: '123',
+            initial,
+            initialActionId: 2,
+          }),
+        },
+        dispatch,
+      )
+    : replayNetworkPrefix(
+        parseNetworkReplay(bytes(raw)),
+        { initial, initialMoveId: 2, clientContract: {} },
+        dispatch,
+      );
   assert.deepEqual(initial, original);
   return result;
 }
@@ -213,4 +245,36 @@ test('actor mismatch stops before applying an operation', () => {
   assert.equal(result.blocked.moveId, 3);
   assert.match(result.blocked.reason, /actor mismatch/);
   assert.equal(result.record.steps.length, 0);
+});
+
+test('speed-up availability is never silently treated as a cosmetic board flip', () => {
+  const result = setup(false, false, true);
+  assert.equal(result.record.steps.length, 0);
+  assert.match(result.blocked.reason, /double-advance availability/);
+  assert.ok(result.blocked.source.some((n) => n.type === 'flipBoard'));
+});
+
+test('conversion consumes retained verified bytes after the backing file is replaced', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'network-retained-'));
+  const path = join(dir, 'source.json');
+  t.after(() => {
+    unlinkSync(path);
+    rmdirSync(dir);
+  });
+  let verifiedSha;
+  const result = setup(false, false, false, (bytes) => {
+    writeFileSync(path, bytes);
+    const retained = readFileSync(path);
+    verifiedSha = createHash('sha256').update(bytes).digest('hex');
+    assert.equal(createHash('sha256').update(retained).digest('hex'), verifiedSha);
+    const replaced = JSON.parse(bytes);
+    // Keep the same table and initial state; only change a later original action.
+    replaced.gameLogs.data.data.at(-1).data[0].type = 'unreviewedReplacement';
+    writeFileSync(path, JSON.stringify(replaced));
+    return retained;
+  });
+  assert.equal(result.rawSha256, verifiedSha);
+  assert.equal(result.blocked, null);
+  assert.equal(result.record.steps.length, 1);
+  assert.match(readFileSync(path, 'utf8'), /unreviewedReplacement/);
 });

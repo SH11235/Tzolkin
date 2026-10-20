@@ -105,6 +105,42 @@ test('saved index preserves ordering, skips checkpoint and filters other player 
   assert.match(result.rawSha256, /^[a-f\d]{64}$/);
 });
 
+test('only the reviewed pre-checkpoint color preference caption is accepted', () => {
+  const f = fixture();
+  const note = {
+    uid: 'color',
+    type: 'simpleNote',
+    log: 'Color of ${players} has been chosen according to his/her preferences. ${change_preferences}',
+    args: {
+      players: '<b>P1</b>',
+      change_preferences: {
+        log: '<a href="https://boardgamearena.com/preferences" target="_blank">${label}</a>',
+        args: { label: 'Change my preferences.' },
+      },
+    },
+  };
+  f.gameLogs.data.data[0].data.push(note);
+  assert.equal(parseNetworkReplay(bytes(f)).groups.length, 4);
+  const late = structuredClone(f);
+  late.gameLogs.data.data[0].data.pop();
+  late.gameLogs.data.data[1].data.push(note);
+  assert.throws(() => parseNetworkReplay(bytes(late)), /unsupported simpleNote/);
+  note.log = 'Unreviewed state effect';
+  assert.throws(() => parseNetworkReplay(bytes(f)), /unsupported simpleNote/);
+});
+
+test('board flips retain their state meaning and reject unknown actors or sides', () => {
+  const f = fixture();
+  const n = { uid: 'flip', type: 'flipBoard', log: '', args: { player_id: '1', side: 1 } };
+  f.gameLogs.data.data.at(-1).data.push(n);
+  assert.equal(
+    parseNetworkReplay(bytes(f)).groups.at(-1).entries.at(-1).classification,
+    'doubleAdvanceAvailability',
+  );
+  n.args.side = 2;
+  assert.throws(() => parseNetworkReplay(bytes(f)), /invalid double-advance/);
+});
+
 test('checkpoint must describe actual pre-distribution contents, not just a packet number', () => {
   for (const mutate of [
     (x) => {
