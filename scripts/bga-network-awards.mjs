@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 
 export const skullShortageCaption = 'Not enough Skulls available for everyone: no one get a Skull.';
+export const singleSkullCaption = 'There is only 1 crystal skull left for ${player_name}';
 const fail = (why) => {
   throw new Error(`Skull award: ${why}`);
 };
@@ -14,6 +15,186 @@ const number = (x) =>
   ['string', 'number'].includes(typeof x) &&
   /^(0|[1-9]\d*)$/.test(String(x)) &&
   Number.isSafeInteger(Number(x));
+
+const exactKeys = (value, keys) =>
+  value &&
+  !Array.isArray(value) &&
+  typeof value === 'object' &&
+  isDeepStrictEqual(Object.keys(value).sort(), [...keys].sort());
+
+export function sourceSingleSkullWitness({
+  ledger,
+  group,
+  before,
+  observation,
+  sourceToNative,
+  unresolvedTiming,
+  sourceStateMatched,
+}) {
+  const captions = group.entries.filter((n) => n.type === 'noSkullsLeft');
+  if (!captions.length) return null;
+  const entries = group.entries,
+    [payment, selection, caption, receipt, transition, ending] = entries;
+  if (
+    captions.length !== 1 ||
+    entries.length !== 6 ||
+    captions[0] !== caption ||
+    !isDeepStrictEqual(
+      entries.map((n) => n.type),
+      [
+        'payGoods',
+        'selectAction',
+        'noSkullsLeft',
+        'takeGoods',
+        'gameStateChange',
+        'gameStateChange',
+      ],
+    ) ||
+    entries.some(
+      (n, i) =>
+        n.packetIndex !== caption.packetIndex ||
+        n.moveId !== group.moveId ||
+        n.notificationIndex !== i,
+    ) ||
+    !exactKeys(payment.args, [
+      'type',
+      'resources',
+      'name',
+      'player_id',
+      'player_name',
+      'quantity',
+      'target',
+    ]) ||
+    !exactKeys(selection.args, ['player_name', 'city', 'action_number']) ||
+    !exactKeys(caption.args, ['player_name']) ||
+    !exactKeys(receipt.args, [
+      'type',
+      'resources',
+      'player_id',
+      'player_name',
+      'quantity',
+      'origin',
+    ]) ||
+    caption.singleSkullCaption !== singleSkullCaption ||
+    payment.args.type !== 'corn' ||
+    payment.args.name !== 'corn' ||
+    payment.args.target !== null ||
+    payment.args.player_name !== null ||
+    !number(payment.args.quantity) ||
+    Number(payment.args.quantity) !== 1 ||
+    selection.args.city !== 'Yaxchilan' ||
+    !number(selection.args.action_number) ||
+    Number(selection.args.action_number) !== 4 ||
+    receipt.args.type !== 'skull' ||
+    !number(receipt.args.quantity) ||
+    Number(receipt.args.quantity) !== 1 ||
+    receipt.args.origin !== 'action_yaxchilan_4' ||
+    Number(transition.args.id) !== 9 ||
+    Number(ending.args.id) !== 7
+  )
+    fail('single-skull caption is outside its closed paid-action boundary');
+  const sourceId = String(receipt.args.player_id),
+    actor = sourceToNative.get(sourceId);
+  const source = ledger.players[sourceId],
+    player = before.players[actor];
+  const names = Object.entries(ledger.initial.players).filter(
+    ([, p]) => p.name === caption.args.player_name,
+  );
+  const task = before.pending?.task;
+  if (
+    names.length !== 1 ||
+    names[0][0] !== sourceId ||
+    !source ||
+    !player ||
+    unresolvedTiming !== false ||
+    sourceStateMatched !== true ||
+    ledger.stateId !== 45 ||
+    ledger.activePlayer !== sourceId ||
+    before.phase !== 'playing' ||
+    before.additionalBuildings !== false ||
+    before.expansion != null ||
+    before.currentPlayer !== actor ||
+    observation?.actor !== actor ||
+    ledger.skullSupply !== 1 ||
+    before.skullSupply !== 1 ||
+    source.technologies.theology !== 3 ||
+    player.technologies.theology !== 3 ||
+    !isDeepStrictEqual(source.resources, player.resources) ||
+    !isDeepStrictEqual(source.technologies, player.technologies) ||
+    task?.type !== 'anyAction' ||
+    task.cost !== 1 ||
+    task.excludeSkulls !== true ||
+    !isDeepStrictEqual(before.pending.after, []) ||
+    String(payment.args.player_id) !== sourceId ||
+    selection.args.player_name !== caption.args.player_name ||
+    receipt.args.player_name !== caption.args.player_name ||
+    String(transition.args.active_player) !== sourceId ||
+    String(ending.args.active_player) !== sourceId
+  )
+    fail('single-skull source and native actor, pool or pending state differ');
+  const rows = observation.legalActions.filter(
+    (r) =>
+      r.action.type === 'useAction' &&
+      r.action.gear === 'yaxchilan' &&
+      r.action.position === 4 &&
+      r.action.source === 'anywhere' &&
+      r.action.cornCost === 1,
+  );
+  if (
+    rows.length !== 1 ||
+    !isDeepStrictEqual(rows[0].move, { type: 'choose', choiceId: 'any:yaxchilan:4' })
+  )
+    fail('single-skull source choice has no unique existing legal move');
+  return {
+    sourceId,
+    actor,
+    moveId: group.moveId,
+    move: structuredClone(rows[0].move),
+    caption: ref(caption),
+    resourceReceipt: ref(receipt),
+    nominalSkulls: 2,
+    actualSkulls: 1,
+    cornCost: 1,
+  };
+}
+
+export function bindSingleSkullOutcome(proof, before, after, steps) {
+  if (!proof) return null;
+  if (
+    steps.length !== 1 ||
+    steps[0].actor !== proof.actor ||
+    !isDeepStrictEqual(steps[0].move, proof.move) ||
+    !isDeepStrictEqual(steps[0].sourceActionIds, [proof.moveId]) ||
+    !isDeepStrictEqual(steps[0].refills, { currentAge: [], age2: [] }) ||
+    after.skullSupply !== 0 ||
+    after.pending !== null ||
+    !isDeepStrictEqual(Object.keys(before).sort(), Object.keys(after).sort())
+  )
+    fail('single-skull grant did not use its one original native action');
+  for (const key of Object.keys(before))
+    if (
+      !['players', 'skullSupply', 'pending', 'log'].includes(key) &&
+      !isDeepStrictEqual(before[key], after[key])
+    )
+      fail('single-skull action changed an unrelated native field');
+  if (before.players.length !== after.players.length) fail('single-skull roster changed');
+  for (let i = 0; i < before.players.length; i++) {
+    const expected = structuredClone(before.players[i]);
+    if (i === proof.actor) {
+      expected.resources.corn -= 1;
+      expected.resources.skull += 1;
+    }
+    if (!isDeepStrictEqual(expected, after.players[i]))
+      fail('single-skull action differs from its exact observed resource grant');
+  }
+  return {
+    ...proof,
+    nativePoolBefore: before.skullSupply,
+    nativePoolAfter: after.skullSupply,
+    sourceCountersModified: false,
+    qualificationRaised: false,
+  };
+}
 
 export function sourceSkullShortageWitness({
   ledger,

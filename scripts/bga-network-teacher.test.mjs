@@ -277,8 +277,8 @@ test('literal final display keeps original IDs and refuses missing or contradict
   assert.equal(result.status.producer.state, 'notRun');
 });
 
-test('final receipt fences cannot publish a manifest after an unresolved or rejected terminal', async (t) => {
-  for (const kind of ['unresolved', 'blocked', 'unfinished', 'missingTerminal'])
+test('rejected receipt boundaries cannot publish a teacher manifest', async (t) => {
+  for (const kind of ['unresolved', 'blocked', 'unfinished', 'missingTerminal', 'singleSkull'])
     await t.test(kind, async (sub) => {
       const { put, root } = await temporary(sub),
         f = rosterFixture();
@@ -303,6 +303,10 @@ test('final receipt fences cannot publish a manifest after an unresolved or reje
       if (kind === 'blocked') prefix.blocked = { moveId: 2 };
       if (kind === 'unfinished') prefix.finished = false;
       if (kind === 'missingTerminal') delete prefix.record.terminalDisplayCheckpoint;
+      if (kind === 'singleSkull') {
+        prefix.timingFences = [];
+        prefix.blocked = { moveId: 2, source: [{ type: 'noSkullsLeft' }] };
+      }
       const result = await buildNetworkTeacher(
         {
           ...f,
@@ -319,7 +323,10 @@ test('final receipt fences cannot publish a manifest after an unresolved or reje
         },
         { core: 'absent', producer: 'absent', loader: 'absent' },
       );
-      assert.match(result.error.reason, /Final scoring receipts did not resolve/);
+      assert.match(
+        result.error.reason,
+        /Final scoring receipts did not resolve|Single-skull receipt was rejected/,
+      );
       assert.equal(result.status.manifest.state, 'notGenerated');
       assert.equal(result.status.producer.state, 'notRun');
       assert.equal(result.dataset, null);

@@ -12,7 +12,12 @@ import {
   bindDeclinedRemainingWorkers,
   proveEquivalentChichenRoutes,
 } from './bga-network-chichen.mjs';
-import { sourceSkullShortageWitness, bindSkullShortageOutcome } from './bga-network-awards.mjs';
+import {
+  sourceSkullShortageWitness,
+  bindSkullShortageOutcome,
+  sourceSingleSkullWitness,
+  bindSingleSkullOutcome,
+} from './bga-network-awards.mjs';
 import {
   appendRewardFence,
   bindNewFixedReward,
@@ -1386,6 +1391,18 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     const stepsBefore = record.steps.length;
     let constructionTransition = null;
     try {
+      const singleSkull = group.entries.some((n) => n.type === 'noSkullsLeft')
+        ? sourceSingleSkullWitness({
+            ledger,
+            group,
+            before,
+            observation: frame.observation,
+            sourceToNative,
+            unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
+            sourceStateMatched:
+              differences(ledger, before, sourceToNative, terminalCalendar).length === 0,
+          })
+        : null;
       const skullShortage = sourceSkullShortageWitness({
         ledger,
         group,
@@ -1934,6 +1951,9 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       }
       for (const n of group.entries) updateLedger(ledger, n, mapper);
       const skullShortageEvidence = bindSkullShortageOutcome(skullShortage, before, native());
+      const singleSkullEvidence = singleSkull
+        ? bindSingleSkullOutcome(singleSkull, before, native(), record.steps.slice(stepsBefore))
+        : null;
       if (skullShortageEvidence)
         audit.push({ moveId: group.moveId, skullShortageEvidence, teacherCertified: false });
       if (native().phase === 'finished') {
@@ -1974,6 +1994,10 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       }
       let diff = differences(ledger, native(), sourceToNative, terminalCalendar);
       const originalDiff = copy(diff);
+      if (singleSkullEvidence) {
+        if (diff.length) fail('single-skull boundary did not match the complete public projection');
+        audit.push({ moveId: group.moveId, singleSkullEvidence, teacherCertified: false });
+      }
       const sourceActor = [...sourceToNative].find(
         ([, id]) => id === frame.observation?.actor,
       )?.[0];

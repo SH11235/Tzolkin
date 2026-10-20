@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { uniqueJson } from './bga-observed-options.mjs';
 import { declinedRemovalCaption } from './bga-network-chichen.mjs';
-import { skullShortageCaption } from './bga-network-awards.mjs';
+import { skullShortageCaption, singleSkullCaption } from './bga-network-awards.mjs';
 
 const MAX_BYTES = 16 * 1024 * 1024;
 const LEGACY_STUDIOS = new Set([
@@ -14,6 +14,7 @@ const LEGACY_STUDIOS = new Set([
   '684dae21c6710db763374fa366fc0c8267b36afcfffbb6648fbb9e65909e24b5',
   '79598faf70819525033768a2e062cf619c3dc75ed9d5eef7c4fa7cefebc39279',
   '85bb4afe09c8dc93fa729f43a4b42db4b964901834220c510c95d52f5d9a0499',
+  'dd0e6a8a5d340da5eccaad7b74901ff43255fefcd8c01266ebdb5d55d807bbc6',
 ]);
 // New client revisions require independent review before they can authorize decoding.
 const REVIEWED_CLIENT_PAIRS = new Set([
@@ -88,6 +89,7 @@ const CLASSIFICATION = {
   workerLimit: 'workerCapCaption',
   middleOfAgeRewards: 'awardCaption',
   noskulltoday: 'awardCaption',
+  noSkullsLeft: 'limitedSkullGrantCaption',
   templeLeader: 'awardCaption',
   templeScore: 'awardCaption',
   finalScoring: 'awardCaption',
@@ -308,6 +310,15 @@ export function parseNetworkReplay(bytes) {
       )
         fail('unknown/invalid/duplicate notification');
       seen.add(n.uid);
+      if (n.type === 'noSkullsLeft') {
+        keys(n.args, ['player_name'], 'single-skull caption');
+        if (
+          n.log !== singleSkullCaption ||
+          typeof n.args.player_name !== 'string' ||
+          Object.values(initial.players).filter((p) => p.name === n.args.player_name).length !== 1
+        )
+          fail('unsupported single-skull caption or actor');
+      }
       if (
         n.type === 'noskulltoday' &&
         (n.log !== skullShortageCaption || !Array.isArray(n.args) || n.args.length)
@@ -410,6 +421,7 @@ export function parseNetworkReplay(bytes) {
         channel: packet.channel,
         ...(declinedActionCaption ? { declinedActionCaption } : {}),
         ...(n.type === 'noskulltoday' ? { skullShortageCaption: n.log } : {}),
+        ...(n.type === 'noSkullsLeft' ? { singleSkullCaption: n.log } : {}),
       };
       entries.push(entry);
       if (n.type === 'finalScoring')
