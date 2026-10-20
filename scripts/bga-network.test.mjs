@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  assertNetworkClockContract,
   inspectArchiveClient,
   inspectCancellationClusters,
   inspectCancellationSequence,
@@ -196,7 +197,14 @@ test('isolated holiday clock captions retain source evidence and reject unreview
   assert.equal(entry.uid, 'holiday');
   assert.equal(entry.moveId, 6);
   assert.deepEqual(entry.args, packet.data[0].args);
+  assert.throws(
+    () => assertNetworkClockContract(parseNetworkReplay(bytes(f)), { studioSha256: 'legacy' }),
+    /requires a reviewed legacy client contract/,
+  );
   for (const mutate of [
+    (p) => (p.packet_type = 'history'),
+    (p) => (p.packet_type = 'single'),
+    (p) => (p.packet_type = 'unknown'),
     (p) => (p.data[0].args.nb_days = '4'),
     (p) => (p.data[0].args.nb_days = 3),
     (p) => (p.data[0].args.nb_days = null),

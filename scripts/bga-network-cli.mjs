@@ -2,7 +2,11 @@ import { readFile, stat, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coreDispatcher } from './bga-replay.mjs';
-import { inspectArchiveClient, parseNetworkReplay } from './bga-network.mjs';
+import {
+  assertNetworkClockContract,
+  inspectArchiveClient,
+  parseNetworkReplay,
+} from './bga-network.mjs';
 import { deriveNetworkInitial, replayNetworkPrefix } from './bga-network-replay.mjs';
 
 async function boundedRead(path, limit = 16 * 1024 * 1024) {
@@ -59,6 +63,7 @@ export function convertNetworkInputs(
   if (!['prepare', 'replay'].includes(mode)) throw new Error('Unsupported conversion mode');
   const clientContract = inspectArchiveClient(studioBytes, gameBytes);
   const index = parseNetworkReplay(bytes);
+  assertNetworkClockContract(index, clientContract);
   if (mode === 'prepare') {
     const prepared = deriveNetworkInitial(index);
     const inspected = dispatch({

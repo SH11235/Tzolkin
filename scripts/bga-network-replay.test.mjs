@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mock, test } from 'node:test';
-import { parseNetworkReplay } from './bga-network.mjs';
+import { assertNetworkClockContract, parseNetworkReplay } from './bga-network.mjs';
 import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +11,7 @@ import { createHash } from 'node:crypto';
 mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
   // Keep the option supported by the declared Node 24.0 minimum.
   namedExports: {
+    assertNetworkClockContract,
     parseNetworkReplay,
     inspectCancellationClusters: () => [],
     inspectArchiveClient: (studio, game) => {

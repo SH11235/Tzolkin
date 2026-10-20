@@ -139,6 +139,12 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
   return contract;
 }
 
+export function assertNetworkClockContract(index, contract) {
+  if (!index.entries.some((n) => n.type === 'timeJokerUsed')) return;
+  if (!validatedContracts.has(contract) || !LEGACY_STUDIOS.has(contract.studioSha256))
+    fail('holiday clock caption requires a reviewed legacy client contract');
+}
+
 /** Read a saved response extract; no browser requests, credential loading or code evaluation. */
 export function parseNetworkReplay(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length > MAX_BYTES) fail('invalid saved response bytes');
@@ -288,6 +294,7 @@ export function parseNetworkReplay(bytes) {
         keys(n.args, ['player_name', 'nb_days'], 'holiday clock caption');
         if (
           packet.channel !== `/table/t${tableId}` ||
+          packet.packet_type !== 'resend' ||
           packet.data.length !== 1 ||
           n.log !== '${player_name} uses a holiday time joker (+${nb_days} days thinking time)' ||
           n.args.nb_days !== 4 ||
