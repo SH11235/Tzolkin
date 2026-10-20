@@ -5,6 +5,7 @@ import { uniqueJson } from './bga-observed-options.mjs';
 const MAX_BYTES = 16 * 1024 * 1024;
 // New client revisions require independent review before they can authorize decoding.
 const REVIEWED_CLIENT_PAIRS = new Set([
+  '535b4e2fe7d67a491590c4a3adb55f83eff9b8d8b495319274feec24b4e5567b:66d51f4c0f2472c0f3e87e903cd179e634bf7cbd2c12810e18e53a1bab724126',
   '1b4b05a634195c41d0ddc12de065f0f432185f4d6494cb3870b27042108e92ff:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   'bb384177730e85653781f3b193f65b1df88c5624439d12d3dae6a22473f19334:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   '8cec9fefd73a8abdfbd539ad1c547e1e92ee8db4ebc0acabeeb8ee87ebdb0b41:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
@@ -79,6 +80,8 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
     if (!Buffer.isBuffer(b) || b.length > 4 * MAX_BYTES) fail('invalid client source bytes');
   const studioSha256 = sha(studioBytes);
   const gameSha256 = sha(gameBytes);
+  const legacyUiDelivery =
+    studioSha256 === '535b4e2fe7d67a491590c4a3adb55f83eff9b8d8b495319274feec24b4e5567b';
   if (!REVIEWED_CLIENT_PAIRS.has(`${studioSha256}:${gameSha256}`))
     fail('unreviewed archive client version');
   const studio = studioBytes.toString('utf8');
@@ -103,7 +106,11 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
     fail('client overrides observed cancellation contract');
   if (
     !studio.includes('e.subscribe("undoRestorePoint",this,"ntf_undoRestorePoint")') ||
-    !studio.includes('ntf_undoRestorePoint:function(t){globalThis.g_archive_mode||')
+    !studio.includes(
+      legacyUiDelivery
+        ? 'ntf_undoRestorePoint:function(t){g_archive_mode||'
+        : 'ntf_undoRestorePoint:function(t){globalThis.g_archive_mode||',
+    )
   )
     fail('unsupported undo dispatch contract');
   const contract = Object.freeze({
@@ -112,6 +119,13 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
     gameSha256,
     cancellationType: 'undoRestoreDISAB',
     scope: 'unchanged archive start-turn captions only; no server deletion claim',
+    ...(legacyUiDelivery
+      ? {
+          originalUiDispatchEquivalence: 'notEstablished',
+          deliveryScope:
+            'Retained HTTP notifications; historical optional random UI suppression is not reproduced.',
+        }
+      : {}),
   });
   validatedContracts.add(contract);
   return contract;

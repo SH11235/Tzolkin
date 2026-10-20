@@ -13,6 +13,12 @@ const TEMPLE = ['chaac', 'quetzalcoatl', 'kukulcan'];
 const temple = (x) => (x === 'kukulcan' ? 'kukulkan' : x);
 const category = (x) => ({ tomb: 'graveyard', civic: 'municipal' })[x] ?? x;
 const copy = structuredClone;
+const sourcePosition = (value, teeth) =>
+  ['number', 'string'].includes(typeof value) &&
+  /^(0|[1-9]\d*)$/.test(String(value)) &&
+  Number.isSafeInteger(Number(value)) &&
+  Number.isSafeInteger(teeth) &&
+  Number(value) < teeth;
 const fail = (message) => {
   throw new Error(`Network native: ${message}`);
 };
@@ -366,6 +372,7 @@ export function validateNeutralNetworkRotation(workers, gears, args) {
       observed.length !== 1 ||
       observed[0].player !== null ||
       observed[0].place !== old.place ||
+      !sourcePosition(observed[0].position, teeth) ||
       Number(observed[0].position) !== (Number(old.position) + 1 + args.twice) % teeth
     )
       fail('neutral rotation identity/position differs from the original gear advance');
@@ -441,9 +448,7 @@ function updateLedger(ledger, entry, mapper) {
       if (!old || String(old.player) !== String(w.player)) fail('rotation worker identity');
       if (
         !Object.hasOwn(ledger.initial.gears, w.place) ||
-        !Number.isSafeInteger(Number(w.position)) ||
-        Number(w.position) < 0 ||
-        Number(w.position) >= Number(ledger.initial.gears[w.place].teethnbr)
+        !sourcePosition(w.position, Number(ledger.initial.gears[w.place].teethnbr))
       )
         fail('rotation worker position');
       ledger.workers.set(String(w.id), copy(w));

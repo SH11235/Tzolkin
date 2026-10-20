@@ -185,6 +185,16 @@ test('three-player source neutral slots keep null ownership and wrap by the orig
     ],
   };
   validateNeutralNetworkRotation(workers, gears, args);
+  const wrap = { twice: 0, workers: args.workers.map((w) => ({ ...w, position: '0' })) };
+  validateNeutralNetworkRotation(workers, gears, wrap);
+  for (const invalidZero of [null, '', false]) {
+    const bad = structuredClone(wrap);
+    bad.workers[0].position = invalidZero;
+    assert.throws(
+      () => validateNeutralNetworkRotation(workers, gears, bad),
+      /neutral rotation identity/,
+    );
+  }
   for (const change of [
     (a) => a.workers.pop(),
     (a) => a.workers.push({ ...a.workers[0] }),
