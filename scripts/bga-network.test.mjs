@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  assertNetworkClockContract,
   inspectArchiveClient,
   inspectCancellationClusters,
   inspectCancellationSequence,
@@ -168,6 +169,87 @@ test('board flips retain their state meaning and reject unknown actors or sides'
   );
   n.args.side = 2;
   assert.throws(() => parseNetworkReplay(bytes(f)), /invalid double-advance/);
+});
+
+test('isolated holiday clock captions retain source evidence and reject unreviewed payloads', () => {
+  const f = fixture();
+  const packet = {
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: '10',
+    packet_type: 'resend',
+    move_id: '6',
+    time: '1',
+    data: [
+      {
+        uid: 'holiday',
+        type: 'timeJokerUsed',
+        log: '${player_name} uses a holiday time joker (+${nb_days} days thinking time)',
+        args: { player_name: 'P3', nb_days: 4 },
+      },
+    ],
+  };
+  f.gameLogs.data.data.push(packet);
+  const index = parseNetworkReplay(bytes(f));
+  const entry = index.clockCaptionEntries[0];
+  assert.equal(entry.classification, 'clock');
+  assert.equal(entry.packetIndex, 6);
+  assert.equal(entry.notificationIndex, 0);
+  assert.equal(entry.uid, 'holiday');
+  assert.equal(entry.moveId, 6);
+  assert.deepEqual(entry.args, packet.data[0].args);
+  assert.deepEqual(index.groups, parseNetworkReplay(bytes(fixture())).groups);
+  assert.equal(
+    index.entries.find((n) => n.uid === 'holiday'),
+    entry,
+  );
+  const rotation = structuredClone(f);
+  rotation.gameLogs.data.data.at(-2).data[0].args.id = 95;
+  rotation.gameLogs.data.data.push({
+    ...packet,
+    packet_id: '11',
+    move_id: '7',
+    data: [{ uid: 'rotation', type: 'rotateWheel', log: '', args: { day: 1, twice: 0 } }],
+  });
+  const rotationIndex = parseNetworkReplay(bytes(rotation));
+  assert.deepEqual(
+    rotationIndex.groups.slice(-2).map((g) => g.moveId),
+    [5, 7],
+  );
+  assert.equal(rotationIndex.groups.at(-2).entries[0].args.id, 95);
+  assert.equal(rotationIndex.groups.at(-1).entries[0].type, 'rotateWheel');
+  const sameMove = structuredClone(f);
+  sameMove.gameLogs.data.data.push({
+    ...packet,
+    packet_id: '11',
+    data: [{ uid: 'state', type: 'gameStateChange', log: '', args: { id: 4, active_player: '1' } }],
+  });
+  const sameMoveIndex = parseNetworkReplay(bytes(sameMove));
+  assert.equal(sameMoveIndex.groups.at(-1).moveId, 6);
+  assert.equal(sameMoveIndex.groups.at(-1).entries[0].uid, 'state');
+  assert.equal(sameMoveIndex.clockCaptionEntries[0].uid, 'holiday');
+  assert.throws(
+    () => assertNetworkClockContract(parseNetworkReplay(bytes(f)), { studioSha256: 'legacy' }),
+    /requires a reviewed legacy client contract/,
+  );
+  for (const mutate of [
+    (p) => (p.packet_type = 'history'),
+    (p) => (p.packet_type = 'single'),
+    (p) => (p.packet_type = 'unknown'),
+    (p) => (p.data[0].args.nb_days = '4'),
+    (p) => (p.data[0].args.nb_days = 3),
+    (p) => (p.data[0].args.nb_days = null),
+    (p) => delete p.data[0].args.nb_days,
+    (p) => (p.data[0].args.corn = 4),
+    (p) => (p.data[0].args.player_name = 'Unknown'),
+    (p) => (p.data[0].log = 'Advance the game by four days'),
+    (p) => (p.channel = '/player/p1'),
+    (p) => p.data.push({ uid: 'extra', type: 'updateReflexionTime', log: '', args: {} }),
+  ]) {
+    const bad = structuredClone(f);
+    mutate(bad.gameLogs.data.data.at(-1));
+    assert.throws(() => parseNetworkReplay(bytes(bad)), /holiday clock caption/);
+  }
 });
 
 test('theology bonus caption only accepts its reviewed template and a known source actor', () => {
