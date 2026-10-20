@@ -64,3 +64,25 @@ test('corpus stages partition original identities while preserving original evid
   );
   assert.throws(() => networkCorpusLedger(queue, [{ tableId: '4', split: null }]), /Unknown/);
 });
+
+test('feeding after a double advance keeps scheduled day separate from observed round', () => {
+  const entry = (type, args) => ({ type, args, visible: true, beforeCheckpoint: false });
+  const index = {
+    initial: { day: 0 },
+    counts: {},
+    groups: [
+      { moveId: 1, entries: [entry('rotateWheel', { day: 7 })] },
+      { moveId: 2, entries: [entry('gameStateChange', { id: 92 })] },
+      { moveId: 3, entries: [entry('rotateWheel', { day: 14 })] },
+      { moveId: 4, entries: [entry('gameStateChange', { id: 92 })] },
+    ],
+  };
+  const nativeReport = {
+    frames: [{ snapshot: { state: { phase: 'playing', foodDays: [8, 14] } } }],
+  };
+  const report = networkEvidenceReport({ tableId: '123', index, nativeReport });
+  assert.equal(report.feeding[1].sourceActualRound, 15);
+  assert.equal(report.feeding[1].scheduledDay, 14);
+  assert.equal(report.feeding[1].nativeReached, true);
+  assert.equal(report.feeding[1].individualFeedingReceiptMatch.state, 'notConnected');
+});
