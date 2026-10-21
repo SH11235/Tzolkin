@@ -293,6 +293,110 @@ test('burn harvest refuses changed native intermediate, penalty, source or unrel
   }
 });
 
+function burnWithCornTimingFixture() {
+  const f = burnHarvestFixture();
+  for (const state of [f.input.before, f.middle.snapshot.state, f.after]) {
+    state.players.push({ resources: { corn: 3 } });
+    state.firstPlayerClaimed = 1;
+    state.accumulatedCorn = 0;
+  }
+  const cornFence = {
+    startMoveId: 6,
+    resolvedMoveId: null,
+    actor: 1,
+    sourceId: '2',
+    amount: 3,
+    excludedMoveIds: [6],
+  };
+  Object.assign(f.input, {
+    sourceStateMatched: false,
+    unresolvedTiming: true,
+    cornFence,
+    unresolvedFences: [cornFence],
+    beforeDifferences: [
+      { field: 'player.2.resources.corn', observed: 0, native: 3 },
+      { field: 'accumulatedCorn', observed: 3, native: 0 },
+    ],
+  });
+  f.input.ledger.players['2'] = { resources: { corn: 0 } };
+  f.input.ledger.accumulatedCorn = 3;
+  f.input.sourceToNative.set('2', 1);
+  return f;
+}
+
+test('burn composition preserves exactly one live corn residual without future choice evidence', () => {
+  const f = burnWithCornTimingFixture();
+  f.input.index.groups.push({
+    moveId: 8,
+    get entries() {
+      throw new Error('Future evidence must not select the burn');
+    },
+  });
+  const proof = sourceBurnHarvestWitness(f.input);
+  assert.equal(proof.cornTiming.amount, 3);
+  assert.equal(
+    bindBurnHarvestOutcome(proof, f.input.before, f.middle, f.after, f.steps).qualificationRaised,
+    false,
+  );
+  for (const mutate of [
+    (x) => {
+      x.input.unresolvedFences.push({ ...x.input.cornFence });
+    },
+    (x) => {
+      x.input.unresolvedFences = [{ ...x.input.cornFence }];
+    },
+    (x) => {
+      x.input.cornFence.amount++;
+    },
+    (x) => {
+      x.input.cornFence.sourceId = '3';
+    },
+    (x) => {
+      x.input.cornFence.actor = 0;
+    },
+    (x) => {
+      x.input.cornFence.resolvedMoveId = 6;
+    },
+    (x) => {
+      x.input.cornFence.excludedMoveIds = [];
+    },
+    (x) => {
+      x.input.ledger.accumulatedCorn++;
+    },
+    (x) => {
+      x.input.before.firstPlayerClaimed = 0;
+    },
+    (x) => {
+      x.input.before.players[1].resources.corn++;
+    },
+    (x) => {
+      x.input.beforeDifferences.push({ field: 'score', observed: 0, native: 1 });
+    },
+    (x) => {
+      x.input.beforeDifferences[0].observed = 1;
+    },
+  ]) {
+    const bad = burnWithCornTimingFixture();
+    mutate(bad);
+    assert.equal(sourceBurnHarvestWitness(bad.input), null);
+  }
+  for (const mutate of [
+    (x) => {
+      x.middle.snapshot.state.players[1].resources.corn++;
+    },
+    (x) => {
+      x.after.accumulatedCorn++;
+    },
+  ]) {
+    const bad = burnWithCornTimingFixture(),
+      proof = sourceBurnHarvestWitness(bad.input);
+    mutate(bad);
+    assert.throws(() =>
+      bindBurnHarvestOutcome(proof, bad.input.before, bad.middle, bad.after, bad.steps),
+    );
+  }
+});
+
 function finalScoreFixture(mutate = () => {}) {
   const raw = fixture();
   let uid = 100;
