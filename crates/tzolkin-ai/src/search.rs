@@ -813,16 +813,26 @@ mod tests {
             min_completed_worlds: 1,
             sampling_salt: 0,
         };
-        // Fixed historical producer key; no model, world or decision is run.
-        let old = PreparedSearch::for_revision(&config, HeuristicRevision::V1).unwrap();
-        assert_eq!(
-            old.configuration_key(),
-            "c40b96c933a0145678602a2820b6ca2200818424f3c80bea67f9b332708a42e3"
+        let previous_rules_key = "c40b96c933a0145678602a2820b6ca2200818424f3c80bea67f9b332708a42e3";
+        let legacy_rollout = PreparedSearch::for_revision(&config, HeuristicRevision::V1).unwrap();
+        assert_ne!(legacy_rollout.configuration_key(), previous_rules_key);
+        assert_ne!(
+            legacy_rollout.configuration_key(),
+            config.configuration_key().unwrap()
         );
-        assert_ne!(old.configuration_key(), config.configuration_key().unwrap());
-        let mut provenance = crate::search_native::provenance(&old);
+        let mut provenance = crate::search_native::provenance(&legacy_rollout);
         assert!(provenance.validate().is_err());
         provenance.validate_historical_restore().unwrap();
+        let mut stale_rules = provenance.clone();
+        let crate::replay::SeatPolicy::Search {
+            configuration_key, ..
+        } = &mut stale_rules
+        else {
+            unreachable!()
+        };
+        *configuration_key = previous_rules_key.into();
+        assert!(stale_rules.validate().is_err());
+        assert!(stale_rules.validate_historical_restore().is_err());
         let crate::replay::SeatPolicy::Search { config, .. } = &mut provenance else {
             unreachable!()
         };
