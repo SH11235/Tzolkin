@@ -2523,7 +2523,7 @@ function buildingMarketFixture(mutateRaw = () => {}) {
       beforePending: { title: 'build' },
     },
   });
-  assert.ok(token);
+
   for (let move = 7; move <= 10; move++) {
     const after = structuredClone(before);
     after.players[0].resources.gold--;
@@ -2633,4 +2633,43 @@ test('structural market exit rejects unknown actors, packets, effects, choices a
   };
   after.players[0].score++;
   assert.throws(() => bindBuildingMarketExit(proof, valid.before, after), /Building market:/);
+});
+
+test('building market accepts canonical integer scalars but refuses coercible source receipts', () => {
+  const alter = (raw, value, where) => {
+    const birth = raw.gameLogs.data.data.find((p) => p.move_id === '6'),
+      sale = raw.gameLogs.data.data.find((p) => p.move_id === '7');
+    if (where === 'type_arg') birth.data[1].args.building.type_arg = value;
+    else if (where === 'points') birth.data[4].args.points = value;
+    else if (where === 'birth') birth.data[0].args.quantity = value;
+    else if (where === 'take') sale.data[1].args.quantity = value;
+    else if (where === 'pay') sale.data[2].args.quantity = value;
+    else sale.data[0].args[where] = value;
+  };
+  for (const [where, values] of [
+    ['quantity1', [true, [1], '1e0']],
+    ['quantity2', [[4], '4e0']],
+    ['take', [[4], '4e0']],
+    ['pay', [true, [1], '1e0']],
+    ['type_arg', [[11], '11e0']],
+    ['points', [[6], '6e0']],
+    ['birth', [[2], '2e0']],
+  ])
+    for (const value of values) {
+      const f = buildingMarketFixture((raw) => alter(raw, value, where));
+      assert.throws(() => proveBuildingMarketExit(f.token, f), /Building market:/);
+    }
+  const f = buildingMarketFixture((raw) => {
+    for (const packet of raw.gameLogs.data.data.filter((p) => Number(p.move_id) >= 6)) {
+      for (const n of packet.data) {
+        if (n.args.quantity !== undefined) n.args.quantity = String(n.args.quantity);
+        if (n.args.points !== undefined) n.args.points = String(n.args.points);
+        if (n.type === 'trade') {
+          n.args.quantity1 = String(n.args.quantity1);
+          n.args.quantity2 = String(n.args.quantity2);
+        }
+      }
+    }
+  });
+  assert.ok(proveBuildingMarketExit(f.token, f));
 });

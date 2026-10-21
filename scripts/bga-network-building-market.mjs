@@ -1,6 +1,11 @@
 import { isDeepStrictEqual as same } from 'node:util';
 import { originalPacketEntry } from './bga-network.mjs';
 
+const integerEquals = (value, expected) =>
+  ['number', 'string'].includes(typeof value) &&
+  /^(0|[1-9]\d*)$/.test(String(value)) &&
+  Number.isSafeInteger(Number(value)) &&
+  Number(value) === expected;
 const proofs = new WeakMap();
 const exits = new WeakMap();
 const fail = () => {
@@ -119,22 +124,22 @@ export function trackBuildingMarket(
     if (
       e[0].args.player_id !== sourceActor ||
       e[0].args.type !== 'stone' ||
-      Number(e[0].args.quantity) !== 2 ||
+      !integerEquals(e[0].args.quantity, 2) ||
       e[1].args.player_id !== sourceActor ||
+      !integerEquals(e[1].args.building?.id, Number(e[1].args.building?.id)) ||
+      Number(e[1].args.building.id) < 1 ||
       e[1].args.building?.type !== 'building_age_2' ||
-      Number(e[1].args.building.type_arg) !== 11 ||
+      !integerEquals(e[1].args.building.type_arg, 11) ||
       e[0].args.target !== `building_age_2_${e[1].args.building.id}` ||
       e[2].args.player_id !== sourceActor ||
       e[2].args.type !== 'corn' ||
-      Number(e[2].args.quantity) !== 1 ||
+      !integerEquals(e[2].args.quantity, 1) ||
       e[2].args.origin !== 'technology_architecture_level_1' ||
-      !same(
-        e.slice(3, 5).map((n) => [n.args.player_id, Number(n.args.points)]),
-        [
-          [sourceActor, 2],
-          [sourceActor, 6],
-        ],
-      ) ||
+      !e
+        .slice(3, 5)
+        .every(
+          (n, i) => n.args.player_id === sourceActor && integerEquals(n.args.points, [2, 6][i]),
+        ) ||
       !state(e[5], 9, sourceActor, index) ||
       !state(e[6], 42, sourceActor, index)
     )
@@ -165,17 +170,17 @@ export function trackBuildingMarket(
     a = e[0].args;
   if (
     a.player_id !== proof.sourceActor ||
-    Number(a.quantity1) !== 1 ||
-    Number(a.quantity2) !== 4 ||
+    !integerEquals(a.quantity1, 1) ||
+    !integerEquals(a.quantity2, 4) ||
     a.resource1 !== "<div class='tz_icon resource_gold'></div>" ||
     a.resource2 !== "<div class='tz_icon resource_corn'></div>" ||
     e[1].args.player_id !== proof.sourceActor ||
     e[1].args.type !== 'corn' ||
-    Number(e[1].args.quantity) !== 4 ||
+    !integerEquals(e[1].args.quantity, 4) ||
     e[1].args.origin !== 'action_uxmal_2' ||
     e[2].args.player_id !== proof.sourceActor ||
     e[2].args.type !== 'gold' ||
-    Number(e[2].args.quantity) !== 1 ||
+    !integerEquals(e[2].args.quantity, 1) ||
     e[2].args.target !== 'action_uxmal_2' ||
     !state(e[3], 42, proof.sourceActor, index)
   )

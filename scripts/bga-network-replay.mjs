@@ -1,4 +1,4 @@
-import { recordDecisionBoundary } from './bga-network-decision-boundary.mjs';
+import { recordDecisionBoundary, classifyDecisionState } from './bga-network-decision-boundary.mjs';
 import {
   trackBuildingMarket,
   proveBuildingMarketExit,
@@ -396,6 +396,7 @@ function initialLedger(index) {
     activePlayer: String(s.gamestate.active_player),
     stateId: Number(s.gamestate.id),
     stateType: s.gamestate.type ?? s.gamestates?.[s.gamestate.id]?.type ?? null,
+    stateNotificationType: s.gamestate.type ?? null,
     stateArgs: copy(s.gamestate.args ?? null),
     age: 1,
     foodDays: [],
@@ -529,6 +530,7 @@ function updateLedger(ledger, entry, mapper) {
     ledger.activePlayer = String(a.active_player);
     ledger.stateId = Number(a.id);
     ledger.stateType = a.type ?? ledger.initial.gamestates[a.id]?.type ?? null;
+    ledger.stateNotificationType = a.type ?? null;
     ledger.stateArgs = copy(a.args);
     if (ledger.stateId === 92) {
       const event = ledger.feedingWitnesses.find((e) => e.start.uid === entry.uid);
@@ -2218,10 +2220,10 @@ export function replayNetworkPrefix(
         terminalCalendarFence.resolvedMoveId = group.moveId;
       }
       const unmaskedDifferences = differences(ledger, native(), sourceToNative);
-      const humanDecision = ledger.stateType === 'activeplayer';
+      const decisionType = classifyDecisionState(ledger, index);
       const decisionBoundary = {
         moveId: group.moveId,
-        humanDecision,
+        ...decisionType,
         sourceStateId: ledger.stateId,
         sourceStateType: ledger.stateType,
         sourceActor: ledger.activePlayer,
@@ -2236,6 +2238,8 @@ export function replayNetworkPrefix(
         sourceStateMetadataPresent: !!index.initial.gamestates[ledger.stateId],
       };
       recordDecisionBoundary(decisionBoundaryAudit, decisionBoundary, onDecisionBoundary);
+      if (decisionType.sourceStateTypeIssue)
+        fail(`Source decision state type not established: ${decisionType.sourceStateTypeIssue}`);
       let diff = differences(ledger, native(), sourceToNative, terminalCalendar);
       const originalDiff = copy(diff);
       buildingMarket = trackBuildingMarket(buildingMarket, {
