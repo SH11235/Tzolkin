@@ -1,6 +1,9 @@
 import { isDeepStrictEqual } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
 
+// Only live proofs retain the binding to original entries and applied transitions.
+const terminalClosures = new WeakMap();
+
 const copy = structuredClone;
 const sourcePosition = (value, teeth) =>
   ['number', 'string'].includes(typeof value) &&
@@ -185,7 +188,9 @@ export function bindTerminalCalendarTransition(witness, sourceDay, before, after
 export function createTerminalCalendarComparison({ index, sourceToNative }) {
   const sequence = originalNetworkSequence(index);
   const witness = terminalPlayingCalendarWitness(index);
+  const initialSource = copy(index.initial);
   let obligation = null;
+  let terminalClosure = null;
   let failure = null;
   const reject = (message) => {
     failure ??= message;
@@ -317,17 +322,38 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
       }
     }
     if (group.moveId === witness.terminal.moveId) {
+      const lastTransition = transitions.at(-1);
+      const finalRotation = original(witness.finalRotation);
       if (
         native.phase !== 'finished' ||
         ledger.day !== witness.sourceFinalDay ||
         !isDeepStrictEqual(native.foodDays, [8, 14, 21, 27]) ||
-        !isDeepStrictEqual(obligation.completedActors, obligation.nativeActorOrder)
+        !isDeepStrictEqual(obligation.completedActors, obligation.nativeActorOrder) ||
+        !lastTransition ||
+        !isDeepStrictEqual(lastTransition.after, native) ||
+        !finalRotation ||
+        ledger.lastRotation?.uid !== finalRotation.uid ||
+        ledger.lastRotation?.moveId !== witness.finalRotation.moveId ||
+        Number(ledger.lastRotation?.day) !== witness.sourceFinalDay ||
+        ledger.lastRotation?.twice !== 0 ||
+        !sequence.groups.every((saved) => isDeepStrictEqual(saved.group, saved.original)) ||
+        !isDeepStrictEqual(index.initial, initialSource)
       ) {
         reject(
           'final-playing calendar did not close its actor cycle, food supply and terminal state',
         );
       } else if (!failure) {
         obligation.closed = true;
+        terminalClosure = Object.freeze({ schema: 'tzolkin-bound-terminal-cycle-v1' });
+        terminalClosures.set(terminalClosure, {
+          index,
+          group,
+          rawSha256: index.rawSha256,
+          initial: initialSource,
+          witness: copy(witness),
+          native: copy(native),
+          nativeActorOrder: copy(obligation.completedActors),
+        });
         evidence.push({
           type: 'terminalPlayingCalendarClosure',
           startMoveId: obligation.startMoveId,
@@ -342,10 +368,48 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
   }
   return {
     compare,
+    terminalClosure: () => (failure ? null : terminalClosure),
     finish: () => ({
       obligation: copy(obligation),
       failure,
       allObligationsClosed: !failure && (!obligation || obligation.closed),
     }),
+  };
+}
+
+export function proveBoundTerminalCoordinates({ index, group, ledger, native, evidence }) {
+  const closed = terminalClosures.get(evidence);
+  const sequence = originalNetworkSequence(index);
+  if (
+    !closed ||
+    closed.index !== index ||
+    closed.group !== group ||
+    closed.rawSha256 !== index.rawSha256 ||
+    sequence?.rawSha256 !== closed.rawSha256 ||
+    !isDeepStrictEqual(index.initial, closed.initial) ||
+    !sequence.groups.every((saved) => isDeepStrictEqual(saved.group, saved.original)) ||
+    !isDeepStrictEqual(native, closed.native) ||
+    native.phase !== 'finished' ||
+    native.pending !== null ||
+    native.round !== closed.witness.nativePlayingRound ||
+    ledger.stateId !== 99 ||
+    ledger.day !== closed.witness.sourceFinalDay ||
+    ledger.lastRotation?.moveId !== closed.witness.finalRotation.moveId ||
+    ledger.lastRotation?.uid !== closed.witness.finalRotation.uid ||
+    ledger.lastRotation?.packetIndex !== closed.witness.finalRotation.packetIndex ||
+    ledger.lastRotation?.notificationIndex !== closed.witness.finalRotation.notificationIndex ||
+    ledger.lastRotation?.day !== closed.witness.sourceFinalDay ||
+    ledger.lastRotation?.twice !== 0
+  )
+    return null;
+  return {
+    sourceRawSha256: closed.rawSha256,
+    originalStart: copy(closed.witness.start),
+    originalTerminal: copy(closed.witness.terminal),
+    finalRotation: copy(closed.witness.finalRotation),
+    nativeActorOrder: copy(closed.nativeActorOrder),
+    actualNativeCycleClosed: true,
+    nativeTerminalStateMatched: true,
+    decisionTimeFeatureEquivalence: 'notEstablished',
   };
 }

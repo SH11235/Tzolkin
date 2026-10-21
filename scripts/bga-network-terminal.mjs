@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { classifyDecisionState } from './bga-network-decision-boundary.mjs';
+import { proveBoundTerminalCoordinates } from './bga-network-semantic-calendar.mjs';
 
 const clone = structuredClone;
 const materials = ['corn', 'wood', 'stone', 'gold', 'skull'];
@@ -154,6 +155,7 @@ export function inspectTerminalProjection({
   sourceToNative,
   feedingTransitions,
   terminalDisplayCheckpoint,
+  terminalCalendarEvidence = null,
 }) {
   const failures = [];
   const finalIndex = index.groups.indexOf(group);
@@ -175,6 +177,23 @@ export function inspectTerminalProjection({
     sourceRotation: clone(ledger.lastRotation),
     matched: ledger.day === 27 && native.round === 27 && ledger.lastRotation?.day === 27,
   };
+  if (!calendar.matched) {
+    const bound = proveBoundTerminalCoordinates({
+      index,
+      group,
+      ledger,
+      native,
+      evidence: terminalCalendarEvidence,
+    });
+    if (bound) {
+      calendar.matched = true;
+      calendar.boundFinalCycle = bound;
+    } else if (ledger.day === 28 && native.round === 27)
+      calendar.boundFinalCycle = {
+        recognized: false,
+        reason: 'closedOriginalCycleEvidenceMissingOrInvalid',
+      };
+  }
   if (!calendar.matched) failures.push('terminalCalendarCoordinatesNotEstablished');
   const exceptions = [];
   const corn = differences.find((d) => d.field === 'accumulatedCorn');
@@ -257,6 +276,35 @@ export function inspectTerminalProjection({
     display,
     teacherCertified: false,
   };
+}
+
+export function comparePublicBoundary({
+  comparison,
+  context,
+  semanticArguments,
+  terminalArguments,
+}) {
+  const semantic = comparison.compare(context, semanticArguments);
+  const terminalValidation = terminalArguments
+    ? inspectTerminalProjection({
+        ...terminalArguments,
+        terminalCalendarEvidence: comparison.terminalCalendarEvidence(),
+      })
+    : null;
+  if (terminalValidation?.completed) {
+    semantic.remainingDifferences = semantic.remainingDifferences.filter(
+      (d) =>
+        !terminalValidation.acceptedExceptions.some(
+          (e) =>
+            isDeepStrictEqual(e.observed, d.observed) &&
+            isDeepStrictEqual(e.native, d.native) &&
+            e.field === d.field,
+        ),
+    );
+    semantic.semanticMatch = !semantic.failure && semantic.remainingDifferences.length === 0;
+    semantic.evidence.push({ type: 'terminalProjection', validation: clone(terminalValidation) });
+  }
+  return { semantic, terminalValidation };
 }
 
 export function replayCompletionEvidence({

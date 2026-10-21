@@ -11,7 +11,7 @@ import { createSemanticComparison } from './bga-network-semantic-comparison.mjs'
 import { createObservedChoices } from './bga-network-observed-choices.mjs';
 import {
   assertObservationBoundary,
-  inspectTerminalProjection,
+  comparePublicBoundary,
   replayCompletionEvidence,
 } from './bga-network-terminal.mjs';
 import {
@@ -2186,28 +2186,36 @@ export function replayNetworkPrefix(
         native: native(),
         observation: frame.observation,
       });
-      if (native().phase === 'finished')
-        terminalValidation = inspectTerminalProjection({
-          index,
-          group,
+      const decisionType = classifyDecisionState(ledger, index);
+      const compared = comparePublicBoundary({
+        comparison: semanticComparison,
+        context: semanticContext,
+        semanticArguments: {
           ledger,
           native: native(),
           observation: frame.observation,
           differences: unmaskedDifferences,
-          sourceToNative,
-          feedingTransitions,
-          terminalDisplayCheckpoint: record.terminalDisplayCheckpoint,
-        });
-      const decisionType = classifyDecisionState(ledger, index);
-      const semantic = semanticComparison.compare(semanticContext, {
-        ledger,
-        native: native(),
-        observation: frame.observation,
-        differences: unmaskedDifferences,
-        constructionTransition,
-        applied: audit.slice(auditBeforeGroup),
-        humanDecision: decisionType.potentialHumanDecision,
+          constructionTransition,
+          applied: audit.slice(auditBeforeGroup),
+          humanDecision: decisionType.potentialHumanDecision,
+        },
+        terminalArguments:
+          native().phase === 'finished'
+            ? {
+                index,
+                group,
+                ledger,
+                native: native(),
+                observation: frame.observation,
+                differences: unmaskedDifferences,
+                sourceToNative,
+                feedingTransitions,
+                terminalDisplayCheckpoint: record.terminalDisplayCheckpoint,
+              }
+            : null,
       });
+      const semantic = compared.semantic;
+      terminalValidation = compared.terminalValidation ?? terminalValidation;
       const buildingResourceClosures = semantic.evidence.some(
         (e) => e.type === 'fixedBuildingClosure',
       )
@@ -2217,22 +2225,6 @@ export function replayNetworkPrefix(
               (w) => w.closed && w.closedMoveId === group.moveId,
             )
         : [];
-      if (terminalValidation?.completed && native().phase === 'finished') {
-        semantic.remainingDifferences = semantic.remainingDifferences.filter(
-          (d) =>
-            !terminalValidation.acceptedExceptions.some(
-              (e) =>
-                isDeepStrictEqual(e.observed, d.observed) &&
-                isDeepStrictEqual(e.native, d.native) &&
-                e.field === d.field,
-            ),
-        );
-        semantic.semanticMatch = !semantic.failure && semantic.remainingDifferences.length === 0;
-        semantic.evidence.push({
-          type: 'terminalProjection',
-          validation: copy(terminalValidation),
-        });
-      }
       const decisionBoundary = {
         moveId: group.moveId,
         ...decisionType,
@@ -2445,6 +2437,10 @@ export function replayNetworkPrefix(
         }
       }
       if (diff.length) {
+        if (native().phase === 'finished')
+          fail(
+            `terminal public state mismatch: ${terminalValidation?.failures.join(', ') ?? 'missing terminal evidence'}`,
+          );
         if (openRotationFence?.finalScoringProof)
           fail(`final scoring rotation did not resolve full public state ${JSON.stringify(diff)}`);
         const claimed = native().firstPlayerClaimed;

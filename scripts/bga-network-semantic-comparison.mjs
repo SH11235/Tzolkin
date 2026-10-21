@@ -508,5 +508,11 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       teacherCertified: false,
     };
   }
-  return { begin, applied, compare, finish };
+  return {
+    begin,
+    applied,
+    compare,
+    finish,
+    terminalCalendarEvidence: calendarComparison.terminalClosure,
+  };
 }

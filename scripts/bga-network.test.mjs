@@ -6,6 +6,8 @@ import {
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
+import { comparePublicBoundary, inspectTerminalProjection } from './bga-network-terminal.mjs';
+import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import { createBuildingResourceComparison } from './bga-network-building-resources.mjs';
 import { coreDispatcher } from './bga-replay.mjs';
 import { fixedBuildingResourceChoiceProof } from './bga-network-compound-choices.mjs';
@@ -20,6 +22,8 @@ function semanticFixture({
   immediate = false,
   purchased = false,
   terminal = false,
+  terminalProjection = false,
+  unusedCorn = false,
   mutateSource = () => {},
 } = {}) {
   const raw = fixture();
@@ -75,10 +79,14 @@ function semanticFixture({
     raw.gameLogs.data.data[2].data.find((n) => n.type === 'placeWorker').args.worker_id = '4';
   }
   if (terminal) {
+    raw.initialState.gamestates[99] = { type: 'manager' };
     const earlier = Array.from({ length: 25 }, (_, i) =>
       packet(i + 2, [
         ...([7, 14, 20].includes(i + 1)
-          ? [n('gameStateChange', { id: 92, active_player: '1' })]
+          ? [
+              n('gameStateChange', { id: 92, active_player: '1' }),
+              n('gameStateChange', { id: i + 1 === 14 ? 94 : 93, active_player: '1' }),
+            ]
           : []),
         n('rotateWheel', { day: i + 1, twice: 0, workers: [] }),
       ]),
@@ -109,6 +117,18 @@ function semanticFixture({
         n('gameStateChange', { id: 99, active_player: owner }),
       ]),
     );
+    if (terminalProjection) {
+      const end = raw.gameLogs.data.data.at(-1).data;
+      end.splice(
+        3,
+        0,
+        ...['1', '2', '3'].flatMap((id) => [
+          n('payGoods', { player_id: id, type: 'corn', quantity: 2, target: null }),
+          n('foodDayCost', { player_id: id, cost: 2, nbr: 1 }),
+        ]),
+        n('gameStateChange', { id: 94, active_player: owner }),
+      );
+    }
   }
   mutateSource(raw);
   const index = parseNetworkReplay(bytes(raw));
@@ -168,6 +188,8 @@ function semanticFixture({
   let native = structuredClone(initial);
   let observation = { actor, legalActions: [] };
   const rows = [];
+  const terminalValidations = [];
+  let terminalArguments = null;
   function step(i, alter = () => {}) {
     const group = index.groups.filter((g) => g.moveId > (terminal ? 26 : purchased ? 2 : 1))[i];
     const context = comparison.begin(group, ledger, native, observation);
@@ -227,6 +249,26 @@ function semanticFixture({
         native.foodDays = [8, 14, 21, 27];
         ledger.day = 28;
         ledger.stateId = 99;
+        if (terminalProjection) {
+          observation = null;
+          native.finalScores = native.players.map((p, id) => ({
+            playerId: id,
+            total: 100.25 - id,
+            rank: id + 1,
+          }));
+          for (const [id, p] of native.players.entries()) {
+            p.resources.corn = 1;
+            p.score = native.finalScores[id].total;
+            ledger.players[String(id + 1)].resources.corn = 1;
+            ledger.players[String(id + 1)].score = Math.floor(p.score);
+          }
+          ledger.foodDays = [8, 14, 21, 27];
+          ledger.feedingWitnesses = sourceFeedingWitnesses(index);
+          if (unusedCorn) {
+            native.accumulatedCorn = 1;
+            differences.push({ field: 'accumulatedCorn', observed: 0, native: 1 });
+          }
+        }
       } else {
         native.turnIndex++;
         native.currentPlayer = native.turnOrder[native.turnIndex];
@@ -252,9 +294,59 @@ function semanticFixture({
         legalActions: context.observation.legalActions,
         step: i + 1,
       });
-    const args = { ledger, native, observation, differences, applied, humanDecision: true };
+    if (terminal && [4, 7].includes(stage)) {
+      const rotation = group.entries.find((n) => n.type === 'rotateWheel');
+      ledger.lastRotation = {
+        moveId: group.moveId,
+        packetIndex: rotation.packetIndex,
+        notificationIndex: rotation.notificationIndex,
+        uid: rotation.uid,
+        day: Number(rotation.args.day),
+        twice: rotation.args.twice,
+      };
+    }
+    const args = {
+      ledger,
+      native,
+      observation,
+      differences,
+      applied,
+      humanDecision: !(terminal && stage === 7),
+    };
     alter(args, context, group);
-    const result = comparison.compare(context, args);
+    let result;
+    if (terminalProjection && stage === 7) {
+      terminalArguments = {
+        index,
+        group,
+        ledger,
+        native,
+        observation,
+        differences,
+        sourceToNative: new Map([
+          ['1', 0],
+          ['2', 1],
+          ['3', 2],
+        ]),
+        feedingTransitions: context.transitions,
+        terminalDisplayCheckpoint: {
+          mode: 'floorTotal',
+          scores: native.finalScores.map((n) => ({
+            playerId: n.playerId,
+            total: Math.floor(n.total),
+            rank: n.rank,
+          })),
+        },
+      };
+      const compared = comparePublicBoundary({
+        comparison,
+        context,
+        semanticArguments: args,
+        terminalArguments,
+      });
+      result = compared.semantic;
+      terminalValidations.push(compared.terminalValidation);
+    } else result = comparison.compare(context, args);
     rows.push(result);
     return result;
   }
@@ -264,6 +356,10 @@ function semanticFixture({
     step,
     rows,
     ledger,
+    terminalValidations,
+    get terminalArguments() {
+      return terminalArguments;
+    },
     get native() {
       return native;
     },
@@ -373,6 +469,122 @@ test('round differences without a bound final calendar stay unresolved and open 
   for (let i = 0; i < 7; i++) assert.equal(terminal.step(i).semanticMatch, true);
   assert.equal(terminal.comparison.finish().terminalCalendar.obligation.closed, false);
   assert.equal(terminal.comparison.finish().allObligationsClosed, false);
+});
+
+function completedTerminalFixture(options = {}, alter = () => {}) {
+  const f = semanticFixture({
+    terminal: true,
+    days: 2,
+    amount: 0,
+    terminalProjection: true,
+    ...options,
+  });
+  for (let i = 0; i < 7; i++) assert.equal(f.step(i).semanticMatch, true);
+  f.step(7, alter);
+  return f;
+}
+
+test('public boundary caller closes the actual cycle before independent terminal projection', () => {
+  for (const unusedCorn of [false, true]) {
+    const f = completedTerminalFixture({ unusedCorn }),
+      checked = f.terminalValidations[0];
+    assert.equal(checked.completed, true);
+    assert.equal(checked.calendar.matched, true);
+    assert.equal(checked.calendar.sourceDay, 28);
+    assert.equal(checked.calendar.sourceCounterRound, 29);
+    assert.equal(checked.calendar.nativeRound, 27);
+    assert.deepEqual(checked.calendar.boundFinalCycle.nativeActorOrder, [1, 2, 0]);
+    assert.equal(checked.calendar.boundFinalCycle.decisionTimeFeatureEquivalence, 'notEstablished');
+    assert.equal(checked.food.matched, true);
+    assert.equal(checked.display.matched, true);
+    assert.equal(f.rows.at(-1).semanticMatch, true);
+    assert.equal(f.comparison.finish().allObligationsClosed, true);
+    assert.equal(checked.acceptedExceptions.length, Number(unusedCorn));
+    const cloned = inspectTerminalProjection({
+      ...f.terminalArguments,
+      ledger: structuredClone(f.ledger),
+      native: structuredClone(f.native),
+      terminalCalendarEvidence: f.comparison.terminalCalendarEvidence(),
+    });
+    assert.equal(cloned.completed, true);
+  }
+});
+
+test('terminal coordinates reject serialized, foreign, missing and stale cycle evidence', () => {
+  for (const change of [
+    (args) => {
+      args.terminalCalendarEvidence = null;
+    },
+    (args) => {
+      args.terminalCalendarEvidence = { closed: true, allObligationsClosed: true };
+    },
+    (args) => {
+      args.terminalCalendarEvidence = structuredClone(args.terminalCalendarEvidence);
+    },
+    (args) => {
+      args.terminalCalendarEvidence =
+        completedTerminalFixture().comparison.terminalCalendarEvidence();
+    },
+    (args) => {
+      args.group = structuredClone(args.group);
+      args.group.entries.at(-1).uid = 'foreign-terminal';
+    },
+    (args) => {
+      args.ledger = structuredClone(args.ledger);
+      args.ledger.lastRotation.uid = 'foreign-rotation';
+    },
+    (args) => {
+      args.native = structuredClone(args.native);
+      args.native.players[0].score++;
+    },
+    (args) => {
+      args.index = { ...args.index, rawSha256: '0'.repeat(64) };
+    },
+    (args) => {
+      const open = semanticFixture({ terminal: true, days: 2, amount: 0 });
+      for (let i = 0; i < 7; i++) open.step(i);
+      args.terminalCalendarEvidence = open.comparison.terminalCalendarEvidence();
+    },
+  ]) {
+    const f = completedTerminalFixture(),
+      args = {
+        ...f.terminalArguments,
+        terminalCalendarEvidence: f.comparison.terminalCalendarEvidence(),
+      };
+    change(args);
+    const checked = inspectTerminalProjection(args);
+    assert.equal(checked.calendar.matched, false);
+    assert.equal(checked.completed, false);
+    assert.equal(checked.calendar.boundFinalCycle.recognized, false);
+  }
+});
+
+test('a closed original calendar cannot certify wrong public resources, scores or ranks', () => {
+  for (const field of ['resources', 'score']) {
+    const f = completedTerminalFixture({}, (args) => {
+      if (field === 'resources') {
+        args.ledger.players['1'].resources.corn++;
+        args.differences.push({ field: 'player.1.resources.corn', observed: 2, native: 1 });
+      } else {
+        args.ledger.players['1'].score++;
+        args.differences.push({ field: 'player.1.score', observed: 101, native: 100 });
+      }
+    });
+    const checked = f.terminalValidations[0];
+    assert.equal(f.comparison.finish().terminalCalendar.obligation.closed, true);
+    assert.equal(checked.calendar.matched, true);
+    assert.equal(checked.completed, false);
+    assert.equal(f.rows.at(-1).semanticMatch, false);
+  }
+  const f = completedTerminalFixture(),
+    args = {
+      ...f.terminalArguments,
+      terminalDisplayCheckpoint: structuredClone(f.terminalArguments.terminalDisplayCheckpoint),
+      terminalCalendarEvidence: f.comparison.terminalCalendarEvidence(),
+    };
+  args.terminalDisplayCheckpoint.scores[0].rank++;
+  assert.equal(inspectTerminalProjection(args).calendar.matched, true);
+  assert.equal(inspectTerminalProjection(args).completed, false);
 });
 
 test('semantic comparison retains raw corn and marker gaps until their independent closures', () => {
