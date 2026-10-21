@@ -3974,7 +3974,13 @@ function emptyPaidTechnologyFixture(mutateRaw = () => {}, mutateContext = () => 
     pending: before.pending,
     legalRows: [skip],
   };
-  const sourceBefore = { initial: index.initial, stateId: 31, activePlayer: '1', stateArgs: args };
+  const sourceBefore = structuredClone({
+    initial: index.initial,
+    stateId: 31,
+    activePlayer: '1',
+    stateArgs: args,
+  });
+  assert.notEqual(sourceBefore.initial, index.initial);
   const sourceAfter = { initial: index.initial, stateId: 7, activePlayer: '1', stateArgs: workers };
   const operation = {
     entry: exit.entries.at(-1),
@@ -4104,6 +4110,9 @@ test('empty paid-menu proof rejects absent budgets, unsupported menus and unboun
     },
     (c) => {
       c.operation.sourceActor = '2';
+    },
+    (c) => {
+      c.sourceBefore.initial.players['1'].name = 'changed';
     },
     (c) => {
       c.operation.legalRows.push({

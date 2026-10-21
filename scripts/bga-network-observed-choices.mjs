@@ -593,11 +593,11 @@ export function createObservedChoices({
       !Object.hasOwn(menu.args, 'args') ||
       !same(menu.args.args, args) ||
       group.moveId !== last.moveId + 1 ||
-      sourceBefore?.initial !== index.initial ||
+      !same(sourceBefore?.initial, index.initial) ||
       sourceBefore.stateId !== 31 ||
       sourceBefore.activePlayer !== last.sourceActor ||
       !same(sourceBefore.stateArgs, args) ||
-      sourceAfter?.initial !== index.initial ||
+      !same(sourceAfter?.initial, index.initial) ||
       sourceAfter.stateId !== 7 ||
       sourceAfter.activePlayer !== last.sourceActor ||
       s[31]?.name !== 'technologyUpgrade' ||
