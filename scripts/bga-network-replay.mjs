@@ -3,6 +3,13 @@ import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import {
+  ageTwoRefillStageCandidate,
+  sourceAgeTwoRefillWitness,
+  bindAgeTwoRefillConsumption,
+  refillsAfterAgeTwoConsumption,
+  bindAgeTwoRefillRotation,
+} from './bga-network-age-two-refill.mjs';
+import {
   isClosedChichenDecline,
   closedChichenDeclineRemovalMenu,
 } from './bga-network-chichen-decline.mjs';
@@ -1404,6 +1411,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     const fencesBeforeGroup = timingFences.length;
     let constructionTransition = null;
     let burnHarvest = null;
+    let ageTwoRefillEvidence = null;
     try {
       const burnBeforeDifferences = differences(ledger, before, sourceToNative, terminalCalendar);
       burnHarvest = sourceBurnHarvestWitness({
@@ -1560,6 +1568,32 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
           currentAge: refillCards.map((c) => mapper.bind(c)),
           age2: reset.map((c) => mapper.bind(c)),
         };
+        let ageTwoReceipt = null,
+          ageTwoResetLedger = null;
+        if (ageTwoRefillStageCandidate(group, before)) {
+          ageTwoReceipt = sourceAgeTwoRefillWitness({
+            index,
+            group,
+            before,
+            sourceStateId: ledger.stateId,
+            sourceActivePlayer: ledger.activePlayer,
+            sourceInitial: ledger.initial,
+            sourceToNative,
+            sourceWorkers: ledger.workers,
+            sourceStateMatched:
+              differences(ledger, before, sourceToNative, terminalCalendar).length === 0,
+            unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
+            refills,
+            mapCard: (c) => mapper.bind(c),
+            catalog,
+          });
+          ageTwoResetLedger = copy(ledger);
+          ageTwoResetLedger.initial = ledger.initial;
+          for (const entry of group.entries) {
+            updateLedger(ageTwoResetLedger, entry, mapper);
+            if (entry.type === 'resetAllBuildings') break;
+          }
+        }
         const nextRemoval = group.entries.find(
           (n) => n.type === 'pickUpWorker' && n.args.city !== undefined,
         );
@@ -1986,6 +2020,15 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               'observed turn end',
               refills,
             );
+            if (ageTwoReceipt)
+              bindAgeTwoRefillConsumption(ageTwoReceipt, {
+                group,
+                before,
+                after: native(),
+                step: record.steps.at(-1),
+                stepIndex: record.steps.length,
+                sourceResetDifferences: differences(ageTwoResetLedger, native(), sourceToNative),
+              });
           } else if (n.type === 'rotateWheel' && native().pending?.task.type === 'rotation') {
             const actor = frame.observation.actor;
             if (
@@ -1996,11 +2039,31 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             )
               fail('calendar rotation actor or consumed right mismatch');
             const start = copy(native());
+            const rotationRefills = ageTwoReceipt
+              ? refillsAfterAgeTwoConsumption(ageTwoReceipt, {
+                  group,
+                  entry: n,
+                  state: start,
+                  actor,
+                  lastStep: record.steps.at(-1),
+                  stepIndex: record.steps.length,
+                  refills,
+                })
+              : refills;
             applyWhere(
               (x) => x.type === 'rotate' && x.days === 1 + a.twice,
               a.twice === 1 ? 'observed two-day rotation' : 'observed one-day rotation',
-              refills,
+              rotationRefills,
             );
+            if (ageTwoReceipt)
+              ageTwoRefillEvidence = bindAgeTwoRefillRotation(ageTwoReceipt, {
+                group,
+                entry: n,
+                before: start,
+                after: native(),
+                step: record.steps.at(-1),
+                stepIndex: record.steps.length,
+              });
             if (terminalWitness?.start.moveId === group.moveId) {
               terminalCalendar = bindTerminalCalendarTransition(
                 terminalWitness,
@@ -2111,6 +2174,18 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       }
       let diff = differences(ledger, native(), sourceToNative, terminalCalendar);
       const originalDiff = copy(diff);
+      if (ageTwoRefillEvidence) {
+        if (diff.length)
+          fail('age-II consumed refill did not rejoin the full original public state');
+        audit.push({
+          moveId: group.moveId,
+          ageTwoRefillEvidence: {
+            ...ageTwoRefillEvidence,
+            sourcePublicRejoined: true,
+          },
+          teacherCertified: false,
+        });
+      }
       if (singleSkullEvidence) {
         if (diff.length) fail('single-skull boundary did not match the complete public projection');
         audit.push({ moveId: group.moveId, singleSkullEvidence, teacherCertified: false });
