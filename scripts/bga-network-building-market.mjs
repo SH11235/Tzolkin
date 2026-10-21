@@ -88,7 +88,16 @@ function state(n, id, actor, index) {
     )
   )
     return false;
-  if (id === 42 ? !same(a.args, { maxvalue: '20' }) : !Array.isArray(a.args) || a.args.length !== 0)
+  const knownNull =
+    a.args === null &&
+    ((id === 9 && index.initial.gamestates[9]?.action === 'stSolveStackedAction') ||
+      (id === 70 && index.initial.gamestates[70]?.args === 'argBuildingFullCost'));
+  if (
+    !Object.hasOwn(a, 'args') ||
+    (id === 42
+      ? !same(a.args, { maxvalue: '20' })
+      : !knownNull && (!Array.isArray(a.args) || a.args.length !== 0))
+  )
     return false;
   if (
     a.updateGameProgression !== undefined &&
