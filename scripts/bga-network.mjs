@@ -34,6 +34,14 @@ const REVIEWED_CLIENT_PAIRS = new Set([
 const validatedContracts = new WeakSet();
 const finalScoringCaptions = new WeakMap();
 const harvestEntries = new WeakMap();
+const architectureEntries = new WeakMap();
+
+export function originalArchitectureEntry(entry) {
+  const bound = architectureEntries.get(entry);
+  return bound && isDeepStrictEqual(entry, bound.entry)
+    ? { packetType: bound.packetType, tableId: bound.tableId }
+    : null;
+}
 
 export function originalHarvestEntry(entry) {
   const bound = harvestEntries.get(entry);
@@ -435,6 +443,19 @@ export function parseNetworkReplay(bytes) {
         ...(n.type === 'noSkullsLeft' ? { singleSkullCaption: n.log } : {}),
       };
       entries.push(entry);
+      if (
+        packet.data.some(
+          (e) =>
+            e.type === 'construct' ||
+            (e.type === 'takeGoods' && e.args?.origin === 'technology_architecture_level_1') ||
+            (e.type === 'gameStateChange' && Number(e.args?.id) === 44),
+        )
+      )
+        architectureEntries.set(entry, {
+          entry: structuredClone(entry),
+          packetType: packet.packet_type,
+          tableId,
+        });
       if (
         packet.data.some(
           (e) =>

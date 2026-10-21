@@ -10,6 +10,7 @@ import {
   parseNetworkReplay,
   originalFinalScoringCaption,
   originalHarvestEntry,
+  originalArchitectureEntry,
 } from './bga-network.mjs';
 import {
   appendRewardFence,
@@ -30,7 +31,7 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { bindAppliedArchitectureCorn } from './bga-network-architecture.mjs';
 
-function automaticArchitectureFixture() {
+function automaticArchitectureFixture(mutateRaw = () => {}) {
   const card = {
     id: 'synthetic-building',
     name: 'Synthetic workshop',
@@ -111,20 +112,35 @@ function automaticArchitectureFixture() {
     notification('gameStateChange', { active_player: '1', id: 9 }),
     notification('gameStateChange', { active_player: '1', id: 60 }),
   ].map((n, i) => ({ ...n, uid: `u${i}`, packetIndex: 1, notificationIndex: i }));
-  const group = { moveId: 2, entries };
-  const index = {
-    initial: {
-      constructions: {
-        building_age_1: {
-          0: { cost: { wood: 2, stone: 1 }, extraction: 1, gold: 1, kind: 'civic' },
-        },
-      },
+  const raw = fixture();
+  raw.initialState.players['1'].name = 'A';
+  raw.initialState.constructions = {
+    building_age_1: {
+      0: { cost: { wood: 2, stone: 1 }, extraction: 1, gold: 1, kind: 'civic' },
     },
-    groups: [
-      { moveId: 1, entries: [notification('gameStateChange', { active_player: '1', id: 44 })] },
-      group,
-    ],
   };
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [
+      { uid: 'before', log: '', type: 'gameStateChange', args: { active_player: '1', id: 44 } },
+    ]),
+    packet(
+      3,
+      entries.map(({ type, args, uid }) => ({ type, args, uid, log: '' })),
+    ),
+  ];
+  mutateRaw(raw);
+  const index = parseNetworkReplay(Buffer.from(JSON.stringify(raw)));
+  const group = index.groups.at(-1);
   return {
     index,
     group,
@@ -221,6 +237,40 @@ test('automatic architecture corn binds one exact build, receipt and complete ou
     mutate(bad);
     assert.throws(() => bindAppliedArchitectureCorn(bad), /Network architecture:/);
   }
+  for (const value of [true, [1], '1e0', '1.0', {}, null]) {
+    const bad = automaticArchitectureFixture((raw) => {
+      raw.gameLogs.data.data.at(-1).data[2].args.quantity = value;
+    });
+    assert.throws(() => bindAppliedArchitectureCorn(bad), /Network architecture:/);
+  }
+  for (const [entry, key] of [
+    [0, 'quantity'],
+    [3, 'points'],
+    [4, 'quantity'],
+    [5, 'level'],
+    [7, 'level'],
+    [8, 'id'],
+    [9, 'id'],
+  ]) {
+    for (const value of [true, [entry === 3 ? 2 : 1]]) {
+      const bad = automaticArchitectureFixture((raw) => {
+        raw.gameLogs.data.data.at(-1).data[entry].args[key] = value;
+      });
+      assert.throws(() => bindAppliedArchitectureCorn(bad), /Network architecture:/);
+    }
+  }
+  for (const packetType of ['history', 'sequence', 'unknown']) {
+    const bad = automaticArchitectureFixture((raw) => {
+      raw.gameLogs.data.data.at(-1).packet_type = packetType;
+    });
+    assert.throws(() => bindAppliedArchitectureCorn(bad), /Network architecture:/);
+  }
+  const privatePacket = automaticArchitectureFixture((raw) => {
+    raw.gameLogs.data.data.at(-1).channel = '/player/p1';
+  });
+  assert.throws(() => bindAppliedArchitectureCorn(privatePacket), /Network architecture:/);
+  const detached = structuredClone(f);
+  assert.throws(() => bindAppliedArchitectureCorn(detached), /Network architecture:/);
 });
 
 // Node's test runner isolates this file. Client/cancellation authentication is stubbed;
@@ -232,6 +282,7 @@ mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
     parseNetworkReplay,
     originalFinalScoringCaption,
     originalHarvestEntry,
+    originalArchitectureEntry,
     inspectCancellationClusters: () => [],
     inspectArchiveClient: (studio, game) => {
       assert.equal(studio.toString(), 'synthetic studio');
