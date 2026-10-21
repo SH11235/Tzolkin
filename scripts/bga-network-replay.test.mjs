@@ -33,6 +33,11 @@ import {
 import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
+  observedStageArguments,
+  observedOperationBinding,
+  createObservedChoices,
+} from './bga-network-observed-choices.mjs';
+import {
   assertObservationBoundary,
   inspectTerminalProjection,
   replayCompletionEvidence,
@@ -1698,12 +1703,36 @@ test('completion separates successful group processing, human coverage, closed o
     timingFences: [],
     terminal: { completed: true },
     blocked: false,
+    observedTrajectory: {
+      expectedBoundaries: [2, 8],
+      allObservedChoicesMatched: true,
+      unresolved: [],
+      sourceRawSha256: '0'.repeat(64),
+      boundaries: [
+        { moveId: 2, verified: true },
+        { moveId: 8, verified: true },
+      ],
+    },
+    legacyObligationsClosed: true,
   };
+  args.index.rawSha256 = '0'.repeat(64);
   const checked = replayCompletionEvidence(args);
   assert.equal(Object.values(checked.prerequisites).every(Boolean), true);
-  assert.equal(checked.fullReplayAchieved, false);
-  assert.ok(checked.unresolved.includes('humanSelectionMeaningNotFullyEstablished'));
+  assert.equal(checked.fullReplayAchieved, true);
+  assert.deepEqual(checked.unresolved, []);
   for (const [change, failed] of [
+    [
+      (a) => {
+        a.legacyObligationsClosed = false;
+      },
+      'legacyObligationsClosed',
+    ],
+    [
+      (a) => {
+        a.observedTrajectory.allObservedChoicesMatched = false;
+      },
+      'humanSelectionMeaningEstablished',
+    ],
     [(a) => a.successfulGroups.pop(), 'allGroupsSuccessfullyProcessed'],
     [(a) => a.decisionBoundaryAudit.pop(), 'requiredHumanBoundariesCovered'],
     [
@@ -2315,4 +2344,755 @@ test('strict replay observes a continuing choice without a new state notificatio
   assert.match(missing.blocked.reason, /sourceStateDefinitionMissing/);
   assert.equal(missing.decisionBoundaryAudit.at(-1).sourceDecisionTypeKnown, false);
   assert.equal(missing.fullReplayAchieved, false);
+});
+
+function observedChoiceFixture(id) {
+  const names = {
+    4: 'playerTurn',
+    6: 'placeWorker',
+    7: 'pickUpWorker',
+    10: 'harvest',
+    31: 'technologyUpgrade',
+    32: 'construct',
+    33: 'constructChooseSparedResources',
+    34: 'tikal4',
+    35: 'tikal5',
+    37: 'constructChooseSparedResources',
+    42: 'trade',
+    44: 'uxmal4',
+    45: 'anyAction',
+    60: 'resourceReward',
+    61: 'templeReward',
+    62: 'freeTechnology',
+    70: 'constructWithoutArchitecture',
+    71: 'theology2',
+    95: 'turnWheel',
+  };
+  const p = {
+    id: 0,
+    resources: { corn: 10, wood: 5, stone: 5, gold: 5, skull: 0 },
+    technologies: { agriculture: 0, extraction: 0, architecture: 0, theology: 0 },
+    temples: { chaac: 0, quetzalcoatl: 0, kukulkan: 0 },
+  };
+  const before = {
+    players: [p],
+    pending: null,
+    turn: { mode: 'none', count: 0, begged: false },
+    phase: 'playing',
+  };
+  const after = structuredClone(before),
+    owner = '1';
+  let args = [],
+    task = null,
+    action,
+    entry;
+  const nt = (type, a) => ({ uid: 'chosen', type, args: { player_id: owner, ...a } });
+  if ([4, 6].includes(id)) {
+    args = { places: { uxmal: id === 4 ? 2 : 1 }, corn: id === 4 ? '0' : '1' };
+    action = { type: 'place', gear: 'uxmal', cornCost: 2, discount: false };
+    entry = nt('placeWorker', { place: 'uxmal', position: '0', corn: 2, worker_id: '1' });
+    after.players[0].resources.corn -= 2;
+  }
+  if (id === 7) {
+    args = {
+      workers: { 1: { id: '1', place: 'uxmal', position: '1', actions: { uxmal: { 1: 0 } } } },
+    };
+    action = { type: 'remove', gear: 'uxmal', position: 1 };
+    entry = nt('pickUpWorker', { worker_id: '1', city: 'Uxmal', position: 1, action_number: 1 });
+  }
+  if (id === 10) {
+    args = { wood: 5, corn: 9, can_burn: true };
+    task = { type: 'palenque', position: 5 };
+    action = { type: 'harvest', kind: 'wood', position: 5 };
+    entry = nt('takeTile', { type: 'wood_tile', action: 5 });
+    after.players[0].resources.wood += 5;
+  }
+  if ([31, 62].includes(id)) {
+    task = { type: 'technology', remaining: 1, free: id === 62 };
+    args =
+      id === 62
+        ? structuredClone(p.technologies)
+        : {
+            technologies: structuredClone(p.technologies),
+            resources: { wood: 5, stone: 5, gold: 5 },
+          };
+    action = { type: 'technology', technology: 'agriculture' };
+    entry = nt('increaseTechnology', { technology_id: 'agriculture', level: 1 });
+    after.players[0].technologies.agriculture = 1;
+  }
+  if ([32, 33, 34, 37, 44, 70].includes(id)) {
+    task = {
+      type: 'build',
+      remaining: 1,
+      architectureAvailable: id !== 70,
+      cornPayment: [37, 44].includes(id),
+      allowMonument: id === 34,
+    };
+    args =
+      id === 34
+        ? { architecture: false }
+        : [33, 37].includes(id)
+          ? { wood: false, stone: false, gold: true }
+          : [];
+    const discounted = [33, 37].includes(id);
+    if (discounted) {
+      before.players[0].technologies.architecture = 1;
+      after.players[0].technologies.architecture = 1;
+    }
+    action = {
+      type: 'build',
+      id: 'b01',
+      cost: task.cornPayment ? [2, 0, 0, 0, 0] : [0, 1, 0, 0, 0],
+      architecture: discounted,
+      discountResource: discounted ? 'gold' : null,
+      renovation: null,
+    };
+    entry = nt('construct', { building: { native: 'b01' } });
+    if (task.cornPayment) after.players[0].resources.corn -= 2;
+    else after.players[0].resources.wood--;
+    if (discounted) after.players[0].resources.corn++;
+  }
+  if (id === 35) {
+    task = { type: 'payResource', amount: 1 };
+    args = {
+      temples: { chaac: '1', quetzalcoatl: '1', kukulcan: '1' },
+      resources: { wood: '5', stone: '5', gold: '5' },
+      canUpgradeOneOnly: false,
+    };
+    action = { type: 'payment', resources: [0, 1, 0, 0, 0] };
+    entry = nt('payGoods', { type: 'wood', quantity: 1, target: 'action_tikal_5' });
+    after.players[0].resources.wood--;
+  }
+  if (id === 42) {
+    task = { type: 'trade' };
+    args = { maxvalue: '20' };
+    action = { type: 'trade', resource: 'gold', buy: false };
+    entry = nt('trade', {
+      resource1: "<div class='resource_gold'></div>",
+      resource2: "<div class='resource_corn'></div>",
+      quantity1: 1,
+      quantity2: 4,
+    });
+    after.players[0].resources.gold--;
+    after.players[0].resources.corn += 4;
+  }
+  if (id === 45) {
+    task = { type: 'anyAction', cost: 1 };
+    args = { palenque: { 1: 1 } };
+    action = { type: 'useAction', gear: 'palenque', position: 1, cornCost: 1, source: 'anywhere' };
+    entry = nt('selectAction', { city: 'Palenque', action_number: 1 });
+    after.players[0].resources.corn--;
+  }
+  if (id === 60) {
+    task = { type: 'resource', remaining: 1 };
+    action = { type: 'resource', resource: 'wood' };
+    entry = nt('takeGoods', { type: 'wood', quantity: 1, origin: null });
+    after.players[0].resources.wood++;
+  }
+  if (id === 61) {
+    task = { type: 'temple', remaining: 1 };
+    args = { chaac: '1', quetzalcoatl: '1', kukulcan: '1' };
+    action = { type: 'temple', temple: 'chaac', direction: 1 };
+    entry = nt('alterTemple', { temple_id: 'chaac', step: 2 });
+    after.players[0].temples.chaac++;
+  }
+  if (id === 71) {
+    task = { type: 'theology', position: 5 };
+    args = { wood: '5', stone: '5', gold: '5' };
+    action = { type: 'offering', resource: 'wood' };
+    entry = nt('payGoods', { type: 'wood', quantity: 1, target: 'technology_theology_level_2' });
+    after.players[0].resources.wood--;
+  }
+  if (id === 95) {
+    task = { type: 'rotation' };
+    action = { type: 'rotate', days: 2 };
+    entry = nt('rotateWheel', { twice: 1 });
+  }
+  before.pending = task ? { task, after: [] } : null;
+  const row = { action, move: structuredClone(action) },
+    entries = [entry];
+  if (action.type === 'build') {
+    for (let i = 0; i < 5; i++)
+      if (action.cost[i])
+        entries.unshift(
+          nt('payGoods', {
+            type: ['corn', 'wood', 'stone', 'gold', 'skull'][i],
+            quantity: action.cost[i],
+            target: 'building',
+          }),
+        );
+    if (action.architecture)
+      entries.push(
+        nt('takeGoods', { type: 'corn', quantity: 1, origin: 'technology_architecture_level_1' }),
+      );
+  }
+  const operation = {
+    entry,
+    row,
+    actor: 0,
+    observationActor: 0,
+    sourceActor: owner,
+    legalRows: [structuredClone(row)],
+    before,
+    after,
+    step: 1,
+    equivalentRows: [],
+  };
+  return {
+    boundary: {
+      moveId: 2,
+      stateId: id,
+      name: names[id],
+      args,
+      actor: 0,
+      sourceActor: owner,
+      pending: before.pending,
+      legalRows: operation.legalRows,
+    },
+    operation,
+    group: { moveId: 3, entries },
+    index: { initial: { players: { 1: { id: '1', name: 'A' } } } },
+    sourceToNative: new Map([[owner, 0]]),
+    mapCard: (card) => card.native,
+    audit: [],
+  };
+}
+
+test('ordinary observed stages bind chosen actors, targets, amounts, costs and stage arguments', () => {
+  for (const id of [4, 6, 7, 10, 31, 32, 33, 34, 35, 37, 42, 44, 45, 60, 61, 62, 70, 71, 95]) {
+    const f = observedChoiceFixture(id);
+    assert.equal(observedStageArguments(f.boundary, f.operation), null, `stage ${id}`);
+    assert.equal(observedOperationBinding(f), null, `binding ${id}`);
+    const actor = structuredClone(f.operation);
+    actor.actor = 1;
+    assert.notEqual(observedOperationBinding({ ...f, operation: actor }), null);
+  }
+  for (const [id, mutate] of [
+    [
+      4,
+      (f) => {
+        f.operation.entry.args.place = 'tikal';
+      },
+    ],
+    [
+      32,
+      (f) => {
+        f.operation.entry.args.building.native = 'b02';
+      },
+    ],
+    [
+      42,
+      (f) => {
+        f.operation.entry.args.quantity2 = 5;
+      },
+    ],
+    [
+      35,
+      (f) => {
+        f.group.entries[0].args.quantity = 2;
+      },
+    ],
+    [
+      61,
+      (f) => {
+        f.operation.entry.args.step = 3;
+      },
+    ],
+    [
+      60,
+      (f) => {
+        f.operation.entry.args.type = 'gold';
+      },
+    ],
+    [
+      95,
+      (f) => {
+        f.operation.entry.args.twice = 0;
+      },
+    ],
+  ]) {
+    const f = observedChoiceFixture(id);
+    mutate(f);
+    assert.notEqual(observedOperationBinding(f), null, `changed target/amount ${id}`);
+  }
+  for (const [id, mutate] of [
+    [
+      4,
+      (f) => {
+        f.boundary.args.corn = '9';
+      },
+    ],
+    [
+      31,
+      (f) => {
+        f.boundary.args.technologies.agriculture = '1';
+      },
+    ],
+    [
+      62,
+      (f) => {
+        f.boundary.args.theology = '1';
+      },
+    ],
+    [
+      61,
+      (f) => {
+        f.boundary.args.chaac = '2';
+      },
+    ],
+    [
+      45,
+      (f) => {
+        f.boundary.args.palenque[1] = 2;
+      },
+    ],
+    [
+      33,
+      (f) => {
+        f.boundary.args.gold = false;
+      },
+    ],
+    [
+      10,
+      (f) => {
+        f.boundary.args.wood = 6;
+      },
+    ],
+    [
+      71,
+      (f) => {
+        f.boundary.args.wood = '0';
+      },
+    ],
+  ]) {
+    const f = observedChoiceFixture(id);
+    mutate(f);
+    assert.notEqual(
+      observedStageArguments(f.boundary, f.operation),
+      null,
+      `changed arguments ${id}`,
+    );
+  }
+});
+
+test('selected corn harvest binds source permission to native tiles and agriculture', () => {
+  const make = (kind) => {
+    const f = observedChoiceFixture(10),
+      empty = kind === 'emptyCorn';
+    f.operation.before.jungle = { 5: { corn: empty ? 1 : 2, wood: 1 } };
+    f.operation.before.players[0].technologies.agriculture = empty ? 2 : 0;
+    f.operation.after = structuredClone(f.operation.before);
+    f.operation.after.players[0].resources.corn += 9;
+    f.operation.row.action = { type: 'harvest', kind, position: 5 };
+    f.operation.row.move = { type: 'harvest', kind, position: 5 };
+    f.operation.legalRows = [structuredClone(f.operation.row)];
+    f.operation.entry = {
+      uid: 'corn-selected',
+      type: empty ? 'takeGoods' : 'takeTile',
+      args: empty
+        ? { player_id: '1', type: 'corn', quantity: 9, origin: 'action_palenque_5' }
+        : { player_id: '1', type: 'corn_tile', action: 5 },
+    };
+    f.group.entries = [f.operation.entry];
+    f.boundary.args = {
+      corn: 9,
+      wood: 5,
+      corn_tile_available: !empty,
+      agriculture_level_2: empty,
+      can_burn: true,
+    };
+    return f;
+  };
+  for (const kind of ['corn', 'emptyCorn']) {
+    const f = make(kind);
+    assert.equal(observedStageArguments(f.boundary, f.operation), null);
+    assert.equal(observedOperationBinding(f), null);
+    for (const mutate of [
+      (f) => {
+        f.boundary.args.corn_tile_available = false;
+        f.boundary.args.agriculture_level_2 = false;
+      },
+      (f) => {
+        delete f.boundary.args.corn_tile_available;
+      },
+      (f) => {
+        delete f.boundary.args.agriculture_level_2;
+      },
+      (f) => {
+        f.boundary.args.corn_tile_available = !f.boundary.args.corn_tile_available;
+      },
+      (f) => {
+        f.boundary.args.agriculture_level_2 = !f.boundary.args.agriculture_level_2;
+      },
+    ]) {
+      const bad = make(kind);
+      mutate(bad);
+      assert.notEqual(observedStageArguments(bad.boundary, bad.operation), null);
+    }
+  }
+});
+
+function compoundObservedFixture(omitExit = false) {
+  let stateSerial = 0;
+  const raw = fixture(),
+    nt = (uid, type, args) => ({ uid, type, log: '', args }),
+    state = (id, args = []) =>
+      nt(`s${id}-${stateSerial++}`, 'gameStateChange', {
+        id,
+        type: [9, 90].includes(id) ? 'game' : id === 99 ? 'manager' : 'activeplayer',
+        active_player: '1',
+        args,
+      });
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  Object.assign(raw.initialState.gamestates, {
+    7: { name: 'pickUpWorker', type: 'activeplayer', possibleactions: ['pickUpWorker', 'endTurn'] },
+    9: { type: 'game' },
+    32: { name: 'construct', type: 'activeplayer', possibleactions: ['construct', 'pass'] },
+    33: {
+      name: 'constructChooseSparedResources',
+      type: 'activeplayer',
+      possibleactions: ['sparedResource'],
+    },
+    42: {
+      name: 'trade',
+      type: 'activeplayer',
+      possibleactions: ['trade', 'pass'],
+      transitions: { nextAction: 9 },
+    },
+    90: { type: 'game' },
+    99: { type: 'manager' },
+  });
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [state(42, { maxvalue: '20' })]),
+    packet(3, [...(omitExit ? [] : [state(9)]), state(32)]),
+    packet(4, [state(33, { wood: false, stone: false, gold: true })]),
+    packet(5, [
+      nt('cost', 'payGoods', { player_id: '1', type: 'wood', quantity: 1, target: 'building' }),
+      nt('build', 'construct', {
+        player_id: '1',
+        building: { id: '1', type: 'building_age_1', type_arg: '1' },
+      }),
+      nt('bonus', 'takeGoods', {
+        player_id: '1',
+        type: 'corn',
+        quantity: 1,
+        origin: 'technology_architecture_level_1',
+      }),
+      state(7, { workers: [] }),
+    ]),
+    packet(6, [state(90), state(99)]),
+  ];
+  const index = parseNetworkReplay(bytes(raw)),
+    sourceToNative = new Map([
+      ['1', 0],
+      ['2', 1],
+      ['3', 2],
+    ]),
+    base = observedChoiceFixture(33).operation.before;
+  const buildTask = {
+    type: 'build',
+    remaining: 1,
+    allowMonument: false,
+    cornPayment: false,
+    architectureAvailable: true,
+  };
+  base.pending = { task: { type: 'trade' }, after: [buildTask] };
+  const skipped = structuredClone(base);
+  skipped.pending = { task: structuredClone(buildTask), after: [] };
+  const built = structuredClone(skipped);
+  built.pending = null;
+  built.players[0].resources.wood--;
+  built.players[0].resources.corn++;
+  const finished = structuredClone(built);
+  finished.phase = 'finished';
+  const skipRow = { action: { type: 'skip' }, move: { type: 'skip' } },
+    buildRow = {
+      action: {
+        type: 'build',
+        id: 'b01',
+        cost: [0, 1, 0, 0, 0],
+        architecture: true,
+        discountResource: 'gold',
+        renovation: null,
+      },
+      move: { type: 'build', id: 'b01' },
+    },
+    endRow = { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } };
+  const boundary = (group, native, rows) => {
+    const n = group.entries.filter((e) => e.type === 'gameStateChange').at(-1);
+    return {
+      moveId: group.moveId,
+      potentialHumanDecision: n.args.type === 'activeplayer',
+      sourceStateId: n.args.id,
+      sourceActor: '1',
+      sourceMenu: n.args.args,
+      nativeActor: n.args.id === 99 ? null : 0,
+      nativePending: native.pending,
+      nativeLegalActions: rows,
+    };
+  };
+  const initialBoundary = {
+    moveId: 2,
+    stateId: 42,
+    name: 'trade',
+    args: { maxvalue: '20' },
+    sourceActor: '1',
+    actor: 0,
+    pending: base.pending,
+    legalRows: [skipRow],
+  };
+  const operation = (entry, row, before, after, step, rows, afterLegalRows = []) => ({
+    entry,
+    row,
+    before,
+    after,
+    step,
+    legalRows: rows,
+    afterLegalRows,
+    actor: 0,
+    observationActor: 0,
+    sourceActor: '1',
+    equivalentRows: [],
+  });
+  const groups = index.groups.filter((g) => g.moveId > 2),
+    construct = groups[2].entries.find((n) => n.type === 'construct');
+  const responses = [
+    {
+      group: groups[0],
+      before: base,
+      after: base,
+      operations: [],
+      boundary: boundary(groups[0], base, [skipRow]),
+    },
+    {
+      group: groups[1],
+      before: base,
+      after: base,
+      operations: [],
+      boundary: boundary(groups[1], base, [skipRow]),
+    },
+    {
+      group: groups[2],
+      before: base,
+      after: built,
+      operations: [
+        operation(construct, skipRow, base, skipped, 1, [skipRow], [buildRow]),
+        operation(construct, buildRow, skipped, built, 2, [buildRow]),
+      ],
+      boundary: boundary(groups[2], built, [endRow]),
+    },
+    {
+      group: groups[3],
+      before: built,
+      after: finished,
+      operations: [operation(groups[3].entries[0], endRow, built, finished, 3, [endRow])],
+      boundary: boundary(groups[3], finished, []),
+    },
+  ];
+  return {
+    index,
+    sourceToNative,
+    initialMoveId: 2,
+    initialBoundary,
+    mapCard: () => 'b01',
+    responses,
+  };
+}
+
+test('source exit and unchanged actual skip close the compound construction choices retrospectively', () => {
+  const f = compoundObservedFixture(),
+    choices = createObservedChoices(f),
+    original = structuredClone(f.responses.map((r) => r.boundary.sourceMenu));
+  for (const r of f.responses) choices.observe({ ...r, audit: [], publicResultMatched: true });
+  const proof = choices.finish();
+  assert.equal(proof.allObservedChoicesMatched, true);
+  assert.equal(proof.verifiedBoundaries, 4);
+  assert.deepEqual(
+    f.responses.map((r) => r.boundary.sourceMenu),
+    original,
+  );
+  assert.equal(proof.boundaries[1].selectedBuildingWasNotAddedToEarlierObservation, true);
+});
+
+test('compound choices reject missing exit, charged or rewarded skip, wrong actor and future-build-only proof', () => {
+  for (const mutate of [
+    (f) => Object.assign(f, compoundObservedFixture(true)),
+    (f) => {
+      f.responses[2].operations[0].after = structuredClone(f.responses[2].operations[0].after);
+      f.responses[2].operations[0].after.players[0].resources.corn++;
+    },
+    (f) => {
+      f.responses[2].operations[0].after = structuredClone(f.responses[2].operations[0].after);
+      f.responses[2].operations[0].after.players[0].resources.wood--;
+    },
+    (f) => {
+      f.responses[2].operations[0].actor = 1;
+    },
+    (f) => {
+      f.responses[2].operations.shift();
+    },
+    (f) => {
+      f.responses[2].operations[1].entry = structuredClone(f.responses[2].operations[1].entry);
+    },
+  ]) {
+    const f = compoundObservedFixture();
+    mutate(f);
+    const choices = createObservedChoices(f);
+    for (const r of f.responses) choices.observe({ ...r, audit: [], publicResultMatched: true });
+    assert.equal(choices.finish().allObservedChoicesMatched, false);
+  }
+});
+
+test('the initial Playing choice binds its own source placement quote before the first operation', () => {
+  const run = (wrong) =>
+    setup(false, false, false, (rawBytes) => {
+      const raw = JSON.parse(rawBytes);
+      raw.initialState.gamestates[4].name = 'playerTurn';
+      raw.initialState.gamestates[6].name = 'placeWorker';
+      raw.gameLogs.data.data[1].data.find((n) => n.type === 'gameStateChange').args.args = {
+        places: { uxmal: wrong ? 1 : 0 },
+        corn: '0',
+        workers: [],
+      };
+      return bytes(raw);
+    });
+  const valid = run(false),
+    invalid = run(true);
+  assert.equal(valid.observedTrajectory.boundaries[0].moveId, 2);
+  assert.equal(valid.observedTrajectory.boundaries[0].verified, true);
+  assert.equal(invalid.observedTrajectory.boundaries[0].verified, false);
+  assert.match(invalid.observedTrajectory.boundaries[0].reason, /placementQuote/);
+  assert.equal(invalid.fullReplayAchieved, false);
+});
+
+test('a failed choice response is retained when a later group can perform the same legal selection', () => {
+  const result = setup(false, false, false, (rawBytes) => {
+    const raw = JSON.parse(rawBytes);
+    Object.assign(raw.initialState.gamestates, {
+      4: { type: 'activeplayer', name: 'playerTurn' },
+      6: { type: 'activeplayer', name: 'placeWorker' },
+      9: { type: 'game', name: 'performNextAction' },
+    });
+    raw.gameLogs.data.data[1].data.find((n) => n.type === 'gameStateChange').args.args = {
+      places: { uxmal: 0 },
+      corn: '0',
+      workers: [],
+    };
+    const placed = raw.gameLogs.data.data.at(-1);
+    placed.packet_id = '4';
+    placed.move_id = '4';
+    const middle = {
+      channel: '/table/t123',
+      table_id: 123,
+      packet_id: '3',
+      packet_type: 'resend',
+      move_id: '3',
+      time: '1',
+      data: [
+        {
+          uid: 'no-choice-response',
+          type: 'gameStateChange',
+          log: '',
+          args: { id: 9, type: 'game', active_player: '1', args: [] },
+        },
+      ],
+    };
+    raw.gameLogs.data.data.splice(2, 0, middle);
+    return bytes(raw);
+  });
+  assert.equal(result.blocked, null);
+  assert.deepEqual(result.completionEvidence.successfulSourceGroups, [3, 4]);
+  const initial = result.observedTrajectory.boundaries.find((b) => b.moveId === 2);
+  assert.equal(initial.verified, false);
+  assert.equal(initial.reason, 'sourceChoiceWithoutBoundNativeOperation');
+  assert.equal(result.observedTrajectory.operations.length, 1);
+  assert.equal(result.fullReplayAchieved, false);
+});
+
+test('resource quantity uses the number of actual legal unit choices for the same original UID', () => {
+  const run = (quantity) => {
+    const raw = fixture(),
+      packet = (id, data) => ({
+        channel: '/table/t123',
+        table_id: 123,
+        packet_id: String(id),
+        packet_type: 'resend',
+        move_id: String(id),
+        time: '1',
+        data,
+      });
+    Object.assign(raw.initialState.gamestates, {
+      60: { name: 'resourceReward', type: 'activeplayer' },
+      7: { name: 'pickUpWorker', type: 'activeplayer', possibleactions: ['endTurn'] },
+    });
+    const chosen = {
+      uid: 'unit-reward',
+      type: 'takeGoods',
+      log: '',
+      args: { player_id: '1', type: 'wood', quantity, origin: null },
+    };
+    raw.gameLogs.data.data = [
+      raw.gameLogs.data.data[0],
+      packet(2, [
+        {
+          uid: 'unit-start',
+          type: 'gameStateChange',
+          log: '',
+          args: { id: 60, type: 'activeplayer', active_player: '1', args: [] },
+        },
+      ]),
+      packet(3, [
+        chosen,
+        {
+          uid: 'unit-after',
+          type: 'gameStateChange',
+          log: '',
+          args: { id: 7, type: 'activeplayer', active_player: '1', args: { workers: [] } },
+        },
+      ]),
+    ];
+    const index = parseNetworkReplay(bytes(raw)),
+      f = observedChoiceFixture(60),
+      group = index.groups.find((g) => g.moveId === 3),
+      entry = group.entries[0];
+    const choices = createObservedChoices({
+      index,
+      initialMoveId: 2,
+      sourceToNative: f.sourceToNative,
+      mapCard: f.mapCard,
+      initialBoundary: { ...f.boundary, moveId: 2, pending: f.operation.before.pending },
+    });
+    choices.observe({
+      group,
+      before: f.operation.before,
+      after: f.operation.after,
+      operations: [{ ...f.operation, entry, afterLegalRows: [] }],
+      boundary: {
+        moveId: 3,
+        potentialHumanDecision: true,
+        sourceStateId: 7,
+        sourceActor: '1',
+        sourceMenu: { workers: [] },
+        nativeActor: 0,
+        nativePending: null,
+        nativeLegalActions: [],
+      },
+      audit: [],
+      publicResultMatched: true,
+    });
+    return choices.finish().boundaries[0];
+  };
+  assert.equal(run(1).verified, true);
+  const mismatch = run(2);
+  assert.equal(mismatch.verified, false);
+  assert.match(mismatch.reason, /Quantity/);
 });
