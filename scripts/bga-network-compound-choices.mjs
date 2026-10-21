@@ -156,6 +156,27 @@ export function technologyChoiceProof({ operation: op, operations, group, owner,
 export function begChoiceProof({ operation: beg, operations, group, owner, index }) {
   const n = beg.entry,
     temple = operations.find((o) => o.step === beg.step + 1);
+  const nonEffects = new Set([
+    'gameStateChange',
+    'gameStateMultipleActiveUpdate',
+    'updateReflexionTime',
+    'timeJokerUsed',
+    'wakeupPlayers',
+  ]);
+  const effects = group.entries.filter((e) => !nonEffects.has(e.type));
+  const corn = effects[1];
+  if (
+    effects.length !== 2 ||
+    effects[0] !== n ||
+    corn?.type !== 'takeGoods' ||
+    !owned(corn, owner, index) ||
+    corn.uid === n.uid ||
+    corn.args.type !== 'corn' ||
+    !integer(corn.args.quantity) ||
+    Number(corn.args.quantity) !== Number(n.args.corn) ||
+    corn.args.origin !== undefined
+  )
+    return false;
   if (
     n?.type !== 'alterTemple' ||
     !owned(n, owner, index) ||

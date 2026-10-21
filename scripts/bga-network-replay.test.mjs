@@ -2877,7 +2877,13 @@ function nativeBegChoice() {
   return {
     operation: operations[0],
     operations,
-    group: { moveId: 3, entries: [entry] },
+    group: {
+      moveId: 3,
+      entries: [
+        entry,
+        { uid: 'corn', type: 'takeGoods', args: { player_id: '1', type: 'corn', quantity: 3 } },
+      ],
+    },
     owner: '1',
     index: { initial: { players: { 1: { name: 'A' } } } },
   };
@@ -2916,6 +2922,173 @@ test('native begging waits for the selected temple penalty and completed corn re
     mutate(f);
     assert.equal(begChoiceProof(f), false);
   }
+});
+
+test('begging source receipts reject unexplained cancelling effects while retaining state and clock notifications', () => {
+  const f = nativeBegChoice();
+  f.group.entries.splice(1, 0, {
+    uid: 'clock',
+    type: 'updateReflexionTime',
+    args: { player_id: '1', delta: 1 },
+  });
+  f.group.entries.push({ uid: 'state', type: 'gameStateChange', args: { id: 4 } });
+  assert.equal(begChoiceProof(f), true);
+  for (const mutate of [
+    (f) =>
+      f.group.entries.push(
+        {
+          uid: 'extraGain',
+          type: 'takeGoods',
+          args: { player_id: '1', type: 'wood', quantity: 1, origin: 'unrelated' },
+        },
+        {
+          uid: 'extraPay',
+          type: 'payGoods',
+          args: { player_id: '1', type: 'wood', quantity: 1, target: 'unrelated' },
+        },
+      ),
+    (f) =>
+      f.group.entries.push(
+        {
+          uid: 'extraUp',
+          type: 'alterTemple',
+          args: { player_id: '1', temple_id: 'kukulcan', step: 2 },
+        },
+        {
+          uid: 'extraDown',
+          type: 'alterTemple',
+          args: { player_id: '1', temple_id: 'kukulcan', step: 1 },
+        },
+      ),
+    (f) => {
+      f.group.entries[1].args.origin = 'unrelated';
+    },
+    (f) => {
+      f.group.entries[1].args.player_id = '2';
+    },
+    (f) => {
+      f.group.entries[1].args.quantity = 2;
+    },
+    (f) => f.group.entries.pop(),
+    (f) => f.group.entries.push({ ...f.group.entries[1], uid: 'extraCorn' }),
+  ]) {
+    const f = nativeBegChoice();
+    mutate(f);
+    assert.equal(begChoiceProof(f), false);
+  }
+});
+
+function beggingPrefixWithExtraEffects(extra = []) {
+  const raw = fixture(),
+    initial = setup().record.initial;
+  Object.assign(raw.initialState, {
+    buildings: [],
+    monuments: [],
+    constructions: {},
+    wealthTiles: {},
+    cornOnWheel: '0',
+    remainingSkulls: '13',
+    jungle: {},
+    gears: { uxmal: { teethnbr: 10 } },
+  });
+  for (const p of Object.values(raw.initialState.players)) {
+    p.corn_tile = '0';
+    p.wood_tile = '0';
+  }
+  raw.initialState.gamestates[4] = {
+    name: 'playerTurn',
+    type: 'activeplayer',
+    possibleactions: ['placeWorker', 'pickUpWorker', 'beg'],
+  };
+  const nt = (uid, type, args) => ({ uid, type, args, log: '' });
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [
+      nt('wealth', 'wealthTiles', {}),
+      nt('initial', 'gameStateChange', {
+        id: 4,
+        type: 'activeplayer',
+        active_player: '1',
+        args: { places: { uxmal: 0 }, corn: '0', workers: [] },
+      }),
+    ]),
+    packet(3, [
+      nt('beg', 'alterTemple', { player_id: '1', temple_id: 'chaac', step: 0, corn: 3 }),
+      nt('corn', 'takeGoods', { player_id: '1', type: 'corn', quantity: 3 }),
+      ...extra,
+      nt('next', 'gameStateChange', {
+        id: 4,
+        type: 'activeplayer',
+        active_player: '1',
+        args: { places: { uxmal: 0 }, corn: '0', workers: [] },
+      }),
+    ]),
+  ];
+  const beg = { action: { type: 'beg' }, move: { type: 'beg' } },
+    penalty = {
+      action: { type: 'temple', temple: 'chaac', direction: -1 },
+      move: { type: 'choose', choiceId: 'chaac' },
+    };
+  const frame = (s) => ({
+    snapshot: { state: s },
+    observation: { actor: 0, legalActions: [s.pending ? penalty : beg] },
+  });
+  const dispatch = (request) => {
+    const s = structuredClone(request.state);
+    if (request.operation === 'publicApply') {
+      if (request.move.type === 'beg')
+        s.pending = {
+          task: { type: 'temple', remaining: 1, direction: -1, reason: 'beg' },
+          after: [],
+        };
+      else {
+        s.pending = null;
+        s.players[0].resources.corn = 3;
+        s.players[0].temples.chaac--;
+        s.turn.begged = true;
+      }
+    }
+    return frame(s);
+  };
+  return replayNetworkPrefix(
+    parseNetworkReplay(bytes(raw)),
+    { initial, initialMoveId: 2, clientContract: {} },
+    dispatch,
+  );
+}
+
+test('prefix cannot certify begging when unrelated original effects cancel at the completed endpoint', () => {
+  const valid = beggingPrefixWithExtraEffects();
+  assert.equal(valid.blocked, null);
+  assert.equal(valid.observedTrajectory.boundaries[0].verified, true);
+  const bad = beggingPrefixWithExtraEffects([
+    {
+      uid: 'unrelatedGain',
+      type: 'takeGoods',
+      args: { player_id: '1', type: 'wood', quantity: 1, origin: 'unrelated' },
+      log: '',
+    },
+    {
+      uid: 'unrelatedPay',
+      type: 'payGoods',
+      args: { player_id: '1', type: 'wood', quantity: 1, target: 'unrelated' },
+      log: '',
+    },
+  ]);
+  assert.equal(bad.blocked, null);
+  assert.equal(bad.record.steps.length, 2);
+  assert.equal(bad.semanticComparison.failure, null);
+  assert.equal(bad.observedTrajectory.boundaries[0].verified, false);
+  assert.equal(bad.observedTrajectory.boundaries[0].reason, 'beggingAmountDiffer');
 });
 
 function nativeForcedRotation() {
