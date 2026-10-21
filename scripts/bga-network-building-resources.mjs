@@ -140,6 +140,131 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
         (human[0] === states.at(-1) && String(human[0].args.active_player) === owner))
     );
   }
+  function precedingMarketExit(context, opening, owner) {
+    const prior = context.transitions.filter((t) => t.step < opening.step);
+    if (prior.length !== 1) return null;
+    const skip = prior[0],
+      position = index.groups.indexOf(context.group),
+      [menu, exit, discount] = index.groups.slice(position - 3, position),
+      definitions = index.initial.gamestates;
+    if (position < 3 || !menu || !exit || !discount) return null;
+    if (
+      !Array.isArray(skip.legalActions) ||
+      !Array.isArray(opening.legalActions) ||
+      !skip.before ||
+      !skip.after
+    )
+      return null;
+    const constructs = context.group.entries.filter((n) => n.type === 'construct');
+    if (constructs.length !== 1 || String(constructs[0].args.player_id) !== owner) return null;
+    const groups = [menu, exit, discount, context.group];
+    const closed = (g) =>
+      isDeepStrictEqual(originalGroups.get(g), g) &&
+      g.entries.every((n, i) => {
+        const packet = originalPacketEntry(n);
+        return (
+          publicEntry(n) &&
+          packet.packetNotificationCount === g.entries.length &&
+          n.packetIndex === g.entries[0].packetIndex &&
+          n.notificationIndex === i &&
+          n.visible &&
+          !n.administrative &&
+          !n.beforeCheckpoint
+        );
+      });
+    const state = (n, id, args) =>
+      n?.type === 'gameStateChange' &&
+      n.args.id === id &&
+      n.args.active_player === owner &&
+      n.args.type === (id === 9 ? 'game' : 'activeplayer') &&
+      Object.hasOwn(n.args, 'args') &&
+      isDeepStrictEqual(n.args.args, args);
+    const buildRows = skip.legalActions.filter((r) => r.action.type === 'skip');
+    const unchanged = (s) =>
+      Object.fromEntries(Object.entries(s).filter(([k]) => !['pending', 'log'].includes(k)));
+    const offer = discount.entries[0]?.args?.args;
+    if (
+      !groups.every(closed) ||
+      groups.some((g, i) => g.moveId !== menu.moveId + i) ||
+      new Set(groups.flatMap((g) => g.entries.map((n) => n.uid))).size !==
+        groups.reduce((n, g) => n + g.entries.length, 0) ||
+      !isDeepStrictEqual(
+        menu.entries.map((n) => n.type),
+        ['trade', 'takeGoods', 'payGoods', 'gameStateChange'],
+      ) ||
+      !state(menu.entries[3], 42, { maxvalue: '20' }) ||
+      menu.entries.slice(0, 3).some((n) => String(n.args.player_id) !== owner) ||
+      exit.entries.length !== 2 ||
+      !state(exit.entries[0], 9, null) ||
+      !state(exit.entries[1], 32, null) ||
+      discount.entries.length !== 1 ||
+      !state(discount.entries[0], 33, offer) ||
+      !isDeepStrictEqual(Object.keys(offer ?? {}).sort(), materials.slice().sort()) ||
+      materials.some((r) => typeof offer[r] !== 'boolean') ||
+      offer[opening.action.discountResource] !== true ||
+      opening.action.architecture !== true ||
+      definitions[42]?.name !== 'trade' ||
+      definitions[42].type !== 'activeplayer' ||
+      definitions[42].args !== 'argTrade' ||
+      !isDeepStrictEqual(definitions[42].possibleactions, ['trade', 'pass']) ||
+      definitions[42].transitions?.nextAction !== 9 ||
+      definitions[9]?.type !== 'game' ||
+      definitions[9].action !== 'stSolveStackedAction' ||
+      definitions[9].transitions?.construct !== 32 ||
+      definitions[32]?.name !== 'construct' ||
+      definitions[32].type !== 'activeplayer' ||
+      definitions[32].args !== 'argConstruct' ||
+      !isDeepStrictEqual(definitions[32].possibleactions, ['construct', 'pass']) ||
+      definitions[32].transitions?.sparedResource !== 33 ||
+      definitions[32].transitions?.nextAction !== 9 ||
+      definitions[33]?.name !== 'constructChooseSparedResources' ||
+      definitions[33].type !== 'activeplayer' ||
+      definitions[33].args !== 'argSparedResource' ||
+      !isDeepStrictEqual(definitions[33].possibleactions, ['sparedResource']) ||
+      definitions[33].transitions?.nextAction !== 9 ||
+      skip.action.type !== 'skip' ||
+      skip.actor !== opening.actor ||
+      skip.before.currentPlayer !== opening.actor ||
+      skip.after.currentPlayer !== opening.actor ||
+      !Number.isSafeInteger(skip.step) ||
+      skip.step + 1 !== opening.step ||
+      !isDeepStrictEqual(skip.before, context.native) ||
+      !isDeepStrictEqual(skip.before.pending?.task, { type: 'trade' }) ||
+      !isDeepStrictEqual(skip.before.pending.after, [skip.after.pending?.task]) ||
+      !isDeepStrictEqual(skip.after.pending?.after, []) ||
+      !isDeepStrictEqual(skip.after.pending?.task, {
+        type: 'build',
+        remaining: 1,
+        allowMonument: false,
+        cornPayment: false,
+        architectureAvailable: true,
+      }) ||
+      !isDeepStrictEqual(unchanged(skip.before), unchanged(skip.after)) ||
+      !isDeepStrictEqual(skip.after, opening.before) ||
+      buildRows.length !== 1 ||
+      !isDeepStrictEqual(buildRows[0].action, skip.action) ||
+      !opening.legalActions.some((r) => isDeepStrictEqual(r.action, opening.action))
+    )
+      return null;
+    return {
+      transition: skip,
+      evidence: {
+        type: 'precedingBuildingMarketExit',
+        actor: opening.actor,
+        sourceOwner: owner,
+        menu: ref(menu.entries[3]),
+        exit: exit.entries.map(ref),
+        discount: ref(discount.entries[0]),
+        constructionMoveId: context.group.moveId,
+        skipStep: skip.step,
+        buildStep: opening.step,
+        construction: ref(constructs[0]),
+        payments: context.group.entries.filter((n) => n.type === 'payGoods').map(ref),
+        gameplayUnchanged: true,
+        humanPassClickObserved: false,
+      },
+    };
+  }
   function closingDecision(item, ledger, native, observation) {
     const state = index.initial.gamestates[ledger.stateId];
     if (state?.type === 'game') return null;
@@ -195,6 +320,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
     const { group, source, transitions } = context;
     const evidence = [],
       fields = new Set();
+    let precedingTransition = null;
     if (!isDeepStrictEqual(originalGroups.get(group), group))
       reject('original notification group changed or is not source-bound');
     const builds = transitions.filter(
@@ -218,6 +344,8 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
       const beforeTasks = opening.before.pending?.after ?? [];
       const tail = opening.after.pending.after;
       const continuation = constructionContinuation(opening);
+      const preceding = transitions.filter((t) => t.step < opening.step);
+      const prefix = preceding.length ? precedingMarketExit(context, opening, sourceOwner) : null;
       const technology = card.effects[0];
       const expectedTask = technology.technology === 'extraction' ? 'resource' : 'technology';
       const payments = group.entries.filter((n) => n.type === 'payGoods');
@@ -265,6 +393,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
         ) ||
         !fixedTask(effect, fixed) ||
         !continuation ||
+        (preceding.length > 0 && !prefix) ||
         opening.after.pending.task.type !== expectedTask ||
         (expectedTask === 'resource' &&
           (opening.before.players[actor].technologies.extraction !== 3 ||
@@ -302,8 +431,11 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
           ...(continuation.inherited.length
             ? { inheritedBuildContinuation: copy(continuation) }
             : {}),
+          ...(prefix ? { precedingMarketExit: copy(prefix.evidence) } : {}),
         };
         history.push(active);
+        precedingTransition = prefix?.transition ?? null;
+        if (prefix) evidence.push(copy(prefix.evidence));
         evidence.push({
           type: 'fixedBuildingEntitlement',
           building: card.id,
@@ -320,7 +452,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
     if (!sourceBoundary(group, item.sourceOwner) || group.entries.some((n) => !publicEntry(n)))
       reject('intervening source decision or nonpublic event is not established');
     const openingGroup = item.startMoveId === group.moveId;
-    const actions = transitions.filter((t) => t !== opening);
+    const actions = transitions.filter((t) => t !== opening && t !== precedingTransition);
     const directReceipts = [];
     const technologyChoices = [],
       templeChoices = [];
