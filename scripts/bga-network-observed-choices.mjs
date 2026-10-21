@@ -179,6 +179,25 @@ export function observedStageArguments(boundary, operation) {
   )
     return 'anyActionQuoteDiffer';
   if (name === 'harvest' && action.type === 'harvest') {
+    if (['corn', 'emptyCorn'].includes(action.kind)) {
+      const forest = before.jungle?.[task.position],
+        agriculture = p.technologies.agriculture >= 2;
+      const canCorn =
+        forest && Number.isSafeInteger(forest.corn) && Number.isSafeInteger(forest.wood)
+          ? forest.corn > forest.wood
+          : null;
+      if (
+        typeof args?.corn_tile_available !== 'boolean' ||
+        typeof args?.agriculture_level_2 !== 'boolean' ||
+        canCorn === null ||
+        args.corn_tile_available !== canCorn ||
+        args.agriculture_level_2 !== agriculture ||
+        !(args.corn_tile_available || args.agriculture_level_2)
+      )
+        return 'sourceCornHarvestPermissionNotBound';
+      if (action.kind === 'corn' ? !canCorn : canCorn || !agriculture)
+        return 'nativeCornHarvestKindDiffer';
+    }
     if (action.kind === 'burn' && args?.can_burn !== true) return 'burnNotOffered';
     const material = action.kind === 'wood' ? 'wood' : 'corn';
     if (
@@ -408,7 +427,8 @@ export function createObservedChoices({
   const expected = [initialMoveId];
   let last = clone(initialBoundary),
     interval = null;
-  const fail = (b, reason, extra = {}) =>
+  const fail = (b, reason, extra = {}) => {
+    if (proofs.get(b.moveId)?.verified === false) return;
     proofs.set(b.moveId, {
       moveId: b.moveId,
       stateId: b.stateId,
@@ -417,7 +437,9 @@ export function createObservedChoices({
       reason,
       ...extra,
     });
-  const pass = (b, kind, group, ops, extra = {}) =>
+  };
+  const pass = (b, kind, group, ops, extra = {}) => {
+    if (proofs.get(b.moveId)?.verified === false) return;
     proofs.set(b.moveId, {
       moveId: b.moveId,
       stateId: b.stateId,
@@ -429,6 +451,7 @@ export function createObservedChoices({
       nativeSteps: ops.map((o) => o.step),
       ...extra,
     });
+  };
   function trusted(group, entry) {
     const p = originalPacketEntry(entry);
     return (

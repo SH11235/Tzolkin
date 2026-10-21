@@ -2675,6 +2675,63 @@ test('ordinary observed stages bind chosen actors, targets, amounts, costs and s
   }
 });
 
+test('selected corn harvest binds source permission to native tiles and agriculture', () => {
+  const make = (kind) => {
+    const f = observedChoiceFixture(10),
+      empty = kind === 'emptyCorn';
+    f.operation.before.jungle = { 5: { corn: empty ? 1 : 2, wood: 1 } };
+    f.operation.before.players[0].technologies.agriculture = empty ? 2 : 0;
+    f.operation.after = structuredClone(f.operation.before);
+    f.operation.after.players[0].resources.corn += 9;
+    f.operation.row.action = { type: 'harvest', kind, position: 5 };
+    f.operation.row.move = { type: 'harvest', kind, position: 5 };
+    f.operation.legalRows = [structuredClone(f.operation.row)];
+    f.operation.entry = {
+      uid: 'corn-selected',
+      type: empty ? 'takeGoods' : 'takeTile',
+      args: empty
+        ? { player_id: '1', type: 'corn', quantity: 9, origin: 'action_palenque_5' }
+        : { player_id: '1', type: 'corn_tile', action: 5 },
+    };
+    f.group.entries = [f.operation.entry];
+    f.boundary.args = {
+      corn: 9,
+      wood: 5,
+      corn_tile_available: !empty,
+      agriculture_level_2: empty,
+      can_burn: true,
+    };
+    return f;
+  };
+  for (const kind of ['corn', 'emptyCorn']) {
+    const f = make(kind);
+    assert.equal(observedStageArguments(f.boundary, f.operation), null);
+    assert.equal(observedOperationBinding(f), null);
+    for (const mutate of [
+      (f) => {
+        f.boundary.args.corn_tile_available = false;
+        f.boundary.args.agriculture_level_2 = false;
+      },
+      (f) => {
+        delete f.boundary.args.corn_tile_available;
+      },
+      (f) => {
+        delete f.boundary.args.agriculture_level_2;
+      },
+      (f) => {
+        f.boundary.args.corn_tile_available = !f.boundary.args.corn_tile_available;
+      },
+      (f) => {
+        f.boundary.args.agriculture_level_2 = !f.boundary.args.agriculture_level_2;
+      },
+    ]) {
+      const bad = make(kind);
+      mutate(bad);
+      assert.notEqual(observedStageArguments(bad.boundary, bad.operation), null);
+    }
+  }
+});
+
 function compoundObservedFixture(omitExit = false) {
   let stateSerial = 0;
   const raw = fixture(),
@@ -2915,6 +2972,50 @@ test('the initial Playing choice binds its own source placement quote before the
   assert.equal(invalid.observedTrajectory.boundaries[0].verified, false);
   assert.match(invalid.observedTrajectory.boundaries[0].reason, /placementQuote/);
   assert.equal(invalid.fullReplayAchieved, false);
+});
+
+test('a failed choice response is retained when a later group can perform the same legal selection', () => {
+  const result = setup(false, false, false, (rawBytes) => {
+    const raw = JSON.parse(rawBytes);
+    Object.assign(raw.initialState.gamestates, {
+      4: { type: 'activeplayer', name: 'playerTurn' },
+      6: { type: 'activeplayer', name: 'placeWorker' },
+      9: { type: 'game', name: 'performNextAction' },
+    });
+    raw.gameLogs.data.data[1].data.find((n) => n.type === 'gameStateChange').args.args = {
+      places: { uxmal: 0 },
+      corn: '0',
+      workers: [],
+    };
+    const placed = raw.gameLogs.data.data.at(-1);
+    placed.packet_id = '4';
+    placed.move_id = '4';
+    const middle = {
+      channel: '/table/t123',
+      table_id: 123,
+      packet_id: '3',
+      packet_type: 'resend',
+      move_id: '3',
+      time: '1',
+      data: [
+        {
+          uid: 'no-choice-response',
+          type: 'gameStateChange',
+          log: '',
+          args: { id: 9, type: 'game', active_player: '1', args: [] },
+        },
+      ],
+    };
+    raw.gameLogs.data.data.splice(2, 0, middle);
+    return bytes(raw);
+  });
+  assert.equal(result.blocked, null);
+  assert.deepEqual(result.completionEvidence.successfulSourceGroups, [3, 4]);
+  const initial = result.observedTrajectory.boundaries.find((b) => b.moveId === 2);
+  assert.equal(initial.verified, false);
+  assert.equal(initial.reason, 'sourceChoiceWithoutBoundNativeOperation');
+  assert.equal(result.observedTrajectory.operations.length, 1);
+  assert.equal(result.fullReplayAchieved, false);
 });
 
 test('resource quantity uses the number of actual legal unit choices for the same original UID', () => {
