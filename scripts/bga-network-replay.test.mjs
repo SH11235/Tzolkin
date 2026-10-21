@@ -3981,7 +3981,12 @@ function emptyPaidTechnologyFixture(mutateRaw = () => {}, mutateContext = () => 
     stateArgs: args,
   });
   assert.notEqual(sourceBefore.initial, index.initial);
-  const sourceAfter = { initial: index.initial, stateId: 7, activePlayer: '1', stateArgs: workers };
+  const sourceAfter = {
+    initial: index.initial,
+    stateId: 7,
+    activePlayer: '1',
+    stateArgs: exit.entries.at(-1).args.args,
+  };
   const operation = {
     entry: exit.entries.at(-1),
     row: skip,
@@ -4005,6 +4010,8 @@ function emptyPaidTechnologyFixture(mutateRaw = () => {}, mutateContext = () => 
     operation,
     sourceBefore,
     sourceAfter,
+    finished,
+    nextLegalRows: [endRow],
   };
   mutateContext(context);
   const boundary = (group, native, rows) => {
@@ -4026,7 +4033,7 @@ function emptyPaidTechnologyFixture(mutateRaw = () => {}, mutateContext = () => 
     before,
     after,
     operations: [operation],
-    boundary: boundary(exit, after, [endRow]),
+    boundary: boundary(exit, after, context.nextLegalRows),
     audit: [],
     publicResultMatched: true,
     sourceBefore,
@@ -4071,6 +4078,74 @@ test('explicit empty paid-technology menu closes only through its original uncha
   });
   assert.equal(objectMenu.allObservedChoicesMatched, true);
   assert.equal(objectMenu.boundaries.find((b) => b.moveId === 2).kind, 'observedLegalSelection');
+});
+
+function emptyWorkerArrayFixture(mutateRaw = () => {}, mutateContext = () => {}) {
+  return emptyPaidTechnologyFixture(
+    (raw) => {
+      raw.gameLogs.data.data[2].data[0].args.args = [];
+      raw.gameLogs.data.data[2].data[1].args.args = { workers: [] };
+      mutateRaw(raw);
+    },
+    (context) => {
+      for (const state of [context.before, context.after, context.finished])
+        state.gears.uxmal = [null, null];
+      mutateContext(context);
+    },
+  );
+}
+
+test('explicit empty worker-return array binds the same paid skip and sole subsequent end turn', () => {
+  const proof = emptyWorkerArrayFixture(),
+    choice = proof.boundaries.find((b) => b.moveId === 2);
+  assert.equal(proof.allObservedChoicesMatched, true);
+  assert.equal(choice.kind, 'emptyPaidTechnologyExit');
+  assert.equal(choice.emptyPaidTechnologyExit.workerMenuRepresentation, 'explicitEmptyArray');
+  assert.equal(choice.emptyPaidTechnologyExit.humanClickObserved, false);
+  assert.equal(choice.emptyPaidTechnologyExit.publicStateUnchanged, true);
+  const ordinary = emptyPaidTechnologyFixture().boundaries.find((b) => b.moveId === 2);
+  assert.equal(ordinary.verified, true);
+  assert.equal(ordinary.emptyPaidTechnologyExit.workerMenuRepresentation, undefined);
+});
+
+test('empty worker-return proof refuses missing, nonempty, sparse or changed menus and extra legal actions', () => {
+  for (const workers of [
+    undefined,
+    null,
+    '',
+    [null],
+    [{ id: '1', place: 'uxmal', position: '1' }],
+    new Array(2),
+  ]) {
+    const proof = emptyWorkerArrayFixture((raw) => {
+      raw.gameLogs.data.data[2].data[1].args.args.workers = workers;
+    });
+    assert.equal(proof.boundaries.find((b) => b.moveId === 2).verified, false);
+  }
+  for (const mutate of [
+    (context) => {
+      context.nextLegalRows = [];
+    },
+    (context) => {
+      context.nextLegalRows.push({
+        action: { type: 'remove', gear: 'uxmal', position: 1 },
+        move: { type: 'remove', gear: 'uxmal', position: 1 },
+      });
+    },
+    (context) => {
+      context.index.groups.find((g) => g.moveId === 3).entries[1].args.args.workers.extra = true;
+    },
+    (context) => {
+      context.sourceAfter.activePlayer = '2';
+    },
+    (context) => {
+      context.before.pending.task.free = true;
+      context.after.pending = null;
+    },
+  ]) {
+    const proof = emptyWorkerArrayFixture(() => {}, mutate);
+    assert.equal(proof.boundaries.find((b) => b.moveId === 2).verified, false);
+  }
 });
 
 test('empty paid-menu proof rejects absent budgets, unsupported menus and unbound native rights', () => {

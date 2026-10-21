@@ -542,7 +542,15 @@ export function createObservedChoices({
       s[42]?.possibleactions?.includes('pass')
     );
   }
-  function emptyPaidTechnologyExit(group, before, after, operations, sourceBefore, sourceAfter) {
+  function emptyPaidTechnologyExit(
+    group,
+    before,
+    after,
+    operations,
+    sourceBefore,
+    sourceAfter,
+    next,
+  ) {
     const args = last.args,
       op = operations[0],
       s = index.initial.gamestates;
@@ -614,6 +622,9 @@ export function createObservedChoices({
     )
       return null;
     const entries = group.entries;
+    const workers = entries[1]?.args?.args?.workers;
+    const emptyWorkerArray =
+      Array.isArray(workers) && workers.length === 0 && Object.keys(workers).length === 0;
     if (
       !same(
         entries.map((n) => n.type),
@@ -656,7 +667,15 @@ export function createObservedChoices({
       !same(sourceAfter.stateArgs, entries[1].args.args) ||
       !entries[1].args.args.workers ||
       typeof entries[1].args.args.workers !== 'object' ||
-      Array.isArray(entries[1].args.args.workers) ||
+      (Array.isArray(workers) &&
+        (!emptyWorkerArray ||
+          next?.stateId !== 7 ||
+          next.actor !== last.actor ||
+          next.sourceActor !== last.sourceActor ||
+          next.pending !== null ||
+          !same(next.legalRows, [
+            { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } },
+          ]))) ||
       Object.values(entries[1].args.args.workers).some(
         (w) =>
           !integer(w.position) ||
@@ -675,6 +694,7 @@ export function createObservedChoices({
       humanClickObserved: false,
       publicStateUnchanged: true,
       nextPending: null,
+      ...(emptyWorkerArray ? { workerMenuRepresentation: 'explicitEmptyArray' } : {}),
     };
   }
   function observe({
@@ -950,6 +970,7 @@ export function createObservedChoices({
           operations,
           sourceBefore,
           sourceAfter,
+          next,
         );
         let issue = emptyTechnologyExit
           ? null
