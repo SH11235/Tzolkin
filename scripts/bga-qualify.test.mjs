@@ -19,7 +19,7 @@ import {
   serializeAuditReport,
   tableFamilyId,
 } from './bga-qualify.mjs';
-import { coreDispatcher, counterCheckpoint } from './bga-replay.mjs';
+import { catalogFingerprint, coreDispatcher, counterCheckpoint } from './bga-replay.mjs';
 
 const nativeCliPath = resolve(
   'target/debug/' + (process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai'),
@@ -239,8 +239,10 @@ function fixture() {
     unsupportedRules: [],
     record: {
       schema: 'tzolkin-public-replay-v1',
-      rulesVersion: 1,
-      catalogHash: '59d366aef93711bb',
+      rulesVersion: 2,
+      catalogHash: catalogFingerprint(
+        readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+      ),
       market: 'unlimited',
       source: { reference, actionIds: [5] },
       initial: nativeInitial,
