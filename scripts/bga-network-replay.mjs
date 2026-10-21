@@ -1,5 +1,6 @@
 import { recordDecisionBoundary, classifyDecisionState } from './bga-network-decision-boundary.mjs';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
+import { createObservedChoices } from './bga-network-observed-choices.mjs';
 import {
   assertObservationBoundary,
   inspectTerminalProjection,
@@ -1328,6 +1329,54 @@ export function replayNetworkPrefix(
     sourceToNative,
   });
   let semanticContext = null;
+  let operationSource = null;
+  let choiceOperations = [];
+  const withoutLog = (state) =>
+    Object.fromEntries(
+      Object.entries(state)
+        .filter(([key]) => key !== 'log')
+        .map(([key, value]) => [key, copy(value)]),
+    );
+  const observedChoices = createObservedChoices({
+    index,
+    initialMoveId,
+    sourceToNative,
+    mapCard: (card) => mapper.bind(card),
+    initialBoundary: {
+      moveId: initialMoveId,
+      stateId: ledger.stateId,
+      name: index.initial.gamestates[ledger.stateId]?.name,
+      args: copy(ledger.stateArgs),
+      sourceActor: ledger.activePlayer,
+      actor: frame.observation.actor,
+      pending: copy(initial.pending),
+      legalRows: copy(frame.observation.legalActions),
+    },
+  });
+  function completionFields(blocked) {
+    const observedTrajectory = observedChoices.finish();
+    const completionEvidence = replayCompletionEvidence({
+      index,
+      initialMoveId,
+      sourceToNative,
+      initialVerified: true,
+      initialCoverageEvidence,
+      successfulGroups,
+      decisionBoundaryAudit,
+      semantic: semanticComparison.finish(),
+      timingFences,
+      terminal: terminalValidation,
+      blocked,
+      observedTrajectory,
+      legacyObligationsClosed: !openRotationFence && !openCornFence && !openRewardFences.length,
+    });
+    return {
+      observedTrajectory,
+      completionEvidence,
+      fullReplayAchieved: completionEvidence.fullReplayAchieved,
+      semanticReplayVerified: completionEvidence.fullReplayAchieved,
+    };
+  }
   function applyWhere(
     predicate,
     reason,
@@ -1364,6 +1413,19 @@ export function replayNetworkPrefix(
       response = apply(row);
     }
     if (response.error) fail(response.error);
+    choiceOperations.push({
+      entry: operationSource,
+      sourceActor: ledger.activePlayer,
+      step: record.steps.length + 1,
+      actor,
+      observationActor: frame.observation.actor,
+      row: copy(row),
+      legalRows: copy(legalActions),
+      equivalentRows: equivalentChoices > 1 ? copy(rows) : [],
+      afterLegalRows: copy(response.observation?.legalActions ?? []),
+      before: withoutLog(preState),
+      after: withoutLog(response.snapshot.state),
+    });
     if (
       (response.snapshot.state.foodDays ?? []).some(
         (day) => !(preState.foodDays ?? []).includes(day),
@@ -1458,6 +1520,8 @@ export function replayNetworkPrefix(
   }
   for (const group of index.groups.filter((g) => g.moveId > initialMoveId)) {
     current = group;
+    operationSource = null;
+    choiceOperations = [];
     semanticContext = semanticComparison.begin(group, ledger, native(), frame.observation);
     const sourceBeforeGroup = {
       initial: ledger.initial,
@@ -1672,6 +1736,7 @@ export function replayNetworkPrefix(
         );
         if (nextRemoval && native().pending) {
           assertActor(nextRemoval);
+          operationSource = nextRemoval;
           for (let i = 0; native().pending && i < 4; i++)
             applyWhere(
               (x) => x.type === 'skip',
@@ -1680,6 +1745,7 @@ export function replayNetworkPrefix(
             );
         }
         for (const n of group.entries) {
+          operationSource = n;
           const a = n.args;
           if (burnHarvest) {
             if (n === group.entries[0]) {
@@ -2191,6 +2257,9 @@ export function replayNetworkPrefix(
           }
         }
         if (stateId() === 70 && native().pending?.task.type === 'trade') {
+          operationSource = group.entries.findLast(
+            (n) => n.type === 'gameStateChange' && Number(n.args.id) === 70,
+          );
           const prior = copy(native());
           const proof = proveBuildingMarketExit(buildingMarket, {
             index,
@@ -2214,9 +2283,11 @@ export function replayNetworkPrefix(
           });
         }
         // A source transition to worker removal ends the preceding optional subtask.
-        if ([4, 7].includes(stateId()) && native().pending)
+        if ([4, 7].includes(stateId()) && native().pending) {
+          operationSource = group.entries.findLast((n) => n.type === 'gameStateChange');
           for (let i = 0; native().pending && i < 4; i++)
             applyWhere((x) => x.type === 'skip', 'observed return to worker selection', refills);
+        }
       }
       for (const n of group.entries) updateLedger(ledger, n, mapper);
       const skullShortageEvidence = bindSkullShortageOutcome(skullShortage, before, native());
@@ -2585,6 +2656,15 @@ export function replayNetworkPrefix(
           ...(finalWitness ? { deferredFinalScores: true } : {}),
           teacherCertified: false,
         });
+        observedChoices.observe({
+          group,
+          before: withoutLog(before),
+          after: withoutLog(native()),
+          operations: choiceOperations,
+          boundary: decisionBoundary,
+          audit: audit.slice(auditBeforeGroup),
+          publicResultMatched: semantic.semanticMatch,
+        });
         successfulGroups.push(group.moveId);
         continue;
       }
@@ -2635,6 +2715,15 @@ export function replayNetworkPrefix(
         nativeSteps: record.steps.length - stepsBefore,
         cancellation: group.entries[0].type === 'undoRestoreDISAB',
       });
+      observedChoices.observe({
+        group,
+        before: withoutLog(before),
+        after: withoutLog(native()),
+        operations: choiceOperations,
+        boundary: decisionBoundary,
+        audit: audit.slice(auditBeforeGroup),
+        publicResultMatched: semantic.semanticMatch,
+      });
       successfulGroups.push(group.moveId);
     } catch (error) {
       if (burnHarvest) {
@@ -2664,22 +2753,8 @@ export function replayNetworkPrefix(
         rawSha256: index.rawSha256,
         finished: false,
         terminalReached: native().phase === 'finished',
-        semanticReplayVerified: false,
-        fullReplayAchieved: false,
+        ...completionFields(true),
         terminalValidation,
-        completionEvidence: replayCompletionEvidence({
-          index,
-          initialMoveId,
-          sourceToNative,
-          initialVerified: true,
-          initialCoverageEvidence,
-          successfulGroups,
-          decisionBoundaryAudit,
-          semantic: semanticComparison.finish(),
-          timingFences,
-          terminal: terminalValidation,
-          blocked: true,
-        }),
         semanticComparison: semanticComparison.finish(),
         decisionBoundaryAudit,
         teacherCompleteness: false,
@@ -2722,22 +2797,8 @@ export function replayNetworkPrefix(
       !openCornFence &&
       !openRewardFences.length,
     terminalReached: native().phase === 'finished',
-    semanticReplayVerified: false,
-    fullReplayAchieved: false,
+    ...completionFields(false),
     terminalValidation,
-    completionEvidence: replayCompletionEvidence({
-      index,
-      initialMoveId,
-      sourceToNative,
-      initialVerified: true,
-      initialCoverageEvidence,
-      successfulGroups,
-      decisionBoundaryAudit,
-      semantic: semanticComparison.finish(),
-      timingFences,
-      terminal: terminalValidation,
-      blocked: false,
-    }),
     semanticComparison: semanticComparison.finish(),
     decisionBoundaryAudit,
     teacherCompleteness: false,

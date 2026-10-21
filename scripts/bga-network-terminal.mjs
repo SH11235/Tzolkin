@@ -271,6 +271,8 @@ export function replayCompletionEvidence({
   terminal,
   blocked,
   sourceToNative,
+  observedTrajectory,
+  legacyObligationsClosed,
 }) {
   const expected = index.groups.filter((g) => g.moveId > initialMoveId).map((g) => g.moveId);
   const required = expectedDecisionBoundaries(index, initialMoveId);
@@ -301,9 +303,14 @@ export function replayCompletionEvidence({
         sourceName: def?.name ?? null,
         nativePendingType: b.nativePending?.task.type ?? null,
         moves: [],
-        meaningEvidence: 'stageClassificationOnly',
+        verifiedMoves: [],
+        unverifiedMoves: [],
       });
-    stages.get(key).moves.push(b.moveId);
+    const stage = stages.get(key);
+    stage.moves.push(b.moveId);
+    const verified =
+      observedTrajectory?.boundaries.find((row) => row.moveId === b.moveId)?.verified === true;
+    stage[verified ? 'verifiedMoves' : 'unverifiedMoves'].push(b.moveId);
   }
   const prerequisites = {
     initialPublicProjectionVerified: initialVerified === true,
@@ -316,12 +323,16 @@ export function replayCompletionEvidence({
     allStrictTimingFencesClosed: timingFences.every((f) => f.resolvedMoveId != null),
     terminalValidationCompleted: terminal?.completed === true,
     noBlock: !blocked,
+    legacyObligationsClosed: legacyObligationsClosed === true,
+    humanSelectionMeaningEstablished:
+      observedTrajectory?.allObservedChoicesMatched === true &&
+      sameObservedBoundaryCoverage(observedTrajectory, index.rawSha256, initialMoveId, required),
   };
   const unresolved = Object.entries(prerequisites)
     .filter(([, passed]) => !passed)
     .map(([name]) => name);
-  // A counter match does not establish the meaning of every source selection stage.
-  unresolved.push('humanSelectionMeaningNotFullyEstablished');
+  for (const boundary of observedTrajectory?.unresolved ?? [])
+    unresolved.push(`unverifiedChoice:${boundary.moveId}:${boundary.reason}`);
   return {
     prerequisites,
     successfulSourceGroups: clone(successfulGroups),
@@ -331,7 +342,22 @@ export function replayCompletionEvidence({
     stageInventory: [...stages.values()],
     unresolved,
     terminalValidationCompleted: terminal?.completed === true,
-    fullReplayAchieved: false,
+    fullReplayAchieved: Object.values(prerequisites).every((passed) => passed === true),
     teacherCertified: false,
   };
+}
+
+function sameObservedBoundaryCoverage(trajectory, rawSha256, initialMoveId, required) {
+  const expected = [initialMoveId, ...required.map((b) => b.moveId)];
+  return (
+    typeof rawSha256 === 'string' &&
+    /^[a-f\d]{64}$/.test(rawSha256) &&
+    trajectory.sourceRawSha256 === rawSha256 &&
+    isDeepStrictEqual(trajectory.expectedBoundaries, expected) &&
+    isDeepStrictEqual(
+      trajectory.boundaries?.map((b) => b.moveId),
+      expected,
+    ) &&
+    trajectory.boundaries.every((b) => b.verified === true)
+  );
 }
