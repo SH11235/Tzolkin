@@ -542,6 +542,141 @@ export function createObservedChoices({
       s[42]?.possibleactions?.includes('pass')
     );
   }
+  function emptyPaidTechnologyExit(group, before, after, operations, sourceBefore, sourceAfter) {
+    const args = last.args,
+      op = operations[0],
+      s = index.initial.gamestates;
+    if (
+      last.stateId !== 31 ||
+      last.name !== 'technologyUpgrade' ||
+      !args ||
+      !Object.hasOwn(args, 'technologies') ||
+      !Array.isArray(args.technologies) ||
+      args.technologies.length ||
+      !same(Object.keys(args).sort(), ['resources', 'technologies']) ||
+      !args.resources ||
+      !same(Object.keys(args.resources).sort(), ['gold', 'stone', 'wood']) ||
+      operations.length !== 1 ||
+      !same(op?.row, { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } }) ||
+      op.actor !== last.actor ||
+      op.sourceActor !== last.sourceActor ||
+      sourceToNative.get(last.sourceActor) !== last.actor ||
+      before.currentPlayer !== last.actor ||
+      before.additionalBuildings !== false ||
+      before.turn?.mode !== 'remove' ||
+      !same(before.pending?.task, { type: 'technology', remaining: 1, free: false }) ||
+      !same(before.pending.after, []) ||
+      !same(last.pending, before.pending) ||
+      !same(op.before, before) ||
+      !same(op.after, after) ||
+      !same(op.legalRows, [op.row]) ||
+      !same(last.legalRows, op.legalRows) ||
+      materials.some(
+        (r) =>
+          !integer(args.resources[r]) ||
+          Number(args.resources[r]) !== 0 ||
+          before.players[last.actor].resources[r] !== 0,
+      )
+    )
+      return null;
+    const expected = clone(before);
+    expected.pending = null;
+    if (!same(after, expected)) return null;
+    const menuGroup = index.groups.find((g) => g.moveId === last.moveId),
+      menu = menuGroup?.entries.findLast((n) => n.type === 'gameStateChange');
+    if (
+      !menu ||
+      !trusted(menuGroup, menu) ||
+      menu.args.id !== 31 ||
+      menu.args.type !== 'activeplayer' ||
+      menu.args.active_player !== last.sourceActor ||
+      !Object.hasOwn(menu.args, 'args') ||
+      !same(menu.args.args, args) ||
+      group.moveId !== last.moveId + 1 ||
+      !same(sourceBefore?.initial, index.initial) ||
+      sourceBefore.stateId !== 31 ||
+      sourceBefore.activePlayer !== last.sourceActor ||
+      !same(sourceBefore.stateArgs, args) ||
+      !same(sourceAfter?.initial, index.initial) ||
+      sourceAfter.stateId !== 7 ||
+      sourceAfter.activePlayer !== last.sourceActor ||
+      s[31]?.name !== 'technologyUpgrade' ||
+      s[31].type !== 'activeplayer' ||
+      s[31].args !== 'argTechnologyUpgrade' ||
+      !same(s[31].possibleactions, ['chooseTechnology', 'pass']) ||
+      s[31].transitions?.nextAction !== 9 ||
+      s[9]?.name !== 'solveStackedAction' ||
+      s[9].type !== 'game' ||
+      s[9].action !== 'stSolveStackedAction' ||
+      s[9].transitions?.stackEmpty !== 7 ||
+      s[7]?.name !== 'pickUpWorker' ||
+      s[7].type !== 'activeplayer'
+    )
+      return null;
+    const entries = group.entries;
+    if (
+      !same(
+        entries.map((n) => n.type),
+        ['gameStateChange', 'gameStateChange'],
+      ) ||
+      !same(
+        entries.map((n) => n.args?.id),
+        [9, 7],
+      ) ||
+      op.entry !== entries[1] ||
+      entries.some((n, i) => {
+        const p = originalPacketEntry(n);
+        return (
+          !trusted(group, n) ||
+          p.packetNotificationCount !== 2 ||
+          n.packetIndex !== entries[0].packetIndex ||
+          n.notificationIndex !== i ||
+          !n.visible ||
+          n.administrative ||
+          n.beforeCheckpoint ||
+          n.args.active_player !== last.sourceActor ||
+          n.args.type !== (i === 0 ? 'game' : 'activeplayer') ||
+          !Object.hasOwn(n.args, 'args') ||
+          Object.keys(n.args).some(
+            (k) =>
+              ![
+                'id',
+                'active_player',
+                'args',
+                'type',
+                'reflexion',
+                'updateGameProgression',
+              ].includes(k),
+          )
+        );
+      }) ||
+      !(entries[0].args.args === null || same(entries[0].args.args, [])) ||
+      !entries[1].args.args ||
+      !same(Object.keys(entries[1].args.args), ['workers']) ||
+      !same(sourceAfter.stateArgs, entries[1].args.args) ||
+      !entries[1].args.args.workers ||
+      typeof entries[1].args.args.workers !== 'object' ||
+      Array.isArray(entries[1].args.args.workers) ||
+      Object.values(entries[1].args.args.workers).some(
+        (w) =>
+          !integer(w.position) ||
+          after.gears[w.place]?.[Number(w.position)]?.playerId !== last.actor,
+      )
+    )
+      return null;
+    return {
+      sourceMenu: ref(menu),
+      sourceExit: entries.map(ref),
+      nativeStep: op.step,
+      actor: op.actor,
+      sourceActor: last.sourceActor,
+      budget: clone(args.resources),
+      structuralPassExit: true,
+      humanClickObserved: false,
+      publicStateUnchanged: true,
+      nextPending: null,
+    };
+  }
   function observe({
     group,
     before,
@@ -808,7 +943,17 @@ export function createObservedChoices({
               });
         interval = null;
       } else {
-        let issue = observedStageArguments(last, operations[0], operations);
+        const emptyTechnologyExit = emptyPaidTechnologyExit(
+          group,
+          before,
+          after,
+          operations,
+          sourceBefore,
+          sourceAfter,
+        );
+        let issue = emptyTechnologyExit
+          ? null
+          : observedStageArguments(last, operations[0], operations);
         if (last.name === 'playerTurn' || last.name === 'pickUpWorker') {
           const removal = operations.find((o) => o.row.action.type === 'remove');
           if (removal) {
@@ -859,7 +1004,16 @@ export function createObservedChoices({
             operations: [...operations],
             proof,
           });
-        } else issue ? fail(last, issue) : pass(last, 'observedLegalSelection', group, operations);
+        } else
+          issue
+            ? fail(last, issue)
+            : pass(
+                last,
+                emptyTechnologyExit ? 'emptyPaidTechnologyExit' : 'observedLegalSelection',
+                group,
+                operations,
+                emptyTechnologyExit ? { emptyPaidTechnologyExit: emptyTechnologyExit } : {},
+              );
       }
     }
     if (nextHuman) {
