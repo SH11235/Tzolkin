@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
 import { provePostReceiptFood } from './bga-network-semantic-feeding.mjs';
 import { createBuildingResourceComparison } from './bga-network-building-resources.mjs';
+import { createTerminalCalendarComparison } from './bga-network-semantic-calendar.mjs';
 
 const clone = structuredClone;
 const sourceId = (entry) => String(entry.args.player_id);
@@ -16,6 +17,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
   const remaining = sequence?.groups.filter(({ group }) => group.moveId > initialMoveId) ?? [];
   const mapping = new Map(sourceToNative);
   const buildingResources = createBuildingResourceComparison({ index, sourceToNative: mapping });
+  const calendarComparison = createTerminalCalendarComparison({ index, sourceToNative: mapping });
   const workers = new Map(index.initial.workers.map((w) => [String(w.id), clone(w)]));
   const owned = new Map(
     [...mapping.keys()].map((id) => [
@@ -454,6 +456,10 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
     if (building.failure) reject(building.failure);
     for (const field of building.fields) allowed.add(field);
     evidence.push(...building.evidence);
+    const calendar = calendarComparison.compare(context, { ledger, native });
+    if (calendar.failure) reject(calendar.failure);
+    for (const field of calendar.fields) allowed.add(field);
+    evidence.push(...calendar.evidence);
     const remainingDifferences = differences.filter((d) => !allowed.has(d.field));
     for (const n of entries) {
       if (n.type === 'cornOnWheel' || n.type === 'firstPlayer') {
@@ -491,10 +497,13 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       sourceSequenceComplete: !!sequence && cursor === remaining.length,
       obligations: clone(obligations),
       buildingResources: buildingResources.finish(),
+      terminalCalendar: calendarComparison.finish(),
       decisionBoundaries: clone(decisions),
       failure,
       allObligationsClosed:
-        obligations.every((c) => c.closed) && buildingResources.finish().allObligationsClosed,
+        obligations.every((c) => c.closed) &&
+        buildingResources.finish().allObligationsClosed &&
+        calendarComparison.finish().allObligationsClosed,
       allDecisionBoundariesMatched: decisions.every((d) => d.matched),
       teacherCertified: false,
     };

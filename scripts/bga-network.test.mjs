@@ -19,6 +19,7 @@ function semanticFixture({
   amount = 2,
   immediate = false,
   purchased = false,
+  terminal = false,
   mutateSource = () => {},
 } = {}) {
   const raw = fixture();
@@ -73,13 +74,49 @@ function semanticFixture({
     );
     raw.gameLogs.data.data[2].data.find((n) => n.type === 'placeWorker').args.worker_id = '4';
   }
+  if (terminal) {
+    const earlier = Array.from({ length: 25 }, (_, i) =>
+      packet(i + 2, [
+        ...([7, 14, 20].includes(i + 1)
+          ? [n('gameStateChange', { id: 92, active_player: '1' })]
+          : []),
+        n('rotateWheel', { day: i + 1, twice: 0, workers: [] }),
+      ]),
+    );
+    for (const p of raw.gameLogs.data.data.slice(1)) {
+      p.packet_id = String(Number(p.packet_id) + 25);
+      p.move_id = String(Number(p.move_id) + 25);
+    }
+    const rotation = raw.gameLogs.data.data.at(-1);
+    Object.assign(rotation.data[0].args, { day: 27, twice: 1, player_id: owner });
+    rotation.data.push(n('gameStateChange', { id: 4, active_player: owner }));
+    raw.gameLogs.data.data.splice(1, 0, ...earlier);
+    raw.gameLogs.data.data.push(
+      packet(32, [
+        n('gameStateChange', { id: 90, active_player: '2' }),
+        n('gameStateChange', { id: 4, active_player: '3' }),
+      ]),
+      packet(33, [
+        n('gameStateChange', { id: 90, active_player: '3' }),
+        n('gameStateChange', { id: 4, active_player: '1' }),
+      ]),
+      packet(34, [
+        n('gameStateChange', { id: 90, active_player: '1' }),
+        n('gameStateChange', { id: 91, active_player: owner }),
+        n('gameStateChange', { id: 92, active_player: owner }),
+        n('finalScoring', {}),
+        n('rotateWheel', { day: 28, twice: 0, workers: [] }),
+        n('gameStateChange', { id: 99, active_player: owner }),
+      ]),
+    );
+  }
   mutateSource(raw);
   const index = parseNetworkReplay(bytes(raw));
   const initial = {
     version: 1,
     additionalBuildings: false,
-    round: 8,
-    foodDays: [],
+    round: terminal ? 26 : 8,
+    foodDays: terminal ? [8, 14, 21] : [],
     skullSupply: 13,
     turnOrder: [0, 1, 2],
     firstPlayer: 0,
@@ -92,6 +129,7 @@ function semanticFixture({
     turn: { mode: 'none', count: 0, begged: false },
     players: [0, 1, 2].map((id) => ({
       workers: purchased && id === actor ? 2 : 1,
+      doubleAdvanceAvailable: true,
       score: 0,
       feedAll: false,
       feedWorkers: 0,
@@ -101,6 +139,7 @@ function semanticFixture({
     })),
   };
   const ledger = {
+    day: terminal ? 25 : 0,
     accumulatedCorn: amount,
     activePlayer: owner,
     stateId: 4,
@@ -118,7 +157,7 @@ function semanticFixture({
   };
   const comparison = createSemanticComparison({
     index,
-    initialMoveId: purchased ? 2 : 1,
+    initialMoveId: terminal ? 26 : purchased ? 2 : 1,
     initial,
     sourceToNative: new Map([
       ['1', 0],
@@ -130,7 +169,7 @@ function semanticFixture({
   let observation = { actor, legalActions: [] };
   const rows = [];
   function step(i, alter = () => {}) {
-    const group = index.groups[i + (purchased ? 1 : 0)];
+    const group = index.groups.filter((g) => g.moveId > (terminal ? 26 : purchased ? 2 : 1))[i];
     const context = comparison.begin(group, ledger, native, observation);
     let differences = [],
       applied = [];
@@ -161,9 +200,10 @@ function semanticFixture({
       ledger.activePlayer = owner;
       ledger.stateId = 95;
       native.pending = { task: { type: 'rotation' } };
+      if (terminal) native.currentPlayer = actor;
       observation = { actor, legalActions: [{ action: { type: 'rotate', days } }] };
       differences = [{ field: 'firstPlayer', native: 0, observed: next }];
-    } else {
+    } else if (stage === 4) {
       native.pending = null;
       native.firstPlayerClaimed = null;
       native.firstPlayer = next;
@@ -174,6 +214,34 @@ function semanticFixture({
       ledger.stateId = 4;
       observation = { actor: next, legalActions: [] };
       applied = [{ actor, action: { type: 'rotate', days }, step: i + 1 }];
+      if (terminal) {
+        native.round = 27;
+        native.players[actor].doubleAdvanceAvailable = false;
+        ledger.day = 27;
+        differences = [{ field: 'round', observed: 28, native: 27 }];
+      }
+    } else {
+      const endingActor = native.currentPlayer;
+      if (stage === 7) {
+        native.phase = 'finished';
+        native.foodDays = [8, 14, 21, 27];
+        ledger.day = 28;
+        ledger.stateId = 99;
+      } else {
+        native.turnIndex++;
+        native.currentPlayer = native.turnOrder[native.turnIndex];
+        ledger.activePlayer = String(native.currentPlayer + 1);
+        differences = [{ field: 'round', observed: 28, native: 27 }];
+      }
+      applied = [{ actor: endingActor, action: { type: 'endTurn' }, step: i + 1 }];
+      comparison.applied(context, {
+        before: context.native,
+        after: native,
+        actor: endingActor,
+        action: { type: 'endTurn' },
+        legalActions: [{ action: { type: 'endTurn' } }],
+        step: i + 1,
+      });
     }
     if (stage === 4)
       comparison.applied(context, {
@@ -201,6 +269,111 @@ function semanticFixture({
     },
   };
 }
+
+test('semantic caller binds cloned source and native rotation through the complete final actor cycle', () => {
+  const f = semanticFixture({ terminal: true, days: 2, amount: 0 });
+  for (let i = 0; i < 8; i++) assert.equal(f.step(i).semanticMatch, true, `stage ${i}`);
+  assert.equal(f.rows[4].rawEqual, false);
+  assert.deepEqual(f.rows[4].remainingDifferences, []);
+  assert.equal(f.rows[4].evidence.at(-1).type, 'terminalPlayingCalendar');
+  assert.equal(f.rows[4].evidence.at(-1).decisionTimeFeatureEquivalence, 'notEstablished');
+  assert.equal(f.rows[7].evidence.at(-1).type, 'terminalPlayingCalendarClosure');
+  const result = f.comparison.finish();
+  assert.equal(result.sourceSequenceComplete, true);
+  assert.equal(result.allObligationsClosed, true);
+  assert.deepEqual(result.terminalCalendar.obligation.completedActors, [1, 2, 0]);
+});
+
+test('final-playing calendar rejects changed native turns, food and unrelated public differences', () => {
+  for (const [stage, alter] of [
+    [
+      4,
+      (args, context) => {
+        context.transitions[0].after.players[1].doubleAdvanceAvailable = true;
+      },
+    ],
+    [
+      4,
+      (args) => {
+        args.differences.push({ field: 'gear.uxmal', observed: [], native: [1] });
+      },
+    ],
+    [
+      4,
+      (args) => {
+        args.differences.push({ field: 'player.2.resources.corn', observed: 3, native: 4 });
+      },
+    ],
+    [
+      5,
+      (args, context) => {
+        context.transitions[0].actor = 0;
+      },
+    ],
+    [
+      5,
+      (args, context) => {
+        context.transitions = [];
+      },
+    ],
+    [
+      6,
+      (args, context) => {
+        context.transitions.push(structuredClone(context.transitions[0]));
+      },
+    ],
+    [
+      5,
+      (args) => {
+        args.native.phase = 'finished';
+      },
+    ],
+    [
+      7,
+      (args) => {
+        args.native.foodDays = [8, 14, 21];
+      },
+    ],
+  ]) {
+    const f = semanticFixture({ terminal: true, days: 2, amount: 0 });
+    for (let i = 0; i < stage; i++) assert.equal(f.step(i).semanticMatch, true);
+    assert.equal(f.step(stage, alter).semanticMatch, false, `stage ${stage}`);
+    assert.equal(f.comparison.finish().allObligationsClosed, false);
+  }
+});
+
+test('final-playing calendar needs the original final turn and food chronology', () => {
+  for (const mutateSource of [
+    (raw) => raw.gameLogs.data.data.at(-1).data.splice(2, 1),
+    (raw) =>
+      raw.gameLogs.data.data.at(-1).data.splice(2, 0, {
+        ...structuredClone(raw.gameLogs.data.data.at(-1).data[2]),
+        uid: 'duplicate-food',
+      }),
+    (raw) => {
+      raw.gameLogs.data.data.at(-2).data[1].args.active_player = '2';
+    },
+    (raw) => raw.gameLogs.data.data.splice(-2, 1),
+  ])
+    assert.throws(
+      () => semanticFixture({ terminal: true, days: 2, amount: 0, mutateSource }),
+      /terminal calendar|notification UID|uid|strictly increasing/i,
+    );
+});
+
+test('round differences without a bound final calendar stay unresolved and open cycles stay conditional', () => {
+  const regular = semanticFixture({ days: 2, amount: 0 });
+  for (let i = 0; i < 4; i++) assert.equal(regular.step(i).semanticMatch, true);
+  const result = regular.step(4, (args) =>
+    args.differences.push({ field: 'round', observed: 28, native: 27 }),
+  );
+  assert.equal(result.semanticMatch, false);
+  assert.deepEqual(result.remainingDifferences, [{ field: 'round', observed: 28, native: 27 }]);
+  const terminal = semanticFixture({ terminal: true, days: 2, amount: 0 });
+  for (let i = 0; i < 7; i++) assert.equal(terminal.step(i).semanticMatch, true);
+  assert.equal(terminal.comparison.finish().terminalCalendar.obligation.closed, false);
+  assert.equal(terminal.comparison.finish().allObligationsClosed, false);
+});
 
 test('semantic comparison retains raw corn and marker gaps until their independent closures', () => {
   for (const self of [false, true])
