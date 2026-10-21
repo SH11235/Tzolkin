@@ -41,7 +41,9 @@ export function provePostReceiptFood({
     before.expansion ||
     before.additionalBuildings ||
     before.round !== event.scheduledDay ||
-    !transition.legalActions.some((r) => r.action.type === 'endTurn') ||
+    before.pending !== null ||
+    transition.actor !== before.currentPlayer ||
+    !transition.legalActions.some((r) => isDeepStrictEqual(r.action, transition.action)) ||
     transition.after.pending?.task.type !== 'rotation' ||
     !isDeepStrictEqual(transition.after.foodDays, [...before.foodDays, event.scheduledDay]) ||
     !isDeepStrictEqual(native.foodDays, transition.after.foodDays)
@@ -59,12 +61,47 @@ export function provePostReceiptFood({
   const bridge = structuredClone(beforeSource.players[claim.sourceOwner].resources);
   bridge.corn += claim.amount;
   if (!isDeepStrictEqual(bridge, claim.nativeResources)) return null;
-  for (const n of entries.slice(paid + 1)) {
-    if (n.type === 'gameStateChange') {
-      const type = n.args.type ?? index.initial.gamestates[n.args.id]?.type;
-      if (type !== 'game' && Number(n.args.id) !== 95) return null;
-    }
+  const state = (n, id, type) =>
+    n?.type === 'gameStateChange' &&
+    Number(n.args.id) === id &&
+    index.initial.gamestates[id]?.type === type &&
+    (n.args.type === undefined || n.args.type === type) &&
+    publicEntry(n);
+  const clock = (n) => n?.type === 'updateReflexionTime' && publicEntry(n);
+  let position = 0;
+  if (!state(entries[position++], 90, 'game')) return null;
+  if (clock(entries[position])) position++;
+  if (!state(entries[position++], 91, 'game') || position !== paid - 1) return null;
+  position = paid + 1;
+  if (
+    entries[position]?.type !== 'firstPlayer' ||
+    !publicEntry(entries[position]) ||
+    sourceToNative.get(String(entries[position].args.player_id)) !== claim.nextStarter
+  )
+    return null;
+  position++;
+  if (position !== start || !state(entries[position++], 92, 'game')) return null;
+  while (position < end) {
+    const n = entries[position++];
+    if (!['payGoods', 'foodDayCost', 'updateScore'].includes(n.type) || !publicEntry(n))
+      return null;
   }
+  if (
+    !state(entries[position++], 93, 'game') ||
+    entries[position]?.type !== 'middleOfAgeRewards' ||
+    !publicEntry(entries[position++])
+  )
+    return null;
+  while (entries[position]?.type === 'takeGoods') {
+    if (!publicEntry(entries[position++])) return null;
+  }
+  if (
+    !state(entries[position], 95, 'activeplayer') ||
+    String(entries[position++].args.active_player) !== claim.sourceOwner
+  )
+    return null;
+  if (clock(entries[position])) position++;
+  if (position !== entries.length) return null;
   const expectedRewards = [],
     results = [];
   let skullRewards = 0;
@@ -168,6 +205,9 @@ export function provePostReceiptFood({
     scheduledDay: event.scheduledDay,
     nativeTransition: structuredClone(transition),
     perPlayerResults: results,
+    authorizedEffectUids: effects
+      .filter(({ position }) => position > paid)
+      .map(({ entry }) => entry.uid),
     sourceIndividualAbsenceNotObservedAsZero: true,
   };
 }

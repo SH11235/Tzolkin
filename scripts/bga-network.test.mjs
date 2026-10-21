@@ -167,7 +167,7 @@ function semanticFixture({
       ledger.activePlayer = String(next + 1);
       ledger.stateId = 4;
       observation = { actor: next, legalActions: [] };
-      applied = [{ actor, action: { type: 'rotate', days } }];
+      applied = [{ actor, action: { type: 'rotate', days }, step: i + 1 }];
     }
     if (stage === 4)
       comparison.applied(context, {
@@ -288,7 +288,7 @@ test('an inline endTurn and rotation bind the actual intermediate legal state', 
       a.ledger.stateId = 4;
       a.differences = [];
       a.observation = { actor: 1, legalActions: [] };
-      a.applied = [{ actor: 1, action: { type: 'rotate', days: 1 } }];
+      a.applied = [{ actor: 1, action: { type: 'rotate', days: 1 }, step: 5 }];
       f.comparison.applied(context, {
         before: intermediate,
         after: a.native,
@@ -307,6 +307,8 @@ function semanticFoodFixture(mutateSource = () => {}) {
   return semanticFixture({
     mutateSource: (raw) => {
       Object.assign(raw.initialState.gamestates, {
+        90: { type: 'game' },
+        91: { type: 'game' },
         92: { type: 'game' },
         93: { type: 'game' },
         95: { type: 'activeplayer' },
@@ -330,6 +332,10 @@ function semanticFoodFixture(mutateSource = () => {}) {
         }),
       );
       raw.gameLogs.data.data[4].data.splice(3, 0, ...feeding);
+      raw.gameLogs.data.data[4].data.unshift(
+        n('gameStateChange', { id: 90, active_player: '3' }),
+        n('gameStateChange', { id: 91, active_player: '2' }),
+      );
       mutateSource(raw);
     },
   });
@@ -365,6 +371,36 @@ test('corn settles before the actual automatic feeding and temple rewards within
     if (!corrupt) assert.ok(result.evidence.some((e) => e.type === 'postReceiptFoodDay'));
   }
   for (const mutate of [
+    (raw) => {
+      const packet = raw.gameLogs.data.data[4];
+      const start = packet.data.findIndex((n) => n.type === 'gameStateChange' && n.args.id === 92);
+      packet.data.splice(start, 0, {
+        uid: '4903',
+        type: 'gameStateChange',
+        log: '',
+        args: { id: 95, type: 'activeplayer', active_player: '2' },
+      });
+    },
+    (raw) => {
+      const packet = raw.gameLogs.data.data[4];
+      const start = packet.data.findIndex((n) => n.type === 'gameStateChange' && n.args.id === 92);
+      packet.data.splice(
+        start,
+        0,
+        {
+          uid: '4904',
+          type: 'alterTemple',
+          log: '',
+          args: { player_id: '2', temple_id: 'kukulcan', step: 3 },
+        },
+        {
+          uid: '4905',
+          type: 'alterTemple',
+          log: '',
+          args: { player_id: '2', temple_id: 'kukulcan', step: 2 },
+        },
+      );
+    },
     (raw) => {
       const p = raw.gameLogs.data.data[4];
       p.data.splice(2, 0, {

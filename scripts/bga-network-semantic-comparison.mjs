@@ -263,8 +263,12 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
         )
           reject('starting-player ownership changed before corn settlement');
         if (
-          entries.some((n) => sourceId(n) === c.sourceOwner && n.type === 'payGoods') &&
-          !followingFood
+          entries.some(
+            (n) =>
+              sourceId(n) === c.sourceOwner &&
+              n.type === 'payGoods' &&
+              !followingFood?.authorizedEffectUids.includes(n.uid),
+          )
         )
           reject('claimant paid resources before corn settlement');
         const unexpected = entries.some(
@@ -281,7 +285,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
               'updateScore',
             ].includes(n.type) &&
             !(receipts.length === 1 && credits.includes(n)) &&
-            !(followingFood && group.entries.indexOf(n) > group.entries.indexOf(receipts[0])),
+            !followingFood?.authorizedEffectUids.includes(n.uid),
         );
         if (unexpected) reject('claimant received an unrelated effect before corn settlement');
         if (followingFood) evidence.push(followingFood);
@@ -390,6 +394,8 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           selected[0].action.days !== 1 + rotation[0].args.twice ||
           transition.before.pending?.task.type !== 'rotation' ||
           transition.actor !== c.owner ||
+          !isDeepStrictEqual(transition.action, selected[0].action) ||
+          transition.step !== selected[0].step ||
           transition.before.firstPlayerClaimed !== c.owner ||
           !isDeepStrictEqual(transition.before.turnOrder, order) ||
           !isDeepStrictEqual(transition.after, native) ||
