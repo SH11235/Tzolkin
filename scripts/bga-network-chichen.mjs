@@ -1,5 +1,10 @@
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
+import {
+  chichenDeclinedRemovalWitness,
+  isClosedChichenDecline,
+  closedChichenDeclineRemovalMenu,
+} from './bga-network-chichen-decline.mjs';
 
 export const declinedRemovalCaption =
   '${player_name} picks up a worker in ${city} (position ${position}) and choose to do nothing';
@@ -46,6 +51,12 @@ export function declinedRemovalWitness(group, entry, worker, gear, context = nul
   };
   const remaining = states[1].args.args?.workers;
   if (Array.isArray(remaining) && remaining.length === 0) return proof;
+  if (
+    gear === 'chichenItza' &&
+    remaining &&
+    Object.values(remaining).some((w) => w?.place === 'chichenItza')
+  )
+    return chichenDeclinedRemovalWitness(group, entry, worker, context);
   const object = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
   if (!object(remaining) || Object.keys(remaining).length === 0)
     fail('declined removal lacks its original worker and no-effect boundary');
@@ -127,6 +138,7 @@ export function bindDeclinedRemainingWorkers(
 ) {
   if (!proof.remainingWorkers) return proof;
   const actor = proof.nativeActor;
+  const closedChichen = isClosedChichenDecline(proof);
   if (
     sha(before) !== proof.beforeStateSha256 ||
     afterRemoval.observation?.actor !== actor ||
@@ -136,10 +148,15 @@ export function bindDeclinedRemainingWorkers(
       position: proof.position,
     }) ||
     !isDeepStrictEqual(afterRemoval.snapshot.state.pending?.after, []) ||
-    afterRemoval.observation.legalActions.length !== 1 ||
-    afterRemoval.observation.legalActions[0].action.type !== 'skip' ||
+    (closedChichen
+      ? !closedChichenDeclineRemovalMenu(proof, afterRemoval.observation.legalActions)
+      : afterRemoval.observation.legalActions.length !== 1 ||
+        afterRemoval.observation.legalActions[0].action.type !== 'skip') ||
     afterSkip.observation?.actor !== actor ||
-    afterSkip.snapshot.state.pending !== null
+    afterSkip.snapshot.state.pending !== null ||
+    (closedChichen &&
+      (!isDeepStrictEqual(afterRemoval.snapshot.state.log, before.log) ||
+        !isDeepStrictEqual(afterSkip.snapshot.state.log, before.log)))
   )
     fail('declined worker does not retain its original pending, skip and actor');
   const expected = structuredClone(before);
@@ -175,7 +192,7 @@ export function bindDeclinedRemainingWorkers(
     );
     const response = dispatch({
       operation: 'publicApply',
-      state: afterSkip.snapshot.state,
+      state: closedChichen ? structuredClone(afterSkip.snapshot.state) : afterSkip.snapshot.state,
       actor,
       move: row.move,
       refills,
@@ -191,7 +208,8 @@ export function bindDeclinedRemainingWorkers(
         position: Number(w.position),
       }) ||
       !isDeepStrictEqual(state.pending?.after, []) ||
-      !Array.isArray(response.observation.legalActions)
+      !Array.isArray(response.observation.legalActions) ||
+      (closedChichen && !isDeepStrictEqual(state.log, afterSkip.snapshot.state.log))
     )
       fail('remaining worker lacks its own native action boundary');
     const expectedCounter = structuredClone(afterSkip.snapshot.state);
@@ -209,7 +227,14 @@ export function bindDeclinedRemainingWorkers(
           (a.type !== 'useAction' ||
             a.gear !== w.place ||
             !Object.hasOwn(w.actions[w.place], String(a.position)) ||
-            w.actions[w.place][String(a.position)] !== a.cornCost),
+            w.actions[w.place][String(a.position)] !== a.cornCost ||
+            (closedChichen &&
+              !(a.source === 'currentGear' && a.position <= Number(w.position)) &&
+              !(
+                a.source === 'theologyAhead' &&
+                a.position === Number(w.position) + 1 &&
+                a.cornCost === 0
+              ))),
       )
     )
       fail('native valid row is outside the original clickable price table');

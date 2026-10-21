@@ -36,6 +36,19 @@ const finalScoringCaptions = new WeakMap();
 const harvestEntries = new WeakMap();
 const architectureEntries = new WeakMap();
 const ordinarySkullEntries = new WeakMap();
+const chichenDeclineEntries = new WeakMap();
+
+export function originalChichenDeclineEntry(entry) {
+  const bound = chichenDeclineEntries.get(entry);
+  return bound && isDeepStrictEqual(entry, bound.entry)
+    ? {
+        packetType: bound.packetType,
+        packetNotificationCount: bound.packetNotificationCount,
+        tableId: bound.tableId,
+        rawSha256: bound.rawSha256,
+      }
+    : null;
+}
 
 export function originalOrdinarySkullEntry(entry) {
   const bound = ordinarySkullEntries.get(entry);
@@ -457,6 +470,14 @@ export function parseNetworkReplay(bytes) {
         ...(n.type === 'noSkullsLeft' ? { singleSkullCaption: n.log } : {}),
       };
       entries.push(entry);
+      if (packet.data.some((n) => n.type === 'pickUpWorker' && n.log === declinedRemovalCaption))
+        chichenDeclineEntries.set(entry, {
+          entry: structuredClone(entry),
+          packetType: packet.packet_type,
+          packetNotificationCount: packet.data.length,
+          tableId,
+          rawSha256,
+        });
       if (n.type === 'gameStateChange' || packet.data.some((e) => e.type === 'noSkullsLeft'))
         ordinarySkullEntries.set(entry, {
           entry: structuredClone(entry),
