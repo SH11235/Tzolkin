@@ -12,6 +12,7 @@ function semanticFixture({
   days = 1,
   amount = 2,
   immediate = false,
+  purchased = false,
   mutateSource = () => {},
 } = {}) {
   const raw = fixture();
@@ -54,9 +55,26 @@ function semanticFixture({
     raw.gameLogs.data.data[4].data.unshift(raw.gameLogs.data.data[2].data[0]);
     raw.gameLogs.data.data.splice(2, 2);
   }
+  if (purchased) {
+    for (const packet of raw.gameLogs.data.data.slice(1)) {
+      packet.packet_id = String(Number(packet.packet_id) + 1);
+      packet.move_id = String(Number(packet.move_id) + 1);
+    }
+    raw.gameLogs.data.data.splice(
+      1,
+      0,
+      packet(2, [n('newWorker', { player_id: owner, player_name: `P${owner}` })]),
+    );
+    raw.gameLogs.data.data[2].data.find((n) => n.type === 'placeWorker').args.worker_id = '4';
+  }
   mutateSource(raw);
   const index = parseNetworkReplay(bytes(raw));
   const initial = {
+    version: 1,
+    additionalBuildings: false,
+    round: 8,
+    foodDays: [],
+    skullSupply: 13,
     turnOrder: [0, 1, 2],
     firstPlayer: 0,
     firstPlayerClaimed: null,
@@ -66,20 +84,35 @@ function semanticFixture({
     phase: 'playing',
     pending: null,
     turn: { mode: 'none', count: 0, begged: false },
-    players: [0, 1, 2].map(() => ({ resources: { corn: 3, wood: 0 } })),
+    players: [0, 1, 2].map((id) => ({
+      workers: purchased && id === actor ? 2 : 1,
+      score: 0,
+      feedAll: false,
+      feedWorkers: 0,
+      feedDiscount: 0,
+      temples: { chaac: -1, quetzalcoatl: -1, kukulkan: -1 },
+      resources: { corn: 3, wood: 0, stone: 0, gold: 0, skull: 0 },
+    })),
   };
   const ledger = {
     accumulatedCorn: amount,
     activePlayer: owner,
     stateId: 4,
     players: Object.fromEntries(
-      ['1', '2', '3'].map((id) => [id, { resources: { corn: 3, wood: 0 } }]),
+      ['1', '2', '3'].map((id) => [
+        id,
+        {
+          workers: purchased && id === owner ? 2 : 1,
+          score: 0,
+          resources: { corn: 3, wood: 0, stone: 0, gold: 0, skull: 0 },
+        },
+      ]),
     ),
     workers: new Map(['1', '2', '3'].map((id) => [id, { id, player: id, place: null }])),
   };
   const comparison = createSemanticComparison({
     index,
-    initialMoveId: 1,
+    initialMoveId: purchased ? 2 : 1,
     initial,
     sourceToNative: new Map([
       ['1', 0],
@@ -91,13 +124,14 @@ function semanticFixture({
   let observation = { actor, legalActions: [] };
   const rows = [];
   function step(i, alter = () => {}) {
-    const group = index.groups[i];
+    const group = index.groups[i + (purchased ? 1 : 0)];
     const context = comparison.begin(group, ledger, native, observation);
     let differences = [],
       applied = [];
     const stage = immediate ? (i === 0 ? 0 : i === 1 ? 3 : 4) : i;
     if (stage === 0) {
-      ledger.workers.get(owner).place = 'startingPlayer';
+      if (purchased) ledger.workers.set('4', { id: '4', player: owner, place: 'startingPlayer' });
+      else ledger.workers.get(owner).place = 'startingPlayer';
       native.firstPlayerClaimed = actor;
     } else if (stage === 1 || stage === 2) {
       native.players[actor].resources.corn = 3 + amount;
@@ -135,6 +169,15 @@ function semanticFixture({
       observation = { actor: next, legalActions: [] };
       applied = [{ actor, action: { type: 'rotate', days } }];
     }
+    if (stage === 4)
+      comparison.applied(context, {
+        before: context.native,
+        after: native,
+        actor,
+        action: { type: 'rotate', days },
+        legalActions: context.observation.legalActions,
+        step: i + 1,
+      });
     const args = { ledger, native, observation, differences, applied, humanDecision: true };
     alter(args, context, group);
     const result = comparison.compare(context, args);
@@ -177,6 +220,188 @@ test('semantic comparison binds zero and immediate receipts without inventing a 
       for (let i = 0; i < (immediate ? 3 : 5); i++) assert.equal(f.step(i).semanticMatch, true);
       assert.equal(f.comparison.finish().allObligationsClosed, true);
     }
+});
+
+test('first observed purchased worker IDs consume owned slots without accepting foreign or duplicate IDs', () => {
+  const good = semanticFixture({ purchased: true });
+  assert.equal(good.step(0).semanticMatch, true);
+  assert.equal(good.rows[0].evidence[0].type, 'firstWorkerIdentity');
+  assert.equal(good.rows[0].evidence[0].previouslyAssigned, 1);
+  assert.equal(good.rows[0].evidence[0].owned, 2);
+  for (const mutateSource of [
+    (raw) => {
+      raw.gameLogs.data.data[1].data[0].args.worker_id = '4';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[1].data[0].args.worker_id = '1';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[1].data.push({ ...raw.gameLogs.data.data[1].data[0], uid: '3001' });
+    },
+  ])
+    assert.equal(semanticFixture({ mutateSource }).step(0).semanticMatch, false);
+  const wrongPurchase = semanticFixture({
+    purchased: true,
+    mutateSource: (raw) => {
+      raw.gameLogs.data.data[1].data[0].args.player_id = '1';
+    },
+  });
+  assert.equal(wrongPurchase.step(0).semanticMatch, false);
+  const wrongCount = semanticFixture({ purchased: true });
+  assert.equal(
+    wrongCount.step(0, (a) => {
+      a.native.players[1].workers = 3;
+    }).semanticMatch,
+    false,
+  );
+});
+
+test('an inline endTurn and rotation bind the actual intermediate legal state', () => {
+  const make = () =>
+    semanticFixture({
+      mutateSource: (raw) => {
+        raw.gameLogs.data.data[4].data.pop();
+        raw.gameLogs.data.data[4].data.push(...raw.gameLogs.data.data[5].data);
+        raw.gameLogs.data.data.pop();
+      },
+    });
+  for (const corrupt of [false, true]) {
+    const f = make();
+    for (let i = 0; i < 3; i++) f.step(i);
+    const result = f.step(3, (a, context) => {
+      const intermediate = structuredClone(a.native);
+      f.comparison.applied(context, {
+        before: context.native,
+        after: intermediate,
+        actor: 2,
+        action: { type: 'endTurn' },
+        legalActions: [{ action: { type: 'endTurn' } }],
+        step: 4,
+      });
+      a.native.pending = null;
+      a.native.firstPlayerClaimed = null;
+      a.native.firstPlayer = 1;
+      a.native.currentPlayer = 1;
+      a.native.turnIndex = 0;
+      a.native.turnOrder = [1, 2, 0];
+      a.ledger.activePlayer = '2';
+      a.ledger.stateId = 4;
+      a.differences = [];
+      a.observation = { actor: 1, legalActions: [] };
+      a.applied = [{ actor: 1, action: { type: 'rotate', days: 1 } }];
+      f.comparison.applied(context, {
+        before: intermediate,
+        after: a.native,
+        actor: corrupt ? 0 : 1,
+        action: { type: 'rotate', days: 1 },
+        legalActions: [{ action: { type: 'rotate', days: 1 } }],
+        step: 5,
+      });
+    });
+    assert.equal(result.semanticMatch, !corrupt);
+    assert.equal(f.comparison.finish().allObligationsClosed, !corrupt);
+  }
+});
+
+function semanticFoodFixture(mutateSource = () => {}) {
+  return semanticFixture({
+    mutateSource: (raw) => {
+      Object.assign(raw.initialState.gamestates, {
+        92: { type: 'game' },
+        93: { type: 'game' },
+        95: { type: 'activeplayer' },
+      });
+      let uid = 4000;
+      const n = (type, args) => ({ uid: String(++uid), type, args, log: '' });
+      const feeding = [n('gameStateChange', { id: 92, active_player: '2' })];
+      for (const id of ['1', '2', '3'])
+        feeding.push(
+          n('payGoods', { player_id: id, type: 'corn', quantity: 2, target: null }),
+          n('foodDayCost', { player_id: id, cost: 2, nbr: 1 }),
+        );
+      feeding.push(
+        n('gameStateChange', { id: 93, active_player: '2' }),
+        n('middleOfAgeRewards', {}),
+        n('takeGoods', {
+          player_id: '2',
+          type: 'wood',
+          quantity: 1,
+          origin: 'temple_kukulcan_step_2',
+        }),
+      );
+      raw.gameLogs.data.data[4].data.splice(3, 0, ...feeding);
+      mutateSource(raw);
+    },
+  });
+}
+
+function completeSemanticFood(f, a, context, corrupt = false) {
+  for (const [index, player] of a.native.players.entries()) {
+    player.resources.corn = index === 1 ? 3 : 1;
+    Object.assign(a.ledger.players[String(index + 1)].resources, player.resources);
+  }
+  a.native.players[1].resources.wood = 1;
+  a.ledger.players['2'].resources.wood = 1;
+  a.native.foodDays = [corrupt ? 14 : 8];
+  f.comparison.applied(context, {
+    before: context.native,
+    after: a.native,
+    actor: 2,
+    action: { type: 'endTurn' },
+    legalActions: [{ action: { type: 'endTurn' } }],
+    step: 4,
+  });
+}
+
+test('corn settles before the actual automatic feeding and temple rewards within one original move', () => {
+  for (const corrupt of [false, true]) {
+    const f = semanticFoodFixture();
+    f.native.players[1].temples.kukulkan = 1;
+    for (let i = 0; i < 3; i++) f.step(i);
+    const result = f.step(3, (a, context) => {
+      completeSemanticFood(f, a, context, corrupt);
+    });
+    assert.equal(result.semanticMatch, !corrupt);
+    if (!corrupt) assert.ok(result.evidence.some((e) => e.type === 'postReceiptFoodDay'));
+  }
+  for (const mutate of [
+    (raw) => {
+      const p = raw.gameLogs.data.data[4];
+      p.data.splice(2, 0, {
+        uid: '4900',
+        type: 'gameStateChange',
+        args: { id: 8, type: 'activeplayer', active_player: '2' },
+        log: '',
+      });
+    },
+    (raw) => {
+      const p = raw.gameLogs.data.data[4];
+      p.data.splice(
+        -1,
+        0,
+        {
+          uid: '4901',
+          type: 'takeGoods',
+          args: { player_id: '2', type: 'wood', quantity: 1, origin: 'building_age_1_b43' },
+          log: '',
+        },
+        {
+          uid: '4902',
+          type: 'payGoods',
+          args: { player_id: '2', type: 'wood', quantity: 1, target: null },
+          log: '',
+        },
+      );
+    },
+  ]) {
+    const f = semanticFoodFixture(mutate);
+    f.native.players[1].temples.kukulkan = 1;
+    for (let i = 0; i < 3; i++) f.step(i);
+    assert.equal(
+      f.step(3, (a, context) => completeSemanticFood(f, a, context)).semanticMatch,
+      false,
+    );
+  }
 });
 
 test('semantic comparison proves an unchanged cancellation but rejects ownership and payment effects', () => {

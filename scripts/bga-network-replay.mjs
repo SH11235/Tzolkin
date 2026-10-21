@@ -1318,6 +1318,7 @@ export function replayNetworkPrefix(
     initial,
     sourceToNative,
   });
+  let semanticContext = null;
   function applyWhere(
     predicate,
     reason,
@@ -1327,6 +1328,7 @@ export function replayNetworkPrefix(
     const rows = actions().filter((row) => predicate(row.action));
     const actor = frame.observation.actor,
       preState = native();
+    const legalActions = actions();
     const apply = (row) => {
       if (++calls > 4000) fail('native call bound');
       return dispatch({
@@ -1352,6 +1354,14 @@ export function replayNetworkPrefix(
       response = apply(row);
     }
     if (response.error) fail(response.error);
+    semanticComparison.applied(semanticContext, {
+      before: preState,
+      after: response.snapshot.state,
+      actor,
+      action: row.action,
+      legalActions,
+      step: record.steps.length + 1,
+    });
     trackRewardQueues(
       openRewardFences,
       preState.pending,
@@ -1426,7 +1436,7 @@ export function replayNetworkPrefix(
   }
   for (const group of index.groups.filter((g) => g.moveId > initialMoveId)) {
     current = group;
-    const semanticContext = semanticComparison.begin(group, ledger, native(), frame.observation);
+    semanticContext = semanticComparison.begin(group, ledger, native(), frame.observation);
     const sourceBeforeGroup = {
       initial: ledger.initial,
       stateId: ledger.stateId,

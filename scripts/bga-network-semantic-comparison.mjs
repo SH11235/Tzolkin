@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
+import { provePostReceiptFood } from './bga-network-semantic-feeding.mjs';
 
 const clone = structuredClone;
 const sourceId = (entry) => String(entry.args.player_id);
@@ -13,6 +14,14 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
   const sequence = originalNetworkSequence(index);
   const remaining = sequence?.groups.filter(({ group }) => group.moveId > initialMoveId) ?? [];
   const mapping = new Map(sourceToNative);
+  const workers = new Map(index.initial.workers.map((w) => [String(w.id), clone(w)]));
+  const owned = new Map(
+    [...mapping.keys()].map((id) => [
+      id,
+      index.initial.workers.filter((w) => String(w.player) === id).length,
+    ]),
+  );
+  const purchases = new Map([...mapping.keys()].map((id) => [id, []]));
   let cursor = 0;
   let order = clone(initial.turnOrder);
   let sourcePool = Number(index.initial.cornOnWheel);
@@ -20,6 +29,11 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
     for (const n of group.entries) {
       if (n.type === 'cornOnWheel') sourcePool++;
       if (n.type === 'firstPlayer') sourcePool = 0;
+      if (n.type === 'newWorker') {
+        const id = sourceId(n);
+        owned.set(id, owned.get(id) + 1);
+        purchases.get(id)?.push(reference(n));
+      }
     }
   let claim = null;
   let failure = sequence ? null : 'original notification sequence is not bound';
@@ -47,7 +61,12 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       source: clone(ledger),
       native: clone(native),
       observation: clone(observation),
+      transitions: [],
     };
+  }
+  function applied(context, transition) {
+    if (['rotate', 'endTurn'].includes(transition.action.type))
+      context.transitions.push(clone(transition));
   }
   function compare(context, { ledger, native, observation, differences, applied, humanDecision }) {
     const { group, source: beforeSource, native: before, observation: priorObservation } = context;
@@ -56,6 +75,56 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       reject('original notification group changed during its native transition');
     const allowed = new Set();
     const evidence = [];
+    const placements = new Map();
+    for (const entry of entries) {
+      const id = sourceId(entry),
+        workerId = String(entry.args.worker_id);
+      if (entry.type === 'newWorker') {
+        if (!publicEntry(entry) || !owned.has(id) || owned.get(id) >= 6)
+          reject('new worker lacks a public original purchase or exceeds ownership');
+        else {
+          owned.set(id, owned.get(id) + 1);
+          purchases.get(id).push(reference(entry));
+        }
+      } else if (entry.type === 'placeWorker') {
+        const known = workers.get(workerId);
+        const assigned = [...workers.values()].filter((w) => String(w.player) === id).length;
+        if (
+          !publicEntry(entry) ||
+          !owned.has(id) ||
+          !/^[1-9]\d*$/.test(workerId) ||
+          (known ? String(known.player) !== id || known.place !== null : owned.get(id) <= assigned)
+        )
+          reject('worker identity lacks an unassigned owned slot or is already occupied');
+        else {
+          const binding = {
+            source: reference(entry),
+            workerId,
+            owner: id,
+            firstObservation: !known,
+            owned: owned.get(id),
+            previouslyAssigned: assigned,
+            purchases: clone(purchases.get(id)),
+          };
+          placements.set(entry, binding);
+          workers.set(workerId, {
+            id: workerId,
+            player: id,
+            place: entry.args.place,
+            position: Number(entry.args.position),
+          });
+          if (!known) evidence.push({ type: 'firstWorkerIdentity', ...binding });
+        }
+      } else if (entry.type === 'pickUpWorker' && workers.has(workerId)) {
+        workers.get(workerId).place = null;
+        workers.get(workerId).position = null;
+      } else if (entry.type === 'rotateWheel') {
+        for (const worker of entry.args.workers) workers.set(String(worker.id), clone(worker));
+      }
+    }
+    for (const [id, count] of owned)
+      if (ledger.players[id].workers !== count || native.players[mapping.get(id)].workers !== count)
+        reject('original purchases do not match complete source and native worker counts');
     if (beforeSource.accumulatedCorn !== sourcePool)
       reject('central corn is not derived from the original notification sequence');
     const claims = entries.filter(
@@ -65,14 +134,12 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       const entry = claims[0],
         owner = sourceId(entry),
         actor = mapping.get(owner);
-      const worker = beforeSource.workers.get(String(entry.args.worker_id));
+      const workerBinding = placements.get(entry);
       if (
         claims.length !== 1 ||
         !publicEntry(entry) ||
         claim ||
-        !worker ||
-        worker.place !== null ||
-        String(worker.player) !== owner ||
+        !workerBinding ||
         before.firstPlayerClaimed !== null ||
         priorObservation.actor !== actor ||
         native.firstPlayerClaimed !== actor ||
@@ -99,6 +166,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           markerOpen: false,
           closed: false,
           receipt: null,
+          workerBinding,
         };
         obligations.push(claim);
       }
@@ -158,7 +226,8 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       ) {
         c.cornOpen = true;
         c.cornStartMoveId = group.moveId;
-        c.nativeResources = clone(native.players[c.owner].resources);
+        c.nativeResources = clone(before.players[c.owner].resources);
+        if (before.accumulatedCorn === c.amount) c.nativeResources.corn += c.amount;
       }
       if (c.cornOpen && !c.cornClosed) {
         if (
@@ -166,7 +235,24 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           (observation.actor === c.owner || mapping.get(ledger.activePlayer) === c.owner)
         )
           reject('claimant can act before the delayed corn receipt');
-        if (!isDeepStrictEqual(native.players[c.owner].resources, c.nativeResources))
+        const followingFood = receipts.length
+          ? provePostReceiptFood({
+              index,
+              group,
+              receipt: receipts[0],
+              claim: c,
+              beforeSource,
+              before,
+              ledger,
+              native,
+              transitions: context.transitions,
+              sourceToNative: mapping,
+            })
+          : null;
+        if (
+          !isDeepStrictEqual(native.players[c.owner].resources, c.nativeResources) &&
+          !followingFood
+        )
           reject('claimant resources changed during delayed corn receipt');
         const ownership = ledger.workers.get(c.worker);
         if (
@@ -176,7 +262,10 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           !receipts.length
         )
           reject('starting-player ownership changed before corn settlement');
-        if (entries.some((n) => sourceId(n) === c.sourceOwner && n.type === 'payGoods'))
+        if (
+          entries.some((n) => sourceId(n) === c.sourceOwner && n.type === 'payGoods') &&
+          !followingFood
+        )
           reject('claimant paid resources before corn settlement');
         const unexpected = entries.some(
           (n) =>
@@ -191,9 +280,11 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
               'construct',
               'updateScore',
             ].includes(n.type) &&
-            !(receipts.length === 1 && credits.includes(n)),
+            !(receipts.length === 1 && credits.includes(n)) &&
+            !(followingFood && group.entries.indexOf(n) > group.entries.indexOf(receipts[0])),
         );
         if (unexpected) reject('claimant received an unrelated effect before corn settlement');
+        if (followingFood) evidence.push(followingFood);
         if (entries.some((n) => n.type === 'undoRestoreDISAB')) {
           const onlyCaption =
             entries.length === 1 &&
@@ -213,7 +304,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
             credit = credits[0];
           if (
             receipts.length !== 1 ||
-            credits.length !== 1 ||
+            (followingFood ? credits.length < 1 : credits.length !== 1) ||
             sourceId(receipt) !== c.sourceOwner ||
             Number(receipt.args.corn) !== c.amount ||
             Number(credit.args.quantity) !== c.amount ||
@@ -287,16 +378,22 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       }
       if (rotation.length) {
         const selected = applied.filter((row) => row.action?.type === 'rotate');
+        const transitions = context.transitions.filter((row) => row.action.type === 'rotate');
+        const transition = transitions[0];
         const offset = order.indexOf(c.nextStarter);
         const nextOrder = [...order.slice(offset), ...order.slice(0, offset)];
         if (
           rotation.length !== 1 ||
           selected.length !== 1 ||
+          transitions.length !== 1 ||
           selected[0].actor !== c.owner ||
           selected[0].action.days !== 1 + rotation[0].args.twice ||
-          before.pending?.task.type !== 'rotation' ||
-          priorObservation.actor !== c.owner ||
-          !priorObservation.legalActions.some(
+          transition.before.pending?.task.type !== 'rotation' ||
+          transition.actor !== c.owner ||
+          transition.before.firstPlayerClaimed !== c.owner ||
+          !isDeepStrictEqual(transition.before.turnOrder, order) ||
+          !isDeepStrictEqual(transition.after, native) ||
+          !transition.legalActions.some(
             (row) => row.action.type === 'rotate' && row.action.days === selected[0].action.days,
           ) ||
           native.firstPlayerClaimed !== null ||
@@ -310,6 +407,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           reject('rotation does not close the original claimant and next-round order');
         } else {
           c.closed = true;
+          c.rotationTransition = clone(transition);
           c.closedMoveId = group.moveId;
           evidence.push({
             type: 'roundClosure',
@@ -373,5 +471,5 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       teacherCertified: false,
     };
   }
-  return { begin, compare, finish };
+  return { begin, applied, compare, finish };
 }
