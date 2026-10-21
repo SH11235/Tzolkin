@@ -39,6 +39,20 @@ const ordinarySkullEntries = new WeakMap();
 const chichenDeclineEntries = new WeakMap();
 const ageTwoRefillEntries = new WeakMap();
 const packetEntries = new WeakMap();
+const originalSequences = new WeakMap();
+
+export function originalNetworkSequence(index) {
+  const bound = originalSequences.get(index);
+  if (!bound || !isDeepStrictEqual(index, bound.snapshot)) return null;
+  return {
+    rawSha256: index.rawSha256,
+    groups: index.groups.map((group, ordinal) => ({
+      group,
+      ordinal,
+      original: structuredClone(bound.snapshot.groups[ordinal]),
+    })),
+  };
+}
 export function originalPacketEntry(entry) {
   const b = packetEntries.get(entry);
   return b && isDeepStrictEqual(entry, b.entry)
@@ -595,7 +609,7 @@ export function parseNetworkReplay(bytes) {
     if (groups.at(-1)?.moveId !== n.moveId) groups.push({ moveId: n.moveId, entries: [] });
     groups.at(-1).entries.push(n);
   }
-  return {
+  const index = {
     schema: 'tzolkin-bga-network-index-v1',
     rawSha256,
     tableId,
@@ -610,6 +624,8 @@ export function parseNetworkReplay(bytes) {
     ...(clockCaptionEntries.length ? { clockCaptionEntries } : {}),
     groups,
   };
+  originalSequences.set(index, { snapshot: structuredClone(index) });
+  return index;
 }
 
 /** A null source owner denotes a neutral gear worker, never an additional seat. */
