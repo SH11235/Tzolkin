@@ -4982,6 +4982,115 @@ fn observed_primitive_conditional_inputs_and_preserved_heldout_split() {
     assert!(fixture.load().is_err()); // A malformed supplied id cannot be bypassed.
 }
 
+fn current_dom_without_table_link() -> Fixture {
+    let mut fixture = Fixture::new();
+    fixture.raw["schema_version"] = json!(1);
+    fixture.raw["source_type"] = json!("public_ui_dom");
+    fixture.raw["export_scope"] = json!("all_rendered_gamereview_log_entries");
+    fixture.raw["dom_entry_count"] = json!(1);
+    fixture.raw["metadata"] = json!({"players":[
+        {"name":"P0","id":"101"},{"name":"P1","id":"102"},{"name":"P2","id":"103"}]});
+    fixture.raw["entries"][0]["raw_text"] = json!(format!(
+        "行動 10 :\n12:00\n{}",
+        fixture.raw["dom_entries"][0]["messages"][0]["raw_text"]
+            .as_str()
+            .unwrap()
+    ));
+    fixture
+}
+
+#[test]
+fn current_dom_absent_table_link_keeps_strict_gamereview_and_existing_labels() {
+    let mut fixture = current_dom_without_table_link();
+    let absent = fixture.load().unwrap();
+    assert_eq!(absent.samples().len(), 1);
+    for host in [
+        "boardgamearena.com",
+        "ja.boardgamearena.com",
+        "en.boardgamearena.com",
+    ] {
+        fixture.raw["metadata"]["tableUrl"] = json!(format!("https://{host}/table?table=123"));
+        let present = fixture.load().unwrap();
+        assert_eq!(
+            serde_json::to_vec(present.samples()).unwrap(),
+            serde_json::to_vec(absent.samples()).unwrap()
+        );
+    }
+    fixture.raw["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tableUrl");
+    for host in [
+        "boardgamearena.com",
+        "ja.boardgamearena.com",
+        "en.boardgamearena.com",
+    ] {
+        fixture.raw["source_url"] = json!(format!("https://{host}/gamereview?table=123"));
+        fixture.record["source"]["reference"] = fixture.raw["source_url"].clone();
+        assert_eq!(fixture.load().unwrap().samples().len(), 1);
+    }
+}
+
+#[test]
+fn current_dom_missing_link_never_overrides_present_invalid_or_other_source_bindings() {
+    let mut fixture = current_dom_without_table_link();
+    for value in [
+        Value::Null,
+        json!(false),
+        json!(123),
+        json!([]),
+        json!({}),
+        json!(""),
+        json!("https://boardgamearena.com/table?table=124"),
+        json!("https://boardgamearena.com/gamereview?table=123"),
+        json!("https://boardgamearena.com/table?table=123&table=123"),
+        json!("https://boardgamearena.com/table?table=123#"),
+        json!("https://boardgamearena.com.evil.example/table?table=123"),
+    ] {
+        fixture.raw["metadata"]["tableUrl"] = value;
+        assert!(fixture.load().is_err());
+    }
+    fixture.raw["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tableUrl");
+    for value in [
+        "https://boardgamearena.com/gamereview?table=124",
+        "http://boardgamearena.com/gamereview?table=123",
+        "https://boardgamearena.com.evil.example/gamereview?table=123",
+        "https://user@boardgamearena.com/gamereview?table=123",
+        "https://boardgamearena.com/table?table=123",
+        "https://boardgamearena.com/gamereview?table=123&extra=1",
+        "https://boardgamearena.com/gamereview?table=123&table=123",
+        "https://boardgamearena.com/gamereview?table=123#",
+    ] {
+        fixture.raw["source_url"] = json!(value);
+        fixture.record["source"]["reference"] = json!(value);
+        assert!(fixture.load().is_err());
+    }
+    let mut fixture = current_dom_without_table_link();
+    fixture.record["source"]["reference"] =
+        json!("https://boardgamearena.com/gamereview?table=124");
+    assert!(fixture.load().is_err());
+    let mut fixture = current_dom_without_table_link();
+    fixture.raw["table_id"] = json!("124");
+    assert!(fixture.load().is_err());
+    for (field, value) in [
+        ("schema_version", json!("1.0")),
+        ("source_type", json!("public_ui_visible_log")),
+        ("export_scope", json!("all_observed_log_entries")),
+    ] {
+        let mut fixture = current_dom_without_table_link();
+        fixture.raw[field] = value;
+        assert!(fixture.load().is_err());
+    }
+    for field in ["name", "id"] {
+        let mut fixture = current_dom_without_table_link();
+        fixture.raw["metadata"]["players"][0][field] = json!("mismatch");
+        assert!(fixture.load().is_err());
+    }
+}
+
 #[test]
 fn factorized_current_gear_actions_are_opt_in_and_remain_source_paired() {
     for removed_position in [1, 2] {

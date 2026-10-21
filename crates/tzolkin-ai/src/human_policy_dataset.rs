@@ -786,13 +786,11 @@ fn roster(raw: &Value, record: &PublicReplayRecord, table: &str) -> Result<Vec<S
     let current = raw["schema_version"] == 1
         && raw["source_type"] == "public_ui_dom"
         && raw["export_scope"] == "all_rendered_gamereview_log_entries"
-        && url_identity(
-            string(&raw["metadata"], "tableUrl").unwrap_or(""),
-            "table",
-            "table",
-        )
-        .ok()
-            == Some(table);
+        && raw["metadata"].get("tableUrl").is_none_or(|value| {
+            value
+                .as_str()
+                .is_some_and(|url| url_identity(url, "table", "table").ok() == Some(table))
+        });
     if (!legacy && !current)
         || raw["table_id"] != table
         || url_identity(string(raw, "source_url")?, "gamereview", "table")? != table
