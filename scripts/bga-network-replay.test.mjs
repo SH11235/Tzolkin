@@ -3891,6 +3891,285 @@ test('ordinary observed stages bind chosen actors, targets, amounts, costs and s
   }
 });
 
+function emptyPaidTechnologyFixture(mutateRaw = () => {}, mutateContext = () => {}) {
+  const raw = fixture();
+  Object.assign(raw.initialState.gamestates, {
+    7: {
+      name: 'pickUpWorker',
+      type: 'activeplayer',
+      possibleactions: ['pickUpWorker', 'endTurn', 'undo'],
+    },
+    9: {
+      name: 'solveStackedAction',
+      type: 'game',
+      action: 'stSolveStackedAction',
+      transitions: { stackEmpty: 7 },
+    },
+    31: {
+      name: 'technologyUpgrade',
+      type: 'activeplayer',
+      args: 'argTechnologyUpgrade',
+      possibleactions: ['chooseTechnology', 'pass'],
+      transitions: { nextAction: 9 },
+    },
+    90: { type: 'game' },
+    99: { type: 'manager' },
+  });
+  let serial = 0;
+  const state = (id, args, type = 'activeplayer') => ({
+    uid: `empty-menu-${serial++}`,
+    type: 'gameStateChange',
+    log: '',
+    args: { id, active_player: '1', args, type },
+  });
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  const workers = {
+    workers: { 1: { id: '1', place: 'uxmal', position: '1', actions: { uxmal: { 1: 0 } } } },
+  };
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [state(31, { technologies: [], resources: { wood: 0, stone: 0, gold: 0 } })]),
+    packet(3, [state(9, null, 'game'), state(7, workers)]),
+    packet(4, [state(90, [], 'game'), state(99, [], 'manager')]),
+  ];
+  mutateRaw(raw);
+  const index = parseNetworkReplay(bytes(raw)),
+    groups = index.groups;
+  const menu = groups.find((g) => g.moveId === 2),
+    exit = groups.find((g) => g.moveId === 3),
+    end = groups.find((g) => g.moveId === 4);
+  const before = structuredClone(observedChoiceFixture(31).operation.before);
+  before.currentPlayer = 0;
+  before.additionalBuildings = false;
+  before.turn = { mode: 'remove', count: 1, begged: false };
+  before.gears = { uxmal: [null, { playerId: 0, dummy: false }] };
+  before.pending = {
+    title: 'technology',
+    task: { type: 'technology', remaining: 1, free: false },
+    after: [],
+  };
+  for (const r of ['wood', 'stone', 'gold']) before.players[0].resources[r] = 0;
+  const after = structuredClone(before);
+  after.pending = null;
+  const finished = structuredClone(after);
+  finished.phase = 'finished';
+  const skip = { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
+    endRow = { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } };
+  const args = menu.entries.at(-1).args.args;
+  const initialBoundary = {
+    moveId: 2,
+    stateId: 31,
+    name: index.initial.gamestates[31].name,
+    args,
+    actor: 0,
+    sourceActor: '1',
+    pending: before.pending,
+    legalRows: [skip],
+  };
+  const sourceBefore = { initial: index.initial, stateId: 31, activePlayer: '1', stateArgs: args };
+  const sourceAfter = { initial: index.initial, stateId: 7, activePlayer: '1', stateArgs: workers };
+  const operation = {
+    entry: exit.entries.at(-1),
+    row: skip,
+    actor: 0,
+    observationActor: 0,
+    sourceActor: '1',
+    legalRows: [skip],
+    before,
+    after,
+    step: 1,
+    equivalentRows: [],
+  };
+  const context = {
+    index,
+    initialMoveId: 2,
+    sourceToNative: new Map([['1', 0]]),
+    mapCard: (c) => c.native,
+    initialBoundary,
+    before,
+    after,
+    operation,
+    sourceBefore,
+    sourceAfter,
+  };
+  mutateContext(context);
+  const boundary = (group, native, rows) => {
+    const n = group.entries.findLast((n) => n.type === 'gameStateChange');
+    return {
+      moveId: group.moveId,
+      potentialHumanDecision: n.args.type === 'activeplayer',
+      sourceStateId: n.args.id,
+      sourceActor: n.args.active_player,
+      sourceMenu: n.args.args,
+      nativeActor: 0,
+      nativePending: native.pending,
+      nativeLegalActions: rows,
+    };
+  };
+  const choices = createObservedChoices(context);
+  choices.observe({
+    group: exit,
+    before,
+    after,
+    operations: [operation],
+    boundary: boundary(exit, after, [endRow]),
+    audit: [],
+    publicResultMatched: true,
+    sourceBefore,
+    sourceAfter,
+  });
+  choices.observe({
+    group: end,
+    before: after,
+    after: finished,
+    operations: [
+      {
+        entry: end.entries[0],
+        row: endRow,
+        actor: 0,
+        observationActor: 0,
+        sourceActor: '1',
+        legalRows: [endRow],
+        before: after,
+        after: finished,
+        step: 2,
+        equivalentRows: [],
+      },
+    ],
+    boundary: boundary(end, finished, []),
+    audit: [],
+    publicResultMatched: true,
+  });
+  return choices.finish();
+}
+
+test('explicit empty paid-technology menu closes only through its original unchanged structural exit', () => {
+  const proof = emptyPaidTechnologyFixture(),
+    choice = proof.boundaries.find((b) => b.moveId === 2);
+  assert.equal(proof.allObservedChoicesMatched, true);
+  assert.equal(choice.kind, 'emptyPaidTechnologyExit');
+  assert.equal(choice.emptyPaidTechnologyExit.structuralPassExit, true);
+  assert.equal(choice.emptyPaidTechnologyExit.humanClickObserved, false);
+  assert.equal(choice.emptyPaidTechnologyExit.publicStateUnchanged, true);
+  assert.deepEqual(choice.emptyPaidTechnologyExit.budget, { wood: 0, stone: 0, gold: 0 });
+  const objectMenu = emptyPaidTechnologyFixture((raw) => {
+    raw.gameLogs.data.data[1].data[0].args.args.technologies = {};
+  });
+  assert.equal(objectMenu.allObservedChoicesMatched, true);
+  assert.equal(objectMenu.boundaries.find((b) => b.moveId === 2).kind, 'observedLegalSelection');
+});
+
+test('empty paid-menu proof rejects absent budgets, unsupported menus and unbound native rights', () => {
+  for (const value of [undefined, null, ['agriculture']]) {
+    const p = emptyPaidTechnologyFixture((raw) => {
+      raw.gameLogs.data.data[1].data[0].args.args.technologies = value;
+    });
+    assert.equal(p.boundaries.find((b) => b.moveId === 2).verified, false);
+  }
+  for (const mutate of [
+    (raw) => {
+      delete raw.gameLogs.data.data[1].data[0].args.args.resources;
+    },
+    (raw) => {
+      raw.gameLogs.data.data[1].data[0].args.args.resources.wood = 1;
+    },
+    (raw) => {
+      raw.gameLogs.data.data[1].data[0].args.args.resources.gold = undefined;
+    },
+    (raw) => {
+      raw.initialState.gamestates[31].name = 'unknown';
+    },
+  ])
+    assert.equal(
+      emptyPaidTechnologyFixture(mutate).boundaries.find((b) => b.moveId === 2).verified,
+      false,
+    );
+  for (const mutate of [
+    (c) => {
+      c.before.pending.task.free = true;
+    },
+    (c) => {
+      c.before.pending.task.remaining = 2;
+    },
+    (c) => {
+      c.initialBoundary.sourceActor = '2';
+    },
+    (c) => {
+      c.operation.sourceActor = '2';
+    },
+    (c) => {
+      c.operation.legalRows.push({
+        action: { type: 'technology', technology: 'agriculture' },
+        move: { type: 'choose', choiceId: 'technology:agriculture' },
+      });
+    },
+    (c) => {
+      c.before.players[0].resources.wood = 1;
+      c.after.players[0].resources.wood = 1;
+    },
+    (c) => {
+      c.after.pending = structuredClone(c.before.pending);
+    },
+    (c) => {
+      c.after.turn.count++;
+    },
+  ])
+    assert.equal(
+      emptyPaidTechnologyFixture(() => {}, mutate).boundaries.find((b) => b.moveId === 2).verified,
+      false,
+    );
+});
+
+test('empty paid-menu proof refuses missing exits, same-state stays and intervening original effects', () => {
+  for (const mutate of [
+    (raw) => raw.gameLogs.data.data[2].data.shift(),
+    (raw) => {
+      raw.gameLogs.data.data[2].data.at(-1).args.id = 31;
+    },
+    (raw) => {
+      raw.gameLogs.data.data[2].data.at(-1).args.active_player = '2';
+    },
+    (raw) =>
+      raw.gameLogs.data.data[2].data.unshift({
+        uid: 'extra-tech',
+        type: 'increaseTechnology',
+        log: '',
+        args: { player_id: '1', technology_id: 'agriculture', level: 1 },
+      }),
+    (raw) =>
+      raw.gameLogs.data.data[2].data.unshift({
+        uid: 'extra-pay',
+        type: 'payGoods',
+        log: '',
+        args: {
+          player_id: '1',
+          type: 'wood',
+          quantity: 1,
+          target: 'technology_agriculture_level_1',
+        },
+      }),
+    (raw) =>
+      raw.gameLogs.data.data[2].data.unshift({
+        uid: 'extra-cancel',
+        type: 'undoRestoreDISAB',
+        log: '',
+        args: { player_name: 'A' },
+      }),
+  ])
+    assert.equal(
+      emptyPaidTechnologyFixture(mutate).boundaries.find((b) => b.moveId === 2).verified,
+      false,
+    );
+});
+
 test('explicit null construction arguments preserve selected full costs and disabled architecture', () => {
   const f = observedChoiceFixture(70);
   f.boundary.args = null;
