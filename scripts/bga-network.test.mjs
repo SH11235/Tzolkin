@@ -17,11 +17,281 @@ import {
   bindSingleSkullOutcome,
 } from './bga-network-awards.mjs';
 import { readFileSync } from 'node:fs';
+import { sourceBurnHarvestWitness, bindBurnHarvestOutcome } from './bga-network-harvest.mjs';
 import {
   finalScoringWitness,
   bindFinalScoringProjections,
   assertFinalScoringResolutionGroup,
 } from './bga-network-final-scoring.mjs';
+
+function burnHarvestFixture(mutate = () => {}) {
+  const raw = fixture();
+  let uid = 1000;
+  const n = (type, args, log = '') => ({ uid: String(++uid), type, args, log });
+  const state = (id, args, type) => n('gameStateChange', { id, active_player: '1', args, type });
+  const packet = (move_id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(move_id + 10),
+    packet_type: 'resend',
+    move_id,
+    time: '1',
+    data,
+  });
+  raw.gameLogs.data.data.push(
+    packet(6, [
+      n(
+        'pickUpWorker',
+        {
+          player_id: '1',
+          player_name: 'P1',
+          worker_id: '1',
+          city: 'Palenque',
+          position: '3',
+          action_number: '3',
+        },
+        '${player_name} picks up a worker in ${city} (position ${position}) and plays action n°${action_number}',
+      ),
+      state(9, null, 'game'),
+      state(
+        10,
+        {
+          corn: 5,
+          wood: 3,
+          can_burn: true,
+          corn_tile_available: false,
+          agriculture_level_2: false,
+          temples: { chaac: '2', quetzalcoatl: '1', kukulcan: '1' },
+        },
+        'activeplayer',
+      ),
+    ]),
+  );
+  raw.gameLogs.data.data.push(
+    packet(7, [
+      n('takeTile', {
+        player_id: null,
+        player_name: '',
+        type: 'wood_tile',
+        action: '3',
+        tile_number: '1',
+      }),
+      n(
+        'alterTemple',
+        { player_id: '1', player_name: 'P1', temple_id: 'chaac', temple: 'Chaac', step: 1 },
+        '${player_name} burn the forest and move down 1 step in ${temple} temple',
+      ),
+      n(
+        'takeTile',
+        {
+          player_id: '1',
+          player_name: 'P1',
+          i18n: ['name'],
+          name: 'corn',
+          type: 'corn_tile',
+          action: '3',
+          tile_number: '1',
+        },
+        '${player_name} takes a ${name} tile',
+      ),
+      n(
+        'takeGoods',
+        {
+          player_id: '1',
+          player_name: 'P1',
+          type: 'corn',
+          quantity: 5,
+          origin: 'action_palenque_3',
+          resources: 'corn',
+        },
+        '${player_name} takes ${resources}',
+      ),
+      state(9, null, 'game'),
+      state(7, { workers: [] }, 'activeplayer'),
+    ]),
+  );
+  mutate(raw);
+  const index = parseNetworkReplay(bytes(raw));
+  const before = {
+    currentPlayer: 0,
+    players: [
+      {
+        resources: { corn: 3 },
+        technologies: { agriculture: 0 },
+        cornTiles: 0,
+        woodTiles: 0,
+        temples: { chaac: 1, quetzalcoatl: 0, kukulkan: 0 },
+      },
+    ],
+    jungle: { 3: { corn: 1, wood: 1 } },
+    pending: { title: 'Harvest', task: { type: 'palenque', position: 3 }, after: [] },
+    marker: 0,
+  };
+  const move = { type: 'choose', choiceId: 'burn' };
+  const input = {
+    index,
+    group: index.groups.at(-1),
+    before,
+    observation: {
+      actor: 0,
+      legalActions: [{ action: { type: 'harvest', kind: 'burn', position: 3 }, move }],
+    },
+    ledger: {
+      stateId: 10,
+      activePlayer: '1',
+      players: { 1: {} },
+      workers: new Map([['1', { player: '1' }]]),
+      jungle: structuredClone(before.jungle),
+    },
+    sourceToNative: new Map([['1', 0]]),
+    sourceStateMatched: true,
+    unresolvedTiming: false,
+  };
+  const middleState = structuredClone(before);
+  middleState.players[0].resources.corn += 5;
+  middleState.players[0].cornTiles++;
+  middleState.jungle[3] = { corn: 0, wood: 0 };
+  middleState.pending = {
+    title: 'Penalty',
+    task: { type: 'temple', remaining: 1, direction: -1, reason: 'burn' },
+    after: [],
+  };
+  const penaltyMove = { type: 'choose', choiceId: 'temple:chaac' };
+  const middle = {
+    snapshot: { state: middleState },
+    observation: {
+      actor: 0,
+      legalActions: [
+        { action: { type: 'temple', temple: 'chaac', direction: -1 }, move: penaltyMove },
+      ],
+    },
+  };
+  const after = structuredClone(middleState);
+  after.pending = null;
+  after.players[0].temples.chaac--;
+  const steps = [move, penaltyMove].map((move) => ({
+    actor: 0,
+    move: structuredClone(move),
+    sourceActionIds: [7],
+    refills: { currentAge: [], age2: [] },
+  }));
+  return { input, middle, after, steps };
+}
+
+test('burn harvest binds the null discarded tile and named penalty as one original operation', () => {
+  const f = burnHarvestFixture(),
+    proof = sourceBurnHarvestWitness(f.input);
+  assert.equal(proof.sourceId, '1');
+  assert.equal(
+    bindBurnHarvestOutcome(proof, f.input.before, f.middle, f.after, f.steps)
+      .intermediateObservationCertified,
+    false,
+  );
+  for (const field of ['sourceStateMatched', 'unresolvedTiming']) {
+    const held = burnHarvestFixture();
+    held.input[field] = field === 'unresolvedTiming';
+    assert.equal(sourceBurnHarvestWitness(held.input), null);
+  }
+});
+
+test('burn harvest refuses unbound, reordered or contradictory original receipts', () => {
+  for (const mutate of [
+    (r) => {
+      r.gameLogs.data.data.at(-1).packet_type = 'history';
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data[1].log = 'unknown effect';
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data[2].args.player_id = '2';
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data[3].args.quantity = 6;
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data[0].args.type = 'corn_tile';
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data[0].args.tile_number = '2';
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data[1].args.step = 0;
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data.reverse();
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data.pop();
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-1).data.push({
+        uid: 'extra',
+        type: 'takeGoods',
+        log: '',
+        args: { player_id: '1', type: 'gold', quantity: 1 },
+      });
+    },
+    (r) => {
+      r.gameLogs.data.data.at(-2).data[0].args.player_id = '2';
+    },
+  ])
+    assert.throws(() => sourceBurnHarvestWitness(burnHarvestFixture(mutate).input));
+  for (const mutate of [
+    (f) => {
+      f.input.group = structuredClone(f.input.group);
+    },
+    (f) => {
+      f.input.before.pending.after = [{ type: 'resource' }];
+    },
+    (f) => {
+      f.input.observation.legalActions.push(structuredClone(f.input.observation.legalActions[0]));
+    },
+    (f) => {
+      f.input.group.entries[1].args.step = 0;
+    },
+    (f) => {
+      f.input.ledger.workers.get('1').player = '2';
+    },
+  ]) {
+    const f = burnHarvestFixture();
+    mutate(f);
+    assert.throws(() => sourceBurnHarvestWitness(f.input));
+  }
+});
+
+test('burn harvest refuses changed native intermediate, penalty, source or unrelated state', () => {
+  for (const mutate of [
+    (f) => {
+      f.middle.snapshot.state.players[0].woodTiles++;
+    },
+    (f) => {
+      f.middle.snapshot.state.pending.task.remaining = 2;
+    },
+    (f) => {
+      f.after.players[0].resources.corn++;
+    },
+    (f) => {
+      f.after.marker++;
+    },
+    (f) => {
+      f.after.players[0].temples.chaac++;
+    },
+    (f) => {
+      f.steps[1].sourceActionIds = [8];
+    },
+    (f) => {
+      f.steps[1].move.choiceId = 'temple:quetzalcoatl';
+    },
+    (f) => {
+      f.middle.observation.legalActions.push(structuredClone(f.middle.observation.legalActions[0]));
+    },
+  ]) {
+    const f = burnHarvestFixture(),
+      proof = sourceBurnHarvestWitness(f.input);
+    mutate(f);
+    assert.throws(() => bindBurnHarvestOutcome(proof, f.input.before, f.middle, f.after, f.steps));
+  }
+});
 
 function finalScoreFixture(mutate = () => {}) {
   const raw = fixture();

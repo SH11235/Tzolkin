@@ -33,6 +33,14 @@ const REVIEWED_CLIENT_PAIRS = new Set([
 ]);
 const validatedContracts = new WeakSet();
 const finalScoringCaptions = new WeakMap();
+const harvestEntries = new WeakMap();
+
+export function originalHarvestEntry(entry) {
+  const bound = harvestEntries.get(entry);
+  return bound && isDeepStrictEqual(entry, bound.entry)
+    ? { caption: bound.caption, packetType: bound.packetType }
+    : null;
+}
 
 export function originalFinalScoringCaption(entry) {
   const bound = finalScoringCaptions.get(entry);
@@ -427,6 +435,18 @@ export function parseNetworkReplay(bytes) {
         ...(n.type === 'noSkullsLeft' ? { singleSkullCaption: n.log } : {}),
       };
       entries.push(entry);
+      if (
+        packet.data.some(
+          (e) =>
+            (e.type === 'takeTile' && e.args?.player_id === null) ||
+            (e.type === 'gameStateChange' && Number(e.args?.id) === 10),
+        )
+      )
+        harvestEntries.set(entry, {
+          entry: structuredClone(entry),
+          caption: n.log,
+          packetType: packet.packet_type,
+        });
       if (n.type === 'finalScoring')
         finalScoringCaptions.set(entry, {
           entry: structuredClone(entry),
