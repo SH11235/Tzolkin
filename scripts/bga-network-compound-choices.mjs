@@ -1,4 +1,10 @@
 import { isDeepStrictEqual as same } from 'node:util';
+import { readFileSync } from 'node:fs';
+import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
+
+const catalog = JSON.parse(
+  readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+);
 
 const resources = ['corn', 'wood', 'stone', 'gold', 'skull'];
 const integer = (n) =>
@@ -336,4 +342,173 @@ export function closedBurnChoiceProof({ operation: op, operations, group, audit,
   expected.players[proof.actor].temples[proof.god]--;
   expected.pending = null;
   return same(expected, penalty.after) ? proof : null;
+}
+
+export function fixedBuildingResourceChoiceProof({
+  operation: op,
+  activation,
+  rewardOperations,
+  group,
+  index,
+  sourceToNative,
+  mapCard,
+  closures,
+}) {
+  const candidates = closures.filter(
+    (w) => w.closed === true && w.closedMoveId === group.moveId && w.consumedAtStep === op.step,
+  );
+  if (candidates.length !== 1) return null;
+  const w = candidates[0],
+    card = catalog.BUILDINGS.find((c) => c.id === w.building),
+    actor = op.actor;
+  if (
+    w.actor !== actor ||
+    sourceToNative.get(w.sourceOwner) !== actor ||
+    w.technology !== 'any' ||
+    activation.actor !== actor ||
+    activation.row.action.type !== 'technology' ||
+    !same(activation.before.pending?.task, { type: 'technology', remaining: 1, free: true }) ||
+    !same(card?.effects, [
+      { type: 'technology', technology: 'any', steps: 1 },
+      { type: 'resources', resources: w.fixed },
+    ]) ||
+    !same(op.before.pending?.task, { type: 'resource', remaining: 1 }) ||
+    op.row.action.type !== 'resource' ||
+    !['wood', 'stone', 'gold'].includes(op.row.action.resource) ||
+    op.observationActor !== actor ||
+    !op.legalRows.some((r) => same(r, op.row))
+  )
+    return null;
+  const sequence = originalNetworkSequence(index);
+  const original = sequence?.groups.find((g) => g.group === group);
+  if (!original || !same(original.original, group)) return null;
+  const entries = index.groups.flatMap((g) => g.entries);
+  const find = (r) => entries.filter((n) => same(ref(n), r));
+  const construction = find(w.sourceConstruction);
+  if (
+    construction.length !== 1 ||
+    construction[0].type !== 'construct' ||
+    !owned(construction[0], w.sourceOwner, index) ||
+    mapCard(construction[0].args.building) !== w.building
+  )
+    return null;
+  const constructionGroup = index.groups.find((g) => g.entries.includes(construction[0]));
+  const expectedOrigin = `${construction[0].args.building.type}_b${construction[0].args.building.id}`;
+  if (constructionGroup.moveId !== w.startMoveId || expectedOrigin !== w.sourceRewardOrigin)
+    return null;
+  const receipts = w.sourceReceipts.flatMap(find);
+  const actualReceipts = constructionGroup.entries.filter(
+    (n) => n.type === 'takeGoods' && n.args.origin === expectedOrigin,
+  );
+  if (
+    receipts.length !== w.sourceReceipts.length ||
+    !receipts.length ||
+    new Set(receipts).size !== receipts.length ||
+    !same(receipts, actualReceipts) ||
+    receipts.some(
+      (n) =>
+        !owned(n, w.sourceOwner, index) ||
+        !resources.includes(n.args.type) ||
+        !integer(n.args.quantity) ||
+        Number(n.args.quantity) < 1,
+    )
+  )
+    return null;
+  const totals = Object.fromEntries(
+    resources.map((r) => [
+      r,
+      receipts
+        .filter((n) => n.args.type === r)
+        .reduce((sum, n) => sum + Number(n.args.quantity), 0),
+    ]),
+  );
+  if (resources.some((r) => totals[r] !== Number(w.fixed[r] ?? 0))) return null;
+  if (
+    ![construction[0], ...receipts, op.entry].every((n) => {
+      const p = originalPacketEntry(n);
+      return (
+        p?.rawSha256 === sequence.rawSha256 &&
+        p.tableId === index.tableId &&
+        p.packetType === 'resend' &&
+        n.channel === `/table/t${index.tableId}`
+      );
+    })
+  )
+    return null;
+  if (
+    op.entry.type !== 'takeGoods' ||
+    op.entry.args.type !== op.row.action.resource ||
+    Number(op.entry.args.quantity) !== 1 ||
+    op.entry.args.origin !== null ||
+    !owned(op.entry, w.sourceOwner, index) ||
+    !group.entries.includes(op.entry)
+  )
+    return null;
+  const full = [activation, ...rewardOperations];
+  if (
+    full.length !== 3 ||
+    w.decisions.length !== 3 ||
+    full.some(
+      (o, i) =>
+        o.actor !== actor ||
+        o.step !== activation.step + i ||
+        w.decisions[i].step !== o.step ||
+        !same(w.decisions[i].action, o.row.action) ||
+        w.decisions[i].legalOptionsIndependent !== true ||
+        !same(
+          w.decisions[i].directContribution,
+          Object.fromEntries(
+            resources.map((r) => [
+              r,
+              Number(o.row.action.type === 'resource' && o.row.action.resource === r),
+            ]),
+          ),
+        ) ||
+        !same(w.decisions[i].fixedContribution, i === 2 ? w.fixed : {}),
+    ) ||
+    full[2] !== op
+  )
+    return null;
+  const build = w.tail?.[1];
+  if (
+    w.tail?.length !== 2 ||
+    !same(w.tail[0], { type: 'effects', effects: [{ type: 'resources', resources: w.fixed }] }) ||
+    ![0, 1].includes(build?.remaining) ||
+    typeof build.cornPayment !== 'boolean' ||
+    typeof build.architectureAvailable !== 'boolean' ||
+    !same(build, {
+      type: 'build',
+      remaining: build.remaining,
+      allowMonument: false,
+      cornPayment: build.cornPayment,
+      architectureAvailable: build.architectureAvailable,
+    }) ||
+    !same(op.before.pending.after, [{ type: 'technology', remaining: 0, free: true }, ...w.tail])
+  )
+    return null;
+  const expected = structuredClone(op.before);
+  for (const r of resources)
+    expected.players[actor].resources[r] +=
+      Number(w.fixed[r] ?? 0) + Number(op.row.action.resource === r);
+  expected.skullSupply -= Number(w.fixed.skull ?? 0);
+  expected.pending = build.remaining ? { task: structuredClone(build), after: [] } : null;
+  const normalized = (s) => {
+    const c = structuredClone(s);
+    delete c.log;
+    if (c.pending) delete c.pending.title;
+    return c;
+  };
+  if (!same(normalized(expected), normalized(op.after))) return null;
+  return {
+    key: JSON.stringify([w.sourceConstruction, op.step]),
+    building: w.building,
+    actor,
+    construction: structuredClone(w.sourceConstruction),
+    receipts: structuredClone(w.sourceReceipts),
+    fixed: structuredClone(w.fixed),
+    direct: structuredClone(w.decisions[2].directContribution),
+    consumedAtStep: op.step,
+    queue: structuredClone(op.before.pending.after),
+    closedMoveId: w.closedMoveId,
+  };
 }

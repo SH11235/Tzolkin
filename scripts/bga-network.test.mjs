@@ -8,6 +8,8 @@ import test from 'node:test';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
 import { createBuildingResourceComparison } from './bga-network-building-resources.mjs';
 import { coreDispatcher } from './bga-replay.mjs';
+import { fixedBuildingResourceChoiceProof } from './bga-network-compound-choices.mjs';
+import { createObservedChoices } from './bga-network-observed-choices.mjs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 
@@ -3273,11 +3275,20 @@ function fixedBuildingFixture(
     branch = null,
     templeSummit = false,
     continuation = null,
+    rewardResource = 'gold',
     mutateSource = () => {},
     mutateFrames = () => {},
   } = {},
 ) {
-  const cacheKey = JSON.stringify([id, capped, stock, branch, templeSummit, continuation]);
+  const cacheKey = JSON.stringify([
+    id,
+    capped,
+    stock,
+    branch,
+    templeSummit,
+    continuation,
+    rewardResource,
+  ]);
   if (!syntheticBuildingFrames.has(cacheKey)) {
     const cli = join(
       process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../target', import.meta.url)),
@@ -3369,8 +3380,9 @@ function fixedBuildingFixture(
           ? rows.find(
               (r) => r.action.technology === (branch ?? (id === 'b26' ? 'theology' : 'extraction')),
             )
-          : (rows.find((r) => r.action.resource === 'gold' || r.action.temple === 'kukulkan') ??
-            rows[0]);
+          : (rows.find(
+              (r) => r.action.resource === rewardResource || r.action.temple === 'kukulkan',
+            ) ?? rows[0]);
       const next = dispatch({
         operation: 'publicApply',
         state: current.snapshot.state,
@@ -3525,7 +3537,7 @@ function fixedBuildingFixture(
       data,
     })),
   ];
-  mutateSource(raw);
+  mutateSource(raw, frames);
   mutateFrames(frames);
   const index = parseNetworkReplay(bytes(raw)),
     helper = createBuildingResourceComparison({
@@ -3598,6 +3610,191 @@ function fixedBuildingFixture(
   }
   return { step, helper, frames, results, index };
 }
+
+function fixedResourceChoiceFixture(options = {}) {
+  const f = fixedBuildingFixture('b24', { capped: true, ...options });
+  for (let i = 0; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+  const operations = f.frames.slice(1).map((t, i) => ({
+    entry: f.index.groups[i + 1].entries.find(
+      (n) => n.type === (t.action.type === 'technology' ? 'increaseTechnology' : 'takeGoods'),
+    ),
+    actor: t.actor,
+    observationActor: t.actor,
+    row: t.legalActions.find((r) => JSON.stringify(r.action) === JSON.stringify(t.action)),
+    legalRows: t.legalActions,
+    before: structuredClone(t.before),
+    after: structuredClone(t.after),
+    step: t.step,
+  }));
+  return {
+    operation: operations.at(-1),
+    activation: operations[0],
+    rewardOperations: operations.slice(1),
+    group: f.index.groups.at(-1),
+    index: f.index,
+    sourceToNative: new Map([
+      ['1', 0],
+      ['2', 1],
+      ['3', 2],
+      ['4', 3],
+    ]),
+    mapCard: () => 'b24',
+    closures: f.helper.finish().obligations,
+  };
+}
+
+test('combined native resource gains bind independent fixed building receipts and queue consumption', () => {
+  for (const options of [{}, { rewardResource: 'wood' }, { continuation: 'architecture' }]) {
+    const f = fixedResourceChoiceFixture(options),
+      proof = fixedBuildingResourceChoiceProof(f);
+    assert.ok(proof, JSON.stringify(options));
+    assert.deepEqual(proof.fixed, { gold: 1 });
+    assert.equal(proof.direct[f.operation.row.action.resource], 1);
+  }
+});
+
+test('combined resource proof rejects foreign, missing, duplicated or unclosed building evidence and state changes', () => {
+  for (const mutate of [
+    (f) => {
+      f.closures[0].actor = 1;
+    },
+    (f) => {
+      f.closures[0].building = 'b25';
+    },
+    (f) => {
+      f.closures[0].closed = false;
+    },
+    (f) => {
+      f.closures[0].sourceConstruction.uid = 'other';
+    },
+    (f) => {
+      f.closures[0].sourceReceipts[0].uid = 'other';
+    },
+    (f) => {
+      f.closures[0].sourceReceipts = [];
+    },
+    (f) => {
+      f.closures[0].sourceReceipts.push(f.closures[0].sourceReceipts[0]);
+    },
+    (f) => {
+      f.closures.push(f.closures[0]);
+    },
+    (f) => {
+      f.closures[0].consumedAtStep--;
+    },
+    (f) => {
+      f.operation.after.players[0].resources.stone++;
+    },
+    (f) => {
+      f.operation.after.players[1].resources.gold++;
+    },
+    (f) => {
+      f.operation.before.pending.after.push(f.operation.before.pending.after[1]);
+    },
+    (f) => {
+      f.closures[0].decisions.at(-1).fixedContribution.gold = 2;
+    },
+    (f) => {
+      f.operation.after.pending = { task: { type: 'build', remaining: 1 }, after: [] };
+    },
+    (f) => {
+      f.operation.after.buildings.push('b01');
+    },
+  ]) {
+    const f = fixedResourceChoiceFixture();
+    mutate(f);
+    assert.equal(fixedBuildingResourceChoiceProof(f), null);
+  }
+});
+
+test('observed capped resource interval reuses one closed building contribution and rejects duplicated consumption', () => {
+  for (const duplicate of [false, true]) {
+    const f = fixedBuildingFixture('b24', {
+      capped: true,
+      mutateSource: (raw, frames) => {
+        for (let i = 0; i < frames.length; i++) {
+          const end = raw.gameLogs.data.data[i + 1].data.at(-1),
+            native = frames[i].after;
+          end.args.args =
+            native.pending?.task.type === 'technology' ? native.players[0].technologies : [];
+        }
+      },
+    });
+    for (let i = 0; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+    const initial = f.frames[0],
+      closures = f.helper.finish().obligations;
+    const args = {
+      index: f.index,
+      initialMoveId: 2,
+      sourceToNative: new Map([
+        ['1', 0],
+        ['2', 1],
+        ['3', 2],
+        ['4', 3],
+      ]),
+      mapCard: () => 'b24',
+      initialBoundary: {
+        moveId: 2,
+        stateId: 62,
+        name: 'freeTechnology',
+        args: initial.after.players[0].technologies,
+        sourceActor: '1',
+        actor: 0,
+        pending: initial.after.pending,
+        legalRows: initial.afterLegalActions,
+      },
+    };
+    const choices = createObservedChoices(args);
+    for (let i = 1; i < f.frames.length; i++) {
+      const t = f.frames[i],
+        group = f.index.groups[i],
+        end = group.entries.at(-1),
+        row = t.legalActions.find((r) => JSON.stringify(r.action) === JSON.stringify(t.action)),
+        entry = group.entries.find(
+          (n) => n.type === (t.action.type === 'technology' ? 'increaseTechnology' : 'takeGoods'),
+        );
+      const strip = (s) => Object.fromEntries(Object.entries(s).filter(([k]) => k !== 'log'));
+      choices.observe({
+        group,
+        before: strip(t.before),
+        after: strip(t.after),
+        operations: [
+          {
+            entry,
+            row,
+            actor: 0,
+            observationActor: 0,
+            sourceActor: '1',
+            step: t.step,
+            legalRows: t.legalActions,
+            before: strip(t.before),
+            after: strip(t.after),
+          },
+        ],
+        boundary: {
+          moveId: group.moveId,
+          potentialHumanDecision: true,
+          sourceStateId: end.args.id,
+          sourceActor: '1',
+          sourceMenu: end.args.args,
+          nativeActor: 0,
+          nativePending: t.after.pending,
+          nativeLegalActions: t.afterLegalActions,
+        },
+        audit: [],
+        publicResultMatched: true,
+        buildingResourceClosures:
+          i === f.frames.length - 1 ? (duplicate ? [...closures, ...closures] : closures) : [],
+      });
+    }
+    const first = choices.finish().boundaries[0];
+    assert.equal(first.verified, !duplicate);
+    if (!duplicate) {
+      assert.equal(first.fixedBuildingContributions.length, 1);
+      assert.deepEqual(first.fixedBuildingContributions[0].fixed, { gold: 1 });
+    }
+  }
+});
 
 test('fixed building resources retain their original receipt through actual native free choices', () => {
   for (const id of ['b11', 'b12', 'b23', 'b24', 'b25', 'b26']) {
