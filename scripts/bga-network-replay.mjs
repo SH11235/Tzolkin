@@ -1,4 +1,5 @@
 import { recordDecisionBoundary, classifyDecisionState } from './bga-network-decision-boundary.mjs';
+import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
 import {
   trackBuildingMarket,
   proveBuildingMarketExit,
@@ -1311,6 +1312,13 @@ export function replayNetworkPrefix(
   let current = null;
   const native = () => frame.snapshot.state;
   const actions = () => frame.observation?.legalActions ?? [];
+  const semanticComparison = createSemanticComparison({
+    index,
+    initialMoveId,
+    initial,
+    sourceToNative,
+  });
+  let semanticContext = null;
   function applyWhere(
     predicate,
     reason,
@@ -1320,6 +1328,7 @@ export function replayNetworkPrefix(
     const rows = actions().filter((row) => predicate(row.action));
     const actor = frame.observation.actor,
       preState = native();
+    const legalActions = actions();
     const apply = (row) => {
       if (++calls > 4000) fail('native call bound');
       return dispatch({
@@ -1345,6 +1354,14 @@ export function replayNetworkPrefix(
       response = apply(row);
     }
     if (response.error) fail(response.error);
+    semanticComparison.applied(semanticContext, {
+      before: preState,
+      after: response.snapshot.state,
+      actor,
+      action: row.action,
+      legalActions,
+      step: record.steps.length + 1,
+    });
     trackRewardQueues(
       openRewardFences,
       preState.pending,
@@ -1419,6 +1436,7 @@ export function replayNetworkPrefix(
   }
   for (const group of index.groups.filter((g) => g.moveId > initialMoveId)) {
     current = group;
+    semanticContext = semanticComparison.begin(group, ledger, native(), frame.observation);
     const sourceBeforeGroup = {
       initial: ledger.initial,
       stateId: ledger.stateId,
@@ -2221,6 +2239,14 @@ export function replayNetworkPrefix(
       }
       const unmaskedDifferences = differences(ledger, native(), sourceToNative);
       const decisionType = classifyDecisionState(ledger, index);
+      const semantic = semanticComparison.compare(semanticContext, {
+        ledger,
+        native: native(),
+        observation: frame.observation,
+        differences: unmaskedDifferences,
+        applied: audit.slice(auditBeforeGroup),
+        humanDecision: decisionType.potentialHumanDecision,
+      });
       const decisionBoundary = {
         moveId: group.moveId,
         ...decisionType,
@@ -2235,6 +2261,7 @@ export function replayNetworkPrefix(
         nativePending: copy(native().pending),
         nativeLegalActions: copy(frame.observation.legalActions),
         differences: copy(unmaskedDifferences),
+        semanticComparison: semantic,
         sourceStateMetadataPresent: !!index.initial.gamestates[ledger.stateId],
       };
       recordDecisionBoundary(decisionBoundaryAudit, decisionBoundary, onDecisionBoundary);
@@ -2562,6 +2589,7 @@ export function replayNetworkPrefix(
         terminalReached: native().phase === 'finished',
         semanticReplayVerified: false,
         fullReplayAchieved: false,
+        semanticComparison: semanticComparison.finish(),
         decisionBoundaryAudit,
         teacherCompleteness: false,
         teacherCertified: false,
@@ -2604,6 +2632,7 @@ export function replayNetworkPrefix(
     terminalReached: native().phase === 'finished',
     semanticReplayVerified: false,
     fullReplayAchieved: false,
+    semanticComparison: semanticComparison.finish(),
     decisionBoundaryAudit,
     teacherCompleteness: false,
     teacherCertified: false,
