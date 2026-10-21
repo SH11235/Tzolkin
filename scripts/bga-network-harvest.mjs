@@ -17,6 +17,59 @@ const integer = (x) =>
   Number.isSafeInteger(Number(x));
 const godName = (x) => (x === 'kukulcan' ? 'kukulkan' : x);
 
+function knownBurnCornTiming({
+  index,
+  group,
+  ledger,
+  before,
+  sourceToNative,
+  cornFence,
+  unresolvedFences,
+  beforeDifferences,
+}) {
+  const f = cornFence;
+  if (!f || !equal(unresolvedFences, [f]) || unresolvedFences[0] !== f) return null;
+  const source = ledger.players[f.sourceId],
+    player = before.players[f.actor];
+  const excluded = index.groups
+    .filter((g) => g.moveId >= f.startMoveId && g.moveId < group.moveId)
+    .map((g) => g.moveId);
+  if (
+    f.resolvedMoveId !== null ||
+    !Number.isSafeInteger(f.startMoveId) ||
+    f.startMoveId >= group.moveId ||
+    excluded[0] !== f.startMoveId ||
+    !equal(f.excludedMoveIds, excluded) ||
+    !Number.isSafeInteger(f.amount) ||
+    f.amount <= 0 ||
+    sourceToNative.get(f.sourceId) !== f.actor ||
+    before.firstPlayerClaimed !== f.actor ||
+    before.currentPlayer === f.actor ||
+    !source ||
+    !player ||
+    ledger.accumulatedCorn !== f.amount ||
+    before.accumulatedCorn !== 0 ||
+    player.resources.corn !== source.resources.corn + f.amount
+  )
+    return null;
+  const residual = [
+    {
+      field: `player.${f.sourceId}.resources.corn`,
+      observed: source.resources.corn,
+      native: player.resources.corn,
+    },
+    { field: 'accumulatedCorn', observed: f.amount, native: 0 },
+  ];
+  if (!equal(beforeDifferences, residual)) return null;
+  return {
+    startMoveId: f.startMoveId,
+    actor: f.actor,
+    sourceId: f.sourceId,
+    amount: f.amount,
+    residual,
+  };
+}
+
 export function sourceBurnHarvestWitness({
   index,
   group,
@@ -26,9 +79,25 @@ export function sourceBurnHarvestWitness({
   sourceToNative,
   sourceStateMatched,
   unresolvedTiming,
+  cornFence = null,
+  unresolvedFences = [],
+  beforeDifferences = [],
 }) {
   if (!group.entries.some((n) => n.type === 'takeTile' && n.args.player_id === null)) return null;
-  if (!sourceStateMatched || unresolvedTiming) return null;
+  const cornTiming =
+    !sourceStateMatched || unresolvedTiming
+      ? knownBurnCornTiming({
+          index,
+          group,
+          ledger,
+          before,
+          sourceToNative,
+          cornFence,
+          unresolvedFences,
+          beforeDifferences,
+        })
+      : null;
+  if ((!sourceStateMatched || unresolvedTiming) && !cornTiming) return null;
   const previous = index.groups[index.groups.indexOf(group) - 1];
   const entries = group.entries;
   const [discard, penalty, tile, goods, transition, ending] = entries;
@@ -207,6 +276,7 @@ export function sourceBurnHarvestWitness({
       packetIndex,
       notificationIndex,
     })),
+    ...(cornTiming ? { cornTiming } : {}),
   };
 }
 

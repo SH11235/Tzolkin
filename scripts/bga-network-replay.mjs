@@ -1396,6 +1396,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
     let constructionTransition = null;
     let burnHarvest = null;
     try {
+      const burnBeforeDifferences = differences(ledger, before, sourceToNative, terminalCalendar);
       burnHarvest = sourceBurnHarvestWitness({
         index,
         group,
@@ -1403,9 +1404,11 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         before,
         observation: frame.observation,
         sourceToNative,
-        sourceStateMatched:
-          differences(ledger, before, sourceToNative, terminalCalendar).length === 0,
+        sourceStateMatched: burnBeforeDifferences.length === 0,
         unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
+        cornFence: openCornFence,
+        unresolvedFences: timingFences.filter((f) => f.resolvedMoveId == null),
+        beforeDifferences: burnBeforeDifferences,
       });
       const singleSkull = group.entries.some((n) => n.type === 'noSkullsLeft')
         ? sourceSingleSkullWitness({
