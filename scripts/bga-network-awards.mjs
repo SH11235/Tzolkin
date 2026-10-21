@@ -11,6 +11,8 @@ const ref = (n) => ({
   notificationIndex: n.notificationIndex,
 });
 const signature = (receipts) => receipts.map((r) => JSON.stringify(r)).sort();
+const shortageSources = new WeakMap();
+const shortageOutcomes = new WeakMap();
 const number = (x) =>
   ['string', 'number'].includes(typeof x) &&
   /^(0|[1-9]\d*)$/.test(String(x)) &&
@@ -337,7 +339,7 @@ export function sourceSkullShortageWitness({
   });
   if (!isDeepStrictEqual(signature(expected), signature(actual)))
     fail('complete original temple reward receipts differ from the catalog');
-  return {
+  const proof = {
     source: ref(n),
     boundary: [ref(entries[i - 2]), ref(entries.at(-1))],
     sourcePhysicalDay: ledger.day,
@@ -350,17 +352,29 @@ export function sourceSkullShortageWitness({
     expectedRewards: expected,
     originalCaption: n.skullShortageCaption,
   };
+  shortageSources.set(proof, {
+    group,
+    original: structuredClone(group),
+    before: structuredClone(before),
+    proof: structuredClone(proof),
+  });
+  return proof;
 }
 
 export function bindSkullShortageOutcome(proof, before, after) {
   if (!proof) return null;
+  const source = shortageSources.get(proof);
   if (
+    !source ||
+    !isDeepStrictEqual(source.proof, proof) ||
+    !isDeepStrictEqual(source.original, source.group) ||
+    !isDeepStrictEqual(source.before, before) ||
     !isDeepStrictEqual(after.foodDays, [...before.foodDays, proof.scheduledDay]) ||
     after.skullSupply !== proof.sourceSkullSupply ||
     proof.players.some((p) => after.players[p.actor].resources.skull !== p.skulls)
   )
     fail('native FoodDay does not retain the witnessed shortage outcome');
-  return {
+  const outcome = {
     ...proof,
     nativeFoodDaysBefore: structuredClone(before.foodDays),
     nativeFoodDaysAfter: structuredClone(after.foodDays),
@@ -368,4 +382,24 @@ export function bindSkullShortageOutcome(proof, before, after) {
     nativeSkullSupplyAfter: after.skullSupply,
     individualSkullsUnchanged: true,
   };
+  shortageOutcomes.set(outcome, {
+    group: source.group,
+    original: source.original,
+    before: source.before,
+    after: structuredClone(after),
+    proof: structuredClone(outcome),
+  });
+  return outcome;
+}
+
+export function isBoundSkullShortageOutcome(proof, { group, before, after }) {
+  const bound = shortageOutcomes.get(proof);
+  return !!(
+    bound &&
+    bound.group === group &&
+    isDeepStrictEqual(bound.original, group) &&
+    isDeepStrictEqual(bound.proof, proof) &&
+    isDeepStrictEqual(bound.before, before) &&
+    isDeepStrictEqual(bound.after, after)
+  );
 }

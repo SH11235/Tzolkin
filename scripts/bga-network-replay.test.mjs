@@ -2233,6 +2233,10 @@ test('source shortage binds every reward and its synchronized pre-award state', 
   const after = structuredClone(f.before);
   after.foodDays.push(21);
   assert.equal(bindSkullShortageOutcome(proof, f.before, after).individualSkullsUnchanged, true);
+  assert.throws(
+    () => bindSkullShortageOutcome(structuredClone(proof), f.before, after),
+    /Skull award:/,
+  );
   assert.equal(sourceSkullShortageWitness({ ...f, group: { entries: [] } }), null);
   for (const mutate of [
     (f) => (f.group.entries[5].skullShortageCaption = 'unknown'),

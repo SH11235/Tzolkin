@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { originalPacketEntry } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
+import { isBoundSkullShortageOutcome } from './bga-network-awards.mjs';
 
 const catalog = JSON.parse(
   readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
@@ -20,6 +21,7 @@ export function provePostReceiptFood({
   native,
   transitions,
   sourceToNative,
+  skullShortageEvidence = null,
 }) {
   const events = sourceFeedingWitnesses(index).filter((e) => e.moveId === group.moveId);
   const ends = transitions.filter((t) => t.action.type === 'endTurn');
@@ -92,6 +94,27 @@ export function provePostReceiptFood({
     !publicEntry(entries[position++])
   )
     return null;
+  let shortage = null;
+  if (entries[position]?.type === 'noskulltoday') {
+    if (
+      event.scheduledDay !== 21 ||
+      !isDeepStrictEqual(transition.after, native) ||
+      !isBoundSkullShortageOutcome(skullShortageEvidence, {
+        group,
+        before,
+        after: transition.after,
+      }) ||
+      !isDeepStrictEqual(skullShortageEvidence.source, {
+        uid: entries[position].uid,
+        packetIndex: entries[position].packetIndex,
+        notificationIndex: entries[position].notificationIndex,
+      }) ||
+      !publicEntry(entries[position])
+    )
+      return null;
+    shortage = skullShortageEvidence;
+    position++;
+  }
   while (entries[position]?.type === 'takeGoods') {
     if (!publicEntry(entries[position++])) return null;
   }
@@ -146,8 +169,9 @@ export function provePostReceiptFood({
       if (!track) return null;
       for (let step = 0; step <= level + 1; step++)
         for (const [resource, amount] of Object.entries(track.resourceRewards[step] ?? {})) {
-          expected[resource] += amount;
           if (resource === 'skull') skullRewards += amount;
+          if (shortage && resource === 'skull') continue;
+          expected[resource] += amount;
           expectedRewards.push([
             sourceActor,
             resource,
@@ -171,7 +195,14 @@ export function provePostReceiptFood({
       return null;
     results.push({ sourceActor, paidCorn: cost, unfedWorkers: unfed, expectedResources: expected });
   }
-  if (skullRewards > before.skullSupply) return null;
+  if (
+    shortage
+      ? skullRewards !== shortage.totalSkullDemand ||
+        before.skullSupply !== shortage.sourceSkullSupply ||
+        skullRewards <= before.skullSupply
+      : skullRewards > before.skullSupply
+  )
+    return null;
   const effects = entries
     .map((entry, position) => ({ entry, position }))
     .filter(({ entry }) => ['takeGoods', 'payGoods', 'updateScore'].includes(entry.type));
@@ -208,6 +239,7 @@ export function provePostReceiptFood({
     authorizedEffectUids: effects
       .filter(({ position }) => position > paid)
       .map(({ entry }) => entry.uid),
+    ...(shortage ? { skullShortageEvidence: structuredClone(shortage) } : {}),
     sourceIndividualAbsenceNotObservedAsZero: true,
   };
 }

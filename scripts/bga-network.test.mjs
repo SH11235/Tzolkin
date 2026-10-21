@@ -24,6 +24,7 @@ function semanticFixture({
   terminal = false,
   terminalProjection = false,
   unusedCorn = false,
+  priorFoodDays = 0,
   mutateSource = () => {},
 } = {}) {
   const raw = fixture();
@@ -131,6 +132,23 @@ function semanticFixture({
     }
   }
   mutateSource(raw);
+  if (priorFoodDays) {
+    for (const row of raw.gameLogs.data.data.slice(1)) {
+      row.move_id = String(Number(row.move_id) + priorFoodDays);
+      row.packet_id = String(Number(row.packet_id) + priorFoodDays);
+    }
+    raw.gameLogs.data.data.splice(
+      1,
+      0,
+      ...Array.from({ length: priorFoodDays }, (_, i) =>
+        packet(i + 2, [
+          n('gameStateChange', { id: 92, active_player: '1' }),
+          n('gameStateChange', { id: i === 0 ? 93 : 94, active_player: '1' }),
+          n('rotateWheel', { day: i === 0 ? 8 : 20, twice: 0, workers: [] }),
+        ]),
+      ),
+    );
+  }
   const index = parseNetworkReplay(bytes(raw));
   const initial = {
     version: 1,
@@ -175,9 +193,10 @@ function semanticFixture({
     ),
     workers: new Map(['1', '2', '3'].map((id) => [id, { id, player: id, place: null }])),
   };
+  const initialMoveId = (terminal ? 26 : purchased ? 2 : 1) + priorFoodDays;
   const comparison = createSemanticComparison({
     index,
-    initialMoveId: terminal ? 26 : purchased ? 2 : 1,
+    initialMoveId,
     initial,
     sourceToNative: new Map([
       ['1', 0],
@@ -191,7 +210,7 @@ function semanticFixture({
   const terminalValidations = [];
   let terminalArguments = null;
   function step(i, alter = () => {}) {
-    const group = index.groups.filter((g) => g.moveId > (terminal ? 26 : purchased ? 2 : 1))[i];
+    const group = index.groups.filter((g) => g.moveId > initialMoveId)[i];
     const context = comparison.begin(group, ledger, native, observation);
     let differences = [],
       applied = [];
@@ -694,8 +713,9 @@ test('an inline endTurn and rotation bind the actual intermediate legal state', 
   }
 });
 
-function semanticFoodFixture(mutateSource = () => {}) {
+function semanticFoodFixture(mutateSource = () => {}, options = {}) {
   return semanticFixture({
+    ...options,
     mutateSource: (raw) => {
       Object.assign(raw.initialState.gamestates, {
         90: { type: 'game' },
@@ -828,6 +848,242 @@ test('corn settles before the actual automatic feeding and temple rewards within
       f.step(3, (a, context) => completeSemanticFood(f, a, context)).semanticMatch,
       false,
     );
+  }
+});
+
+function shortageCornFixture(mutateSource = () => {}) {
+  const f = semanticFoodFixture(
+    (raw) => {
+      const data = raw.gameLogs.data.data[4].data;
+      const middle = data.findIndex((n) => n.type === 'middleOfAgeRewards');
+      data[middle].args = [];
+      data.splice(
+        middle + 1,
+        1,
+        { uid: 'shortage', type: 'noskulltoday', args: [], log: skullShortageCaption },
+        ...['1', '2'].flatMap((id) =>
+          [2, 4].map((step) => ({
+            uid: `reward-${id}-${step}`,
+            type: 'takeGoods',
+            log: '',
+            args: {
+              player_id: id,
+              type: 'wood',
+              quantity: 1,
+              origin: `temple_kukulcan_step_${step}`,
+            },
+          })),
+        ),
+      );
+      mutateSource(raw);
+    },
+    { priorFoodDays: 2 },
+  );
+  f.native.round = 21;
+  f.native.foodDays = [8, 14];
+  f.native.skullSupply = 1;
+  f.ledger.day = 20;
+  f.ledger.skullSupply = 1;
+  for (const [i, p] of f.native.players.entries()) {
+    p.temples.kukulkan = i < 2 ? 4 : -1;
+    p.buildings = [];
+    f.ledger.players[String(i + 1)].temples = structuredClone(p.temples);
+  }
+  for (let i = 0; i < 3; i++) assert.equal(f.step(i).semanticMatch, true);
+  return f;
+}
+
+function settleShortageCorn(f, mutate = () => {}) {
+  return f.step(3, (args, context, group) => {
+    for (const [i, p] of args.native.players.entries()) {
+      p.resources.corn = i === 1 ? 3 : 1;
+      p.resources.wood = i < 2 ? 2 : 0;
+      Object.assign(args.ledger.players[String(i + 1)].resources, p.resources);
+    }
+    args.native.foodDays = [8, 14, 21];
+    const proof = sourceSkullShortageWitness({
+      ledger: context.source,
+      group,
+      before: context.native,
+      catalog: JSON.parse(
+        readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+      ),
+      sourceToNative: new Map([
+        ['1', 0],
+        ['2', 1],
+        ['3', 2],
+      ]),
+      unresolvedTiming: false,
+    });
+    args.skullShortageEvidence = bindSkullShortageOutcome(proof, context.native, args.native);
+    f.comparison.applied(context, {
+      before: context.native,
+      after: args.native,
+      actor: 2,
+      action: { type: 'endTurn' },
+      legalActions: [{ action: { type: 'endTurn' } }],
+      step: 4,
+    });
+    mutate(args, context, group);
+  });
+}
+
+test('delayed corn composes live shortage and all-player feeding proofs without consuming the last skull', () => {
+  const f = shortageCornFixture();
+  const result = settleShortageCorn(f);
+  assert.equal(result.semanticMatch, true);
+  const food = result.evidence.find((e) => e.type === 'postReceiptFoodDay');
+  assert.equal(food.scheduledDay, 21);
+  assert.equal(food.skullShortageEvidence.totalSkullDemand, 2);
+  assert.equal(food.skullShortageEvidence.sourceSkullSupply, 1);
+  assert.deepEqual(
+    food.perPlayerResults.map((p) => p.paidCorn),
+    [2, 2, 2],
+  );
+  assert.deepEqual(
+    f.native.players.map((p) => p.resources.skull),
+    [0, 0, 0],
+  );
+  assert.equal(f.native.skullSupply, 1);
+  assert.equal(f.comparison.finish().obligations[0].cornClosed, true);
+  assert.equal(f.comparison.finish().allObligationsClosed, false);
+});
+
+test('shortage corn refuses missing, serialized, foreign, changed or stale live proofs and transitions', () => {
+  const foreign = shortageCornFixture();
+  let foreignProof;
+  settleShortageCorn(foreign, (args) => {
+    foreignProof = args.skullShortageEvidence;
+  });
+  for (const change of [
+    (a) => {
+      a.skullShortageEvidence = null;
+    },
+    (a) => {
+      a.skullShortageEvidence = structuredClone(a.skullShortageEvidence);
+    },
+    (a) => {
+      a.skullShortageEvidence = foreignProof;
+    },
+    (a) => {
+      a.skullShortageEvidence.totalSkullDemand++;
+    },
+    (a) => {
+      a.skullShortageEvidence.sourceSkullSupply = 0;
+    },
+    (a) => {
+      a.native.players[0].resources.corn++;
+    },
+    (a) => {
+      a.native.players[1].resources.wood--;
+    },
+    (a) => {
+      a.native.players[2].score--;
+    },
+    (a) => {
+      a.native.skullSupply = 0;
+    },
+    (a, c) => {
+      c.transitions[0].before.players[0].resources.corn++;
+    },
+    (a, c) => {
+      c.transitions[0].after.players[2].score++;
+    },
+    (a, c) => {
+      c.transitions[0].actor = 1;
+    },
+    (a, c) => {
+      c.transitions[0].legalActions = [];
+    },
+    (a, c) => {
+      c.transitions.push(structuredClone(c.transitions[0]));
+    },
+    (a, c) => {
+      c.transitions = [];
+    },
+    (a, c, g) => {
+      g.entries.find((n) => n.type === 'noskulltoday').uid = 'changed';
+    },
+  ]) {
+    const f = shortageCornFixture();
+    assert.equal(settleShortageCorn(f, change).semanticMatch, false);
+  }
+});
+
+test('shortage corn rejects changed receipts, food, rewards, demand and extra effects', () => {
+  for (const change of [
+    (p) => {
+      p.find((n) => n.type === 'firstPlayerCorn').args.player_id = '1';
+    },
+    (p) => {
+      p.find((n) => n.type === 'firstPlayerCorn').args.corn++;
+    },
+    (p) => {
+      p.splice(
+        p.findIndex((n) => n.type === 'firstPlayerCorn'),
+        1,
+      );
+    },
+    (p) => {
+      p.splice(4, 0, {
+        ...structuredClone(p.find((n) => n.type === 'firstPlayerCorn')),
+        uid: 'duplicate-receipt',
+      });
+    },
+    (p) => {
+      p.find((n) => n.type === 'takeGoods').args.quantity++;
+    },
+    (p) => {
+      p.find((n) => n.type === 'foodDayCost').args.cost++;
+    },
+    (p) => {
+      p.find((n) => n.type === 'payGoods').args.quantity++;
+    },
+    (p) => {
+      p.find((n) => n.uid === 'reward-1-2').args.type = 'stone';
+    },
+    (p) => {
+      p.find((n) => n.uid === 'reward-1-2').args.quantity++;
+    },
+    (p) => {
+      p.splice(
+        p.findIndex((n) => n.uid === 'reward-1-2'),
+        1,
+      );
+    },
+    (p) => {
+      p.splice(-1, 0, {
+        ...structuredClone(p.find((n) => n.uid === 'reward-1-2')),
+        uid: 'duplicate-reward',
+      });
+    },
+    (p) => {
+      p.splice(-1, 0, {
+        uid: 'extra',
+        type: 'takeGoods',
+        log: '',
+        args: { player_id: '2', type: 'wood', quantity: 1, origin: null },
+      });
+    },
+    (p) => {
+      p.splice(-1, 0, {
+        uid: 'loss',
+        type: 'updateScore',
+        log: '',
+        args: { player_id: '2', points: -3 },
+      });
+    },
+  ]) {
+    let rejected;
+    try {
+      const f = shortageCornFixture((raw) => change(raw.gameLogs.data.data[4].data));
+      const result = settleShortageCorn(f);
+      rejected = !result.semanticMatch;
+    } catch (error) {
+      assert.match(error.message, /Network replay:|Skull award:|Source feeding:/);
+      rejected = true;
+    }
+    assert.equal(rejected, true);
   }
 });
 
@@ -1003,6 +1259,8 @@ import {
 } from './bga-network-chichen-decline.mjs';
 import {
   skullShortageCaption,
+  sourceSkullShortageWitness,
+  bindSkullShortageOutcome,
   singleSkullCaption,
   sourceSingleSkullWitness,
   bindSingleSkullOutcome,
