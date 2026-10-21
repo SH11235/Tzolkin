@@ -5,6 +5,7 @@ import {
   begChoiceProof,
   forcedRotationProof,
   closedBurnChoiceProof,
+  fixedBuildingResourceChoiceProof,
 } from './bga-network-compound-choices.mjs';
 
 const clone = structuredClone;
@@ -36,6 +37,35 @@ export const choicePublicState = (state) =>
       .filter(([k]) => !['pending', 'log'].includes(k))
       .map(([k, v]) => [k, clone(v)]),
   );
+const constructionSourceFields = [
+  'players',
+  'workers',
+  'buildings',
+  'monuments',
+  'jungle',
+  'skullSupply',
+  'skullSpaces',
+  'day',
+  'age',
+  'firstPlayer',
+  'accumulatedCorn',
+  'foodDays',
+  'activePlayer',
+];
+const constructionSourceState = (ledger) => {
+  if (
+    !ledger ||
+    !(ledger.workers instanceof Map) ||
+    !constructionSourceFields.every((k) => Object.hasOwn(ledger, k) && ledger[k] !== undefined)
+  )
+    return null;
+  return Object.fromEntries(
+    constructionSourceFields.map((k) => [
+      k,
+      k === 'workers' ? [...ledger.workers] : clone(ledger[k]),
+    ]),
+  );
+};
 const payments = (group, owner) =>
   resources.map((r) =>
     group.entries
@@ -99,7 +129,13 @@ export function observedStageArguments(boundary, operation, operations = [operat
     const tracks = name === 'freeTechnology' ? args : args?.technologies;
     if (
       !tracks ||
-      technologies.some((t) => !integer(tracks[t]) || Number(tracks[t]) !== p.technologies[t])
+      typeof tracks !== 'object' ||
+      Array.isArray(tracks) ||
+      Object.entries(tracks).some(
+        ([t, value]) =>
+          !technologies.includes(t) || !integer(value) || Number(value) !== p.technologies[t],
+      ) ||
+      (action.type === 'technology' && !Object.hasOwn(tracks, action.technology))
     )
       return 'technologyArgumentsDiffer';
     if (task.free !== (name === 'freeTechnology')) return 'technologyPaymentModeDiffer';
@@ -515,6 +551,9 @@ export function createObservedChoices({
     audit,
     publicResultMatched,
     semanticEvidence = [],
+    buildingResourceClosures = [],
+    sourceBefore = null,
+    sourceAfter = null,
   }) {
     const nextHuman = boundary.potentialHumanDecision;
     const next = {
@@ -571,6 +610,7 @@ export function createObservedChoices({
         group,
         boundary: clone(last),
         bindingError: binding,
+        buildingResourceClosures: clone(buildingResourceClosures),
       });
       operationEvidence.push({
         step: op.step,
@@ -625,12 +665,91 @@ export function createObservedChoices({
         (sourceExit(group) || (constructNames.has(last.name) && constructNames.has(next.name)))
       ) {
         if (last.name === 'constructChooseSparedResources' && next.name === 'construct') {
-          for (const b of [...(interval?.boundaries ?? []), last])
-            fail(b, 'constructionDraftReturnNotEstablished');
+          const start = interval?.boundaries?.[0],
+            definition = index.initial.gamestates;
+          const opening = interval?.groups?.[0];
+          const prior = interval?.sourceOpening;
+          const currentBefore = constructionSourceState(sourceBefore),
+            currentAfter = constructionSourceState(sourceAfter);
+          const path = [opening, group];
+          const valid =
+            interval &&
+            interval.boundaries.length === 1 &&
+            interval.exit === null &&
+            start?.name === 'construct' &&
+            start.stateId === 32 &&
+            last.stateId === 33 &&
+            next.stateId === 32 &&
+            definition[32]?.type === 'activeplayer' &&
+            definition[32]?.name === 'construct' &&
+            definition[32]?.transitions?.sparedResource === 33 &&
+            definition[32]?.possibleactions?.includes('construct') &&
+            definition[32]?.action == null &&
+            definition[33]?.type === 'activeplayer' &&
+            definition[33]?.name === 'constructChooseSparedResources' &&
+            definition[33]?.transitions?.cancel === 32 &&
+            definition[33]?.possibleactions?.includes('sparedResource') &&
+            definition[33]?.action == null &&
+            path.every(
+              (g, i) =>
+                g &&
+                g.entries.length === 1 &&
+                trusted(g, g.entries[0]) &&
+                originalPacketEntry(g.entries[0])?.packetNotificationCount === 1 &&
+                g.entries[0].type === 'gameStateChange' &&
+                Number(g.entries[0].args.id) === (i === 0 ? 33 : 32) &&
+                g.entries[0].args.type === 'activeplayer' &&
+                String(g.entries[0].args.active_player) === start.sourceActor,
+            ) &&
+            sourceToNative.get(start.sourceActor) === start.actor &&
+            last.actor === start.actor &&
+            next.actor === start.actor &&
+            prior &&
+            currentBefore &&
+            currentAfter &&
+            same(prior, currentBefore) &&
+            same(prior, currentAfter) &&
+            prior.activePlayer === start.sourceActor &&
+            same(start.args, next.args) &&
+            empty(start.args) &&
+            same(Object.keys(last.args ?? {}).sort(), materials.toSorted()) &&
+            materials.every((r) => typeof last.args[r] === 'boolean') &&
+            materials.some((r) => last.args[r]) &&
+            same(interval.native, before) &&
+            same(before, after) &&
+            before.pending?.task.type === 'build' &&
+            before.pending.task.architectureAvailable !== false &&
+            before.players[start.actor].technologies.architecture >= 3 &&
+            same(start.pending, before.pending) &&
+            same(next.pending, before.pending) &&
+            same(start.legalRows, last.legalRows) &&
+            same(start.legalRows, next.legalRows) &&
+            start.legalRows.length > 0 &&
+            start.legalRows.every((r) => ['build', 'monument', 'skip'].includes(r.action.type));
+          for (const b of [...(interval?.boundaries ?? []), last]) {
+            if (valid)
+              pass(b, 'uncommittedConstructionDraftCancelled', group, [], {
+                intervalSource: [...interval.source, ...group.entries.map(ref)],
+                sourcePublicBefore: clone(prior),
+                sourcePublicAfter: clone(currentAfter),
+                unknownDraftBuildingId: null,
+                futureBuildingWasNotAssigned: true,
+                nativeExecutionUnchanged: true,
+              });
+            else fail(b, 'constructionDraftReturnNotEstablished');
+          }
           interval = null;
         } else {
-          interval ??= { boundaries: [], native: clone(before), exit: null, source: [] };
+          interval ??= {
+            boundaries: [],
+            native: clone(before),
+            exit: null,
+            source: [],
+            groups: [],
+            sourceOpening: constructionSourceState(sourceBefore),
+          };
           interval.boundaries.push(last);
+          interval.groups.push(group);
           interval.source.push(...group.entries.map(ref));
           if (sourceExit(group))
             interval.exit = {
@@ -639,7 +758,11 @@ export function createObservedChoices({
               actor: last.actor,
             };
         }
-      } else fail(last, 'sourceChoiceWithoutBoundNativeOperation');
+      } else {
+        for (const b of [...(interval?.boundaries ?? []), last])
+          fail(b, 'sourceChoiceWithoutBoundNativeOperation');
+        interval = null;
+      }
     } else {
       const build = operations.find((o) => ['build', 'monument'].includes(o.row.action.type));
       if (interval) {
@@ -745,16 +868,24 @@ export function createObservedChoices({
     }
   }
   function finish() {
+    const consumedBuildingRewards = new Set();
     for (const deferred of deferredTechnologies) {
       const { proof, boundary, group } = deferred;
       let previous = proof.commit,
         issue = null;
+      const fixedContributions = [];
       const following = capturedOperations
         .filter((c) => c.operation.step > proof.commit.step)
         .slice(0, proof.reward.remaining);
       if (following.length !== proof.reward.remaining) issue = 'technologyCapRewardNotClosed';
       for (let i = 0; i < following.length; i++) {
-        const { operation: op, group: response, boundary: choice, bindingError } = following[i];
+        const {
+          operation: op,
+          group: response,
+          boundary: choice,
+          bindingError,
+          buildingResourceClosures,
+        } = following[i];
         if (
           bindingError ||
           proofs.get(choice.moveId)?.verified !== true ||
@@ -775,8 +906,27 @@ export function createObservedChoices({
             op.after.players[op.actor].resources[op.row.action.resource] -
               op.before.players[op.actor].resources[op.row.action.resource] !==
               1
-          )
-            issue ??= 'technologyCapResourceRewardNotIsolated';
+          ) {
+            const bound =
+              !issue &&
+              fixedBuildingResourceChoiceProof({
+                operation: op,
+                activation: deferred.operations.find((o) => o.row.action.type === 'technology'),
+                rewardOperations: following.map((c) => c.operation),
+                group: response,
+                index,
+                sourceToNative,
+                mapCard,
+                closures: buildingResourceClosures,
+              });
+            if (
+              !bound ||
+              consumedBuildingRewards.has(bound.key) ||
+              fixedContributions.some((c) => c.key === bound.key)
+            )
+              issue ??= 'technologyCapResourceRewardNotIsolated';
+            else fixedContributions.push(bound);
+          }
         } else if (op.row.action.type !== 'temple' || op.row.action.direction !== 1)
           issue ??= 'technologyCapTempleRewardNotBound';
         previous = op;
@@ -784,7 +934,9 @@ export function createObservedChoices({
           issue ??= 'technologyCapRewardSourceNotBound';
       }
       if (issue) fail(boundary, issue);
-      else
+      else {
+        for (const contribution of fixedContributions)
+          consumedBuildingRewards.add(contribution.key);
         pass(
           boundary,
           'technologyCapRewardInterval',
@@ -795,8 +947,10 @@ export function createObservedChoices({
             activationSource: clone(proof.source),
             rewardSource: following.map((c) => ref(c.operation.entry)),
             decisionObservationsUnmodified: true,
+            fixedBuildingContributions: clone(fixedContributions),
           },
         );
+      }
     }
     const all = expected.map(
       (moveId) =>

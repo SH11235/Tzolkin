@@ -3456,6 +3456,324 @@ test('temple menus require selected targets and validate present values while al
   }
 });
 
+test('technology menus bind the selected offered track and present levels without requiring unaffordable tracks', () => {
+  for (const id of [31, 62]) {
+    const f = observedChoiceFixture(id),
+      tracks = id === 31 ? f.boundary.args.technologies : f.boundary.args;
+    delete tracks.theology;
+    assert.equal(observedStageArguments(f.boundary, f.operation), null);
+    delete tracks.agriculture;
+    assert.equal(observedStageArguments(f.boundary, f.operation), 'technologyArgumentsDiffer');
+    tracks.agriculture = 0;
+    tracks.extraction = 1;
+    assert.equal(observedStageArguments(f.boundary, f.operation), 'technologyArgumentsDiffer');
+  }
+  const f = observedChoiceFixture(31);
+  f.boundary.args.resources.wood++;
+  assert.equal(observedStageArguments(f.boundary, f.operation), 'technologyBudgetArgumentsDiffer');
+});
+
+function constructionDraftFixture(mutateRaw = () => {}, laterBuild = false) {
+  const raw = fixture();
+  let uid = 0;
+  const state = (id, args) => ({
+    uid: `draft${uid++}`,
+    type: 'gameStateChange',
+    log: '',
+    args: { id, type: 'activeplayer', active_player: '1', args },
+  });
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  Object.assign(raw.initialState.gamestates, {
+    32: {
+      name: 'construct',
+      type: 'activeplayer',
+      args: 'argConstruct',
+      possibleactions: ['construct', 'pass'],
+      transitions: { nextAction: 9, sparedResource: 33 },
+    },
+    33: {
+      name: 'constructChooseSparedResources',
+      type: 'activeplayer',
+      args: 'argSparedResource',
+      possibleactions: ['sparedResource'],
+      transitions: { nextAction: 9, cancel: 32 },
+    },
+    99: { type: 'manager' },
+  });
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [state(32, [])]),
+    packet(3, [state(33, { wood: true, stone: false, gold: true })]),
+    packet(4, [state(32, [])]),
+  ];
+  if (laterBuild)
+    raw.gameLogs.data.data.push(
+      packet(5, [
+        {
+          uid: 'laterCost',
+          type: 'payGoods',
+          log: '',
+          args: { player_id: '1', type: 'wood', quantity: 1, target: 'building' },
+        },
+        {
+          uid: 'laterBuild',
+          type: 'construct',
+          log: '',
+          args: { player_id: '1', building: { native: 'b02' } },
+        },
+        {
+          uid: 'laterBonus',
+          type: 'takeGoods',
+          log: '',
+          args: {
+            player_id: '1',
+            type: 'corn',
+            quantity: 1,
+            origin: 'technology_architecture_level_1',
+          },
+        },
+        { ...state(99, []), args: { id: 99, type: 'manager', active_player: '1', args: [] } },
+      ]),
+    );
+  mutateRaw(raw);
+  const index = parseNetworkReplay(bytes(raw)),
+    base = observedChoiceFixture(33).operation.before;
+  base.pending.task.cornPayment = false;
+  base.players[0].technologies.architecture = 3;
+  base.buildings = ['b01', 'b02'];
+  base.players[0].buildings = [];
+  const laterRow = {
+    action: {
+      type: 'build',
+      id: 'b02',
+      architecture: true,
+      discountResource: 'wood',
+      cost: [0, 1, 0, 0, 0],
+    },
+    move: { type: 'choose', choiceId: 'build2' },
+  };
+  const rows = [
+    {
+      action: { type: 'build', id: 'b01', discountResource: 'wood' },
+      move: { type: 'choose', choiceId: 'build1' },
+    },
+    { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } },
+    laterRow,
+  ];
+  const source = {
+    players: {
+      1: {
+        resources: { corn: 10, wood: 5, stone: 5, gold: 5, skull: 0 },
+        buildings: [],
+        monuments: [],
+        workers: 3,
+      },
+    },
+    workers: new Map([['1', { id: '1', player: '1', place: null, position: null }]]),
+    buildings: ['b01', 'b02'],
+    monuments: [],
+    jungle: {},
+    skullSupply: 13,
+    skullSpaces: Array(10).fill(null),
+    day: 2,
+    age: 1,
+    firstPlayer: '1',
+    accumulatedCorn: 0,
+    foodDays: [],
+    activePlayer: '1',
+  };
+  const boundary = (g) => {
+    const n = g.entries.filter((n) => n.type === 'gameStateChange').at(-1);
+    return {
+      moveId: g.moveId,
+      potentialHumanDecision: n.args.id !== 99,
+      sourceStateId: n.args.id,
+      sourceActor: String(n.args.active_player),
+      sourceMenu: n.args.args,
+      nativeActor: 0,
+      nativePending: structuredClone(base.pending),
+      nativeLegalActions: structuredClone(rows),
+    };
+  };
+  const responses = index.groups
+    .filter((g) => g.moveId > 2)
+    .map((group) => ({
+      group,
+      before: structuredClone(base),
+      after: structuredClone(base),
+      operations: [],
+      boundary: boundary(group),
+      audit: [],
+      publicResultMatched: true,
+      sourceBefore: structuredClone(source),
+      sourceAfter: structuredClone(source),
+    }));
+  if (laterBuild) {
+    const r = responses.at(-1);
+    r.after.players[0].resources.wood--;
+    r.after.players[0].resources.corn++;
+    r.after.players[0].buildings.push('b02');
+    r.after.buildings = ['b01'];
+    r.after.pending = null;
+    r.operations = [
+      {
+        entry: r.group.entries.find((n) => n.type === 'construct'),
+        row: laterRow,
+        actor: 0,
+        observationActor: 0,
+        sourceActor: '1',
+        step: 1,
+        legalRows: rows,
+        before: r.before,
+        after: r.after,
+      },
+    ];
+    r.boundary.nativePending = null;
+    r.boundary.nativeLegalActions = [];
+  }
+  return {
+    index,
+    initialMoveId: 2,
+    sourceToNative: new Map([
+      ['1', 0],
+      ['2', 1],
+    ]),
+    mapCard: (card) => card.native,
+    initialBoundary: {
+      moveId: 2,
+      stateId: 32,
+      name: 'construct',
+      args: [],
+      sourceActor: '1',
+      actor: 0,
+      pending: structuredClone(base.pending),
+      legalRows: structuredClone(rows),
+    },
+    responses,
+  };
+}
+
+test('complete source cancellation closes an unknown uncommitted construction draft without a future building', () => {
+  const f = constructionDraftFixture(),
+    choices = createObservedChoices(f),
+    original = structuredClone(f.responses);
+  for (const r of f.responses) choices.observe(r);
+  const proof = choices.finish();
+  assert.equal(proof.boundaries[0].verified, true);
+  assert.equal(proof.boundaries[1].verified, true);
+  for (const b of proof.boundaries.slice(0, 2)) {
+    assert.equal(b.kind, 'uncommittedConstructionDraftCancelled');
+    assert.equal(b.unknownDraftBuildingId, null);
+    assert.deepEqual(b.nativeSteps, []);
+    assert.deepEqual(b.sourcePublicBefore, b.sourcePublicAfter);
+  }
+  assert.deepEqual(f.responses, original);
+  assert.equal(proof.boundaries[2].verified, false);
+});
+
+test('construction cancellation rejects unsupported source paths, public changes and altered choice availability', () => {
+  for (const mutateRaw of [
+    (raw) => {
+      raw.initialState.gamestates[33].transitions.cancel = 34;
+    },
+    (raw) => {
+      raw.initialState.gamestates[33].action = 'unprovedEffect';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[3].data[0].args.active_player = '2';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[3].data.push({
+        uid: 'payment',
+        type: 'payGoods',
+        log: '',
+        args: { player_id: '1', type: 'wood', quantity: 1, target: 'building' },
+      });
+    },
+    (raw) => {
+      raw.gameLogs.data.data[3].data.push({
+        uid: 'caption',
+        type: 'updateReflexionTime',
+        log: '',
+        args: { player_id: '1', delta: 1 },
+      });
+    },
+    (raw) => {
+      raw.gameLogs.data.data[3].data[0].args.args = { changed: true };
+    },
+  ]) {
+    const f = constructionDraftFixture(mutateRaw),
+      choices = createObservedChoices(f);
+    for (const r of f.responses) choices.observe(r);
+    assert.equal(choices.finish().boundaries[0].verified, false);
+  }
+  for (const mutate of [
+    (f) => {
+      f.responses[1].sourceAfter.players[1].resources.wood--;
+    },
+    (f) => {
+      f.responses[1].sourceAfter.players[1].buildings.push('b01');
+    },
+    (f) => {
+      f.responses[1].sourceAfter.buildings.pop();
+    },
+    (f) => {
+      f.responses[1].sourceAfter.workers.get('1').player = '2';
+    },
+    (f) => {
+      f.responses[1].boundary.nativeLegalActions.pop();
+    },
+    (f) => {
+      f.responses[1].after.players[0].resources.wood--;
+    },
+    (f) => {
+      f.responses[1].sourceAfter = null;
+    },
+    (f) => {
+      f.responses[0].sourceBefore = {};
+    },
+  ]) {
+    const f = constructionDraftFixture();
+    mutate(f);
+    const choices = createObservedChoices(f);
+    for (const r of f.responses) choices.observe(r);
+    assert.equal(choices.finish().boundaries[0].verified, false);
+  }
+});
+
+test('a later committed building cannot supply the identity or proof of an unsupported earlier draft', () => {
+  for (const invalid of [false, true]) {
+    const f = constructionDraftFixture((raw) => {
+        if (invalid)
+          raw.gameLogs.data.data[3].data.push({
+            uid: 'unknownClock',
+            type: 'updateReflexionTime',
+            args: { player_id: '1', delta: 1 },
+            log: '',
+          });
+      }, true),
+      choices = createObservedChoices(f);
+    for (const r of f.responses) choices.observe(r);
+    const proof = choices.finish();
+    assert.equal(proof.boundaries[0].verified, !invalid);
+    assert.equal(proof.boundaries[1].verified, !invalid);
+    assert.equal(proof.boundaries[2].verified, true);
+    if (!invalid) {
+      assert.equal(proof.boundaries[0].unknownDraftBuildingId, null);
+      assert.equal(JSON.stringify(proof.boundaries[0]).includes('b02'), true);
+      assert.equal(Object.hasOwn(proof.boundaries[0], 'selectedBuilding'), false);
+    }
+  }
+});
+
 test('ordinary observed stages bind chosen actors, targets, amounts, costs and stage arguments', () => {
   for (const id of [4, 6, 7, 10, 31, 32, 33, 34, 35, 37, 42, 44, 45, 60, 61, 62, 70, 71, 95]) {
     const f = observedChoiceFixture(id);

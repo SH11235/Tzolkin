@@ -2370,6 +2370,15 @@ export function replayNetworkPrefix(
         applied: audit.slice(auditBeforeGroup),
         humanDecision: decisionType.potentialHumanDecision,
       });
+      const buildingResourceClosures = semantic.evidence.some(
+        (e) => e.type === 'fixedBuildingClosure',
+      )
+        ? semanticComparison
+            .finish()
+            .buildingResources.obligations.filter(
+              (w) => w.closed && w.closedMoveId === group.moveId,
+            )
+        : [];
       if (terminalValidation?.completed && native().phase === 'finished') {
         semantic.remainingDifferences = semantic.remainingDifferences.filter(
           (d) =>
@@ -2665,6 +2674,9 @@ export function replayNetworkPrefix(
           audit: audit.slice(auditBeforeGroup),
           publicResultMatched: semantic.semanticMatch,
           semanticEvidence: semantic.evidence,
+          buildingResourceClosures,
+          sourceBefore: semanticContext.source,
+          sourceAfter: ledger,
         });
         successfulGroups.push(group.moveId);
         continue;
@@ -2725,6 +2737,9 @@ export function replayNetworkPrefix(
         audit: audit.slice(auditBeforeGroup),
         publicResultMatched: semantic.semanticMatch,
         semanticEvidence: semantic.evidence,
+        buildingResourceClosures,
+        sourceBefore: semanticContext.source,
+        sourceAfter: ledger,
       });
       successfulGroups.push(group.moveId);
     } catch (error) {
