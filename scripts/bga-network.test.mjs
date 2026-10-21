@@ -1039,6 +1039,22 @@ test('ordinary skull recovery refuses source, delivery, menu and state ambiguity
   }
 });
 
+test('ordinary skull recovery refuses an original extra notification removed from the working group', () => {
+  const f = ordinarySkullFixture((raw) => {
+    raw.gameLogs.data.data.at(-1).data.push({
+      uid: 'extra-wood',
+      type: 'takeGoods',
+      log: '',
+      args: { player_id: '1', type: 'wood', quantity: '1', origin: 'action_yaxchilan_4' },
+    });
+  });
+  const extra = f.input.group.entries.pop();
+  assert.equal(extra.type, 'takeGoods');
+  assert.ok(f.input.index.entries.includes(extra));
+  assert.equal(f.input.group.entries.length, 5);
+  assert.throws(() => sourceOrdinarySingleSkullWitness(f.input));
+});
+
 test('ordinary skull outcome refuses unexplained intermediate or final fields and different native operations', () => {
   for (const mutate of [
     (f) => (f.middle.skullSupply = 0),

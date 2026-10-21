@@ -53,6 +53,7 @@ export function sourceOrdinarySingleSkullWitness({
       original.packetType !== 'resend' ||
       original.tableId !== index.tableId ||
       original.rawSha256 !== index.rawSha256 ||
+      (n !== prior && original.packetNotificationCount !== 5) ||
       n.channel !== `/table/t${index.tableId}` ||
       !n.visible ||
       n.beforeCheckpoint ||

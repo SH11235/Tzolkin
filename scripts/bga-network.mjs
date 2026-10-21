@@ -40,7 +40,12 @@ const ordinarySkullEntries = new WeakMap();
 export function originalOrdinarySkullEntry(entry) {
   const bound = ordinarySkullEntries.get(entry);
   return bound && isDeepStrictEqual(entry, bound.entry)
-    ? { packetType: bound.packetType, tableId: bound.tableId, rawSha256: bound.rawSha256 }
+    ? {
+        packetType: bound.packetType,
+        packetNotificationCount: bound.packetNotificationCount,
+        tableId: bound.tableId,
+        rawSha256: bound.rawSha256,
+      }
     : null;
 }
 
@@ -456,6 +461,7 @@ export function parseNetworkReplay(bytes) {
         ordinarySkullEntries.set(entry, {
           entry: structuredClone(entry),
           packetType: packet.packet_type,
+          packetNotificationCount: packet.data.length,
           tableId,
           rawSha256,
         });
