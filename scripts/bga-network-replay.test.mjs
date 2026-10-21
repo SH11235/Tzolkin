@@ -11,6 +11,7 @@ import {
   originalFinalScoringCaption,
   originalHarvestEntry,
   originalArchitectureEntry,
+  originalOrdinarySkullEntry,
 } from './bga-network.mjs';
 import {
   appendRewardFence,
@@ -283,6 +284,7 @@ mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
     originalFinalScoringCaption,
     originalHarvestEntry,
     originalArchitectureEntry,
+    originalOrdinarySkullEntry,
     inspectCancellationClusters: () => [],
     inspectArchiveClient: (studio, game) => {
       assert.equal(studio.toString(), 'synthetic studio');

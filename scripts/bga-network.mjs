@@ -35,6 +35,19 @@ const validatedContracts = new WeakSet();
 const finalScoringCaptions = new WeakMap();
 const harvestEntries = new WeakMap();
 const architectureEntries = new WeakMap();
+const ordinarySkullEntries = new WeakMap();
+
+export function originalOrdinarySkullEntry(entry) {
+  const bound = ordinarySkullEntries.get(entry);
+  return bound && isDeepStrictEqual(entry, bound.entry)
+    ? {
+        packetType: bound.packetType,
+        packetNotificationCount: bound.packetNotificationCount,
+        tableId: bound.tableId,
+        rawSha256: bound.rawSha256,
+      }
+    : null;
+}
 
 export function originalArchitectureEntry(entry) {
   const bound = architectureEntries.get(entry);
@@ -186,6 +199,7 @@ export function assertNetworkClockContract(index, contract) {
 export function parseNetworkReplay(bytes) {
   if (!Buffer.isBuffer(bytes) || bytes.length > MAX_BYTES) fail('invalid saved response bytes');
   const raw = uniqueJson(bytes, MAX_BYTES, 'network extract');
+  const rawSha256 = sha(bytes);
   keys(raw, ['schema', 'tableId', 'source', 'initialState', 'gameLogs'], 'extract');
   if (raw.schema !== 'tzolkin-bga-replay-network-extract-v1') fail('unsupported extract schema');
   const tableId = String(integer(raw.tableId, 'table ID', 1));
@@ -443,6 +457,14 @@ export function parseNetworkReplay(bytes) {
         ...(n.type === 'noSkullsLeft' ? { singleSkullCaption: n.log } : {}),
       };
       entries.push(entry);
+      if (n.type === 'gameStateChange' || packet.data.some((e) => e.type === 'noSkullsLeft'))
+        ordinarySkullEntries.set(entry, {
+          entry: structuredClone(entry),
+          packetType: packet.packet_type,
+          packetNotificationCount: packet.data.length,
+          tableId,
+          rawSha256,
+        });
       if (
         packet.data.some(
           (e) =>
@@ -514,7 +536,7 @@ export function parseNetworkReplay(bytes) {
   }
   return {
     schema: 'tzolkin-bga-network-index-v1',
-    rawSha256: sha(bytes),
+    rawSha256,
     tableId,
     viewer,
     sourceUrl: url.href,
