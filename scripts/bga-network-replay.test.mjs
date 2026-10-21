@@ -3891,6 +3891,38 @@ test('ordinary observed stages bind chosen actors, targets, amounts, costs and s
   }
 });
 
+test('explicit null construction arguments preserve selected full costs and disabled architecture', () => {
+  const f = observedChoiceFixture(70);
+  f.boundary.args = null;
+  assert.equal(observedStageArguments(f.boundary, f.operation), null);
+  assert.equal(observedOperationBinding(f), null);
+  const changedCost = structuredClone(f.operation.row);
+  changedCost.action.cost[1]++;
+  const costOperation = {
+    ...f.operation,
+    row: changedCost,
+    legalRows: [structuredClone(changedCost)],
+  };
+  assert.equal(
+    observedOperationBinding({ ...f, operation: costOperation }),
+    'constructionTargetOrPaymentDiffer',
+  );
+  const rights = { ...f.operation, before: structuredClone(f.operation.before) };
+  rights.before.pending.task.architectureAvailable = true;
+  assert.equal(observedStageArguments(f.boundary, rights), 'architectureDisabledStageDiffer');
+  const changedBonus = structuredClone(f.operation.row);
+  changedBonus.action.architecture = true;
+  const bonusOperation = {
+    ...f.operation,
+    row: changedBonus,
+    legalRows: [structuredClone(changedBonus)],
+  };
+  assert.equal(
+    observedOperationBinding({ ...f, operation: bonusOperation }),
+    'architectureBonusChoiceDiffer',
+  );
+});
+
 test('selected corn harvest binds source permission to native tiles and agriculture', () => {
   const make = (kind) => {
     const f = observedChoiceFixture(10),

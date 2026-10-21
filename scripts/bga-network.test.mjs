@@ -3026,6 +3026,7 @@ function buildingMarketFixture(
   raw.initialState.gamestates[9] = {
     name: 'solveStackedAction',
     type: 'game',
+    action: 'stSolveStackedAction',
     transitions: { constructWithoutArchitecture: 70 },
   };
   raw.initialState.gamestates[42] = {
@@ -3037,6 +3038,7 @@ function buildingMarketFixture(
   raw.initialState.gamestates[70] = {
     name: 'constructWithoutArchitecture',
     type: 'activeplayer',
+    args: 'argBuildingFullCost',
     possibleactions: ['construct', 'pass'],
   };
   let uid = 10000;
@@ -3244,6 +3246,80 @@ test('a bounded original construction and four sales establish a zero-score stru
   assert.equal(evidence.scoreDelta, 0);
   assert.equal(evidence.humanSkipObserved, false);
   assert.throws(() => bindBuildingMarketExit(proof, f.before, after), /Building market:/);
+});
+
+test('building-market birth and exit retain explicit null arguments for their known source handlers', () => {
+  for (const positions of [[0], [1], [2], [0, 1, 2]]) {
+    const f = buildingMarketFixture((raw) => {
+      const packets = raw.gameLogs.data.data;
+      const states = [packets.find((p) => p.move_id === '6').data[5], ...packets.at(-1).data];
+      for (const i of positions) states[i].args.args = null;
+    });
+    const proof = proveBuildingMarketExit(f.token, f),
+      after = structuredClone(f.before);
+    after.pending = {
+      title: 'build',
+      task: after.pending.after[0],
+      after: after.pending.after.slice(1),
+    };
+    const result = bindBuildingMarketExit(proof, f.before, after);
+    assert.equal(result.humanSkipObserved, false);
+    assert.equal(result.scoreDelta, 0);
+  }
+});
+
+test('building-market null support refuses missing arguments, unknown handlers and unrelated payloads', () => {
+  for (const position of [0, 1, 2]) {
+    for (const value of [undefined, {}, [1], 'null', 0, false]) {
+      const f = buildingMarketFixture((raw) => {
+        const packets = raw.gameLogs.data.data;
+        const states = [packets.find((p) => p.move_id === '6').data[5], ...packets.at(-1).data];
+        states[position].args.args = value;
+      });
+      assert.throws(() => proveBuildingMarketExit(f.token, f), /Building market:/);
+    }
+  }
+  for (const mutate of [
+    (raw) => {
+      raw.initialState.gamestates[9].action = 'unknown';
+    },
+    (raw) => {
+      raw.initialState.gamestates[70].args = 'unknown';
+    },
+    (raw) => {
+      raw.gameLogs.data.data.at(-1).data[1].args.active_player = '2';
+    },
+    (raw) => {
+      raw.gameLogs.data.data.find((p) => p.move_id === '6').data[0].args.quantity = 3;
+    },
+    (raw) => {
+      raw.gameLogs.data.data.find((p) => p.move_id === '6').data[6].args.args = null;
+    },
+    (raw) => {
+      raw.gameLogs.data.data.find((p) => p.move_id === '7').data[3].args.args = null;
+    },
+  ]) {
+    const f = buildingMarketFixture((raw) => {
+      const packets = raw.gameLogs.data.data;
+      for (const n of [packets.find((p) => p.move_id === '6').data[5], ...packets.at(-1).data])
+        n.args.args = null;
+      mutate(raw);
+    });
+    assert.throws(() => proveBuildingMarketExit(f.token, f), /Building market:/);
+  }
+  const wrongTail = buildingMarketFixture(
+    (raw) => {
+      const packets = raw.gameLogs.data.data;
+      for (const n of [packets.find((p) => p.move_id === '6').data[5], ...packets.at(-1).data])
+        n.args.args = null;
+    },
+    {
+      mutateTail: (t) => {
+        t[0].architectureAvailable = true;
+      },
+    },
+  );
+  assert.throws(() => proveBuildingMarketExit(wrongTail.token, wrongTail), /Building market:/);
 });
 
 test('mixed building-market exchanges bind every legal native unit with either concrete continuation', () => {
