@@ -27,6 +27,7 @@ import {
   trackRewardQueues,
 } from './bga-network-rewards.mjs';
 import { catalogFingerprint } from './bga-replay.mjs';
+import { sourceBurnHarvestWitness, bindBurnHarvestOutcome } from './bga-network-harvest.mjs';
 
 const catalogBytes = readFileSync(
   new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url),
@@ -1389,8 +1390,23 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       Object.entries(ledger.players).map(([id, player]) => [id, player.score]),
     );
     const stepsBefore = record.steps.length;
+    const frameBeforeGroup = frame;
+    const auditBeforeGroup = audit.length;
+    const fencesBeforeGroup = timingFences.length;
     let constructionTransition = null;
+    let burnHarvest = null;
     try {
+      burnHarvest = sourceBurnHarvestWitness({
+        index,
+        group,
+        ledger,
+        before,
+        observation: frame.observation,
+        sourceToNative,
+        sourceStateMatched:
+          differences(ledger, before, sourceToNative, terminalCalendar).length === 0,
+        unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
+      });
       const singleSkull = group.entries.some((n) => n.type === 'noSkullsLeft')
         ? sourceSingleSkullWitness({
             ledger,
@@ -1542,6 +1558,43 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         }
         for (const n of group.entries) {
           const a = n.args;
+          if (burnHarvest) {
+            if (n === group.entries[0]) {
+              applyWhere(
+                (x) =>
+                  x.type === 'harvest' && x.kind === 'burn' && x.position === burnHarvest.position,
+                'observed forest burn',
+              );
+              const middle = frame;
+              applyWhere(
+                (x) => x.type === 'temple' && x.temple === burnHarvest.god && x.direction === -1,
+                'observed forest burn temple penalty',
+              );
+              const evidence = bindBurnHarvestOutcome(
+                burnHarvest,
+                before,
+                middle,
+                native(),
+                record.steps.slice(stepsBefore),
+              );
+              audit.push({
+                moveId: group.moveId,
+                burnHarvestEvidence: evidence,
+                teacherCertified: false,
+              });
+              timingFences.push({
+                kind: 'atomicBurnHarvest',
+                startMoveId: group.moveId,
+                resolvedMoveId: group.moveId,
+                excludedMoveIds: [group.moveId],
+                actor: burnHarvest.actor,
+                sourceId: burnHarvest.sourceId,
+                reason:
+                  'Native grants harvest goods before the temple choice; source publishes them after the named penalty.',
+              });
+            }
+            continue;
+          }
           if (
             n.type === 'alterTemple' &&
             Number.isInteger(a.corn) &&
@@ -2263,6 +2316,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         cancellation: group.entries[0].type === 'undoRestoreDISAB',
       });
     } catch (error) {
+      if (burnHarvest) {
+        frame = frameBeforeGroup;
+        record.steps.length = stepsBefore;
+        audit.length = auditBeforeGroup;
+        timingFences.length = fencesBeforeGroup;
+      }
       if (native().phase === 'finished') {
         const result = group.entries.find(
           (n) => n.type === 'gameStateChange' && Number(n.args.id) === 99,

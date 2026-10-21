@@ -9,6 +9,7 @@ import {
   assertNetworkClockContract,
   parseNetworkReplay,
   originalFinalScoringCaption,
+  originalHarvestEntry,
 } from './bga-network.mjs';
 import {
   appendRewardFence,
@@ -36,6 +37,7 @@ mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
     assertNetworkClockContract,
     parseNetworkReplay,
     originalFinalScoringCaption,
+    originalHarvestEntry,
     inspectCancellationClusters: () => [],
     inspectArchiveClient: (studio, game) => {
       assert.equal(studio.toString(), 'synthetic studio');
