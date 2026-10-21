@@ -3013,8 +3013,21 @@ test('age-II stage refuses unconsumed, foreign, intervening or mismatched comple
   }
 });
 
-function buildingMarketFixture(mutateRaw = () => {}) {
+function buildingMarketFixture(
+  mutateRaw = () => {},
+  {
+    trades = Array.from({ length: 4 }, () => ({ resource: 'gold', buy: false, units: 1 })),
+    singleTail = false,
+    mutateOperations = () => {},
+    mutateTail = () => {},
+  } = {},
+) {
   const raw = fixture();
+  raw.initialState.gamestates[9] = {
+    name: 'solveStackedAction',
+    type: 'game',
+    transitions: { constructWithoutArchitecture: 70 },
+  };
   raw.initialState.gamestates[42] = {
     name: 'trade',
     type: 'activeplayer',
@@ -3058,22 +3071,29 @@ function buildingMarketFixture(mutateRaw = () => {}) {
       state(42, { maxvalue: '20' }),
     ]),
   );
-  for (let move = 7; move <= 10; move++)
+  const prices = { wood: 2, stone: 3, gold: 4 };
+  for (const [i, trade] of trades.entries()) {
+    const { resource, buy, units } = trade;
+    const payment = buy ? 'corn' : resource,
+      receipt = buy ? resource : 'corn',
+      cost = (buy ? prices[resource] : 1) * units,
+      gain = (buy ? 1 : prices[resource]) * units;
     raw.gameLogs.data.data.push(
-      packet(move, [
+      packet(7 + i, [
         n('trade', {
           player_id: '1',
-          quantity1: 1,
-          quantity2: 4,
-          resource1: "<div class='tz_icon resource_gold'></div>",
-          resource2: "<div class='tz_icon resource_corn'></div>",
+          quantity1: cost,
+          quantity2: gain,
+          resource1: `<div class='tz_icon resource_${payment}'></div>`,
+          resource2: `<div class='tz_icon resource_${receipt}'></div>`,
         }),
-        n('takeGoods', { player_id: '1', type: 'corn', quantity: 4, origin: 'action_uxmal_2' }),
-        n('payGoods', { player_id: '1', type: 'gold', quantity: 1, target: 'action_uxmal_2' }),
+        n('takeGoods', { player_id: '1', type: receipt, quantity: gain, origin: 'action_uxmal_2' }),
+        n('payGoods', { player_id: '1', type: payment, quantity: cost, target: 'action_uxmal_2' }),
         state(42, { maxvalue: '20' }),
       ]),
     );
-  raw.gameLogs.data.data.push(packet(11, [state(9, [], 'game'), state(70)]));
+  }
+  raw.gameLogs.data.data.push(packet(7 + trades.length, [state(9, [], 'game'), state(70)]));
   mutateRaw(raw);
   const index = parseNetworkReplay(bytes(raw));
   const tail = [
@@ -3092,16 +3112,57 @@ function buildingMarketFixture(mutateRaw = () => {}) {
       architectureAvailable: false,
     },
   ];
+  if (singleTail) tail.pop();
+  mutateTail(tail);
   let before = {
     currentPlayer: 0,
-    players: [{ resources: { corn: 3, gold: 6 }, score: 8, buildings: ['b21', 'b18'] }],
+    players: [
+      {
+        resources: { corn: 3, wood: 0, stone: 0, gold: 6 },
+        score: 8,
+        buildings: ['b21', 'b18'],
+      },
+    ],
     pending: { title: 'market', task: { type: 'trade' }, after: tail },
   };
+  const constructionBefore = structuredClone(before);
+  constructionBefore.players[0].resources.corn--;
+  constructionBefore.players[0].resources.stone += 2;
+  constructionBefore.players[0].score -= 8;
+  constructionBefore.players[0].buildings.pop();
+  constructionBefore.pending = { title: 'build', task: { type: 'build', remaining: 2 }, after: [] };
+  const buildAction = {
+    type: 'build',
+    id: 'b18',
+    renovation: null,
+    architecture: true,
+    discountResource: 'stone',
+    cost: [0, 0, 2, 0, 0],
+  };
+  const operation = (entry, before, after, action, choiceId) => {
+    const row = { action, move: { type: 'choose', choiceId } };
+    return {
+      entry,
+      actor: 0,
+      observationActor: 0,
+      sourceActor: '1',
+      before: structuredClone(before),
+      after: structuredClone(after),
+      row,
+      legalRows: [structuredClone(row)],
+    };
+  };
+  const birthGroup = index.groups.find((g) => g.moveId === 6);
+  const birthOperations = [
+    operation(birthGroup.entries[1], constructionBefore, before, buildAction, 'build:b18:stone'),
+  ];
+  mutateOperations(birthOperations, 6);
   let token = trackBuildingMarket(null, {
     index,
-    group: index.groups.find((g) => g.moveId === 6),
-    before,
+    group: birthGroup,
+    before: constructionBefore,
     after: before,
+    operations: birthOperations,
     sourceActor: '1',
     sourceBefore: {
       initial: index.initial,
@@ -3111,29 +3172,47 @@ function buildingMarketFixture(mutateRaw = () => {}) {
     },
     differences: [],
     transition: {
-      action: { id: 'b18', architecture: true, discountResource: 'stone', cost: [0, 0, 2, 0, 0] },
+      action: buildAction,
       architectureLevel: 3,
       beforePending: { title: 'build' },
     },
   });
 
-  for (let move = 7; move <= 10; move++) {
+  for (const [i, trade] of trades.entries()) {
+    const move = 7 + i,
+      group = index.groups.find((g) => g.moveId === move),
+      { resource, buy, units } = trade;
     const after = structuredClone(before);
-    after.players[0].resources.gold--;
-    after.players[0].resources.corn += 4;
+    const operations = [];
+    for (let unit = 0; unit < units; unit++) {
+      const unitBefore = structuredClone(after);
+      after.players[0].resources[buy ? 'corn' : resource] -= buy ? prices[resource] : 1;
+      after.players[0].resources[buy ? resource : 'corn'] += buy ? 1 : prices[resource];
+      operations.push(
+        operation(
+          group.entries[0],
+          unitBefore,
+          after,
+          { type: 'trade', resource, buy },
+          `${buy ? 'buy' : 'sell'}:${resource}`,
+        ),
+      );
+    }
+    mutateOperations(operations, move);
     token = trackBuildingMarket(token, {
       index,
-      group: index.groups.find((g) => g.moveId === move),
+      group,
       before,
       after,
       differences: [],
+      operations,
     });
     before = after;
   }
   return {
     token,
     index,
-    group: index.groups.find((g) => g.moveId === 11),
+    group: index.groups.find((g) => g.moveId === 7 + trades.length),
     ledger: {
       initial: index.initial,
       stateId: 42,
@@ -3165,6 +3244,149 @@ test('a bounded original construction and four sales establish a zero-score stru
   assert.equal(evidence.scoreDelta, 0);
   assert.equal(evidence.humanSkipObserved, false);
   assert.throws(() => bindBuildingMarketExit(proof, f.before, after), /Building market:/);
+});
+
+test('mixed building-market exchanges bind every legal native unit with either concrete continuation', () => {
+  const trades = [
+    { resource: 'gold', buy: false, units: 2 },
+    { resource: 'wood', buy: true, units: 3 },
+    { resource: 'wood', buy: false, units: 2 },
+    { resource: 'stone', buy: true, units: 2 },
+    { resource: 'stone', buy: false, units: 1 },
+    { resource: 'gold', buy: true, units: 1 },
+  ];
+  for (const singleTail of [false, true]) {
+    const f = buildingMarketFixture(() => {}, { trades, singleTail });
+    const proof = proveBuildingMarketExit(f.token, f),
+      after = structuredClone(f.before);
+    after.pending = {
+      title: 'build',
+      task: after.pending.after[0],
+      after: after.pending.after.slice(1),
+    };
+    const evidence = bindBuildingMarketExit(proof, f.before, after);
+    assert.equal(evidence.transactions.length, 6);
+    assert.equal(
+      evidence.transactions.reduce((n, t) => n + t.units, 0),
+      11,
+    );
+    assert.deepEqual(after.players[0].resources, { corn: 2, wood: 1, stone: 1, gold: 5 });
+    assert.equal(after.pending.after.length, singleTail ? 0 : 1);
+    assert.equal(evidence.humanSkipObserved, false);
+  }
+});
+
+test('building-market receipts reject wrong prices, amounts, actors and missing or duplicated effects', () => {
+  for (const mutate of [
+    (e) => e[0].args.quantity2++,
+    (e) => e[0].args.quantity1++,
+    (e) => {
+      e[0].args.resource2 = "<div class='tz_icon resource_wood'></div>";
+    },
+    (e) => {
+      e[1].args.player_id = '2';
+    },
+    (e) => {
+      e[2].args.player_id = '2';
+    },
+    (e) => {
+      e[1].args.origin = 'unknown';
+    },
+    (e) => {
+      e[2].args.target = 'unknown';
+    },
+    (e) => {
+      e[1].args.quantity++;
+    },
+    (e) => {
+      e[2].args.quantity++;
+    },
+    (e) => e.splice(1, 1),
+    (e) =>
+      e.push({
+        uid: 'extra-effect',
+        type: 'takeGoods',
+        args: { player_id: '1', type: 'corn', quantity: 1 },
+        log: '',
+      }),
+  ]) {
+    const f = buildingMarketFixture((raw) =>
+      mutate(raw.gameLogs.data.data.find((p) => p.move_id === '7').data),
+    );
+    assert.throws(() => proveBuildingMarketExit(f.token, f), /Building market:/);
+  }
+  assert.throws(
+    () =>
+      buildingMarketFixture((raw) => {
+        const e = raw.gameLogs.data.data.find((p) => p.move_id === '7').data;
+        e[2].uid = e[1].uid;
+      }),
+    /invalid\/duplicate notification/,
+  );
+});
+
+test('building-market proof refuses unbound native choices, queue changes and financing from later trades', () => {
+  for (const mutate of [
+    (ops) => {
+      ops[0].actor = 1;
+    },
+    (ops) => {
+      ops[0].observationActor = 1;
+    },
+    (ops) => {
+      ops[0].sourceActor = '2';
+    },
+    (ops) => {
+      ops[0].entry = structuredClone(ops[0].entry);
+    },
+    (ops) => {
+      ops[0].legalRows = [];
+    },
+    (ops) => {
+      ops[0].before.players[0].resources.corn++;
+    },
+    (ops) => {
+      ops[0].after.players[0].score++;
+    },
+    (ops) => {
+      ops[0].after.pending.after[0].architectureAvailable = true;
+    },
+    (ops) => ops.pop(),
+    (ops) => ops.push(ops[0]),
+  ]) {
+    const f = buildingMarketFixture(() => {}, {
+      mutateOperations: (ops, move) => {
+        if (move === 7) mutate(ops);
+      },
+    });
+    assert.throws(() => proveBuildingMarketExit(f.token, f), /Building market:/);
+  }
+  for (const mutateTail of [
+    (t) => t.push({ type: 'technology', remaining: 1 }),
+    (t) => {
+      t[0].remaining = 0;
+    },
+    (t) => {
+      t[0].allowMonument = true;
+    },
+  ]) {
+    const f = buildingMarketFixture(() => {}, { mutateTail });
+    assert.throws(() => proveBuildingMarketExit(f.token, f), /Building market:/);
+  }
+  for (const resource of ['gold', 'stone']) {
+    const trades =
+      resource === 'gold'
+        ? [
+            { resource, buy: true, units: 1 },
+            { resource, buy: false, units: 1 },
+          ]
+        : [
+            { resource, buy: false, units: 1 },
+            { resource, buy: true, units: 1 },
+          ];
+    const f = buildingMarketFixture(() => {}, { trades });
+    assert.throws(() => proveBuildingMarketExit(f.token, f), /Building market:/);
+  }
 });
 
 test('structural market exit rejects unknown actors, packets, effects, choices and pending changes', () => {

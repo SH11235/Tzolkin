@@ -27,6 +27,27 @@ const tail = [
     architectureAvailable: false,
   },
 ];
+const supportedTail = (value) => same(value, tail) || same(value, tail.slice(0, 1));
+const publicState = (value) =>
+  Object.fromEntries(Object.entries(value).filter(([k]) => k !== 'log'));
+const prices = { wood: 2, stone: 3, gold: 4 };
+function boundOperation(op, { index, entry, actor, sourceActor, before, after, action, move }) {
+  return (
+    op?.actor === actor &&
+    op.row &&
+    Array.isArray(op.legalRows) &&
+    op.observationActor === actor &&
+    op.sourceActor === sourceActor &&
+    op.entry === entry &&
+    originalPacketEntry(entry)?.rawSha256 === index.rawSha256 &&
+    same(op.before, publicState(before)) &&
+    same(op.after, publicState(after)) &&
+    same(op.row.action, action) &&
+    same(op.row.move, move) &&
+    op.legalRows.filter((r) => same(r.action, action) && same(r.move, move)).length === 1 &&
+    op.legalRows.some((r) => same(r, op.row))
+  );
+}
 function closed(index, group, types) {
   return (
     index.groups.includes(group) &&
@@ -34,6 +55,7 @@ function closed(index, group, types) {
       group.entries.map((n) => n.type),
       types,
     ) &&
+    new Set(group.entries.map((n) => n.uid)).size === types.length &&
     group.entries.every((n, i) => {
       const source = originalPacketEntry(n);
       return (
@@ -94,11 +116,13 @@ function state(n, id, actor, index) {
 }
 export function trackBuildingMarket(
   previous,
-  { index, group, before, after, transition, sourceActor, sourceBefore, differences },
+  { index, group, before, after, transition, sourceActor, sourceBefore, differences, operations },
 ) {
   if (differences.length) return null;
   if (
-    transition?.action.id === 'b18' &&
+    transition?.action.type === 'build' &&
+    transition.action.id === 'b18' &&
+    transition.action.renovation === null &&
     sourceBefore?.initial === index.initial &&
     sourceBefore.stateId === 37 &&
     sourceBefore.activePlayer === sourceActor &&
@@ -107,8 +131,8 @@ export function trackBuildingMarket(
     transition.architectureLevel === 3 &&
     transition.action.discountResource === 'stone' &&
     same(transition.action.cost, [0, 0, 2, 0, 0]) &&
-    same(after.pending?.after, tail) &&
-    after.pending?.task.type === 'trade' &&
+    supportedTail(after.pending?.after) &&
+    same(after.pending?.task, { type: 'trade' }) &&
     after.players[after.currentPlayer].buildings.at(-1) === 'b18' &&
     closed(index, group, [
       'payGoods',
@@ -141,7 +165,18 @@ export function trackBuildingMarket(
           (n, i) => n.args.player_id === sourceActor && integerEquals(n.args.points, [2, 6][i]),
         ) ||
       !state(e[5], 9, sourceActor, index) ||
-      !state(e[6], 42, sourceActor, index)
+      !state(e[6], 42, sourceActor, index) ||
+      operations?.length !== 1 ||
+      !boundOperation(operations[0], {
+        index,
+        entry: e[1],
+        actor: after.currentPlayer,
+        sourceActor,
+        before,
+        after,
+        action: transition.action,
+        move: { type: 'choose', choiceId: 'build:b18:stone' },
+      })
     )
       return null;
     const token = {};
@@ -151,7 +186,11 @@ export function trackBuildingMarket(
       sourceActor,
       state: structuredClone(after),
       lastMove: group.moveId,
-      sales: 0,
+      constructionMove: group.moveId,
+      constructionUids: e.map((n) => n.uid),
+      transactions: [],
+      tail: structuredClone(after.pending.after),
+      uids: new Set(e.map((n) => n.uid)),
       title: transition.beforePending.title,
     });
     return token;
@@ -160,41 +199,71 @@ export function trackBuildingMarket(
   if (
     !proof ||
     proof.index !== index ||
-    proof.sales >= 4 ||
     !same(proof.state, before) ||
     group.moveId !== proof.lastMove + 1 ||
-    !closed(index, group, ['trade', 'takeGoods', 'payGoods', 'gameStateChange'])
+    !closed(index, group, ['trade', 'takeGoods', 'payGoods', 'gameStateChange']) ||
+    group.entries.some((n) => proof.uids.has(n.uid))
   )
     return null;
   const e = group.entries,
     a = e[0].args;
+  const icon = (resource) => `<div class='tz_icon resource_${resource}'></div>`;
+  const buy = a.resource1 === icon('corn');
+  const resource = Object.keys(prices).find((r) => (buy ? a.resource2 : a.resource1) === icon(r));
+  if (!resource || (!buy && a.resource2 !== icon('corn'))) return null;
+  const units = Number(buy ? a.quantity2 : a.quantity1);
+  if (!Number.isSafeInteger(units) || units < 1 || units > 100) return null;
+  const payment = buy ? 'corn' : resource,
+    receipt = buy ? resource : 'corn',
+    cost = buy ? prices[resource] : 1,
+    gain = buy ? 1 : prices[resource];
   if (
     a.player_id !== proof.sourceActor ||
-    !integerEquals(a.quantity1, 1) ||
-    !integerEquals(a.quantity2, 4) ||
-    a.resource1 !== "<div class='tz_icon resource_gold'></div>" ||
-    a.resource2 !== "<div class='tz_icon resource_corn'></div>" ||
+    !integerEquals(a.quantity1, cost * units) ||
+    !integerEquals(a.quantity2, gain * units) ||
     e[1].args.player_id !== proof.sourceActor ||
-    e[1].args.type !== 'corn' ||
-    !integerEquals(e[1].args.quantity, 4) ||
+    e[1].args.type !== receipt ||
+    !integerEquals(e[1].args.quantity, gain * units) ||
     e[1].args.origin !== 'action_uxmal_2' ||
     e[2].args.player_id !== proof.sourceActor ||
-    e[2].args.type !== 'gold' ||
-    !integerEquals(e[2].args.quantity, 1) ||
+    e[2].args.type !== payment ||
+    !integerEquals(e[2].args.quantity, cost * units) ||
     e[2].args.target !== 'action_uxmal_2' ||
-    !state(e[3], 42, proof.sourceActor, index)
+    !state(e[3], 42, proof.sourceActor, index) ||
+    operations?.length !== units
   )
     return null;
   const expected = structuredClone(before);
-  expected.players[proof.actor].resources.gold -= 1;
-  expected.players[proof.actor].resources.corn += 4;
+  for (const op of operations) {
+    const unitBefore = structuredClone(expected);
+    if (expected.players[proof.actor].resources[payment] < cost) return null;
+    expected.players[proof.actor].resources[payment] -= cost;
+    expected.players[proof.actor].resources[receipt] += gain;
+    if (
+      !boundOperation(op, {
+        index,
+        entry: e[0],
+        actor: proof.actor,
+        sourceActor: proof.sourceActor,
+        before: unitBefore,
+        after: expected,
+        action: { type: 'trade', resource, buy },
+        move: { type: 'choose', choiceId: `${buy ? 'buy' : 'sell'}:${resource}` },
+      })
+    )
+      return null;
+  }
   if (!same(expected, after)) return null;
   const token = {};
   proofs.set(token, {
     ...proof,
     state: structuredClone(after),
     lastMove: group.moveId,
-    sales: proof.sales + 1,
+    transactions: [
+      ...proof.transactions,
+      { sourceMove: group.moveId, uids: e.map((n) => n.uid), resource, buy, units, cost, gain },
+    ],
+    uids: new Set([...proof.uids, ...e.map((n) => n.uid)]),
   });
   return token;
 }
@@ -207,7 +276,6 @@ export function proveBuildingMarketExit(
   if (
     !p ||
     p.index !== index ||
-    p.sales !== 4 ||
     p.lastMove + 1 !== group.moveId ||
     differences.length ||
     ledger.initial !== index.initial ||
@@ -216,17 +284,25 @@ export function proveBuildingMarketExit(
     !same(ledger.stateArgs, { maxvalue: '20' }) ||
     !same(before, p.state) ||
     before.currentPlayer !== p.actor ||
-    !same(before.pending?.after, tail) ||
+    !same(before.pending?.after, p.tail) ||
+    !supportedTail(p.tail) ||
+    !same(before.pending?.task, { type: 'trade' }) ||
     !closed(index, group, ['gameStateChange', 'gameStateChange']) ||
     !state(group.entries[0], 9, p.sourceActor, index) ||
     !state(group.entries[1], 70, p.sourceActor, index) ||
+    group.entries.some((n) => p.uids.has(n.uid)) ||
     group.entries[0].args.type !== 'game' ||
     group.entries[1].args.type !== 'activeplayer' ||
     s[42]?.name !== 'trade' ||
+    s[42].type !== 'activeplayer' ||
     !same(s[42].possibleactions, ['trade', 'pass']) ||
     s[42].transitions?.nextAction !== 9 ||
     s[42].transitions?.nextTrade !== 42 ||
+    s[9]?.name !== 'solveStackedAction' ||
+    s[9].type !== 'game' ||
+    s[9].transitions?.constructWithoutArchitecture !== 70 ||
     s[70]?.name !== 'constructWithoutArchitecture' ||
+    s[70].type !== 'activeplayer' ||
     !same(s[70].possibleactions, ['construct', 'pass'])
   )
     fail();
@@ -251,6 +327,10 @@ export function proveBuildingMarketExit(
     sourceActor: p.sourceActor,
     source: group.moveId,
     title: p.title,
+    constructionMove: p.constructionMove,
+    constructionUids: structuredClone(p.constructionUids),
+    transactions: structuredClone(p.transactions),
+    exitUids: group.entries.map((n) => n.uid),
   };
   exits.set(result, { proof: structuredClone(result), before: structuredClone(before) });
   return result;
@@ -270,6 +350,10 @@ export function bindBuildingMarketExit(proof, before, after) {
     sourceMove: proof.source,
     sourceActor: proof.sourceActor,
     actor: proof.actor,
+    constructionMove: proof.constructionMove,
+    constructionUids: proof.constructionUids,
+    transactions: proof.transactions,
+    exitUids: proof.exitUids,
     scoreDelta: 0,
     derivedReplayTransition: true,
     humanSkipObserved: false,

@@ -2430,6 +2430,7 @@ export function replayNetworkPrefix(
         before,
         after: native(),
         transition: constructionTransition,
+        operations: choiceOperations,
         sourceBefore: sourceBeforeGroup,
         sourceActor: [...sourceToNative].find(([, id]) => id === frame.observation?.actor)?.[0],
         differences: unmaskedDifferences,
