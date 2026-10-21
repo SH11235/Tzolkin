@@ -25,6 +25,42 @@ const basic = (s) =>
   s.additionalBuildings === false &&
   s.players.every((p) => !p.tribe);
 
+function constructionContinuation(opening) {
+  const task = opening.before.pending?.task;
+  const inherited = opening.before.pending?.after;
+  const tail = opening.after.pending?.after;
+  if (
+    task?.type !== 'build' ||
+    ![1, 2].includes(task.remaining) ||
+    typeof task.allowMonument !== 'boolean' ||
+    typeof task.cornPayment !== 'boolean' ||
+    (task.architectureAvailable !== undefined && typeof task.architectureAvailable !== 'boolean') ||
+    (task.mandatory !== undefined && task.mandatory !== false) ||
+    !Array.isArray(tail) ||
+    !Array.isArray(inherited) ||
+    inherited.length > 1 ||
+    (inherited.length === 1 &&
+      !isDeepStrictEqual(inherited[0], {
+        type: 'build',
+        remaining: 0,
+        allowMonument: false,
+        cornPayment: false,
+        architectureAvailable: false,
+      }))
+  )
+    return null;
+  const follow = {
+    type: 'build',
+    remaining: task.remaining - 1,
+    allowMonument: false,
+    cornPayment: task.cornPayment,
+    architectureAvailable: task.architectureAvailable !== false && !opening.action.architecture,
+  };
+  return isDeepStrictEqual(tail.slice(1), [follow, ...inherited])
+    ? { follow, inherited: copy(inherited) }
+    : null;
+}
+
 export function createBuildingResourceComparison({ index, sourceToNative }) {
   const history = [];
   const sequence = originalNetworkSequence(index);
@@ -181,6 +217,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
       const effect = opening.after.pending.after[0];
       const beforeTasks = opening.before.pending?.after ?? [];
       const tail = opening.after.pending.after;
+      const continuation = constructionContinuation(opening);
       const technology = card.effects[0];
       const expectedTask = technology.technology === 'extraction' ? 'resource' : 'technology';
       const payments = group.entries.filter((n) => n.type === 'payGoods');
@@ -227,9 +264,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
           (t) => t.type === 'effects' && t.effects.some((e) => e.type === 'resources'),
         ) ||
         !fixedTask(effect, fixed) ||
-        tail.length !== 2 ||
-        tail[1].type !== 'build' ||
-        ![0, 1].includes(tail[1].remaining) ||
+        !continuation ||
         opening.after.pending.task.type !== expectedTask ||
         (expectedTask === 'resource' &&
           (opening.before.players[actor].technologies.extraction !== 3 ||
@@ -264,6 +299,9 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
           stage: expectedTask,
           decisions: [],
           sourceRewardOrigin: `${construct.args.building.type}_b${construct.args.building.id}`,
+          ...(continuation.inherited.length
+            ? { inheritedBuildContinuation: copy(continuation) }
+            : {}),
         };
         history.push(active);
         evidence.push({

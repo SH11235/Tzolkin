@@ -3958,6 +3958,11 @@ function fixedBuildingFixture(
     branch = null,
     templeSummit = false,
     continuation = null,
+    constructionArchitecture = false,
+    inheritedEmptyBuild = false,
+    technologyLevels = null,
+    startingResources = null,
+    followingBuilding = null,
     rewardResource = 'gold',
     mutateSource = () => {},
     mutateFrames = () => {},
@@ -3970,6 +3975,11 @@ function fixedBuildingFixture(
     branch,
     templeSummit,
     continuation,
+    constructionArchitecture,
+    inheritedEmptyBuild,
+    technologyLevels,
+    startingResources,
+    followingBuilding,
     rewardResource,
   ]);
   if (!syntheticBuildingFrames.has(cacheKey)) {
@@ -3990,8 +4000,9 @@ function fixedBuildingFixture(
       round: card.age === 1 ? 5 : 16,
       age: card.age,
       foodDays: card.age === 1 ? [] : [8, 14],
-      buildings: [id],
-      buildingDeckCount: catalog.BUILDINGS.filter((c) => c.age === card.age).length - 1,
+      buildings: [id, ...(followingBuilding ? [followingBuilding] : [])],
+      buildingDeckCount:
+        catalog.BUILDINGS.filter((c) => c.age === card.age).length - (followingBuilding ? 2 : 1),
       age2DeckCount: card.age === 1 ? 18 : 0,
       skullSupply: stock,
       currentPlayer: 0,
@@ -4016,6 +4027,8 @@ function fixedBuildingFixture(
         monuments: [],
       });
     state.players[1].resources.skull = 13 - stock;
+    if (technologyLevels) Object.assign(state.players[0].technologies, technologyLevels);
+    if (startingResources) Object.assign(state.players[0].resources, startingResources);
     state.turn = { mode: 'remove', count: 1, begged: false };
     if (templeSummit) {
       state.players[0].temples.kukulkan = catalog.TEMPLE_TRACKS.kukulkan.max - 1;
@@ -4029,13 +4042,26 @@ function fixedBuildingFixture(
         remaining: continuation ? 2 : 1,
         allowMonument: false,
         cornPayment: false,
-        architectureAvailable: continuation === 'architecture',
+        architectureAvailable: constructionArchitecture || continuation === 'architecture',
       },
-      after: [],
+      after: inheritedEmptyBuild
+        ? [
+            {
+              type: 'build',
+              remaining: 0,
+              allowMonument: false,
+              cornPayment: false,
+              architectureAvailable: false,
+            },
+          ]
+        : [],
     };
     const frame = dispatch({ operation: 'publicInspect', state });
     const build = frame.observation.legalActions.find(
-      (r) => r.action.type === 'build' && r.action.id === id && r.action.architecture === false,
+      (r) =>
+        r.action.type === 'build' &&
+        r.action.id === id &&
+        r.action.architecture === constructionArchitecture,
     );
     assert.ok(build);
     const after = dispatch({ operation: 'publicApply', state, actor: 0, move: build.move });
@@ -4162,6 +4188,19 @@ function fixedBuildingFixture(
       building: { id: '10', type: `building_age_${card.age}`, type_arg: '0' },
     }),
   );
+  if (opener.action.architecture) {
+    const level = opener.before.players[0].technologies.architecture;
+    if (level >= 1)
+      initialEvents.push(
+        n('takeGoods', {
+          player_id: '1',
+          type: 'corn',
+          quantity: 1,
+          origin: 'technology_architecture_level_1',
+        }),
+      );
+    if (level >= 2) initialEvents.push(n('updateScore', { player_id: '1', points: 2 }));
+  }
   for (const [type, quantity] of Object.entries(card.effects[1].resources))
     initialEvents.push(
       n('takeGoods', { player_id: '1', type, quantity, origin: `building_age_${card.age}_b10` }),
@@ -4546,6 +4585,139 @@ test('fixed reward closure verifies the remaining worker or building decision', 
   assert.equal(result.failure, null);
   assert.equal(result.unresolved.awaitingDecisionClosure, true);
   assert.equal(deferred.helper.finish().allObligationsClosed, false);
+});
+
+test('fixed rewards bind inherited empty construction without losing the current build right', () => {
+  for (const [id, continuation, constructionArchitecture, theology] of [
+    ['b23', null, true, 1],
+    ['b24', 'architecture', false, 2],
+  ]) {
+    const f = fixedBuildingFixture(id, {
+      inheritedEmptyBuild: true,
+      continuation,
+      constructionArchitecture,
+      branch: 'theology',
+      technologyLevels: { agriculture: 0, extraction: 3, architecture: 3, theology },
+      followingBuilding: continuation ? 'b28' : null,
+      startingResources: continuation ? { gold: 0 } : null,
+    });
+    assert.equal(f.frames[0].after.pending.after.length, 3);
+    for (let i = 0; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+    const obligation = f.helper.finish().obligations[0];
+    assert.equal(obligation.closed, true);
+    assert.deepEqual(
+      obligation.inheritedBuildContinuation.inherited,
+      f.frames[0].before.pending.after,
+    );
+    assert.deepEqual(
+      obligation.inheritedBuildContinuation.follow,
+      f.frames[0].after.pending.after[1],
+    );
+    assert.equal(f.frames[1].action.technology, 'theology');
+    assert.equal(f.frames[1].after.players[0].technologies.theology, theology + 1);
+    if (continuation) {
+      assert.equal(f.frames.at(-1).after.pending.task.remaining, 1);
+      assert.equal(f.frames.at(-1).after.pending.task.architectureAvailable, true);
+      assert.equal(f.frames.at(-1).after.pending.after[0].remaining, 0);
+      assert.equal(
+        f.frames.at(-1).after.players[0].resources.gold,
+        f.frames[0].after.players[0].resources.gold + 1,
+      );
+      assert.ok(
+        f.frames
+          .at(-1)
+          .afterLegalActions.some(
+            (r) =>
+              r.action.type === 'build' &&
+              r.action.id === 'b28' &&
+              r.action.discountResource === 'stone' &&
+              r.action.cost[3] === 1,
+          ),
+      );
+      assert.equal(f.frames[0].after.players[0].resources.gold, 0);
+      assert.equal(f.frames.at(-1).after.players[0].resources.gold, 1);
+    } else assert.equal(f.frames.at(-1).after.pending, null);
+  }
+});
+
+test('inherited construction rejects altered provenance, follow flags and extra effects', () => {
+  const options = { inheritedEmptyBuild: true, continuation: 'architecture' };
+  for (const mutateFrames of [
+    (frames) => {
+      frames[0].before.pending.after[0].type = 'trade';
+      frames[0].after.pending.after[2].type = 'trade';
+    },
+    (frames) => {
+      frames[0].before.pending.after[0].remaining = 1;
+      frames[0].after.pending.after[2].remaining = 1;
+    },
+    ...['allowMonument', 'cornPayment', 'architectureAvailable', 'mandatory'].map(
+      (flag) => (frames) => {
+        frames[0].before.pending.after[0][flag] = true;
+        frames[0].after.pending.after[2][flag] = true;
+      },
+    ),
+    (frames) => {
+      frames[0].after.pending.after.splice(1, 1);
+    },
+    (frames) => {
+      frames[0].after.pending.after.push(structuredClone(frames[0].after.pending.after[2]));
+    },
+    (frames) => {
+      const tail = frames[0].after.pending.after;
+      [tail[1], tail[2]] = [tail[2], tail[1]];
+    },
+    (frames) => {
+      frames[0].after.pending.after[1].remaining = 0;
+    },
+    ...['allowMonument', 'cornPayment', 'mandatory'].map((flag) => (frames) => {
+      frames[0].after.pending.after[1][flag] = true;
+    }),
+    (frames) => {
+      frames[0].after.pending.after[1].architectureAvailable = false;
+    },
+    (frames) => {
+      frames[0].after.pending.after.unshift(structuredClone(frames[0].after.pending.after[0]));
+    },
+    (frames) => {
+      frames[0].actor = 1;
+    },
+    (frames) => {
+      frames[0].action.cost[1]++;
+    },
+  ]) {
+    const f = fixedBuildingFixture('b24', { ...options, mutateFrames });
+    assert.ok(f.step(0).failure);
+    assert.equal(f.helper.finish().allObligationsClosed, false);
+  }
+});
+
+test('inherited reward stays open when the free choice consumes resources or loses fixed gold', () => {
+  for (const mutateFrames of [
+    (frames) => {
+      frames[1].before.pending.after[2].architectureAvailable = true;
+    },
+    (frames) => {
+      frames[1].after.players[0].resources.gold--;
+    },
+    (frames) => {
+      frames[1].after.players[0].resources.corn--;
+    },
+    (frames) => {
+      frames[1].after.pending.task.remaining = 0;
+    },
+  ]) {
+    const f = fixedBuildingFixture('b24', {
+      inheritedEmptyBuild: true,
+      continuation: 'architecture',
+      branch: 'theology',
+    });
+    assert.equal(f.step(0).failure, null);
+    f.frames[1] = structuredClone(f.frames[1]);
+    mutateFrames(f.frames);
+    assert.ok(f.step(1).failure);
+    assert.equal(f.helper.finish().allObligationsClosed, false);
+  }
 });
 
 test('fixed rewards reject altered origins, actors, costs, duplicate receipts and unclosed queues', () => {
