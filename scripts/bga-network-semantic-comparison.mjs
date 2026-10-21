@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
 import { provePostReceiptFood } from './bga-network-semantic-feeding.mjs';
+import { createBuildingResourceComparison } from './bga-network-building-resources.mjs';
 
 const clone = structuredClone;
 const sourceId = (entry) => String(entry.args.player_id);
@@ -14,6 +15,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
   const sequence = originalNetworkSequence(index);
   const remaining = sequence?.groups.filter(({ group }) => group.moveId > initialMoveId) ?? [];
   const mapping = new Map(sourceToNative);
+  const buildingResources = createBuildingResourceComparison({ index, sourceToNative: mapping });
   const workers = new Map(index.initial.workers.map((w) => [String(w.id), clone(w)]));
   const owned = new Map(
     [...mapping.keys()].map((id) => [
@@ -65,10 +67,17 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
     };
   }
   function applied(context, transition) {
-    if (['rotate', 'endTurn'].includes(transition.action.type))
+    if (
+      ['rotate', 'endTurn', 'build', 'technology', 'resource', 'temple', 'skip'].includes(
+        transition.action.type,
+      )
+    )
       context.transitions.push(clone(transition));
   }
-  function compare(context, { ledger, native, observation, differences, applied, humanDecision }) {
+  function compare(
+    context,
+    { ledger, native, observation, differences, applied, humanDecision, constructionTransition },
+  ) {
     const { group, source: beforeSource, native: before, observation: priorObservation } = context;
     const entries = group.entries;
     if (!isDeepStrictEqual(context.original, group))
@@ -435,6 +444,16 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       )
         reject('unclaimed rotation changed the starter or round order');
     }
+    const building = buildingResources.compare(context, {
+      ledger,
+      native,
+      observation,
+      differences,
+      constructionTransition,
+    });
+    if (building.failure) reject(building.failure);
+    for (const field of building.fields) allowed.add(field);
+    evidence.push(...building.evidence);
     const remainingDifferences = differences.filter((d) => !allowed.has(d.field));
     for (const n of entries) {
       if (n.type === 'cornOnWheel' || n.type === 'firstPlayer') {
@@ -456,7 +475,8 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           claimMoveId: c.claimMoveId,
           corn: c.cornOpen && !c.cornClosed,
           marker: c.markerOpen,
-        })),
+        }))
+        .concat(building.unresolved ? [building.unresolved] : []),
       failure,
     };
     if (humanDecision) decisions.push({ moveId: group.moveId, matched: result.semanticMatch });
@@ -470,9 +490,11 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       sourceGroupsExpected: remaining.length,
       sourceSequenceComplete: !!sequence && cursor === remaining.length,
       obligations: clone(obligations),
+      buildingResources: buildingResources.finish(),
       decisionBoundaries: clone(decisions),
       failure,
-      allObligationsClosed: obligations.every((c) => c.closed),
+      allObligationsClosed:
+        obligations.every((c) => c.closed) && buildingResources.finish().allObligationsClosed,
       allDecisionBoundariesMatched: decisions.every((d) => d.matched),
       teacherCertified: false,
     };

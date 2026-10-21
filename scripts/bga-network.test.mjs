@@ -6,6 +6,10 @@ import {
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
+import { createBuildingResourceComparison } from './bga-network-building-resources.mjs';
+import { coreDispatcher } from './bga-replay.mjs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
 function semanticFixture({
   self = false,
@@ -3259,4 +3263,411 @@ test('building market accepts canonical integer scalars but refuses coercible so
     }
   });
   assert.ok(proveBuildingMarketExit(f.token, f));
+});
+const syntheticBuildingFrames = new Map();
+function fixedBuildingFixture(
+  id = 'b24',
+  {
+    capped = false,
+    stock = 2,
+    branch = null,
+    templeSummit = false,
+    mutateSource = () => {},
+    mutateFrames = () => {},
+  } = {},
+) {
+  const cacheKey = JSON.stringify([id, capped, stock, branch, templeSummit]);
+  if (!syntheticBuildingFrames.has(cacheKey)) {
+    const cli = join(
+      process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../target', import.meta.url)),
+      'debug',
+      process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai',
+    );
+    const dispatch = coreDispatcher(cli);
+    const state = JSON.parse(
+      readFileSync(new URL('./fixtures/bga-reconstruction-small.json', import.meta.url)),
+    ).companion.record.initial;
+    const catalog = JSON.parse(
+      readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+    );
+    const card = catalog.BUILDINGS.find((c) => c.id === id);
+    Object.assign(state, {
+      round: card.age === 1 ? 5 : 16,
+      age: card.age,
+      foodDays: card.age === 1 ? [] : [8, 14],
+      buildings: [id],
+      buildingDeckCount: catalog.BUILDINGS.filter((c) => c.age === card.age).length - 1,
+      age2DeckCount: card.age === 1 ? 18 : 0,
+      skullSupply: stock,
+      currentPlayer: 0,
+      firstPlayer: 0,
+      firstPlayerClaimed: null,
+      accumulatedCorn: 0,
+      turnOrder: [0, 1, 2, 3],
+      turnIndex: 0,
+    });
+    for (const p of state.players)
+      Object.assign(p, {
+        name: `P${p.id + 1}`,
+        resources: { corn: 20, wood: 20, stone: 20, gold: 20, skull: 0 },
+        technologies: {
+          agriculture: capped ? 3 : 0,
+          extraction: capped ? 3 : 0,
+          architecture: capped ? 3 : 0,
+          theology: capped ? 3 : 0,
+        },
+        temples: { chaac: 0, quetzalcoatl: 0, kukulkan: 0 },
+        buildings: [],
+        monuments: [],
+      });
+    state.players[1].resources.skull = 13 - stock;
+    if (templeSummit) {
+      state.players[0].temples.kukulkan = catalog.TEMPLE_TRACKS.kukulkan.max - 1;
+      state.players[0].doubleAdvanceAvailable = false;
+      state.players[1].temples.chaac = catalog.TEMPLE_TRACKS.chaac.max;
+    }
+    state.pending = {
+      title: 'Synthetic construction',
+      task: {
+        type: 'build',
+        remaining: 1,
+        allowMonument: false,
+        cornPayment: false,
+        architectureAvailable: false,
+      },
+      after: [],
+    };
+    const frame = dispatch({ operation: 'publicInspect', state });
+    const build = frame.observation.legalActions.find(
+      (r) => r.action.type === 'build' && r.action.id === id && r.action.architecture === false,
+    );
+    assert.ok(build);
+    const after = dispatch({ operation: 'publicApply', state, actor: 0, move: build.move });
+    assert.equal(after.error, undefined);
+    const frames = [
+      {
+        before: state,
+        after: after.snapshot.state,
+        actor: 0,
+        action: build.action,
+        legalActions: frame.observation.legalActions,
+        step: 1,
+      },
+    ];
+    let current = after;
+    while (
+      current.snapshot.state.pending?.after.some(
+        (t) => t.type === 'effects' && t.effects.some((e) => e.type === 'resources'),
+      )
+    ) {
+      const rows = current.observation.legalActions;
+      const row =
+        current.snapshot.state.pending.task.type === 'technology'
+          ? rows.find(
+              (r) => r.action.technology === (branch ?? (id === 'b26' ? 'theology' : 'extraction')),
+            )
+          : (rows.find((r) => r.action.resource === 'gold' || r.action.temple === 'kukulkan') ??
+            rows[0]);
+      const next = dispatch({
+        operation: 'publicApply',
+        state: current.snapshot.state,
+        actor: 0,
+        move: row.move,
+      });
+      assert.equal(next.error, undefined);
+      frames.push({
+        before: current.snapshot.state,
+        after: next.snapshot.state,
+        actor: 0,
+        action: row.action,
+        legalActions: rows,
+        step: frames.length + 1,
+      });
+      current = next;
+    }
+    syntheticBuildingFrames.set(cacheKey, { frames, card });
+  }
+  const { frames, card } = structuredClone(syntheticBuildingFrames.get(cacheKey));
+  let uid = 6000;
+  const n = (type, args) => ({ uid: String(++uid), type, args, log: '' });
+  const raw = fixture();
+  raw.initialState.players['4'] = { ...raw.initialState.players['3'], id: '4', name: 'P4' };
+  raw.initialState.workers.push({ id: '4', player: '4', place: null, position: null });
+  raw.initialState.playerorder = [1, 2, 3, 4];
+  raw.initialState.gamestate.multiactive = ['1', '2', '3', '4'];
+  raw.gameLogs.data.data[0].data[1].args = ['1', '2', '3', '4'];
+  Object.assign(raw.initialState.gamestates, {
+    9: { type: 'game' },
+    60: { type: 'activeplayer', name: 'resourceReward' },
+    61: { type: 'activeplayer', name: 'templeReward' },
+    62: { type: 'activeplayer', name: 'freeTechnology' },
+    7: { type: 'activeplayer' },
+    32: { type: 'activeplayer' },
+  });
+  const stateNotice = (state) => {
+    const type = state.pending?.task.type;
+    return [
+      n('gameStateChange', { id: 9, type: 'game', active_player: '1' }),
+      n('gameStateChange', {
+        id:
+          type === 'technology'
+            ? 62
+            : type === 'resource'
+              ? 60
+              : type === 'temple'
+                ? 61
+                : type === 'build'
+                  ? 32
+                  : 7,
+        type: 'activeplayer',
+        active_player: '1',
+      }),
+    ];
+  };
+  const technologyEvents = (technology, level) => [
+    n('increaseTechnology', { player_id: '1', technology_id: technology, level: level + 1 }),
+    ...(level === 3
+      ? [
+          {
+            ...n(`${technology}Max`, { player_name: 'P1' }),
+            log: technology === 'theology' ? 'Theology bonus: ${player_name} takes a skull' : '',
+          },
+          n('decreaseTechnology', { player_id: '1', technology_id: technology, level: 3 }),
+        ]
+      : []),
+  ];
+  const opener = frames[0],
+    kinds = ['corn', 'wood', 'stone', 'gold', 'skull'];
+  const initialEvents = kinds.flatMap((type, i) =>
+    opener.action.cost[i]
+      ? [
+          n('payGoods', {
+            player_id: '1',
+            type,
+            quantity: opener.action.cost[i],
+            target: `building_age_${card.age}_10`,
+          }),
+        ]
+      : [],
+  );
+  initialEvents.push(
+    n('construct', {
+      player_id: '1',
+      building: { id: '10', type: `building_age_${card.age}`, type_arg: '0' },
+    }),
+  );
+  for (const [type, quantity] of Object.entries(card.effects[1].resources))
+    initialEvents.push(
+      n('takeGoods', { player_id: '1', type, quantity, origin: `building_age_${card.age}_b10` }),
+    );
+  if (card.effects[0].technology === 'extraction')
+    initialEvents.push(...technologyEvents('extraction', capped ? 3 : 0));
+  initialEvents.push(...stateNotice(opener.after));
+  const eventGroups = [initialEvents];
+  for (const t of frames.slice(1)) {
+    const events = [];
+    if (t.action.type === 'technology') {
+      const level = t.before.players[0].technologies[t.action.technology];
+      events.push(...technologyEvents(t.action.technology, level));
+      if (level === 3 && t.action.technology === 'theology')
+        events.push(
+          n('takeGoods', {
+            player_id: '1',
+            type: 'skull',
+            quantity: 1,
+            origin: 'technology_theology_level_4',
+          }),
+        );
+      if (level === 3 && t.action.technology === 'architecture')
+        events.push(n('updateScore', { player_id: '1', points: 3 }));
+    } else if (t.action.type === 'temple') {
+      const temple = t.action.temple;
+      if (t.before.players[0].temples[temple] !== t.after.players[0].temples[temple])
+        events.push(
+          n('alterTemple', {
+            player_id: '1',
+            temple_id: temple === 'kukulkan' ? 'kukulcan' : temple,
+            step: t.after.players[0].temples[temple] + 1,
+          }),
+        );
+      if (!t.before.players[0].doubleAdvanceAvailable && t.after.players[0].doubleAdvanceAvailable)
+        events.push({
+          ...n('flipBoard', { player_id: '1', player_name: 'P1', side: 0 }),
+          log: '${player_name} flips his board lighter side up',
+        });
+    } else if (t.action.type === 'resource')
+      events.push(
+        n('takeGoods', { player_id: '1', type: t.action.resource, quantity: 1, origin: null }),
+      );
+    events.push(...stateNotice(t.after));
+    eventGroups.push(events);
+  }
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    ...eventGroups.map((data, i) => ({
+      channel: '/table/t123',
+      table_id: 123,
+      packet_id: String(i + 2),
+      packet_type: 'resend',
+      move_id: String(i + 2),
+      time: '1',
+      data,
+    })),
+  ];
+  mutateSource(raw);
+  mutateFrames(frames);
+  const index = parseNetworkReplay(bytes(raw)),
+    helper = createBuildingResourceComparison({
+      index,
+      sourceToNative: new Map([
+        ['1', 0],
+        ['2', 1],
+        ['3', 2],
+        ['4', 3],
+      ]),
+    });
+  const ledger = {
+    players: Object.fromEntries(
+      frames[0].before.players.map((p) => [
+        String(p.id + 1),
+        { resources: structuredClone(p.resources) },
+      ]),
+    ),
+    skullSupply: stock,
+  };
+  const results = [];
+  function step(i) {
+    const group = index.groups[i],
+      t = frames[i],
+      source = structuredClone(ledger);
+    for (const n of group.entries)
+      if (n.type === 'takeGoods' || n.type === 'payGoods') {
+        ledger.players[String(n.args.player_id)].resources[n.args.type] +=
+          Number(n.args.quantity) * (n.type === 'takeGoods' ? 1 : -1);
+        if (n.type === 'takeGoods' && n.args.type === 'skull')
+          ledger.skullSupply -= Number(n.args.quantity);
+      }
+    for (const n of group.entries)
+      if (n.type === 'gameStateChange') {
+        ledger.stateId = Number(n.args.id);
+        ledger.activePlayer = String(n.args.active_player);
+      }
+    const differences = [];
+    for (const [id, player] of Object.entries(ledger.players))
+      for (const r of kinds) {
+        const observed = player.resources[r],
+          native = t.after.players[Number(id) - 1].resources[r];
+        if (observed !== native)
+          differences.push({ field: `player.${id}.resources.${r}`, observed, native });
+      }
+    if (ledger.skullSupply !== t.after.skullSupply)
+      differences.push({
+        field: 'skullSupply',
+        observed: ledger.skullSupply,
+        native: t.after.skullSupply,
+      });
+    const context = { group, source, transitions: [t] },
+      args = {
+        ledger,
+        native: t.after,
+        observation: { actor: 0 },
+        differences,
+        constructionTransition:
+          i === 0
+            ? {
+                nativeId: card.id,
+                action: t.action,
+                sourceConstructUid: group.entries.find((n) => n.type === 'construct').uid,
+              }
+            : null,
+      };
+    const result = helper.compare(context, args);
+    results.push(result);
+    return result;
+  }
+  return { step, helper, frames, results, index };
+}
+
+test('fixed building resources retain their original receipt through actual native free choices', () => {
+  for (const id of ['b11', 'b12', 'b23', 'b24', 'b25', 'b26']) {
+    const f = fixedBuildingFixture(id, { capped: true });
+    assert.equal(f.step(0).failure, null);
+    assert.equal(f.helper.finish().allObligationsClosed, false);
+    for (let i = 1; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+    assert.equal(f.helper.finish().allObligationsClosed, true);
+    assert.equal(f.helper.finish().obligations[0].building, id);
+    assert.ok(f.helper.finish().obligations[0].consumedAtStep > 1);
+  }
+  for (const options of [{}, { capped: true, branch: 'agriculture', templeSummit: true }]) {
+    const f = fixedBuildingFixture('b24', options);
+    for (let i = 0; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+    assert.equal(f.helper.finish().allObligationsClosed, true);
+  }
+});
+
+test('fixed skull profile refuses stock zero or one and preserves both allocations with two', () => {
+  for (const stock of [0, 1])
+    assert.ok(fixedBuildingFixture('b26', { capped: true, stock }).step(0).failure);
+  const f = fixedBuildingFixture('b26', { capped: true, stock: 2 });
+  f.step(0);
+  assert.equal(f.step(1).failure, null);
+  const choice = f.helper.finish().obligations[0].decisions[0];
+  assert.equal(choice.directContribution.skull, 1);
+  assert.equal(choice.fixedContribution.skull, 1);
+  assert.equal(choice.preSkullSupply, 2);
+  assert.equal(choice.postSkullSupply, 0);
+});
+
+test('fixed rewards reject altered origins, actors, costs, duplicate receipts and unclosed queues', () => {
+  for (const mutateSource of [
+    (raw) => {
+      raw.gameLogs.data.data[1].data.find((n) => n.type === 'takeGoods').args.origin =
+        'building_age_2_b11';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[1].data.find((n) => n.type === 'takeGoods').args.player_id = '2';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[1].data.find((n) => n.type === 'payGoods').args.quantity++;
+    },
+    (raw) => {
+      const p = raw.gameLogs.data.data[1];
+      p.data.splice(3, 0, { ...p.data.find((n) => n.type === 'takeGoods'), uid: '7001' });
+    },
+    (raw) => {
+      raw.gameLogs.data.data[1].channel = '/player/p1';
+    },
+  ])
+    assert.ok(fixedBuildingFixture('b24', { mutateSource }).step(0).failure);
+  const f = fixedBuildingFixture('b24');
+  f.step(0);
+  assert.equal(f.helper.finish().allObligationsClosed, false);
+  assert.equal(f.helper.finish().teacherCertified, false);
+});
+
+test('fixed rewards refuse surcharge, identical nested rewards and hidden intervening decisions', () => {
+  for (const mutateFrames of [
+    (frames) => {
+      frames[0].after.pending.task.free = false;
+    },
+    (frames) => {
+      frames[0].before.pending.after.push(structuredClone(frames[0].after.pending.after[0]));
+    },
+    (frames) => {
+      frames[0].after.pending.after.push(structuredClone(frames[0].after.pending.after[0]));
+    },
+  ])
+    assert.ok(fixedBuildingFixture('b24', { mutateFrames }).step(0).failure);
+  const f = fixedBuildingFixture('b24', {
+    mutateSource: (raw) => {
+      raw.gameLogs.data.data[2].data.unshift({
+        uid: '7002',
+        type: 'gameStateChange',
+        log: '',
+        args: { id: 61, type: 'activeplayer', active_player: '1' },
+      });
+    },
+  });
+  f.step(0);
+  assert.ok(f.step(1).failure);
 });

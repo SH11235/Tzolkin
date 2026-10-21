@@ -2025,6 +2025,7 @@ export function replayNetworkPrefix(
             if (constructionTransition) fail('multiple construction transitions in one boundary');
             constructionTransition = {
               nativeId: id,
+              sourceConstructUid: n.uid,
               beforeState: architectureCorn ? copy(native()) : null,
               matchingOptions: candidates.filter(
                 (r) =>
@@ -2244,6 +2245,7 @@ export function replayNetworkPrefix(
         native: native(),
         observation: frame.observation,
         differences: unmaskedDifferences,
+        constructionTransition,
         applied: audit.slice(auditBeforeGroup),
         humanDecision: decisionType.potentialHumanDecision,
       });
