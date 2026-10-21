@@ -2664,6 +2664,7 @@ export function replayNetworkPrefix(
           boundary: decisionBoundary,
           audit: audit.slice(auditBeforeGroup),
           publicResultMatched: semantic.semanticMatch,
+          semanticEvidence: semantic.evidence,
         });
         successfulGroups.push(group.moveId);
         continue;
@@ -2723,6 +2724,7 @@ export function replayNetworkPrefix(
         boundary: decisionBoundary,
         audit: audit.slice(auditBeforeGroup),
         publicResultMatched: semantic.semanticMatch,
+        semanticEvidence: semantic.evidence,
       });
       successfulGroups.push(group.moveId);
     } catch (error) {

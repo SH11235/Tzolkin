@@ -1,5 +1,11 @@
 import { isDeepStrictEqual as same } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
+import {
+  technologyChoiceProof,
+  begChoiceProof,
+  forcedRotationProof,
+  closedBurnChoiceProof,
+} from './bga-network-compound-choices.mjs';
 
 const clone = structuredClone;
 const resources = ['corn', 'wood', 'stone', 'gold', 'skull'];
@@ -73,7 +79,7 @@ const constructNames = new Set([
   'constructWithoutArchitecture',
 ]);
 
-export function observedStageArguments(boundary, operation) {
+export function observedStageArguments(boundary, operation, operations = [operation]) {
   const { name, args, actor } = boundary,
     before = operation.before,
     action = operation.row.action;
@@ -107,11 +113,19 @@ export function observedStageArguments(boundary, operation) {
   }
   if (name === 'templeReward' || name === 'tikal5') {
     const temples = name === 'templeReward' ? args : args?.temples;
+    const selected = operations
+      .filter((o) => o.row.action.type === 'temple')
+      .map((o) => (o.row.action.temple === 'kukulkan' ? 'kukulcan' : o.row.action.temple));
     if (
       !temples ||
-      ['chaac', 'quetzalcoatl', 'kukulcan'].some(
-        (t) => !integer(temples[t]) || Number(temples[t]) - 1 !== p.temples[god(t)],
-      )
+      !Object.keys(temples).length ||
+      Object.entries(temples).some(
+        ([t, value]) =>
+          !['chaac', 'quetzalcoatl', 'kukulcan'].includes(t) ||
+          !integer(value) ||
+          Number(value) - 1 !== p.temples[god(t)],
+      ) ||
+      selected.some((t) => !Object.hasOwn(temples, t))
     )
       return 'templeArgumentsDiffer';
     if (
@@ -217,6 +231,8 @@ export function observedOperationBinding({
   sourceToNative,
   mapCard,
   audit,
+  operations = [op],
+  semanticEvidence = [],
 }) {
   const n = op.entry,
     a = n?.args,
@@ -224,13 +240,24 @@ export function observedOperationBinding({
     p = op.before.players[op.actor],
     q = op.after.players[op.actor];
   const owner = sourceOwner(n, index, op.sourceActor);
+  const context = {
+    operation: op,
+    operations,
+    group,
+    index,
+    sourceToNative,
+    audit,
+    semanticEvidence,
+  };
+  const forced = forcedRotationProof(context);
+  const burn = closedBurnChoiceProof(context);
   if (
     !n ||
     !a ||
     !x ||
     !p ||
     !q ||
-    sourceToNative.get(owner) !== op.actor ||
+    (sourceToNative.get(owner) !== op.actor && !forced && !burn) ||
     op.actor !== op.observationActor ||
     !op.legalRows.some((r) => same(r, op.row))
   )
@@ -278,13 +305,7 @@ export function observedOperationBinding({
         : 'selectedActionPositionDiffer';
     }
     case 'technology':
-      return n.type === 'increaseTechnology' &&
-        a.technology_id === x.technology &&
-        integer(a.level) &&
-        Number(a.level) === Math.min(3, p.technologies[x.technology] + 1) &&
-        q.technologies[x.technology] === Number(a.level)
-        ? null
-        : 'technologyTargetOrLevelDiffer';
+      return technologyChoiceProof({ ...context, owner }).error;
     case 'payment':
       return ['increaseTechnology', 'payGoods'].includes(n.type) &&
         ['payResource', 'payTechnology'].includes(op.before.pending?.task.type) &&
@@ -303,6 +324,7 @@ export function observedOperationBinding({
         ? null
         : 'offeringTargetOrAmountDiffer';
     case 'temple': {
+      if (burn) return null;
       const direct =
         n.type === 'alterTemple'
           ? n
@@ -366,11 +388,7 @@ export function observedOperationBinding({
       return null;
     }
     case 'beg':
-      return n.type === 'alterTemple' &&
-        Number(a.corn) > 0 &&
-        q.resources.corn - p.resources.corn === Number(a.corn)
-        ? null
-        : 'beggingAmountDiffer';
+      return begChoiceProof({ ...context, owner }) ? null : 'beggingAmountDiffer';
     case 'endTurn':
       return n.type === 'gameStateChange' && Number(a.id) === 90
         ? null
@@ -380,14 +398,7 @@ export function observedOperationBinding({
         ? null
         : 'rotationDistanceDiffer';
     case 'harvest': {
-      if (x.kind === 'burn')
-        return audit.some(
-          (row) =>
-            row.burnHarvestEvidence?.actor === op.actor &&
-            row.burnHarvestEvidence.moveId === group.moveId,
-        )
-          ? null
-          : 'closedBurnWitnessMissing';
+      if (x.kind === 'burn') return burn ? null : 'closedBurnWitnessMissing';
       if (
         n.type === 'takeTile' &&
         Number(a.action) === x.position &&
@@ -424,6 +435,8 @@ export function createObservedChoices({
     originals = new Map(sequence?.groups.map((x) => [x.group, x.original]) ?? []),
     proofs = new Map(),
     operationEvidence = [];
+  const capturedOperations = [],
+    deferredTechnologies = [];
   const expected = [initialMoveId];
   let last = clone(initialBoundary),
     interval = null;
@@ -493,7 +506,16 @@ export function createObservedChoices({
       s[42]?.possibleactions?.includes('pass')
     );
   }
-  function observe({ group, before, after, operations, boundary, audit, publicResultMatched }) {
+  function observe({
+    group,
+    before,
+    after,
+    operations,
+    boundary,
+    audit,
+    publicResultMatched,
+    semanticEvidence = [],
+  }) {
     const nextHuman = boundary.potentialHumanDecision;
     const next = {
       moveId: group.moveId,
@@ -508,7 +530,18 @@ export function createObservedChoices({
     const sourceBound = originals.has(group) && same(originals.get(group), group);
     const unchanged = same(before, after);
     const actorSame =
-      operations.every((o) => o.actor === last.actor) &&
+      operations.every(
+        (o) =>
+          o.actor === last.actor ||
+          forcedRotationProof({
+            operation: o,
+            operations,
+            group,
+            index,
+            sourceToNative,
+            semanticEvidence,
+          }),
+      ) &&
       (!nextHuman ||
         next.actor === last.actor ||
         operations.some((o) => ['endTurn', 'rotate'].includes(o.row.action.type)));
@@ -521,9 +554,24 @@ export function createObservedChoices({
           : null;
     for (const op of operations) {
       const binding = trusted(group, op.entry)
-        ? observedOperationBinding({ operation: op, group, index, sourceToNative, mapCard, audit })
+        ? observedOperationBinding({
+            operation: op,
+            group,
+            index,
+            sourceToNative,
+            mapCard,
+            audit,
+            operations,
+            semanticEvidence,
+          })
         : 'chosenNotificationNotOriginal';
       error ??= binding;
+      capturedOperations.push({
+        operation: op,
+        group,
+        boundary: clone(last),
+        bindingError: binding,
+      });
       operationEvidence.push({
         step: op.step,
         moveId: group.moveId,
@@ -637,7 +685,7 @@ export function createObservedChoices({
               });
         interval = null;
       } else {
-        let issue = observedStageArguments(last, operations[0]);
+        let issue = observedStageArguments(last, operations[0], operations);
         if (last.name === 'playerTurn' || last.name === 'pickUpWorker') {
           const removal = operations.find((o) => o.row.action.type === 'remove');
           if (removal) {
@@ -671,7 +719,24 @@ export function createObservedChoices({
           !audit.some((a) => a.declinedRemovalEvidence)
         )
           issue ??= 'sourceStageDoesNotOfferPass';
-        issue ? fail(last, issue) : pass(last, 'observedLegalSelection', group, operations);
+        const tech = operations.find((o) => o.row.action.type === 'technology');
+        const proof = tech
+          ? technologyChoiceProof({
+              operation: tech,
+              operations,
+              group,
+              index,
+              owner: sourceOwner(tech.entry, index, tech.sourceActor),
+            })
+          : null;
+        if (!issue && proof?.reward) {
+          deferredTechnologies.push({
+            boundary: clone(last),
+            group,
+            operations: [...operations],
+            proof,
+          });
+        } else issue ? fail(last, issue) : pass(last, 'observedLegalSelection', group, operations);
       }
     }
     if (nextHuman) {
@@ -680,6 +745,59 @@ export function createObservedChoices({
     }
   }
   function finish() {
+    for (const deferred of deferredTechnologies) {
+      const { proof, boundary, group } = deferred;
+      let previous = proof.commit,
+        issue = null;
+      const following = capturedOperations
+        .filter((c) => c.operation.step > proof.commit.step)
+        .slice(0, proof.reward.remaining);
+      if (following.length !== proof.reward.remaining) issue = 'technologyCapRewardNotClosed';
+      for (let i = 0; i < following.length; i++) {
+        const { operation: op, group: response, boundary: choice, bindingError } = following[i];
+        if (
+          bindingError ||
+          proofs.get(choice.moveId)?.verified !== true ||
+          op.actor !== proof.reward.actor ||
+          !same(op.before, previous.after) ||
+          observedStageArguments(choice, op) ||
+          !same(op.before.pending?.task, {
+            ...proof.reward.task,
+            remaining: proof.reward.remaining - i,
+          })
+        )
+          issue ??= 'technologyCapRewardChoiceNotBound';
+        if (proof.track === 'extraction') {
+          if (
+            op.row.action.type !== 'resource' ||
+            op.entry.type !== 'takeGoods' ||
+            op.entry.args.origin !== null ||
+            op.after.players[op.actor].resources[op.row.action.resource] -
+              op.before.players[op.actor].resources[op.row.action.resource] !==
+              1
+          )
+            issue ??= 'technologyCapResourceRewardNotIsolated';
+        } else if (op.row.action.type !== 'temple' || op.row.action.direction !== 1)
+          issue ??= 'technologyCapTempleRewardNotBound';
+        previous = op;
+        if (!originals.has(response) || !same(originals.get(response), response))
+          issue ??= 'technologyCapRewardSourceNotBound';
+      }
+      if (issue) fail(boundary, issue);
+      else
+        pass(
+          boundary,
+          'technologyCapRewardInterval',
+          following.at(-1).group,
+          [...deferred.operations, ...following.map((c) => c.operation)],
+          {
+            activationMoveId: group.moveId,
+            activationSource: clone(proof.source),
+            rewardSource: following.map((c) => ref(c.operation.entry)),
+            decisionObservationsUnmodified: true,
+          },
+        );
+    }
     const all = expected.map(
       (moveId) =>
         proofs.get(moveId) ?? {
