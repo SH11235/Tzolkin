@@ -109,6 +109,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       JSON.stringify({
         tableId: result.tableId,
         terminalReached: result.terminalReached,
+        terminalValidationCompleted: result.terminalValidation?.completed ?? false,
+        completionUnresolved: result.completionEvidence?.unresolved ?? [],
         semanticReplayVerified: result.semanticReplayVerified,
         teacherCompleteness: result.teacherCompleteness,
         steps: result.record?.steps.length,

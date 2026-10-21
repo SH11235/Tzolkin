@@ -1,6 +1,11 @@
 import { recordDecisionBoundary, classifyDecisionState } from './bga-network-decision-boundary.mjs';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
 import {
+  assertObservationBoundary,
+  inspectTerminalProjection,
+  replayCompletionEvidence,
+} from './bga-network-terminal.mjs';
+import {
   trackBuildingMarket,
   proveBuildingMarketExit,
   bindBuildingMarketExit,
@@ -1296,6 +1301,7 @@ export function replayNetworkPrefix(
   }
   let frame = dispatch({ operation: 'publicInspect', state: initial });
   if (frame.error) fail(frame.error);
+  if (!frame.observation) fail('absent observation at the initial Playing boundary');
   let calls = 1;
   const audit = [];
   const timingFences = [];
@@ -1308,6 +1314,9 @@ export function replayNetworkPrefix(
   let openCornFence = null;
   let openRewardFences = [];
   const decisionBoundaryAudit = [];
+  const successfulGroups = [];
+  const feedingTransitions = [];
+  let terminalValidation = null;
   let buildingMarket = null;
   let current = null;
   const native = () => frame.snapshot.state;
@@ -1325,6 +1334,7 @@ export function replayNetworkPrefix(
     refills = { currentAge: [], age2: [] },
     cornEquivalent = false,
   ) {
+    if (!frame.observation) fail(`${reason}: absent observation before a native operation`);
     const rows = actions().filter((row) => predicate(row.action));
     const actor = frame.observation.actor,
       preState = native();
@@ -1354,6 +1364,18 @@ export function replayNetworkPrefix(
       response = apply(row);
     }
     if (response.error) fail(response.error);
+    if (
+      (response.snapshot.state.foodDays ?? []).some(
+        (day) => !(preState.foodDays ?? []).includes(day),
+      )
+    )
+      feedingTransitions.push({
+        before: copy(preState),
+        after: copy(response.snapshot.state),
+        action: copy(row.action),
+        step: record.steps.length + 1,
+        moveId: current.moveId,
+      });
     semanticComparison.applied(semanticContext, {
       before: preState,
       after: response.snapshot.state,
@@ -1455,6 +1477,15 @@ export function replayNetworkPrefix(
     let burnHarvest = null;
     let ageTwoRefillEvidence = null;
     try {
+      if (
+        group.entries.some(
+          (n) =>
+            n.type === 'gameStateChange' &&
+            (n.args.type === 'multipleactiveplayer' ||
+              index.initial.gamestates[n.args.id]?.type === 'multipleactiveplayer'),
+        )
+      )
+        fail('multiple-active source decisions are not supported after initial setup');
       const burnBeforeDifferences = differences(ledger, before, sourceToNative, terminalCalendar);
       burnHarvest = sourceBurnHarvestWitness({
         index,
@@ -2239,6 +2270,25 @@ export function replayNetworkPrefix(
         terminalCalendarFence.resolvedMoveId = group.moveId;
       }
       const unmaskedDifferences = differences(ledger, native(), sourceToNative);
+      assertObservationBoundary({
+        index,
+        group,
+        ledger,
+        native: native(),
+        observation: frame.observation,
+      });
+      if (native().phase === 'finished')
+        terminalValidation = inspectTerminalProjection({
+          index,
+          group,
+          ledger,
+          native: native(),
+          observation: frame.observation,
+          differences: unmaskedDifferences,
+          sourceToNative,
+          feedingTransitions,
+          terminalDisplayCheckpoint: record.terminalDisplayCheckpoint,
+        });
       const decisionType = classifyDecisionState(ledger, index);
       const semantic = semanticComparison.compare(semanticContext, {
         ledger,
@@ -2249,6 +2299,22 @@ export function replayNetworkPrefix(
         applied: audit.slice(auditBeforeGroup),
         humanDecision: decisionType.potentialHumanDecision,
       });
+      if (terminalValidation?.completed && native().phase === 'finished') {
+        semantic.remainingDifferences = semantic.remainingDifferences.filter(
+          (d) =>
+            !terminalValidation.acceptedExceptions.some(
+              (e) =>
+                isDeepStrictEqual(e.observed, d.observed) &&
+                isDeepStrictEqual(e.native, d.native) &&
+                e.field === d.field,
+            ),
+        );
+        semantic.semanticMatch = !semantic.failure && semantic.remainingDifferences.length === 0;
+        semantic.evidence.push({
+          type: 'terminalProjection',
+          validation: copy(terminalValidation),
+        });
+      }
       const decisionBoundary = {
         moveId: group.moveId,
         ...decisionType,
@@ -2259,9 +2325,9 @@ export function replayNetworkPrefix(
         sourcePossibleActions: copy(
           index.initial.gamestates[ledger.stateId]?.possibleactions ?? null,
         ),
-        nativeActor: frame.observation.actor,
+        nativeActor: frame.observation?.actor ?? null,
         nativePending: copy(native().pending),
-        nativeLegalActions: copy(frame.observation.legalActions),
+        nativeLegalActions: copy(frame.observation?.legalActions ?? []),
         differences: copy(unmaskedDifferences),
         semanticComparison: semantic,
         sourceStateMetadataPresent: !!index.initial.gamestates[ledger.stateId],
@@ -2271,6 +2337,13 @@ export function replayNetworkPrefix(
         fail(`Source decision state type not established: ${decisionType.sourceStateTypeIssue}`);
       let diff = differences(ledger, native(), sourceToNative, terminalCalendar);
       const originalDiff = copy(diff);
+      if (terminalValidation?.completed && native().phase === 'finished')
+        diff = diff.filter(
+          (d) =>
+            !terminalValidation.acceptedExceptions.some(
+              (e) => e.field === d.field && e.observed === d.observed && e.native === d.native,
+            ),
+        );
       buildingMarket = trackBuildingMarket(buildingMarket, {
         index,
         group,
@@ -2278,7 +2351,7 @@ export function replayNetworkPrefix(
         after: native(),
         transition: constructionTransition,
         sourceBefore: sourceBeforeGroup,
-        sourceActor: [...sourceToNative].find(([, id]) => id === frame.observation.actor)?.[0],
+        sourceActor: [...sourceToNative].find(([, id]) => id === frame.observation?.actor)?.[0],
         differences: unmaskedDifferences,
       });
       if (ageTwoRefillEvidence) {
@@ -2512,6 +2585,7 @@ export function replayNetworkPrefix(
           ...(finalWitness ? { deferredFinalScores: true } : {}),
           teacherCertified: false,
         });
+        successfulGroups.push(group.moveId);
         continue;
       }
       if (openRotationFence) {
@@ -2561,6 +2635,7 @@ export function replayNetworkPrefix(
         nativeSteps: record.steps.length - stepsBefore,
         cancellation: group.entries[0].type === 'undoRestoreDISAB',
       });
+      successfulGroups.push(group.moveId);
     } catch (error) {
       if (burnHarvest) {
         frame = frameBeforeGroup;
@@ -2591,6 +2666,20 @@ export function replayNetworkPrefix(
         terminalReached: native().phase === 'finished',
         semanticReplayVerified: false,
         fullReplayAchieved: false,
+        terminalValidation,
+        completionEvidence: replayCompletionEvidence({
+          index,
+          initialMoveId,
+          sourceToNative,
+          initialVerified: true,
+          initialCoverageEvidence,
+          successfulGroups,
+          decisionBoundaryAudit,
+          semantic: semanticComparison.finish(),
+          timingFences,
+          terminal: terminalValidation,
+          blocked: true,
+        }),
         semanticComparison: semanticComparison.finish(),
         decisionBoundaryAudit,
         teacherCompleteness: false,
@@ -2614,6 +2703,7 @@ export function replayNetworkPrefix(
           moveId: group.moveId,
           source: group.entries,
           reason: error.message,
+          exceptionStack: error.stack ?? null,
           beforeState: before,
           afterState: native(),
           legalActions: actions(),
@@ -2634,6 +2724,20 @@ export function replayNetworkPrefix(
     terminalReached: native().phase === 'finished',
     semanticReplayVerified: false,
     fullReplayAchieved: false,
+    terminalValidation,
+    completionEvidence: replayCompletionEvidence({
+      index,
+      initialMoveId,
+      sourceToNative,
+      initialVerified: true,
+      initialCoverageEvidence,
+      successfulGroups,
+      decisionBoundaryAudit,
+      semantic: semanticComparison.finish(),
+      timingFences,
+      terminal: terminalValidation,
+      blocked: false,
+    }),
     semanticComparison: semanticComparison.finish(),
     decisionBoundaryAudit,
     teacherCompleteness: false,

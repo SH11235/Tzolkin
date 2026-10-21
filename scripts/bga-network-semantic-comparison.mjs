@@ -241,7 +241,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       if (c.cornOpen && !c.cornClosed) {
         if (
           !receipts.length &&
-          (observation.actor === c.owner || mapping.get(ledger.activePlayer) === c.owner)
+          (observation?.actor === c.owner || mapping.get(ledger.activePlayer) === c.owner)
         )
           reject('claimant can act before the delayed corn receipt');
         const followingFood = receipts.length
