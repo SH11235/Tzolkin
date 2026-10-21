@@ -2014,13 +2014,22 @@ function ageTwoReceiptFixture(mutateRaw = () => {}) {
       active_player: active,
       args: [],
       type: id === 4 ? 'activeplayer' : 'game',
+      reflexion: { total: { 1: '1', 2: '2', 3: '3', 4: '4' } },
+      updateGameProgression: 50,
     });
   const data = [
     state(90),
     state(91, '2'),
-    n('takeGoods', { type: 'corn', player_id: '1', quantity: '1' }),
-    n('firstPlayerCorn', { player_id: '1', corn: '1' }),
-    n('firstPlayer', { player_id: '1' }),
+    n('takeGoods', {
+      type: 'corn',
+      player_id: '1',
+      player_name: null,
+      quantity: '1',
+      resources: '',
+      origin: null,
+    }),
+    n('firstPlayerCorn', { player_id: '1', player_name: 'P1', corn: '1', corn_icon: '' }),
+    n('firstPlayer', { player_id: '1', player_name: 'P1' }),
     state(92),
   ];
   for (const id of ['1', '2', '3', '4'])
@@ -2073,6 +2082,42 @@ function ageTwoReceiptFixture(mutateRaw = () => {}) {
     state(8),
     state(4),
   );
+  data[34].args.args = {
+    beg: 0,
+    temples: { chaac: '1', quetzalcoatl: '1', kukulcan: '1' },
+    places: { startingPlayer: 0, palenque: 0, yaxchilan: 0, tikal: 0, uxmal: 0, chichenItza: 0 },
+    corn: '0',
+    cornicon: '',
+    workers: Object.fromEntries(
+      Array.from({ length: 5 }, (_, i) => {
+        const id = String(20 + i),
+          position = i + 1;
+        return [
+          id,
+          {
+            id,
+            place: 'tikal',
+            position: String(position),
+            actions: {
+              tikal: Object.fromEntries(
+                Array.from({ length: position }, (_, j) => [String(j + 1), position - j - 1]),
+              ),
+            },
+          },
+        ];
+      }),
+    ),
+  };
+  raw.gameLogs.data.data.push({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: '17',
+    packet_type: 'resend',
+    move_id: 5,
+    time: '1',
+    data: [state(6)],
+  });
+  raw.gameLogs.data.data.at(-1).data[0].args.type = 'activeplayer';
   raw.gameLogs.data.data.push({
     channel: '/table/t123',
     table_id: 123,
@@ -2266,6 +2311,35 @@ test('age-II stage rejects missing, duplicated, altered or trimmed original noti
     (raw) => (raw.gameLogs.data.data.at(-1).data[18].args.temple = 'chaac'),
     (raw) => (raw.gameLogs.data.data.at(-1).data[17].args.player_id = '2'),
     (raw) => (raw.gameLogs.data.data.at(-1).data[24].args.player_name = 'P3'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[2].args.origin = 'building_age_1_b43'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[2].args.extra = true),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[2].args.player_name = 'P1'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[3].args.player_name = 'P2'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[3].args.extra = true),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[4].args.player_name = 'P3'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[31].args.player_name = 'P2'),
+    (raw) => {
+      const workers = raw.gameLogs.data.data.at(-1).data[30].args.workers;
+      [workers[0].id, workers[1].id] = [workers[1].id, workers[0].id];
+    },
+    (raw) => (raw.gameLogs.data.data.at(-1).data[30].args.workers[1].id = '20'),
+    (raw) => raw.gameLogs.data.data.at(-1).data[30].args.workers.pop(),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[30].args.workers[0].player = ['1']),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[30].args.workers[0].id = ['20']),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[30].args.workers[0].extra = true),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[30].args.extra = true),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.active_player = ['1']),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[6].args.player_id = ['1']),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[31].args.worker_id = ['9']),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[5].args.args = { unknown: true }),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[14].args.reflexion.total['9'] = 0),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[14].args.reflexion.total['1'] = []),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.type = 'activeplayer'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[34].args.args.unknown = true),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[34].args.args.workers['20'].position = '2'),
+    (raw) =>
+      (raw.gameLogs.data.data.at(-1).data[34].args.args.workers['20'].actions.tikal['1'] = 1),
+    (raw) => (raw.gameLogs.data.data.at(-2).data[0].args.active_player = ['1']),
   ])
     assert.throws(() => {
       const f = ageTwoReceiptFixture(mutate);

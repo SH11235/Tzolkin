@@ -116,7 +116,34 @@ export function sourceAgeTwoRefillWitness({
     first = entries[0],
     actor = before.currentPlayer;
   const sourceId = String(first.args.active_player);
-  if (sourceToNative.get(sourceId) !== actor || sourceActivePlayer !== sourceId) fail();
+  if (
+    !integer(first.args.active_player, Number(first.args.active_player)) ||
+    !integer(sourceActivePlayer, Number(sourceActivePlayer)) ||
+    sourceToNative.get(sourceId) !== actor ||
+    sourceActivePlayer !== sourceId
+  )
+    fail();
+  const actorName = index.initial.players[sourceId]?.name;
+  if (typeof actorName !== 'string' || actorName !== before.players[actor].name) fail();
+  const prior = index.entries
+    .filter(
+      (n) =>
+        n.visible && !n.administrative && n.type === 'gameStateChange' && n.moveId < group.moveId,
+    )
+    .at(-1);
+  const priorOriginal = originalAgeTwoRefillEntry(prior);
+  if (
+    !priorOriginal ||
+    priorOriginal.packetType !== 'resend' ||
+    priorOriginal.tableId !== index.tableId ||
+    priorOriginal.rawSha256 !== index.rawSha256 ||
+    prior.beforeCheckpoint ||
+    !integer(prior.args.id, 6) ||
+    !integer(prior.args.active_player, Number(prior.args.active_player)) ||
+    String(prior.args.active_player) !== sourceId ||
+    prior.args.type !== 'activeplayer'
+  )
+    fail();
   for (const [i, n] of entries.entries()) {
     const original = originalAgeTwoRefillEntry(n);
     if (
@@ -150,10 +177,33 @@ export function sourceAgeTwoRefillWitness({
   const claimed = [...sourceWorkers.values()].filter((w) => w.place === 'startingPlayer');
   if (
     claimed.length !== 1 ||
+    !integer(claimed[0].id, Number(claimed[0].id)) ||
+    !integer(claimed[0].player, Number(claimed[0].player)) ||
+    ![2, 3, 4, 31].every((i) =>
+      integer(entries[i].args.player_id, Number(entries[i].args.player_id)),
+    ) ||
+    !integer(entries[31].args.worker_id, Number(entries[31].args.worker_id)) ||
     String(claimed[0].player) !== sourceId ||
     String(entries[31].args.worker_id) !== String(claimed[0].id) ||
     String(entries[31].args.player_id) !== sourceId ||
     !keys(entries[31].args, ['player_id', 'player_name', 'worker_id']) ||
+    entries[31].args.player_name !== actorName ||
+    !keys(entries[2].args, [
+      'type',
+      'resources',
+      'player_id',
+      'player_name',
+      'quantity',
+      'origin',
+    ]) ||
+    entries[2].args.player_name !== null ||
+    entries[2].args.origin !== null ||
+    typeof entries[2].args.resources !== 'string' ||
+    !keys(entries[3].args, ['player_id', 'player_name', 'corn', 'corn_icon']) ||
+    entries[3].args.player_name !== actorName ||
+    typeof entries[3].args.corn_icon !== 'string' ||
+    !keys(entries[4].args, ['player_id', 'player_name']) ||
+    entries[4].args.player_name !== actorName ||
     entries[2].args.type !== 'corn' ||
     String(entries[2].args.player_id) !== sourceId ||
     !integer(entries[2].args.quantity, before.accumulatedCorn) ||
@@ -196,6 +246,14 @@ export function sourceAgeTwoRefillWitness({
   )
     fail();
   verifySettlementReceipts(entries, before, sourceToNative, index.initial, catalog);
+  verifyRotationAndStateSchemas(
+    entries,
+    before,
+    sourceWorkers,
+    sourceToNative,
+    index.initial,
+    settledState(before, ids, catalog),
+  );
   const proof = {
     profile: 'ageTwoRefillConsumedAtEndTurn',
     moveId: group.moveId,
@@ -285,7 +343,10 @@ function verifySettlementReceipts(entries, before, sourceToNative, initial, cata
     sources.some(([id, actor]) => initial.players[id]?.name !== before.players[actor]?.name)
   )
     fail();
-  const actorOf = (n) => sourceToNative.get(String(n.args.player_id));
+  const actorOf = (n) => {
+    if (!integer(n.args.player_id, Number(n.args.player_id))) fail();
+    return sourceToNative.get(String(n.args.player_id));
+  };
   const nameOf = (actor) => before.players[actor]?.name;
   const update = (n, actor, points) => {
     if (
@@ -373,6 +434,116 @@ function verifySettlementReceipts(entries, before, sourceToNative, initial, cata
       caption.args.points !== points
     )
       fail();
+  }
+}
+
+function verifyRotationAndStateSchemas(entries, before, workers, sourceToNative, initial, settled) {
+  const gears = ['palenque', 'yaxchilan', 'tikal', 'uxmal', 'chichenItza'];
+  const actorId = String(entries[0].args.active_player),
+    actor = before.currentPlayer;
+  const expected = new Map();
+  for (const w of workers.values()) {
+    if (w.place === null || w.place === 'startingPlayer') continue;
+    const position = Number(w.position),
+      owner = sourceToNative.get(String(w.player));
+    if (
+      !gears.includes(w.place) ||
+      !integer(w.id, Number(w.id)) ||
+      Number(w.id) < 1 ||
+      !integer(w.position, position) ||
+      !integer(w.player, Number(w.player)) ||
+      !Number.isInteger(owner) ||
+      !equal(before.gears[w.place]?.[position], { playerId: owner, dummy: false })
+    )
+      fail();
+    if (position + 1 <= (w.place === 'chichenItza' ? 10 : 7))
+      expected.set(String(w.id), {
+        id: String(w.id),
+        player: String(w.player),
+        place: w.place,
+        position: position + 1,
+      });
+  }
+  const rotation = entries[30].args;
+  if (
+    !keys(rotation, ['day', 'twice', 'workers']) ||
+    !Array.isArray(rotation.workers) ||
+    rotation.workers.length !== expected.size ||
+    new Set(rotation.workers.map((w) => String(w.id))).size !== expected.size
+  )
+    fail();
+  for (const w of rotation.workers) {
+    const original = expected.get(String(w.id));
+    if (
+      !original ||
+      !keys(w, ['id', 'player', 'place', 'position']) ||
+      !integer(w.id, Number(original.id)) ||
+      !integer(w.player, Number(w.player)) ||
+      String(w.player) !== original.player ||
+      w.place !== original.place ||
+      !integer(w.position, original.position)
+    )
+      fail();
+  }
+  const states = entries.filter((n) => n.type === 'gameStateChange'),
+    roster = Object.keys(initial.players);
+  for (const [i, n] of states.entries()) {
+    const a = n.args;
+    if (
+      !keys(a, ['id', 'active_player', 'args', 'type', 'reflexion', 'updateGameProgression']) ||
+      !integer(a.id, Number(a.id)) ||
+      !integer(a.active_player, Number(a.active_player)) ||
+      !roster.includes(String(a.active_player)) ||
+      a.type !== (i === 6 ? 'activeplayer' : 'game') ||
+      !keys(a.reflexion, ['total']) ||
+      !keys(a.reflexion.total, roster) ||
+      Object.values(a.reflexion.total).some((v) => !integer(v, Number(v))) ||
+      !integer(a.updateGameProgression, Number(a.updateGameProgression)) ||
+      Number(a.updateGameProgression) > 100 ||
+      (i !== 6 && (!Array.isArray(a.args) || a.args.length !== 0))
+    )
+      fail();
+  }
+  const menu = states[6].args.args;
+  if (
+    !keys(menu, ['beg', 'temples', 'places', 'corn', 'cornicon', 'workers']) ||
+    !integer(menu.beg, Number(menu.beg)) ||
+    Number(menu.beg) > 3 ||
+    !integer(menu.corn, Number(menu.corn)) ||
+    typeof menu.cornicon !== 'string' ||
+    !keys(menu.temples, ['chaac', 'quetzalcoatl', 'kukulcan']) ||
+    Object.values(menu.temples).some((v) => !integer(v, Number(v))) ||
+    !keys(menu.places, ['startingPlayer', ...gears]) ||
+    Object.values(menu.places).some((v) => v !== 0)
+  )
+    fail();
+  const owned = [...expected.values()].filter((w) => w.player === actorId);
+  if (
+    !keys(
+      menu.workers,
+      owned.map((w) => w.id),
+    )
+  )
+    fail();
+  for (const w of owned) {
+    const row = menu.workers[w.id],
+      free = w.position >= 6;
+    if (
+      !['uxmal', 'tikal', 'yaxchilan'].includes(w.place) ||
+      !keys(row, ['id', 'place', 'position', 'actions']) ||
+      row.id !== w.id ||
+      row.place !== w.place ||
+      !integer(row.position, w.position) ||
+      !keys(row.actions, [w.place])
+    )
+      fail();
+    const prices = Object.fromEntries(
+      Array.from({ length: free ? 5 : w.position }, (_, i) => [
+        String(i + 1),
+        free ? 0 : w.position - i - 1,
+      ]).filter(([, price]) => price <= settled.players[actor].resources.corn),
+    );
+    if (!equal(row.actions[w.place], prices)) fail();
   }
 }
 

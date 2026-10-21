@@ -483,7 +483,7 @@ export function parseNetworkReplay(bytes) {
         ...(n.type === 'noSkullsLeft' ? { singleSkullCaption: n.log } : {}),
       };
       entries.push(entry);
-      if (packet.data.some((n) => n.type === 'resetAllBuildings'))
+      if (n.type === 'gameStateChange' || packet.data.some((n) => n.type === 'resetAllBuildings'))
         ageTwoRefillEntries.set(entry, {
           entry: structuredClone(entry),
           packetType: packet.packet_type,
