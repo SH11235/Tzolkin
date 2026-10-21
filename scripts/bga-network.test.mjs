@@ -3959,6 +3959,8 @@ function fixedBuildingFixture(
     templeSummit = false,
     continuation = null,
     constructionArchitecture = false,
+    constructionDiscountResource = null,
+    marketPrefix = false,
     inheritedEmptyBuild = false,
     technologyLevels = null,
     startingResources = null,
@@ -3966,6 +3968,7 @@ function fixedBuildingFixture(
     rewardResource = 'gold',
     mutateSource = () => {},
     mutateFrames = () => {},
+    mutateTransitions = () => {},
   } = {},
 ) {
   const cacheKey = JSON.stringify([
@@ -3976,6 +3979,8 @@ function fixedBuildingFixture(
     templeSummit,
     continuation,
     constructionArchitecture,
+    constructionDiscountResource,
+    marketPrefix,
     inheritedEmptyBuild,
     technologyLevels,
     startingResources,
@@ -3989,7 +3994,7 @@ function fixedBuildingFixture(
       process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai',
     );
     const dispatch = coreDispatcher(cli);
-    const state = JSON.parse(
+    let state = JSON.parse(
       readFileSync(new URL('./fixtures/bga-reconstruction-small.json', import.meta.url)),
     ).companion.record.initial;
     const catalog = JSON.parse(
@@ -4056,12 +4061,42 @@ function fixedBuildingFixture(
           ]
         : [],
     };
-    const frame = dispatch({ operation: 'publicInspect', state });
+    let frame = dispatch({ operation: 'publicInspect', state });
+    let prefixFrame = null;
+    if (marketPrefix) {
+      const market = structuredClone(state);
+      market.pending = {
+        title: 'Synthetic market',
+        task: { type: 'trade' },
+        after: [state.pending.task, ...state.pending.after],
+      };
+      const marketFrame = dispatch({ operation: 'publicInspect', state: market });
+      const skip = marketFrame.observation.legalActions.find((r) => r.action.type === 'skip');
+      const result = dispatch({
+        operation: 'publicApply',
+        state: market,
+        actor: 0,
+        move: skip.move,
+      });
+      assert.equal(result.error, undefined);
+      prefixFrame = {
+        before: market,
+        after: result.snapshot.state,
+        actor: 0,
+        action: skip.action,
+        legalActions: marketFrame.observation.legalActions,
+        step: 1,
+      };
+      state = result.snapshot.state;
+      frame = result;
+    }
     const build = frame.observation.legalActions.find(
       (r) =>
         r.action.type === 'build' &&
         r.action.id === id &&
-        r.action.architecture === constructionArchitecture,
+        r.action.architecture === constructionArchitecture &&
+        (constructionDiscountResource === null ||
+          r.action.discountResource === constructionDiscountResource),
     );
     assert.ok(build);
     const after = dispatch({ operation: 'publicApply', state, actor: 0, move: build.move });
@@ -4074,7 +4109,7 @@ function fixedBuildingFixture(
         actor: 0,
         action: build.action,
         legalActions: frame.observation.legalActions,
-        step: 1,
+        step: marketPrefix ? 2 : 1,
       },
     ];
     let current = after;
@@ -4106,13 +4141,13 @@ function fixedBuildingFixture(
         actor: 0,
         action: row.action,
         legalActions: rows,
-        step: frames.length + 1,
+        step: frames.length + 1 + (marketPrefix ? 1 : 0),
       });
       current = next;
     }
-    syntheticBuildingFrames.set(cacheKey, { frames, card });
+    syntheticBuildingFrames.set(cacheKey, { frames, card, prefixFrame });
   }
-  const { frames, card } = structuredClone(syntheticBuildingFrames.get(cacheKey));
+  const { frames, card, prefixFrame } = structuredClone(syntheticBuildingFrames.get(cacheKey));
   let uid = 6000;
   const n = (type, args) => ({ uid: String(++uid), type, args, log: '' });
   const raw = fixture();
@@ -4134,6 +4169,36 @@ function fixedBuildingFixture(
       possibleactions: ['construct', 'pass'],
     },
   });
+  if (marketPrefix)
+    Object.assign(raw.initialState.gamestates, {
+      9: {
+        type: 'game',
+        name: 'solveStackedAction',
+        action: 'stSolveStackedAction',
+        transitions: { construct: 32 },
+      },
+      32: {
+        type: 'activeplayer',
+        name: 'construct',
+        args: 'argConstruct',
+        possibleactions: ['construct', 'pass'],
+        transitions: { nextAction: 9, sparedResource: 33 },
+      },
+      33: {
+        type: 'activeplayer',
+        name: 'constructChooseSparedResources',
+        args: 'argSparedResource',
+        possibleactions: ['sparedResource'],
+        transitions: { nextAction: 9, cancel: 32 },
+      },
+      42: {
+        type: 'activeplayer',
+        name: 'trade',
+        args: 'argTrade',
+        possibleactions: ['trade', 'pass'],
+        transitions: { nextAction: 9, nextTrade: 42 },
+      },
+    });
   const stateNotice = (state) => {
     const type = state.pending?.task.type;
     return [
@@ -4208,7 +4273,40 @@ function fixedBuildingFixture(
   if (card.effects[0].technology === 'extraction')
     initialEvents.push(...technologyEvents('extraction', capped ? 3 : 0));
   initialEvents.push(...stateNotice(opener.after));
-  const eventGroups = [initialEvents];
+  const prefixGroups = marketPrefix
+    ? [
+        [
+          n('trade', {
+            player_id: '1',
+            resource1: "<div class='tz_icon resource_corn'></div>",
+            quantity1: 2,
+            resource2: "<div class='tz_icon resource_wood'></div>",
+            quantity2: 1,
+          }),
+          n('takeGoods', { player_id: '1', type: 'wood', quantity: 1, origin: 'action_uxmal_2' }),
+          n('payGoods', { player_id: '1', type: 'corn', quantity: 2, target: 'action_uxmal_2' }),
+          n('gameStateChange', {
+            id: 42,
+            type: 'activeplayer',
+            active_player: '1',
+            args: { maxvalue: '20' },
+          }),
+        ],
+        [
+          n('gameStateChange', { id: 9, type: 'game', active_player: '1', args: null }),
+          n('gameStateChange', { id: 32, type: 'activeplayer', active_player: '1', args: null }),
+        ],
+        [
+          n('gameStateChange', {
+            id: 33,
+            type: 'activeplayer',
+            active_player: '1',
+            args: { wood: true, stone: true, gold: false },
+          }),
+        ],
+      ]
+    : [];
+  const eventGroups = [...prefixGroups, initialEvents];
   for (const t of frames.slice(1)) {
     const events = [];
     if (t.action.type === 'technology') {
@@ -4260,7 +4358,7 @@ function fixedBuildingFixture(
     })),
   ];
   mutateSource(raw, frames);
-  mutateFrames(frames);
+  mutateFrames(frames, prefixFrame);
   const index = parseNetworkReplay(bytes(raw)),
     helper = createBuildingResourceComparison({
       index,
@@ -4273,7 +4371,7 @@ function fixedBuildingFixture(
     });
   const ledger = {
     players: Object.fromEntries(
-      frames[0].before.players.map((p) => [
+      (prefixFrame?.before ?? frames[0].before).players.map((p) => [
         String(p.id + 1),
         { resources: structuredClone(p.resources) },
       ]),
@@ -4282,7 +4380,7 @@ function fixedBuildingFixture(
   };
   const results = [];
   function step(i) {
-    const group = index.groups[i],
+    const group = index.groups[i + prefixGroups.length],
       t = frames[i],
       source = structuredClone(ledger);
     for (const n of group.entries)
@@ -4311,7 +4409,12 @@ function fixedBuildingFixture(
         observed: ledger.skullSupply,
         native: t.after.skullSupply,
       });
-    const context = { group, source, transitions: [t] },
+    const context = {
+        group,
+        source,
+        native: i === 0 ? (prefixFrame?.before ?? t.before) : t.before,
+        transitions: i === 0 && prefixFrame ? [prefixFrame, t] : [t],
+      },
       args = {
         ledger,
         native: t.after,
@@ -4326,6 +4429,7 @@ function fixedBuildingFixture(
               }
             : null,
       };
+    mutateTransitions(context.transitions, i);
     const result = helper.compare(context, args);
     results.push(result);
     return result;
@@ -4637,6 +4741,124 @@ test('fixed rewards bind inherited empty construction without losing the current
       assert.equal(f.frames[0].after.players[0].resources.gold, 0);
       assert.equal(f.frames.at(-1).after.players[0].resources.gold, 1);
     } else assert.equal(f.frames.at(-1).after.pending, null);
+  }
+});
+
+function marketBuildingFixture(options = {}) {
+  return fixedBuildingFixture('b26', {
+    marketPrefix: true,
+    stock: 3,
+    constructionArchitecture: true,
+    constructionDiscountResource: 'stone',
+    branch: 'extraction',
+    technologyLevels: { agriculture: 0, extraction: 3, architecture: 3, theology: 0 },
+    ...options,
+  });
+}
+
+test('a preceding market skip is independently proved before fixed building choices', () => {
+  const f = marketBuildingFixture();
+  for (let i = 0; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+  const witness = f.helper.finish().obligations[0];
+  assert.equal(witness.closed, true);
+  assert.equal(witness.precedingMarketExit.skipStep, 1);
+  assert.equal(witness.precedingMarketExit.buildStep, 2);
+  assert.equal(witness.precedingMarketExit.constructionMoveId, f.index.groups[3].moveId);
+  assert.equal(witness.precedingMarketExit.exit.length, 2);
+  assert.equal(witness.precedingMarketExit.humanPassClickObserved, false);
+  assert.deepEqual(
+    witness.decisions.map((d) => d.action.type),
+    ['technology', 'resource', 'resource'],
+  );
+  assert.equal(f.frames.at(-1).after.players[0].resources.skull, 1);
+  assert.equal(f.frames.at(-1).after.skullSupply, 2);
+});
+
+test('market construction prefix refuses changed source exit, discount, actor and payment', () => {
+  for (const mutateSource of [
+    (raw) => raw.gameLogs.data.data[2].data.pop(),
+    (raw) =>
+      raw.gameLogs.data.data[2].data.push({ ...raw.gameLogs.data.data[2].data[0], uid: '99001' }),
+    (raw) => {
+      raw.gameLogs.data.data[1].data.at(-1).args.args.maxvalue = '21';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[2].data[1].args.id = 70;
+    },
+    (raw) => {
+      raw.gameLogs.data.data[3].data[0].args.active_player = '2';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[3].data[0].args.args.stone = false;
+    },
+    (raw) => {
+      raw.initialState.gamestates[42].possibleactions = ['trade'];
+    },
+    (raw) => {
+      raw.initialState.gamestates[32].transitions.sparedResource = 37;
+    },
+    (raw) => {
+      raw.gameLogs.data.data[4].data.find((n) => n.type === 'payGoods').args.quantity++;
+    },
+    (raw) => {
+      raw.gameLogs.data.data[4].data.find((n) => n.type === 'construct').args.building.id = '11';
+    },
+  ]) {
+    const f = marketBuildingFixture({ mutateSource });
+    assert.ok(f.step(0).failure);
+    assert.equal(f.helper.finish().allObligationsClosed, false);
+  }
+});
+
+test('market construction prefix refuses unproved operations and changed native state chains', () => {
+  for (const [caseIndex, mutateFrames] of [
+    (_frames, prefix) => {
+      prefix.actor = 1;
+    },
+    (_frames, prefix) => {
+      prefix.step = 3;
+    },
+    (_frames, prefix) => {
+      prefix.before.pending.after[0].remaining = 2;
+    },
+    (_frames, prefix) => {
+      prefix.before.pending.after[0].architectureAvailable = false;
+    },
+    (_frames, prefix) => {
+      prefix.legalActions = prefix.legalActions.filter((r) => r.action.type !== 'skip');
+    },
+    (_frames, prefix) => {
+      prefix.after.players[0].resources.corn++;
+    },
+    (_frames, prefix) => {
+      prefix.after.skullSupply--;
+    },
+    (_frames, prefix) => {
+      prefix.after.turn.count++;
+    },
+    (_frames, prefix) => {
+      prefix.after = structuredClone(prefix.after);
+      prefix.after.pending.title = 'Changed boundary';
+    },
+    (frames) => {
+      frames[0].action = { ...frames[0].action, discountResource: 'wood' };
+    },
+  ].entries()) {
+    const f = marketBuildingFixture({ mutateFrames });
+    assert.ok(f.step(0).failure, `native mutation ${caseIndex}`);
+  }
+  for (const operation of ['skip', 'endTurn']) {
+    const f = marketBuildingFixture({
+      mutateTransitions(transitions, i) {
+        if (i === 0)
+          transitions.unshift({
+            ...structuredClone(transitions[0]),
+            action: { type: operation },
+            step: 0,
+          });
+      },
+    });
+    assert.ok(f.step(0).failure);
   }
 });
 
