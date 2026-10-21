@@ -32,6 +32,15 @@ import {
 } from './bga-network-chichen.mjs';
 import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { coreDispatcher } from './bga-replay.mjs';
+import {
+  technologyChoiceProof,
+  begChoiceProof,
+  forcedRotationProof,
+  closedBurnChoiceProof,
+} from './bga-network-compound-choices.mjs';
+import { bindBurnHarvestOutcome } from './bga-network-harvest.mjs';
 import {
   observedStageArguments,
   observedOperationBinding,
@@ -2538,6 +2547,31 @@ function observedChoiceFixture(id) {
     step: 1,
     equivalentRows: [],
   };
+  const operations = [operation];
+  if (id === 31) {
+    const paid = structuredClone(after);
+    paid.players[0].resources.wood--;
+    operation.after = structuredClone(before);
+    operation.after.pending = {
+      task: { type: 'payTechnology', technology: 'agriculture', amount: 1 },
+      after: [{ type: 'technology', remaining: 0, free: false }],
+    };
+    const payRow = {
+      action: { type: 'payment', resources: [0, 1, 0, 0, 0] },
+      move: { type: 'choose', choiceId: 'payment:0' },
+    };
+    operations.push({
+      ...operation,
+      before: operation.after,
+      after: paid,
+      row: payRow,
+      legalRows: [payRow],
+      step: 2,
+    });
+    entries.unshift(
+      nt('payGoods', { type: 'wood', quantity: 1, target: 'technology_agriculture_level_1' }),
+    );
+  }
   return {
     boundary: {
       moveId: 2,
@@ -2550,6 +2584,7 @@ function observedChoiceFixture(id) {
       legalRows: operation.legalRows,
     },
     operation,
+    operations,
     group: { moveId: 3, entries },
     index: { initial: { players: { 1: { id: '1', name: 'A' } } } },
     sourceToNative: new Map([[owner, 0]]),
@@ -2557,6 +2592,869 @@ function observedChoiceFixture(id) {
     audit: [],
   };
 }
+
+const technologyNativeFixtures = new Map();
+function nativeTechnologyChoice(track, { free = false, capped = false } = {}) {
+  const key = JSON.stringify([track, free, capped]);
+  if (technologyNativeFixtures.has(key)) return structuredClone(technologyNativeFixtures.get(key));
+  const dispatch = coreDispatcher(
+    join(
+      process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../target', import.meta.url)),
+      'debug',
+      process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai',
+    ),
+  );
+  const state = JSON.parse(
+    readFileSync(new URL('./fixtures/bga-reconstruction-small.json', import.meta.url)),
+  ).companion.record.initial;
+  state.currentPlayer = 0;
+  state.turn = { mode: 'remove', count: 1, begged: false };
+  for (const p of state.players) {
+    p.name = p.id === 0 ? 'A' : `P${p.id}`;
+    p.resources = { corn: 10, wood: 5, stone: 5, gold: 5, skull: 0 };
+    p.technologies = { agriculture: 0, extraction: 0, architecture: 0, theology: 0 };
+    p.temples = { chaac: 0, quetzalcoatl: 0, kukulkan: 0 };
+  }
+  state.skullSupply = 13;
+  state.players[0].technologies[track] = capped ? 3 : 0;
+  state.pending = {
+    title: 'Synthetic technology',
+    task: { type: 'technology', remaining: 1, free },
+    after: [],
+  };
+  let frame = dispatch({ operation: 'publicInspect', state });
+  assert.equal(frame.error, undefined);
+  const strip = (s) => Object.fromEntries(Object.entries(s).filter(([k]) => k !== 'log'));
+  const entry = {
+    uid: 'advance',
+    type: 'increaseTechnology',
+    args: { player_id: '1', technology_id: track, level: capped ? 4 : 1 },
+  };
+  const operations = [];
+  const apply = (row, source = entry) => {
+    const before = frame;
+    frame = dispatch({
+      operation: 'publicApply',
+      state: before.snapshot.state,
+      actor: 0,
+      move: row.move,
+    });
+    assert.equal(frame.error, undefined);
+    const op = {
+      entry: source,
+      row,
+      actor: 0,
+      observationActor: 0,
+      sourceActor: '1',
+      step: operations.length + 1,
+      legalRows: before.observation.legalActions,
+      before: strip(before.snapshot.state),
+      after: strip(frame.snapshot.state),
+      afterLegalRows: frame.observation?.legalActions ?? [],
+      equivalentRows: [],
+    };
+    operations.push(op);
+    return op;
+  };
+  apply(
+    frame.observation.legalActions.find(
+      (r) => r.action.type === 'technology' && r.action.technology === track,
+    ),
+  );
+  const entries = [];
+  if (!free) {
+    const row = frame.observation.legalActions.find((r) => r.action.type === 'payment');
+    for (let i = 0; i < 5; i++)
+      if (row.action.resources[i])
+        entries.push({
+          uid: `cost${i}`,
+          type: 'payGoods',
+          args: {
+            player_id: '1',
+            type: ['corn', 'wood', 'stone', 'gold', 'skull'][i],
+            quantity: row.action.resources[i],
+            target: `technology_${track}_level_${capped ? 4 : 1}`,
+          },
+        });
+    apply(row);
+  }
+  entries.push(entry);
+  if (capped) {
+    if (track === 'architecture')
+      entries.push({ uid: 'points', type: 'updateScore', args: { player_id: '1', points: 3 } });
+    if (track === 'theology')
+      entries.push({
+        uid: 'skull',
+        type: 'takeGoods',
+        args: { player_id: '1', type: 'skull', quantity: 1, origin: 'technology_theology_level_4' },
+      });
+    entries.push(
+      { uid: 'cap', type: `${track}Max`, args: { player_name: 'A' } },
+      {
+        uid: 'return',
+        type: 'decreaseTechnology',
+        args: { player_id: '1', technology_id: track, level: 3 },
+      },
+    );
+  }
+  const selectedCount = operations.length;
+  if (capped && ['agriculture', 'extraction'].includes(track))
+    for (let i = 0; i < (track === 'extraction' ? 2 : 1); i++) {
+      const row = frame.observation.legalActions.find((r) =>
+        track === 'extraction'
+          ? r.action.type === 'resource' && r.action.resource === 'gold'
+          : r.action.type === 'temple' && r.action.temple === 'chaac',
+      );
+      const source = {
+        uid: `reward${i}`,
+        type: track === 'extraction' ? 'takeGoods' : 'alterTemple',
+        args:
+          track === 'extraction'
+            ? { player_id: '1', type: 'gold', quantity: 1, origin: null }
+            : {
+                player_id: '1',
+                temple_id: 'chaac',
+                step: frame.snapshot.state.players[0].temples.chaac + 2,
+              },
+      };
+      apply(row, source);
+    }
+  const result = {
+    operation: operations[0],
+    operations: operations.slice(0, selectedCount),
+    rewardOperations: operations.slice(selectedCount),
+    group: { moveId: 3, entries },
+    owner: '1',
+    index: { initial: { players: { 1: { id: '1', name: 'A' } } } },
+  };
+  technologyNativeFixtures.set(key, result);
+  return result;
+}
+
+test('actual native technology selectors bind payment completion and each paid or free capped reward', () => {
+  for (const track of ['agriculture', 'extraction', 'architecture', 'theology']) {
+    for (const config of [{}, { free: true }, { capped: true }, { free: true, capped: true }]) {
+      const f = nativeTechnologyChoice(track, config),
+        proof = technologyChoiceProof(f);
+      assert.equal(proof.error, null, JSON.stringify([track, config]));
+      assert.equal(proof.capped, config.capped === true);
+      if (!config.free) {
+        assert.equal(
+          f.operation.before.players[0].technologies[track],
+          f.operation.after.players[0].technologies[track],
+        );
+        assert.equal(proof.commit.row.action.type, 'payment');
+      }
+      if (config.capped && ['agriculture', 'extraction'].includes(track)) {
+        assert.ok(proof.reward);
+        assert.equal(f.rewardOperations.length, proof.reward.remaining);
+      }
+    }
+  }
+});
+
+test('technology completion rejects missing or duplicate payment, changed actor, target, cost, cap return and reward', () => {
+  for (const mutate of [
+    (f) => f.operations.pop(),
+    (f) => f.operations.push({ ...f.operations[1], step: 3 }),
+    (f) => {
+      f.operations[1].actor = 1;
+    },
+    (f) => {
+      f.operations[1].entry = { ...f.operation.entry, uid: 'other' };
+    },
+    (f) => {
+      f.operation.after.pending.task.technology = 'theology';
+    },
+    (f) => {
+      f.group.entries.find((e) => e.type === 'payGoods').args.quantity++;
+    },
+    (f) => {
+      f.group.entries.find((e) => e.type === 'payGoods').args.target =
+        'technology_theology_level_4';
+    },
+    (f) => {
+      f.group.entries.find((e) => e.type === 'decreaseTechnology').args.level = 2;
+    },
+    (f) => {
+      f.group.entries = f.group.entries.filter((e) => e.type !== 'decreaseTechnology');
+    },
+    (f) => {
+      f.group.entries.push({
+        ...f.group.entries.find((e) => e.type === 'decreaseTechnology'),
+        uid: 'duplicate',
+      });
+    },
+    (f) => {
+      f.operations[1].after.players[0].score++;
+    },
+  ]) {
+    const f = nativeTechnologyChoice('architecture', { capped: true });
+    mutate(f);
+    assert.ok(technologyChoiceProof(f).error);
+  }
+  const free = nativeTechnologyChoice('architecture', { free: true, capped: true });
+  free.group.entries.unshift({
+    type: 'payGoods',
+    args: { player_id: '1', type: 'wood', quantity: 1 },
+  });
+  assert.ok(technologyChoiceProof(free).error);
+  for (const mutate of [
+    (f) => {
+      f.group.entries.find((e) => e.type === 'takeGoods').args.quantity = 2;
+    },
+    (f) => {
+      f.operations[1].after.skullSupply++;
+    },
+    (f) => {
+      f.operation.before.skullSupply = 0;
+    },
+  ]) {
+    const f = nativeTechnologyChoice('theology', { capped: true });
+    mutate(f);
+    assert.ok(technologyChoiceProof(f).error);
+  }
+});
+
+function nativeCompoundOperations(state, sources, choose) {
+  state.log = [];
+  const dispatch = coreDispatcher(
+    join(
+      process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../target', import.meta.url)),
+      'debug',
+      process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai',
+    ),
+  );
+  let frame = dispatch({ operation: 'publicInspect', state });
+  assert.equal(frame.error, undefined);
+  const operations = [];
+  const strip = (s) => Object.fromEntries(Object.entries(s).filter(([k]) => k !== 'log'));
+  for (let i = 0; i < sources.length; i++) {
+    const before = frame,
+      actor = before.observation.actor,
+      row = choose(before.observation.legalActions, i);
+    assert.ok(row);
+    frame = dispatch({
+      operation: 'publicApply',
+      state: before.snapshot.state,
+      actor,
+      move: row.move,
+    });
+    assert.equal(frame.error, undefined);
+    operations.push({
+      entry: sources[i],
+      row,
+      actor,
+      observationActor: actor,
+      sourceActor: String(actor + 1),
+      step: i + 1,
+      legalRows: before.observation.legalActions,
+      before: strip(before.snapshot.state),
+      after: strip(frame.snapshot.state),
+      afterLegalRows: frame.observation?.legalActions ?? [],
+    });
+  }
+  return operations;
+}
+
+function nativeBegChoice() {
+  const state = nativeTechnologyChoice('agriculture', { free: true }).operation.before;
+  state.pending = null;
+  state.turn = { mode: 'none', count: 0, begged: false };
+  state.players[0].resources.corn = 0;
+  const entry = {
+    uid: 'beg',
+    type: 'alterTemple',
+    args: { player_id: '1', temple_id: 'chaac', step: 0, corn: 3 },
+  };
+  const operations = nativeCompoundOperations(state, [entry, entry], (rows, i) =>
+    rows.find((r) =>
+      i === 0
+        ? r.action.type === 'beg'
+        : r.action.type === 'temple' && r.action.temple === 'chaac' && r.action.direction === -1,
+    ),
+  );
+  return {
+    operation: operations[0],
+    operations,
+    group: {
+      moveId: 3,
+      entries: [
+        entry,
+        { uid: 'corn', type: 'takeGoods', args: { player_id: '1', type: 'corn', quantity: 3 } },
+      ],
+    },
+    owner: '1',
+    index: { initial: { players: { 1: { name: 'A' } } } },
+  };
+}
+
+test('native begging waits for the selected temple penalty and completed corn receipt', () => {
+  const f = nativeBegChoice();
+  assert.equal(begChoiceProof(f), true);
+  assert.equal(f.operation.after.players[0].resources.corn, 0);
+  assert.equal(f.operations[1].after.players[0].resources.corn, 3);
+  for (const mutate of [
+    (f) => f.operations.pop(),
+    (f) => {
+      f.operations[1].actor = 1;
+    },
+    (f) => {
+      f.operations[1].entry = { ...f.operation.entry, uid: 'other' };
+    },
+    (f) => {
+      f.operation.after.players[0].resources.corn = 3;
+    },
+    (f) => {
+      f.operations[1].after.turn.begged = false;
+    },
+    (f) => {
+      f.operation.entry.args.temple_id = 'kukulcan';
+    },
+    (f) => {
+      f.operation.entry.args.corn = 2;
+    },
+    (f) => {
+      f.operation.before.turn.begged = true;
+    },
+  ]) {
+    const f = nativeBegChoice();
+    mutate(f);
+    assert.equal(begChoiceProof(f), false);
+  }
+});
+
+test('begging source receipts reject unexplained cancelling effects while retaining state and clock notifications', () => {
+  const f = nativeBegChoice();
+  f.group.entries.splice(1, 0, {
+    uid: 'clock',
+    type: 'updateReflexionTime',
+    args: { player_id: '1', delta: 1 },
+  });
+  f.group.entries.push({ uid: 'state', type: 'gameStateChange', args: { id: 4 } });
+  assert.equal(begChoiceProof(f), true);
+  for (const mutate of [
+    (f) =>
+      f.group.entries.push(
+        {
+          uid: 'extraGain',
+          type: 'takeGoods',
+          args: { player_id: '1', type: 'wood', quantity: 1, origin: 'unrelated' },
+        },
+        {
+          uid: 'extraPay',
+          type: 'payGoods',
+          args: { player_id: '1', type: 'wood', quantity: 1, target: 'unrelated' },
+        },
+      ),
+    (f) =>
+      f.group.entries.push(
+        {
+          uid: 'extraUp',
+          type: 'alterTemple',
+          args: { player_id: '1', temple_id: 'kukulcan', step: 2 },
+        },
+        {
+          uid: 'extraDown',
+          type: 'alterTemple',
+          args: { player_id: '1', temple_id: 'kukulcan', step: 1 },
+        },
+      ),
+    (f) => {
+      f.group.entries[1].args.origin = 'unrelated';
+    },
+    (f) => {
+      f.group.entries[1].args.player_id = '2';
+    },
+    (f) => {
+      f.group.entries[1].args.quantity = 2;
+    },
+    (f) => f.group.entries.pop(),
+    (f) => f.group.entries.push({ ...f.group.entries[1], uid: 'extraCorn' }),
+  ]) {
+    const f = nativeBegChoice();
+    mutate(f);
+    assert.equal(begChoiceProof(f), false);
+  }
+});
+
+function beggingPrefixWithExtraEffects(extra = []) {
+  const raw = fixture(),
+    initial = setup().record.initial;
+  Object.assign(raw.initialState, {
+    buildings: [],
+    monuments: [],
+    constructions: {},
+    wealthTiles: {},
+    cornOnWheel: '0',
+    remainingSkulls: '13',
+    jungle: {},
+    gears: { uxmal: { teethnbr: 10 } },
+  });
+  for (const p of Object.values(raw.initialState.players)) {
+    p.corn_tile = '0';
+    p.wood_tile = '0';
+  }
+  raw.initialState.gamestates[4] = {
+    name: 'playerTurn',
+    type: 'activeplayer',
+    possibleactions: ['placeWorker', 'pickUpWorker', 'beg'],
+  };
+  const nt = (uid, type, args) => ({ uid, type, args, log: '' });
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [
+      nt('wealth', 'wealthTiles', {}),
+      nt('initial', 'gameStateChange', {
+        id: 4,
+        type: 'activeplayer',
+        active_player: '1',
+        args: { places: { uxmal: 0 }, corn: '0', workers: [] },
+      }),
+    ]),
+    packet(3, [
+      nt('beg', 'alterTemple', { player_id: '1', temple_id: 'chaac', step: 0, corn: 3 }),
+      nt('corn', 'takeGoods', { player_id: '1', type: 'corn', quantity: 3 }),
+      ...extra,
+      nt('next', 'gameStateChange', {
+        id: 4,
+        type: 'activeplayer',
+        active_player: '1',
+        args: { places: { uxmal: 0 }, corn: '0', workers: [] },
+      }),
+    ]),
+  ];
+  const beg = { action: { type: 'beg' }, move: { type: 'beg' } },
+    penalty = {
+      action: { type: 'temple', temple: 'chaac', direction: -1 },
+      move: { type: 'choose', choiceId: 'chaac' },
+    };
+  const frame = (s) => ({
+    snapshot: { state: s },
+    observation: { actor: 0, legalActions: [s.pending ? penalty : beg] },
+  });
+  const dispatch = (request) => {
+    const s = structuredClone(request.state);
+    if (request.operation === 'publicApply') {
+      if (request.move.type === 'beg')
+        s.pending = {
+          task: { type: 'temple', remaining: 1, direction: -1, reason: 'beg' },
+          after: [],
+        };
+      else {
+        s.pending = null;
+        s.players[0].resources.corn = 3;
+        s.players[0].temples.chaac--;
+        s.turn.begged = true;
+      }
+    }
+    return frame(s);
+  };
+  return replayNetworkPrefix(
+    parseNetworkReplay(bytes(raw)),
+    { initial, initialMoveId: 2, clientContract: {} },
+    dispatch,
+  );
+}
+
+test('prefix cannot certify begging when unrelated original effects cancel at the completed endpoint', () => {
+  const valid = beggingPrefixWithExtraEffects();
+  assert.equal(valid.blocked, null);
+  assert.equal(valid.observedTrajectory.boundaries[0].verified, true);
+  const bad = beggingPrefixWithExtraEffects([
+    {
+      uid: 'unrelatedGain',
+      type: 'takeGoods',
+      args: { player_id: '1', type: 'wood', quantity: 1, origin: 'unrelated' },
+      log: '',
+    },
+    {
+      uid: 'unrelatedPay',
+      type: 'payGoods',
+      args: { player_id: '1', type: 'wood', quantity: 1, target: 'unrelated' },
+      log: '',
+    },
+  ]);
+  assert.equal(bad.blocked, null);
+  assert.equal(bad.record.steps.length, 2);
+  assert.equal(bad.semanticComparison.failure, null);
+  assert.equal(bad.observedTrajectory.boundaries[0].verified, false);
+  assert.equal(bad.observedTrajectory.boundaries[0].reason, 'beggingAmountDiffer');
+});
+
+function nativeForcedRotation() {
+  const state = nativeTechnologyChoice('agriculture', { free: true }).operation.before;
+  Object.assign(state, {
+    pending: null,
+    currentPlayer: 3,
+    turnIndex: 3,
+    turnOrder: [0, 1, 2, 3],
+    firstPlayer: 0,
+    firstPlayerClaimed: 0,
+    round: 2,
+    turn: { mode: 'place', count: 1, begged: false },
+  });
+  state.players[0].doubleAdvanceAvailable = false;
+  const end = { uid: 'end', type: 'gameStateChange', args: { id: 90, active_player: '4' } },
+    rotate = { uid: 'rotate', type: 'rotateWheel', args: { player_id: null, twice: 0 } },
+    claim = {
+      uid: 'claim',
+      type: 'placeWorker',
+      args: { player_id: '1', place: 'startingPlayer' },
+    };
+  const operations = nativeCompoundOperations(state, [end, rotate], (rows, i) =>
+    rows.find((r) =>
+      i === 0 ? r.action.type === 'endTurn' : r.action.type === 'rotate' && r.action.days === 1,
+    ),
+  );
+  const ref = (n) => ({
+    uid: n.uid,
+    packetIndex: n.packetIndex,
+    notificationIndex: n.notificationIndex,
+  });
+  return {
+    operation: operations[1],
+    operations,
+    group: { moveId: 3, entries: [end, rotate] },
+    index: {
+      groups: [
+        { moveId: 2, entries: [claim] },
+        { moveId: 3, entries: [end, rotate] },
+      ],
+    },
+    sourceToNative: new Map([
+      ['1', 0],
+      ['4', 3],
+    ]),
+    semanticEvidence: [
+      {
+        type: 'roundClosure',
+        claim: ref(claim),
+        rotation: ref(rotate),
+        days: 1,
+        nextStarter: 1,
+        nextOrder: [1, 2, 3, 0],
+      },
+    ],
+  };
+}
+
+test('native forced rotation binds the original claimant and closed round rather than the ending player', () => {
+  const f = nativeForcedRotation();
+  assert.ok(forcedRotationProof(f));
+  assert.equal(f.operation.legalRows.length, 1);
+  for (const mutate of [
+    (f) => {
+      f.semanticEvidence = [];
+    },
+    (f) => {
+      f.semanticEvidence[0].claim.uid = 'other';
+    },
+    (f) => {
+      f.index.groups[0].entries[0].args.player_id = '4';
+    },
+    (f) => {
+      f.operation.legalRows.push(f.operation.legalRows[0]);
+    },
+    (f) => {
+      f.operation.row.action.days = 2;
+    },
+    (f) => {
+      f.operation.entry.args.player_id = '4';
+    },
+    (f) => {
+      f.operation.after.firstPlayer = 0;
+    },
+    (f) => {
+      f.operations[0].row.action.type = 'place';
+    },
+  ]) {
+    const f = nativeForcedRotation();
+    mutate(f);
+    assert.equal(forcedRotationProof(f), null);
+  }
+});
+
+function nativeClosedBurn() {
+  const state = nativeTechnologyChoice('agriculture', { free: true }).operation.before;
+  state.pending = {
+    title: 'Synthetic harvest',
+    task: { type: 'palenque', position: 3 },
+    after: [],
+  };
+  state.jungle[3] = { corn: 1, wood: 1 };
+  const neutral = {
+    uid: 'neutral',
+    type: 'takeTile',
+    args: { player_id: null, player_name: '', type: 'wood_tile', action: 3, tile_number: 1 },
+  };
+  const operations = nativeCompoundOperations(state, [neutral, neutral], (rows, i) =>
+    rows.find((r) =>
+      i === 0
+        ? r.action.type === 'harvest' && r.action.kind === 'burn'
+        : r.action.type === 'temple' && r.action.temple === 'chaac' && r.action.direction === -1,
+    ),
+  );
+  const group = { moveId: 3, entries: [neutral] },
+    [burn, penalty] = operations;
+  const proof = {
+    actor: 0,
+    sourceId: '1',
+    position: 3,
+    god: 'chaac',
+    corn: burn.after.players[0].resources.corn - burn.before.players[0].resources.corn,
+    moveId: 3,
+    move: burn.row.move,
+    source: [{ uid: 'neutral', packetIndex: undefined, notificationIndex: undefined }],
+  };
+  const closed = bindBurnHarvestOutcome(
+    proof,
+    burn.before,
+    { snapshot: { state: burn.after }, observation: { actor: 0, legalActions: penalty.legalRows } },
+    penalty.after,
+    operations.map((o) => ({
+      actor: 0,
+      sourceActionIds: [3],
+      refills: { currentAge: [], age2: [] },
+      move: o.row.move,
+    })),
+  );
+  return {
+    operation: burn,
+    operations,
+    group,
+    audit: [{ moveId: 3, burnHarvestEvidence: closed }],
+    sourceToNative: new Map([['1', 0]]),
+  };
+}
+
+test('native neutral burn receipt reuses only its exact closed witness and complete two-step effect', () => {
+  const f = nativeClosedBurn();
+  assert.ok(closedBurnChoiceProof(f));
+  assert.ok(closedBurnChoiceProof({ ...f, operation: f.operations[1] }));
+  for (const mutate of [
+    (f) => {
+      f.audit = [];
+    },
+    (f) => {
+      f.audit[0].burnHarvestEvidence.source[0].uid = 'other';
+    },
+    (f) => {
+      f.audit[0].burnHarvestEvidence.actor = 1;
+    },
+    (f) => {
+      f.audit[0].burnHarvestEvidence.sourceCountersModified = true;
+    },
+    (f) => {
+      f.operations[1].after.players[0].resources.corn++;
+    },
+    (f) => {
+      f.operation.entry.args.player_name = 'A';
+    },
+    (f) => {
+      f.operations[1].row.action.temple = 'kukulkan';
+    },
+  ]) {
+    const f = nativeClosedBurn();
+    mutate(f);
+    assert.equal(closedBurnChoiceProof(f), null);
+  }
+});
+
+function nativeTechnologyTrajectory(track, { free = false, capped = true } = {}) {
+  const f = nativeTechnologyChoice(track, { free, capped }),
+    raw = fixture();
+  let serial = 0;
+  raw.initialState.players['1'].name = 'A';
+  const nt = (type, args, uid = `source${serial++}`) => ({ uid, type, args, log: '' });
+  const state = (id, args = []) =>
+    nt('gameStateChange', {
+      id,
+      type: id === 99 ? 'manager' : 'activeplayer',
+      active_player: '1',
+      args,
+    });
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  Object.assign(raw.initialState.gamestates, {
+    31: { name: 'technologyUpgrade', type: 'activeplayer' },
+    62: { name: 'freeTechnology', type: 'activeplayer' },
+    60: { name: 'resourceReward', type: 'activeplayer' },
+    61: { name: 'templeReward', type: 'activeplayer' },
+    99: { type: 'manager' },
+  });
+  const menu = (op) =>
+    op.before.pending?.task.type === 'resource'
+      ? []
+      : Object.fromEntries(
+          Object.entries(op.before.players[0].temples).map(([t, n]) => [
+            t === 'kukulkan' ? 'kukulcan' : t,
+            n + 1,
+          ]),
+        );
+  const p = f.operation.before.players[0];
+  const initialArgs = free
+    ? p.technologies
+    : {
+        technologies: p.technologies,
+        resources: { wood: p.resources.wood, stone: p.resources.stone, gold: p.resources.gold },
+      };
+  const groups = [
+    packet(2, [state(free ? 62 : 31, initialArgs)]),
+    packet(3, [
+      ...f.group.entries.map((n) => nt(n.type, n.args, n.uid)),
+      state(
+        f.rewardOperations.length ? (track === 'extraction' ? 60 : 61) : 99,
+        f.rewardOperations.length ? menu(f.rewardOperations[0]) : [],
+      ),
+    ]),
+  ];
+  for (let i = 0; i < f.rewardOperations.length; i++) {
+    const op = f.rewardOperations[i],
+      next = f.rewardOperations[i + 1];
+    groups.push(
+      packet(4 + i, [
+        nt(op.entry.type, op.entry.args, op.entry.uid),
+        state(next ? 60 : 99, next ? menu(next) : []),
+      ]),
+    );
+  }
+  raw.gameLogs.data.data = [raw.gameLogs.data.data[0], ...groups];
+  const index = parseNetworkReplay(bytes(raw)),
+    responses = [];
+  const initialBoundary = {
+    moveId: 2,
+    stateId: free ? 62 : 31,
+    name: free ? 'freeTechnology' : 'technologyUpgrade',
+    args: initialArgs,
+    sourceActor: '1',
+    actor: 0,
+    pending: f.operation.before.pending,
+    legalRows: f.operation.legalRows,
+  };
+  for (const group of index.groups.filter((g) => g.moveId > 2)) {
+    const ops = group.moveId === 3 ? f.operations : [f.rewardOperations[group.moveId - 4]];
+    for (const op of ops) op.entry = group.entries.find((n) => n.uid === op.entry.uid);
+    const n = group.entries.at(-1),
+      after = ops.at(-1).after;
+    responses.push({
+      group,
+      before: ops[0].before,
+      after,
+      operations: ops,
+      boundary: {
+        moveId: group.moveId,
+        potentialHumanDecision: n.args.id !== 99,
+        sourceStateId: n.args.id,
+        sourceActor: '1',
+        sourceMenu: n.args.args,
+        nativeActor: 0,
+        nativePending: after.pending,
+        nativeLegalActions: ops.at(-1).afterLegalRows,
+      },
+      audit: [],
+      publicResultMatched: true,
+    });
+  }
+  return {
+    index,
+    initialMoveId: 2,
+    initialBoundary,
+    sourceToNative: new Map([['1', 0]]),
+    mapCard: () => null,
+    responses,
+  };
+}
+
+test('capped native reward choices close retrospectively without changing their earlier menus', () => {
+  for (const track of ['agriculture', 'extraction'])
+    for (const free of [false, true]) {
+      const f = nativeTechnologyTrajectory(track, { free }),
+        original = structuredClone(f.responses.map((r) => r.boundary)),
+        choices = createObservedChoices(f);
+      for (const r of f.responses) choices.observe(r);
+      const proof = choices.finish();
+      assert.equal(
+        proof.allObservedChoicesMatched,
+        true,
+        JSON.stringify([track, free, proof.unresolved]),
+      );
+      assert.equal(proof.boundaries[0].kind, 'technologyCapRewardInterval');
+      assert.deepEqual(
+        f.responses.map((r) => r.boundary),
+        original,
+      );
+    }
+});
+
+test('capped reward proof remains unresolved for truncated, unbound or nonisolated continuations', () => {
+  for (const mutate of [
+    (f) => f.responses.pop(),
+    (f) => {
+      f.responses[1].operations[0].actor = 1;
+    },
+    (f) => {
+      f.responses[1].operations[0].entry = { ...f.responses[1].operations[0].entry, uid: 'other' };
+    },
+    (f) => {
+      f.responses[1].operations[0].before.pending.task.remaining = 1;
+    },
+    (f) => {
+      f.responses[2].operations[0].after.players[0].resources.gold++;
+    },
+    (f) => {
+      f.responses[1].publicResultMatched = false;
+    },
+  ]) {
+    const f = nativeTechnologyTrajectory('extraction');
+    mutate(f);
+    const choices = createObservedChoices(f);
+    for (const r of f.responses) choices.observe(r);
+    assert.equal(choices.finish().boundaries[0].verified, false);
+  }
+});
+
+test('temple menus require selected targets and validate present values while allowing unselected omissions', () => {
+  for (const id of [61, 35]) {
+    const f = observedChoiceFixture(id),
+      table = id === 35 ? f.boundary.args.temples : f.boundary.args;
+    delete table.quetzalcoatl;
+    delete table.kukulcan;
+    const operations =
+      id === 35
+        ? [f.operation, { row: { action: { type: 'temple', temple: 'chaac', direction: 1 } } }]
+        : [f.operation];
+    assert.equal(observedStageArguments(f.boundary, f.operation, operations), null);
+    delete table.chaac;
+    table.quetzalcoatl = '1';
+    assert.equal(
+      observedStageArguments(f.boundary, f.operation, operations),
+      'templeArgumentsDiffer',
+    );
+    table.chaac = '1';
+    table.quetzalcoatl = '2';
+    assert.equal(
+      observedStageArguments(f.boundary, f.operation, operations),
+      'templeArgumentsDiffer',
+    );
+  }
+});
 
 test('ordinary observed stages bind chosen actors, targets, amounts, costs and stage arguments', () => {
   for (const id of [4, 6, 7, 10, 31, 32, 33, 34, 35, 37, 42, 44, 45, 60, 61, 62, 70, 71, 95]) {
