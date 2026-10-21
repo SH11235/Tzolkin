@@ -225,6 +225,8 @@ export function networkEvidenceReport({
     },
     terminal: {
       state: terminal?.phase === 'finished' ? 'reached' : 'notReached',
+      validation: prefix?.terminalValidation ?? null,
+      completion: prefix?.completionEvidence ?? null,
       exactSourceMatched: nativeReport?.terminalMatched ?? null,
       sourceDisplayComparison: nativeReport?.terminalDisplayComparison ?? null,
       remainingDifference: prefix?.blocked

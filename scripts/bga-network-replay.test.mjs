@@ -32,6 +32,11 @@ import {
 } from './bga-network-chichen.mjs';
 import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import {
+  assertObservationBoundary,
+  inspectTerminalProjection,
+  replayCompletionEvidence,
+} from './bga-network-terminal.mjs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { bindAppliedArchitectureCorn } from './bga-network-architecture.mjs';
@@ -1325,15 +1330,18 @@ function setup(
   };
   const frame = (state) => ({
     snapshot: { state },
-    observation: {
-      actor: 0,
-      legalActions: [
-        {
-          action: { type: 'place', gear: 'uxmal', cornCost: 0, discount: false },
-          move: { type: 'place', gear: 'uxmal' },
-        },
-      ],
-    },
+    observation:
+      state.phase === 'finished'
+        ? null
+        : {
+            actor: 0,
+            legalActions: [
+              {
+                action: { type: 'place', gear: 'uxmal', cornCost: 0, discount: false },
+                move: { type: 'place', gear: 'uxmal' },
+              },
+            ],
+          },
   });
   const dispatch = (request) => {
     const state = structuredClone(request.state);
@@ -1412,6 +1420,10 @@ test('terminal integer display uses the existing floor contract and never become
   assert.equal(result.record.steps[0].checkpoint, undefined);
   assert.equal(result.record.terminalDisplayCheckpoint.mode, 'floorTotal');
   assert.equal(result.record.terminalDisplayCheckpoint.scores[0].total, 1);
+  assert.equal(result.decisionBoundaryAudit.at(-1).nativeActor, null);
+  assert.deepEqual(result.decisionBoundaryAudit.at(-1).nativeLegalActions, []);
+  assert.equal(result.completionEvidence.prerequisites.allGroupsSuccessfullyProcessed, true);
+  assert.equal(result.completionEvidence.fullReplayAchieved, false);
   const wrong = setup(
     false,
     false,
@@ -1426,6 +1438,281 @@ test('terminal integer display uses the existing floor contract and never become
     true,
   );
   assert.match(wrong.blocked.reason, /public state mismatch/);
+  assert.equal(wrong.completionEvidence.prerequisites.allGroupsSuccessfullyProcessed, false);
+  assert.match(wrong.blocked.exceptionStack, /replayNetworkPrefix/);
+});
+
+function terminalAuditFixture() {
+  const sourceToNative = new Map([
+    ['1', 0],
+    ['2', 1],
+    ['3', 2],
+  ]);
+  const resources = (corn) => ({ corn, wood: 0, stone: 0, gold: 0, skull: 0 });
+  const players = Array.from({ length: 3 }, (_, id) => ({
+    id,
+    workers: 3,
+    feedWorkers: 0,
+    feedAll: false,
+    feedDiscount: 0,
+    resources: resources(10),
+    score: 0,
+  }));
+  const before = {
+    phase: 'playing',
+    additionalBuildings: false,
+    round: 27,
+    expansion: null,
+    firstPlayerClaimed: null,
+    currentPlayer: 2,
+    accumulatedCorn: 0,
+    foodDays: [8, 14, 21],
+    players,
+  };
+  const native = {
+    ...structuredClone(before),
+    phase: 'finished',
+    pending: null,
+    foodDays: [8, 14, 21, 27],
+    finalScores: players.map((p) => ({ playerId: p.id, total: 100.25 - p.id, rank: p.id + 1 })),
+  };
+  native.players.forEach((p) => {
+    p.resources.corn = 4;
+    p.score = 100.25 - p.id;
+  });
+  const group = {
+    moveId: 9,
+    entries: [{ type: 'gameStateChange', args: { id: 99, type: 'manager' } }],
+  };
+  const index = {
+    initial: {
+      gamestate: { id: 4, type: 'activeplayer' },
+      gamestates: { 4: { name: 'playerTurn', type: 'activeplayer' }, 99: { type: 'manager' } },
+    },
+    groups: [group],
+  };
+  const event = {
+    scheduledDay: 27,
+    eligible: true,
+    start: { uid: 'final-food' },
+    receipts: [...sourceToNative].map(([id]) => ({
+      sourceActorId: id,
+      paidCorn: 6,
+      penaltyPoints: null,
+      costCaptions: [{ workers: 3 }],
+      penaltyCaptions: [],
+    })),
+  };
+  const ledger = {
+    stateId: 99,
+    day: 27,
+    lastRotation: { day: 27, uid: 'final-rotation' },
+    stateNotificationType: 'manager',
+    accumulatedCorn: 0,
+    foodDays: [8, 14, 21, 27],
+    feedingWitnesses: [event],
+    players: Object.fromEntries(
+      [...sourceToNative].map(([id, actor]) => [
+        id,
+        { resources: resources(4), score: 100 - actor },
+      ]),
+    ),
+  };
+  return {
+    index,
+    group,
+    ledger,
+    native,
+    observation: null,
+    differences: [],
+    sourceToNative,
+    feedingTransitions: [
+      { before, after: structuredClone(native), action: { type: 'endTurn' }, step: 50 },
+    ],
+    terminalDisplayCheckpoint: {
+      mode: 'floorTotal',
+      scores: native.finalScores.map((n) => ({
+        playerId: n.playerId,
+        total: Math.floor(n.total),
+        rank: n.rank,
+      })),
+    },
+  };
+}
+
+test('terminal validation independently checks final food, public differences and integer display ranks', () => {
+  const f = terminalAuditFixture();
+  assert.doesNotThrow(() => assertObservationBoundary(f));
+  const checked = inspectTerminalProjection(f);
+  assert.equal(checked.completed, true);
+  assert.equal(checked.food.players.length, 3);
+  assert.equal(checked.display.matched, true);
+  const missingDisplay = terminalAuditFixture();
+  missingDisplay.terminalDisplayCheckpoint = null;
+  assert.equal(inspectTerminalProjection(missingDisplay).display.state, 'notAvailable');
+  for (const mutate of [
+    (f) => {
+      f.native.players[0].resources.corn++;
+    },
+    (f) => {
+      f.ledger.feedingWitnesses[0].receipts[0].paidCorn--;
+    },
+    (f) => {
+      f.ledger.feedingWitnesses[0].receipts[0].penaltyPoints = 3;
+    },
+    (f) => {
+      f.native.foodDays.pop();
+    },
+    (f) => {
+      f.ledger.players['1'].score++;
+    },
+    (f) => {
+      f.terminalDisplayCheckpoint.scores[0].rank++;
+    },
+    (f) => {
+      f.differences.push({ field: 'player.1.temple.chaac', observed: 2, native: 1 });
+    },
+  ]) {
+    const altered = terminalAuditFixture();
+    mutate(altered);
+    assert.equal(inspectTerminalProjection(altered).completed, false);
+  }
+});
+
+test('only a final unusable single central corn is accepted and the raw difference remains', () => {
+  const f = terminalAuditFixture();
+  f.differences = [{ field: 'accumulatedCorn', observed: 3, native: 4 }];
+  f.ledger.accumulatedCorn = 3;
+  f.native.accumulatedCorn = 4;
+  const checked = inspectTerminalProjection(f);
+  assert.equal(checked.completed, true);
+  assert.equal(checked.acceptedExceptions.length, 1);
+  assert.deepEqual(checked.rawDifferences, f.differences);
+  for (const mutate of [
+    (f) => {
+      f.differences[0].native++;
+    },
+    (f) => {
+      f.native.phase = 'playing';
+    },
+    (f) => {
+      f.native.pending = { task: { type: 'rotation' } };
+    },
+    (f) => {
+      f.ledger.stateId = 4;
+      f.ledger.stateNotificationType = 'activeplayer';
+    },
+    (f) => {
+      f.index.groups.push({
+        moveId: 10,
+        entries: [{ type: 'gameStateChange', args: { id: 4, type: 'activeplayer' } }],
+      });
+    },
+  ]) {
+    const altered = terminalAuditFixture();
+    altered.differences = structuredClone(f.differences);
+    altered.ledger.accumulatedCorn = 3;
+    altered.native.accumulatedCorn = 4;
+    mutate(altered);
+    assert.equal(inspectTerminalProjection(altered).completed, false);
+  }
+});
+
+test('absent observation remains invalid before source end, with pending work or a later human choice', () => {
+  for (const mutate of [
+    (f) => {
+      f.native.phase = 'playing';
+    },
+    (f) => {
+      f.ledger.stateId = 4;
+    },
+    (f) => {
+      f.native.pending = { task: { type: 'resource' } };
+    },
+    (f) => {
+      f.index.groups.push({
+        moveId: 10,
+        entries: [{ type: 'gameStateChange', args: { id: 4, type: 'activeplayer' } }],
+      });
+    },
+    (f) => {
+      f.ledger.stateNotificationType = 'activeplayer';
+    },
+  ]) {
+    const f = terminalAuditFixture();
+    mutate(f);
+    assert.throws(() => assertObservationBoundary(f), /absent observation/);
+  }
+});
+
+test('completion separates successful group processing, human coverage, closed obligations and terminal audit', () => {
+  const f = terminalAuditFixture();
+  const first = {
+    moveId: 8,
+    entries: [{ type: 'gameStateChange', args: { id: 4, type: 'activeplayer' } }],
+  };
+  f.index.groups.unshift(first);
+  const args = {
+    index: f.index,
+    sourceToNative: f.sourceToNative,
+    initialMoveId: 2,
+    initialVerified: true,
+    initialCoverageEvidence: { connected: true },
+    successfulGroups: [8, 9],
+    decisionBoundaryAudit: [
+      {
+        moveId: 8,
+        sourceActor: '1',
+        nativeActor: 0,
+        sourceStateId: 4,
+        potentialHumanDecision: true,
+        sourceDecisionTypeKnown: true,
+        sourceStateTypeIssue: null,
+        semanticComparison: { semanticMatch: true },
+        nativePending: null,
+      },
+    ],
+    semantic: { sourceSequenceComplete: true, allObligationsClosed: true, failure: null },
+    timingFences: [],
+    terminal: { completed: true },
+    blocked: false,
+  };
+  const checked = replayCompletionEvidence(args);
+  assert.equal(Object.values(checked.prerequisites).every(Boolean), true);
+  assert.equal(checked.fullReplayAchieved, false);
+  assert.ok(checked.unresolved.includes('humanSelectionMeaningNotFullyEstablished'));
+  for (const [change, failed] of [
+    [(a) => a.successfulGroups.pop(), 'allGroupsSuccessfullyProcessed'],
+    [(a) => a.decisionBoundaryAudit.pop(), 'requiredHumanBoundariesCovered'],
+    [
+      (a) => {
+        a.semantic.allObligationsClosed = false;
+      },
+      'allSemanticObligationsClosed',
+    ],
+    [
+      (a) => {
+        a.terminal.completed = false;
+      },
+      'terminalValidationCompleted',
+    ],
+    [
+      (a) => {
+        a.blocked = true;
+      },
+      'noBlock',
+    ],
+    [
+      (a) => {
+        a.timingFences = [{ resolvedMoveId: null }];
+      },
+      'allStrictTimingFencesClosed',
+    ],
+  ]) {
+    const altered = structuredClone(args);
+    change(altered);
+    assert.equal(replayCompletionEvidence(altered).prerequisites[failed], false);
+  }
 });
 
 test('counter mismatch stops at the original move without repairing the native state', () => {
