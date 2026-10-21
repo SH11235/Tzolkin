@@ -9,7 +9,15 @@ import {
   validInitialNetworkWorkers,
 } from './bga-network.mjs';
 import { networkCardMapper, replayNetworkPrefix } from './bga-network-replay.mjs';
-import { declinedRemovalCaption } from './bga-network-chichen.mjs';
+import {
+  declinedRemovalCaption,
+  declinedRemovalWitness,
+  bindDeclinedRemainingWorkers,
+} from './bga-network-chichen.mjs';
+import {
+  isClosedChichenDecline,
+  closedChichenDeclineRemovalMenu,
+} from './bga-network-chichen-decline.mjs';
 import {
   skullShortageCaption,
   singleSkullCaption,
@@ -1634,4 +1642,346 @@ test('forged contracts cannot authorize cancellation inspection or native replay
       ),
     /unreviewed archive client version/,
   );
+});
+
+function explicitChichenFixture(mutateRaw = () => {}) {
+  const raw = fixture();
+  const remaining = Object.fromEntries(
+    [
+      [12, 3],
+      [14, 4],
+      [15, 5],
+    ].map(([id, p]) => [
+      String(id),
+      {
+        id: String(id),
+        place: 'chichenItza',
+        position: String(p),
+        actions: {
+          chichenItza: Object.fromEntries(
+            Array.from({ length: p + 1 }, (_, i) => [String(i + 1), Math.max(0, p - i - 1)]),
+          ),
+        },
+      },
+    ]),
+  );
+  raw.gameLogs.data.data.push({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: '16',
+    packet_type: 'resend',
+    move_id: 6,
+    time: '1',
+    data: [
+      {
+        uid: 'decline-worker',
+        type: 'pickUpWorker',
+        log: declinedRemovalCaption,
+        args: {
+          player_id: '1',
+          player_name: 'P1',
+          worker_id: '11',
+          city: 'Chichen Itza',
+          position: '1',
+        },
+      },
+      {
+        uid: 'decline-transition',
+        type: 'gameStateChange',
+        log: '',
+        args: { id: 9, active_player: '1', args: [], type: 'game' },
+      },
+      {
+        uid: 'decline-remaining',
+        type: 'gameStateChange',
+        log: '',
+        args: { id: 7, active_player: '1', args: { workers: remaining }, type: 'activeplayer' },
+      },
+    ],
+  });
+  mutateRaw(raw);
+  const index = parseNetworkReplay(bytes(raw)),
+    group = index.groups.at(-1),
+    entry = group.entries[0];
+  const before = {
+    phase: 'playing',
+    additionalBuildings: false,
+    pending: null,
+    currentPlayer: 0,
+    turn: { mode: 'remove', count: 1, begged: false },
+    players: [
+      {
+        id: 0,
+        name: 'P1',
+        resources: { corn: 16, wood: 0, stone: 2, gold: 0, skull: 3 },
+        technologies: { theology: 3 },
+      },
+      { id: 1, resources: { corn: 10 } },
+    ],
+    gears: { chichenItza: Array(13).fill(null) },
+    skullSupply: 0,
+    skullSpaces: [null, null, 1, 1, null, null, null, null, null, null],
+    log: [],
+    untouched: { value: 7 },
+  };
+  const workers = new Map(
+    [
+      [11, 1],
+      [12, 3],
+      [14, 4],
+      [15, 5],
+    ].map(([id, p]) => [
+      String(id),
+      { id: String(id), player: '1', place: 'chichenItza', position: String(p) },
+    ]),
+  );
+  for (const w of workers.values())
+    before.gears.chichenItza[Number(w.position)] = { playerId: 0, dummy: false };
+  const worker = workers.get('11'),
+    context = {
+      index,
+      workers,
+      sourceStateId: 7,
+      sourceActivePlayer: '1',
+      sourceInitial: index.initial,
+      sourceToNative: new Map([
+        ['1', 0],
+        ['2', 1],
+        ['3', 2],
+      ]),
+      nativeActor: 0,
+      before,
+      sourceStateMatched: true,
+      unresolvedTiming: false,
+    };
+  const skip = { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } };
+  const afterRemoval = {
+    snapshot: { state: structuredClone(before) },
+    observation: {
+      actor: 0,
+      legalActions: [
+        {
+          action: {
+            type: 'useAction',
+            gear: 'chichenItza',
+            position: 1,
+            source: 'currentGear',
+            cornCost: 0,
+          },
+          move: { type: 'choose', choiceId: 'action:1' },
+        },
+        skip,
+      ],
+    },
+  };
+  afterRemoval.snapshot.state.gears.chichenItza[1] = null;
+  afterRemoval.snapshot.state.turn.count++;
+  afterRemoval.snapshot.state.pending = {
+    title: 'Action',
+    task: { type: 'action', gear: 'chichenItza', position: 1 },
+    after: [],
+  };
+  const afterSkip = {
+    snapshot: { state: structuredClone(afterRemoval.snapshot.state) },
+    observation: {
+      actor: 0,
+      legalActions: [
+        ...[3, 4, 5].map((p) => ({
+          action: { type: 'remove', gear: 'chichenItza', position: p },
+          move: { type: 'remove', gear: 'chichenItza', position: p },
+        })),
+        { action: { type: 'endTurn' }, move: { type: 'endTurn' } },
+      ],
+    },
+  };
+  afterSkip.snapshot.state.pending = null;
+  const requests = [];
+  const dispatch = (request) => {
+    requests.push(request);
+    const state = structuredClone(request.state),
+      p = request.move.position;
+    state.gears.chichenItza[p] = null;
+    state.turn.count++;
+    state.pending = {
+      title: 'Action',
+      task: { type: 'action', gear: 'chichenItza', position: p },
+      after: [],
+    };
+    const rows = [
+      {
+        action: {
+          type: 'useAction',
+          gear: 'chichenItza',
+          position: p + 1,
+          source: 'theologyAhead',
+          cornCost: 0,
+        },
+        move: { type: 'choose', choiceId: `ahead:${p + 1}` },
+      },
+      ...[...Array(p)]
+        .map((_, i) => p - i)
+        .filter((t) => state.skullSpaces[t] === null)
+        .map((t) => ({
+          action: {
+            type: 'useAction',
+            gear: 'chichenItza',
+            position: t,
+            source: 'currentGear',
+            cornCost: p - t,
+          },
+          move: { type: 'choose', choiceId: `action:${t}` },
+        })),
+      skip,
+    ];
+    return { snapshot: { state }, observation: { actor: 0, legalActions: rows } };
+  };
+  return {
+    index,
+    group,
+    entry,
+    worker,
+    context,
+    before,
+    afterRemoval,
+    afterSkip,
+    dispatch,
+    requests,
+  };
+}
+
+const chichenProof = (f) =>
+  declinedRemovalWitness(f.group, f.entry, f.worker, 'chichenItza', f.context);
+const bindChichen = (f, proof = chichenProof(f)) =>
+  bindDeclinedRemainingWorkers(proof, {
+    before: f.before,
+    afterRemoval: f.afterRemoval,
+    afterSkip: f.afterSkip,
+    dispatch: f.dispatch,
+    refills: { currentAge: [], age2: [] },
+  });
+
+test('explicit Chichen decline binds a unique chosen skip among legal actions and independent remaining probes', () => {
+  const f = explicitChichenFixture(),
+    proof = chichenProof(f);
+  assert.equal(isClosedChichenDecline(proof), true);
+  assert.equal(
+    closedChichenDeclineRemovalMenu(proof, f.afterRemoval.observation.legalActions),
+    true,
+  );
+  const result = bindChichen(f, proof);
+  assert.equal(result.sourceBackendMask, 'notEstablished');
+  assert.equal(result.completeStateDeltaVerified, true);
+  assert.equal(result.completeRemainingSetVerified, true);
+  assert.equal(f.requests.length, 3);
+  assert.equal(new Set(f.requests.map((r) => r.state)).size, 3);
+  for (const r of f.requests) assert.deepEqual(r.state, f.afterSkip.snapshot.state);
+  assert.deepEqual(
+    result.remainingMenus.map((m) =>
+      m.nativeValidRows.filter((a) => a.type === 'useAction').map((a) => a.source),
+    ),
+    [
+      ['theologyAhead', 'currentGear'],
+      ['theologyAhead', 'currentGear', 'currentGear'],
+      ['theologyAhead', 'currentGear', 'currentGear', 'currentGear'],
+    ],
+  );
+});
+
+test('explicit Chichen decline rejects altered originals, truncated packets, workers, full tables and state', () => {
+  for (const mutate of [
+    (raw) =>
+      raw.gameLogs.data.data.at(-1).data.push({
+        uid: 'extra',
+        type: 'takeGoods',
+        log: '',
+        args: { player_id: '1', type: 'wood', quantity: 1 },
+      }),
+    (raw) => (raw.gameLogs.data.data.at(-1).packet_type = 'history'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.city = 'Tikal'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.position = '2'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.action_number = '1'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[1].args.active_player = '2'),
+    (raw) =>
+      (raw.gameLogs.data.data.at(-1).data[2].args.args.workers['12'].actions.chichenItza['4'] = 1),
+    (raw) =>
+      delete raw.gameLogs.data.data.at(-1).data[2].args.args.workers['12'].actions.chichenItza['1'],
+    (raw) => (raw.gameLogs.data.data.at(-1).data[2].args.args.workers['14'].position = '5'),
+  ]) {
+    assert.throws(() => {
+      const f = explicitChichenFixture(mutate);
+      if (f.group.entries.length === 4) {
+        f.group.entries.pop();
+        assert.equal(f.index.entries.at(-1).uid, 'extra');
+      }
+      chichenProof(f);
+    });
+  }
+  for (const mutate of [
+    (f) => (f.group.entries[0].args.position = '2'),
+    (f) => (f.group = structuredClone(f.group)),
+    (f) => (f.context.index.tableId = '124'),
+    (f) => (f.context.sourceStateId = 95),
+    (f) => (f.context.sourceStateId = undefined),
+    (f) => (f.context.sourceActivePlayer = '2'),
+    (f) => (f.context.sourceInitial = structuredClone(f.index.initial)),
+    (f) => (f.worker.player = '2'),
+    (f) => (f.context.sourceStateMatched = false),
+    (f) => (f.context.unresolvedTiming = true),
+    (f) => (f.before.players[0].technologies.theology = 2),
+    (f) => (f.before.players[0].resources.skull = 2),
+    (f) => (f.before.skullSupply = 1),
+    (f) => (f.before.skullSpaces[1] = 1),
+    (f) => (f.before.skullSpaces[2] = null),
+    (f) => (f.before.gears.chichenItza[4].dummy = true),
+    (f) => (f.before.pending = { task: { type: 'trade' } }),
+  ]) {
+    const f = explicitChichenFixture();
+    mutate(f);
+    assert.throws(() => chichenProof(f));
+  }
+});
+
+test('explicit Chichen decline refuses forged proof brands and unrelated post-removal or probe changes', () => {
+  const f = explicitChichenFixture(),
+    p = chichenProof(f);
+  assert.equal(isClosedChichenDecline(structuredClone(p)), false);
+  p.remainingWorkers['12'].actions.chichenItza['4'] = 1;
+  assert.equal(isClosedChichenDecline(p), false);
+  for (const mutate of [
+    (f) => f.afterRemoval.observation.legalActions.push(f.afterRemoval.observation.legalActions[1]),
+    (f) => f.afterRemoval.snapshot.state.players[0].resources.corn--,
+    (f) => f.afterRemoval.snapshot.state.log.push('unobserved'),
+    (f) => f.afterSkip.snapshot.state.players[1].resources.corn++,
+    (f) => (f.afterSkip.snapshot.state.pending = f.afterRemoval.snapshot.state.pending),
+    (f) => f.afterSkip.observation.legalActions.pop(),
+    (f) => {
+      const base = f.dispatch;
+      f.dispatch = (r) => {
+        const x = base(r);
+        x.snapshot.state.players[0].resources.skull--;
+        return x;
+      };
+    },
+    (f) => {
+      const base = f.dispatch;
+      f.dispatch = (r) => {
+        const x = base(r);
+        x.observation.legalActions[0].action.source = 'otherGear';
+        return x;
+      };
+    },
+    (f) => {
+      const base = f.dispatch;
+      f.dispatch = (r) => {
+        const x = base(r);
+        x.observation.legalActions[0].action.cornCost = 1;
+        return x;
+      };
+    },
+  ]) {
+    const f = explicitChichenFixture(),
+      p = chichenProof(f);
+    mutate(f);
+    assert.throws(() => bindChichen(f, p));
+  }
 });

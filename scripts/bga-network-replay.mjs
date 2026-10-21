@@ -3,6 +3,10 @@ import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import {
+  isClosedChichenDecline,
+  closedChichenDeclineRemovalMenu,
+} from './bga-network-chichen-decline.mjs';
+import {
   finalScoringWitness,
   bindFinalScoringProjections,
   assertFinalScoringResolutionGroup,
@@ -1667,6 +1671,10 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
                 sourceToNative,
                 nativeActor: getActor(n),
                 before: beforeDecline,
+                index,
+                sourceStateId: ledger.stateId,
+                sourceActivePlayer: ledger.activePlayer,
+                sourceInitial: ledger.initial,
                 sourceStateMatched: differences(ledger, beforeDecline, sourceToNative).length === 0,
                 unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
               },
@@ -1680,7 +1688,11 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             if (declined) {
               const afterRemoval = frame;
               const choices = actions();
-              if (choices.length !== 1 || choices[0].action.type !== 'skip')
+              if (
+                isClosedChichenDecline(declined)
+                  ? !closedChichenDeclineRemovalMenu(declined, choices)
+                  : choices.length !== 1 || choices[0].action.type !== 'skip'
+              )
                 fail('explicit declined removal lacks its unique legal skip');
               applyWhere((x) => x.type === 'skip', 'explicit original declined action');
               audit.at(-1).declinedRemovalEvidence = bindDeclinedRemainingWorkers(declined, {
