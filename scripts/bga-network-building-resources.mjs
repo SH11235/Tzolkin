@@ -104,6 +104,57 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
         (human[0] === states.at(-1) && String(human[0].args.active_player) === owner))
     );
   }
+  function closingDecision(item, ledger, native, observation) {
+    const state = index.initial.gamestates[ledger.stateId];
+    if (state?.type === 'game') return null;
+    if (
+      state?.type !== 'activeplayer' ||
+      String(ledger.activePlayer) !== item.sourceOwner ||
+      observation.actor !== item.actor ||
+      native.currentPlayer !== item.actor
+    )
+      return false;
+    const rows = observation.legalActions ?? [];
+    const possible = state.possibleactions ?? [];
+    if (!native.pending) {
+      if (state.name === 'pickUpWorker' && native.turn.mode === 'remove' && native.turn.count > 0)
+        return (
+          possible.includes('pickUpWorker') &&
+          possible.includes('endTurn') &&
+          rows.some((r) => r.action.type === 'endTurn') &&
+          rows.every((r) => ['remove', 'endTurn'].includes(r.action.type))
+        );
+      if (state.name === 'placeWorker' && native.turn.mode === 'place' && native.turn.count > 0)
+        return (
+          possible.includes('placeWorker') &&
+          possible.includes('endTurn') &&
+          rows.some((r) => r.action.type === 'endTurn') &&
+          rows.every((r) => ['place', 'endTurn'].includes(r.action.type))
+        );
+      if (state.name === 'playerTurn' && native.turn.mode === 'none' && native.turn.count === 0)
+        return (
+          possible.includes('placeWorker') &&
+          possible.includes('pickUpWorker') &&
+          rows.length > 0 &&
+          rows.every((r) => ['place', 'remove', 'beg'].includes(r.action.type))
+        );
+      return false;
+    }
+    const task = native.pending.task;
+    if (
+      task.type !== 'build' ||
+      task.remaining !== 1 ||
+      task.mandatory ||
+      !possible.includes('construct') ||
+      !possible.includes('pass') ||
+      !rows.some((r) => r.action.type === 'skip') ||
+      !rows.every((r) => ['build', 'monument', 'skip'].includes(r.action.type))
+    )
+      return false;
+    return task.architectureAvailable === false
+      ? state.name === 'constructWithoutArchitecture'
+      : state.name === 'construct';
+  }
   function compare(context, { ledger, native, observation, differences, constructionTransition }) {
     const { group, source, transitions } = context;
     const evidence = [],
@@ -530,7 +581,10 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
         (item.fixed.skull && differences.some((d) => d.field === 'skullSupply'))
       )
         reject('consumed fixed reward did not rejoin its original counters');
-      if (!failure) {
+      const decision = closingDecision(item, ledger, native, observation);
+      if (decision === false)
+        reject('source and native remaining decisions differ at reward closure');
+      if (!failure && decision === true) {
         item.closed = true;
         item.closedMoveId = group.moveId;
         evidence.push({
@@ -555,6 +609,8 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
             startMoveId: active.startMoveId,
             construction: active.sourceConstruction,
             fixed: copy(active.fixed),
+            nativeConsumedAtStep: active.consumedAtStep,
+            awaitingDecisionClosure: active.consumedAtStep !== null,
           }
         : null,
     };

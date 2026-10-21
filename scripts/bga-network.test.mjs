@@ -3272,11 +3272,12 @@ function fixedBuildingFixture(
     stock = 2,
     branch = null,
     templeSummit = false,
+    continuation = null,
     mutateSource = () => {},
     mutateFrames = () => {},
   } = {},
 ) {
-  const cacheKey = JSON.stringify([id, capped, stock, branch, templeSummit]);
+  const cacheKey = JSON.stringify([id, capped, stock, branch, templeSummit, continuation]);
   if (!syntheticBuildingFrames.has(cacheKey)) {
     const cli = join(
       process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../target', import.meta.url)),
@@ -3321,6 +3322,7 @@ function fixedBuildingFixture(
         monuments: [],
       });
     state.players[1].resources.skull = 13 - stock;
+    state.turn = { mode: 'remove', count: 1, begged: false };
     if (templeSummit) {
       state.players[0].temples.kukulkan = catalog.TEMPLE_TRACKS.kukulkan.max - 1;
       state.players[0].doubleAdvanceAvailable = false;
@@ -3330,10 +3332,10 @@ function fixedBuildingFixture(
       title: 'Synthetic construction',
       task: {
         type: 'build',
-        remaining: 1,
+        remaining: continuation ? 2 : 1,
         allowMonument: false,
         cornPayment: false,
-        architectureAvailable: false,
+        architectureAvailable: continuation === 'architecture',
       },
       after: [],
     };
@@ -3348,6 +3350,7 @@ function fixedBuildingFixture(
       {
         before: state,
         after: after.snapshot.state,
+        afterLegalActions: after.observation.legalActions,
         actor: 0,
         action: build.action,
         legalActions: frame.observation.legalActions,
@@ -3378,6 +3381,7 @@ function fixedBuildingFixture(
       frames.push({
         before: current.snapshot.state,
         after: next.snapshot.state,
+        afterLegalActions: next.observation.legalActions,
         actor: 0,
         action: row.action,
         legalActions: rows,
@@ -3401,8 +3405,13 @@ function fixedBuildingFixture(
     60: { type: 'activeplayer', name: 'resourceReward' },
     61: { type: 'activeplayer', name: 'templeReward' },
     62: { type: 'activeplayer', name: 'freeTechnology' },
-    7: { type: 'activeplayer' },
-    32: { type: 'activeplayer' },
+    7: { type: 'activeplayer', name: 'pickUpWorker', possibleactions: ['pickUpWorker', 'endTurn'] },
+    32: { type: 'activeplayer', name: 'construct', possibleactions: ['construct', 'pass'] },
+    70: {
+      type: 'activeplayer',
+      name: 'constructWithoutArchitecture',
+      possibleactions: ['construct', 'pass'],
+    },
   });
   const stateNotice = (state) => {
     const type = state.pending?.task.type;
@@ -3417,7 +3426,9 @@ function fixedBuildingFixture(
               : type === 'temple'
                 ? 61
                 : type === 'build'
-                  ? 32
+                  ? state.pending.task.architectureAvailable === false
+                    ? 70
+                    : 32
                   : 7,
         type: 'activeplayer',
         active_player: '1',
@@ -3570,7 +3581,7 @@ function fixedBuildingFixture(
       args = {
         ledger,
         native: t.after,
-        observation: { actor: 0 },
+        observation: { actor: 0, legalActions: t.afterLegalActions },
         differences,
         constructionTransition:
           i === 0
@@ -3616,6 +3627,45 @@ test('fixed skull profile refuses stock zero or one and preserves both allocatio
   assert.equal(choice.fixedContribution.skull, 1);
   assert.equal(choice.preSkullSupply, 2);
   assert.equal(choice.postSkullSupply, 0);
+});
+
+test('fixed reward closure verifies the remaining worker or building decision', () => {
+  for (const continuation of [null, 'architecture', 'withoutArchitecture']) {
+    const f = fixedBuildingFixture('b24', { continuation });
+    for (let i = 0; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+    assert.equal(f.helper.finish().allObligationsClosed, true);
+    if (continuation) assert.equal(f.frames.at(-1).after.pending.task.type, 'build');
+  }
+  for (const sourceId of [60, 61, 62, 32]) {
+    const f = fixedBuildingFixture('b24', {
+      mutateSource: (raw) => {
+        raw.gameLogs.data.data.at(-1).data.at(-1).args.id = sourceId;
+      },
+    });
+    f.step(0);
+    assert.match(f.step(1).failure, /remaining decisions differ/);
+    assert.equal(f.helper.finish().allObligationsClosed, false);
+  }
+  const build = fixedBuildingFixture('b24', {
+    continuation: 'architecture',
+    mutateSource: (raw) => {
+      raw.gameLogs.data.data.at(-1).data.at(-1).args.id = 62;
+    },
+  });
+  build.step(0);
+  assert.match(build.step(1).failure, /remaining decisions differ/);
+  const deferred = fixedBuildingFixture('b24', {
+    mutateSource: (raw) => {
+      const state = raw.gameLogs.data.data.at(-1).data.at(-1).args;
+      state.id = 9;
+      state.type = 'game';
+    },
+  });
+  deferred.step(0);
+  const result = deferred.step(1);
+  assert.equal(result.failure, null);
+  assert.equal(result.unresolved.awaitingDecisionClosure, true);
+  assert.equal(deferred.helper.finish().allObligationsClosed, false);
 });
 
 test('fixed rewards reject altered origins, actors, costs, duplicate receipts and unclosed queues', () => {
