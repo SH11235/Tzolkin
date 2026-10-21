@@ -20,7 +20,7 @@ function zeroModel() {
       featureCount: 512,
       hiddenCount: 32,
       parameterCount: 16449,
-      rulesVersion: 1,
+      rulesVersion: 2,
       rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677',
       observationSchema: 1,
       moveSchema: 1,
@@ -176,7 +176,7 @@ function zeroConditionalModel() {
     inputContract: 'conditional-basic-unlimited-3-4p-public512-playing-v1',
     featureSchema: 2,
     featureCount: 512,
-    rulesVersion: 1,
+    rulesVersion: 2,
     catalogHash: native.contract.catalogHash,
     sourceAuthenticated: false,
     sourceQualified: false,
@@ -340,7 +340,7 @@ function ownSetupCompositeModel() {
       hiddenCount: 32,
       parameterCount: 16449,
       backend: 'scalar',
-      rulesVersion: 1,
+      rulesVersion: 2,
       rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677',
       observationSchema: 1,
       moveSchema: 1,
@@ -718,5 +718,23 @@ it('moves one loaded Wasm model through fresh guarded games and binds all actors
     } finally {
       model.free();
     }
+  }
+});
+
+it('refuses old rules and foreign catalogs even with a valid synthetic model checksum', () => {
+  const baseline = JSON.parse(new TextDecoder().decode(zeroModel().bytes));
+  for (const contract of [
+    { ...baseline.contract, rulesVersion: 1 },
+    { ...baseline.contract, catalogHash: '0'.repeat(16) },
+  ]) {
+    const value = { ...baseline, contract, checksum: '' };
+    value.checksum = createHash('sha256')
+      .update('tzolkin-numeric-policy-deployment-v1\0')
+      .update(JSON.stringify(value))
+      .digest('hex');
+    const bytes = new TextEncoder().encode(JSON.stringify(value));
+    expect(() => new CpuDeployment(bytes, value.checksum)).toThrow(
+      'Incompatible numeric deployment contract',
+    );
   }
 });

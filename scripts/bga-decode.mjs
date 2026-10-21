@@ -378,7 +378,7 @@ function decodeGame(rawBytes, witnesses, dispatch, tableBytes, declaredProfile) 
   };
   const record = {
     schema: 'tzolkin-public-replay-v1',
-    rulesVersion: 1,
+    rulesVersion: 2,
     catalogHash: witnesses.catalogHash,
     market: 'unlimited',
     source,

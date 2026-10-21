@@ -295,6 +295,13 @@ fn unknown_private_setup_and_decks_never_cross_public_boundary() {
 
 #[test]
 fn checked_api_rejects_hidden_fields_unsupported_rules_and_initial_corruption() {
+    let mut legacy = partial(3);
+    legacy.rules_version = 1;
+    assert!(
+        verify_public_replay(&legacy)
+            .unwrap_err()
+            .contains("rulesVersion")
+    );
     let record = partial(3);
     let state = serde_json::to_value(&record.initial).unwrap();
     let result: Value = serde_json::from_str(

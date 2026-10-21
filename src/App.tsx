@@ -21,6 +21,7 @@ import { GameBoardView, type View } from './ui/GameBoardView';
 import { ActionsSidebar } from './ui/ActionsSidebar';
 import {
   SAVE_KEY,
+  serializeSession,
   controllersFor,
   parseSession,
   readSession,
@@ -186,7 +187,7 @@ function App() {
   }
   function updateSession(next: Session, snapshot: GameSnapshot) {
     try {
-      localStorage.setItem(SAVE_KEY, JSON.stringify(next));
+      localStorage.setItem(SAVE_KEY, serializeSession(next));
       setSaved(next);
       setAutosaveAvailable(true);
     } catch {
@@ -566,7 +567,7 @@ function App() {
     setSaving(true);
     try {
       const written = await saveGameFile(
-        JSON.stringify(data, null, 2),
+        serializeSession(data, 2),
         `tzolkin-day-${data.state.round}.json`,
       );
       if (written) setNotice('対局の保存ファイルを書き出しました。');

@@ -7,7 +7,7 @@ import {
 import type { PublicReplayReport } from '../src/game/publicReplay';
 import { request } from './helpers/core';
 
-const SAVE_KEY = 'tzolkin.game.v1';
+const SAVE_KEY = 'tzolkin.game.v2';
 
 test('hostile terminal display evidence is rejected before results are rendered', async ({
   page,

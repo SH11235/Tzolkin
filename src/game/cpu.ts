@@ -95,7 +95,7 @@ export interface OwnSetupIdentity {
     readonly hiddenCount: 32;
     readonly parameterCount: 16449;
     readonly backend: 'scalar';
-    readonly rulesVersion: 1;
+    readonly rulesVersion: 2;
     readonly rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677';
     readonly observationSchema: 1;
     readonly moveSchema: 1;
@@ -660,7 +660,7 @@ function ownSetupMetadataMatches(metadata: CpuModelMetadata): boolean {
     hiddenCount: 32,
     parameterCount: 16449,
     backend: 'scalar',
-    rulesVersion: 1,
+    rulesVersion: 2,
     rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677',
     observationSchema: 1,
     moveSchema: 1,

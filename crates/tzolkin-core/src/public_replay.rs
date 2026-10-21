@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
 pub const PUBLIC_REPLAY_SCHEMA: &str = "tzolkin-public-replay-v1";
-pub const PUBLIC_RULES_VERSION: u32 = 1;
+pub const PUBLIC_RULES_VERSION: u32 = 2;
 pub const MAX_PUBLIC_STEPS: usize = 4000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

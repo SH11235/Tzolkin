@@ -1,8 +1,9 @@
+import { sessionSave } from './helpers/session';
 import { expect, test } from '@playwright/test';
 import { applyMove, createGame, getChoices, request } from './helpers/core';
 import { GEAR_IDS, type GameState } from '../src/game/types';
 
-const SAVE_KEY = 'tzolkin.game.v1';
+const SAVE_KEY = 'tzolkin.game.v2';
 
 function fixture(corn: number): GameState {
   let state = createGame(['A', 'B', 'C', 'D'], 42);
@@ -36,7 +37,7 @@ for (const corn of [0, 1, 5]) {
     const state = fixture(corn);
     await page.addInitScript(({ key, text }) => localStorage.setItem(key, text), {
       key: SAVE_KEY,
-      text: JSON.stringify({ state, history: [] }),
+      text: sessionSave({ state, history: [] }),
     });
     await page.goto('/');
     await page.getByRole('button', { name: /^保存した対局を続ける/ }).click();

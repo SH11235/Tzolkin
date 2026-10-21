@@ -1,10 +1,11 @@
 /// <reference lib="dom" />
+import { sessionSave } from './helpers/session';
 import { expect, test, type Page } from '@playwright/test';
 import type { GameSnapshot } from '../src/game/engine';
 import type { Choice, GameState } from '../src/game/types';
 import { applyMove, getChoices, inspectGame, request } from './helpers/core';
 
-const SAVE_KEY = 'tzolkin.game.v1';
+const SAVE_KEY = 'tzolkin.game.v2';
 const NAMES = ['翡翠', '黄金', '珊瑚', '藍', '紫水晶'];
 const browserErrors = new WeakMap<Page, string[]>();
 
@@ -20,7 +21,7 @@ async function importGame(page: Page, state: GameState) {
   await page.getByLabel('対局の保存ファイル', { exact: true }).setInputFiles({
     name: 'expansion.json',
     mimeType: 'application/json',
-    buffer: Buffer.from(JSON.stringify({ state, history: [] })),
+    buffer: Buffer.from(sessionSave({ state, history: [] })),
   });
   await expect(page.locator('.game-app')).toBeVisible();
 }

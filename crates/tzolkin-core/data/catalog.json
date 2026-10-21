@@ -866,11 +866,11 @@
       },
       "effects": [
         {
-          "type": "trade"
-        },
-        {
           "type": "points",
           "amount": 6
+        },
+        {
+          "type": "trade"
         }
       ]
     },
@@ -922,11 +922,11 @@
       },
       "effects": [
         {
-          "type": "action"
-        },
-        {
           "type": "points",
           "amount": 2
+        },
+        {
+          "type": "action"
         }
       ]
     },
@@ -1645,11 +1645,11 @@
       },
       "effects": [
         {
-          "type": "trade"
-        },
-        {
           "type": "points",
           "amount": 6
+        },
+        {
+          "type": "trade"
         }
       ]
     },
@@ -1701,11 +1701,11 @@
       },
       "effects": [
         {
-          "type": "action"
-        },
-        {
           "type": "points",
           "amount": 2
+        },
+        {
+          "type": "action"
         }
       ]
     },
