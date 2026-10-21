@@ -28,6 +28,200 @@ import { mkdtempSync, writeFileSync, readFileSync, unlinkSync, rmdirSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { bindAppliedArchitectureCorn } from './bga-network-architecture.mjs';
+
+function automaticArchitectureFixture() {
+  const card = {
+    id: 'synthetic-building',
+    name: 'Synthetic workshop',
+    cost: { wood: 2, stone: 1 },
+    effects: [
+      { type: 'technology', technology: 'extraction', steps: 1 },
+      { type: 'resources', resources: { gold: 1 } },
+    ],
+  };
+  const before = {
+    currentPlayer: 0,
+    players: [
+      {
+        name: 'A',
+        resources: { corn: 20, gold: 0 },
+        score: 0,
+        technologies: { architecture: 2, extraction: 3 },
+        buildings: [],
+      },
+    ],
+    buildings: [card.id],
+    log: [],
+    pending: {
+      title: '建設するタイルを選択',
+      task: { type: 'build', remaining: 1, allowMonument: false, cornPayment: true },
+      after: [],
+    },
+    untouched: { sentinel: true },
+  };
+  const after = structuredClone(before);
+  after.players[0].resources.corn = 15;
+  after.players[0].score = 2;
+  after.players[0].buildings.push(card.id);
+  after.buildings = [];
+  after.log.push('A が「Synthetic workshop」を建設');
+  after.pending = {
+    title: '資源を選択（残り 2 個）',
+    task: { type: 'resource', remaining: 2 },
+    after: [
+      { type: 'effects', effects: [{ type: 'resources', resources: { gold: 1 } }] },
+      {
+        type: 'build',
+        remaining: 0,
+        allowMonument: false,
+        cornPayment: true,
+        architectureAvailable: false,
+      },
+    ],
+  };
+  const notification = (type, args) => ({ type, args });
+  const entries = [
+    notification('payGoods', {
+      player_id: '1',
+      type: 'corn',
+      quantity: 6,
+      target: 'building_age_1_7',
+    }),
+    notification('construct', {
+      player_id: '1',
+      building: { id: '7', type: 'building_age_1', type_arg: '0' },
+    }),
+    notification('takeGoods', {
+      player_id: '1',
+      type: 'corn',
+      quantity: 1,
+      origin: 'technology_architecture_level_1',
+    }),
+    notification('updateScore', { player_id: '1', points: 2 }),
+    notification('takeGoods', {
+      player_id: '1',
+      type: 'gold',
+      quantity: 1,
+      origin: 'building_age_1_b7',
+    }),
+    notification('increaseTechnology', { player_id: '1', technology_id: 'extraction', level: 4 }),
+    notification('extractionMax', { player_name: 'A' }),
+    notification('decreaseTechnology', { player_id: '1', technology_id: 'extraction', level: 3 }),
+    notification('gameStateChange', { active_player: '1', id: 9 }),
+    notification('gameStateChange', { active_player: '1', id: 60 }),
+  ].map((n, i) => ({ ...n, uid: `u${i}`, packetIndex: 1, notificationIndex: i }));
+  const group = { moveId: 2, entries };
+  const index = {
+    initial: {
+      constructions: {
+        building_age_1: {
+          0: { cost: { wood: 2, stone: 1 }, extraction: 1, gold: 1, kind: 'civic' },
+        },
+      },
+    },
+    groups: [
+      { moveId: 1, entries: [notification('gameStateChange', { active_player: '1', id: 44 })] },
+      group,
+    ],
+  };
+  return {
+    index,
+    group,
+    sourceId: '1',
+    actor: 0,
+    card,
+    sourceStateMatched: true,
+    unresolvedTiming: false,
+    transition: {
+      beforeState: before,
+      afterState: after,
+      matchingOptions: 1,
+      action: {
+        type: 'build',
+        id: card.id,
+        cost: [6, 0, 0, 0, 0],
+        architecture: true,
+        discountResource: null,
+        renovation: null,
+      },
+    },
+  };
+}
+
+test('automatic architecture corn binds one exact build, receipt and complete outcome', () => {
+  const f = automaticArchitectureFixture(),
+    copy = structuredClone(f);
+  const proof = bindAppliedArchitectureCorn(f);
+  assert.equal(proof.automaticCorn, 1);
+  assert.equal(proof.automaticPoints, 2);
+  assert.deepEqual(proof.fixedResources, { gold: 1 });
+  assert.equal(proof.queueBinding.consumedAtStep, null);
+  assert.deepEqual(f, copy);
+  for (const mutate of [
+    (x) => {
+      x.sourceStateMatched = false;
+    },
+    (x) => {
+      x.unresolvedTiming = true;
+    },
+    (x) => {
+      x.transition.matchingOptions = 2;
+    },
+    (x) => {
+      x.transition.action.architecture = false;
+    },
+    (x) => {
+      x.transition.beforeState.players[0].technologies.architecture = 1;
+    },
+    (x) => {
+      x.transition.beforeState.pending.task.cornPayment = false;
+    },
+    (x) => {
+      x.group.entries[2].args.player_id = '2';
+    },
+    (x) => {
+      x.group.entries[2].args.quantity = 2;
+    },
+    (x) => {
+      x.group.entries[2].args.origin = null;
+    },
+    (x) => {
+      x.group.entries.push(structuredClone(x.group.entries[2]));
+    },
+    (x) => {
+      [x.group.entries[2], x.group.entries[4]] = [x.group.entries[4], x.group.entries[2]];
+    },
+    (x) => {
+      x.group.entries[1].args.building.type_arg = '1';
+    },
+    (x) => {
+      x.card.effects[0].technology = 'theology';
+    },
+    (x) => {
+      x.transition.afterState.untouched.sentinel = false;
+    },
+    (x) => {
+      x.transition.afterState.players[0].resources.gold = 1;
+    },
+    (x) => {
+      x.transition.afterState.pending.after.reverse();
+    },
+    (x) => {
+      x.group.entries[5].args.level = 3;
+    },
+    (x) => {
+      x.group.entries[3].args.points = 4;
+    },
+    (x) => {
+      x.group.entries[4].args.origin = null;
+    },
+  ]) {
+    const bad = automaticArchitectureFixture();
+    mutate(bad);
+    assert.throws(() => bindAppliedArchitectureCorn(bad), /Network architecture:/);
+  }
+});
 
 // Node's test runner isolates this file. Client/cancellation authentication is stubbed;
 // the production allowlist and real-contract rejection tests remain unchanged.

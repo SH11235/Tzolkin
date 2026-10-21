@@ -28,6 +28,7 @@ import {
 } from './bga-network-rewards.mjs';
 import { catalogFingerprint } from './bga-replay.mjs';
 import { sourceBurnHarvestWitness, bindBurnHarvestOutcome } from './bga-network-harvest.mjs';
+import { bindAppliedArchitectureCorn } from './bga-network-architecture.mjs';
 
 const catalogBytes = readFileSync(
   new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url),
@@ -1814,6 +1815,29 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             );
           } else if (
             n.type === 'takeGoods' &&
+            a.type === 'corn' &&
+            a.origin === 'technology_architecture_level_1' &&
+            native().pending?.task.type === 'resource'
+          ) {
+            assertActor(n);
+            const proof = bindAppliedArchitectureCorn({
+              index,
+              group,
+              sourceId: String(a.player_id),
+              actor: frame.observation.actor,
+              transition: constructionTransition,
+              sourceStateMatched: burnBeforeDifferences.length === 0,
+              unresolvedTiming: timingFences.some((f) => f.resolvedMoveId == null),
+              card: catalog.BUILDINGS.find((b) => b.id === constructionTransition?.nativeId),
+            });
+            audit.push({
+              moveId: group.moveId,
+              appliedArchitectureReceipt: proof,
+              teacherCertified: false,
+            });
+            continue;
+          } else if (
+            n.type === 'takeGoods' &&
             native().pending?.task.type === 'resource' &&
             queuedBuildingResources(
               group.entries,
@@ -1903,6 +1927,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             if (constructionTransition) fail('multiple construction transitions in one boundary');
             constructionTransition = {
               nativeId: id,
+              beforeState: architectureCorn ? copy(native()) : null,
+              matchingOptions: candidates.filter(
+                (r) =>
+                  isDeepStrictEqual(r.action.cost, paid) &&
+                  r.action.architecture === architectureCorn,
+              ).length,
               beforePending: copy(native().pending),
               beforeScore: native().players[actor].score,
               architectureLevel: native().players[actor].technologies.architecture,
@@ -1921,6 +1951,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             );
             Object.assign(constructionTransition, {
               action: selected,
+              afterState: architectureCorn ? copy(native()) : null,
               afterPending: copy(native().pending),
               afterScore: native().players[actor].score,
             });
