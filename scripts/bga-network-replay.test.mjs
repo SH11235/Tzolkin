@@ -1638,10 +1638,32 @@ test('absent observation remains invalid before source end, with pending work or
     (f) => {
       f.ledger.stateNotificationType = 'activeplayer';
     },
+    (f) => {
+      f.index.initial.gamestates[88] = { type: 'multipleactiveplayer' };
+      f.index.groups.push({
+        moveId: 10,
+        entries: [
+          {
+            type: 'gameStateChange',
+            args: { id: 88, type: 'multipleactiveplayer', multiactive: ['1', '2', '3'] },
+          },
+        ],
+      });
+    },
+    (f) => {
+      f.index.groups.push({
+        moveId: 10,
+        entries: [
+          { type: 'gameStateChange', args: { id: 4, type: 'activeplayer' } },
+          { type: 'gameStateChange', args: { id: 99, type: 'manager' } },
+        ],
+      });
+    },
   ]) {
     const f = terminalAuditFixture();
     mutate(f);
     assert.throws(() => assertObservationBoundary(f), /absent observation/);
+    assert.equal(inspectTerminalProjection(f).completed, false);
   }
 });
 
@@ -1713,6 +1735,29 @@ test('completion separates successful group processing, human coverage, closed o
     change(altered);
     assert.equal(replayCompletionEvidence(altered).prerequisites[failed], false);
   }
+  const multi = structuredClone(args);
+  multi.index.initial.gamestates[88] = { type: 'multipleactiveplayer' };
+  multi.index.groups[0].entries[0].args = { id: 88, type: 'multipleactiveplayer' };
+  multi.decisionBoundaryAudit = [];
+  const missing = replayCompletionEvidence(multi);
+  assert.equal(missing.requiredHumanBoundaries.length, 1);
+  assert.equal(missing.requiredHumanBoundaries[0].unsupportedMultipleActive, true);
+  assert.equal(missing.prerequisites.requiredHumanBoundariesCovered, false);
+});
+
+test('multiple-active source state after setup is rejected rather than assigned one native actor', () => {
+  const result = setup(false, false, false, (rawBytes) => {
+    const raw = JSON.parse(rawBytes);
+    raw.initialState.gamestates[88] = { type: 'multipleactiveplayer' };
+    raw.gameLogs.data.data.at(-1).data.at(-1).args = {
+      id: 88,
+      type: 'multipleactiveplayer',
+      multiactive: ['1', '2', '3'],
+    };
+    return bytes(raw);
+  });
+  assert.match(result.blocked.reason, /multiple-active/);
+  assert.equal(result.completionEvidence.prerequisites.requiredHumanBoundariesCovered, false);
 });
 
 test('counter mismatch stops at the original move without repairing the native state', () => {

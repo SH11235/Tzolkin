@@ -12,15 +12,27 @@ export function expectedDecisionBoundaries(index, initialMoveId) {
   };
   const result = [];
   for (const group of index.groups) {
+    let multiple = null;
     for (const n of group.entries)
       if (n.type === 'gameStateChange') {
         ledger.stateId = Number(n.args.id);
         ledger.stateNotificationType = n.args.type ?? null;
+        if (
+          n.args.type === 'multipleactiveplayer' ||
+          index.initial.gamestates[n.args.id]?.type === 'multipleactiveplayer'
+        )
+          multiple = { ...ledger };
       }
     if (group.moveId <= initialMoveId) continue;
-    const type = classifyDecisionState(ledger, index);
+    const expected = multiple ?? ledger;
+    const type = classifyDecisionState(expected, index);
     if (type.potentialHumanDecision)
-      result.push({ moveId: group.moveId, stateId: ledger.stateId, ...type });
+      result.push({
+        moveId: group.moveId,
+        stateId: expected.stateId,
+        unsupportedMultipleActive: multiple !== null,
+        ...type,
+      });
   }
   return result;
 }
@@ -34,9 +46,25 @@ export function assertObservationBoundary({ index, group, ledger, native, observ
     ledger.stateId !== 99 ||
     definition?.type !== 'manager' ||
     classifyDecisionState(ledger, index).sourceStateTypeIssue ||
-    expectedDecisionBoundaries(index, group.moveId).length
+    postTerminalHumanStates(index, group.moveId).length
   )
     throw new Error('Network native: absent observation is not an aligned final manager boundary');
+}
+
+export function postTerminalHumanStates(index, moveId) {
+  return index.groups
+    .filter((g) => g.moveId > moveId)
+    .flatMap((group) =>
+      group.entries
+        .filter((n) => n.type === 'gameStateChange')
+        .flatMap((n) => {
+          const ledger = { stateId: Number(n.args.id), stateNotificationType: n.args.type ?? null };
+          const type = classifyDecisionState(ledger, index);
+          return type.potentialHumanDecision
+            ? [{ moveId: group.moveId, uid: n.uid, ...ledger, ...type }]
+            : [];
+        }),
+    );
 }
 
 function finalFeeding({ ledger, native, transitions, sourceToNative }) {
@@ -138,7 +166,7 @@ export function inspectTerminalProjection({
     failures.push('nativeTerminalNotSettled');
   if (observation != null && observation.legalActions?.length)
     failures.push('nativeTerminalHasChoices');
-  if (expectedDecisionBoundaries(index, group.moveId).length)
+  if (postTerminalHumanStates(index, group.moveId).length)
     failures.push('sourceHumanDecisionAfterNativeTerminal');
   const calendar = {
     sourceDay: ledger.day,
@@ -254,7 +282,7 @@ export function replayCompletionEvidence({
       required.map((b) => b.moveId),
       observed.map((b) => b.moveId),
     ) &&
-    required.every((b) => !b.sourceStateTypeIssue) &&
+    required.every((b) => !b.sourceStateTypeIssue && !b.unsupportedMultipleActive) &&
     observed.every(
       (b) =>
         b.sourceDecisionTypeKnown &&

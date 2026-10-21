@@ -16,8 +16,13 @@ export function classifyDecisionState(ledger, index) {
     (notified !== null && !notificationKnown);
   const known = definitionKnown && (notified === null || notificationKnown) && !conflict;
   return {
-    humanDecision: defined === 'activeplayer' || notified === 'activeplayer',
-    potentialHumanDecision: defined === 'activeplayer' || notified === 'activeplayer' || !known,
+    humanDecision:
+      ['activeplayer', 'multipleactiveplayer'].includes(defined) ||
+      ['activeplayer', 'multipleactiveplayer'].includes(notified),
+    potentialHumanDecision:
+      ['activeplayer', 'multipleactiveplayer'].includes(defined) ||
+      ['activeplayer', 'multipleactiveplayer'].includes(notified) ||
+      !known,
     sourceDecisionTypeKnown: known,
     sourceDefinedStateType: defined,
     sourceNotifiedStateType: notified,

@@ -1477,6 +1477,15 @@ export function replayNetworkPrefix(
     let burnHarvest = null;
     let ageTwoRefillEvidence = null;
     try {
+      if (
+        group.entries.some(
+          (n) =>
+            n.type === 'gameStateChange' &&
+            (n.args.type === 'multipleactiveplayer' ||
+              index.initial.gamestates[n.args.id]?.type === 'multipleactiveplayer'),
+        )
+      )
+        fail('multiple-active source decisions are not supported after initial setup');
       const burnBeforeDifferences = differences(ledger, before, sourceToNative, terminalCalendar);
       burnHarvest = sourceBurnHarvestWitness({
         index,
