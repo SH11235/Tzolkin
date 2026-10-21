@@ -29,6 +29,10 @@ import {
 import { catalogFingerprint } from './bga-replay.mjs';
 import { sourceBurnHarvestWitness, bindBurnHarvestOutcome } from './bga-network-harvest.mjs';
 import { bindAppliedArchitectureCorn } from './bga-network-architecture.mjs';
+import {
+  sourceOrdinarySingleSkullWitness,
+  bindOrdinarySingleSkullOutcome,
+} from './bga-network-ordinary-skull.mjs';
 
 const catalogBytes = readFileSync(
   new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url),
@@ -1412,7 +1416,10 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         beforeDifferences: burnBeforeDifferences,
       });
       const singleSkull = group.entries.some((n) => n.type === 'noSkullsLeft')
-        ? sourceSingleSkullWitness({
+        ? (group.entries[0]?.type === 'pickUpWorker'
+            ? sourceOrdinarySingleSkullWitness
+            : sourceSingleSkullWitness)({
+            index,
             ledger,
             group,
             before,
@@ -1423,6 +1430,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               differences(ledger, before, sourceToNative, terminalCalendar).length === 0,
           })
         : null;
+      let ordinarySkullRemoval = null;
       const skullShortage = sourceSkullShortageWitness({
         ledger,
         group,
@@ -1667,6 +1675,8 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
               (x) => x.type === 'remove' && x.gear === gear && x.position === Number(a.position),
               'observed worker removal',
             );
+            if (singleSkull?.kind === 'ordinaryWorkerRemoval')
+              ordinarySkullRemoval = copy(native());
             if (declined) {
               const afterRemoval = frame;
               const choices = actions();
@@ -2039,7 +2049,15 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       for (const n of group.entries) updateLedger(ledger, n, mapper);
       const skullShortageEvidence = bindSkullShortageOutcome(skullShortage, before, native());
       const singleSkullEvidence = singleSkull
-        ? bindSingleSkullOutcome(singleSkull, before, native(), record.steps.slice(stepsBefore))
+        ? singleSkull.kind === 'ordinaryWorkerRemoval'
+          ? bindOrdinarySingleSkullOutcome(
+              singleSkull,
+              before,
+              ordinarySkullRemoval,
+              native(),
+              record.steps.slice(stepsBefore),
+            )
+          : bindSingleSkullOutcome(singleSkull, before, native(), record.steps.slice(stepsBefore))
         : null;
       if (skullShortageEvidence)
         audit.push({ moveId: group.moveId, skullShortageEvidence, teacherCertified: false });

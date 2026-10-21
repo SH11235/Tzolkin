@@ -17,6 +17,10 @@ import {
   bindSingleSkullOutcome,
 } from './bga-network-awards.mjs';
 import { readFileSync } from 'node:fs';
+import {
+  sourceOrdinarySingleSkullWitness,
+  bindOrdinarySingleSkullOutcome,
+} from './bga-network-ordinary-skull.mjs';
 import { sourceBurnHarvestWitness, bindBurnHarvestOutcome } from './bga-network-harvest.mjs';
 import {
   finalScoringWitness,
@@ -889,6 +893,174 @@ test('single-skull warning requires the closed original paid action and its exac
       w = sourceSingleSkullWitness(bad.input);
     mutate(bad);
     assert.throws(() => bindSingleSkullOutcome(w, bad.input.before, bad.after, bad.steps));
+  }
+});
+
+function ordinarySkullFixture(mutateRaw = () => {}) {
+  const raw = fixture();
+  let uid = 2000;
+  const n = (type, args, log = '') => ({ uid: String(++uid), type, args, log });
+  const packet = (move, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(move + 10),
+    packet_type: 'resend',
+    move_id: move,
+    time: '1',
+    data,
+  });
+  raw.gameLogs.data.data.push(
+    packet(6, [
+      n('gameStateChange', {
+        id: 7,
+        active_player: '1',
+        args: {
+          workers: {
+            1: {
+              id: '1',
+              place: 'yaxchilan',
+              position: '4',
+              actions: { yaxchilan: { 1: 3, 2: 2, 3: 1, 4: 0 } },
+            },
+          },
+        },
+      }),
+    ]),
+  );
+  raw.gameLogs.data.data.push(
+    packet(7, [
+      n('pickUpWorker', {
+        player_id: '1',
+        player_name: 'P1',
+        worker_id: '1',
+        city: 'Yaxchilan',
+        position: '4',
+        action_number: '4',
+      }),
+      n('noSkullsLeft', { player_name: 'P1' }, singleSkullCaption),
+      n('takeGoods', {
+        type: 'skull',
+        resources: '',
+        player_id: '1',
+        player_name: 'P1',
+        quantity: '1',
+        origin: 'action_yaxchilan_4',
+      }),
+      n('gameStateChange', { id: 9, active_player: '1', args: [] }),
+      n('gameStateChange', { id: 7, active_player: '1', args: { workers: {} } }),
+    ]),
+  );
+  mutateRaw(raw);
+  const index = parseNetworkReplay(bytes(raw)),
+    f = singleSkullFixture();
+  f.input.before.pending = null;
+  f.input.before.turn = { mode: 'remove', count: 1, begged: true };
+  f.input.before.gears = { yaxchilan: Array(10).fill(null) };
+  f.input.before.gears.yaxchilan[4] = { playerId: 0, dummy: false };
+  f.input.index = index;
+  f.input.group = index.groups.at(-1);
+  f.input.ledger.initial = index.initial;
+  f.input.ledger.stateId = 7;
+  f.input.ledger.workers = new Map([
+    ['1', { id: '1', player: '1', place: 'yaxchilan', position: '4' }],
+  ]);
+  const move = { type: 'remove', gear: 'yaxchilan', position: 4 };
+  f.input.observation.legalActions = [{ move, action: structuredClone(move) }];
+  const middle = structuredClone(f.input.before);
+  middle.gears.yaxchilan[4] = null;
+  middle.turn.count++;
+  middle.pending = {
+    title: 'action',
+    task: { type: 'action', gear: 'yaxchilan', position: 4 },
+    after: [],
+  };
+  const after = structuredClone(middle);
+  after.pending = null;
+  after.skullSupply = 0;
+  after.players[0].resources.skull++;
+  after.log.push('grant');
+  const steps = [move, { type: 'choose', choiceId: 'action:4' }].map((m) => ({
+    actor: 0,
+    move: m,
+    sourceActionIds: [7],
+    refills: { currentAge: [], age2: [] },
+  }));
+  return { input: f.input, middle, after, steps };
+}
+
+test('ordinary skull recovery binds the source worker menu and preserves the zero-corn two-step outcome', () => {
+  const f = ordinarySkullFixture(),
+    proof = sourceOrdinarySingleSkullWitness(f.input);
+  const outcome = bindOrdinarySingleSkullOutcome(proof, f.input.before, f.middle, f.after, f.steps);
+  assert.equal(outcome.cornCost, 0);
+  assert.equal(outcome.actualSkulls, 1);
+  assert.equal(outcome.nativePoolAfter, 0);
+  assert.equal(outcome.nativeRemovalCountAfter, 2);
+  assert.equal(f.after.players[0].resources.corn, f.input.before.players[0].resources.corn);
+  assert.throws(() => sourceSingleSkullWitness(f.input));
+});
+
+test('ordinary skull recovery refuses source, delivery, menu and state ambiguity', () => {
+  for (const mutate of [
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.city = 'Tikal'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.action_number = '3'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[0].args.position = false),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[1].args.player_name = 'P2'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[2].args.quantity = '2'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[2].args.origin = 'other'),
+    (raw) => (raw.gameLogs.data.data.at(-1).data[3].args.active_player = '2'),
+    (raw) =>
+      raw.gameLogs.data.data
+        .at(-1)
+        .data.push({ uid: 'extra', type: 'takeGoods', log: '', args: {} }),
+    (raw) => (raw.gameLogs.data.data.at(-1).packet_type = 'history'),
+    (raw) =>
+      (raw.gameLogs.data.data.at(-2).data[0].args.args.workers['1'].actions.yaxchilan[4] = 1),
+  ])
+    assert.throws(() => sourceOrdinarySingleSkullWitness(ordinarySkullFixture(mutate).input));
+  for (const mutate of [
+    (f) => (f.input.group = structuredClone(f.input.group)),
+    (f) => (f.input.group.entries[0].args.action_number = '3'),
+    (f) => (f.input.index.tableId = '124'),
+    (f) => (f.input.ledger.workers.get('1').player = '2'),
+    (f) => (f.input.ledger.skullSupply = 2),
+    (f) => (f.input.before.skullSupply = 2),
+    (f) => (f.input.before.players[0].technologies.theology = 2),
+    (f) => (f.input.before.gears.yaxchilan[4].dummy = true),
+    (f) => (f.input.before.pending = { task: { type: 'anyAction' }, after: [] }),
+    (f) => (f.input.unresolvedTiming = true),
+    (f) => (f.input.sourceStateMatched = false),
+    (f) =>
+      f.input.observation.legalActions.push(structuredClone(f.input.observation.legalActions[0])),
+  ]) {
+    const f = ordinarySkullFixture();
+    mutate(f);
+    assert.throws(() => sourceOrdinarySingleSkullWitness(f.input));
+  }
+});
+
+test('ordinary skull outcome refuses unexplained intermediate or final fields and different native operations', () => {
+  for (const mutate of [
+    (f) => (f.middle.skullSupply = 0),
+    (f) => f.middle.players[0].resources.skull++,
+    (f) => f.middle.pending.after.push({ type: 'points', amount: 1 }),
+    (f) => f.middle.turn.count++,
+    (f) => f.after.players[0].resources.corn--,
+    (f) => f.after.players[1].resources.wood++,
+    (f) => f.after.players[0].technologies.theology--,
+    (f) => (f.after.pending = f.middle.pending),
+    (f) => f.after.log.push('extra'),
+    (f) => (f.steps[0].actor = 1),
+    (f) => (f.steps[1].move.choiceId = 'action:3'),
+    (f) => (f.steps[1].sourceActionIds = [8]),
+    (f) => f.steps[1].refills.currentAge.push('b1'),
+  ]) {
+    const f = ordinarySkullFixture(),
+      proof = sourceOrdinarySingleSkullWitness(f.input);
+    mutate(f);
+    assert.throws(() =>
+      bindOrdinarySingleSkullOutcome(proof, f.input.before, f.middle, f.after, f.steps),
+    );
   }
 });
 
