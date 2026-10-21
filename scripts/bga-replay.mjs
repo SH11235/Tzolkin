@@ -846,7 +846,7 @@ export function revalidateRecord(recordBytes, previousCatalogBytes, currentCatal
   if (
     !object(original) ||
     original.schema !== 'tzolkin-public-replay-v1' ||
-    original.rulesVersion !== 1 ||
+    original.rulesVersion !== 2 ||
     original.market !== 'unlimited' ||
     !Array.isArray(original.initial?.players) ||
     ![3, 4].includes(original.initial.players.length) ||

@@ -1,7 +1,8 @@
 import { validateGameState } from './engine';
 import type { GameState } from './types';
+import { CATALOG_HASH, RULES_VERSION, SESSION_SCHEMA } from './rules';
 
-export const SAVE_KEY = 'tzolkin.game.v1';
+export const SAVE_KEY = 'tzolkin.game.v2';
 export type Controller = 'human' | 'cpu';
 export type CpuPolicy = { mode: 'nn'; modelChecksum: string };
 export type Session = {
@@ -35,17 +36,35 @@ export function requiresNnCpuGuard(session: Session): boolean {
     controllersFor(session).includes('cpu')
   );
 }
+export function serializeSession(session: Session, space?: number): string {
+  return JSON.stringify(
+    { ...session, schema: SESSION_SCHEMA, rulesVersion: RULES_VERSION, catalogHash: CATALOG_HASH },
+    null,
+    space,
+  );
+}
 class InvalidSaveError extends Error {}
 export async function parseSession(text: string): Promise<Session> {
   let value: unknown;
   try {
     value = JSON.parse(text);
   } catch {
-    throw new InvalidSaveError('有効なツォルキンのセーブデータではありません。');
+    throw new InvalidSaveError('現在のルール版に対応したセーブデータではありません。');
   }
   if (
     !value ||
     typeof value !== 'object' ||
+    !('schema' in value) ||
+    value.schema !== SESSION_SCHEMA ||
+    !('rulesVersion' in value) ||
+    value.rulesVersion !== RULES_VERSION ||
+    !('catalogHash' in value) ||
+    value.catalogHash !== CATALOG_HASH
+  )
+    throw new InvalidSaveError('現在のルール版に対応したセーブデータではありません。');
+  if (
+    !('history' in value) ||
+    !Array.isArray(value.history) ||
     !('state' in value) ||
     !(await validateGameState(value.state))
   )
@@ -53,7 +72,9 @@ export async function parseSession(text: string): Promise<Session> {
   const candidates: unknown[] =
     'history' in value && Array.isArray(value.history) ? value.history : [];
   const valid = await Promise.all(candidates.map((entry) => validateGameState(entry)));
-  const history = candidates.filter((_, index) => valid[index]).slice(-60) as GameState[];
+  if (valid.some((accepted) => !accepted))
+    throw new InvalidSaveError('対局履歴が不正なセーブデータです。');
+  const history = candidates.slice(-60) as GameState[];
   const state = value.state as GameState;
   let cpuPolicy: CpuPolicy | undefined;
   if ('cpuPolicy' in value) {

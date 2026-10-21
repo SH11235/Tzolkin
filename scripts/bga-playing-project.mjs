@@ -2770,7 +2770,7 @@ export function projectCapturedInitial(
   };
   const record = {
     schema: 'tzolkin-public-replay-v1',
-    rulesVersion: 1,
+    rulesVersion: 2,
     catalogHash: witness.catalogHash,
     market: 'unlimited',
     source: { reference: game.source.reference, actionIds: [actionId] },

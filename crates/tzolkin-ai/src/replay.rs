@@ -13,7 +13,7 @@ use tzolkin_core::validation::validate_game_state;
 use tzolkin_core::*;
 
 pub const REPLAY_SCHEMA: u32 = 1;
-pub const RULES_VERSION: u32 = 1;
+pub const RULES_VERSION: u32 = 2;
 pub const RULES_BASELINE: &str = "1ec8fdbb61f671ca2cbf0dbac7f3662c160be677";
 pub const MAX_DECISIONS: usize = 4000;
 pub const RL_ARGMAX_SELECTION_VERSION: &str = "public-rl-argmax-first-legal-tie-v1";

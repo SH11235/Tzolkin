@@ -1387,32 +1387,34 @@ pub(super) fn complete(
             let Some(card) = tzolkin_core::catalog::building(id) else {
                 return Ok(Err("unestablishedBuildingTradeOrigin"));
             };
-            if !card
-                .effects
-                .iter()
-                .any(|e| matches!(e, tzolkin_core::Effect::Trade))
+            if id != "b18"
+                || !matches!(
+                    card.effects.as_slice(),
+                    [
+                        tzolkin_core::Effect::Points { amount: 6 },
+                        tzolkin_core::Effect::Trade
+                    ]
+                )
                 || r.frames[entry + 1].snapshot.state.pending.as_ref() != Some(p)
             {
                 return Ok(Err("buildingTradeQueueMismatch"));
             }
-            let Some(points) = deferred_points(before) else {
-                return Ok(Err("unsupportedBuildingTradeQueue"));
-            };
-            let Some(Task::Build {
-                remaining,
-                allow_monument: false,
-                corn_payment: false,
-                architecture_available: Some(false),
-                mandatory: false,
-            }) = p.after.last()
+            let [
+                Task::Build {
+                    remaining,
+                    allow_monument: false,
+                    corn_payment: false,
+                    architecture_available: Some(false),
+                    mandatory: false,
+                },
+            ] = p.after.as_slice()
             else {
                 return Ok(Err("unsupportedBuildingTradeQueue"));
             };
-            if p.after.len() != 2 || !(0..=1).contains(remaining) {
+            if !(0..=1).contains(remaining) {
                 return Ok(Err("unsupportedBuildingTradeQueue"));
             }
             let mut expected = before.clone();
-            expected.players[actor].score += points as f64;
             expected.pending = (*remaining > 0).then(|| Pending {
                 title: "建設するタイルを選択".into(),
                 task: p.after.last().unwrap().clone(),
@@ -2195,6 +2197,14 @@ mod tests {
     #[test]
     fn nested_trade_uses_origin_and_queue_and_keeps_future_build_out_of_inputs() {
         let (s, r) = building_trade("b26");
+        assert_eq!(
+            r.frames[1].snapshot.state.players[0].score,
+            r.frames[0].snapshot.state.players[0].score + 8.0
+        );
+        assert_eq!(
+            r.frames[3].snapshot.state.players[0].score,
+            r.frames[2].snapshot.state.players[0].score
+        );
         let out = complete(
             2,
             &TypedAction::Skip,
@@ -2233,7 +2243,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(encode(&r), encode(&fr));
-        for variant in 0..3 {
+        for variant in 0..5 {
             let (mut s, mut r) = building_trade("b26");
             match variant {
                 0 => {
@@ -2245,7 +2255,21 @@ mod tests {
                         }
                 }
                 1 => s.record.steps[1].source_action_ids.clear(),
-                _ => s.raw["dom_entries"][1]["messages"][0]["html"] = json!("wrong resource"),
+                2 => s.raw["dom_entries"][1]["messages"][0]["html"] = json!("wrong resource"),
+                3 => r.frames[2]
+                    .snapshot
+                    .state
+                    .pending
+                    .as_mut()
+                    .unwrap()
+                    .after
+                    .insert(
+                        0,
+                        Task::Effects {
+                            effects: vec![tzolkin_core::Effect::Points { amount: 6 }],
+                        },
+                    ),
+                _ => r.frames[3].snapshot.state.players[0].score += 6.0,
             }
             assert!(
                 complete(

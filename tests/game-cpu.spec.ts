@@ -3,7 +3,7 @@ import type { Session } from '../src/game/storage';
 
 async function sessionOf(page: Page): Promise<Session> {
   return page.evaluate(
-    () => JSON.parse(localStorage.getItem('tzolkin.game.v1') ?? 'null') as Session,
+    () => JSON.parse(localStorage.getItem('tzolkin.game.v2') ?? 'null') as Session,
   );
 }
 
@@ -51,7 +51,7 @@ test('a saved NN game resumes and imports paused without silently changing its C
     cpuPolicy: { mode: 'nn', modelChecksum: 'a'.repeat(64) },
   };
   await page.evaluate(
-    (value) => localStorage.setItem('tzolkin.game.v1', JSON.stringify(value)),
+    (value) => localStorage.setItem('tzolkin.game.v2', JSON.stringify(value)),
     saved,
   );
   await page.reload();

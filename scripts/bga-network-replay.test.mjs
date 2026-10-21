@@ -14,6 +14,7 @@ import {
   originalOrdinarySkullEntry,
   originalChichenDeclineEntry,
   originalAgeTwoRefillEntry,
+  originalPacketEntry,
 } from './bga-network.mjs';
 import {
   appendRewardFence,
@@ -289,6 +290,7 @@ mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
     originalOrdinarySkullEntry,
     originalChichenDeclineEntry,
     originalAgeTwoRefillEntry,
+    originalPacketEntry,
     inspectCancellationClusters: () => [],
     inspectArchiveClient: (studio, game) => {
       assert.equal(studio.toString(), 'synthetic studio');
@@ -1230,7 +1232,14 @@ function fixture() {
     },
   };
 }
-function setup(payment = false, wrongActor = false, flip = false, capture = null, finish = false) {
+function setup(
+  payment = false,
+  wrongActor = false,
+  flip = false,
+  capture = null,
+  finish = false,
+  decisionObserver = null,
+) {
   const raw = fixture();
   Object.assign(raw.initialState, {
     buildings: [],
@@ -1276,6 +1285,7 @@ function setup(payment = false, wrongActor = false, flip = false, capture = null
   ];
   raw.initialState.gamestates[4] = { type: 'activeplayer' };
   raw.initialState.gamestates[6] = { type: 'activeplayer' };
+  raw.initialState.gamestates[99] = { type: 'manager' };
   const initial = {
     version: 1,
     additionalBuildings: false,
@@ -1366,6 +1376,7 @@ function setup(payment = false, wrongActor = false, flip = false, capture = null
           bytes: capture(bytes(raw)),
           studioBytes: Buffer.from('synthetic studio'),
           gameBytes: Buffer.from('synthetic game'),
+          onDecisionBoundary: decisionObserver,
           witnessesBytes: bytes({
             schema: 'tzolkin-bga-public-witnesses-v1',
             tableId: '123',
@@ -1377,7 +1388,7 @@ function setup(payment = false, wrongActor = false, flip = false, capture = null
       )
     : replayNetworkPrefix(
         parseNetworkReplay(bytes(raw)),
-        { initial, initialMoveId: 2, clientContract: {} },
+        { initial, initialMoveId: 2, clientContract: {}, onDecisionBoundary: decisionObserver },
         dispatch,
       );
   assert.deepEqual(initial, original);
@@ -1891,4 +1902,83 @@ test('source shortage binds every reward and its synchronized pre-award state', 
     mutate(bad);
     assert.throws(() => bindSkullShortageOutcome(proof, f.before, bad), /Skull award:/);
   }
+});
+
+test('strict replay cannot hide a human boundary behind a contradictory notification type', () => {
+  const seen = [];
+  const result = setup(
+    false,
+    false,
+    false,
+    (bytes) => {
+      const raw = JSON.parse(bytes);
+      const packet = raw.gameLogs.data.data.at(-1);
+      packet.data.find((n) => n.type === 'gameStateChange').args.type = 'game';
+      packet.data.splice(1, 0, {
+        uid: 'corn-extra',
+        type: 'takeGoods',
+        log: '',
+        args: { player_id: '1', type: 'corn', quantity: 1 },
+      });
+      return Buffer.from(JSON.stringify(raw));
+    },
+    false,
+    (row) => {
+      seen.push(row);
+      if (row.sourceStateTypeIssue) throw new Error(row.sourceStateTypeIssue);
+      if (row.humanDecision && row.differences.length) throw new Error('strict raw mismatch');
+    },
+  );
+  assert.match(result.blocked.reason, /sourceStateTypeMismatch/);
+  assert.equal(seen[0].humanDecision, true);
+  assert.equal(seen[0].sourceDefinedStateType, 'activeplayer');
+  assert.equal(seen[0].sourceNotifiedStateType, 'game');
+  assert.ok(seen[0].differences.some((d) => d.field.endsWith('.corn')));
+  assert.equal(result.fullReplayAchieved, false);
+});
+test('strict replay observes a continuing choice without a new state notification and refuses missing definitions', () => {
+  const mutate = (bytes) => {
+    const raw = JSON.parse(bytes);
+    raw.gameLogs.data.data.push({
+      channel: '/table/t123',
+      table_id: 123,
+      packet_id: '4',
+      packet_type: 'resend',
+      move_id: '4',
+      time: '1',
+      data: [
+        {
+          uid: 'corn-continuation',
+          type: 'takeGoods',
+          log: '',
+          args: { player_id: '1', type: 'corn', quantity: 1 },
+        },
+      ],
+    });
+    return raw;
+  };
+  const rows = [];
+  const result = setup(
+    false,
+    false,
+    false,
+    (bytes) => Buffer.from(JSON.stringify(mutate(bytes))),
+    false,
+    (row) => {
+      rows.push(row);
+      if (!row.sourceDecisionTypeKnown || (row.humanDecision && row.differences.length))
+        throw new Error('strict raw mismatch');
+    },
+  );
+  assert.equal(result.blocked.moveId, 4);
+  assert.equal(rows.at(-1).humanDecision, true);
+  assert.equal(rows.at(-1).sourceStateId, 6);
+  const missing = setup(false, false, false, (bytes) => {
+    const raw = mutate(bytes);
+    delete raw.initialState.gamestates[6];
+    return Buffer.from(JSON.stringify(raw));
+  });
+  assert.match(missing.blocked.reason, /sourceStateDefinitionMissing/);
+  assert.equal(missing.decisionBoundaryAudit.at(-1).sourceDecisionTypeKnown, false);
+  assert.equal(missing.fullReplayAchieved, false);
 });

@@ -71,7 +71,7 @@ export function publicReplayFixture(playerCount: 3 | 4 = 3): PublicReplayRecord 
   });
   return {
     schema: 'tzolkin-public-replay-v1',
-    rulesVersion: 1,
+    rulesVersion: 2,
     catalogHash: catalogHash(),
     market: 'unlimited',
     source: { reference: 'synthetic-ui-fixture', actionIds: [5] },

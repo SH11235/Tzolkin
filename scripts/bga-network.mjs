@@ -38,6 +38,18 @@ const architectureEntries = new WeakMap();
 const ordinarySkullEntries = new WeakMap();
 const chichenDeclineEntries = new WeakMap();
 const ageTwoRefillEntries = new WeakMap();
+const packetEntries = new WeakMap();
+export function originalPacketEntry(entry) {
+  const b = packetEntries.get(entry);
+  return b && isDeepStrictEqual(entry, b.entry)
+    ? {
+        packetType: b.packetType,
+        packetNotificationCount: b.packetNotificationCount,
+        tableId: b.tableId,
+        rawSha256: b.rawSha256,
+      }
+    : null;
+}
 
 export function originalAgeTwoRefillEntry(entry) {
   const bound = ageTwoRefillEntries.get(entry);
@@ -483,6 +495,13 @@ export function parseNetworkReplay(bytes) {
         ...(n.type === 'noSkullsLeft' ? { singleSkullCaption: n.log } : {}),
       };
       entries.push(entry);
+      packetEntries.set(entry, {
+        entry: structuredClone(entry),
+        packetType: packet.packet_type,
+        packetNotificationCount: packet.data.length,
+        tableId,
+        rawSha256,
+      });
       if (n.type === 'gameStateChange' || packet.data.some((n) => n.type === 'resetAllBuildings'))
         ageTwoRefillEntries.set(entry, {
           entry: structuredClone(entry),

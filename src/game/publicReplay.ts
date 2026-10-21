@@ -20,7 +20,7 @@ export interface ReplayEvidence {
 
 export interface PublicReplayRecord {
   schema: 'tzolkin-public-replay-v1';
-  rulesVersion: 1;
+  rulesVersion: 2;
   catalogHash: string;
   market: 'unlimited';
   source: ReplayEvidence;

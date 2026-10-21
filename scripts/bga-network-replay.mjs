@@ -1,3 +1,9 @@
+import { recordDecisionBoundary, classifyDecisionState } from './bga-network-decision-boundary.mjs';
+import {
+  trackBuildingMarket,
+  proveBuildingMarketExit,
+  bindBuildingMarketExit,
+} from './bga-network-building-market.mjs';
 import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual } from 'node:util';
 import { assertNetworkClockContract, inspectCancellationClusters } from './bga-network.mjs';
@@ -389,6 +395,9 @@ function initialLedger(index) {
     day: Number(s.day),
     activePlayer: String(s.gamestate.active_player),
     stateId: Number(s.gamestate.id),
+    stateType: s.gamestate.type ?? s.gamestates?.[s.gamestate.id]?.type ?? null,
+    stateNotificationType: s.gamestate.type ?? null,
+    stateArgs: copy(s.gamestate.args ?? null),
     age: 1,
     foodDays: [],
     feedingWitnesses: [],
@@ -520,6 +529,9 @@ function updateLedger(ledger, entry, mapper) {
   else if (entry.type === 'gameStateChange') {
     ledger.activePlayer = String(a.active_player);
     ledger.stateId = Number(a.id);
+    ledger.stateType = a.type ?? ledger.initial.gamestates[a.id]?.type ?? null;
+    ledger.stateNotificationType = a.type ?? null;
+    ledger.stateArgs = copy(a.args);
     if (ledger.stateId === 92) {
       const event = ledger.feedingWitnesses.find((e) => e.start.uid === entry.uid);
       if (event) {
@@ -1209,7 +1221,11 @@ export function proveCalendarDesignation(state, observation, entries, sourceToNa
 }
 
 /** Strict bounded prefix decoding. Unknown decisions or first mismatch stop without state repairs. */
-export function replayNetworkPrefix(index, { initial, initialMoveId, clientContract }, dispatch) {
+export function replayNetworkPrefix(
+  index,
+  { initial, initialMoveId, clientContract, onDecisionBoundary },
+  dispatch,
+) {
   assertNetworkClockContract(index, clientContract);
   const clusters = inspectCancellationClusters(index, clientContract);
   if (
@@ -1252,7 +1268,7 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
   if (initialDiff.length) fail(`initial boundary mismatch ${JSON.stringify(initialDiff)}`);
   const record = {
     schema: 'tzolkin-public-replay-v1',
-    rulesVersion: 1,
+    rulesVersion: 2,
     catalogHash: catalogFingerprint(catalogBytes),
     market: 'unlimited',
     source: { reference: index.sourceUrl, actionIds: [initialMoveId] },
@@ -1290,6 +1306,8 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
   let openRotationFence = null;
   let openCornFence = null;
   let openRewardFences = [];
+  const decisionBoundaryAudit = [];
+  let buildingMarket = null;
   let current = null;
   const native = () => frame.snapshot.state;
   const actions = () => frame.observation?.legalActions ?? [];
@@ -1401,6 +1419,12 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
   }
   for (const group of index.groups.filter((g) => g.moveId > initialMoveId)) {
     current = group;
+    const sourceBeforeGroup = {
+      initial: ledger.initial,
+      stateId: ledger.stateId,
+      activePlayer: ledger.activePlayer,
+      stateArgs: copy(ledger.stateArgs),
+    };
     const before = copy(native());
     const scoresBeforeGroup = Object.fromEntries(
       Object.entries(ledger.players).map(([id, player]) => [id, player.score]),
@@ -2116,6 +2140,29 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
             });
           }
         }
+        if (stateId() === 70 && native().pending?.task.type === 'trade') {
+          const prior = copy(native());
+          const proof = proveBuildingMarketExit(buildingMarket, {
+            index,
+            group,
+            ledger,
+            before: prior,
+            legal: actions(),
+            differences: differences(ledger, prior, sourceToNative),
+          });
+          applyWhere(
+            (x) => x.type === 'skip',
+            'observed structural exit to construction without architecture',
+            refills,
+          );
+          const evidence = bindBuildingMarketExit(proof, prior, native());
+          audit[audit.length - 1].derivedFromVisibleBoundary = true;
+          audit.push({
+            moveId: group.moveId,
+            buildingMarketExit: evidence,
+            teacherCertified: false,
+          });
+        }
         // A source transition to worker removal ends the preceding optional subtask.
         if ([4, 7].includes(stateId()) && native().pending)
           for (let i = 0; native().pending && i < 4; i++)
@@ -2172,8 +2219,39 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
           fail('terminal calendar did not reach its original final feeding and end boundary');
         terminalCalendarFence.resolvedMoveId = group.moveId;
       }
+      const unmaskedDifferences = differences(ledger, native(), sourceToNative);
+      const decisionType = classifyDecisionState(ledger, index);
+      const decisionBoundary = {
+        moveId: group.moveId,
+        ...decisionType,
+        sourceStateId: ledger.stateId,
+        sourceStateType: ledger.stateType,
+        sourceActor: ledger.activePlayer,
+        sourceMenu: copy(ledger.stateArgs),
+        sourcePossibleActions: copy(
+          index.initial.gamestates[ledger.stateId]?.possibleactions ?? null,
+        ),
+        nativeActor: frame.observation.actor,
+        nativePending: copy(native().pending),
+        nativeLegalActions: copy(frame.observation.legalActions),
+        differences: copy(unmaskedDifferences),
+        sourceStateMetadataPresent: !!index.initial.gamestates[ledger.stateId],
+      };
+      recordDecisionBoundary(decisionBoundaryAudit, decisionBoundary, onDecisionBoundary);
+      if (decisionType.sourceStateTypeIssue)
+        fail(`Source decision state type not established: ${decisionType.sourceStateTypeIssue}`);
       let diff = differences(ledger, native(), sourceToNative, terminalCalendar);
       const originalDiff = copy(diff);
+      buildingMarket = trackBuildingMarket(buildingMarket, {
+        index,
+        group,
+        before,
+        after: native(),
+        transition: constructionTransition,
+        sourceBefore: sourceBeforeGroup,
+        sourceActor: [...sourceToNative].find(([, id]) => id === frame.observation.actor)?.[0],
+        differences: unmaskedDifferences,
+      });
       if (ageTwoRefillEvidence) {
         if (diff.length)
           fail('age-II consumed refill did not rejoin the full original public state');
@@ -2483,6 +2561,8 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
         finished: false,
         terminalReached: native().phase === 'finished',
         semanticReplayVerified: false,
+        fullReplayAchieved: false,
+        decisionBoundaryAudit,
         teacherCompleteness: false,
         teacherCertified: false,
         record,
@@ -2523,6 +2603,8 @@ export function replayNetworkPrefix(index, { initial, initialMoveId, clientContr
       !openRewardFences.length,
     terminalReached: native().phase === 'finished',
     semanticReplayVerified: false,
+    fullReplayAchieved: false,
+    decisionBoundaryAudit,
     teacherCompleteness: false,
     teacherCertified: false,
     record,

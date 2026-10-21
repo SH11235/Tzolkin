@@ -1,4 +1,5 @@
 /// <reference lib="dom" />
+import { sessionSave } from './helpers/session';
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -7,7 +8,7 @@ import { GEAR_LABELS } from '../src/game/catalog';
 import { createGame, getAvailableMoves, getChoices } from './helpers/core';
 import { GEAR_IDS, type Choice, type GameMove, type GameState } from '../src/game/types';
 
-const SAVE_KEY = 'tzolkin.game.v1';
+const SAVE_KEY = 'tzolkin.game.v2';
 const NAMES = ['アオ', 'ミドリ', 'アカ', 'キ'];
 const errors = new WeakMap<Page, string[]>();
 
@@ -117,7 +118,7 @@ async function importState(page: Page, state: unknown): Promise<void> {
   await page.getByLabel('対局の保存ファイル', { exact: true }).setInputFiles({
     name: 'tzolkin-fixture.json',
     mimeType: 'application/json',
-    buffer: Buffer.from(JSON.stringify({ state, history: [] })),
+    buffer: Buffer.from(sessionSave({ state, history: [] })),
   });
 }
 
@@ -264,7 +265,7 @@ test('a temporary core load failure preserves the saved game and offers a retry'
   page,
 }) => {
   const state = createGame(['保存済みA', '保存済みB'], 42);
-  const original = JSON.stringify({ state, history: [] });
+  const original = sessionSave({ state, history: [] });
   await page.evaluate(({ key, text }) => localStorage.setItem(key, text), {
     key: SAVE_KEY,
     text: original,

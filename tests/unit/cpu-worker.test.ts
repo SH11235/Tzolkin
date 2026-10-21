@@ -136,7 +136,7 @@ describe('CPU Worker request lifecycle', () => {
           hiddenCount: 32,
           parameterCount: 16449,
           backend: 'scalar',
-          rulesVersion: 1,
+          rulesVersion: 2,
           rulesBaseline: '1ec8fdbb61f671ca2cbf0dbac7f3662c160be677',
           observationSchema: 1,
           moveSchema: 1,
