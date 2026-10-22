@@ -1165,6 +1165,7 @@ export function replayNetworkPrefix(
     initialMoveId,
     initial,
     sourceToNative,
+    mapCard: (card) => mapper.bind(card),
   });
   let semanticContext = null;
   let operationSource = null;
