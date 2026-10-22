@@ -3,12 +3,19 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseNetworkReplay } from './bga-network.mjs';
 import { finalScoringWitness } from './bga-network-final-scoring.mjs';
-import { createFinalFoodProof } from './bga-network-final-food.mjs';
+import {
+  createFinalFoodProof,
+  createZeroCornFinalFoodProof,
+  proveZeroCornTerminalCoordinates,
+} from './bga-network-final-food.mjs';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
-import { comparePublicBoundary } from './bga-network-terminal.mjs';
+import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
+import { proveBoundTerminalCoordinates } from './bga-network-semantic-calendar.mjs';
+import { comparePublicBoundary, inspectTerminalProjection } from './bga-network-terminal.mjs';
 
 const clone = structuredClone;
-function fixture(changeRaw = () => {}) {
+function fixture(changeRaw = () => {}, { zeroCorn = false } = {}) {
+  const amount = zeroCorn ? 0 : 3;
   const sourceToNative = new Map(['1', '2', '3', '4'].map((id, actor) => [id, actor]));
   let uid = 0;
   const n = (type, args, log = '') => ({ uid: String(++uid), type, args, log });
@@ -98,7 +105,7 @@ function fixture(changeRaw = () => {}) {
       workers,
       playerorder: [3, 4, 1, 2],
       firstPlayer: '3',
-      cornOnWheel: '3',
+      cornOnWheel: String(amount),
       day: '0',
       buildings: initialCards,
       monuments: [],
@@ -138,6 +145,7 @@ function fixture(changeRaw = () => {}) {
               worker_id: '1',
               place: 'startingPlayer',
               position: 0,
+              corn: amount,
             }),
           ]),
           packet(4, [state(90), state(4, '2')]),
@@ -149,8 +157,8 @@ function fixture(changeRaw = () => {}) {
             state(90, '2'),
             n('updateReflexionTime', {}),
             state(91, '3'),
-            n('takeGoods', { player_id: '1', type: 'corn', quantity: 3, origin: null }),
-            n('firstPlayerCorn', { player_id: '1', corn: 3 }),
+            n('takeGoods', { player_id: '1', type: 'corn', quantity: amount, origin: null }),
+            n('firstPlayerCorn', { player_id: '1', corn: amount }),
             n('firstPlayer', { player_id: '1' }),
             state(92),
             ...pay('1', 4, 3),
@@ -198,6 +206,13 @@ function fixture(changeRaw = () => {}) {
       state(99),
     ]),
   );
+  if (zeroCorn) {
+    const final = raw.gameLogs.data.data.at(-1).data;
+    final.unshift(n('flipBoard', { player_id: '1', side: 1 }));
+    const rotation = final.find((n) => n.type === 'rotateWheel');
+    Object.assign(rotation.args, { day: 28, twice: 1, player_id: '1' });
+    rotation.args.workers[0].position = 2;
+  }
   changeRaw(raw, raw.gameLogs.data.data.at(-2).data);
   const index = parseNetworkReplay(Buffer.from(JSON.stringify(raw))),
     group = index.groups.find((g) => g.moveId === 6);
@@ -247,7 +262,7 @@ function fixture(changeRaw = () => {}) {
     buildingDeckCount: 8,
     age2DeckCount: 18,
     monuments: [],
-    gears: { palenque: [{ playerId: 1, dummy: false }, null] },
+    gears: { palenque: [{ playerId: 1, dummy: false }, null, ...(zeroCorn ? [null] : [])] },
     skullSpaces: Array.from({ length: 10 }, () => null),
   };
   const initial = clone(before);
@@ -258,23 +273,27 @@ function fixture(changeRaw = () => {}) {
     turnIndex: 0,
     pending: null,
     foodDays: [],
-    accumulatedCorn: 3,
+    accumulatedCorn: amount,
     turn: { mode: 'none', count: 0, begged: false },
   });
-  const factory = createFinalFoodProof({ index, initial, sourceToNative });
+  const factory = (zeroCorn ? createZeroCornFinalFoodProof : createFinalFoodProof)({
+    index,
+    initial,
+    sourceToNative,
+  });
   const source = {
     day: 26,
     age: 2,
     stateId: 6,
     activePlayer: '2',
-    accumulatedCorn: 3,
+    accumulatedCorn: amount,
     firstPlayer: '3',
     buildings: clone(before.buildings),
     workers: new Map(workers.map((w) => [w.id, clone(w)])),
     players: Object.fromEntries(players.map((p, i) => [String(i + 1), clone(p)])),
     skullSpaces: clone(before.skullSpaces),
   };
-  source.players['1'].resources.corn = 1;
+  source.players['1'].resources.corn = zeroCorn ? 4 : 1;
   source.workers.get('1').place = 'startingPlayer';
   source.workers.get('4').place = 'palenque';
   const ledger = clone(source);
@@ -338,7 +357,7 @@ function fixture(changeRaw = () => {}) {
     sourceOwner: '1',
     owner: 0,
     worker: '1',
-    amount: 3,
+    amount,
     oldStarter: 2,
     nextStarter: 0,
     nativeResources: clone(before.players[0].resources),
@@ -348,7 +367,21 @@ function fixture(changeRaw = () => {}) {
       notificationIndex: claimEntry.notificationIndex,
     },
   };
+  if (zeroCorn) {
+    claim.cornOpen = false;
+    claim.cornClosed = true;
+    const receipt = group.entries.find((n) => n.type === 'firstPlayerCorn');
+    claim.receipt = {
+      caption: {
+        uid: receipt.uid,
+        packetIndex: receipt.packetIndex,
+        notificationIndex: receipt.notificationIndex,
+      },
+    };
+    delete claim.nativeResources;
+  }
   return {
+    zeroCorn,
     index,
     initial,
     sourceToNative,
@@ -410,12 +443,21 @@ function actual(f, proof) {
     pending: null,
     firstPlayerClaimed: null,
     firstPlayer: 0,
-    gears: { palenque: [null, { playerId: 1, dummy: false }] },
+    gears: {
+      palenque: f.zeroCorn
+        ? [null, null, { playerId: 1, dummy: false }]
+        : [null, { playerId: 1, dummy: false }],
+    },
   });
   native.finalScores = proof.components.map((c) => ({
     playerId: c.actor,
     ...Object.fromEntries(Object.entries(c).filter(([key]) => key !== 'actor')),
   }));
+  native.finalScores.forEach((row) => {
+    native.players[row.playerId].score = row.total;
+    row.rank = 1 + native.finalScores.filter((other) => other.total > row.total).length;
+  });
+  if (f.zeroCorn) native.players[0].doubleAdvanceAvailable = false;
   const group = f.index.groups.at(-1);
   const context = {
     group,
@@ -428,21 +470,23 @@ function actual(f, proof) {
         before: clone(f.input.native),
         after: clone(native),
         actor: 0,
-        action: { type: 'rotate', days: 1 },
+        action: { type: 'rotate', days: f.zeroCorn ? 2 : 1 },
         step: 11,
         legalActions: clone(f.input.observation.legalActions),
       },
     ],
   };
   const ledger = clone(f.input.ledger);
-  Object.assign(ledger, { day: 27, stateId: 99 });
+  Object.assign(ledger, { day: f.zeroCorn ? 28 : 27, stateId: 99 });
+  const rotation = group.entries.find((n) => n.type === 'rotateWheel');
+  ledger.lastRotation = { ...rotation.args, uid: rotation.uid, moveId: group.moveId };
   ledger.workers.get('1').place = null;
-  ledger.workers.get('4').position = 1;
+  ledger.workers.get('4').position = f.zeroCorn ? 2 : 1;
   return {
     context,
     ledger,
     native,
-    selected: [{ actor: 0, action: { type: 'rotate', days: 1 }, step: 11 }],
+    selected: [{ actor: 0, action: { type: 'rotate', days: f.zeroCorn ? 2 : 1 }, step: 11 }],
   };
 }
 test('final food proves all players, tied temple awards and exact pending receipt differences', () => {
@@ -615,10 +659,10 @@ function publicCaller(f, mutate = () => {}) {
     currentPlayer: 0,
     turnIndex: 2,
     firstPlayerClaimed: null,
-    accumulatedCorn: 3,
+    accumulatedCorn: f.input.claim.amount,
     turn: { mode: 'none', count: 0, begged: false },
   });
-  native.players[0].resources.corn = 1;
+  native.players[0].resources.corn = f.input.context.source.players['1'].resources.corn;
   let observation = { actor: 0, legalActions: [f.endRow] };
   const differences = () => [
     { field: 'player.1.resources.corn', observed: 1, native: 4 },
@@ -640,13 +684,13 @@ function publicCaller(f, mutate = () => {}) {
       ledger.stateId = 4;
       ledger.activePlayer = '2';
       observation = { actor: 1, legalActions: [f.endRow] };
-      diff = differences();
+      diff = f.zeroCorn ? [] : differences();
     }
     if (group.moveId === 5) {
       native.turn = { mode: 'place', count: 1, begged: false };
       ledger.stateId = 6;
       ledger.workers.get('4').place = 'palenque';
-      diff = differences();
+      diff = f.zeroCorn ? [] : differences();
     }
     if (group.moveId === 6) {
       const transition = clone(f.input.context.transitions[0]);
@@ -739,4 +783,243 @@ test('public caller never authorizes final score deltas while another timing obl
       false,
     );
   }
+});
+
+function zeroPending(f) {
+  const food = f.factory.prove(f.input);
+  assert.ok(food);
+  const proof = f.factory.issue(food, f.input);
+  f.input.claim.pendingFinalScore = proof;
+  return proof;
+}
+function closeZero(f) {
+  const proof = zeroPending(f);
+  f.factory.bindLegacy(proof, f.input.context, oldWitness(f));
+  const a = actual(f, proof);
+  f.factory.close(proof, a.context, a.ledger, a.native, a.selected);
+  return { proof, ...a };
+}
+test('explicit zero corn receipts use a separate entry and close only the observed double advance', () => {
+  const f = fixture(() => {}, { zeroCorn: true });
+  const positive = createFinalFoodProof({
+    index: f.index,
+    initial: f.initial,
+    sourceToNative: f.sourceToNative,
+  });
+  assert.equal(positive.prove(f.input), null);
+  const p = zeroPending(f);
+  assert.equal(p.closed, false);
+  const a = actual(f, p);
+  assert.equal(
+    proveZeroCornTerminalCoordinates({
+      index: f.index,
+      group: a.context.group,
+      ledger: a.ledger,
+      native: a.native,
+      evidence: p,
+    }),
+    null,
+  );
+  f.factory.bindLegacy(p, f.input.context, oldWitness(f));
+  assert.equal(
+    proveZeroCornTerminalCoordinates({
+      index: f.index,
+      group: a.context.group,
+      ledger: a.ledger,
+      native: a.native,
+      evidence: p,
+    }),
+    null,
+  );
+  f.factory.close(p, a.context, a.ledger, a.native, a.selected);
+  assert.ok(
+    proveZeroCornTerminalCoordinates({
+      index: f.index,
+      group: a.context.group,
+      ledger: a.ledger,
+      native: a.native,
+      evidence: p,
+    }),
+  );
+  assert.equal(
+    proveBoundTerminalCoordinates({
+      index: f.index,
+      group: a.context.group,
+      ledger: a.ledger,
+      native: a.native,
+      evidence: p,
+    }),
+    null,
+  );
+});
+test('zero entitlement requires explicit claim amount pool history and adjacent original zero receipts', () => {
+  for (const change of [
+    (raw) => {
+      raw.initialState.cornOnWheel = '1';
+    },
+    (raw) => {
+      raw.gameLogs.data.data
+        .find((p) => p.move_id === '3')
+        .data.find((n) => n.type === 'placeWorker').args.corn = 1;
+    },
+    (raw) => {
+      delete raw.gameLogs.data.data
+        .find((p) => p.move_id === '3')
+        .data.find((n) => n.type === 'placeWorker').args.corn;
+    },
+    (raw, rows) => {
+      rows.find((n) => n.type === 'takeGoods').args.quantity = '1';
+    },
+    (raw, rows) => {
+      rows.find((n) => n.type === 'firstPlayerCorn').args.corn = '1';
+    },
+    (raw, rows) => {
+      rows.splice(
+        rows.findIndex((n) => n.type === 'takeGoods'),
+        1,
+      );
+    },
+    (raw, rows) => {
+      rows.find((n) => n.type === 'firstPlayerCorn').args.player_id = '2';
+    },
+  ]) {
+    const f = fixture(change, { zeroCorn: true });
+    assert.equal(f.factory.prove(f.input), null);
+  }
+  const f = fixture(() => {}, { zeroCorn: true });
+  f.input.claim.amount = 1;
+  assert.equal(f.factory.prove(f.input), null);
+});
+test('zero double coordinate authority rejects copying mutation other groups and unconsumed rights', () => {
+  for (const change of [
+    (a) => {
+      a.proof = clone(a.proof);
+    },
+    (a) => {
+      a.ledger = clone(a.ledger);
+    },
+    (a) => {
+      a.native = clone(a.native);
+    },
+    (a) => {
+      a.ledger.lastRotation = { ...a.ledger.lastRotation };
+    },
+    (a) => {
+      a.proof.components[0].resourcePoints++;
+    },
+    (a) => {
+      a.native.players[0].doubleAdvanceAvailable = true;
+    },
+    (a) => {
+      a.ledger.lastRotation.twice = 0;
+    },
+    (a) => {
+      a.context.group.entries[0].args.side = 0;
+    },
+  ]) {
+    const f = fixture(() => {}, { zeroCorn: true }),
+      a = closeZero(f);
+    change(a);
+    assert.equal(
+      proveZeroCornTerminalCoordinates({
+        index: f.index,
+        group: a.context.group,
+        ledger: a.ledger,
+        native: a.native,
+        evidence: a.proof,
+      }),
+      null,
+    );
+  }
+  for (const change of [
+    (a) => {
+      a.context.transitions[0].action.days = 1;
+      a.selected[0].action.days = 1;
+    },
+    (a) => {
+      a.selected[0].actor = 1;
+    },
+    (a) => {
+      a.native.players[0].doubleAdvanceAvailable = true;
+      a.context.transitions[0].after.players[0].doubleAdvanceAvailable = true;
+    },
+    (a) => {
+      a.native.finalScores[0].resourcePoints++;
+      a.native.finalScores[0].skullPoints--;
+      a.context.transitions[0].after = clone(a.native);
+    },
+  ]) {
+    const f = fixture(() => {}, { zeroCorn: true }),
+      p = zeroPending(f);
+    f.factory.bindLegacy(p, f.input.context, oldWitness(f));
+    const a = actual(f, p);
+    change(a);
+    assert.throws(() => f.factory.close(p, a.context, a.ledger, a.native, a.selected));
+    assert.equal(p.closed, false);
+  }
+});
+test('public terminal caller accepts day28 only after the live zero double rotation closes', () => {
+  const f = fixture(() => {}, { zeroCorn: true }),
+    r = publicCaller(f);
+  assert.equal(r.semantic.semanticMatch, true);
+  assert.equal(r.comparison.finish().obligations.at(-1).cornOpen, false);
+  assert.equal(r.comparison.zeroCornFinalEvidence(), null);
+  r.comparison.bindSource95Legacy(r.context, oldWitness(f));
+  const pending = r.semantic.evidence.find((e) => e.type === 'pendingFinalScoreReceipts'),
+    a = actual(f, pending);
+  const context = r.comparison.begin(a.context.group, r.ledger, r.native, r.observation);
+  r.comparison.applied(context, a.context.transitions[0]);
+  Object.assign(a.ledger, {
+    initial: f.index.initial,
+    foodDays: [8, 14, 21, 27],
+    feedingWitnesses: sourceFeedingWitnesses(f.index),
+  });
+  const terminalArguments = {
+    index: f.index,
+    group: a.context.group,
+    ledger: a.ledger,
+    native: a.native,
+    observation: null,
+    differences: [],
+    sourceToNative: f.sourceToNative,
+    feedingTransitions: f.input.context.transitions,
+    terminalDisplayCheckpoint: {
+      mode: 'floorTotal',
+      scores: a.native.finalScores.map((s) => ({
+        playerId: s.playerId,
+        total: Math.floor(s.total),
+        rank: s.rank,
+      })),
+    },
+  };
+  assert.equal(inspectTerminalProjection(terminalArguments).completed, false);
+  const result = comparePublicBoundary({
+    comparison: r.comparison,
+    context,
+    semanticArguments: {
+      ledger: a.ledger,
+      native: a.native,
+      observation: null,
+      differences: [],
+      applied: a.selected,
+      humanDecision: false,
+    },
+    terminalArguments,
+  });
+  assert.equal(result.semantic.semanticMatch, true);
+  assert.equal(result.terminalValidation.completed, true);
+  assert.ok(result.terminalValidation.calendar.boundZeroCornDoubleAdvance);
+  assert.equal(r.comparison.finish().allObligationsClosed, true);
+  const proof = r.comparison.zeroCornFinalEvidence();
+  assert.ok(proof);
+  assert.equal(
+    inspectTerminalProjection({ ...terminalArguments, zeroCornFinalEvidence: clone(proof) })
+      .completed,
+    false,
+  );
+  a.ledger.lastRotation.twice = 0;
+  assert.equal(
+    inspectTerminalProjection({ ...terminalArguments, zeroCornFinalEvidence: proof }).completed,
+    false,
+  );
 });
