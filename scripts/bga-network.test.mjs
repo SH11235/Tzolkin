@@ -4218,6 +4218,7 @@ function fixedBuildingFixture(
     continuation = null,
     constructionArchitecture = false,
     constructionDiscountResource = null,
+    constructionAllowMonument = false,
     marketPrefix = false,
     inheritedEmptyBuild = false,
     technologyLevels = null,
@@ -4238,6 +4239,7 @@ function fixedBuildingFixture(
     continuation,
     constructionArchitecture,
     constructionDiscountResource,
+    constructionAllowMonument,
     marketPrefix,
     inheritedEmptyBuild,
     technologyLevels,
@@ -4303,7 +4305,7 @@ function fixedBuildingFixture(
       task: {
         type: 'build',
         remaining: continuation ? 2 : 1,
-        allowMonument: false,
+        allowMonument: constructionAllowMonument,
         cornPayment: false,
         architectureAvailable: constructionArchitecture || continuation === 'architecture',
       },
@@ -4908,6 +4910,155 @@ test('fixed skull profile refuses stock zero or one and preserves both allocatio
   assert.equal(choice.fixedContribution.skull, 1);
   assert.equal(choice.preSkullSupply, 2);
   assert.equal(choice.postSkullSupply, 0);
+});
+
+const noncompetingSkullOptions = {
+  stock: 1,
+  technologyLevels: { agriculture: 0, extraction: 3, architecture: 3, theology: 0 },
+  continuation: 'architecture',
+  constructionAllowMonument: true,
+};
+
+test('a noncompeting last skull closes every supported free technology branch before Build1', () => {
+  for (const branch of ['agriculture', 'extraction', 'architecture', 'theology']) {
+    const f = fixedBuildingFixture('b26', { ...noncompetingSkullOptions, branch });
+    for (let i = 0; i < f.frames.length; i++) assert.equal(f.step(i).failure, null);
+    const proof = f.helper.finish().obligations[0];
+    assert.equal(proof.closed, true);
+    assert.deepEqual(
+      proof.noncompetingSkullProfile.technologies,
+      noncompetingSkullOptions.technologyLevels,
+    );
+    assert.equal(
+      proof.decisions.reduce((n, d) => n + (d.fixedContribution.skull ?? 0), 0),
+      1,
+    );
+    assert.equal(
+      proof.decisions.reduce((n, d) => n + d.directContribution.skull, 0),
+      0,
+    );
+    assert.equal(f.frames.at(-1).after.players[0].resources.skull, 1);
+    assert.equal(f.frames.at(-1).after.skullSupply, 0);
+    assert.equal(f.frames.at(-1).after.pending.task.type, 'build');
+    assert.equal(f.frames.at(-1).after.pending.task.remaining, 1);
+  }
+});
+
+test('early and queued last-skull credits preserve all four tech choices and nine extraction paths', () => {
+  const f = fixedBuildingFixture('b26', { ...noncompetingSkullOptions, branch: 'extraction' });
+  const cli = join(
+    process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../target', import.meta.url)),
+    'debug',
+    process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai',
+  );
+  const dispatch = coreDispatcher(cli);
+  const late = structuredClone(f.frames[0].after);
+  const early = structuredClone(late);
+  assert.deepEqual(early.pending.after[0], {
+    type: 'effects',
+    effects: [{ type: 'resources', resources: { skull: 1 } }],
+  });
+  early.pending.after.shift();
+  early.players[0].resources.skull++;
+  early.skullSupply--;
+  const frontier = [{ late, early, choices: [] }];
+  const leaves = [];
+  const strip = (s) => Object.fromEntries(Object.entries(s).filter(([key]) => key !== 'log'));
+  while (frontier.length) {
+    assert.ok(frontier.length < 20);
+    const pair = frontier.pop();
+    const a = dispatch({ operation: 'publicInspect', state: pair.late });
+    const b = dispatch({ operation: 'publicInspect', state: pair.early });
+    assert.equal(a.error, undefined);
+    assert.equal(b.error, undefined);
+    assert.equal(a.observation.actor, b.observation.actor);
+    assert.deepEqual(a.observation.legalActions, b.observation.legalActions);
+    if (pair.late.pending.task.type === 'build') {
+      assert.deepEqual(strip(pair.late), strip(pair.early));
+      assert.equal(pair.late.pending.task.remaining, 1);
+      assert.equal(pair.late.players[0].resources.skull, 1);
+      assert.equal(pair.late.skullSupply, 0);
+      leaves.push(pair.choices);
+      continue;
+    }
+    assert.ok(['technology', 'resource'].includes(pair.late.pending.task.type));
+    assert.equal(pair.late.players[0].resources.skull, 0);
+    assert.equal(pair.late.skullSupply, 1);
+    for (const row of a.observation.legalActions) {
+      const afterA = dispatch({
+        operation: 'publicApply',
+        state: pair.late,
+        actor: 0,
+        move: row.move,
+      });
+      const afterB = dispatch({
+        operation: 'publicApply',
+        state: pair.early,
+        actor: 0,
+        move: row.move,
+      });
+      assert.equal(afterA.error, undefined);
+      assert.equal(afterB.error, undefined);
+      frontier.push({
+        late: afterA.snapshot.state,
+        early: afterB.snapshot.state,
+        choices: [...pair.choices, row.action],
+      });
+    }
+  }
+  assert.equal(leaves.length, 12);
+  assert.equal(new Set(leaves.map((path) => path[0].technology)).size, 4);
+  const extraction = leaves.filter((path) => path[0].technology === 'extraction');
+  assert.equal(extraction.length, 9);
+  assert.equal(
+    new Set(
+      extraction.map((path) =>
+        path
+          .slice(1)
+          .map((a) => a.resource)
+          .join('/'),
+      ),
+    ).size,
+    9,
+  );
+});
+
+test('last-skull admission refuses unreviewed profiles, altered receipts and missing construction rights', () => {
+  for (const change of [
+    { stock: 0 },
+    { technologyLevels: { ...noncompetingSkullOptions.technologyLevels, theology: 3 } },
+    { technologyLevels: { ...noncompetingSkullOptions.technologyLevels, agriculture: 3 } },
+    { continuation: null },
+    { inheritedEmptyBuild: true },
+    {
+      mutateSource: (raw) => {
+        raw.gameLogs.data.data[1].data.find((n) => n.type === 'takeGoods').args.quantity = 2;
+      },
+    },
+    {
+      mutateSource: (raw) => {
+        raw.gameLogs.data.data[1].data.find((n) => n.type === 'takeGoods').args.player_id = '2';
+      },
+    },
+    {
+      mutateFrames: (frames) => {
+        frames[0].after.pending.after.pop();
+      },
+    },
+    {
+      mutateFrames: (frames) => {
+        frames[0].after.pending.after.push({ type: 'resource', remaining: 1 });
+      },
+    },
+  ]) {
+    const f = fixedBuildingFixture('b26', {
+      ...noncompetingSkullOptions,
+      branch: 'extraction',
+      ...change,
+    });
+    assert.ok(f.step(0).failure);
+    assert.equal(f.helper.finish().allObligationsClosed, false);
+  }
 });
 
 test('fixed reward closure verifies the remaining worker or building decision', () => {
