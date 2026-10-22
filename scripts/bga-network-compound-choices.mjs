@@ -26,7 +26,17 @@ const owned = (n, owner, index) =>
 const publicState = (s) =>
   Object.fromEntries(Object.entries(s).filter(([k]) => !['pending', 'log'].includes(k)));
 
-export function technologyChoiceProof({ operation: op, operations, group, owner, index }) {
+export function technologyChoiceProof({
+  operation: op,
+  operations,
+  group,
+  owner,
+  index,
+  sourceToNative,
+  mapCard,
+  buildingResourceClosures = [],
+  capturedOperations = [],
+}) {
   const reject = (error) => ({ error });
   const n = op.entry,
     track = op.row.action.technology,
@@ -142,11 +152,29 @@ export function technologyChoiceProof({ operation: op, operations, group, owner,
       skulls.length !== 1 ||
       !owned(skulls[0], owner, index) ||
       Number(skulls[0].args.quantity) !== 1 ||
-      skulls[0].args.origin !== 'technology_theology_level_4' ||
-      commit.after.players[op.actor].resources.skull - p.resources.skull !== 1 ||
-      commit.after.skullSupply !== op.before.skullSupply - 1
+      skulls[0].args.origin !== 'technology_theology_level_4'
     )
       return reject('technologyCapSkullNotBound');
+    if (
+      commit.after.players[op.actor].resources.skull - p.resources.skull !== 1 ||
+      commit.after.skullSupply !== op.before.skullSupply - 1
+    ) {
+      const fixed =
+        free &&
+        fixedBuildingSkullChoiceProof({
+          operation: op,
+          operations,
+          group,
+          owner,
+          index,
+          sourceToNative,
+          mapCard,
+          closures: buildingResourceClosures,
+          capturedOperations,
+        });
+      if (!fixed) return reject('technologyCapSkullNotBound');
+      proof.fixedBuildingContribution = fixed;
+    }
     proof.source.push(ref(skulls[0]));
   } else if (track === 'agriculture' || track === 'extraction') {
     const task =
@@ -157,6 +185,177 @@ export function technologyChoiceProof({ operation: op, operations, group, owner,
     proof.reward = { task, actor: op.actor, remaining: task.remaining };
   } else return reject('technologyCapTrackUnsupported');
   return proof;
+}
+
+function fixedBuildingSkullChoiceProof({
+  operation: op,
+  operations,
+  group,
+  owner,
+  index,
+  sourceToNative,
+  mapCard,
+  closures,
+  capturedOperations,
+}) {
+  const candidates = closures.filter(
+    (w) => w.closed === true && w.closedMoveId === group.moveId && w.consumedAtStep === op.step,
+  );
+  if (candidates.length !== 1 || operations.length !== 1 || operations[0] !== op) return null;
+  const w = candidates[0],
+    actor = op.actor,
+    sequence = originalNetworkSequence(index),
+    position = sequence?.groups.findIndex((g) => g.group === group);
+  if (
+    !sequence ||
+    position < 1 ||
+    !same(sequence.groups[position].original, group) ||
+    w.actor !== actor ||
+    w.sourceOwner !== owner ||
+    sourceToNative?.get(owner) !== actor ||
+    w.building !== 'b26' ||
+    !same(w.fixed, { skull: 1 }) ||
+    w.technology !== 'any' ||
+    !same(catalog.BUILDINGS.find((c) => c.id === w.building)?.effects, [
+      { type: 'technology', technology: 'any', steps: 1 },
+      { type: 'resources', resources: { skull: 1 } },
+    ]) ||
+    !same(op.before.pending?.task, { type: 'technology', remaining: 1, free: true }) ||
+    op.observationActor !== actor ||
+    !op.legalRows.some((r) => same(r, op.row)) ||
+    !integer(op.before.skullSupply) ||
+    op.before.skullSupply < 2 ||
+    w.initialSkullSupply !== op.before.skullSupply
+  )
+    return null;
+  const constructionGroup = sequence.groups[position - 1].group,
+    entries = index.groups.flatMap((g) => g.entries),
+    find = (r) => entries.filter((n) => same(ref(n), r)),
+    constructions = find(w.sourceConstruction);
+  if (constructions.length !== 1 || typeof mapCard !== 'function') return null;
+  const construction = constructions[0],
+    origin = `${construction.args?.building?.type}_b${construction.args?.building?.id}`;
+  if (
+    !same(sequence.groups[position - 1].original, constructionGroup) ||
+    !constructionGroup.entries.includes(construction) ||
+    construction.type !== 'construct' ||
+    !owned(construction, owner, index) ||
+    mapCard(construction.args.building) !== w.building ||
+    constructionGroup.moveId !== w.startMoveId ||
+    origin !== w.sourceRewardOrigin ||
+    !Array.isArray(w.sourceReceipts) ||
+    w.sourceReceipts.length !== 1
+  )
+    return null;
+  const receipts = find(w.sourceReceipts[0]),
+    actual = constructionGroup.entries.filter(
+      (n) => n.type === 'takeGoods' && n.args.origin === origin,
+    );
+  if (
+    receipts.length !== 1 ||
+    actual.length !== 1 ||
+    receipts[0] !== actual[0] ||
+    !owned(actual[0], owner, index) ||
+    actual[0].args.type !== 'skull' ||
+    !integer(actual[0].args.quantity) ||
+    Number(actual[0].args.quantity) !== 1 ||
+    constructionGroup.entries.indexOf(construction) >=
+      constructionGroup.entries.indexOf(actual[0]) ||
+    ![construction, actual[0], ...group.entries].every((n) => {
+      const p = originalPacketEntry(n);
+      return (
+        p?.rawSha256 === sequence.rawSha256 &&
+        p.tableId === index.tableId &&
+        p.packetType === 'resend' &&
+        n.channel === `/table/t${index.tableId}`
+      );
+    }) ||
+    group.entries.some((n) => n.uid === actual[0].uid) ||
+    group.entries.filter((n) => n.type === 'takeGoods').length !== 1 ||
+    group.entries.some(
+      (n) =>
+        ![
+          'increaseTechnology',
+          'takeGoods',
+          'theologyMax',
+          'decreaseTechnology',
+          'gameStateChange',
+          'gameStateMultipleActiveUpdate',
+          'updateReflexionTime',
+          'timeJokerUsed',
+          'wakeupPlayers',
+        ].includes(n.type),
+    )
+  )
+    return null;
+  const previous = capturedOperations.filter((c) => c.operation.step === op.step - 1);
+  if (
+    previous.length !== 1 ||
+    previous[0].bindingError !== null ||
+    previous[0].group !== constructionGroup ||
+    previous[0].operation.entry !== construction ||
+    previous[0].operation.actor !== actor ||
+    previous[0].operation.observationActor !== actor ||
+    previous[0].operation.row.action.type !== 'build' ||
+    previous[0].operation.row.action.id !== w.building ||
+    !previous[0].operation.legalRows.some((r) => same(r, previous[0].operation.row)) ||
+    !same(previous[0].operation.after, op.before)
+  )
+    return null;
+  const tail = op.before.pending.after,
+    build = {
+      type: 'build',
+      remaining: 0,
+      allowMonument: false,
+      cornPayment: false,
+      architectureAvailable: false,
+    };
+  if (
+    !Array.isArray(tail) ||
+    ![2, 3].includes(tail.length) ||
+    !same(w.tail, tail) ||
+    !same(tail[0], {
+      type: 'effects',
+      effects: [{ type: 'resources', resources: { skull: 1 } }],
+    }) ||
+    tail.slice(1).some((t) => !same(t, build)) ||
+    !Array.isArray(w.decisions) ||
+    w.decisions.length !== 1
+  )
+    return null;
+  const decision = w.decisions[0],
+    direct = { corn: 0, wood: 0, stone: 0, gold: 0, skull: 1 };
+  if (
+    decision.step !== op.step ||
+    !same(decision.action, op.row.action) ||
+    !same(decision.directContribution, direct) ||
+    !same(decision.fixedContribution, { skull: 1 }) ||
+    decision.preSkullSupply !== op.before.skullSupply ||
+    decision.postSkullSupply !== op.after.skullSupply
+  )
+    return null;
+  const expected = structuredClone(op.before);
+  expected.players[actor].resources.skull += 2;
+  expected.skullSupply -= 2;
+  expected.pending = null;
+  const normalized = (s) => {
+    const c = structuredClone(s);
+    delete c.log;
+    return c;
+  };
+  if (!same(normalized(expected), normalized(op.after))) return null;
+  return {
+    key: JSON.stringify([sequence.rawSha256, w.sourceConstruction, w.sourceReceipts]),
+    building: w.building,
+    actor,
+    construction: structuredClone(w.sourceConstruction),
+    receipts: structuredClone(w.sourceReceipts),
+    fixed: { skull: 1 },
+    direct,
+    consumedAtStep: op.step,
+    queue: structuredClone(tail),
+    closedMoveId: w.closedMoveId,
+  };
 }
 
 export function begChoiceProof({ operation: beg, operations, group, owner, index }) {
