@@ -2200,6 +2200,10 @@ export function replayNetworkPrefix(
           skullShortageEvidence,
           applied: audit.slice(auditBeforeGroup),
           humanDecision: decisionType.potentialHumanDecision,
+          timingState: {
+            rewardsOpen: openRewardFences.length > 0,
+            rotationOpen: !!openRotationFence,
+          },
         },
         terminalArguments:
           native().phase === 'finished'
@@ -2495,6 +2499,11 @@ export function replayNetworkPrefix(
             ? { finalScoringProof: bindFinalScoringProjections(finalWitness, native(), responses) }
             : {}),
         };
+        if (finalWitness)
+          semanticComparison.bindSource95Legacy(
+            semanticContext,
+            openRotationFence.finalScoringProof,
+          );
         timingFences.push(openRotationFence);
         audit.push({
           moveId: group.moveId,

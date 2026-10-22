@@ -5,7 +5,7 @@ import {
   originalFinalScoringCaption,
 } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
-import { finalMonumentMetric } from './bga-network-final-scoring.mjs';
+import { finalMonumentMetric, finalResourceComponents } from './bga-network-final-scoring.mjs';
 
 const issued = new WeakMap();
 const clone = structuredClone;
@@ -416,9 +416,7 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
       consumed.add(matches[0].caption);
       monumentPoints += metric.points;
     }
-    const resourcePoints =
-        (resources.corn + resources.wood * 2 + resources.stone * 3 + resources.gold * 4) / 4,
-      skullPoints = resources.skull * 3;
+    const { resourcePoints, skullPoints } = finalResourceComponents(resources);
     const rr = finals.filter(
       ({ caption: n }) => String(n.args.player_id) === id && !Object.hasOwn(n.args, 'nbr'),
     );

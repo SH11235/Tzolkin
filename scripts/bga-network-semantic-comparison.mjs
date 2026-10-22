@@ -5,6 +5,7 @@ import { createBuildingResourceComparison } from './bga-network-building-resourc
 import { createTerminalCalendarComparison } from './bga-network-semantic-calendar.mjs';
 import { terminalSettlementScoreUids } from './bga-network-terminal-settlement.mjs';
 import { createDay14FoodProof, day14FoodCandidate } from './bga-network-day14-feeding.mjs';
+import { createFinalFoodProof, finalFoodCandidate } from './bga-network-final-food.mjs';
 
 const clone = structuredClone;
 const sourceId = (entry) => String(entry.args.player_id);
@@ -24,6 +25,7 @@ export function createSemanticComparison({
   const sequence = originalNetworkSequence(index);
   const remaining = sequence?.groups.filter(({ group }) => group.moveId > initialMoveId) ?? [];
   const mapping = new Map(sourceToNative);
+  const finalFood = createFinalFoodProof({ index, initial, sourceToNative: mapping });
   const day14Food = createDay14FoodProof({
     index,
     initial,
@@ -56,6 +58,7 @@ export function createSemanticComparison({
     }
   let claim = null;
   let failure = sequence ? null : 'original notification sequence is not bound';
+  let poisoned = false;
   const obligations = [];
   const decisions = [];
   const reject = (reason) => {
@@ -71,6 +74,7 @@ export function createSemanticComparison({
     );
   };
   function begin(group, ledger, native, observation) {
+    if (poisoned) throw new Error(failure ?? 'Final receipt composition failed');
     const bound = remaining[cursor++];
     if (!bound || bound.group !== group || !isDeepStrictEqual(bound.original, group))
       reject('original notification group changed or was omitted');
@@ -103,8 +107,10 @@ export function createSemanticComparison({
       constructionTransition,
       skullShortageEvidence,
       terminalScoreSettlement,
+      timingState,
     },
   ) {
+    if (poisoned) throw new Error(failure ?? 'Final receipt composition failed');
     const { group, source: beforeSource, native: before, observation: priorObservation } = context;
     const entries = group.entries;
     if (!isDeepStrictEqual(context.original, group))
@@ -286,6 +292,12 @@ export function createSemanticComparison({
               skullShortageEvidence,
             })
           : null;
+        let finalInput = null;
+        if (!followingFood && receipts.length && finalFoodCandidate(context, native)) {
+          finalInput = { context, ledger, native, observation, claim: c, timingState };
+          const proof = finalFood.prove(finalInput);
+          if (proof && finalFood.verify(proof, finalInput)) followingFood = proof;
+        }
         if (!followingFood && receipts.length && day14FoodCandidate(context, native)) {
           const input = { context, ledger, native, observation, claim: c };
           const proof = day14Food.prove(input);
@@ -313,6 +325,41 @@ export function createSemanticComparison({
           )
         )
           reject('claimant paid resources before corn settlement');
+        const closeReceipt = () => {
+          const receipt = receipts[0],
+            credit = credits[0];
+          if (
+            receipts.length !== 1 ||
+            (followingFood ? credits.length < 1 : credits.length !== 1) ||
+            sourceId(receipt) !== c.sourceOwner ||
+            Number(receipt.args.corn) !== c.amount ||
+            Number(credit.args.quantity) !== c.amount ||
+            credit.packetIndex !== receipt.packetIndex ||
+            credit.notificationIndex >= receipt.notificationIndex ||
+            ledger.accumulatedCorn !== 0 ||
+            native.accumulatedCorn !== 0 ||
+            ledger.players[c.sourceOwner].resources.corn !== native.players[c.owner].resources.corn
+          ) {
+            reject('delayed corn receipt does not close the original amount and owner');
+            return false;
+          }
+          c.cornClosed = true;
+          c.cornClosedMoveId = group.moveId;
+          c.receipt = { credit: reference(credit), caption: reference(receipt) };
+          return true;
+        };
+        let closedEarly = false;
+        if (finalInput && followingFood?.type === 'postReceiptFinalFoodTemples') {
+          try {
+            if (failure || !closeReceipt()) throw new Error(failure);
+            closedEarly = true;
+            c.pendingFinalScore = finalFood.issue(followingFood, finalInput);
+          } catch (error) {
+            poisoned = true;
+            reject(error.message);
+            throw error;
+          }
+        }
         const terminalScoreUids = terminalSettlementScoreUids(terminalScoreSettlement, {
           context,
           ledger,
@@ -334,11 +381,27 @@ export function createSemanticComparison({
             ].includes(n.type) &&
             !(receipts.length === 1 && credits.includes(n)) &&
             !(n.type === 'updateScore' && terminalScoreUids.includes(n.uid)) &&
+            !(
+              n.type === 'updateScore' && c.pendingFinalScore?.authorizedEffectUids.includes(n.uid)
+            ) &&
             !followingFood?.authorizedEffectUids.includes(n.uid),
         );
         if (unexpected) reject('claimant received an unrelated effect before corn settlement');
         if (followingFood) evidence.push(followingFood);
         if (terminalScoreUids.length) evidence.push(clone(terminalScoreSettlement));
+        if (c.pendingFinalScore) {
+          for (const expected of c.pendingFinalScore.scoreDifferences) {
+            const actual = differences.find((d) => d.field === expected.field);
+            if (
+              expected.observed === expected.native
+                ? !!actual
+                : !isDeepStrictEqual(actual, expected)
+            )
+              reject('final score difference is not the exact individually verified receipt delta');
+            else if (actual) allowed.add(expected.field);
+          }
+          evidence.push(clone(c.pendingFinalScore));
+        }
         if (entries.some((n) => n.type === 'undoRestoreDISAB')) {
           const onlyCaption =
             entries.length === 1 &&
@@ -354,26 +417,7 @@ export function createSemanticComparison({
           else evidence.push({ type: 'unchangedCancellation', source: reference(entries[0]) });
         }
         if (receipts.length) {
-          const receipt = receipts[0],
-            credit = credits[0];
-          if (
-            receipts.length !== 1 ||
-            (followingFood ? credits.length < 1 : credits.length !== 1) ||
-            sourceId(receipt) !== c.sourceOwner ||
-            Number(receipt.args.corn) !== c.amount ||
-            Number(credit.args.quantity) !== c.amount ||
-            credit.packetIndex !== receipt.packetIndex ||
-            credit.notificationIndex >= receipt.notificationIndex ||
-            ledger.accumulatedCorn !== 0 ||
-            native.accumulatedCorn !== 0 ||
-            ledger.players[c.sourceOwner].resources.corn !== native.players[c.owner].resources.corn
-          ) {
-            reject('delayed corn receipt does not close the original amount and owner');
-          } else {
-            c.cornClosed = true;
-            c.cornClosedMoveId = group.moveId;
-            c.receipt = { credit: reference(credit), caption: reference(receipt) };
-          }
+          if (!closedEarly) closeReceipt();
         } else {
           const field = `player.${c.sourceOwner}.resources.corn`;
           const corn = differences.find((d) => d.field === field);
@@ -462,6 +506,18 @@ export function createSemanticComparison({
         ) {
           reject('rotation does not close the original claimant and next-round order');
         } else {
+          if (c.pendingFinalScore) {
+            try {
+              if (failure) throw new Error(failure);
+              evidence.push(
+                finalFood.close(c.pendingFinalScore, context, ledger, native, selected),
+              );
+            } catch (error) {
+              poisoned = true;
+              reject(error.message);
+              throw error;
+            }
+          }
           c.closed = true;
           c.rotationTransition = clone(transition);
           c.closedMoveId = group.moveId;
@@ -508,6 +564,7 @@ export function createSemanticComparison({
     }
     if (ledger.accumulatedCorn !== sourcePool)
       reject('central corn does not match the original round receipts');
+    if (failure && obligations.some((c) => c.pendingFinalScore)) poisoned = true;
     const result = {
       sourceRawSha256: sequence?.rawSha256 ?? null,
       rawEqual: differences.length === 0,
@@ -520,6 +577,7 @@ export function createSemanticComparison({
           claimMoveId: c.claimMoveId,
           corn: c.cornOpen && !c.cornClosed,
           marker: c.markerOpen,
+          ...(c.pendingFinalScore ? { finalScores: !c.pendingFinalScore.closed } : {}),
         }))
         .concat(building.unresolved ? [building.unresolved] : []),
       failure,
@@ -552,6 +610,17 @@ export function createSemanticComparison({
     applied,
     compare,
     finish,
+    bindSource95Legacy(context, witness) {
+      if (!claim?.pendingFinalScore) return;
+      try {
+        if (failure || poisoned) throw new Error(failure);
+        finalFood.bindLegacy(claim.pendingFinalScore, context, witness);
+      } catch (error) {
+        poisoned = true;
+        reject(error.message);
+        throw error;
+      }
+    },
     terminalCalendarEvidence: calendarComparison.terminalClosure,
   };
 }
