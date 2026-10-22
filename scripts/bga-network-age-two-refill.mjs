@@ -1,7 +1,8 @@
 import { isDeepStrictEqual as equal } from 'node:util';
-import { originalAgeTwoRefillEntry } from './bga-network.mjs';
+import { originalAgeTwoRefillEntry, originalPacketEntry } from './bga-network.mjs';
 
 const bindings = new WeakMap();
+const completedBindings = new WeakMap();
 const fail = () => {
   throw new Error('Age-II refill: missing closed original consumption stage');
 };
@@ -265,6 +266,8 @@ export function sourceAgeTwoRefillWitness({
     qualificationRaised: false,
   };
   bindings.set(proof, {
+    index,
+    mapping: structuredClone(sourceToNative),
     proof: structuredClone(proof),
     group,
     originalGroup: structuredClone(group),
@@ -549,7 +552,7 @@ function verifyRotationAndStateSchemas(entries, before, workers, sourceToNative,
 
 export function bindAgeTwoRefillConsumption(
   proof,
-  { group, before, after, step, stepIndex, sourceResetDifferences },
+  { group, before, after, step, stepIndex, sourceResetDifferences, context, recordSteps },
 ) {
   const b = bound(proof, group);
   if (
@@ -573,6 +576,26 @@ export function bindAgeTwoRefillConsumption(
   b.after = structuredClone(after);
   b.step = structuredClone(step);
   b.stepIndex = stepIndex;
+  if (context !== undefined || recordSteps !== undefined) {
+    const transition = context?.transitions.at(-1);
+    if (
+      context?.group !== group ||
+      !equal(context.native, before) ||
+      context.transitions.length !== 1 ||
+      transition?.action.type !== 'endTurn' ||
+      transition.actor !== proof.actor ||
+      transition.step !== stepIndex ||
+      !equal(transition.before, before) ||
+      !equal(transition.after, after) ||
+      recordSteps?.[stepIndex - 1] !== step
+    )
+      fail();
+    b.context = context;
+    b.transitionArray = context.transitions;
+    b.endTransition = transition;
+    b.recordSteps = recordSteps;
+    b.endStep = step;
+  }
 }
 
 export function refillsAfterAgeTwoConsumption(
@@ -593,7 +616,10 @@ export function refillsAfterAgeTwoConsumption(
   return emptyRefills();
 }
 
-export function bindAgeTwoRefillRotation(proof, { group, entry, before, after, step, stepIndex }) {
+export function bindAgeTwoRefillRotation(
+  proof,
+  { group, entry, before, after, step, stepIndex, context, recordSteps },
+) {
   const b = bound(proof, group);
   if (
     b.phase !== 'consumed' ||
@@ -633,12 +659,126 @@ export function bindAgeTwoRefillRotation(proof, { group, entry, before, after, s
   expected.log.push(`第 15 日：${expected.players[proof.actor].name} から開始`);
   if (!equal(after, expected)) fail();
   b.phase = 'resolved';
-  return {
+  const evidence = {
     ...proof,
     consumedAtStep: b.stepIndex,
     rotationAtStep: stepIndex,
     originalReceiptConsumedOnce: true,
     duplicateRefillOmittedOnlyAfterVerifiedConsumption: true,
     completeNativeStatesVerified: true,
+  };
+  if (context !== undefined || recordSteps !== undefined) {
+    const transition = context?.transitions.at(-1);
+    if (
+      context !== b.context ||
+      context.transitions !== b.transitionArray ||
+      context.transitions.length !== 2 ||
+      context.transitions[0] !== b.endTransition ||
+      transition?.action.type !== 'rotate' ||
+      transition.action.days !== 1 ||
+      transition.actor !== proof.actor ||
+      transition.step !== stepIndex ||
+      !equal(transition.before, before) ||
+      !equal(transition.after, after) ||
+      recordSteps !== b.recordSteps ||
+      recordSteps[stepIndex - 1] !== step ||
+      recordSteps[b.stepIndex - 1] !== b.endStep
+    )
+      fail();
+    completedBindings.set(evidence, {
+      proof,
+      evidence: structuredClone(evidence),
+      context,
+      contextSnapshot: structuredClone(context),
+      endTransition: b.endTransition,
+      rotationTransition: transition,
+      recordSteps,
+      endStep: b.endStep,
+      rotationStep: step,
+      after: structuredClone(after),
+    });
+  }
+  return evidence;
+}
+
+export function verifiedAgeTwoClaimantFood(
+  evidence,
+  { index, context, native, ledger, claim, sourceToNative, recordSteps },
+) {
+  const closed = completedBindings.get(evidence);
+  if (!closed || !equal(evidence, closed.evidence) || context !== closed.context) return null;
+  const b = bound(closed.proof, context.group),
+    proof = closed.proof;
+  if (
+    b.phase !== 'resolved' ||
+    b.index !== index ||
+    !equal(sourceToNative, b.mapping) ||
+    !equal(context, closed.contextSnapshot) ||
+    context.transitions !== b.transitionArray ||
+    context.transitions[0] !== closed.endTransition ||
+    context.transitions[1] !== closed.rotationTransition ||
+    recordSteps !== closed.recordSteps ||
+    recordSteps.length !== evidence.rotationAtStep ||
+    recordSteps[evidence.consumedAtStep - 1] !== closed.endStep ||
+    recordSteps[evidence.rotationAtStep - 1] !== closed.rotationStep ||
+    !equal(closed.endStep, b.step) ||
+    !equal(closed.rotationStep, {
+      actor: proof.actor,
+      move: { type: 'choose', choiceId: 'rotate:1' },
+      refills: emptyRefills(),
+      sourceActionIds: [proof.moveId],
+    }) ||
+    !equal(native, closed.after) ||
+    claim.owner !== proof.actor ||
+    claim.sourceOwner !== String(context.group.entries[0].args.active_player) ||
+    claim.worker !== String(context.group.entries[31].args.worker_id) ||
+    claim.amount !== b.before.accumulatedCorn ||
+    claim.amount <= 0 ||
+    claim.oldStarter !== b.before.firstPlayer ||
+    claim.nextStarter !== proof.actor ||
+    !equal(claim.order, b.before.turnOrder) ||
+    ledger.stateId !== 4 ||
+    ledger.activePlayer !== claim.sourceOwner ||
+    !equal(ledger.stateArgs, context.group.entries[34].args.args)
+  )
+    return null;
+  const original = index.entries.find((n) => n.uid === claim.claim?.uid);
+  const originalBinding = original && originalPacketEntry(original);
+  if (
+    !originalBinding ||
+    originalBinding.tableId !== index.tableId ||
+    originalBinding.rawSha256 !== index.rawSha256 ||
+    originalBinding.packetType !== 'resend' ||
+    original.channel !== `/table/t${index.tableId}` ||
+    !equal(ref(original), claim.claim) ||
+    original.moveId !== claim.claimMoveId ||
+    original.moveId >= proof.moveId ||
+    original.type !== 'placeWorker' ||
+    original.args.place !== 'startingPlayer' ||
+    String(original.args.player_id) !== claim.sourceOwner ||
+    String(original.args.worker_id) !== claim.worker
+  )
+    return null;
+  const resources = structuredClone(b.before.players[proof.actor].resources);
+  resources.corn += claim.amount;
+  if (!equal(claim.nativeResources, resources)) return null;
+  return {
+    type: 'postReceiptClaimantDay14FoodRotation',
+    moveId: proof.moveId,
+    owner: proof.actor,
+    amount: claim.amount,
+    claim: ref(original),
+    receipt: ref(context.group.entries[3]),
+    consumedAtStep: evidence.consumedAtStep,
+    rotationAtStep: evidence.rotationAtStep,
+    originalReceiptConsumedOnce: true,
+    completeNativeStatesVerified: true,
+    authorizedEffectUids: context.group.entries
+      .filter(
+        (n) =>
+          String(n.args.player_id) === claim.sourceOwner &&
+          ['payGoods', 'updateScore'].includes(n.type),
+      )
+      .map((n) => n.uid),
   };
 }
