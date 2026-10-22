@@ -5,6 +5,7 @@ import {
   originalFinalScoringCaption,
 } from './bga-network.mjs';
 import { sourceCheckpoint } from './bga-network-source-projection.mjs';
+import { terminalRoundSourceClaim } from './bga-network-terminal-claim.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import {
   foodCost,
@@ -340,11 +341,15 @@ export function terminalComponentGate(input) {
       (t) => t.before.phase === 'playing' && t.after.phase === 'finished',
     ) ?? finishedFeeding;
   const before = terminal?.before ?? input.context?.native;
+  const sourceClaim = terminalRoundSourceClaim(input.index, input.group);
   if (
     before &&
     Number.isSafeInteger(before.firstPlayerClaimed) &&
     before.firstPlayerClaimed >= 0 &&
     before.firstPlayerClaimed < input.native.players.length &&
+    sourceClaim &&
+    input.sourceToNative.get(String(sourceClaim.entry.args.player_id)) ===
+      before.firstPlayerClaimed &&
     finishedFeeding?.before.firstPlayerClaimed !== null
   )
     return { required: false, matched: true, path: 'claimedTerminal' };

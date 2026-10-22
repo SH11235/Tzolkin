@@ -6,6 +6,7 @@ import {
 } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import { finalMonumentMetric, finalResourceComponents } from './bga-network-final-scoring.mjs';
+import { terminalRoundSourceClaim } from './bga-network-terminal-claim.mjs';
 
 const issued = new WeakMap();
 const clone = structuredClone;
@@ -172,20 +173,9 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
       sourceToNative.get(String(states[1].args.active_player)) === before.firstPlayer,
   );
   check(states.slice(2, 4).every((n) => String(n.args.active_player) === sourceOwner));
-  let claims = [],
-    amount = Number(index.initial.cornOnWheel);
-  for (const g of index.groups) {
-    if (g === group) break;
-    for (const n of g.entries) {
-      if (n.type === 'rotateWheel') claims = [];
-      if (n.type === 'cornOnWheel') amount++;
-      if (n.type === 'firstPlayer') amount = 0;
-      if (n.type === 'placeWorker' && n.args.place === 'startingPlayer')
-        claims.push({ entry: n, amount });
-    }
-  }
-  check(claims.length === 1);
-  const claim = claims[0],
+  const claim = terminalRoundSourceClaim(index, group);
+  check(claim);
+  const amount = claim.currentAmount,
     worker = source.workers.get(String(claim.entry.args.worker_id));
   const claimPacket = originalPacketEntry(claim.entry);
   check(

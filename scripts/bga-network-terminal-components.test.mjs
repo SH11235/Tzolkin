@@ -28,12 +28,82 @@ test('fractional total corruption cannot hide behind the same integer display', 
   assert.equal(inspectTerminalProjection(f).completed, false);
 });
 
-test('claimed final food retains its separate component proof path', () => {
+test('native claimed marker without original claim cannot skip component validation', () => {
   const f = fixture();
   f.context.native.firstPlayerClaimed = 0;
   const checked = inspectTerminalProjection(f);
+  assert.equal(checked.completed, false);
+  assert.equal(checked.components.required, true);
+});
+
+function claimedFixture(kind = 'valid') {
+  const f = fixture({
+    changeRaw(raw) {
+      const claim = (uid, actor, worker) => ({
+        uid,
+        type: 'placeWorker',
+        log: '',
+        args: {
+          player_id: actor,
+          worker_id: worker,
+          place: 'startingPlayer',
+          position: 0,
+          corn: 0,
+        },
+      });
+      const entries = [claim('9001', kind === 'actor' ? '2' : '1', kind === 'actor' ? '2' : '1')];
+      if (kind === 'duplicate') entries.push(claim('9002', '2', '2'));
+      if (kind === 'priorRound')
+        entries.push({
+          uid: '9003',
+          type: 'rotateWheel',
+          log: '',
+          args: { day: 26, twice: 0, workers: [] },
+        });
+      raw.gameLogs.data.data.splice(-1, 0, {
+        channel: '/table/t123',
+        table_id: 123,
+        packet_id: '8',
+        packet_type: 'resend',
+        move_id: '8',
+        time: '1',
+        data: entries,
+      });
+    },
+  });
+  f.context.native.firstPlayerClaimed = 0;
+  const fed = structuredClone(f.native);
+  Object.assign(fed, {
+    phase: 'playing',
+    firstPlayerClaimed: 0,
+    pending: { task: { type: 'rotation' }, after: [] },
+    finalScores: [],
+  });
+  const end = { ...f.context.transitions[0], after: fed };
+  const action = { type: 'rotate', days: 1 };
+  const rotate = {
+    before: fed,
+    after: f.native,
+    actor: 0,
+    action,
+    legalActions: [{ action }],
+    step: 51,
+  };
+  f.context.transitions = [end, rotate];
+  f.feedingTransitions = [end];
+  return f;
+}
+
+test('source-bound claim retains playing after food and finished after rotation', () => {
+  const f = claimedFixture();
+  const checked = inspectTerminalProjection(f);
   assert.equal(checked.completed, true);
   assert.deepEqual(checked.components, { required: false, matched: true, path: 'claimedTerminal' });
+});
+
+test('prior-round, duplicate and other-actor source claims cannot bypass components', () => {
+  for (const kind of ['priorRound', 'duplicate', 'actor'])
+    assert.equal(inspectTerminalProjection(claimedFixture(kind)).completed, false, kind);
 });
 
 test('equal-total source monument cancellation fails despite unchanged final display', () => {
