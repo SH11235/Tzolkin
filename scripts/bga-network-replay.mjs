@@ -1072,10 +1072,21 @@ export function proveCalendarDesignation(state, observation, entries, sourceToNa
   };
 }
 
+const prefixFailures = new WeakMap();
+export function networkPrefixFailure(prefix) {
+  const bound = prefixFailures.get(prefix);
+  return bound &&
+    isDeepStrictEqual(prefix.blocked, bound.blocked) &&
+    isDeepStrictEqual(prefix.record, bound.record) &&
+    prefix.calls === bound.calls
+    ? { error: bound.error, hookError: bound.hookError, context: structuredClone(bound.context) }
+    : null;
+}
+
 /** Strict bounded prefix decoding. Unknown decisions or first mismatch stop without state repairs. */
 export function replayNetworkPrefix(
   index,
-  { initial, initialMoveId, clientContract, onDecisionBoundary },
+  { initial, initialMoveId, clientContract, onDecisionBoundary, onReplayFailure },
   dispatch,
 ) {
   assertNetworkClockContract(index, clientContract);
@@ -2655,6 +2666,35 @@ export function replayNetworkPrefix(
       });
       successfulGroups.push(group.moveId);
     } catch (error) {
+      let failureContext = null,
+        hookError = null;
+      if (onReplayFailure) {
+        failureContext = {
+          moveId: group.moveId,
+          partial: {
+            schema: 'tzolkin-bga-network-failure-partial-v1',
+            tableId: index.tableId,
+            rawSha256: index.rawSha256,
+            record: copy(record),
+            audit: copy(audit),
+            calls,
+            blocked: {
+              moveId: group.moveId,
+              source: copy(group.entries),
+              reason: error instanceof Error ? error.message : String(error),
+            },
+          },
+        };
+        try {
+          const returned = onReplayFailure(error, copy(failureContext));
+          if (returned !== undefined)
+            throw new TypeError('Replay failure callback must return undefined synchronously', {
+              cause: error,
+            });
+        } catch (failure) {
+          hookError = failure;
+        }
+      }
       if (burnHarvest) {
         frame = frameBeforeGroup;
         record.steps.length = stepsBefore;
@@ -2676,7 +2716,7 @@ export function replayNetworkPrefix(
             })),
           };
       }
-      return {
+      const prefix = {
         schema: 'tzolkin-bga-network-prefix-v1',
         tableId: index.tableId,
         rawSha256: index.rawSha256,
@@ -2714,6 +2754,16 @@ export function replayNetworkPrefix(
         },
         cardMappings: mapper.entries(),
       };
+      if (onReplayFailure)
+        prefixFailures.set(prefix, {
+          error,
+          hookError,
+          context: failureContext,
+          blocked: copy(prefix.blocked),
+          record: copy(prefix.record),
+          calls: prefix.calls,
+        });
+      return prefix;
     }
   }
   return {

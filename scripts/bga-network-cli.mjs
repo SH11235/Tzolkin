@@ -57,7 +57,15 @@ export async function exportNetworkPrefix(flags) {
 
 /** Convert only retained inputs. No source path is reopened after pin verification. */
 export function convertNetworkInputs(
-  { bytes, studioBytes, gameBytes, witnessesBytes, mode = 'replay', onDecisionBoundary },
+  {
+    bytes,
+    studioBytes,
+    gameBytes,
+    witnessesBytes,
+    mode = 'replay',
+    onDecisionBoundary,
+    onReplayFailure,
+  },
   dispatch,
 ) {
   if (!['prepare', 'replay'].includes(mode)) throw new Error('Unsupported conversion mode');
@@ -90,6 +98,7 @@ export function convertNetworkInputs(
       initialMoveId: witnesses.initialActionId,
       clientContract,
       onDecisionBoundary,
+      onReplayFailure,
     },
     dispatch,
   );
