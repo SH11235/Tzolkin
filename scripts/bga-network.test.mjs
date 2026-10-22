@@ -987,11 +987,14 @@ function completedTerminalFixture(options = {}, alter = () => {}) {
   return f;
 }
 
-test('public boundary caller closes the actual cycle before independent terminal projection', () => {
+test('a closed calendar and final display cannot certify missing terminal components', () => {
   for (const unusedCorn of [false, true]) {
     const f = completedTerminalFixture({ unusedCorn }),
       checked = f.terminalValidations[0];
-    assert.equal(checked.completed, true);
+    assert.equal(checked.completed, false);
+    assert.equal(checked.components.required, true);
+    assert.equal(checked.components.matched, false);
+    assert.ok(checked.failures.includes('terminalComponentsNotEstablished'));
     assert.equal(checked.calendar.matched, true);
     assert.equal(checked.calendar.sourceDay, 28);
     assert.equal(checked.calendar.sourceCounterRound, 29);
@@ -1000,8 +1003,7 @@ test('public boundary caller closes the actual cycle before independent terminal
     assert.equal(checked.calendar.boundFinalCycle.decisionTimeFeatureEquivalence, 'notEstablished');
     assert.equal(checked.food.matched, true);
     assert.equal(checked.display.matched, true);
-    assert.equal(f.rows.at(-1).semanticMatch, true);
-    assert.equal(f.comparison.finish().allObligationsClosed, true);
+    assert.equal(f.comparison.finish().terminalCalendar.obligation.closed, true);
     assert.equal(checked.acceptedExceptions.length, Number(unusedCorn));
     const cloned = inspectTerminalProjection({
       ...f.terminalArguments,
@@ -1009,7 +1011,9 @@ test('public boundary caller closes the actual cycle before independent terminal
       native: structuredClone(f.native),
       terminalCalendarEvidence: f.comparison.terminalCalendarEvidence(),
     });
-    assert.equal(cloned.completed, true);
+    assert.equal(cloned.calendar.matched, true);
+    assert.equal(cloned.completed, false);
+    assert.equal(cloned.components.matched, false);
   }
 });
 
