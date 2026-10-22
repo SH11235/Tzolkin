@@ -32,8 +32,9 @@ export function knownFinalMetricRefusal(error) {
   return issued && error instanceof UnsupportedFinalMetric ? { ...issued } : null;
 }
 
+export class FinalScoringMismatch extends Error {}
 const fail = (message) => {
-  throw new Error(`Network final scoring: ${message}`);
+  throw new FinalScoringMismatch(`Network final scoring: ${message}`);
 };
 const suffixes = {
   graveyards: 'Tombs',

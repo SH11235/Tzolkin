@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { classifyDecisionState } from './bga-network-decision-boundary.mjs';
 import { proveBoundTerminalCoordinates } from './bga-network-semantic-calendar.mjs';
 import { prepareTerminalScoreSettlement } from './bga-network-terminal-settlement.mjs';
+import { terminalComponentGate } from './bga-network-terminal-components.mjs';
 import { proveZeroCornTerminalCoordinates } from './bga-network-final-food.mjs';
 
 const clone = structuredClone;
@@ -159,6 +160,8 @@ export function inspectTerminalProjection({
   terminalDisplayCheckpoint,
   terminalCalendarEvidence = null,
   zeroCornFinalEvidence = null,
+  context = null,
+  catalog,
 }) {
   const failures = [];
   const finalIndex = index.groups.indexOf(group);
@@ -237,6 +240,17 @@ export function inspectTerminalProjection({
   if (residual.length) failures.push('terminalPublicProjectionMismatch');
   const feeding = finalFeeding({ ledger, native, transitions: feedingTransitions, sourceToNative });
   failures.push(...feeding.failures);
+  const components = terminalComponentGate({
+    index,
+    group,
+    context,
+    ledger,
+    native,
+    sourceToNative,
+    catalog,
+    feedingTransitions,
+  });
+  if (!components.matched) failures.push('terminalComponentsNotEstablished');
   const scores = [];
   const results = native.finalScores;
   if (
@@ -287,6 +301,7 @@ export function inspectTerminalProjection({
     acceptedExceptions: exceptions,
     remainingDifferences: clone(residual),
     food: feeding,
+    components,
     calendar,
     scores,
     display,
@@ -307,6 +322,7 @@ export function comparePublicBoundary({
   const terminalValidation = terminalArguments
     ? inspectTerminalProjection({
         ...terminalArguments,
+        context,
         terminalCalendarEvidence: comparison.terminalCalendarEvidence(),
         zeroCornFinalEvidence: comparison.zeroCornFinalEvidence?.() ?? null,
       })

@@ -1,3 +1,4 @@
+import { terminalComponentFixture } from './fixtures/bga-terminal-components.mjs';
 import assert from 'node:assert/strict';
 import { mock, test } from 'node:test';
 import {
@@ -1626,101 +1627,7 @@ test('terminal integer display uses the existing floor contract and never become
 });
 
 function terminalAuditFixture() {
-  const sourceToNative = new Map([
-    ['1', 0],
-    ['2', 1],
-    ['3', 2],
-  ]);
-  const resources = (corn) => ({ corn, wood: 0, stone: 0, gold: 0, skull: 0 });
-  const players = Array.from({ length: 3 }, (_, id) => ({
-    id,
-    workers: 3,
-    feedWorkers: 0,
-    feedAll: false,
-    feedDiscount: 0,
-    resources: resources(10),
-    score: 0,
-  }));
-  const before = {
-    phase: 'playing',
-    additionalBuildings: false,
-    round: 27,
-    expansion: null,
-    firstPlayerClaimed: null,
-    currentPlayer: 2,
-    accumulatedCorn: 0,
-    foodDays: [8, 14, 21],
-    players,
-  };
-  const native = {
-    ...structuredClone(before),
-    phase: 'finished',
-    pending: null,
-    foodDays: [8, 14, 21, 27],
-    finalScores: players.map((p) => ({ playerId: p.id, total: 100.25 - p.id, rank: p.id + 1 })),
-  };
-  native.players.forEach((p) => {
-    p.resources.corn = 4;
-    p.score = 100.25 - p.id;
-  });
-  const group = {
-    moveId: 9,
-    entries: [{ type: 'gameStateChange', args: { id: 99, type: 'manager' } }],
-  };
-  const index = {
-    initial: {
-      gamestate: { id: 4, type: 'activeplayer' },
-      gamestates: { 4: { name: 'playerTurn', type: 'activeplayer' }, 99: { type: 'manager' } },
-    },
-    groups: [group],
-  };
-  const event = {
-    scheduledDay: 27,
-    eligible: true,
-    start: { uid: 'final-food' },
-    receipts: [...sourceToNative].map(([id]) => ({
-      sourceActorId: id,
-      paidCorn: 6,
-      penaltyPoints: null,
-      costCaptions: [{ workers: 3 }],
-      penaltyCaptions: [],
-    })),
-  };
-  const ledger = {
-    stateId: 99,
-    day: 27,
-    lastRotation: { day: 27, uid: 'final-rotation' },
-    stateNotificationType: 'manager',
-    accumulatedCorn: 0,
-    foodDays: [8, 14, 21, 27],
-    feedingWitnesses: [event],
-    players: Object.fromEntries(
-      [...sourceToNative].map(([id, actor]) => [
-        id,
-        { resources: resources(4), score: 100 - actor },
-      ]),
-    ),
-  };
-  return {
-    index,
-    group,
-    ledger,
-    native,
-    observation: null,
-    differences: [],
-    sourceToNative,
-    feedingTransitions: [
-      { before, after: structuredClone(native), action: { type: 'endTurn' }, step: 50 },
-    ],
-    terminalDisplayCheckpoint: {
-      mode: 'floorTotal',
-      scores: native.finalScores.map((n) => ({
-        playerId: n.playerId,
-        total: Math.floor(n.total),
-        rank: n.rank,
-      })),
-    },
-  };
+  return terminalComponentFixture();
 }
 
 test('terminal validation independently checks final food, public differences and integer display ranks', () => {
