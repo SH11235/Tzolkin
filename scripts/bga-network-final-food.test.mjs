@@ -870,7 +870,7 @@ test('zero entitlement requires explicit claim amount pool history and adjacent 
   const initialPrivate = fixture((raw) => insertPrivate(raw), { zeroCorn: true });
   assert.ok(initialPrivate.factory.prove(initialPrivate.input));
   for (const [type, move] of [
-    ['timeJokerUsed', 1],
+    ['updateReflexionTime', 1],
     ['chooseWealthTiles', 3],
   ]) {
     const bad = fixture((raw) => insertPrivate(raw, type, move), { zeroCorn: true });
