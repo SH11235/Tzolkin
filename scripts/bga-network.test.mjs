@@ -994,7 +994,7 @@ test('a closed calendar and final display cannot certify missing terminal compon
     assert.equal(checked.completed, false);
     assert.equal(checked.components.required, true);
     assert.equal(checked.components.matched, false);
-    assert.ok(checked.failures.includes('terminalComponentsNotEstablished'));
+    assert.deepEqual(checked.failures, ['terminalComponentsNotEstablished']);
     assert.equal(checked.calendar.matched, true);
     assert.equal(checked.calendar.sourceDay, 28);
     assert.equal(checked.calendar.sourceCounterRound, 29);
@@ -1003,6 +1003,7 @@ test('a closed calendar and final display cannot certify missing terminal compon
     assert.equal(checked.calendar.boundFinalCycle.decisionTimeFeatureEquivalence, 'notEstablished');
     assert.equal(checked.food.matched, true);
     assert.equal(checked.display.matched, true);
+    assert.equal(checked.scores.every((row) => row.matched), true);
     assert.equal(f.comparison.finish().terminalCalendar.obligation.closed, true);
     assert.equal(checked.acceptedExceptions.length, Number(unusedCorn));
     const cloned = inspectTerminalProjection({
@@ -1081,6 +1082,13 @@ test('a closed original calendar cannot certify wrong public resources, scores o
     assert.equal(f.comparison.finish().terminalCalendar.obligation.closed, true);
     assert.equal(checked.calendar.matched, true);
     assert.equal(checked.completed, false);
+    assert.ok(checked.failures.includes('terminalPublicProjectionMismatch'));
+    assert.ok(
+      checked.remainingDifferences.some(
+        (row) => row.field === (field === 'resources' ? 'player.1.resources.corn' : 'player.1.score'),
+      ),
+    );
+    if (field === 'score') assert.ok(checked.failures.includes('terminalScoreMismatch:1'));
     assert.equal(f.rows.at(-1).semanticMatch, false);
   }
   const f = completedTerminalFixture(),
@@ -1090,8 +1098,11 @@ test('a closed original calendar cannot certify wrong public resources, scores o
       terminalCalendarEvidence: f.comparison.terminalCalendarEvidence(),
     };
   args.terminalDisplayCheckpoint.scores[0].rank++;
-  assert.equal(inspectTerminalProjection(args).calendar.matched, true);
-  assert.equal(inspectTerminalProjection(args).completed, false);
+  const checked = inspectTerminalProjection(args);
+  assert.equal(checked.calendar.matched, true);
+  assert.equal(checked.display.matched, false);
+  assert.ok(checked.failures.includes('terminalDisplayOrRankMismatch'));
+  assert.equal(checked.completed, false);
 });
 
 test('semantic comparison retains raw corn and marker gaps until their independent closures', () => {
