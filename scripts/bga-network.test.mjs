@@ -1003,7 +1003,10 @@ test('a closed calendar and final display cannot certify missing terminal compon
     assert.equal(checked.calendar.boundFinalCycle.decisionTimeFeatureEquivalence, 'notEstablished');
     assert.equal(checked.food.matched, true);
     assert.equal(checked.display.matched, true);
-    assert.equal(checked.scores.every((row) => row.matched), true);
+    assert.equal(
+      checked.scores.every((row) => row.matched),
+      true,
+    );
     assert.equal(f.comparison.finish().terminalCalendar.obligation.closed, true);
     assert.equal(checked.acceptedExceptions.length, Number(unusedCorn));
     const cloned = inspectTerminalProjection({
@@ -1085,7 +1088,8 @@ test('a closed original calendar cannot certify wrong public resources, scores o
     assert.ok(checked.failures.includes('terminalPublicProjectionMismatch'));
     assert.ok(
       checked.remainingDifferences.some(
-        (row) => row.field === (field === 'resources' ? 'player.1.resources.corn' : 'player.1.score'),
+        (row) =>
+          row.field === (field === 'resources' ? 'player.1.resources.corn' : 'player.1.score'),
       ),
     );
     if (field === 'score') assert.ok(checked.failures.includes('terminalScoreMismatch:1'));
