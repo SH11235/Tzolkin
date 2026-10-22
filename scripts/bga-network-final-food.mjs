@@ -66,8 +66,14 @@ const identities = (input) => [
   input.context.source,
   input.context.native,
   input.context.transitions,
+  input.context.observation,
+  input.context.group.entries,
+  ...input.context.group.entries,
   input.ledger,
   input.native,
+  input.claim,
+  input.observation,
+  input.timingState,
   ...input.context.transitions.flatMap((t) => [t, t.before, t.after, t.legalActions]),
 ];
 
@@ -532,6 +538,7 @@ export function createFinalFoodProof({ index, initial, sourceToNative }) {
     requireProof(bound?.issuer === issuer && bound.claimRef.pendingFinalScore === proof);
     requireProof(
       same(proof, bound.proof) &&
+        bound.input.claim === bound.claimRef &&
         same(bound.input.context, bound.context) &&
         same(bound.nativeRef, bound.native) &&
         same(claimValue(bound.claimRef), bound.claim) &&

@@ -568,6 +568,36 @@ test('pending final score closes only the actual single rotation with unchanged 
     assert.equal(p.closed, false);
   }
 });
+test('final receipt authority rejects equal clones and later same-object mutation', () => {
+  for (const change of [
+    (f) => {
+      f.input.claim = clone(f.input.claim);
+    },
+    (f) => {
+      f.input.observation = clone(f.input.observation);
+    },
+    (f) => {
+      f.input.timingState = clone(f.input.timingState);
+    },
+    (f) => {
+      f.input.context.group.entries = [...f.input.context.group.entries];
+    },
+    (f) => {
+      f.input.context.transitions[0].after = clone(f.input.context.transitions[0].after);
+    },
+    (f) => {
+      f.input.claim.receipt.caption.uid = 'foreign';
+    },
+    (f) => {
+      f.input.context.source.players['2'].score++;
+    },
+  ]) {
+    const f = fixture(),
+      proof = settle(f, f.factory.prove(f.input));
+    change(f);
+    assert.throws(() => f.factory.bindLegacy(proof, f.input.context, oldWitness(f)));
+  }
+});
 function publicCaller(f, mutate = () => {}) {
   const comparison = createSemanticComparison({
     index: f.index,
