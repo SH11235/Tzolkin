@@ -9,6 +9,7 @@ export {
 import { recordDecisionBoundary, classifyDecisionState } from './bga-network-decision-boundary.mjs';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
 import { createObservedChoices } from './bga-network-observed-choices.mjs';
+import { createEmptyBuildingExit } from './bga-network-empty-building.mjs';
 import {
   assertObservationBoundary,
   comparePublicBoundary,
@@ -1157,6 +1158,8 @@ export function replayNetworkPrefix(
   const feedingTransitions = [];
   let terminalValidation = null;
   let buildingMarket = null;
+  const emptyBuilding = createEmptyBuildingExit({ index, sourceToNative });
+  let openEmptyBuilding = null;
   let current = null;
   const native = () => frame.snapshot.state;
   const actions = () => frame.observation?.legalActions ?? [];
@@ -1207,7 +1210,8 @@ export function replayNetworkPrefix(
       terminal: terminalValidation,
       blocked,
       observedTrajectory,
-      legacyObligationsClosed: !openRotationFence && !openCornFence && !openRewardFences.length,
+      legacyObligationsClosed:
+        !openRotationFence && !openCornFence && !openRewardFences.length && !openEmptyBuilding,
     });
     return {
       observedTrajectory,
@@ -1379,7 +1383,16 @@ export function replayNetworkPrefix(
     let constructionTransition = null;
     let burnHarvest = null;
     let ageTwoRefillEvidence = null;
+    let openedEmptyBuilding = null;
+    const closingEmptyBuilding = openEmptyBuilding;
     try {
+      if (closingEmptyBuilding)
+        emptyBuilding.prepareExit(closingEmptyBuilding, {
+          group,
+          ledger,
+          before,
+          legal: actions(),
+        });
       if (
         group.entries.some(
           (n) =>
@@ -1776,15 +1789,31 @@ export function replayNetworkPrefix(
                   'Structural theology-ahead route; only the final Chichen target is observed.';
               }
             }
-            applyWhere(
-              (x) =>
-                x.type === 'useAction' &&
-                x.gear === gear &&
-                x.position === Number(a.action_number) &&
-                (observedCorn === null || x.cornCost === observedCorn),
-              'observed gear action',
-              refills,
-            );
+            const empty = emptyBuilding.open({
+              group,
+              entry: n,
+              ledger,
+              before: beforeDecline,
+              after: native(),
+              operation: choiceOperations.at(-1),
+              legal: actions(),
+              sourceStateMatched: differences(ledger, beforeDecline, sourceToNative).length === 0,
+              timingClear: !openRotationFence && !openCornFence && !openRewardFences.length,
+            });
+            if (empty) {
+              if (openEmptyBuilding) fail('duplicate empty building interval');
+              openedEmptyBuilding = empty;
+              openEmptyBuilding = empty;
+            } else
+              applyWhere(
+                (x) =>
+                  x.type === 'useAction' &&
+                  x.gear === gear &&
+                  x.position === Number(a.action_number) &&
+                  (observedCorn === null || x.cornCost === observedCorn),
+                'observed gear action',
+                refills,
+              );
             if (routeEquivalence) {
               const selected = audit.at(-1);
               selected.equivalentChoices = 2;
@@ -2129,6 +2158,30 @@ export function replayNetworkPrefix(
         }
       }
       for (const n of group.entries) updateLedger(ledger, n, mapper);
+      if (openedEmptyBuilding) {
+        emptyBuilding.bindEntry(openedEmptyBuilding, { ledger, native: native() });
+        audit.push({
+          moveId: group.moveId,
+          emptyBuildingEntry: copy(openedEmptyBuilding),
+          teacherCertified: false,
+        });
+      }
+      if (closingEmptyBuilding) {
+        const closed = emptyBuilding.close(closingEmptyBuilding, {
+          group,
+          ledger,
+          before,
+          after: native(),
+          operation: choiceOperations[0],
+        });
+        audit.push({
+          moveId: group.moveId,
+          step: closed.nativeStep,
+          emptyBuildingExit: closed,
+          teacherCertified: false,
+        });
+        openEmptyBuilding = null;
+      }
       const skullShortageEvidence = bindSkullShortageOutcome(skullShortage, before, native());
       const singleSkullEvidence = singleSkull
         ? singleSkull.kind === 'ordinaryWorkerRemoval'
