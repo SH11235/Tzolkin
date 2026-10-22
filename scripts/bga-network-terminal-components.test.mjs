@@ -2,7 +2,6 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { terminalComponentFixture as fixture } from './fixtures/bga-terminal-components.mjs';
 import { inspectTerminalProjection, comparePublicBoundary } from './bga-network-terminal.mjs';
-import { knownFinalMetricRefusal } from './bga-network-final-scoring.mjs';
 
 test('immediate terminal gate binds all original components for three and four players', () => {
   for (const count of [3, 4])
@@ -171,16 +170,13 @@ test('actual no-claim transition cannot escape through a claimed context marker'
   assert.equal(inspectTerminalProjection(f).completed, false);
 });
 
-test('source-issued unsupported metric remains a typed local refusal', () => {
+test('reviewed metric ownership does not authorize unrelated original monument captions', () => {
   const f = fixture({ monuments: true });
   f.context.source.players['1'].monuments = ['m07'];
   f.context.native.players[0].monuments = ['m07'];
   f.ledger.players['1'].monuments = ['m07'];
   f.native.players[0].monuments = ['m07'];
-  assert.throws(
-    () => inspectTerminalProjection(f),
-    (error) => knownFinalMetricRefusal(error)?.monument === 'm07',
-  );
+  assert.equal(inspectTerminalProjection(f).completed, false);
 });
 
 test('public boundary comparison supplies the actual context to the mandatory terminal gate', () => {

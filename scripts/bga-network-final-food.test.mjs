@@ -1146,7 +1146,7 @@ test('global monument counts include its owner and opponents but exclude the unb
           catalog.MONUMENTS.find((m) => m.scoreKey === scoreKey),
           catalog,
         ),
-      /unreviewed/,
+      /ownership/,
     );
   }
 });
