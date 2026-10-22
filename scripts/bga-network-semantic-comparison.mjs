@@ -4,6 +4,7 @@ import { provePostReceiptFood } from './bga-network-semantic-feeding.mjs';
 import { createBuildingResourceComparison } from './bga-network-building-resources.mjs';
 import { createTerminalCalendarComparison } from './bga-network-semantic-calendar.mjs';
 import { terminalSettlementScoreUids } from './bga-network-terminal-settlement.mjs';
+import { createDay14FoodProof, day14FoodCandidate } from './bga-network-day14-feeding.mjs';
 
 const clone = structuredClone;
 const sourceId = (entry) => String(entry.args.player_id);
@@ -13,10 +14,23 @@ const reference = (entry) => ({
   notificationIndex: entry.notificationIndex,
 });
 
-export function createSemanticComparison({ index, initialMoveId, initial, sourceToNative }) {
+export function createSemanticComparison({
+  index,
+  initialMoveId,
+  initial,
+  sourceToNative,
+  mapCard,
+}) {
   const sequence = originalNetworkSequence(index);
   const remaining = sequence?.groups.filter(({ group }) => group.moveId > initialMoveId) ?? [];
   const mapping = new Map(sourceToNative);
+  const day14Food = createDay14FoodProof({
+    index,
+    initial,
+    initialMoveId,
+    sourceToNative: mapping,
+    mapCard,
+  });
   const buildingResources = createBuildingResourceComparison({ index, sourceToNative: mapping });
   const calendarComparison = createTerminalCalendarComparison({ index, sourceToNative: mapping });
   const workers = new Map(index.initial.workers.map((w) => [String(w.id), clone(w)]));
@@ -257,7 +271,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           (observation?.actor === c.owner || mapping.get(ledger.activePlayer) === c.owner)
         )
           reject('claimant can act before the delayed corn receipt');
-        const followingFood = receipts.length
+        let followingFood = receipts.length
           ? provePostReceiptFood({
               index,
               group,
@@ -272,6 +286,11 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
               skullShortageEvidence,
             })
           : null;
+        if (!followingFood && receipts.length && day14FoodCandidate(context, native)) {
+          const input = { context, ledger, native, observation, claim: c };
+          const proof = day14Food.prove(input);
+          if (proof && day14Food.verify(proof, input)) followingFood = proof;
+        }
         if (
           !isDeepStrictEqual(native.players[c.owner].resources, c.nativeResources) &&
           !followingFood
