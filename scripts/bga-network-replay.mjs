@@ -2042,6 +2042,8 @@ export function replayNetworkPrefix(
                 step: record.steps.at(-1),
                 stepIndex: record.steps.length,
                 sourceResetDifferences: differences(ageTwoResetLedger, native(), sourceToNative),
+                context: semanticContext,
+                recordSteps: record.steps,
               });
           } else if (n.type === 'rotateWheel' && native().pending?.task.type === 'rotation') {
             const actor = frame.observation.actor;
@@ -2077,6 +2079,8 @@ export function replayNetworkPrefix(
                 after: native(),
                 step: record.steps.at(-1),
                 stepIndex: record.steps.length,
+                context: semanticContext,
+                recordSteps: record.steps,
               });
             if (terminalWitness?.start.moveId === group.moveId) {
               terminalCalendar = bindTerminalCalendarTransition(
@@ -2263,6 +2267,8 @@ export function replayNetworkPrefix(
             rewardsOpen: openRewardFences.length > 0,
             rotationOpen: !!openRotationFence,
           },
+          ageTwoRefillEvidence,
+          recordSteps: record.steps,
         },
         terminalArguments:
           native().phase === 'finished'

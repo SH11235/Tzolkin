@@ -5,6 +5,7 @@ import { createBuildingResourceComparison } from './bga-network-building-resourc
 import { createTerminalCalendarComparison } from './bga-network-semantic-calendar.mjs';
 import { terminalSettlementScoreUids } from './bga-network-terminal-settlement.mjs';
 import { createDay14FoodProof, day14FoodCandidate } from './bga-network-day14-feeding.mjs';
+import { verifiedAgeTwoClaimantFood } from './bga-network-age-two-refill.mjs';
 import {
   createFinalFoodProof,
   createZeroCornFinalFoodProof,
@@ -121,6 +122,8 @@ export function createSemanticComparison({
       skullShortageEvidence,
       terminalScoreSettlement,
       timingState,
+      ageTwoRefillEvidence,
+      recordSteps,
     },
   ) {
     if (poisoned) throw new Error(failure ?? 'Final receipt composition failed');
@@ -324,6 +327,17 @@ export function createSemanticComparison({
           const input = { context, ledger, native, observation, claim: c };
           const proof = day14Food.prove(input);
           if (proof && day14Food.verify(proof, input)) followingFood = proof;
+        }
+        if (!followingFood && receipts.length && ageTwoRefillEvidence) {
+          followingFood = verifiedAgeTwoClaimantFood(ageTwoRefillEvidence, {
+            index,
+            context,
+            native,
+            ledger,
+            claim: c,
+            sourceToNative: mapping,
+            recordSteps,
+          });
         }
         if (
           !isDeepStrictEqual(native.players[c.owner].resources, c.nativeResources) &&
