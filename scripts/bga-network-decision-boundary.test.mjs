@@ -31,6 +31,14 @@ test('unsupported final metrics are issued only for canonical owned catalog card
         return true;
       },
     );
+    const negative = { ...structuredClone(player), templePoints: -3 };
+    assert.throws(
+      () => finalMonumentMetric({ players: [negative] }, negative, card, catalog),
+      (error) => {
+        assert.equal(knownFinalMetricRefusal(error)?.metric, metric);
+        return true;
+      },
+    );
     assert.equal(knownFinalMetricRefusal({ ...refusal }), null);
     assert.equal(
       knownFinalMetricRefusal(
@@ -70,6 +78,9 @@ test('unsupported final metrics are issued only for canonical owned catalog card
       },
       (p) => {
         p.templePoints = NaN;
+      },
+      (p) => {
+        p.templePoints = 0.5;
       },
     ]) {
       const p = structuredClone(player),

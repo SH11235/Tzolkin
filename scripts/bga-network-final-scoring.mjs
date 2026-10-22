@@ -91,8 +91,7 @@ export function finalMonumentMetric(state, player, card, catalog) {
         'theology',
       ]) &&
       Object.values(player.technologies).every((n) => Number.isInteger(n) && n >= 0 && n <= 3) &&
-      Number.isSafeInteger(player.templePoints) &&
-      player.templePoints >= 0
+      Number.isSafeInteger(player.templePoints)
     )
       throw new UnsupportedFinalMetric(card);
     fail('unreviewed monument metric');
