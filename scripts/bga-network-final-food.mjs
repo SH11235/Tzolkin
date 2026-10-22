@@ -1,0 +1,633 @@
+import { readFileSync } from 'node:fs';
+import { isDeepStrictEqual as same } from 'node:util';
+import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
+import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
+import { originalFinalScoringCaption } from './bga-network.mjs';
+import {
+  finalScoreReceiptComponents,
+  finalResourceComponents,
+  bindFinalScoringProjections,
+  assertFinalScoringResolutionGroup,
+} from './bga-network-final-scoring.mjs';
+import {
+  foodCost,
+  templePositionPoints,
+  templeLeaderAwards,
+} from './bga-network-food-temple-metrics.mjs';
+
+const catalog = JSON.parse(
+  readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+);
+const clone = structuredClone;
+const bindings = new WeakMap();
+const pendingBindings = new WeakMap();
+const ref = ({ uid, packetIndex, notificationIndex }) => ({ uid, packetIndex, notificationIndex });
+const canonical = (state) =>
+  Object.fromEntries(Object.entries(state).filter(([key]) => key !== 'log'));
+const clocks = new Set(['updateReflexionTime', 'timeJokerUsed']);
+const fields = [
+  'technologies',
+  'temples',
+  'buildings',
+  'monuments',
+  'workers',
+  'feedWorkers',
+  'feedDiscount',
+  'cornTiles',
+  'woodTiles',
+  'doubleAdvanceAvailable',
+];
+class ProofMismatch extends Error {}
+const requireProof = (valid) => {
+  if (!valid) throw new ProofMismatch('FinalFood food and temple proof mismatch');
+};
+const integer = (value, signed = false) => {
+  requireProof(
+    ['number', 'string'].includes(typeof value) &&
+      (signed ? /^(0|-?[1-9]\d*)$/ : /^(0|[1-9]\d*)$/).test(String(value)) &&
+      Number.isSafeInteger(Number(value)),
+  );
+  return Number(value);
+};
+const signature = (rows) => rows.map((row) => JSON.stringify(row)).sort();
+const claimValue = (claim) => ({
+  sourceOwner: claim.sourceOwner,
+  owner: claim.owner,
+  worker: claim.worker,
+  amount: claim.amount,
+  claim: claim.claim,
+  nativeResources: claim.nativeResources,
+  oldStarter: claim.oldStarter,
+  nextStarter: claim.nextStarter,
+});
+const identities = (input) => [
+  input.context,
+  input.context.group,
+  input.context.source,
+  input.context.native,
+  input.context.transitions,
+  input.ledger,
+  input.native,
+  ...input.context.transitions.flatMap((t) => [t, t.before, t.after, t.legalActions]),
+];
+
+export function finalFoodCandidate(context, native) {
+  return (
+    context.native.round === 27 &&
+    context.native.players.length === 4 &&
+    native.phase === 'playing' &&
+    native.pending?.task.type === 'rotation' &&
+    context.group.entries.some((n) => n.type === 'finalScoring' && Array.isArray(n.args))
+  );
+}
+
+export function createFinalFoodProof({ index, initial, sourceToNative }) {
+  const prepared = clone(initial),
+    preparedMapping = clone(sourceToNative),
+    issuer = {};
+  const publicEntry = (n) => {
+    const source = originalPacketEntry(n);
+    return (
+      source?.packetType === 'resend' &&
+      source.tableId === index.tableId &&
+      source.rawSha256 === index.rawSha256 &&
+      n.channel === `/table/t${index.tableId}`
+    );
+  };
+  function validate(input) {
+    const { context, ledger, native, observation, claim } = input;
+    const { group, source, native: before, transitions } = context;
+    requireProof(finalFoodCandidate(context, native));
+    requireProof(
+      input.timingState?.rewardsOpen === false && input.timingState?.rotationOpen === false,
+    );
+    requireProof(
+      originalNetworkSequence(index)?.groups.some((g) => g.group === group) &&
+        same(context.original, group) &&
+        same(initial, prepared) &&
+        same(sourceToNative, preparedMapping),
+    );
+    requireProof(
+      before.version === 1 &&
+        before.phase === 'playing' &&
+        before.expansion == null &&
+        before.additionalBuildings === false &&
+        before.age === 2 &&
+        before.pending === null,
+    );
+    requireProof(
+      sourceToNative.size === 4 &&
+        before.turnOrder.length === 4 &&
+        before.turnIndex === 3 &&
+        before.currentPlayer !== claim.owner &&
+        before.firstPlayerClaimed === claim.owner &&
+        before.accumulatedCorn === 0,
+    );
+    requireProof(same(before.foodDays, [8, 14, 21]) && transitions.length === 1);
+    const transition = transitions[0];
+    requireProof(
+      transition.action.type === 'endTurn' &&
+        transition.actor === before.currentPlayer &&
+        same(canonical(transition.before), canonical(before)) &&
+        same(canonical(transition.after), canonical(native)),
+    );
+    requireProof(
+      transition.legalActions.some((row) => same(row.action, transition.action)) &&
+        context.observation?.actor === transition.actor &&
+        same(context.observation.legalActions, transition.legalActions),
+    );
+    requireProof(
+      sourceToNative.get(source.activePlayer) === transition.actor &&
+        index.initial.gamestates[source.stateId]?.type === 'activeplayer' &&
+        index.initial.gamestates[source.stateId]?.possibleactions?.includes('endTurn'),
+    );
+    requireProof(
+      native.currentPlayer === claim.owner &&
+        native.firstPlayerClaimed === claim.owner &&
+        same(native.pending.after, []) &&
+        same(native.foodDays, [8, 14, 21, 27]) &&
+        ledger.stateId === 95 &&
+        ledger.activePlayer === claim.sourceOwner &&
+        source.day === 26 &&
+        ledger.day === 26,
+    );
+    requireProof(
+      observation?.actor === claim.owner &&
+        observation.legalActions.length === 2 &&
+        same(observation.legalActions.map((row) => row.action.days).sort(), [1, 2]) &&
+        observation.legalActions.every((row) => row.action.type === 'rotate'),
+    );
+    requireProof(
+      before.players[claim.owner].doubleAdvanceAvailable === true &&
+        source.players[claim.sourceOwner].doubleAdvanceAvailable === true,
+    );
+    const entries = group.entries;
+    requireProof(entries.length > 0 && new Set(entries.map((n) => n.uid)).size === entries.length);
+    for (const [position, n] of entries.entries())
+      requireProof(
+        publicEntry(n) &&
+          n.packetIndex === entries[0].packetIndex &&
+          n.notificationIndex === entries[0].notificationIndex + position &&
+          n.moveId === group.moveId,
+      );
+    const game = entries.filter((n) => !clocks.has(n.type));
+    const states = game.filter((n) => n.type === 'gameStateChange');
+    requireProof(
+      same(
+        states.map((n) => integer(n.args.id)),
+        [90, 91, 92, 94, 95],
+      ),
+    );
+    for (const [position, n] of states.entries()) {
+      const type = position === 4 ? 'activeplayer' : 'game';
+      requireProof(
+        index.initial.gamestates[n.args.id]?.type === type &&
+          (n.args.type === undefined || n.args.type === type),
+      );
+    }
+    requireProof(
+      sourceToNative.get(String(states[0].args.active_player)) === transition.actor &&
+        sourceToNative.get(String(states[1].args.active_player)) === before.firstPlayer &&
+        states.slice(2).every((n) => String(n.args.active_player) === claim.sourceOwner),
+    );
+    requireProof(
+      same(
+        game.slice(0, 6).map((n) => n.type),
+        [
+          'gameStateChange',
+          'gameStateChange',
+          'takeGoods',
+          'firstPlayerCorn',
+          'firstPlayer',
+          'gameStateChange',
+        ],
+      ),
+    );
+    const credit = game[2],
+      receipt = game[3];
+    requireProof(
+      integer(claim.amount) > 0 &&
+        source.accumulatedCorn === claim.amount &&
+        ledger.accumulatedCorn === 0 &&
+        native.accumulatedCorn === 0,
+    );
+    requireProof(
+      credit.args.origin === null &&
+        credit.args.type === 'corn' &&
+        String(credit.args.player_id) === claim.sourceOwner &&
+        integer(credit.args.quantity) === claim.amount &&
+        credit.notificationIndex + 1 === receipt.notificationIndex,
+    );
+    requireProof(
+      String(receipt.args.player_id) === claim.sourceOwner &&
+        integer(receipt.args.corn) === claim.amount &&
+        sourceToNative.get(String(game[4].args.player_id)) === claim.nextStarter,
+    );
+    const originalClaim = index.groups
+      .filter((g) => g.moveId < group.moveId)
+      .flatMap((g) => g.entries)
+      .find((n) => same(ref(n), claim.claim));
+    requireProof(
+      originalClaim &&
+        publicEntry(originalClaim) &&
+        originalClaim.type === 'placeWorker' &&
+        originalClaim.args.place === 'startingPlayer' &&
+        String(originalClaim.args.player_id) === claim.sourceOwner &&
+        String(originalClaim.args.worker_id) === claim.worker,
+    );
+    for (const snapshot of [source, ledger]) {
+      const worker = snapshot.workers.get(claim.worker);
+      requireProof(
+        worker?.place === 'startingPlayer' && String(worker.player) === claim.sourceOwner,
+      );
+    }
+    requireProof(same(claim.nativeResources, before.players[claim.owner].resources));
+    const events = sourceFeedingWitnesses(index).filter((event) => event.moveId === group.moveId);
+    requireProof(
+      events.length === 1 &&
+        events[0].eligible &&
+        events[0].scheduledDay === 27 &&
+        events[0].sourcePhysicalDay === 26,
+    );
+    const state94 = game.indexOf(states[3]),
+      state95 = game.indexOf(states[4]);
+    const food = game.slice(6, state94);
+    requireProof(food.length % 2 === 0);
+    for (let i = 0; i < food.length; i += 2) {
+      const [effect, caption] = food.slice(i, i + 2);
+      requireProof(
+        caption.type === 'foodDayCost' &&
+          String(effect.args.player_id) === String(caption.args.player_id) &&
+          effect.notificationIndex + 1 === caption.notificationIndex,
+      );
+      requireProof(
+        effect.type === 'payGoods'
+          ? effect.args.type === 'corn' &&
+              effect.args.target === null &&
+              integer(effect.args.quantity) === integer(caption.args.cost)
+          : effect.type === 'updateScore' &&
+              integer(effect.args.points, true) === -integer(caption.args.points),
+      );
+    }
+    const headers = game.filter((n) => n.type === 'finalScoring' && Array.isArray(n.args));
+    requireProof(headers.length === 1);
+    const header = headers[0],
+      headerIndex = game.indexOf(header);
+    requireProof(
+      originalFinalScoringCaption(header)?.caption === 'Final scoring!' &&
+        header.args.length === 0 &&
+        headerIndex > state94 &&
+        headerIndex < state95 &&
+        game.slice(state95 + 1).length === 0,
+    );
+    const temple = game.slice(state94 + 1, headerIndex);
+    requireProof(temple.length % 2 === 0);
+    const pairs = Array.from({ length: temple.length / 2 }, (_, i) => {
+      const [effect, caption] = temple.slice(i * 2, i * 2 + 2);
+      requireProof(
+        effect.type === 'updateScore' &&
+          ['templeScore', 'templeLeader'].includes(caption.type) &&
+          String(effect.args.player_id) === String(caption.args.player_id) &&
+          sourceToNative.has(String(effect.args.player_id)) &&
+          integer(effect.args.points, true) === integer(caption.args.points, true) &&
+          effect.notificationIndex + 1 === caption.notificationIndex,
+      );
+      return { effect, caption };
+    });
+    const awards = templeLeaderAwards(source.players, catalog.TEMPLE_TRACKS, 2);
+
+    const leaders = awards.map((row) => [row.sourceActor, row.temple, row.points]);
+    requireProof(
+      same(
+        signature(leaders),
+        signature(
+          pairs
+            .filter((p) => p.caption.type === 'templeLeader')
+            .map(({ caption: n }) => [
+              String(n.args.player_id),
+              n.args.temple === 'kukulcan' ? 'kukulkan' : n.args.temple,
+              integer(n.args.points),
+            ]),
+        ),
+      ),
+    );
+    const expected = clone(before),
+      players = [];
+    for (const [id, actor] of sourceToNative) {
+      const p = source.players[id],
+        nativePlayer = before.players[actor];
+      requireProof(
+        p.score === nativePlayer.score &&
+          fields.every((field) => same(p[field], nativePlayer[field])) &&
+          nativePlayer.feedAll === false &&
+          nativePlayer.buildingSkulls === 0,
+      );
+      const available = clone(p.resources);
+      if (actor === claim.owner) available.corn += claim.amount;
+      requireProof(same(available, nativePlayer.resources));
+      const { free, fed, cost, unfed } = foodCost(nativePlayer, available.corn);
+      const original = events[0].receipts.find((row) => row.sourceActorId === id);
+      requireProof(
+        original &&
+          (original.paidCorn ?? 0) === cost &&
+          (original.penaltyPoints ?? 0) === unfed * 3 &&
+          original.costCaptions.every((row) => row.workers === free + fed) &&
+          original.penaltyCaptions.every((row) => row.workers === unfed),
+      );
+      const resources = { ...available, corn: available.corn - cost };
+      requireProof(same(resources, ledger.players[id].resources));
+      const points = templePositionPoints(p, catalog.TEMPLE_TRACKS);
+      const bonuses = leaders.filter((row) => row[0] === id).reduce((sum, row) => sum + row[2], 0);
+      const positionReceipts = pairs.filter(
+        (row) => row.caption.type === 'templeScore' && String(row.caption.args.player_id) === id,
+      );
+      requireProof(
+        positionReceipts.length === 1 &&
+          integer(positionReceipts[0].caption.args.points, true) === points,
+      );
+      const score = p.score - unfed * 3 + points + bonuses;
+      requireProof(
+        Number.isSafeInteger(score) &&
+          fields.every((field) => same(p[field], ledger.players[id][field])),
+      );
+      Object.assign(expected.players[actor], {
+        resources,
+        score,
+        templePoints: nativePlayer.templePoints + points,
+      });
+      players.push({
+        actor,
+        paidCorn: cost,
+        unfedWorkers: unfed,
+        penaltyPoints: unfed * 3,
+        templePoints: points,
+        leaderBonus: bonuses,
+        expectedResources: resources,
+        score,
+      });
+    }
+    Object.assign(expected, {
+      currentPlayer: claim.owner,
+      pending: {
+        title: 'スタートプレイヤー：カレンダーを進める',
+        task: { type: 'rotation' },
+        after: [],
+      },
+      foodDays: [8, 14, 21, 27],
+    });
+    requireProof(same(canonical(expected), canonical(native)) && same(initial, prepared));
+    return {
+      type: 'postReceiptFinalFoodTemples',
+      header: ref(header),
+      end: ref(states[4]),
+      receiptUid: receipt.uid,
+      claim: clone(claim.claim),
+      owner: claim.sourceOwner,
+      amount: claim.amount,
+      sourceFeedingStart: events[0].start,
+      scheduledDay: 27,
+      nativeStep: transition.step,
+      perPlayerResults: players,
+      authorizedEffectUids: [
+        ...food.filter((n) => ['payGoods', 'updateScore'].includes(n.type)),
+        ...pairs.map((row) => row.effect),
+      ]
+        .filter((n) => String(n.args.player_id) === claim.sourceOwner)
+        .map((n) => n.uid),
+      sourceIndividualAbsenceNotObservedAsZero: true,
+    };
+  }
+  function prove(input) {
+    if (!finalFoodCandidate(input.context, input.native)) return null;
+    const snapshot = clone(input),
+      refs = identities(input),
+      claimSnapshot = clone(claimValue(input.claim));
+    try {
+      const proof = validate(input);
+      requireProof(same(input, snapshot));
+      bindings.set(proof, { issuer, input, snapshot, refs, claimSnapshot, proof: clone(proof) });
+      return proof;
+    } catch (error) {
+      if (error instanceof ProofMismatch) return null;
+      throw error;
+    }
+  }
+  function verifyProof(proof, input) {
+    const bound = bindings.get(proof);
+    return (
+      !!bound &&
+      bound.issuer === issuer &&
+      bound.input === input &&
+      same(input, bound.snapshot) &&
+      identities(input).every((value, i) => value === bound.refs[i]) &&
+      same(claimValue(input.claim), bound.claimSnapshot) &&
+      same(proof, bound.proof) &&
+      same(initial, prepared) &&
+      same(sourceToNative, preparedMapping) &&
+      originalNetworkSequence(index) !== null
+    );
+  }
+  function issue(food, input) {
+    const bound = bindings.get(food);
+    requireProof(bound?.issuer === issuer && bound.input === input);
+    const staticInput = (value) => ({ ...value, claim: claimValue(value.claim) });
+    requireProof(same(staticInput(input), staticInput(bound.snapshot)) && same(food, bound.proof));
+    requireProof(identities(input).every((value, i) => value === bound.refs[i]));
+    const { context, ledger, native, claim } = input;
+    requireProof(
+      claim.cornClosed === true &&
+        claim.cornClosedMoveId === context.group.moveId &&
+        !claim.pendingFinalScore,
+    );
+    const entries = context.group.entries;
+    const header = entries.find((n) => same(ref(n), food.header));
+    const end = entries.find((n) => same(ref(n), food.end));
+    requireProof(
+      header &&
+        end &&
+        same(claim.receipt, {
+          credit: ref(
+            entries.find(
+              (n) =>
+                n.type === 'takeGoods' &&
+                String(n.args.player_id) === claim.sourceOwner &&
+                n.args.type === 'corn',
+            ),
+          ),
+          caption: ref(entries.find((n) => n.uid === food.receiptUid)),
+        }),
+    );
+    const sourceBoard = {
+      players: [],
+      skullSpaces: ledger.skullSpaces.map((id) => (id === null ? null : sourceToNative.get(id))),
+    };
+    const scores = {};
+    for (const [id, actor] of sourceToNative) {
+      sourceBoard.players[actor] = ledger.players[id];
+      scores[id] = food.perPlayerResults.find((row) => row.actor === actor).score;
+    }
+    const witness = finalScoreReceiptComponents({
+      entries,
+      header,
+      end,
+      state: native,
+      sourceToNative,
+      scores,
+      sourceBoard,
+      catalog,
+    });
+    const components = witness.players.map((player) => {
+      const resource = finalResourceComponents(native.players[player.actor].resources);
+      requireProof(
+        Math.floor(resource.resourcePoints + resource.skullPoints) === player.resource.points,
+      );
+      const monumentPoints = player.monuments.reduce((sum, row) => sum + row.points, 0);
+      return {
+        actor: player.actor,
+        pointsBeforeFinal: player.before,
+        monumentPoints,
+        ...resource,
+        total: player.before + monumentPoints + resource.resourcePoints + resource.skullPoints,
+      };
+    });
+    const scoreDifferences = witness.players.map((player) => ({
+      field: `player.${player.sourceActor}.score`,
+      observed: player.total,
+      native: player.before,
+    }));
+    const scoreUpdates = entries
+      .slice(entries.indexOf(header) + 1, entries.indexOf(end))
+      .filter((n) => n.type === 'updateScore');
+    const proof = {
+      type: 'pendingFinalScoreReceipts',
+      claim: clone(claim.claim),
+      owner: claim.sourceOwner,
+      food: clone(food),
+      witness,
+      components,
+      scoreDifferences,
+      authorizedEffectUids: scoreUpdates
+        .filter((n) => String(n.args.player_id) === claim.sourceOwner)
+        .map((n) => n.uid),
+      legacyBound: false,
+      closed: false,
+    };
+    pendingBindings.set(proof, {
+      issuer,
+      input,
+      context: clone(context),
+      refs: bound.refs,
+      native: clone(native),
+      nativeRef: native,
+      claim: clone(claimValue(claim)),
+      claimRef: claim,
+      receipt: clone(claim.receipt),
+      receiptMoveId: claim.cornClosedMoveId,
+      proof: clone(proof),
+    });
+    return proof;
+  }
+  function assertLive(proof) {
+    const bound = pendingBindings.get(proof);
+    requireProof(bound?.issuer === issuer && bound.claimRef.pendingFinalScore === proof);
+    requireProof(
+      same(proof, bound.proof) &&
+        same(bound.input.context, bound.context) &&
+        same(bound.nativeRef, bound.native) &&
+        same(claimValue(bound.claimRef), bound.claim) &&
+        bound.claimRef.cornClosed === true &&
+        same(bound.claimRef.receipt, bound.receipt) &&
+        bound.claimRef.cornClosedMoveId === bound.receiptMoveId &&
+        same(initial, prepared) &&
+        same(sourceToNative, preparedMapping),
+    );
+    requireProof(identities(bound.input).every((value, i) => value === bound.refs[i]));
+    requireProof(
+      originalNetworkSequence(index)?.groups.some(
+        (row) => row.group === bound.input.context.group && same(row.original, row.group),
+      ),
+    );
+    return bound;
+  }
+  function bindLegacy(proof, context, witness) {
+    const bound = assertLive(proof);
+    requireProof(
+      bound.input.context === context &&
+        !proof.legacyBound &&
+        !proof.closed &&
+        same(witness, proof.witness),
+    );
+    proof.legacyBound = true;
+    bound.proof = clone(proof);
+  }
+  function close(proof, context, ledger, native, selected) {
+    const bound = assertLive(proof);
+    requireProof(proof.legacyBound && !proof.closed && context !== bound.input.context);
+    const position = index.groups.indexOf(bound.input.context.group);
+    requireProof(
+      index.groups[position + 1] === context.group && same(context.original, context.group),
+    );
+    assertFinalScoringResolutionGroup(context.group);
+    const rotations = context.group.entries.filter((n) => n.type === 'rotateWheel');
+    const transition = context.transitions[0];
+    requireProof(
+      context.transitions.length === 1 &&
+        selected.length === 1 &&
+        rotations[0].args.twice === 0 &&
+        !context.group.entries.some((n) => n.type === 'flipBoard') &&
+        ledger.day === 27 &&
+        ledger.stateId === 99 &&
+        index.initial.gamestates[99]?.type === 'manager' &&
+        context.source.day === 26 &&
+        context.source.stateId === 95 &&
+        selected[0].actor === bound.claimRef.owner &&
+        transition.actor === bound.claimRef.owner &&
+        transition.action.type === 'rotate' &&
+        transition.action.days === 1 &&
+        transition.step === selected[0].step &&
+        same(transition.action, selected[0].action) &&
+        same(canonical(context.native), canonical(bound.native)) &&
+        same(canonical(transition.before), canonical(bound.native)) &&
+        same(canonical(transition.after), canonical(native)) &&
+        same(context.observation.legalActions, transition.legalActions) &&
+        same(transition.legalActions, bound.input.observation.legalActions) &&
+        native.phase === 'finished' &&
+        native.round === 27,
+    );
+    bindFinalScoringProjections(proof.witness, bound.native, [{ snapshot: { state: native } }]);
+    requireProof(native.finalScores.length === proof.components.length);
+    for (const component of proof.components) {
+      const rows = native.finalScores.filter((row) => row.playerId === component.actor);
+      requireProof(
+        rows.length === 1 &&
+          Object.entries(component).every(
+            ([key, value]) => key === 'actor' || rows[0][key] === value,
+          ),
+      );
+      requireProof(
+        native.players[component.actor].doubleAdvanceAvailable ===
+          bound.native.players[component.actor].doubleAdvanceAvailable,
+      );
+    }
+    const gears = Object.fromEntries(
+      Object.entries(native.gears).map(([gear, cells]) => [gear, cells.map(() => null)]),
+    );
+    for (const worker of ledger.workers.values())
+      if (worker.place && worker.place !== 'startingPlayer') {
+        requireProof(
+          Object.hasOwn(gears, worker.place) &&
+            Number.isSafeInteger(Number(worker.position)) &&
+            gears[worker.place][Number(worker.position)] === null,
+        );
+        gears[worker.place][Number(worker.position)] =
+          worker.player === null
+            ? { playerId: -1, dummy: true }
+            : { playerId: sourceToNative.get(String(worker.player)), dummy: false };
+      }
+    requireProof(same(gears, native.gears));
+    proof.closed = true;
+    bound.proof = clone(proof);
+    return clone(proof);
+  }
+  return { prove, verify: verifyProof, issue, bindLegacy, close };
+}

@@ -70,6 +70,14 @@ export function finalMonumentMetric(state, player, card, catalog) {
   return { nbr, points };
 }
 
+export function finalResourceComponents(resources) {
+  return {
+    resourcePoints:
+      (resources.corn + resources.wood * 2 + resources.stone * 3 + resources.gold * 4) / 4,
+    skullPoints: resources.skull * 3,
+  };
+}
+
 /** Bind complete original receipts before probing any legal calendar outcome. */
 export function finalScoringWitness({
   group,
@@ -221,6 +229,28 @@ export function finalScoringWitness({
     scores[id] += n.args.points;
     if (!Number.isSafeInteger(scores[id])) fail('unsafe pre-header score');
   }
+  return finalScoreReceiptComponents({
+    entries,
+    header,
+    end,
+    state,
+    sourceToNative,
+    scores,
+    sourceBoard,
+    catalog,
+  });
+}
+
+export function finalScoreReceiptComponents({
+  entries,
+  header,
+  end,
+  state,
+  sourceToNative,
+  scores,
+  sourceBoard,
+  catalog,
+}) {
   const players = new Map();
   for (const [id, actor] of sourceToNative) {
     const p = state.players[actor],

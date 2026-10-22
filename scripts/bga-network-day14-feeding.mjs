@@ -2,6 +2,11 @@ import { readFileSync } from 'node:fs';
 import { isDeepStrictEqual as same } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
+import {
+  foodCost,
+  templePositionPoints,
+  templeLeaderAwards,
+} from './bga-network-food-temple-metrics.mjs';
 
 const catalog = JSON.parse(
   readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
@@ -273,15 +278,12 @@ export function createDay14FoodProof({ index, initial, initialMoveId, sourceToNa
       );
       return { effect, caption };
     });
-    const leaders = [];
-    for (const [templeId, track] of Object.entries(catalog.TEMPLE_TRACKS)) {
-      const highest = Math.max(...Object.values(source.players).map((p) => p.temples[templeId]));
-      const winners = Object.entries(source.players).filter(
-        ([, p]) => p.temples[templeId] === highest,
-      );
-      requireProof(winners.length === 1);
-      leaders.push([winners[0][0], templeId, track.age1Bonus]);
-    }
+    const awards = templeLeaderAwards(source.players, catalog.TEMPLE_TRACKS, 1);
+    requireProof(
+      awards.length === Object.keys(catalog.TEMPLE_TRACKS).length &&
+        awards.every((row) => row.winnerCount === 1),
+    );
+    const leaders = awards.map((row) => [row.sourceActor, row.temple, row.points]);
     requireProof(
       same(
         signature(leaders),
@@ -309,14 +311,7 @@ export function createDay14FoodProof({ index, initial, initialMoveId, sourceToNa
       const available = clone(p.resources);
       if (actor === claim.owner) available.corn += claim.amount;
       requireProof(same(available, nativePlayer.resources));
-      const free = Math.min(p.workers, p.feedWorkers),
-        price = Math.max(0, 2 - p.feedDiscount);
-      const fed =
-        price === 0
-          ? p.workers - free
-          : Math.min(p.workers - free, Math.floor(available.corn / price));
-      const cost = fed * price,
-        unfed = p.workers - free - fed;
+      const { free, fed, cost, unfed } = foodCost(nativePlayer, available.corn);
       const original = events[0].receipts.find((row) => row.sourceActorId === id);
       requireProof(
         original &&
@@ -327,10 +322,7 @@ export function createDay14FoodProof({ index, initial, initialMoveId, sourceToNa
       );
       const resources = { ...available, corn: available.corn - cost };
       requireProof(same(resources, ledger.players[id].resources));
-      const points = Object.entries(p.temples).reduce(
-        (sum, [templeId, level]) => sum + catalog.TEMPLE_TRACKS[templeId].points[level + 1],
-        0,
-      );
+      const points = templePositionPoints(p, catalog.TEMPLE_TRACKS);
       const bonuses = leaders.filter((row) => row[0] === id).reduce((sum, row) => sum + row[2], 0);
       const positionReceipts = pairs.filter(
         (row) => row.caption.type === 'templeScore' && String(row.caption.args.player_id) === id,
