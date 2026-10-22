@@ -137,7 +137,7 @@ export function createEmptyBuildingExit({ index, sourceToNative }) {
         quoted?.place === 'tikal' &&
         Number(quoted.position) === 2 &&
         Object.hasOwn(quoted.actions?.tikal ?? {}, '2') &&
-        Number(quoted.actions.tikal[2]) === 0,
+        (quoted.actions.tikal[2] === 0 || quoted.actions.tikal[2] === '0'),
     );
     assert(
       before.version === 1 &&

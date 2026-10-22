@@ -271,8 +271,16 @@ test('empty Tikal building entry stays open until its actual structural exit', (
   assert.ok(evidence(f, p));
   assert.equal(p.humanClickObserved, false);
   assert.equal(p.nativeStep, 2);
+  const quoted = fixture();
+  quoted.input.ledger.stateArgs.workers[1].actions.tikal[2] = '0';
+  assert.ok(evidence(quoted, closed(quoted)));
 });
 test('empty building proof rejects other markets actors targets effects queues and legal choices', () => {
+  for (const quote of [null, false, true, '', ' ', [], {}, '00', '0.0', undefined]) {
+    const f = fixture();
+    f.input.ledger.stateArgs.workers[1].actions.tikal[2] = quote;
+    assert.throws(() => f.factory.open(f.input));
+  }
   for (const mutate of [
     (f) => {
       f.input.after.buildings = ['b01'];
