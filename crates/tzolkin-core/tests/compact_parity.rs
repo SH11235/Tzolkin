@@ -289,6 +289,52 @@ fn assert_transition(
     expected
 }
 
+#[test]
+fn exhausted_distinct_temple_keeps_building_attributes_in_compact_transitions() {
+    let mut state = monument_payment_state(false, 4);
+    state.players[0].temples.insert(TempleId::Chaac, 5);
+    state.players[0].temples.insert(TempleId::Kukulkan, 6);
+    state.players[0].temples.insert(TempleId::Quetzalcoatl, 2);
+    let build = Task::Build {
+        remaining: 1,
+        allow_monument: false,
+        corn_payment: true,
+        architecture_available: Some(false),
+        mandatory: false,
+    };
+    let tail = vec![build.clone(), Task::Trade];
+    state.pending = Some(Pending {
+        title: "Distinct temple advance".into(),
+        task: Task::Temple {
+            remaining: 2,
+            distinct: Some(vec![]),
+            direction: None,
+            reason: None,
+        },
+        after: tail,
+    });
+    let before = state.clone();
+    let compact = assert_state(&state);
+    let after = assert_transition(
+        &state,
+        &compact,
+        GameMove::Choose {
+            choice_id: "temple:quetzalcoatl".into(),
+        },
+    );
+    let pending = after.pending.as_ref().unwrap();
+    assert_eq!(pending.task, build);
+    assert_eq!(pending.after, [Task::Trade]);
+    assert_eq!(after.players[0].temples[&TempleId::Quetzalcoatl], 3);
+    assert_eq!(after.players[0].resources, before.players[0].resources);
+    assert_eq!(after.players[0].score, before.players[0].score);
+    assert_eq!(
+        after.players[0].double_advance_available,
+        before.players[0].double_advance_available
+    );
+    assert_state(&after);
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReferenceTraces {

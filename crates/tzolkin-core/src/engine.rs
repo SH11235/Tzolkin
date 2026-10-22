@@ -970,6 +970,22 @@ fn next_tasks(
         {
             continue;
         }
+        if let Task::Temple {
+            remaining,
+            distinct: Some(selected),
+            direction,
+            ..
+        } = &task
+            && *remaining > 0
+            && !selected.is_empty()
+            && matches!(*direction, None | Some(1))
+            && TEMPLE_IDS
+                .iter()
+                .filter(|temple| !selected.contains(temple))
+                .all(|temple| !can_raise(s, *temple))
+        {
+            continue;
+        }
         s.pending = Some(Pending {
             title: task_title(&task),
             task,
@@ -3587,6 +3603,121 @@ fn finalize(s: &mut GameState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn exhausted_temple_state() -> GameState {
+        let mut state = create_game(vec!["A".into(), "B".into(), "C".into()], 5, false).unwrap();
+        state.phase = Phase::Playing;
+        state.players[0].temples.insert(TempleId::Chaac, 5);
+        state.players[0].temples.insert(TempleId::Kukulkan, 6);
+        state.players[0].temples.insert(TempleId::Quetzalcoatl, 3);
+        state
+    }
+
+    #[test]
+    fn exhausted_distinct_temple_preserves_the_complete_following_queue() {
+        for remaining in [1, 2, 3] {
+            for direction in [None, Some(1)] {
+                let mut state = exhausted_temple_state();
+                let before = state.clone();
+                let build = Task::Build {
+                    remaining: 1,
+                    allow_monument: false,
+                    corn_payment: true,
+                    architecture_available: Some(false),
+                    mandatory: true,
+                };
+                let tail = vec![Task::Resource { remaining: 2 }, Task::Trade];
+                let mut tasks = vec![
+                    Task::Temple {
+                        remaining,
+                        distinct: Some(vec![TempleId::Quetzalcoatl]),
+                        direction,
+                        reason: None,
+                    },
+                    build.clone(),
+                ];
+                tasks.extend(tail.clone());
+                next_tasks(&mut state, tasks, &mut None);
+                let mut expected = before;
+                expected.pending = Some(Pending {
+                    title: task_title(&build),
+                    task: build,
+                    after: tail,
+                });
+                assert_eq!(state, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn exhausted_distinct_temple_respects_occupied_top_spaces() {
+        let mut state = exhausted_temple_state();
+        state.players[0].temples.insert(TempleId::Chaac, 4);
+        state.players[1].temples.insert(TempleId::Chaac, 5);
+        let before = state.clone();
+        let tail = Task::Resource { remaining: 1 };
+        next_tasks(
+            &mut state,
+            vec![
+                Task::Temple {
+                    remaining: 1,
+                    distinct: Some(vec![TempleId::Quetzalcoatl]),
+                    direction: None,
+                    reason: None,
+                },
+                tail.clone(),
+            ],
+            &mut None,
+        );
+        let mut expected = before;
+        expected.pending = Some(Pending {
+            title: task_title(&tail),
+            task: tail,
+            after: vec![],
+        });
+        assert_eq!(state, expected);
+    }
+
+    #[test]
+    fn temple_exhaustion_keeps_available_unrestricted_and_descending_tasks() {
+        for (distinct, direction, open) in [
+            (None, None, false),
+            (Some(vec![]), None, false),
+            (Some(vec![TempleId::Quetzalcoatl]), Some(-1), false),
+            (Some(vec![TempleId::Quetzalcoatl]), None, true),
+        ] {
+            let mut state = exhausted_temple_state();
+            state.players[0].resources = zero_resources();
+            state.expansion = Some(ExpansionState {
+                prophecies: vec![ProphecyId::WrathfulGods],
+                active_prophecy: Some(0),
+                ..Default::default()
+            });
+            if open {
+                state.players[0].temples.insert(TempleId::Chaac, 3);
+            }
+            let before = state.clone();
+            let task = Task::Temple {
+                remaining: 1,
+                distinct,
+                direction,
+                reason: None,
+            };
+            let tail = vec![Task::BuildMonument];
+            next_tasks(
+                &mut state,
+                prepend(vec![task.clone()], tail.clone()),
+                &mut None,
+            );
+            let mut expected = before;
+            expected.pending = Some(Pending {
+                title: task_title(&task),
+                task,
+                after: tail,
+            });
+            assert_eq!(state, expected);
+        }
+    }
 
     #[test]
     fn yaxchilan_one_and_extra_worker_grant_printed_wealth_before_first_turn() {
