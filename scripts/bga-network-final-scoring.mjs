@@ -1,5 +1,36 @@
 import { isDeepStrictEqual } from 'node:util';
+import { readFileSync } from 'node:fs';
 import { originalFinalScoringCaption } from './bga-network.mjs';
+
+const canonicalCatalog = JSON.parse(
+  readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+);
+const unsupportedMetrics = new Set(['maxTechnologies', 'templePoints']);
+const issuedRefusals = new WeakMap();
+class UnsupportedFinalMetric extends Error {
+  constructor(card) {
+    super('Network final scoring: unreviewed monument metric');
+    this.name = 'UnsupportedFinalMetric';
+    this.code = 'unsupportedFinalMonumentMetric';
+    this.origin = 'finalMonumentMetric';
+    issuedRefusals.set(
+      this,
+      Object.freeze({
+        type: this.name,
+        code: this.code,
+        origin: this.origin,
+        monument: card.id,
+        metric: card.scoreKey,
+      }),
+    );
+    Object.freeze(this);
+  }
+}
+
+export function knownFinalMetricRefusal(error) {
+  const issued = issuedRefusals.get(error);
+  return issued && error instanceof UnsupportedFinalMetric ? { ...issued } : null;
+}
 
 const fail = (message) => {
   throw new Error(`Network final scoring: ${message}`);
@@ -37,7 +68,34 @@ const reference = (n) => ({
 
 export function finalMonumentMetric(state, player, card, catalog) {
   const key = card.scoreKey;
-  if (!Object.hasOwn(suffixes, key)) fail('unreviewed monument metric');
+  if (!Object.hasOwn(suffixes, key)) {
+    const canonical = canonicalCatalog.MONUMENTS.find((m) => m.id === card.id);
+    if (
+      unsupportedMetrics.has(key) &&
+      isDeepStrictEqual(card, canonical) &&
+      isDeepStrictEqual(
+        catalog.MONUMENTS.filter((m) => m.id === card.id),
+        [canonical],
+      ) &&
+      Array.isArray(state?.players) &&
+      state.players.includes(player) &&
+      Array.isArray(player?.monuments) &&
+      player.monuments.includes(card.id) &&
+      new Set(player.monuments).size === player.monuments.length &&
+      player.monuments.every((id) => canonicalCatalog.MONUMENTS.some((m) => m.id === id)) &&
+      player.technologies &&
+      isDeepStrictEqual(Object.keys(player.technologies).sort(), [
+        'agriculture',
+        'architecture',
+        'extraction',
+        'theology',
+      ]) &&
+      Object.values(player.technologies).every((n) => Number.isInteger(n) && n >= 0 && n <= 3) &&
+      Number.isSafeInteger(player.templePoints)
+    )
+      throw new UnsupportedFinalMetric(card);
+    fail('unreviewed monument metric');
+  }
   let nbr, points;
   if (['graveyards', 'municipals', 'shrines'].includes(key)) {
     const category = { graveyards: 'graveyard', municipals: 'municipal', shrines: 'shrine' }[key];
