@@ -279,6 +279,7 @@ function fixture(changeRaw = () => {}, { zeroCorn = false } = {}) {
   const factory = (zeroCorn ? createZeroCornFinalFoodProof : createFinalFoodProof)({
     index,
     initial,
+    initialMoveId: 2,
     sourceToNative,
   });
   const source = {
@@ -853,13 +854,30 @@ test('explicit zero corn receipts use a separate entry and close only the observ
   );
 });
 test('zero entitlement requires explicit claim amount pool history and adjacent original zero receipts', () => {
-  const initialPrivate = fixture(
-    (raw) => {
-      raw.gameLogs.data.data[0].channel = '/player/p1';
-    },
-    { zeroCorn: true },
-  );
+  const insertPrivate = (raw, type = 'chooseWealthTiles', move = 1) => {
+    const packet = clone(raw.gameLogs.data.data[0]);
+    packet.channel = '/player/p1';
+    packet.move_id = String(move);
+    packet.data = [
+      { uid: 'private-setup', type, args: type === 'chooseWealthTiles' ? [] : {}, log: '' },
+    ];
+    const at = raw.gameLogs.data.data.findLastIndex((p) => Number(p.move_id) === move) + 1;
+    raw.gameLogs.data.data.splice(at, 0, packet);
+    raw.gameLogs.data.data.forEach((p, i) => {
+      p.packet_id = String(i + 1);
+    });
+  };
+  const initialPrivate = fixture((raw) => insertPrivate(raw), { zeroCorn: true });
   assert.ok(initialPrivate.factory.prove(initialPrivate.input));
+  for (const [type, move] of [
+    ['timeJokerUsed', 1],
+    ['chooseWealthTiles', 3],
+  ]) {
+    const bad = fixture((raw) => insertPrivate(raw, type, move), { zeroCorn: true });
+    assert.equal(bad.factory.prove(bad.input), null);
+  }
+  initialPrivate.index.groups[0].entries[0].uid = 'mutated';
+  assert.equal(initialPrivate.factory.prove(initialPrivate.input), null);
   for (const change of [
     (raw) => {
       raw.initialState.cornOnWheel = '1';

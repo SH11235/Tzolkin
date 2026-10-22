@@ -30,7 +30,12 @@ export function createSemanticComparison({
   const remaining = sequence?.groups.filter(({ group }) => group.moveId > initialMoveId) ?? [];
   const mapping = new Map(sourceToNative);
   const finalFood = createFinalFoodProof({ index, initial, sourceToNative: mapping });
-  const zeroCornFinal = createZeroCornFinalFoodProof({ index, initial, sourceToNative: mapping });
+  const zeroCornFinal = createZeroCornFinalFoodProof({
+    index,
+    initial,
+    initialMoveId,
+    sourceToNative: mapping,
+  });
   const finalFactory = (proof) =>
     proof.food.type === 'postReceiptZeroCornFinalTemples' ? zeroCornFinal : finalFood;
   let closedZeroCornFinal = null;

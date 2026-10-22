@@ -91,11 +91,11 @@ export function createFinalFoodProof({ index, initial, sourceToNative }) {
   return createFoodProof({ index, initial, sourceToNative }, false);
 }
 
-export function createZeroCornFinalFoodProof({ index, initial, sourceToNative }) {
-  return createFoodProof({ index, initial, sourceToNative }, true);
+export function createZeroCornFinalFoodProof({ index, initial, initialMoveId, sourceToNative }) {
+  return createFoodProof({ index, initial, initialMoveId, sourceToNative }, true);
 }
 
-function createFoodProof({ index, initial, sourceToNative }, zeroCorn) {
+function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zeroCorn) {
   const prepared = clone(initial),
     preparedMapping = clone(sourceToNative),
     issuer = {};
@@ -113,6 +113,7 @@ function createFoodProof({ index, initial, sourceToNative }, zeroCorn) {
     let pool = integer(index.initial.cornOnWheel),
       found = false;
     const groups = index.groups.filter((g) => g.moveId <= context.group.moveId);
+    requireProof(Number.isSafeInteger(initialMoveId) && initialMoveId < context.group.moveId);
     for (const g of groups)
       for (const n of g.entries) {
         const provenance = originalPacketEntry(n);
@@ -123,6 +124,12 @@ function createFoodProof({ index, initial, sourceToNative }, zeroCorn) {
         );
         if (found || ['cornOnWheel', 'firstPlayer'].includes(n.type) || same(ref(n), claim.claim))
           requireProof(publicEntry(n));
+        else if (!publicEntry(n))
+          requireProof(
+            g.moveId <= initialMoveId &&
+              n.type === 'chooseWealthTiles' &&
+              [...sourceToNative.keys()].some((id) => n.channel === `/player/p${id}`),
+          );
         if (same(ref(n), claim.claim)) {
           requireProof(
             !found &&
