@@ -1529,9 +1529,18 @@ function emptyBuildingPrefix(includeExit = true) {
     };
   };
   return {
-    result: replayNetworkPrefix(
-      parseNetworkReplay(bytes(raw)),
-      { initial, initialMoveId: 2, clientContract: {} },
+    result: convertNetworkInputs(
+      {
+        bytes: bytes(raw),
+        studioBytes: Buffer.from('synthetic studio'),
+        gameBytes: Buffer.from('synthetic game'),
+        witnessesBytes: bytes({
+          schema: 'tzolkin-bga-public-witnesses-v1',
+          tableId: '123',
+          initial,
+          initialActionId: 2,
+        }),
+      },
       dispatch,
     ),
     applied,
