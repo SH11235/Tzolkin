@@ -2203,6 +2203,7 @@ export function replayNetworkPrefix(
         terminalArguments:
           native().phase === 'finished'
             ? {
+                catalog,
                 index,
                 group,
                 ledger,

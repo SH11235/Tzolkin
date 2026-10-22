@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { classifyDecisionState } from './bga-network-decision-boundary.mjs';
 import { proveBoundTerminalCoordinates } from './bga-network-semantic-calendar.mjs';
+import { prepareTerminalScoreSettlement } from './bga-network-terminal-settlement.mjs';
 
 const clone = structuredClone;
 const materials = ['corn', 'wood', 'stone', 'gold', 'skull'];
@@ -284,7 +285,10 @@ export function comparePublicBoundary({
   semanticArguments,
   terminalArguments,
 }) {
-  const semantic = comparison.compare(context, semanticArguments);
+  const terminalScoreSettlement = terminalArguments?.catalog
+    ? prepareTerminalScoreSettlement({ ...terminalArguments, context })
+    : null;
+  const semantic = comparison.compare(context, { ...semanticArguments, terminalScoreSettlement });
   const terminalValidation = terminalArguments
     ? inspectTerminalProjection({
         ...terminalArguments,

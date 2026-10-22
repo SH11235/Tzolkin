@@ -34,7 +34,7 @@ const reference = (n) => ({
   uid: n.uid,
 });
 
-function metric(state, player, card, catalog) {
+export function finalMonumentMetric(state, player, card, catalog) {
   const key = card.scoreKey;
   if (!Object.hasOwn(suffixes, key)) fail('unreviewed monument metric');
   let nbr, points;
@@ -291,7 +291,7 @@ export function finalScoringWitness({
         const cards = catalog.MONUMENTS.filter((c) => c.id === id);
         if (cards.length !== 1) fail('unknown monument identity');
         const card = cards[0],
-          expected = metric(state, p, card, catalog);
+          expected = finalMonumentMetric(state, p, card, catalog);
         return (
           bound.caption ===
             'Monument: ${player_name} scores ${points} for ${nbr} ' + suffixes[card.scoreKey] &&
