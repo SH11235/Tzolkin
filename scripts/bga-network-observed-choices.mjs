@@ -270,6 +270,8 @@ export function observedOperationBinding({
   audit,
   operations = [op],
   semanticEvidence = [],
+  buildingResourceClosures = [],
+  capturedOperations = [],
 }) {
   const n = op.entry,
     a = n?.args,
@@ -283,8 +285,11 @@ export function observedOperationBinding({
     group,
     index,
     sourceToNative,
+    mapCard,
     audit,
     semanticEvidence,
+    buildingResourceClosures,
+    capturedOperations,
   };
   const forced = forcedRotationProof(context);
   const burn = closedBurnChoiceProof(context);
@@ -473,7 +478,8 @@ export function createObservedChoices({
     proofs = new Map(),
     operationEvidence = [];
   const capturedOperations = [],
-    deferredTechnologies = [];
+    deferredTechnologies = [],
+    consumedImmediateBuildingRewards = new Set();
   const expected = [initialMoveId];
   let last = clone(initialBoundary),
     interval = null;
@@ -758,6 +764,8 @@ export function createObservedChoices({
             audit,
             operations,
             semanticEvidence,
+            buildingResourceClosures,
+            capturedOperations,
           })
         : 'chosenNotificationNotOriginal';
       error ??= binding;
@@ -1022,8 +1030,19 @@ export function createObservedChoices({
               group,
               index,
               owner: sourceOwner(tech.entry, index, tech.sourceActor),
+              sourceToNative,
+              mapCard,
+              buildingResourceClosures,
+              capturedOperations,
             })
           : null;
+        if (proof?.error) issue ??= proof.error;
+        if (proof?.fixedBuildingContribution) {
+          if (consumedImmediateBuildingRewards.has(proof.fixedBuildingContribution.key))
+            issue ??= 'fixedBuildingRewardAlreadyConsumed';
+          else if (!issue)
+            consumedImmediateBuildingRewards.add(proof.fixedBuildingContribution.key);
+        }
         if (!issue && proof?.reward) {
           deferredTechnologies.push({
             boundary: clone(last),
@@ -1047,7 +1066,9 @@ export function createObservedChoices({
                   ? { emptyPaidTechnologyExit: emptyTechnologyExit }
                   : emptyBuildingExit
                     ? { emptyBuildingExit }
-                    : {},
+                    : proof?.fixedBuildingContribution
+                      ? { fixedBuildingContributions: [clone(proof.fixedBuildingContribution)] }
+                      : {},
               );
       }
     }
@@ -1057,7 +1078,7 @@ export function createObservedChoices({
     }
   }
   function finish() {
-    const consumedBuildingRewards = new Set();
+    const consumedBuildingRewards = new Set(consumedImmediateBuildingRewards);
     for (const deferred of deferredTechnologies) {
       const { proof, boundary, group } = deferred;
       let previous = proof.commit,

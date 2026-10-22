@@ -2767,6 +2767,382 @@ function observedChoiceFixture(id) {
 }
 
 const technologyNativeFixtures = new Map();
+function fixedSkullTechnologyFixture(mutateRaw = () => {}) {
+  const raw = fixture();
+  raw.initialState.players['1'].name = 'A';
+  Object.assign(raw.initialState.gamestates, {
+    32: { name: 'construct', type: 'activeplayer' },
+    62: { name: 'freeTechnology', type: 'activeplayer', possibleactions: ['chooseTechnology'] },
+    99: { type: 'manager' },
+  });
+  const nt = (uid, type, args) => ({ uid, type, args, log: '' }),
+    state = (uid, id, args = []) => nt(uid, 'gameStateChange', { id, active_player: '1', args }),
+    technologies = { agriculture: 0, extraction: 3, architecture: 3, theology: 3 },
+    card = { id: '66', type: 'building_age_2', type_arg: '16' },
+    packet = (id, data) => ({
+      channel: '/table/t123',
+      table_id: 123,
+      packet_id: String(id),
+      packet_type: 'resend',
+      move_id: String(id),
+      time: '1',
+      data,
+    });
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [state('construct-menu', 32)]),
+    packet(3, [
+      nt('wood-cost', 'payGoods', {
+        player_id: '1',
+        type: 'wood',
+        quantity: 2,
+        target: 'building',
+      }),
+      nt('stone-cost', 'payGoods', {
+        player_id: '1',
+        type: 'stone',
+        quantity: 1,
+        target: 'building',
+      }),
+      nt('construct', 'construct', { player_id: '1', building: card }),
+      nt('architecture-corn', 'takeGoods', {
+        player_id: '1',
+        type: 'corn',
+        quantity: 1,
+        origin: 'technology_architecture_level_1',
+      }),
+      nt('architecture-score', 'updateScore', { player_id: '1', points: 2 }),
+      nt('fixed-skull', 'takeGoods', {
+        player_id: '1',
+        type: 'skull',
+        quantity: 1,
+        origin: 'building_age_2_b66',
+      }),
+      state('free-menu', 62, technologies),
+    ]),
+    packet(4, [
+      nt('advance', 'increaseTechnology', { player_id: '1', technology_id: 'theology', level: 4 }),
+      nt('cap-skull', 'takeGoods', {
+        player_id: '1',
+        type: 'skull',
+        quantity: 1,
+        origin: 'technology_theology_level_4',
+      }),
+      {
+        ...nt('cap', 'theologyMax', { player_name: 'A' }),
+        log: 'Theology bonus: ${player_name} takes a skull',
+      },
+      nt('return', 'decreaseTechnology', { player_id: '1', technology_id: 'theology', level: 3 }),
+      state('closed', 99),
+    ]),
+  ];
+  mutateRaw(raw);
+  const index = parseNetworkReplay(bytes(raw)),
+    constructionGroup = index.groups.find((g) => g.moveId === 3),
+    group = index.groups.find((g) => g.moveId === 4),
+    beforeBuild = {
+      currentPlayer: 0,
+      skullSupply: 13,
+      players: ['A', 'B', 'C'].map((name) => ({
+        name,
+        resources: { corn: 10, wood: 3, stone: 3, gold: 0, skull: 0 },
+        technologies: clone(technologies),
+        score: 0,
+        buildings: [],
+      })),
+      pending: {
+        task: {
+          type: 'build',
+          remaining: 1,
+          allowMonument: false,
+          cornPayment: false,
+          architectureAvailable: true,
+        },
+        after: [],
+      },
+      untouched: { sentinel: true },
+      log: [],
+    },
+    before = clone(beforeBuild),
+    build = {
+      type: 'build',
+      remaining: 0,
+      allowMonument: false,
+      cornPayment: false,
+      architectureAvailable: false,
+    },
+    tail = [
+      { type: 'effects', effects: [{ type: 'resources', resources: { skull: 1 } }] },
+      clone(build),
+      clone(build),
+    ];
+  before.players[0].resources.wood -= 2;
+  before.players[0].resources.stone--;
+  before.players[0].resources.corn++;
+  before.players[0].score += 2;
+  before.players[0].buildings.push('b26');
+  before.pending = { task: { type: 'technology', remaining: 1, free: true }, after: tail };
+  const after = clone(before);
+  after.players[0].resources.skull += 2;
+  after.skullSupply -= 2;
+  after.pending = null;
+  const row = {
+      action: { type: 'technology', technology: 'theology' },
+      move: { type: 'choose', choiceId: 'theology' },
+    },
+    buildRow = {
+      action: { type: 'build', id: 'b26', cost: [0, 2, 1, 0, 0], architecture: true },
+      move: { type: 'choose', choiceId: 'b26' },
+    },
+    operation = {
+      step: 2,
+      actor: 0,
+      observationActor: 0,
+      sourceActor: '1',
+      entry: group.entries.find((n) => n.uid === 'advance'),
+      row,
+      legalRows: [clone(row)],
+      before,
+      after,
+    },
+    construction = constructionGroup.entries.find((n) => n.uid === 'construct'),
+    fixed = constructionGroup.entries.find((n) => n.uid === 'fixed-skull'),
+    sourceRef = (n) => ({
+      uid: n.uid,
+      packetIndex: n.packetIndex,
+      notificationIndex: n.notificationIndex,
+    }),
+    prior = {
+      step: 1,
+      actor: 0,
+      observationActor: 0,
+      sourceActor: '1',
+      entry: construction,
+      row: buildRow,
+      legalRows: [clone(buildRow)],
+      before: beforeBuild,
+      after: before,
+    },
+    closure = {
+      actor: 0,
+      sourceOwner: '1',
+      building: 'b26',
+      fixed: { skull: 1 },
+      technology: 'any',
+      sourceConstruction: sourceRef(construction),
+      sourceReceipts: [sourceRef(fixed)],
+      startMoveId: 3,
+      initialSkullSupply: 13,
+      consumedAtStep: 2,
+      closed: true,
+      closedMoveId: 4,
+      tail: clone(tail),
+      sourceRewardOrigin: 'building_age_2_b66',
+      decisions: [
+        {
+          step: 2,
+          action: clone(row.action),
+          directContribution: { corn: 0, wood: 0, stone: 0, gold: 0, skull: 1 },
+          fixedContribution: { skull: 1 },
+          preSkullSupply: 13,
+          postSkullSupply: 11,
+          legalOptionsIndependent: true,
+        },
+      ],
+    },
+    sourceToNative = new Map([
+      ['1', 0],
+      ['2', 1],
+      ['3', 2],
+    ]),
+    mapCard = (c) =>
+      c.type === 'building_age_2' && c.id === '66' && c.type_arg === '16' ? 'b26' : null,
+    response = (g, op, human, id, args) => ({
+      group: g,
+      before: op.before,
+      after: op.after,
+      operations: [op],
+      boundary: {
+        potentialHumanDecision: human,
+        sourceStateId: id,
+        sourceActor: '1',
+        sourceMenu: args,
+        nativeActor: 0,
+        nativePending: op.after.pending,
+        nativeLegalActions: human ? [row] : [],
+      },
+      audit: [],
+      publicResultMatched: true,
+      buildingResourceClosures: [closure],
+    });
+  return {
+    operation,
+    operations: [operation],
+    group,
+    index,
+    owner: '1',
+    sourceToNative,
+    mapCard,
+    buildingResourceClosures: [closure],
+    capturedOperations: [{ operation: prior, group: constructionGroup, bindingError: null }],
+    initialMoveId: 2,
+    initialBoundary: {
+      moveId: 2,
+      stateId: 32,
+      name: 'construct',
+      args: [],
+      sourceActor: '1',
+      actor: 0,
+      pending: beforeBuild.pending,
+      legalRows: [buildRow],
+    },
+    responses: [
+      response(constructionGroup, prior, true, 62, technologies),
+      response(group, operation, false, 99, []),
+    ],
+  };
+}
+
+test('fixed skull technology binds distinct original rewards and the complete closed queue', () => {
+  const f = fixedSkullTechnologyFixture(),
+    snapshot = clone(f.operation),
+    proof = technologyChoiceProof(f);
+  assert.equal(proof.error, null);
+  assert.deepEqual(proof.fixedBuildingContribution.fixed, { skull: 1 });
+  assert.equal(proof.fixedBuildingContribution.receipts[0].uid, 'fixed-skull');
+  assert.ok(proof.source.some((r) => r.uid === 'cap-skull'));
+  assert.deepEqual(f.operation, snapshot);
+  const choices = createObservedChoices(f);
+  for (const response of f.responses) choices.observe(response);
+  const result = choices.finish();
+  assert.equal(result.allObservedChoicesMatched, true, JSON.stringify(result.unresolved));
+  assert.equal(result.boundaries[1].fixedBuildingContributions.length, 1);
+  assert.equal(result.candidateSetComparison.state, 'notCompared');
+  choices.observe(f.responses[1]);
+  assert.equal(choices.finish().allObservedChoicesMatched, false);
+});
+
+test('fixed skull technology rejects unbound receipts, ownership, queues and intervening operations', () => {
+  const mutations = [
+    (f) => {
+      f.buildingResourceClosures = [];
+    },
+    (f) => {
+      f.buildingResourceClosures[0].closed = false;
+    },
+    (f) => {
+      f.buildingResourceClosures[0].sourceOwner = '2';
+    },
+    (f) => {
+      f.buildingResourceClosures[0].sourceReceipts.push(
+        clone(f.buildingResourceClosures[0].sourceReceipts[0]),
+      );
+    },
+    (f) => {
+      f.buildingResourceClosures[0].sourceReceipts[0].uid = 'absent';
+    },
+    (f) => {
+      f.buildingResourceClosures[0].fixed.skull = 2;
+    },
+    (f) => {
+      f.buildingResourceClosures[0].decisions[0].directContribution.skull = 2;
+    },
+    (f) => {
+      f.buildingResourceClosures[0].decisions[0].preSkullSupply--;
+    },
+    (f) => {
+      f.buildingResourceClosures[0].tail.push({ type: 'trade' });
+    },
+    (f) => {
+      f.operation.before.pending.after.push({ type: 'trade' });
+    },
+    (f) => {
+      f.operation.after.players[1].resources.skull++;
+    },
+    (f) => {
+      f.operation.after.skullSupply++;
+    },
+    (f) => {
+      f.operation.after.untouched.sentinel = false;
+    },
+    (f) => {
+      f.mapCard = () => 'b25';
+    },
+    (f) => {
+      f.capturedOperations[0].bindingError = 'unbound';
+    },
+    (f) => {
+      f.capturedOperations[0].operation.step--;
+    },
+    (f) => {
+      f.capturedOperations.push(f.capturedOperations[0]);
+    },
+    (f) => {
+      f.capturedOperations[0].operation.row.action = { type: 'offering', resource: 'skull' };
+    },
+    (f) => {
+      f.operation.before.pending.task.free = false;
+    },
+    (f) => {
+      f.index = clone(f.index);
+    },
+  ];
+  for (const mutate of mutations) {
+    const f = fixedSkullTechnologyFixture();
+    mutate(f);
+    assert.ok(technologyChoiceProof(f).error, String(mutate));
+  }
+  for (const change of [
+    (raw) => {
+      raw.gameLogs.data.data[2].data[5].args.player_id = '2';
+    },
+    (raw) => {
+      raw.gameLogs.data.data[2].data[5].args.quantity = 2;
+    },
+    (raw) => {
+      raw.gameLogs.data.data[2].data.push({
+        ...clone(raw.gameLogs.data.data[2].data[5]),
+        uid: 'second-fixed-skull',
+      });
+    },
+  ])
+    assert.ok(technologyChoiceProof(fixedSkullTechnologyFixture(change)).error);
+  assert.throws(
+    () =>
+      fixedSkullTechnologyFixture((raw) => {
+        raw.gameLogs.data.data[3].data[1].uid = 'fixed-skull';
+      }),
+    /duplicate notification/,
+  );
+  for (const supply of [0, 1, 2]) {
+    const f = fixedSkullTechnologyFixture(),
+      w = f.buildingResourceClosures[0];
+    f.operation.before.skullSupply = supply;
+    f.operation.after.skullSupply = supply - 2;
+    w.initialSkullSupply = w.decisions[0].preSkullSupply = supply;
+    w.decisions[0].postSkullSupply = supply - 2;
+    assert.equal(technologyChoiceProof(f).error === null, supply === 2);
+  }
+  for (const mutate of [
+    (f) => {
+      f.buildingResourceClosures = [];
+    },
+    (f) => {
+      f.buildingResourceClosures[0].sourceOwner = '2';
+    },
+    (f) => {
+      f.buildingResourceClosures[0].tail.push({ type: 'trade' });
+    },
+  ]) {
+    const f = fixedSkullTechnologyFixture();
+    mutate(f);
+    const choices = createObservedChoices(f);
+    for (const response of f.responses)
+      choices.observe({ ...response, buildingResourceClosures: f.buildingResourceClosures });
+    assert.equal(choices.finish().allObservedChoicesMatched, false);
+  }
+});
+
 function nativeTechnologyChoice(track, { free = false, capped = false } = {}) {
   const key = JSON.stringify([track, free, capped]);
   if (technologyNativeFixtures.has(key)) return structuredClone(technologyNativeFixtures.get(key));
