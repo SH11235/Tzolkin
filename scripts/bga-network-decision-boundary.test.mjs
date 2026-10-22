@@ -4,88 +4,46 @@ import { recordDecisionBoundary } from './bga-network-decision-boundary.mjs';
 import { readFileSync } from 'node:fs';
 import { finalMonumentMetric, knownFinalMetricRefusal } from './bga-network-final-scoring.mjs';
 
-test('unsupported final metrics are issued only for canonical owned catalog cards', () => {
+test('reviewed final metrics retain canonical ownership and reject fabricated refusal metadata', () => {
   const catalog = JSON.parse(
     readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
   );
-  for (const metric of ['maxTechnologies', 'templePoints']) {
-    const card = catalog.MONUMENTS.find((m) => m.scoreKey === metric),
+  for (const id of ['m07', 'm11']) {
+    const card = catalog.MONUMENTS.find((m) => m.id === id),
       player = {
-        monuments: [card.id],
+        monuments: [id],
         technologies: { agriculture: 0, extraction: 3, architecture: 0, theology: 0 },
-        templePoints: 0,
+        temples: { chaac: 0, quetzalcoatl: 0, kukulkan: 0 },
+        templePoints: -3,
       },
       state = { players: [player] };
-    let refusal;
-    assert.throws(
-      () => finalMonumentMetric(state, player, card, catalog),
-      (error) => {
-        refusal = error;
-        assert.deepEqual(knownFinalMetricRefusal(error), {
-          type: 'UnsupportedFinalMetric',
-          code: 'unsupportedFinalMonumentMetric',
-          origin: 'finalMonumentMetric',
-          monument: card.id,
-          metric,
-        });
-        return true;
-      },
+    assert.deepEqual(
+      finalMonumentMetric(state, player, card, catalog),
+      id === 'm07' ? { nbr: 1, points: 9 } : { points: 0 },
     );
-    const negative = { ...structuredClone(player), templePoints: -3 };
-    assert.throws(
-      () => finalMonumentMetric({ players: [negative] }, negative, card, catalog),
-      (error) => {
-        assert.equal(knownFinalMetricRefusal(error)?.metric, metric);
-        return true;
+    for (const fake of [
+      {
+        name: 'UnsupportedFinalMetric',
+        code: 'unsupportedFinalMonumentMetric',
+        origin: 'finalMonumentMetric',
       },
-    );
-    assert.equal(knownFinalMetricRefusal({ ...refusal }), null);
-    assert.equal(
-      knownFinalMetricRefusal(
-        Object.assign(Object.create(Object.getPrototypeOf(refusal)), refusal),
-      ),
-      null,
-    );
-    assert.equal(knownFinalMetricRefusal(JSON.parse(JSON.stringify(refusal))), null);
-    assert.equal(
-      knownFinalMetricRefusal(
-        Object.assign(new Error(refusal.message), {
-          code: refusal.code,
-          origin: refusal.origin,
-          name: refusal.name,
-        }),
-      ),
-      null,
-    );
-    for (const mutate of [
-      (p, c) => {
-        c.cost = {};
-      },
-      (p, c) => {
-        c.id = 'unknown';
-      },
-      (p, c) => {
-        c.scoreKey = 'unknown';
-      },
-      (p) => {
-        p.monuments = [];
-      },
-      (p) => {
-        p.monuments.push(card.id);
-      },
-      (p) => {
-        p.technologies.theology = 4;
-      },
-      (p) => {
-        p.templePoints = NaN;
-      },
-      (p) => {
-        p.templePoints = 0.5;
-      },
-    ]) {
+      Object.assign(new Error('unreviewed monument metric'), {
+        name: 'UnsupportedFinalMetric',
+        code: 'unsupportedFinalMonumentMetric',
+        origin: 'finalMonumentMetric',
+      }),
+    ])
+      assert.equal(knownFinalMetricRefusal(fake), null);
+    for (const kind of ['card', 'owner', 'duplicate', 'metric']) {
       const p = structuredClone(player),
         c = structuredClone(card);
-      mutate(p, c);
+      if (kind === 'card') c.cost = {};
+      if (kind === 'owner') p.monuments = [];
+      if (kind === 'duplicate') p.monuments.push(id);
+      if (kind === 'metric') {
+        if (id === 'm07') p.technologies.theology = 4;
+        else p.temples.chaac = 6;
+      }
       assert.throws(
         () => finalMonumentMetric({ players: [p] }, p, c, catalog),
         (error) => {

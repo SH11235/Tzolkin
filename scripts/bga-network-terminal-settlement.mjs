@@ -5,7 +5,11 @@ import {
   originalFinalScoringCaption,
 } from './bga-network.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
-import { finalMonumentMetric, finalResourceComponents } from './bga-network-final-scoring.mjs';
+import {
+  finalMonumentMetric,
+  finalMonumentReceipt,
+  finalResourceComponents,
+} from './bga-network-final-scoring.mjs';
 import { terminalRoundSourceClaim } from './bga-network-terminal-claim.mjs';
 
 const issued = new WeakMap();
@@ -23,29 +27,16 @@ const metricFields = [
   'feedWorkers',
   'feedDiscount',
 ];
-const suffixes = {
-  graveyards: 'Tombs',
-  municipals: 'Civic buildings',
-  shrines: 'Shrines',
-  constructions: 'buildings and monuments',
-  cornTiles: 'Corn Harvest Tile',
-  woodTiles: 'Wood Harvest Tile',
-  technologyLevels: 'technology level',
-  workers: 'workers in play',
-  highestTemple: 'steps above the starting space',
-  allSkulls: 'Skulls on Chichen Itza',
-  maxTechnologies: 'technologies at 3rd level',
-};
 const fail = () => {
   throw new Error('Network terminal settlement: independent component proof failed');
 };
 const check = (ok) => {
   if (!ok) fail();
 };
-const integer = (x) => {
+const integer = (x, signed = false) => {
   check(
     ['number', 'string'].includes(typeof x) &&
-      /^(0|[1-9]\d*)$/.test(String(x)) &&
+      (signed ? /^(0|-?[1-9]\d*)$/ : /^(0|[1-9]\d*)$/).test(String(x)) &&
       Number.isSafeInteger(Number(x)),
   );
   return Number(x);
@@ -62,14 +53,6 @@ const inputIdentities = ({ index, context, sourceToNative, catalog }) => [
   context.transitions,
   ...context.transitions.flatMap((t) => [t, t.before, t.after, t.legalActions]),
 ];
-
-function monumentMetric(state, player, card, catalog) {
-  if (card.scoreKey !== 'maxTechnologies') return finalMonumentMetric(state, player, card, catalog);
-  const levels = Object.values(player.technologies);
-  check(levels.length === 4 && levels.every((n) => Number.isInteger(n) && n >= 0 && n <= 3));
-  const nbr = levels.filter((n) => n === 3).length;
-  return { nbr, points: [0, 9, 20, 33, 33][nbr] };
-}
 
 function validate({ index, context, ledger, native, sourceToNative, catalog }) {
   const { group, source, native: before, transitions } = context;
@@ -275,7 +258,7 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
       check(
         effect.type === 'updateScore' &&
           String(effect.args.player_id) === String(caption.args.player_id) &&
-          integer(effect.args.points) === integer(caption.args.points),
+          integer(effect.args.points, true) === integer(caption.args.points, true),
       );
       check(sourceToNative.has(String(effect.args.player_id)));
       return { effect, caption };
@@ -325,10 +308,26 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
         ['player_id', 'player_name', 'points', ...(hasMetric ? ['nbr'] : [])].sort(),
       ),
     );
-    if (hasMetric) check(!resourcesStarted);
-    else {
+    if (bound.caption === 'Remaining resources: ${player_name} scores ${points} points') {
+      check(!hasMetric);
       resourcesStarted = true;
       check(sourceToNative.get(String(caption.args.player_id)) === finalResourceActor++);
+    } else {
+      check(!resourcesStarted);
+      const player = before.players[sourceToNative.get(String(caption.args.player_id))];
+      check(
+        player.monuments.some((id) => {
+          const cards = catalog.MONUMENTS.filter((m) => m.id === id);
+          check(cards.length === 1);
+          return !!finalMonumentReceipt({
+            entry: caption,
+            state: before,
+            player,
+            card: cards[0],
+            catalog,
+          });
+        }),
+      );
     }
   }
   check(finalResourceActor === 3);
@@ -376,7 +375,10 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
     const templeReceipts = temple.filter(
       (r) => r.caption.type === 'templeScore' && String(r.caption.args.player_id) === id,
     );
-    check(templeReceipts.length === 1 && integer(templeReceipts[0].caption.args.points) === points);
+    check(
+      templeReceipts.length === 1 &&
+        integer(templeReceipts[0].caption.args.points, true) === points,
+    );
     const score = p.score - unfed * 3 + points + bonus;
     check(f.score === score && f.templePoints === p.templePoints + points);
     check(
@@ -392,15 +394,11 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
       const cards = catalog.MONUMENTS.filter((c) => c.id === monument);
       check(cards.length === 1);
       const card = cards[0],
-        metric = monumentMetric(before, p, card, catalog);
+        metric = finalMonumentMetric(before, p, card, catalog);
       const matches = finals.filter(
         ({ caption: n }) =>
           String(n.args.player_id) === id &&
-          Object.hasOwn(n.args, 'nbr') &&
-          originalFinalScoringCaption(n)?.caption ===
-            'Monument: ${player_name} scores ${points} for ${nbr} ' + suffixes[card.scoreKey] &&
-          integer(n.args.nbr) === metric.nbr &&
-          integer(n.args.points) === metric.points,
+          !!finalMonumentReceipt({ entry: n, state: before, player: p, card, catalog }),
       );
       check(matches.length === 1 && !consumed.has(matches[0].caption));
       consumed.add(matches[0].caption);
@@ -408,7 +406,11 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
     }
     const { resourcePoints, skullPoints } = finalResourceComponents(resources);
     const rr = finals.filter(
-      ({ caption: n }) => String(n.args.player_id) === id && !Object.hasOwn(n.args, 'nbr'),
+      ({ caption: n }) =>
+        String(n.args.player_id) === id &&
+        originalFinalScoringCaption(n)?.caption ===
+          'Remaining resources: ${player_name} scores ${points} points' &&
+        !Object.hasOwn(n.args, 'nbr'),
     );
     check(
       rr.length === 1 &&

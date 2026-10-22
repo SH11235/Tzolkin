@@ -5,7 +5,6 @@ import { originalFinalScoringCaption } from './bga-network.mjs';
 const canonicalCatalog = JSON.parse(
   readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
 );
-const unsupportedMetrics = new Set(['maxTechnologies', 'templePoints']);
 const issuedRefusals = new WeakMap();
 class UnsupportedFinalMetric extends Error {
   constructor(card) {
@@ -48,12 +47,14 @@ const suffixes = {
   highestTemple: 'steps above the starting space',
   allSkulls: 'Skulls on Chichen Itza',
   allMonuments: 'monuments construted by all players',
+  maxTechnologies: 'technologies at 3rd level',
+  templePoints: 'points in the temples',
 };
 const clockTypes = new Set(['updateReflexionTime', 'timeJokerUsed']);
-const integer = (value) => {
+const integer = (value, signed = false) => {
   if (
     !['number', 'string'].includes(typeof value) ||
-    !/^(0|[1-9]\d*)$/.test(String(value)) ||
+    !(signed ? /^(0|-?[1-9]\d*)$/ : /^(0|[1-9]\d*)$/).test(String(value)) ||
     !Number.isSafeInteger(Number(value))
   )
     fail('noncanonical receipt integer');
@@ -69,10 +70,58 @@ const reference = (n) => ({
 
 export function finalMonumentMetric(state, player, card, catalog) {
   const key = card.scoreKey;
+  if (key === 'maxTechnologies' || key === 'templePoints') {
+    const canonical = canonicalCatalog.MONUMENTS.find((m) => m.id === card.id);
+    if (
+      !isDeepStrictEqual(card, canonical) ||
+      !isDeepStrictEqual(
+        catalog.MONUMENTS.filter((m) => m.id === card.id),
+        [canonical],
+      ) ||
+      !state.players?.includes(player) ||
+      !player.monuments?.includes(card.id) ||
+      new Set(player.monuments).size !== player.monuments.length ||
+      player.monuments.some((id) => !canonicalCatalog.MONUMENTS.some((m) => m.id === id))
+    )
+      fail('canonical monument ownership differs');
+    if (key === 'maxTechnologies') {
+      if (
+        !player.technologies ||
+        !isDeepStrictEqual(Object.keys(player.technologies).sort(), [
+          'agriculture',
+          'architecture',
+          'extraction',
+          'theology',
+        ]) ||
+        Object.values(player.technologies).some((n) => !Number.isInteger(n) || n < 0 || n > 3)
+      )
+        fail('invalid source technology levels');
+      const nbr = Object.values(player.technologies).filter((n) => n === 3).length;
+      return { nbr, points: [0, 9, 20, 33, 33][nbr] };
+    }
+    if (
+      !isDeepStrictEqual(catalog.TEMPLE_TRACKS, canonicalCatalog.TEMPLE_TRACKS) ||
+      !player.temples ||
+      !isDeepStrictEqual(
+        Object.keys(player.temples).sort(),
+        Object.keys(canonicalCatalog.TEMPLE_TRACKS).sort(),
+      ) ||
+      Object.entries(player.temples).some(
+        ([t, n]) => !Number.isInteger(n) || n < -1 || n > catalog.TEMPLE_TRACKS[t].max,
+      )
+    )
+      fail('invalid source temple positions');
+    return {
+      points: Object.entries(player.temples).reduce(
+        (sum, [t, n]) => sum + catalog.TEMPLE_TRACKS[t].points[n + 1],
+        0,
+      ),
+    };
+  }
   if (!Object.hasOwn(suffixes, key)) {
     const canonical = canonicalCatalog.MONUMENTS.find((m) => m.id === card.id);
     if (
-      unsupportedMetrics.has(key) &&
+      canonical &&
       isDeepStrictEqual(card, canonical) &&
       isDeepStrictEqual(
         catalog.MONUMENTS.filter((m) => m.id === card.id),
@@ -140,6 +189,28 @@ export function finalMonumentMetric(state, player, card, catalog) {
   integer(nbr);
   integer(points);
   return { nbr, points };
+}
+
+export function finalMonumentReceipt({ entry, state, player, card, catalog }) {
+  const original = originalFinalScoringCaption(entry),
+    quantity = card.scoreKey !== 'templePoints';
+  const caption = quantity
+    ? 'Monument: ${player_name} scores ${points} for ${nbr} ' + suffixes[card.scoreKey]
+    : 'Monument: ${player_name} scores ${points} for points in the temples';
+  if (!original || original.caption !== caption) return null;
+  if (
+    !Object.hasOwn(suffixes, card.scoreKey) ||
+    !exactKeys(entry.args, ['player_id', 'player_name', 'points', ...(quantity ? ['nbr'] : [])]) ||
+    entry.args.player_name !== original.playerName
+  )
+    fail('monument caption shape or original actor differs');
+  const expected = finalMonumentMetric(state, player, card, catalog);
+  if (
+    (quantity && integer(entry.args.nbr) !== expected.nbr) ||
+    integer(entry.args.points, true) !== expected.points
+  )
+    return null;
+  return expected;
 }
 
 export function finalResourceComponents(resources) {
@@ -288,7 +359,8 @@ export function finalScoringWitness({
       } else if (
         effect.type !== 'updateScore' ||
         !['templeLeader', 'templeScore'].includes(caption.type) ||
-        integer(effect.args.points) !== integer(caption.args.points)
+        integer(effect.args.points, caption.type === 'templeScore') !==
+          integer(caption.args.points, caption.type === 'templeScore')
       )
         fail('temple effect differs from original receipt');
     }
@@ -395,36 +467,35 @@ export function finalScoreReceiptComponents({
       String(update.args.player_id) !== id ||
       update.args.player_name !== null ||
       receipt.args.player_name !== bound.playerName ||
-      integer(update.args.points) !== integer(receipt.args.points)
+      integer(update.args.points, true) !== integer(receipt.args.points, true)
     )
       fail('receipt actor, name, shape or adjacent score increment differs');
-    const points = integer(receipt.args.points);
-    if (hasMetric) {
+    const points = integer(receipt.args.points, true);
+    if (bound.caption !== 'Remaining resources: ${player_name} scores ${points} points') {
       if (resourcesStarted) fail('monument receipt follows resource receipts');
-      const nbr = integer(receipt.args.nbr),
-        p = state.players[player.actor];
+      const p = state.players[player.actor];
       const matches = player.remaining.filter((id) => {
         const cards = catalog.MONUMENTS.filter((c) => c.id === id);
         if (cards.length !== 1) fail('unknown monument identity');
-        const card = cards[0],
-          expected = finalMonumentMetric(state, p, card, catalog);
-        return (
-          bound.caption ===
-            'Monument: ${player_name} scores ${points} for ${nbr} ' + suffixes[card.scoreKey] &&
-          nbr === expected.nbr &&
-          points === expected.points
-        );
+        return !!finalMonumentReceipt({
+          entry: receipt,
+          state,
+          player: p,
+          card: cards[0],
+          catalog,
+        });
       });
       if (matches.length !== 1) fail('missing, duplicate, ambiguous or incorrect monument receipt');
       player.remaining.splice(player.remaining.indexOf(matches[0]), 1);
-      player.monuments.push({ monument: matches[0], nbr, points, source: reference(receipt) });
+      player.monuments.push({
+        monument: matches[0],
+        ...(hasMetric ? { nbr: integer(receipt.args.nbr) } : {}),
+        points,
+        source: reference(receipt),
+      });
     } else {
       resourcesStarted = true;
-      if (
-        bound.caption !== 'Remaining resources: ${player_name} scores ${points} points' ||
-        player.resource !== null ||
-        player.actor !== resourceActor++
-      )
+      if (hasMetric || points < 0 || player.resource !== null || player.actor !== resourceActor++)
         fail('resource receipt identity, order or multiplicity differs');
       player.resource = { points, source: reference(receipt) };
     }

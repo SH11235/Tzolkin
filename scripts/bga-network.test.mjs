@@ -284,16 +284,46 @@ test('terminal settlement binds individual awards before semantic acceptance', (
       ),
     ),
   );
-  assert.throws(
-    () =>
-      finalMonumentMetric(
-        input.context.native,
-        input.context.native.players[0],
-        input.catalog.MONUMENTS.find((c) => c.id === 'm07'),
-        input.catalog,
-      ),
-    /unreviewed/,
+  assert.deepEqual(
+    finalMonumentMetric(
+      input.context.native,
+      input.context.native.players[0],
+      input.catalog.MONUMENTS.find((c) => c.id === 'm07'),
+      input.catalog,
+    ),
+    { nbr: 3, points: 33 },
   );
+});
+
+test('terminal settlement identifies the temple monument without treating it as resources', () => {
+  const { input, claim } = terminalSettlementFixture((entries) => {
+    const at = entries.findIndex(
+      (n) => n.type === 'finalScoring' && n.log.endsWith('technologies at 3rd level'),
+    );
+    entries[at].log = 'Monument: ${player_name} scores ${points} for points in the temples';
+    delete entries[at].args.nbr;
+    entries[at].args.points = 4;
+    entries[at - 1].args.points = 4;
+  });
+  input.context.source.players['1'].monuments = ['m11'];
+  input.ledger.players['1'].monuments = ['m11'];
+  input.ledger.players['1'].score = 23;
+  const states = [
+    input.context.native,
+    input.native,
+    ...input.context.transitions.flatMap((t) => [t.before, t.after]),
+  ];
+  for (const state of states) {
+    state.players[0].monuments = ['m11'];
+    if (state.phase === 'finished') {
+      state.players[0].score = 23.75;
+      state.finalScores[0].monumentPoints = 4;
+      state.finalScores[0].total = 23.75;
+    }
+  }
+  const proof = prepareTerminalScoreSettlement(input);
+  assert.ok(proof);
+  assert.equal(terminalSettlementScoreUids(proof, { ...input, claim }).length, 5);
 });
 
 test('terminal settlement rejects compensating original awards and changed captions', () => {
