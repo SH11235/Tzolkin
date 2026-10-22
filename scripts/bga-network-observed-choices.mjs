@@ -1,5 +1,6 @@
 import { isDeepStrictEqual as same } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
+import { closedEmptyBuildingExit } from './bga-network-empty-building.mjs';
 import {
   technologyChoiceProof,
   begChoiceProof,
@@ -972,9 +973,14 @@ export function createObservedChoices({
           sourceAfter,
           next,
         );
-        let issue = emptyTechnologyExit
-          ? null
-          : observedStageArguments(last, operations[0], operations);
+        const emptyBuildingExit = closedEmptyBuildingExit(
+          audit.find((a) => a.emptyBuildingExit)?.emptyBuildingExit,
+          { group, before, after, operations, sourceBefore, sourceAfter, boundary: last },
+        );
+        let issue =
+          emptyTechnologyExit || emptyBuildingExit
+            ? null
+            : observedStageArguments(last, operations[0], operations);
         if (last.name === 'playerTurn' || last.name === 'pickUpWorker') {
           const removal = operations.find((o) => o.row.action.type === 'remove');
           if (removal) {
@@ -1030,10 +1036,18 @@ export function createObservedChoices({
             ? fail(last, issue)
             : pass(
                 last,
-                emptyTechnologyExit ? 'emptyPaidTechnologyExit' : 'observedLegalSelection',
+                emptyTechnologyExit
+                  ? 'emptyPaidTechnologyExit'
+                  : emptyBuildingExit
+                    ? 'emptyBuildingExit'
+                    : 'observedLegalSelection',
                 group,
                 operations,
-                emptyTechnologyExit ? { emptyPaidTechnologyExit: emptyTechnologyExit } : {},
+                emptyTechnologyExit
+                  ? { emptyPaidTechnologyExit: emptyTechnologyExit }
+                  : emptyBuildingExit
+                    ? { emptyBuildingExit }
+                    : {},
               );
       }
     }

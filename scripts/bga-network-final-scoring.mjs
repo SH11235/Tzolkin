@@ -15,6 +15,7 @@ const suffixes = {
   workers: 'workers in play',
   highestTemple: 'steps above the starting space',
   allSkulls: 'Skulls on Chichen Itza',
+  allMonuments: 'monuments construted by all players',
 };
 const clockTypes = new Set(['updateReflexionTime', 'timeJokerUsed']);
 const integer = (value) => {
@@ -61,6 +62,18 @@ export function finalMonumentMetric(state, player, card, catalog) {
   } else if (key === 'highestTemple') {
     nbr = Math.max(0, ...Object.values(player.temples));
     points = nbr * 3;
+  } else if (key === 'allMonuments') {
+    const owned = state.players.flatMap((p) => p.monuments);
+    if (
+      ![2, 3, 4].includes(state.players.length) ||
+      !player.monuments.includes(card.id) ||
+      new Set(owned).size !== owned.length ||
+      owned.some((id) => catalog.MONUMENTS.filter((m) => m.id === id).length !== 1) ||
+      owned.some((id) => state.monuments.includes(id))
+    )
+      fail('global monument ownership or player count differs');
+    nbr = owned.length;
+    points = nbr * (8 - state.players.length);
   } else {
     nbr = state.skullSpaces.filter((s) => s !== null).length;
     points = nbr * 3;
@@ -251,6 +264,20 @@ export function finalScoreReceiptComponents({
   sourceBoard,
   catalog,
 }) {
+  if (
+    state.players.some((p) =>
+      p.monuments.some((id) =>
+        catalog.MONUMENTS.some((m) => m.id === id && m.scoreKey === 'allMonuments'),
+      ),
+    ) &&
+    (state.players.length !== sourceToNative.size ||
+      sourceBoard.players.length !== state.players.length ||
+      new Set(sourceToNative.values()).size !== state.players.length ||
+      [...sourceToNative.values()].some(
+        (actor) => !Number.isSafeInteger(actor) || actor < 0 || actor >= state.players.length,
+      ))
+  )
+    fail('global monument player roster differs from source');
   const players = new Map();
   for (const [id, actor] of sourceToNative) {
     const p = state.players[actor],

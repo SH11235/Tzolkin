@@ -331,9 +331,11 @@ const {
   terminalPlayingCalendarWitness,
   bindTerminalCalendarTransition,
   feedingSourceBoardCheckpoint,
+  checkpointOperationType,
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
+const clone = structuredClone;
 
 function remainingDeclineFixture() {
   const worker = { id: '2', player: '1', place: 'chichenItza', position: '2' };
@@ -1418,6 +1420,173 @@ function setup(
   assert.deepEqual(initial, original);
   return result;
 }
+
+function emptyBuildingPrefix(includeExit = true) {
+  const raw = fixture();
+  Object.assign(raw.initialState, {
+    buildings: [],
+    monuments: [],
+    constructions: {},
+    wealthTiles: {},
+    cornOnWheel: '0',
+    remainingSkulls: '13',
+    jungle: {},
+    gears: { tikal: { teethnbr: 10 } },
+  });
+  for (const p of Object.values(raw.initialState.players))
+    Object.assign(p, { corn_tile: '0', wood_tile: '0', flipped: '0' });
+  const menu = {
+    workers: { 1: { id: '1', place: 'tikal', position: '2', actions: { tikal: { 2: 0 } } } },
+  };
+  Object.assign(raw.initialState.gamestates, {
+    4: {
+      name: 'playerTurn',
+      type: 'activeplayer',
+      possibleactions: ['placeWorker', 'pickUpWorker', 'endTurn'],
+    },
+    9: { name: 'solveStackedAction', type: 'game', transitions: { construct: 32, stackEmpty: 7 } },
+    32: {
+      name: 'construct',
+      type: 'activeplayer',
+      possibleactions: ['construct', 'pass'],
+      transitions: { nextAction: 9 },
+    },
+    7: { name: 'pickUpWorker', type: 'activeplayer', possibleactions: ['pickUpWorker', 'endTurn'] },
+  });
+  let uid = 100;
+  const n = (type, args) => ({ uid: String(++uid), type, args, log: '' });
+  const state = (id, args) =>
+    n('gameStateChange', {
+      id,
+      active_player: '1',
+      type: id === 9 ? 'game' : 'activeplayer',
+      args,
+    });
+  const packet = (id, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(id),
+    packet_type: 'resend',
+    move_id: String(id),
+    time: '1',
+    data,
+  });
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    packet(2, [
+      n('wealthTiles', {}),
+      n('placeWorker', { player_id: '1', worker_id: '1', place: 'tikal', position: '2', corn: 0 }),
+      state(4, menu),
+    ]),
+    packet(3, [
+      n('pickUpWorker', {
+        player_id: '1',
+        worker_id: '1',
+        city: 'Tikal',
+        position: '2',
+        action_number: '2',
+        corn: 0,
+      }),
+      state(9, []),
+      state(32, []),
+    ]),
+    ...(includeExit ? [packet(4, [state(9, []), state(7, { workers: [] })])] : []),
+  ];
+  const initial = clone(setup().record.initial);
+  initial.gears = { tikal: Array(10).fill(null) };
+  initial.gears.tikal[2] = { playerId: 0, dummy: false };
+  for (const p of initial.players) p.doubleAdvanceAvailable = true;
+  const remove = {
+    action: { type: 'remove', gear: 'tikal', position: 2 },
+    move: { type: 'remove', gear: 'tikal', position: 2 },
+  };
+  const skip = { action: { type: 'skip' }, move: { type: 'choose', choiceId: 'skip' } };
+  const end = { action: { type: 'endTurn', doubleAdvance: null }, move: { type: 'endTurn' } };
+  const applied = [];
+  const dispatch = (request) => {
+    const state = clone(request.state);
+    if (request.operation === 'publicApply') {
+      applied.push(clone(request.move));
+      if (request.move.type === 'remove') {
+        state.gears.tikal[2] = null;
+        state.turn = { mode: 'remove', count: 1, begged: false };
+        state.pending = {
+          title: 'ティカル：実行するアクションを選択',
+          task: { type: 'action', gear: 'tikal', position: 2 },
+          after: [],
+        };
+      } else {
+        assert.deepEqual(request.move, skip.move);
+        state.pending = null;
+      }
+    }
+    return {
+      snapshot: { state },
+      observation: {
+        actor: 0,
+        legalActions: [state.pending ? skip : state.turn.mode === 'remove' ? end : remove],
+      },
+    };
+  };
+  return {
+    result: convertNetworkInputs(
+      {
+        bytes: bytes(raw),
+        studioBytes: Buffer.from('synthetic studio'),
+        gameBytes: Buffer.from('synthetic game'),
+        witnessesBytes: bytes({
+          schema: 'tzolkin-bga-public-witnesses-v1',
+          tableId: '123',
+          initial,
+          initialActionId: 2,
+        }),
+      },
+      dispatch,
+    ),
+    applied,
+  };
+}
+
+test('empty-building proof and the real skip share a step without shadowing its checkpoint', () => {
+  const { result, applied } = emptyBuildingPrefix();
+  assert.equal(result.blocked, null);
+  assert.deepEqual(applied, [
+    { type: 'remove', gear: 'tikal', position: 2 },
+    { type: 'choose', choiceId: 'skip' },
+  ]);
+  assert.equal(result.record.steps.length, 2);
+  assert.deepEqual(result.record.steps[1].checkpoint.source.actionIds, [4]);
+  const proof = result.audit.find((a) => a.emptyBuildingExit);
+  const operation = result.audit.find((a) => a.step === proof.step && a.action);
+  assert.equal(operation.action.type, 'skip');
+  assert.equal(proof.emptyBuildingExit.closed, true);
+  const boundary = result.observedTrajectory.boundaries.find((b) => b.moveId === 3);
+  assert.equal(boundary.verified, true);
+  assert.equal(boundary.kind, 'emptyBuildingExit');
+  const truncated = emptyBuildingPrefix(false);
+  assert.equal(
+    truncated.result.observedTrajectory.boundaries.find((b) => b.moveId === 3).verified,
+    false,
+  );
+  assert.equal(truncated.result.completionEvidence.prerequisites.legacyObligationsClosed, false);
+});
+
+test('checkpoint types require one actual operation at the exact step', () => {
+  for (const type of ['skip', 'endTurn', 'rotate']) {
+    const operation = { step: 2, row: { action: { type } } };
+    const evidence = { step: 2, emptyBuildingExit: { closed: true } };
+    const earlier = { step: 1, row: { action: { type: 'place' } } };
+    for (const operations of [
+      [earlier, operation],
+      [operation, earlier],
+    ]) {
+      assert.equal(checkpointOperationType(operations, 2), type);
+    }
+    assert.throws(() => checkpointOperationType([], 2), /exactly one/);
+    assert.throws(() => checkpointOperationType([operation, clone(operation)], 2), /exactly one/);
+    assert.throws(() => checkpointOperationType([evidence], 2), /exactly one/);
+  }
+});
 
 test('prefix applies a uniquely observed legal operation and retains source checkpoints', () => {
   const result = setup();

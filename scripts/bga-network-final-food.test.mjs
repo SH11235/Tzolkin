@@ -1,8 +1,16 @@
 import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { parseNetworkReplay } from './bga-network.mjs';
-import { finalScoringWitness } from './bga-network-final-scoring.mjs';
+import {
+  finalScoringWitness,
+  finalMonumentMetric,
+  finalScoreReceiptComponents,
+  bindFinalScoringProjections,
+} from './bga-network-final-scoring.mjs';
+import { coreDispatcher } from './bga-replay.mjs';
 import {
   createFinalFoodProof,
   createZeroCornFinalFoodProof,
@@ -14,7 +22,10 @@ import { proveBoundTerminalCoordinates } from './bga-network-semantic-calendar.m
 import { comparePublicBoundary, inspectTerminalProjection } from './bga-network-terminal.mjs';
 
 const clone = structuredClone;
-function fixture(changeRaw = () => {}, { zeroCorn = false } = {}) {
+const catalog = JSON.parse(
+  readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+);
+function fixture(changeRaw = () => {}, { zeroCorn = false, globalMonuments = false } = {}) {
   const amount = zeroCorn ? 0 : 3;
   const sourceToNative = new Map(['1', '2', '3', '4'].map((id, actor) => [id, actor]));
   let uid = 0;
@@ -213,6 +224,29 @@ function fixture(changeRaw = () => {}, { zeroCorn = false } = {}) {
     Object.assign(rotation.args, { day: 28, twice: 1, player_id: '1' });
     rotation.args.workers[0].position = 2;
   }
+  if (globalMonuments) {
+    const receipts = raw.gameLogs.data.data.at(-2).data;
+    const header = receipts.findIndex((n) => n.type === 'finalScoring' && Array.isArray(n.args));
+    const values = [
+      ['1', 20, 5, 'monuments construted by all players'],
+      ['2', 4, 1, 'Civic buildings'],
+      ['3', 0, 0, 'Corn Harvest Tile'],
+      ['4', 0, 0, 'Wood Harvest Tile'],
+      ['4', 0, 0, 'Skulls on Chichen Itza'],
+    ];
+    receipts.splice(
+      header + 1,
+      0,
+      ...values.flatMap(([id, points, nbr, suffix]) => [
+        n('updateScore', { player_id: id, player_name: null, points }),
+        n(
+          'finalScoring',
+          { player_id: id, player_name: `P${id}`, points, nbr },
+          'Monument: ${player_name} scores ${points} for ${nbr} ' + suffix,
+        ),
+      ]),
+    );
+  }
   changeRaw(raw, raw.gameLogs.data.data.at(-2).data);
   const index = parseNetworkReplay(Buffer.from(JSON.stringify(raw))),
     group = index.groups.find((g) => g.moveId === 6);
@@ -265,6 +299,10 @@ function fixture(changeRaw = () => {}, { zeroCorn = false } = {}) {
     gears: { palenque: [{ playerId: 1, dummy: false }, null, ...(zeroCorn ? [null] : [])] },
     skullSpaces: Array.from({ length: 10 }, () => null),
   };
+  if (globalMonuments)
+    before.players.forEach((p, actor) => {
+      p.monuments = [['m05'], ['m06'], ['m03'], ['m04', 'm13']][actor];
+    });
   const initial = clone(before);
   Object.assign(initial, {
     round: 1,
@@ -308,7 +346,7 @@ function fixture(changeRaw = () => {}, { zeroCorn = false } = {}) {
   });
   Object.values(ledger.players).forEach((p, actor) => {
     p.resources.corn = 0;
-    p.score = [18, 23, 20, 21][actor];
+    p.score = [18, 23, 20, 21][actor] + (globalMonuments ? [20, 4, 0, 0][actor] : 0);
   });
   const native = clone(before);
   Object.assign(native, {
@@ -701,7 +739,17 @@ function publicCaller(f, mutate = () => {}) {
       observation = clone(f.input.observation);
       diff = [
         { field: 'firstPlayer', native: 2, observed: 0 },
-        { field: 'player.1.score', native: 17, observed: 18 },
+        ...native.players.flatMap((p, actor) =>
+          p.score !== ledger.players[String(actor + 1)].score
+            ? [
+                {
+                  field: `player.${actor + 1}.score`,
+                  native: p.score,
+                  observed: ledger.players[String(actor + 1)].score,
+                },
+              ]
+            : [],
+        ),
       ];
       applied = [{ actor: 1, action: { type: 'endTurn' }, step: 10 }];
       mutate({ context, ledger, native, observation, diff });
@@ -1047,4 +1095,291 @@ test('public terminal caller accepts day28 only after the live zero double rotat
     inspectTerminalProjection({ ...terminalArguments, zeroCornFinalEvidence: proof }).completed,
     false,
   );
+});
+
+function monumentReceiptInput(f) {
+  const entries = f.input.context.group.entries;
+  return {
+    entries,
+    header: entries.find((n) => n.type === 'finalScoring' && Array.isArray(n.args)),
+    end: entries.find((n) => n.type === 'gameStateChange' && Number(n.args.id) === 95),
+    state: f.input.native,
+    sourceToNative: f.sourceToNative,
+    scores: Object.fromEntries(
+      [...f.sourceToNative].map(([id, actor]) => [id, f.input.native.players[actor].score]),
+    ),
+    sourceBoard: {
+      players: Object.values(f.input.ledger.players),
+      skullSpaces: clone(f.input.native.skullSpaces),
+    },
+    catalog,
+  };
+}
+
+test('global monument counts include its owner and opponents but exclude the unbuilt market', () => {
+  const card = catalog.MONUMENTS.find((m) => m.id === 'm05');
+  for (const count of [2, 3, 4]) {
+    const players = Array.from({ length: count }, () => ({ monuments: [] }));
+    players[0].monuments = ['m05'];
+    players.at(-1).monuments = ['m06', 'm03', 'm04', 'm13'];
+    const state = { players, monuments: ['m09'] };
+    assert.deepEqual(finalMonumentMetric(state, players[0], card, catalog), {
+      nbr: 5,
+      points: 5 * (8 - count),
+    });
+    state.monuments = [];
+    assert.equal(finalMonumentMetric(state, players[0], card, catalog).nbr, 5);
+    assert.throws(() => finalMonumentMetric(state, players.at(-1), card, catalog), /ownership/);
+    state.monuments = ['m05'];
+    assert.throws(() => finalMonumentMetric(state, players[0], card, catalog), /ownership/);
+    state.monuments = [];
+    players.at(-1).monuments.push('m05');
+    assert.throws(() => finalMonumentMetric(state, players[0], card, catalog), /ownership/);
+  }
+  for (const scoreKey of ['maxTechnologies', 'templePoints']) {
+    const f = fixture(() => {}, { globalMonuments: true });
+    assert.throws(
+      () =>
+        finalMonumentMetric(
+          f.input.native,
+          f.input.native.players[0],
+          catalog.MONUMENTS.find((m) => m.scoreKey === scoreKey),
+          catalog,
+        ),
+      /unreviewed/,
+    );
+  }
+});
+
+test('global monument receipts reject altered identity counts points roster and ownership', () => {
+  const make = (change) => fixture(change, { globalMonuments: true });
+  const valid = finalScoreReceiptComponents(monumentReceiptInput(make()));
+  assert.deepEqual(
+    valid.players[0].monuments.map((m) => [m.monument, m.nbr, m.points]),
+    [['m05', 5, 20]],
+  );
+  const mutations = [
+    (rows) => {
+      rows.find((n) => n.type === 'finalScoring' && n.args.nbr === 5).args.nbr = 6;
+    },
+    (rows) => {
+      const i = rows.findIndex((n) => n.type === 'finalScoring' && n.args.nbr === 5);
+      rows[i].args.points = 24;
+      rows[i - 1].args.points = 24;
+    },
+    (rows) => {
+      const i = rows.findIndex((n) => n.type === 'finalScoring' && n.args.nbr === 5);
+      rows[i - 1].args.player_id = '2';
+    },
+    (rows) => {
+      const i = rows.findIndex((n) => n.type === 'finalScoring' && n.args.nbr === 5);
+      rows[i].args.player_id = '3';
+      rows[i].args.player_name = 'P3';
+      rows[i - 1].args.player_id = '3';
+    },
+    (rows) => {
+      const i = rows.findIndex((n) => n.type === 'finalScoring' && n.args.nbr === 5);
+      rows.splice(i - 1, 2);
+    },
+    (rows) => {
+      const i = rows.findIndex((n) => n.type === 'finalScoring' && n.args.nbr === 5);
+      const pair = clone(rows.slice(i - 1, i + 1));
+      pair[0].uid = 'extra-update';
+      pair[1].uid = 'extra-receipt';
+      rows.splice(i + 1, 0, ...pair);
+    },
+    (rows) => {
+      const n = rows.find((n) => n.type === 'finalScoring' && n.args.nbr === 5);
+      n.log = n.log.replace('construted', 'constructed');
+    },
+  ];
+  for (const mutate of mutations) {
+    const f = make((raw, rows) => mutate(rows));
+    assert.throws(
+      () => finalScoreReceiptComponents(monumentReceiptInput(f)),
+      /Network final scoring/,
+    );
+  }
+  for (const mutate of [
+    (a) => {
+      a.state.players.pop();
+    },
+    (a) => {
+      a.sourceToNative.delete('4');
+    },
+    (a) => {
+      a.sourceToNative.set('4', 2);
+    },
+    (a) => {
+      a.sourceToNative.set('4', 4);
+    },
+    (a) => {
+      a.state.monuments.push('m05');
+    },
+    (a) => {
+      a.state.players[1].monuments.push('m05');
+      a.sourceBoard.players[1].monuments.push('m05');
+    },
+    (a) => {
+      a.state.players[0].monuments = ['m07'];
+      a.sourceBoard.players[0].monuments = ['m07'];
+    },
+    (a) => {
+      a.state.players[0].monuments = ['m09'];
+      a.sourceBoard.players[0].monuments = ['m09'];
+    },
+  ]) {
+    const a = monumentReceiptInput(make());
+    mutate(a);
+    assert.throws(() => finalScoreReceiptComponents(a), /Network final scoring/);
+  }
+});
+
+test('global monument receipts close through the public scoring and mocked terminal suffix', () => {
+  for (const zeroCorn of [false, true]) {
+    const f = fixture(() => {}, { zeroCorn, globalMonuments: true }),
+      r = publicCaller(f);
+    assert.equal(r.semantic.semanticMatch, true);
+    const pending = r.semantic.evidence.find((e) => e.type === 'pendingFinalScoreReceipts');
+    assert.equal(pending.components[0].monumentPoints, 20);
+    r.comparison.bindSource95Legacy(r.context, oldWitness(f));
+    const a = actual(f, pending);
+    bindFinalScoringProjections(oldWitness(f), f.input.native, [{ snapshot: { state: a.native } }]);
+    const wrong = clone(a.native);
+    wrong.finalScores[0].monumentPoints++;
+    wrong.finalScores[0].resourcePoints--;
+    assert.throws(
+      () =>
+        bindFinalScoringProjections(oldWitness(f), f.input.native, [
+          { snapshot: { state: wrong } },
+        ]),
+      /individual original receipts/,
+    );
+    const context = r.comparison.begin(a.context.group, r.ledger, r.native, r.observation);
+    r.comparison.applied(context, a.context.transitions[0]);
+    Object.assign(a.ledger, {
+      initial: f.index.initial,
+      foodDays: [8, 14, 21, 27],
+      feedingWitnesses: sourceFeedingWitnesses(f.index),
+    });
+    const terminalArguments = {
+      index: f.index,
+      group: a.context.group,
+      ledger: a.ledger,
+      native: a.native,
+      observation: null,
+      differences: [],
+      sourceToNative: f.sourceToNative,
+      feedingTransitions: f.input.context.transitions,
+      terminalDisplayCheckpoint: {
+        mode: 'floorTotal',
+        scores: a.native.finalScores.map((s) => ({
+          playerId: s.playerId,
+          total: Math.floor(s.total),
+          rank: s.rank,
+        })),
+      },
+    };
+    const result = comparePublicBoundary({
+      comparison: r.comparison,
+      context,
+      semanticArguments: {
+        ledger: a.ledger,
+        native: a.native,
+        observation: null,
+        differences: [],
+        applied: a.selected,
+        humanDecision: false,
+      },
+      terminalArguments,
+    });
+    assert.equal(result.semantic.semanticMatch, true);
+    assert.equal(result.terminalValidation.completed, true);
+    assert.equal(r.comparison.finish().allObligationsClosed, true);
+  }
+});
+
+test('native end-turn and rotation independently score all owned monuments', (t) => {
+  const state = clone(
+    JSON.parse(readFileSync(new URL('./fixtures/bga-reconstruction-small.json', import.meta.url)))
+      .companion.record.initial,
+  );
+  Object.assign(state, {
+    round: 27,
+    age: 2,
+    currentPlayer: 3,
+    firstPlayer: 0,
+    firstPlayerClaimed: 0,
+    turnOrder: [0, 1, 2, 3],
+    turnIndex: 3,
+    turn: { mode: 'remove', count: 1, begged: false },
+    pending: null,
+    foodDays: [8, 14, 21],
+    buildings: [],
+    monuments: ['m09'],
+    accumulatedCorn: 0,
+  });
+  for (const slots of Object.values(state.gears)) slots.fill(null);
+  state.buildings = catalog.BUILDINGS.filter((b) => b.age === 2)
+    .slice(0, 6)
+    .map((b) => b.id);
+  state.buildingDeckCount =
+    catalog.BUILDINGS.filter((b) => b.age === 2).length - state.buildings.length;
+  state.age2DeckCount = 0;
+  state.players.forEach((p, i) => {
+    Object.assign(p, {
+      score: 0,
+      resources: { corn: 6, wood: 0, stone: 0, gold: 0, skull: 0 },
+      buildings: [],
+      monuments: [['m05'], ['m01', 'm02'], ['m03'], ['m04']][i],
+      cornTiles: 0,
+      woodTiles: 0,
+      feedWorkers: 0,
+      feedDiscount: 0,
+      feedAll: false,
+      buildingSkulls: 0,
+      doubleAdvanceAvailable: true,
+    });
+    p.temples = { chaac: 0, quetzalcoatl: 0, kukulkan: 0 };
+  });
+  const actualDispatch = coreDispatcher(
+    join(
+      process.env.CARGO_TARGET_DIR ?? fileURLToPath(new URL('../target', import.meta.url)),
+      'debug',
+      process.platform === 'win32' ? 'tzolkin-ai.exe' : 'tzolkin-ai',
+    ),
+  );
+  let calls = 0;
+  const dispatch = (request) => {
+    assert.ok(++calls <= 3);
+    const response = actualDispatch(request);
+    assert.equal(response.error, undefined);
+    return response;
+  };
+  const before = dispatch({ operation: 'publicInspect', state });
+  const end = before.observation.legalActions.find((r) => r.action.type === 'endTurn');
+  assert.ok(end);
+  const afterFood = dispatch({
+    operation: 'publicApply',
+    state: before.snapshot.state,
+    actor: before.observation.actor,
+    move: end.move,
+  });
+  const rotate = afterFood.observation.legalActions.find(
+    (r) => r.action.type === 'rotate' && r.action.days === 1,
+  );
+  assert.ok(rotate);
+  const finished = dispatch({
+    operation: 'publicApply',
+    state: afterFood.snapshot.state,
+    actor: afterFood.observation.actor,
+    move: rotate.move,
+  });
+  assert.equal(finished.snapshot.state.phase, 'finished');
+  assert.equal(
+    finished.snapshot.state.finalScores.find((r) => r.playerId === 0).monumentPoints,
+    20,
+  );
+  assert.equal(calls, 3);
+  t.diagnostic(`native calls: ${calls}`);
 });
