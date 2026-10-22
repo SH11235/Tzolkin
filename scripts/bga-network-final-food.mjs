@@ -115,7 +115,14 @@ function createFoodProof({ index, initial, sourceToNative }, zeroCorn) {
     const groups = index.groups.filter((g) => g.moveId <= context.group.moveId);
     for (const g of groups)
       for (const n of g.entries) {
-        requireProof(publicEntry(n));
+        const provenance = originalPacketEntry(n);
+        requireProof(
+          provenance?.packetType === 'resend' &&
+            provenance.tableId === index.tableId &&
+            provenance.rawSha256 === index.rawSha256,
+        );
+        if (found || ['cornOnWheel', 'firstPlayer'].includes(n.type) || same(ref(n), claim.claim))
+          requireProof(publicEntry(n));
         if (same(ref(n), claim.claim)) {
           requireProof(
             !found &&

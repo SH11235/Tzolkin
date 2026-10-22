@@ -853,6 +853,13 @@ test('explicit zero corn receipts use a separate entry and close only the observ
   );
 });
 test('zero entitlement requires explicit claim amount pool history and adjacent original zero receipts', () => {
+  const initialPrivate = fixture(
+    (raw) => {
+      raw.gameLogs.data.data[0].channel = '/player/p1';
+    },
+    { zeroCorn: true },
+  );
+  assert.ok(initialPrivate.factory.prove(initialPrivate.input));
   for (const change of [
     (raw) => {
       raw.initialState.cornOnWheel = '1';
