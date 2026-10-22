@@ -2196,6 +2196,7 @@ export function replayNetworkPrefix(
           observation: frame.observation,
           differences: unmaskedDifferences,
           constructionTransition,
+          skullShortageEvidence,
           applied: audit.slice(auditBeforeGroup),
           humanDecision: decisionType.potentialHumanDecision,
         },

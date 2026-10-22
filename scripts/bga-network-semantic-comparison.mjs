@@ -78,7 +78,16 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
   }
   function compare(
     context,
-    { ledger, native, observation, differences, applied, humanDecision, constructionTransition },
+    {
+      ledger,
+      native,
+      observation,
+      differences,
+      applied,
+      humanDecision,
+      constructionTransition,
+      skullShortageEvidence,
+    },
   ) {
     const { group, source: beforeSource, native: before, observation: priorObservation } = context;
     const entries = group.entries;
@@ -258,6 +267,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
               native,
               transitions: context.transitions,
               sourceToNative: mapping,
+              skullShortageEvidence,
             })
           : null;
         if (
