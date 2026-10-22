@@ -50,6 +50,17 @@ const integer = (x) => {
   return Number(x);
 };
 const signatures = (rows) => rows.map((r) => JSON.stringify(r)).sort();
+const inputIdentities = ({ index, context, sourceToNative, catalog }) => [
+  index,
+  sourceToNative,
+  catalog,
+  context.group,
+  context.source,
+  context.native,
+  context.observation,
+  context.transitions,
+  ...context.transitions.flatMap((t) => [t, t.before, t.after, t.legalActions]),
+];
 
 function monumentMetric(state, player, card, catalog) {
   if (card.scoreKey !== 'maxTechnologies') return finalMonumentMetric(state, player, card, catalog);
@@ -480,6 +491,7 @@ export function prepareTerminalScoreSettlement(input) {
       context: input.context,
       ledger: input.ledger,
       native: input.native,
+      identities: inputIdentities(input),
       snapshot: clone(input),
       proof: clone(proof),
     });
@@ -496,6 +508,7 @@ export function terminalSettlementScoreUids(proof, { context, ledger, native, cl
     bound.context !== context ||
     bound.ledger !== ledger ||
     bound.native !== native ||
+    !inputIdentities(bound.input).every((value, i) => value === bound.identities[i]) ||
     !same(bound.input, bound.snapshot) ||
     !same(proof, bound.proof)
   )

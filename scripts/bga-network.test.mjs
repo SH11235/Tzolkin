@@ -442,6 +442,31 @@ test('terminal proof values and live identity reject serialization, stale inputs
       x.input.context = structuredClone(x.input.context);
     },
     (x) => {
+      x.input.context.group = structuredClone(x.input.context.group);
+    },
+    (x) => {
+      x.input.context.source = structuredClone(x.input.context.source);
+    },
+    (x) => {
+      x.input.context.native = structuredClone(x.input.context.native);
+    },
+    (x) => {
+      x.input.context.transitions = structuredClone(x.input.context.transitions);
+    },
+    (x) => {
+      x.input.context.transitions[0] = structuredClone(x.input.context.transitions[0]);
+    },
+    (x) => {
+      x.input.context.transitions[0].before = structuredClone(
+        x.input.context.transitions[0].before,
+      );
+    },
+    (x) => {
+      x.input.context.transitions[1].legalActions = structuredClone(
+        x.input.context.transitions[1].legalActions,
+      );
+    },
+    (x) => {
       x.claim.claim.uid = 'foreign';
     },
     (x) => {
