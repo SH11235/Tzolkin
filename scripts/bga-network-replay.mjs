@@ -86,6 +86,12 @@ const sourcePosition = (value, teeth) =>
 const fail = (message) => {
   throw new Error(`Network native: ${message}`);
 };
+export function checkpointOperationType(operations, step) {
+  const matching = operations.filter((operation) => operation.step === step);
+  if (matching.length !== 1 || typeof matching[0].row?.action?.type !== 'string')
+    fail('checkpoint requires exactly one applied operation');
+  return matching[0].row.action.type;
+}
 const amounts = (x) => R.map((k) => Number(x?.[k] ?? 0));
 const canonical = (x) =>
   Array.isArray(x)
@@ -2601,7 +2607,7 @@ export function replayNetworkPrefix(
           source: { reference: index.sourceUrl, actionIds: [group.moveId] },
           expected: sourceCheckpoint(ledger, sourceToNative),
         };
-        const operation = audit.findLast((row) => row.step === record.steps.length)?.action.type;
+        const operation = checkpointOperationType(choiceOperations, record.steps.length);
         const full = feedingSourceBoardCheckpoint(ledger, sourceToNative, group.moveId, {
           operationType: operation,
           unresolvedTimingFence: timingFences.some(

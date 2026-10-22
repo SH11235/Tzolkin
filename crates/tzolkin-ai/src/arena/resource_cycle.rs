@@ -2515,8 +2515,6 @@ mod tests {
                 Some(Task::Resource { remaining: 1 })
             ));
             assert!(crate::policy::resource_cycle_v8_conversion_scores(&co).is_none());
-            // Core still offers upward no-op choices at a capped temple. They
-            // consume the visible remaining/distinct slot without forcing V7.
             nested.pending = Some(Pending {
                 title: "capped".into(),
                 task: Task::Temple {
@@ -2535,9 +2533,9 @@ mod tests {
             assert!(cv.iter().all(|v| *v == 0.0));
             let unchanged = apply_move(&nested, choose_move(&co, &v8).unwrap().r#move).unwrap();
             assert_eq!(unchanged.players[1].temples, nested.players[1].temples);
-            assert!(
-                matches!(unchanged.pending.as_ref().map(|p|&p.task),Some(Task::Temple{remaining:1,distinct:Some(used),..}) if used.len()==1)
-            );
+            let mut expected = nested.clone();
+            expected.pending = None;
+            assert_eq!(unchanged, expected);
             // A genuinely unsupported affordable action effect, not just an
             // absent target, refuses the entire otherwise-funded callback.
             let mut unsupported = build.clone();
