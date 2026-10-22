@@ -176,7 +176,19 @@ test('reviewed metric ownership does not authorize unrelated original monument c
   f.context.native.players[0].monuments = ['m07'];
   f.ledger.players['1'].monuments = ['m07'];
   f.native.players[0].monuments = ['m07'];
-  assert.equal(inspectTerminalProjection(f).completed, false);
+  const checked = inspectTerminalProjection(f);
+  assert.equal(checked.completed, false);
+  assert.equal(checked.components.matched, false);
+  assert.equal(
+    checked.components.failure,
+    'Network final scoring: missing, duplicate, ambiguous or incorrect monument receipt',
+  );
+  assert.ok(checked.failures.includes('terminalComponentsNotEstablished'));
+  assert.equal(checked.food.matched, true);
+  assert.equal(
+    checked.scores.every((r) => r.matched),
+    true,
+  );
 });
 
 test('public boundary comparison supplies the actual context to the mandatory terminal gate', () => {

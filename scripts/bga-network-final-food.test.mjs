@@ -475,6 +475,61 @@ function oldWitness(f) {
     ),
   });
 }
+test('legacy scoring witness accepts signed temple positions and their monument but rejects negative leaders', () => {
+  const make = (negativeLeader = false) => {
+    const f = fixture((raw) => {
+      const entries = raw.gameLogs.data.data.find((p) => Number(p.move_id) === 6).data;
+      const temple = entries.find((n) => n.type === 'templeScore' && n.args.player_id === '4');
+      temple.args.points = -6;
+      entries[entries.indexOf(temple) - 1].args.points = -6;
+      const at = entries.findIndex((n) => n.type === 'finalScoring' && !Array.isArray(n.args));
+      entries.splice(
+        at - 1,
+        0,
+        {
+          uid: '9000',
+          type: 'updateScore',
+          log: '',
+          args: { player_id: '4', player_name: null, points: -6 },
+        },
+        {
+          uid: '9001',
+          type: 'finalScoring',
+          log: 'Monument: ${player_name} scores ${points} for points in the temples',
+          args: { player_id: '4', player_name: 'P4', points: -6 },
+        },
+      );
+      if (negativeLeader) {
+        const leader = entries.find((n) => n.type === 'templeLeader');
+        leader.args.points = -1;
+        entries[entries.indexOf(leader) - 1].args.points = -1;
+      }
+    });
+    for (const p of [
+      f.input.context.source.players['4'],
+      f.input.ledger.players['4'],
+      f.input.context.native.players[3],
+      f.input.native.players[3],
+    ]) {
+      p.temples = { chaac: -1, quetzalcoatl: -1, kukulkan: -1 };
+      p.monuments = ['m11'];
+    }
+    f.input.native.players[3].score = 15;
+    f.input.native.players[3].templePoints = -6;
+    f.input.ledger.players['4'].score = 9;
+    return f;
+  };
+  const witness = oldWitness(make());
+  const player = witness.players.find((p) => p.actor === 3);
+  assert.equal(player.before, 15);
+  assert.deepEqual(
+    player.monuments.map((m) => [m.monument, m.points]),
+    [['m11', -6]],
+  );
+  assert.equal(player.total, 9);
+  assert.throws(() => oldWitness(make(true)), /noncanonical receipt integer/);
+});
+
 function actual(f, proof) {
   const native = clone(f.input.native);
   Object.assign(native, {

@@ -359,7 +359,8 @@ export function finalScoringWitness({
       } else if (
         effect.type !== 'updateScore' ||
         !['templeLeader', 'templeScore'].includes(caption.type) ||
-        integer(effect.args.points) !== integer(caption.args.points)
+        integer(effect.args.points, caption.type === 'templeScore') !==
+          integer(caption.args.points, caption.type === 'templeScore')
       )
         fail('temple effect differs from original receipt');
     }
