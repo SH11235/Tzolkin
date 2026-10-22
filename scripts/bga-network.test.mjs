@@ -14,6 +14,489 @@ import { fixedBuildingResourceChoiceProof } from './bga-network-compound-choices
 import { createObservedChoices } from './bga-network-observed-choices.mjs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import {
+  prepareTerminalScoreSettlement,
+  terminalSettlementScoreUids,
+} from './bga-network-terminal-settlement.mjs';
+import { finalMonumentMetric } from './bga-network-final-scoring.mjs';
+
+function terminalSettlementFixture(mutateRaw = () => {}) {
+  const raw = fixture();
+  raw.initialState.cornOnWheel = '1';
+  raw.initialState.gamestates = Object.fromEntries(
+    [90, 91, 92, 93, 94, 99].map((id) => [id, { type: id === 99 ? 'manager' : 'game' }]),
+  );
+  raw.initialState.gamestates[7] = { type: 'activeplayer', possibleactions: ['endTurn'] };
+  let uid = 100;
+  const n = (type, args, log = '') => ({ uid: String(++uid), type, args, log });
+  const state = (id, actor = '2') => n('gameStateChange', { id, active_player: actor });
+  const packet = (move, data) => ({
+    channel: '/table/t123',
+    table_id: 123,
+    packet_id: String(move),
+    packet_type: 'resend',
+    move_id: String(move),
+    time: '1',
+    data,
+  });
+  const score = (id, points, type, extra = {}, log = '') => [
+    n('updateScore', { player_id: id, player_name: null, points }),
+    n(type, { player_id: id, player_name: `P${id}`, points, ...extra }, log),
+  ];
+  const monument = (id, points, nbr, suffix) =>
+    score(
+      id,
+      points,
+      'finalScoring',
+      { nbr },
+      'Monument: ${player_name} scores ${points} for ${nbr} ' + suffix,
+    );
+  const resource = (id, points) =>
+    score(
+      id,
+      points,
+      'finalScoring',
+      {},
+      'Remaining resources: ${player_name} scores ${points} points',
+    );
+  const pay = (id, cost, nbr) => [
+    n('payGoods', { player_id: id, type: 'corn', quantity: cost, target: null }),
+    n('foodDayCost', { player_id: id, player_name: `P${id}`, cost, nbr }),
+  ];
+  raw.gameLogs.data.data = [
+    raw.gameLogs.data.data[0],
+    ...[93, 94, 93].map((id, i) => packet(i + 2, [state(92), state(id)])),
+    packet(5, [
+      n('placeWorker', { player_id: '2', worker_id: '2', place: 'startingPlayer', position: 0 }),
+    ]),
+    packet(6, [
+      state(90, '3'),
+      state(91, '1'),
+      n('takeGoods', { player_id: '2', type: 'corn', quantity: 1, origin: null }),
+      n('firstPlayerCorn', { player_id: '2', corn: 1 }),
+      n('firstPlayer', { player_id: '2' }),
+      state(92),
+      ...pay('1', 2, 3),
+      ...pay('3', 6, 3),
+      state(94),
+      ...score('1', 2, 'templeLeader', { temple: 'chaac' }),
+      ...score('2', 6, 'templeLeader', { temple: 'quetzalcoatl' }),
+      ...score('3', 4, 'templeLeader', { temple: 'kukulcan' }),
+      ...score('1', 4, 'templeScore'),
+      ...score('2', 2, 'templeScore'),
+      ...score('3', 3, 'templeScore'),
+      n('finalScoring', [], 'Final scoring!'),
+      ...monument('1', 33, 3, 'technologies at 3rd level'),
+      ...monument('2', 6, 3, 'buildings and monuments'),
+      ...monument('2', 6, 2, 'Skulls on Chichen Itza'),
+      ...resource('1', 3),
+      ...resource('2', 3),
+      ...resource('3', 6),
+      n('rotateWheel', { day: 27, twice: 0, workers: [] }),
+      n('pickUpWorker', { player_id: '2', worker_id: '2' }),
+      state(99),
+      n('simpleNode', {}),
+    ]),
+  ];
+  mutateRaw(raw.gameLogs.data.data.at(-1).data, raw);
+  const index = parseNetworkReplay(bytes(raw)),
+    group = index.groups.at(-1);
+  const technologies = { agriculture: 0, extraction: 0, architecture: 0, theology: 0 };
+  const sourcePlayers = {
+    1: {
+      resources: { corn: 3, wood: 1, stone: 0, gold: 0, skull: 1 },
+      score: 10,
+      technologies: { ...technologies, agriculture: 3, extraction: 3, architecture: 3 },
+      temples: { chaac: 2, quetzalcoatl: 0, kukulkan: 0 },
+      buildings: [],
+      monuments: ['m07'],
+      workers: 3,
+      feedWorkers: 2,
+      feedDiscount: 0,
+      cornTiles: 0,
+      woodTiles: 0,
+    },
+    2: {
+      resources: { corn: 4, wood: 1, stone: 1, gold: 1, skull: 0 },
+      score: 20,
+      technologies: { ...technologies },
+      temples: { chaac: 0, quetzalcoatl: 2, kukulkan: 0 },
+      buildings: ['b01'],
+      monuments: ['m02', 'm13'],
+      workers: 3,
+      feedWorkers: 3,
+      feedDiscount: 0,
+      cornTiles: 0,
+      woodTiles: 0,
+    },
+    3: {
+      resources: { corn: 6, wood: 0, stone: 1, gold: 0, skull: 2 },
+      score: 30,
+      technologies: { ...technologies },
+      temples: { chaac: 0, quetzalcoatl: 0, kukulkan: 2 },
+      buildings: [],
+      monuments: [],
+      workers: 3,
+      feedWorkers: 0,
+      feedDiscount: 0,
+      cornTiles: 0,
+      woodTiles: 0,
+    },
+  };
+  const source = {
+    stateId: 7,
+    activePlayer: '3',
+    day: 26,
+    accumulatedCorn: 1,
+    players: structuredClone(sourcePlayers),
+    skullSpaces: ['1', '3'],
+    workers: new Map([['2', { player: '2', place: 'startingPlayer' }]]),
+  };
+  const before = {
+    version: 1,
+    phase: 'playing',
+    round: 27,
+    expansion: null,
+    additionalBuildings: false,
+    pending: null,
+    currentPlayer: 2,
+    turnOrder: [0, 1, 2],
+    turnIndex: 2,
+    firstPlayer: 0,
+    firstPlayerClaimed: 1,
+    accumulatedCorn: 0,
+    foodDays: [8, 14, 21],
+    skullSpaces: [0, 2],
+    players: Object.values(sourcePlayers).map((p, id) => ({
+      ...structuredClone(p),
+      id,
+      buildingSkulls: 0,
+      feedAll: false,
+      templePoints: 0,
+    })),
+  };
+  before.players[1].resources.corn = 5;
+  const fed = structuredClone(before);
+  Object.assign(fed, {
+    currentPlayer: 1,
+    pending: { task: { type: 'rotation' }, after: [] },
+    foodDays: [8, 14, 21, 27],
+  });
+  [16, 28, 37].forEach((score, id) => {
+    fed.players[id].score = score;
+    fed.players[id].templePoints = [4, 2, 3][id];
+    fed.players[id].resources.corn = [1, 5, 0][id];
+  });
+  const native = structuredClone(fed);
+  Object.assign(native, {
+    phase: 'finished',
+    pending: null,
+    firstPlayerClaimed: null,
+    firstPlayer: 1,
+  });
+  native.finalScores = [
+    {
+      playerId: 0,
+      pointsBeforeFinal: 16,
+      monumentPoints: 33,
+      resourcePoints: 0.75,
+      skullPoints: 3,
+      total: 52.75,
+    },
+    {
+      playerId: 1,
+      pointsBeforeFinal: 28,
+      monumentPoints: 12,
+      resourcePoints: 3.5,
+      skullPoints: 0,
+      total: 43.5,
+    },
+    {
+      playerId: 2,
+      pointsBeforeFinal: 37,
+      monumentPoints: 0,
+      resourcePoints: 0.75,
+      skullPoints: 6,
+      total: 43.75,
+    },
+  ];
+  native.players.forEach((p, id) => {
+    p.score = [52.75, 43.5, 43.75][id];
+  });
+  const ledger = { day: 27, stateId: 99, players: structuredClone(sourcePlayers) };
+  Object.values(ledger.players).forEach((p, id) => {
+    p.resources.corn = [1, 5, 0][id];
+    p.score = [52, 43, 43][id];
+  });
+  const transition = (action, actor, start, end, step) => ({
+    action,
+    actor,
+    before: structuredClone(start),
+    after: structuredClone(end),
+    step,
+    legalActions: [{ action: structuredClone(action) }],
+  });
+  const context = {
+    group,
+    original: structuredClone(group),
+    source,
+    native: before,
+    observation: { actor: 2, legalActions: [{ action: { type: 'endTurn' } }] },
+    transitions: [
+      transition({ type: 'endTurn' }, 2, before, fed, 10),
+      transition({ type: 'rotate', days: 1 }, 1, fed, native, 11),
+    ],
+  };
+  const sourceToNative = new Map([
+    ['1', 0],
+    ['2', 1],
+    ['3', 2],
+  ]);
+  const catalog = JSON.parse(
+    readFileSync(new URL('../crates/tzolkin-core/data/catalog.json', import.meta.url)),
+  );
+  const claimEntry = index.groups.find((g) => g.moveId === 5).entries[0];
+  const claim = {
+    claim: {
+      uid: claimEntry.uid,
+      packetIndex: claimEntry.packetIndex,
+      notificationIndex: claimEntry.notificationIndex,
+    },
+    sourceOwner: '2',
+    owner: 1,
+    amount: 1,
+    nativeResources: structuredClone(before.players[1].resources),
+  };
+  return { input: { index, context, ledger, native, sourceToNative, catalog }, claim };
+}
+
+test('terminal settlement binds individual awards before semantic acceptance', () => {
+  const { input, claim } = terminalSettlementFixture();
+  const proof = prepareTerminalScoreSettlement(input);
+  assert.ok(proof);
+  const authorized = terminalSettlementScoreUids(proof, { ...input, claim });
+  assert.equal(authorized.length, 5);
+  assert.ok(
+    authorized.every((uid) =>
+      input.context.group.entries.some(
+        (n) => n.uid === uid && n.type === 'updateScore' && n.args.player_id === '2',
+      ),
+    ),
+  );
+  assert.throws(
+    () =>
+      finalMonumentMetric(
+        input.context.native,
+        input.context.native.players[0],
+        input.catalog.MONUMENTS.find((c) => c.id === 'm07'),
+        input.catalog,
+      ),
+    /unreviewed/,
+  );
+});
+
+test('terminal settlement rejects compensating original awards and changed captions', () => {
+  for (const change of [
+    (rows) => {
+      const pairs = rows.filter(
+        (n) => n.type === 'finalScoring' && n.args.nbr !== undefined && n.args.player_id === '2',
+      );
+      pairs[0].args.points++;
+      pairs[1].args.points--;
+      for (const n of pairs) rows[rows.indexOf(n) - 1].args.points = n.args.points;
+    },
+    (rows) => {
+      const n = rows.find(
+        (n) => n.type === 'finalScoring' && n.args.nbr === 3 && n.args.player_id === '1',
+      );
+      n.args.nbr = 2;
+    },
+    (rows) => {
+      const n = rows.find((n) => n.type === 'templeScore');
+      n.args.points++;
+      rows[rows.indexOf(n) - 1].args.points++;
+    },
+    (rows) => {
+      rows.find((n) => n.type === 'foodDayCost').args.nbr++;
+    },
+    (rows) => {
+      rows.find((n) => n.type === 'firstPlayerCorn').args.corn++;
+    },
+    (rows) => {
+      rows.find((n) => n.type === 'firstPlayerCorn').args.player_id = '1';
+    },
+    (rows) => {
+      rows.splice(
+        rows.findIndex((n) => n.type === 'takeGoods'),
+        1,
+      );
+    },
+    (rows) => {
+      rows.splice(
+        rows.findIndex((n) => n.type === 'firstPlayerCorn'),
+        1,
+      );
+    },
+    (rows) => {
+      const receipt = rows.find(
+        (n) => n.type === 'finalScoring' && !Array.isArray(n.args) && !Object.hasOwn(n.args, 'nbr'),
+      );
+      receipt.args.points++;
+      rows[rows.indexOf(receipt) - 1].args.points++;
+    },
+    (rows) => {
+      rows.find((n) => n.type === 'rotateWheel').args.twice = 1;
+    },
+    (rows) => {
+      rows.find(
+        (n) => n.type === 'finalScoring' && !Array.isArray(n.args) && !Object.hasOwn(n.args, 'nbr'),
+      ).log = 'Unknown scoring';
+    },
+    (rows) => {
+      rows.splice(2, 0, {
+        uid: 'extra',
+        type: 'takeGoods',
+        args: { player_id: '2', type: 'corn', quantity: 1, origin: null },
+        log: '',
+      });
+    },
+  ]) {
+    const { input } = terminalSettlementFixture(change);
+    assert.equal(prepareTerminalScoreSettlement(input), null);
+  }
+});
+
+test('terminal settlement rejects changed states, unknown choices and incomplete effects', () => {
+  for (const change of [
+    (i) => {
+      i.context.source.players['1'].technologies.agriculture--;
+    },
+    (i) => {
+      i.context.source.players['2'].resources.corn++;
+    },
+    (i) => {
+      i.native.finalScores[0].resourcePoints++;
+      i.native.finalScores[0].skullPoints--;
+    },
+    (i) => {
+      i.context.transitions[0].legalActions = [];
+    },
+    (i) => {
+      i.context.observation.actor = 0;
+    },
+    (i) => {
+      i.context.transitions[1].legalActions.push({ action: { type: 'rotate', days: 2 } });
+    },
+    (i) => {
+      i.context.transitions[1].before.players[0].resources.corn++;
+    },
+    (i) => {
+      i.context.transitions[1].step++;
+    },
+    (i) => {
+      i.native.players[1].resources.gold++;
+    },
+    (i) => {
+      i.context.native.players[1].feedWorkers--;
+    },
+    (i) => {
+      i.context.transitions.splice(0, 1);
+    },
+    (i) => {
+      i.context.group.entries[0].uid = 'unknown';
+    },
+    (i) => {
+      i.context.native.players[0].temples.chaac = 0;
+    },
+    (i) => {
+      i.context.group.entries[0].packetIndex++;
+    },
+    (i) => {
+      i.native = structuredClone(i.context.transitions[0].after);
+    },
+  ]) {
+    const { input } = terminalSettlementFixture();
+    change(input);
+    assert.equal(prepareTerminalScoreSettlement(input), null);
+  }
+});
+
+test('terminal proof values and live identity reject serialization, stale inputs and mutation', () => {
+  for (const change of [
+    (x) => {
+      x.proof = structuredClone(x.proof);
+    },
+    (x) => {
+      x.proof.authorizedScoreUids.push('foreign');
+    },
+    (x) => {
+      x.input.context.source.players['1'].score++;
+    },
+    (x) => {
+      x.input.native.finalScores[0].total++;
+    },
+    (x) => {
+      x.input.context.transitions[1].legalActions.push({ action: { type: 'rotate', days: 2 } });
+    },
+    (x) => {
+      x.input.context = structuredClone(x.input.context);
+    },
+    (x) => {
+      x.input.context.group = structuredClone(x.input.context.group);
+    },
+    (x) => {
+      x.input.context.source = structuredClone(x.input.context.source);
+    },
+    (x) => {
+      x.input.context.native = structuredClone(x.input.context.native);
+    },
+    (x) => {
+      x.input.context.transitions = structuredClone(x.input.context.transitions);
+    },
+    (x) => {
+      x.input.context.transitions[0] = structuredClone(x.input.context.transitions[0]);
+    },
+    (x) => {
+      x.input.context.transitions[0].before = structuredClone(
+        x.input.context.transitions[0].before,
+      );
+    },
+    (x) => {
+      x.input.context.transitions[1].legalActions = structuredClone(
+        x.input.context.transitions[1].legalActions,
+      );
+    },
+    (x) => {
+      x.claim.claim.uid = 'foreign';
+    },
+    (x) => {
+      x.claim.owner = 0;
+    },
+    (x) => {
+      x.claim.amount++;
+    },
+    (x) => {
+      x.claim.nativeResources.corn++;
+    },
+  ]) {
+    const x = terminalSettlementFixture();
+    x.proof = prepareTerminalScoreSettlement(x.input);
+    assert.ok(x.proof);
+    change(x);
+    assert.deepEqual(terminalSettlementScoreUids(x.proof, { ...x.input, claim: x.claim }), []);
+  }
+});
+
+test('terminal operation continuity follows the top-level log observation contract', () => {
+  const { input } = terminalSettlementFixture();
+  input.context.transitions[0].before.log = ['earlier'];
+  input.context.transitions[0].after.log = ['food'];
+  input.context.transitions[1].before.log = ['another observation'];
+  input.context.transitions[1].after.log = ['final'];
+  assert.ok(prepareTerminalScoreSettlement(input));
+  input.context.transitions[1].before.pending.after.push({ type: 'resource' });
+  assert.equal(prepareTerminalScoreSettlement(input), null);
+});
 
 function semanticFixture({
   self = false,

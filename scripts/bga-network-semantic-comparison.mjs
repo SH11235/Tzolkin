@@ -3,6 +3,7 @@ import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs'
 import { provePostReceiptFood } from './bga-network-semantic-feeding.mjs';
 import { createBuildingResourceComparison } from './bga-network-building-resources.mjs';
 import { createTerminalCalendarComparison } from './bga-network-semantic-calendar.mjs';
+import { terminalSettlementScoreUids } from './bga-network-terminal-settlement.mjs';
 
 const clone = structuredClone;
 const sourceId = (entry) => String(entry.args.player_id);
@@ -87,6 +88,7 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
       humanDecision,
       constructionTransition,
       skullShortageEvidence,
+      terminalScoreSettlement,
     },
   ) {
     const { group, source: beforeSource, native: before, observation: priorObservation } = context;
@@ -292,6 +294,12 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
           )
         )
           reject('claimant paid resources before corn settlement');
+        const terminalScoreUids = terminalSettlementScoreUids(terminalScoreSettlement, {
+          context,
+          ledger,
+          native,
+          claim: c,
+        });
         const unexpected = entries.some(
           (n) =>
             sourceId(n) === c.sourceOwner &&
@@ -306,10 +314,12 @@ export function createSemanticComparison({ index, initialMoveId, initial, source
               'updateScore',
             ].includes(n.type) &&
             !(receipts.length === 1 && credits.includes(n)) &&
+            !(n.type === 'updateScore' && terminalScoreUids.includes(n.uid)) &&
             !followingFood?.authorizedEffectUids.includes(n.uid),
         );
         if (unexpected) reject('claimant received an unrelated effect before corn settlement');
         if (followingFood) evidence.push(followingFood);
+        if (terminalScoreUids.length) evidence.push(clone(terminalScoreSettlement));
         if (entries.some((n) => n.type === 'undoRestoreDISAB')) {
           const onlyCaption =
             entries.length === 1 &&
