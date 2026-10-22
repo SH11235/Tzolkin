@@ -61,6 +61,32 @@ function constructionContinuation(opening) {
     : null;
 }
 
+function noncompetingFixedSkull(opening, technology, fixed, continuation) {
+  const levels = opening.before.players[opening.actor]?.technologies;
+  if (
+    opening.before.skullSupply !== 1 ||
+    !isDeepStrictEqual(fixed, { skull: 1 }) ||
+    technology.type !== 'technology' ||
+    technology.technology !== 'any' ||
+    technology.steps !== 1 ||
+    !isDeepStrictEqual(levels, { agriculture: 0, extraction: 3, architecture: 3, theology: 0 }) ||
+    opening.before.pending?.after?.length !== 0 ||
+    opening.after.pending?.task?.type !== 'technology' ||
+    opening.after.pending.task.remaining !== 1 ||
+    opening.after.pending.task.free !== true ||
+    !continuation ||
+    continuation.inherited.length !== 0 ||
+    continuation.follow.remaining !== 1
+  )
+    return null;
+  return {
+    technologies: copy(levels),
+    freeTechnologyChoices: 1,
+    fixedSkull: 1,
+    openingSkullSupply: 1,
+  };
+}
+
 export function createBuildingResourceComparison({ index, sourceToNative }) {
   const history = [];
   const sequence = originalNetworkSequence(index);
@@ -347,6 +373,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
       const preceding = transitions.filter((t) => t.step < opening.step);
       const prefix = preceding.length ? precedingMarketExit(context, opening, sourceOwner) : null;
       const technology = card.effects[0];
+      const noncompetingSkull = noncompetingFixedSkull(opening, technology, fixed, continuation);
       const expectedTask = technology.technology === 'extraction' ? 'resource' : 'technology';
       const payments = group.entries.filter((n) => n.type === 'payGoods');
       const receipts = group.entries.filter(
@@ -399,7 +426,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
           (opening.before.players[actor].technologies.extraction !== 3 ||
             opening.after.pending.task.remaining !== 2)) ||
         !pendingProfile(opening.after, actor) ||
-        (fixed.skull && opening.before.skullSupply < 2) ||
+        (fixed.skull && opening.before.skullSupply < 2 && !noncompetingSkull) ||
         receipts.length !== Object.keys(fixed).length ||
         receipts.some(
           (n) =>
@@ -428,6 +455,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
           stage: expectedTask,
           decisions: [],
           sourceRewardOrigin: `${construct.args.building.type}_b${construct.args.building.id}`,
+          ...(noncompetingSkull ? { noncompetingSkullProfile: copy(noncompetingSkull) } : {}),
           ...(continuation.inherited.length
             ? { inheritedBuildContinuation: copy(continuation) }
             : {}),
@@ -444,6 +472,7 @@ export function createBuildingResourceComparison({ index, sourceToNative }) {
           fixed: copy(fixed),
           nativeBuildStep: opening.step,
           preRewardSkullSupply: opening.before.skullSupply,
+          ...(noncompetingSkull ? { noncompetingSkullProfile: copy(noncompetingSkull) } : {}),
         });
       }
     }
