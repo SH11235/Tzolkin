@@ -6,6 +6,7 @@ import {
 } from './bga-network.mjs';
 import { sourceCheckpoint } from './bga-network-source-projection.mjs';
 import { terminalRoundSourceClaim } from './bga-network-terminal-claim.mjs';
+import { consumeClaimantLastTerminalComponents } from './bga-network-final-food.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import {
   foodCost,
@@ -342,7 +343,7 @@ export function terminalComponentGate(input) {
     ) ?? finishedFeeding;
   const before = terminal?.before ?? input.context?.native;
   const sourceClaim = terminalRoundSourceClaim(input.index, input.group);
-  if (
+  const claimed =
     before &&
     Number.isSafeInteger(before.firstPlayerClaimed) &&
     before.firstPlayerClaimed >= 0 &&
@@ -350,9 +351,29 @@ export function terminalComponentGate(input) {
     sourceClaim &&
     input.sourceToNative.get(String(sourceClaim.entry.args.player_id)) ===
       before.firstPlayerClaimed &&
-    finishedFeeding?.before.firstPlayerClaimed !== null
+    finishedFeeding?.before.firstPlayerClaimed !== null;
+  if (
+    (input.claimantLastFinalEvidence !== null && input.claimantLastFinalEvidence !== undefined) ||
+    (claimed &&
+      before.players.length === 3 &&
+      before.pending?.task.type === 'rotation' &&
+      Array.isArray(before.turnOrder) &&
+      before.turnIndex === before.turnOrder.length - 1 &&
+      before.turnOrder.at(-1) === before.firstPlayerClaimed &&
+      before.currentPlayer === before.firstPlayerClaimed &&
+      sourceClaim.amount > 0)
   )
-    return { required: false, matched: true, path: 'claimedTerminal' };
+    return (
+      consumeClaimantLastTerminalComponents({
+        ...input,
+        evidence: input.claimantLastFinalEvidence,
+      }) ?? {
+        required: true,
+        matched: false,
+        failure: 'closed claimant component evidence missing or invalid',
+      }
+    );
+  if (claimed) return { required: false, matched: true, path: 'claimedTerminal' };
   try {
     return validate(input);
   } catch (error) {
