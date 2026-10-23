@@ -289,43 +289,59 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
         row.effectMatched &&
         row.choices?.every((proof) => verifiedObservedChoiceBoundary(index, proof)),
     );
+  const coordinateChoices = (row) => row.choices ?? row.coordinateChoices;
+  const coordinateReentriesClosed = () =>
+    reentries.every(
+      (row) =>
+        row.effectMatched &&
+        coordinateChoices(row)?.every((proof) => verifiedObservedChoiceBoundary(index, proof)),
+    );
+  function bindRow(row, tokens) {
+    const [before, after] = tokens.map((proof) => verifiedObservedChoiceBoundary(index, proof));
+    const begResponse = before && responses.get(before.responseMoveId),
+      choiceResponse = after && responses.get(after.responseMoveId);
+    const reference = (n) => ({
+      uid: n.uid,
+      packetIndex: n.packetIndex,
+      notificationIndex: n.notificationIndex,
+    });
+    if (
+      before &&
+      after &&
+      before.sourceActor === row.sourceActor &&
+      after.sourceActor === row.sourceActor &&
+      before.actor === obligation.nativeActorOrder[row.position] &&
+      after.actor === before.actor &&
+      isDeepStrictEqual(before.source, reference(row.previous)) &&
+      isDeepStrictEqual(after.source, reference(row.entry)) &&
+      before.responseMoveId === row.entry.moveId &&
+      after.responseMoveId > row.entry.moveId &&
+      after.responseMoveId <= row.end.moveId &&
+      begResponse &&
+      choiceResponse &&
+      isDeepStrictEqual(before.nativeBefore, begResponse.before) &&
+      isDeepStrictEqual(before.nativeAfter, begResponse.after) &&
+      isDeepStrictEqual(after.nativeBefore, choiceResponse.before) &&
+      isDeepStrictEqual(after.nativeAfter, choiceResponse.after)
+    )
+      row.coordinateChoices = tokens;
+  }
   function bindChoices(choices) {
     for (const row of reentries.filter((r) => r.effectMatched && !r.choices)) {
       const tokens = [
         choices.boundaryEvidence(row.previous.moveId),
         choices.boundaryEvidence(row.entry.moveId),
       ];
-      const [before, after] = tokens.map((proof) => verifiedObservedChoiceBoundary(index, proof));
-      const begResponse = before && responses.get(before.responseMoveId),
-        choiceResponse = after && responses.get(after.responseMoveId);
-      const reference = (n) => ({
-        uid: n.uid,
-        packetIndex: n.packetIndex,
-        notificationIndex: n.notificationIndex,
-      });
+      row.prior = tokens[0];
+      bindRow(row, tokens);
       if (
-        before &&
-        after &&
-        before.sourceActor === row.sourceActor &&
-        after.sourceActor === row.sourceActor &&
-        before.actor === obligation.nativeActorOrder[row.position] &&
-        after.actor === before.actor &&
-        isDeepStrictEqual(before.source, reference(row.previous)) &&
-        isDeepStrictEqual(after.source, reference(row.entry)) &&
-        before.responseMoveId === row.entry.moveId &&
-        after.responseMoveId > row.entry.moveId &&
-        after.responseMoveId <= row.end.moveId &&
-        begResponse &&
-        choiceResponse &&
-        isDeepStrictEqual(before.nativeBefore, begResponse.before) &&
-        isDeepStrictEqual(before.nativeAfter, begResponse.after) &&
-        isDeepStrictEqual(after.nativeBefore, choiceResponse.before) &&
-        isDeepStrictEqual(after.nativeAfter, choiceResponse.after)
+        row.coordinateChoices === tokens &&
+        tokens.every((proof) => verifiedObservedChoiceBoundary(index, proof)?.meaningOnly === false)
       )
         row.choices = tokens;
     }
   }
-  function compare(context, { ledger, native, operations = [] }) {
+  function compare(context, { ledger, native, operations = [], terminalChoiceEvidence = null }) {
     const fields = [],
       evidence = [];
     if (!witness) return { fields, evidence, failure };
@@ -469,6 +485,8 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
       }
     }
     if (group.moveId === witness.terminal.moveId) {
+      for (const row of reentries.filter((r) => !r.choices && r.effectMatched))
+        bindRow(row, [row.prior, terminalChoiceEvidence]);
       const lastTransition = transitions.at(-1);
       const finalRotation = original(witness.finalRotation);
       if (
@@ -476,7 +494,7 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
         ledger.day !== witness.sourceFinalDay ||
         !isDeepStrictEqual(native.foodDays, [8, 14, 21, 27]) ||
         !isDeepStrictEqual(obligation.completedActors, obligation.nativeActorOrder) ||
-        !reentriesClosed() ||
+        !coordinateReentriesClosed() ||
         !lastTransition ||
         !isDeepStrictEqual(lastTransition.after, native) ||
         !finalRotation ||
@@ -501,7 +519,7 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
           witness: copy(witness),
           native: copy(native),
           nativeActorOrder: copy(obligation.completedActors),
-          reentryChoices: reentries.flatMap((row) => row.choices ?? []),
+          reentryChoices: reentries.flatMap((row) => coordinateChoices(row) ?? []),
         });
         evidence.push({
           type: 'terminalPlayingCalendarClosure',
@@ -518,7 +536,7 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
   return {
     compare,
     bindChoices,
-    terminalClosure: () => (failure || !reentriesClosed() ? null : terminalClosure),
+    terminalClosure: () => (failure || !coordinateReentriesClosed() ? null : terminalClosure),
     finish: () => ({
       obligation: copy(obligation),
       failure,

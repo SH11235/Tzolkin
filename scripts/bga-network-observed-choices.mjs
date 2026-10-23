@@ -40,9 +40,11 @@ export function verifiedObservedChoiceBoundary(index, evidence) {
     !bound ||
     bound.index !== index ||
     !sequence ||
-    bound.proofs.get(bound.boundary.moveId) !== bound.result ||
-    bound.result.verified !== true ||
-    !same(bound.result, bound.snapshot) ||
+    (bound.meaningOnly
+      ? bound.proofs.get(bound.boundary.moveId)?.verified === false
+      : bound.proofs.get(bound.boundary.moveId) !== bound.result ||
+        bound.result.verified !== true ||
+        !same(bound.result, bound.snapshot)) ||
     !sequence.groups.some(
       ({ group, original }) => group === bound.group && same(group, original),
     ) ||
@@ -56,7 +58,8 @@ export function verifiedObservedChoiceBoundary(index, evidence) {
     args: clone(bound.boundary.args),
     sourceActor: bound.boundary.sourceActor,
     actor: bound.boundary.actor,
-    responseMoveId: bound.result.responseMoveId,
+    responseMoveId: bound.meaningOnly ? bound.responseMoveId : bound.result.responseMoveId,
+    meaningOnly: bound.meaningOnly === true,
     nativeBefore: clone(bound.nativeBefore),
     nativeAfter: clone(bound.nativeAfter),
   };
@@ -580,6 +583,92 @@ export function createObservedChoices({
       entry.channel === `/table/t${index.tableId}`
     );
   }
+  function selectedWorkerIssue(boundary, operations) {
+    let issue = null;
+    if (boundary.name === 'playerTurn' || boundary.name === 'pickUpWorker') {
+      const removal = operations.find((o) => o.row.action.type === 'remove');
+      if (removal) {
+        const worker = boundary.args?.workers?.[String(removal.entry.args.worker_id)];
+        if (
+          !worker ||
+          worker.place !== removal.row.action.gear ||
+          Number(worker.position) !== removal.row.action.position
+        )
+          issue ??= 'sourceWorkerMenuTargetMissing';
+        const choice = operations.find(
+          (o) =>
+            o.row.action.type === 'useAction' &&
+            o.row.action.position === Number(removal.entry.args.action_number),
+        );
+        if (
+          choice &&
+          (!integer(worker?.actions?.[choice.row.action.gear]?.[choice.row.action.position]) ||
+            Number(worker.actions[choice.row.action.gear][choice.row.action.position]) !==
+              choice.row.action.cornCost)
+        )
+          issue ??= 'sourceWorkerActionQuoteDiffer';
+      }
+    }
+    return issue;
+  }
+  function terminalPlayerEvidence({ group, before, after, operations, audit = [] }) {
+    if (
+      last.stateId !== 4 ||
+      last.name !== 'playerTurn' ||
+      interval ||
+      after.phase !== 'finished' ||
+      after.pending !== null ||
+      !operations.length ||
+      !same(operations[0].before, before) ||
+      !same(operations.at(-1).after, after) ||
+      observedStageArguments(last, operations[0], operations) ||
+      selectedWorkerIssue(last, operations) ||
+      operations.some(
+        (op, i) =>
+          !['place', 'firstPlayer', 'remove', 'useAction', 'endTurn'].includes(
+            op.row.action.type,
+          ) ||
+          op.actor !== last.actor ||
+          !trusted(group, op.entry) ||
+          (i > 0 && !same(operations[i - 1].after, op.before)) ||
+          observedOperationBinding({
+            operation: op,
+            operations,
+            group,
+            index,
+            sourceToNative,
+            mapCard,
+            audit,
+          }),
+      )
+    )
+      return null;
+    const sourceGroup = sequence?.groups.find(({ group }) => group.moveId === last.moveId)?.group;
+    const entry = sourceGroup?.entries.findLast(
+      (n) => n.type === 'gameStateChange' && Number(n.args.id) === 4,
+    );
+    if (
+      !entry ||
+      !trusted(sourceGroup, entry) ||
+      entry.args.type !== 'activeplayer' ||
+      String(entry.args.active_player) !== last.sourceActor ||
+      !same(entry.args.args, last.args)
+    )
+      return null;
+    const evidence = Object.freeze({ schema: 'tzolkin-terminal-choice-meaning-v1' });
+    boundaryEvidence.set(evidence, {
+      index,
+      group: sourceGroup,
+      entry,
+      boundary: clone(last),
+      proofs,
+      meaningOnly: true,
+      responseMoveId: group.moveId,
+      nativeBefore: clone(before),
+      nativeAfter: clone(after),
+    });
+    return evidence;
+  }
   function sourceExit(group) {
     const e = group.entries,
       s = index.initial.gamestates;
@@ -1049,30 +1138,7 @@ export function createObservedChoices({
           emptyTechnologyExit || emptyBuildingExit
             ? null
             : observedStageArguments(last, operations[0], operations);
-        if (last.name === 'playerTurn' || last.name === 'pickUpWorker') {
-          const removal = operations.find((o) => o.row.action.type === 'remove');
-          if (removal) {
-            const worker = last.args?.workers?.[String(removal.entry.args.worker_id)];
-            if (
-              !worker ||
-              worker.place !== removal.row.action.gear ||
-              Number(worker.position) !== removal.row.action.position
-            )
-              issue ??= 'sourceWorkerMenuTargetMissing';
-            const choice = operations.find(
-              (o) =>
-                o.row.action.type === 'useAction' &&
-                o.row.action.position === Number(removal.entry.args.action_number),
-            );
-            if (
-              choice &&
-              (!integer(worker?.actions?.[choice.row.action.gear]?.[choice.row.action.position]) ||
-                Number(worker.actions[choice.row.action.gear][choice.row.action.position]) !==
-                  choice.row.action.cornCost)
-            )
-              issue ??= 'sourceWorkerActionQuoteDiffer';
-          }
-        }
+        issue ??= selectedWorkerIssue(last, operations);
         if (
           operations[0].row.action.type === 'skip' &&
           last.name !== 'trade' &&
@@ -1246,5 +1312,14 @@ export function createObservedChoices({
       teacherCertified: false,
     };
   }
-  return { observe, finish, boundaryEvidence: (moveId) => issuedBoundaries.get(moveId) ?? null };
+  return {
+    observe,
+    finish,
+    terminalPlayerEvidence,
+    rejectTerminalMeaning: (evidence) => {
+      const bound = boundaryEvidence.get(evidence);
+      if (bound?.index === index && bound.meaningOnly) boundaryEvidence.delete(evidence);
+    },
+    boundaryEvidence: (moveId) => issuedBoundaries.get(moveId) ?? null,
+  };
 }

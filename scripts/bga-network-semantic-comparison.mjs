@@ -126,6 +126,7 @@ export function createSemanticComparison({
       ageTwoRefillEvidence,
       recordSteps,
       choiceOperations = [],
+      terminalChoiceEvidence = null,
     },
   ) {
     if (poisoned) throw new Error(failure ?? 'Final receipt composition failed');
@@ -611,6 +612,7 @@ export function createSemanticComparison({
       ledger,
       native,
       operations: choiceOperations,
+      terminalChoiceEvidence,
     });
     if (calendar.failure) reject(calendar.failure);
     for (const field of calendar.fields) allowed.add(field);

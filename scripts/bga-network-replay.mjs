@@ -2217,6 +2217,16 @@ export function replayNetworkPrefix(
         observation: frame.observation,
       });
       const decisionType = classifyDecisionState(ledger, index);
+      const terminalChoiceEvidence =
+        native().phase === 'finished'
+          ? observedChoices.terminalPlayerEvidence({
+              group,
+              before: withoutLog(before),
+              after: withoutLog(native()),
+              operations: choiceOperations,
+              audit: audit.slice(auditBeforeGroup),
+            })
+          : null;
       const compared = comparePublicBoundary({
         comparison: semanticComparison,
         context: semanticContext,
@@ -2236,6 +2246,7 @@ export function replayNetworkPrefix(
           ageTwoRefillEvidence,
           recordSteps: record.steps,
           choiceOperations,
+          terminalChoiceEvidence,
         },
         terminalArguments:
           native().phase === 'finished'
@@ -2254,6 +2265,7 @@ export function replayNetworkPrefix(
             : null,
       });
       const semantic = compared.semantic;
+      if (!semantic.semanticMatch) observedChoices.rejectTerminalMeaning(terminalChoiceEvidence);
       terminalValidation = compared.terminalValidation ?? terminalValidation;
       const buildingResourceClosures = semantic.evidence.some(
         (e) => e.type === 'fixedBuildingClosure',
