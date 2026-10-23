@@ -266,6 +266,7 @@ export function inspectTerminalProjection({
     sourceToNative,
     catalog,
     feedingTransitions,
+    claimantLastFinalEvidence,
   });
   if (!components.matched) failures.push('terminalComponentsNotEstablished');
   const scores = [];

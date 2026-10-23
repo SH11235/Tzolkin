@@ -1352,6 +1352,18 @@ for (const claimantLastTurn of [false, true])
     });
     assert.equal(result.semantic.semanticMatch, true);
     assert.equal(result.terminalValidation.completed, true);
+    if (claimantLastTurn) {
+      const components = result.terminalValidation.components;
+      assert.equal(components.required, true);
+      assert.equal(components.individualResourceAndSkullComponentsVerified, true);
+      assert.equal(components.nativeStep, 11);
+      assert.deepEqual(components.finalScoring, pending.witness);
+      assert.deepEqual(components.individualComponents, pending.components);
+      assert.deepEqual(
+        components.sourceCornReceipt,
+        r.comparison.finish().obligations.at(-1).receipt,
+      );
+    }
     assert.ok(
       result.terminalValidation.calendar[
         claimantLastTurn ? 'boundClaimantLastDoubleAdvance' : 'boundZeroCornDoubleAdvance'
@@ -1370,6 +1382,105 @@ for (const claimantLastTurn of [false, true])
       false,
     );
   });
+
+function lastTerminalCase(close = true) {
+  const f = fixture(undefined, { claimantLastTurn: true }),
+    r = publicCaller(f);
+  r.comparison.bindSource95Legacy(r.context, oldWitness(f));
+  const pending = r.semantic.evidence.find((e) => e.type === 'pendingFinalScoreReceipts');
+  const a = actual(f, pending);
+  const context = r.comparison.begin(a.context.group, r.ledger, r.native, r.observation);
+  r.comparison.applied(context, a.context.transitions[0]);
+  Object.assign(a.ledger, {
+    initial: f.index.initial,
+    foodDays: [8, 14, 21, 27],
+    feedingWitnesses: sourceFeedingWitnesses(f.index),
+  });
+  if (close)
+    r.comparison.compare(context, {
+      ledger: a.ledger,
+      native: a.native,
+      observation: null,
+      differences: [],
+      applied: a.selected,
+      humanDecision: false,
+    });
+  const proof = close
+    ? r.comparison.claimantLastFinalEvidence()
+    : settle(f, f.factory.prove(f.input));
+  const args = {
+    index: f.index,
+    group: context.group,
+    context,
+    ledger: a.ledger,
+    native: a.native,
+    observation: null,
+    differences: [],
+    sourceToNative: f.sourceToNative,
+    feedingTransitions: f.input.context.transitions,
+    claimantLastFinalEvidence: proof,
+    terminalDisplayCheckpoint: {
+      mode: 'floorTotal',
+      scores: a.native.finalScores.map((s) => ({
+        playerId: s.playerId,
+        total: Math.floor(s.total),
+        rank: s.rank,
+      })),
+    },
+  };
+  return { f, proof, args };
+}
+
+test('mandatory claimant components require the live closed proof and consume it once', () => {
+  const valid = lastTerminalCase();
+  const result = inspectTerminalProjection(valid.args);
+  assert.equal(result.completed, true, JSON.stringify(result));
+  assert.equal(result.components.required, true);
+  assert.equal(result.components.individualResourceAndSkullComponentsVerified, true);
+  assert.equal(inspectTerminalProjection(valid.args).components.matched, false);
+  const pending = lastTerminalCase(false);
+  assert.equal(pending.proof.closed, false);
+  assert.equal(inspectTerminalProjection(pending.args).components.matched, false);
+  for (const change of [
+    (c) => {
+      c.args.claimantLastFinalEvidence = null;
+    },
+    (c) => {
+      c.args.claimantLastFinalEvidence = clone(c.proof);
+    },
+    (c) => {
+      c.args.context = clone(c.args.context);
+    },
+    (c) => {
+      c.args.claimantLastFinalEvidence = lastTerminalCase().proof;
+    },
+    (c) => {
+      c.args.sourceToNative = new Map([
+        ['1', 0],
+        ['2', 2],
+        ['3', 1],
+      ]);
+    },
+    (c) => {
+      c.proof.witness.players[0].resource.points++;
+    },
+    (c) => {
+      c.args.native.finalScores[0].resourcePoints--;
+      c.args.native.finalScores[0].skullPoints++;
+    },
+    (c) => {
+      c.f.index.groups.find((g) => g.moveId === 6).entries.find((n) => n.type === 'firstPlayerCorn')
+        .args.corn++;
+    },
+  ]) {
+    const c = lastTerminalCase();
+    change(c);
+    const rejected = inspectTerminalProjection(c.args);
+    assert.equal(rejected.components.required, true);
+    assert.equal(rejected.components.matched, false);
+    assert.equal(rejected.completed, false);
+  }
+});
 
 function monumentReceiptInput(f) {
   const entries = f.input.context.group.entries;

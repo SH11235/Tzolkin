@@ -814,6 +814,45 @@ export function proveClaimantLastTerminalCoordinates(input) {
   return proveFoodTerminalCoordinates(input, false);
 }
 
+export function consumeClaimantLastTerminalComponents(input) {
+  if (!proveClaimantLastTerminalCoordinates(input)) return null;
+  const bound = pendingBindings.get(input.evidence),
+    closed = bound.closure,
+    proof = input.evidence;
+  try {
+    requireProof(
+      !bound.componentsConsumed &&
+        input.context === closed.context &&
+        input.sourceToNative instanceof Map &&
+        input.sourceToNative.size === proof.components.length &&
+        proof.witness.players.every(
+          (player) => input.sourceToNative.get(player.sourceActor) === player.actor,
+        ) &&
+        proof.food.claimantLastTurn === true,
+    );
+    const result = {
+      required: true,
+      matched: true,
+      sourceRawSha256: input.index.rawSha256,
+      sourceMoveId: input.group.moveId,
+      nativeStep: closed.context.transitions[0].step,
+      claim: clone(proof.claim),
+      sourceCornReceipt: clone(bound.receipt),
+      foodAndTemples: clone(proof.food.perPlayerResults),
+      sourceFeedingStart: clone(proof.food.sourceFeedingStart),
+      finalScoring: clone(proof.witness),
+      individualComponents: clone(proof.components),
+      sourceDerivedBeforeAndAfter: true,
+      individualResourceAndSkullComponentsVerified: true,
+    };
+    bound.componentsConsumed = true;
+    return result;
+  } catch (error) {
+    if (error instanceof ProofMismatch) return null;
+    throw error;
+  }
+}
+
 function proveFoodTerminalCoordinates({ index, group, ledger, native, evidence }, zeroCorn) {
   const bound = pendingBindings.get(evidence),
     closed = bound?.closure;
