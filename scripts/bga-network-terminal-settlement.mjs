@@ -60,10 +60,26 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
   check(
     sequence && sequence.groups.some((g) => g.group === group) && same(context.original, group),
   );
-  check(index.groups.at(-1) === group && sourceToNative.size === 3 && before.players.length === 3);
+  const playerCount = sourceToNative.size;
   check(
-    new Set(sourceToNative.values()).size === 3 &&
-      [...sourceToNative.values()].every((n) => [0, 1, 2].includes(n)),
+    index.groups.at(-1) === group &&
+      [3, 4].includes(playerCount) &&
+      before.players.length === playerCount,
+  );
+  check(
+    new Set(sourceToNative.values()).size === playerCount &&
+      [...sourceToNative.values()].every((n) => Number.isInteger(n) && n >= 0 && n < playerCount),
+  );
+  const sourceActors = [...sourceToNative.keys()].sort();
+  check(
+    same(Object.keys(index.initial.players).sort(), sourceActors) &&
+      same(Object.keys(source.players).sort(), sourceActors) &&
+      same(Object.keys(ledger.players).sort(), sourceActors) &&
+      same(
+        before.players.map((p) => p.id),
+        Array.from({ length: playerCount }, (_, i) => i),
+      ) &&
+      native.players.length === playerCount,
   );
   check(
     before.version === 1 &&
@@ -99,8 +115,8 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
   );
   for (const t of transitions)
     check(
-      t.legalActions?.length === 1 &&
-        same(t.legalActions[0].action, t.action) &&
+      (t === end || t.legalActions?.length === 1) &&
+        t.legalActions?.filter((row) => same(row.action, t.action)).length === 1 &&
         t.actor === t.before.currentPlayer,
     );
   const fed = end.after;
@@ -330,7 +346,7 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
       );
     }
   }
-  check(finalResourceActor === 3);
+  check(finalResourceActor === playerCount);
   for (const [id, actor] of sourceToNative) {
     const original = source.players[id],
       p = before.players[actor],
@@ -432,6 +448,7 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
         ledger.players[id].score === Math.floor(total),
     );
     results.push({
+      sourceActor: id,
       actor,
       cost,
       unfed,
@@ -440,9 +457,13 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
       monumentPoints,
       resourcePoints,
       skullPoints,
+      scoreBefore: p.score,
+      scoreAfterFoodAndTemples: score,
+      finalTotal: total,
+      resources: clone(resources),
     });
   }
-  check(consumed.size === finals.length && native.finalScores.length === 3);
+  check(consumed.size === finals.length && native.finalScores.length === playerCount);
   check(
     same(before.skullSpaces, fed.skullSpaces) &&
       same(fed.skullSpaces, native.skullSpaces) &&
@@ -464,6 +485,10 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
     credit: ref(credit),
     receipt: ref(receipt),
     authorizedScoreUids,
+    scoreEffects: [
+      ...feeding.filter((entry) => entry.type === 'updateScore'),
+      ...[...temple, ...finals].map((row) => row.effect),
+    ].map(ref),
     results,
   };
 }
@@ -512,4 +537,36 @@ export function terminalSettlementScoreUids(proof, { context, ledger, native, cl
   )
     return [];
   return [...proof.authorizedScoreUids];
+}
+
+export function consumeTerminalSettlementComponents(input) {
+  const proof = input.terminalScoreSettlement;
+  const bound = issued.get(proof);
+  if (
+    !bound ||
+    bound.componentsConsumed ||
+    bound.context !== input.context ||
+    bound.ledger !== input.ledger ||
+    bound.native !== input.native ||
+    bound.input.index !== input.index ||
+    bound.input.context.group !== input.group ||
+    bound.input.sourceToNative !== input.sourceToNative ||
+    bound.input.catalog !== input.catalog ||
+    !inputIdentities(bound.input).every((value, i) => value === bound.identities[i]) ||
+    !same(bound.input, bound.snapshot) ||
+    !same(proof, bound.proof)
+  )
+    return null;
+  bound.componentsConsumed = true;
+  return {
+    required: true,
+    matched: true,
+    path: 'terminalScoreSettlement',
+    sourceMoveId: input.group.moveId,
+    consumedScoreEffects: clone(proof.scoreEffects),
+    foodAndTemples: clone(proof.results),
+    finalScoring: clone(proof.results),
+    sourceDerivedBeforeAndAfter: true,
+    individualResourceAndSkullComponentsVerified: true,
+  };
 }

@@ -19,6 +19,7 @@ import {
   prepareTerminalScoreSettlement,
   terminalSettlementScoreUids,
 } from './bga-network-terminal-settlement.mjs';
+import { terminalComponentGate } from './bga-network-terminal-components.mjs';
 import { finalMonumentMetric } from './bga-network-final-scoring.mjs';
 
 function terminalSettlementFixture(mutateRaw = () => {}) {
@@ -270,6 +271,195 @@ function terminalSettlementFixture(mutateRaw = () => {}) {
   };
   return { input: { index, context, ledger, native, sourceToNative, catalog }, claim };
 }
+
+function fourPlayerTerminalSettlementFixture(changeRows = () => {}) {
+  const f = terminalSettlementFixture((rows, raw) => {
+    raw.initialState.players['4'] = {
+      ...structuredClone(raw.initialState.players['3']),
+      id: '4',
+      name: 'P4',
+    };
+    raw.initialState.playerorder.push(4);
+    raw.initialState.workers.push({ id: '4', player: '4', place: null, position: null });
+    raw.initialState.gamestate.multiactive.push('4');
+    raw.gameLogs.data.data[0].data
+      .find((n) => n.type === 'gameStateMultipleActiveUpdate')
+      .args.push('4');
+    const pair = (type, points, log = '') => [
+      {
+        uid: `${type}-4-effect`,
+        type: 'updateScore',
+        log: '',
+        args: { player_id: '4', player_name: null, points },
+      },
+      { uid: `${type}-4-caption`, type, log, args: { player_id: '4', player_name: 'P4', points } },
+    ];
+    rows.splice(
+      rows.findIndex((n) => n.type === 'finalScoring'),
+      0,
+      ...pair('templeScore', 0),
+    );
+    rows.splice(
+      rows.findIndex((n) => n.type === 'rotateWheel'),
+      0,
+      ...pair('finalScoring', 1, 'Remaining resources: ${player_name} scores ${points} points'),
+    );
+    changeRows(rows);
+  });
+  const { input } = f;
+  input.sourceToNative.set('4', 3);
+  const p = {
+    ...structuredClone(input.context.source.players['3']),
+    resources: { corn: 4, wood: 0, stone: 0, gold: 0, skull: 0 },
+    score: 40,
+    temples: { chaac: 0, quetzalcoatl: 0, kukulkan: 0 },
+    feedWorkers: 3,
+  };
+  input.context.source.players['4'] = structuredClone(p);
+  input.ledger.players['4'] = { ...structuredClone(p), score: 41 };
+  const states = new Set([
+    input.context.native,
+    input.native,
+    ...input.context.transitions.flatMap((t) => [t.before, t.after]),
+  ]);
+  for (const state of states) {
+    state.players.push({
+      ...structuredClone(p),
+      id: 3,
+      buildingSkulls: 0,
+      feedAll: false,
+      templePoints: 0,
+    });
+    state.turnOrder = [0, 1, 3, 2];
+    if (state.pending === null && state.phase === 'playing') state.turnIndex = 3;
+    if (state.phase === 'finished') {
+      state.players[3].score = 41;
+      state.finalScores.push({
+        playerId: 3,
+        pointsBeforeFinal: 40,
+        monumentPoints: 0,
+        resourcePoints: 1,
+        skullPoints: 0,
+        total: 41,
+      });
+    }
+  }
+  const extraChoice = { action: { type: 'place', placements: [{ gear: 'uxmal', slot: 0 }] } };
+  input.context.observation.legalActions.push(extraChoice);
+  input.context.transitions[0].legalActions.push(structuredClone(extraChoice));
+  return f;
+}
+
+test('four-player terminal settlement requires all individual components and consumes its live proof once', () => {
+  const { input, claim } = fourPlayerTerminalSettlementFixture();
+  const proof = prepareTerminalScoreSettlement(input);
+  assert.ok(proof);
+  assert.equal(proof.results.length, 4);
+  assert.equal(terminalSettlementScoreUids(proof, { ...input, claim }).length, 5);
+  const componentInput = { ...input, group: input.context.group, terminalScoreSettlement: proof };
+  const components = terminalComponentGate(componentInput);
+  assert.equal(components.required, true);
+  assert.equal(components.matched, true);
+  assert.equal(components.individualResourceAndSkullComponentsVerified, true);
+  assert.equal(components.foodAndTemples.length, 4);
+  assert.equal(terminalComponentGate(componentInput).matched, false);
+});
+
+test('four-player settlement rejects missing components and foreign component proof bindings', () => {
+  for (const change of [
+    (i) => {
+      i.native.finalScores.pop();
+    },
+    (i) => {
+      delete i.context.source.players['4'];
+    },
+    (i) => {
+      i.sourceToNative.delete('4');
+    },
+    (i) => {
+      i.native.players[3].score++;
+    },
+    (i) => {
+      i.native.finalScores[3].resourcePoints++;
+      i.native.finalScores[3].skullPoints--;
+    },
+    (i) => {
+      i.context.transitions[0].legalActions.shift();
+    },
+  ]) {
+    const { input } = fourPlayerTerminalSettlementFixture();
+    change(input);
+    assert.equal(prepareTerminalScoreSettlement(input), null);
+  }
+  for (const change of [
+    (i) => {
+      i.terminalScoreSettlement = structuredClone(i.terminalScoreSettlement);
+    },
+    (i) => {
+      i.group = structuredClone(i.group);
+    },
+    (i) => {
+      i.context = structuredClone(i.context);
+    },
+    (i) => {
+      i.sourceToNative = new Map(i.sourceToNative);
+    },
+    (i) => {
+      i.native = structuredClone(i.native);
+    },
+    (i) => {
+      i.terminalScoreSettlement.results[3].resourcePoints++;
+    },
+  ]) {
+    const { input } = fourPlayerTerminalSettlementFixture();
+    const proof = prepareTerminalScoreSettlement(input);
+    assert.ok(proof);
+    const componentInput = { ...input, group: input.context.group, terminalScoreSettlement: proof };
+    change(componentInput);
+    assert.equal(terminalComponentGate(componentInput).matched, false);
+  }
+  const missing = fourPlayerTerminalSettlementFixture((rows) => {
+    rows.splice(
+      rows.findIndex((n) => n.uid === 'finalScoring-4-effect'),
+      2,
+    );
+  });
+  assert.equal(prepareTerminalScoreSettlement(missing.input), null);
+});
+
+test('terminal boundary caller connects settlement proof to mandatory components', () => {
+  for (const create of [terminalSettlementFixture, fourPlayerTerminalSettlementFixture]) {
+    const { input } = create();
+    Object.assign(input.ledger, {
+      foodDays: [8, 14, 21, 27],
+      feedingWitnesses: sourceFeedingWitnesses(input.index),
+      lastRotation: { day: 27 },
+    });
+    const compared = comparePublicBoundary({
+      context: input.context,
+      comparison: {
+        compare(context, args) {
+          assert.ok(args.terminalScoreSettlement);
+          return { failure: null, remainingDifferences: [], semanticMatch: true, evidence: [] };
+        },
+        terminalCalendarEvidence: () => null,
+      },
+      semanticArguments: {},
+      terminalArguments: {
+        ...input,
+        group: input.context.group,
+        differences: [],
+        feedingTransitions: [input.context.transitions[0]],
+      },
+    });
+    assert.equal(compared.terminalValidation.components.required, true);
+    assert.equal(compared.terminalValidation.components.matched, true);
+    assert.equal(
+      compared.terminalValidation.components.individualResourceAndSkullComponentsVerified,
+      true,
+    );
+  }
+});
 
 test('terminal settlement binds individual awards before semantic acceptance', () => {
   const { input, claim } = terminalSettlementFixture();

@@ -7,6 +7,7 @@ import {
 import { sourceCheckpoint } from './bga-network-source-projection.mjs';
 import { terminalRoundSourceClaim } from './bga-network-terminal-claim.mjs';
 import { consumeClaimantLastTerminalComponents } from './bga-network-final-food.mjs';
+import { consumeTerminalSettlementComponents } from './bga-network-terminal-settlement.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
 import {
   foodCost,
@@ -334,6 +335,14 @@ function validate({ index, group, context, ledger, native, sourceToNative, catal
 }
 
 export function terminalComponentGate(input) {
+  if (input.terminalScoreSettlement != null)
+    return (
+      consumeTerminalSettlementComponents(input) ?? {
+        required: true,
+        matched: false,
+        failure: 'terminal settlement component evidence missing or invalid',
+      }
+    );
   const finishedFeeding = input.feedingTransitions?.find(
     (t) => t.before.phase === 'playing' && t.after.phase === 'finished',
   );
