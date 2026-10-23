@@ -335,6 +335,8 @@ const {
   checkpointOperationType,
 } = await import('./bga-network-replay.mjs');
 const { convertNetworkInputs } = await import('./bga-network-cli.mjs');
+const { createTerminalCalendarComparison, proveBoundTerminalCoordinates } =
+  await import('./bga-network-semantic-calendar.mjs');
 const bytes = (x) => Buffer.from(JSON.stringify(x));
 const clone = structuredClone;
 
@@ -5162,4 +5164,493 @@ test('resource quantity uses the number of actual legal unit choices for the sam
   const mismatch = run(2);
   assert.equal(mismatch.verified, false);
   assert.match(mismatch.reason, /Quantity/);
+});
+
+function terminalReentryFixture(mutateRaw = () => {}) {
+  const raw = fixture(),
+    source = terminalCalendarFixture();
+  const planning = { places: { uxmal: 0 }, corn: '0', workers: {} };
+  source.groups.splice(-3, 0, {
+    moveId: 31,
+    entries: [
+      { type: 'alterTemple', args: { player_id: '2', temple_id: 'chaac', step: 5, corn: 3 } },
+      { type: 'takeGoods', args: { player_id: '2', type: 'corn', quantity: 3 } },
+      {
+        type: 'gameStateChange',
+        args: { id: 4, active_player: '2', type: 'activeplayer', args: planning },
+      },
+    ],
+  });
+  source.groups.slice(-3).forEach((group) => group.moveId++);
+  source.groups
+    .find((group) => group.moveId === 32)
+    .entries.unshift({
+      type: 'placeWorker',
+      args: { player_id: '2', place: 'uxmal', position: 0, corn: 0, worker_id: 'synthetic-worker' },
+    });
+  raw.initialState.gamestates[4] = {
+    name: 'playerTurn',
+    type: 'activeplayer',
+    possibleactions: ['beg', 'placeWorker', 'pickUpWorker'],
+  };
+  const checkpoint = raw.gameLogs.data.data[0];
+  raw.gameLogs.data.data = [
+    checkpoint,
+    ...source.groups.map((group, i) => ({
+      channel: '/table/t123',
+      table_id: 123,
+      packet_id: String(i + 2),
+      packet_type: 'resend',
+      move_id: String(group.moveId <= 25 ? group.moveId + 1 : group.moveId),
+      time: '1',
+      data: group.entries.map((entry, j) => {
+        const n = structuredClone(entry);
+        n.uid = `calendar-${i}-${j}`;
+        n.log = '';
+        if (n.type === 'gameStateChange' && Number(n.args.id) === 4)
+          Object.assign(n.args, {
+            type: 'activeplayer',
+            args: { ...planning, ...(group.moveId === 30 ? { beg: 3 } : {}) },
+          });
+        if (n.type === 'rotateWheel' && group.moveId === 30) n.args.player_id = '2';
+        return n;
+      }),
+    })),
+  ];
+  mutateRaw(raw);
+  const index = parseNetworkReplay(bytes(raw)),
+    seats = new Map([
+      ['1', 0],
+      ['2', 1],
+      ['3', 2],
+    ]);
+  const before = {
+    phase: 'playing',
+    round: 26,
+    pending: { task: { type: 'rotation' } },
+    foodDays: [8, 14, 21],
+    firstPlayerClaimed: 1,
+    firstPlayer: 1,
+    currentPlayer: 1,
+    turnIndex: 2,
+    turnOrder: [1, 2, 0],
+    turn: { mode: 'none', count: 0, begged: false },
+    players: Array.from({ length: 3 }, () => ({
+      doubleAdvanceAvailable: true,
+      resources: { corn: 0, wood: 0, stone: 0, gold: 0, skull: 0 },
+      temples: { chaac: 5, quetzalcoatl: 0, kukulkan: 0 },
+    })),
+  };
+  const entered = structuredClone(before);
+  Object.assign(entered, { round: 27, pending: null, firstPlayerClaimed: null, turnIndex: 0 });
+  entered.players[1].doubleAdvanceAvailable = false;
+  const pending = structuredClone(entered);
+  pending.pending = {
+    task: { type: 'temple', remaining: 1, direction: -1, reason: 'beg' },
+    after: [],
+  };
+  const begged = structuredClone(entered);
+  begged.players[1].resources.corn = 3;
+  begged.players[1].temples.chaac--;
+  begged.turn.begged = true;
+  const placed = structuredClone(begged);
+  placed.turn.mode = 'place';
+  placed.turn.count = 1;
+  const next = structuredClone(placed);
+  next.currentPlayer = 2;
+  next.turnIndex = 1;
+  next.turn = { mode: 'none', count: 0, begged: false };
+  const begRow = { action: { type: 'beg' }, move: { type: 'beg' } },
+    templeRow = {
+      action: { type: 'temple', temple: 'chaac', direction: -1 },
+      move: { type: 'choose', choiceId: 'chaac' },
+    };
+  const placeRow = {
+    action: { type: 'place', gear: 'uxmal', cornCost: 0 },
+    move: { type: 'place', gear: 'uxmal', position: 0 },
+  };
+  const endRow = { action: { type: 'endTurn' }, move: { type: 'endTurn' } };
+  const group = (move) => index.groups.find((g) => g.moveId === move);
+  const operation = (entry, row, step, a, b) => ({
+    entry,
+    row,
+    step,
+    actor: 1,
+    observationActor: 1,
+    sourceActor: '2',
+    legalRows: [row],
+    before: a,
+    after: b,
+    afterLegalRows: [],
+  });
+  const beg = operation(group(31).entries[0], begRow, 1, entered, pending),
+    temple = operation(group(31).entries[0], templeRow, 2, pending, begged);
+  const place = operation(group(32).entries[0], placeRow, 3, begged, placed),
+    end = operation(
+      group(32).entries.find((n) => n.type === 'gameStateChange' && Number(n.args.id) === 90),
+      endRow,
+      4,
+      placed,
+      next,
+    );
+  const calendar = createTerminalCalendarComparison({ index, sourceToNative: seats });
+  const ledger = (move) => ({
+    day: move === 34 ? 28 : 27,
+    stateId: move === 34 ? 99 : 4,
+    ...(move === 34
+      ? {
+          lastRotation: {
+            ...group(34).entries.find((n) => n.type === 'rotateWheel'),
+            moveId: 34,
+            day: 28,
+            twice: 0,
+          },
+        }
+      : {}),
+  });
+  const compare = (move, a, b, transitions = [], operations = []) =>
+    calendar.compare(
+      { group: group(move), native: a, transitions },
+      { ledger: ledger(move), native: b, operations },
+    );
+  const transition = (actor, a, b, type = 'endTurn') => ({
+    actor,
+    before: a,
+    after: b,
+    action: { type },
+    legalActions: [],
+  });
+  const rotate = {
+    actor: 1,
+    before,
+    after: entered,
+    action: { type: 'rotate', days: 2 },
+    legalActions: [
+      { action: { type: 'rotate', days: 2 }, move: { type: 'choose', choiceId: '2' } },
+    ],
+  };
+  const choiceBoundary = (move, actor, state, rows) => ({
+    potentialHumanDecision: true,
+    sourceStateId: 4,
+    sourceActor: String(actor + 1),
+    nativeActor: actor,
+    sourceMenu: group(move).entries.findLast(
+      (n) => n.type === 'gameStateChange' && Number(n.args.id) === 4,
+    ).args.args,
+    nativePending: null,
+    nativeLegalActions: rows,
+  });
+  const initialBoundary = {
+    moveId: 30,
+    stateId: 4,
+    name: 'playerTurn',
+    args: choiceBoundary(30, 1, entered, [begRow]).sourceMenu,
+    sourceActor: '2',
+    actor: 1,
+    pending: null,
+    legalRows: [begRow],
+  };
+  const choices = createObservedChoices({
+    index,
+    initialMoveId: 30,
+    sourceToNative: seats,
+    mapCard: (x) => x,
+    initialBoundary,
+  });
+  const observeBeg = () =>
+    choices.observe({
+      group: group(31),
+      before: entered,
+      after: begged,
+      operations: [beg, temple],
+      boundary: choiceBoundary(31, 1, begged, [placeRow]),
+      audit: [],
+      publicResultMatched: true,
+    });
+  const observePlace = () =>
+    choices.observe({
+      group: group(32),
+      before: begged,
+      after: next,
+      operations: [place, end],
+      boundary: choiceBoundary(32, 2, next, [placeRow]),
+      audit: [],
+      publicResultMatched: true,
+    });
+  const enter = () => compare(30, before, entered, [rotate]);
+  const applyBeg = () => compare(31, entered, begged, [], [beg, temple]);
+  const advance = () => compare(32, begged, next, [transition(1, placed, next)]);
+  function close() {
+    const third = structuredClone(next);
+    third.currentPlayer = 0;
+    third.turnIndex = 2;
+    compare(33, next, third, [transition(2, next, third)]);
+    const finished = structuredClone(third);
+    finished.phase = 'finished';
+    finished.pending = null;
+    finished.foodDays.push(27);
+    const result = compare(34, third, finished, [transition(0, third, finished)]);
+    return { result, native: finished, ledger: ledger(34), group: group(34) };
+  }
+  return {
+    index,
+    raw,
+    seats,
+    calendar,
+    choices,
+    entered,
+    begged,
+    next,
+    beg,
+    temple,
+    place,
+    end,
+    initialBoundary,
+    choiceBoundary,
+    enter,
+    applyBeg,
+    advance,
+    observeBeg,
+    observePlace,
+    close,
+    group,
+  };
+}
+
+test('terminal turn intervals preserve same-actor decisions and unchanged three/four-player cycles', () => {
+  const f = terminalReentryFixture(),
+    before = structuredClone(f.index);
+  const witness = terminalPlayingCalendarWitness(f.index);
+  assert.deepEqual(f.index, before);
+  assert.equal(witness.turnStarts.length, 3);
+  assert.equal(witness.turnEnds.length, 3);
+  assert.equal(witness.turnIntervals[0].reentries[0].moveId, 31);
+  assert.deepEqual(witness.turnIntervals[0].reentries[0].args, f.group(31).entries.at(-1).args);
+  const noReentry = terminalCalendarFixture();
+  assert.equal(terminalPlayingCalendarWitness(noReentry).turnIntervals, undefined);
+  const four = terminalCalendarFixture();
+  four.initial.playerorder.push(4);
+  four.groups.at(-2).entries[1].args.active_player = '4';
+  four.groups.at(-1).moveId = 34;
+  four.groups.splice(-1, 0, {
+    moveId: 33,
+    entries: [
+      { type: 'gameStateChange', args: { id: 90, active_player: '4' } },
+      { type: 'gameStateChange', args: { id: 4, active_player: '1' } },
+    ],
+  });
+  assert.deepEqual(terminalPlayingCalendarWitness(four).sourceActorOrder, ['2', '3', '4', '1']);
+  for (const mutate of [
+    (raw) =>
+      (raw.gameLogs.data.data.find((p) => p.move_id === '31').data.at(-1).args.active_player = '3'),
+    (raw) =>
+      raw.gameLogs.data.data
+        .find((p) => p.move_id === '31')
+        .data.splice(2, 0, {
+          uid: 'foreign-intermediate-actor',
+          type: 'gameStateChange',
+          log: '',
+          args: { id: 31, active_player: '3', type: 'activeplayer', args: {} },
+        }),
+    (raw) => raw.gameLogs.data.data.find((p) => p.move_id === '32').data.splice(1, 1),
+    (raw) =>
+      raw.gameLogs.data.data
+        .find((p) => p.move_id === '32')
+        .data.splice(2, 0, {
+          ...structuredClone(raw.gameLogs.data.data.find((p) => p.move_id === '32').data[1]),
+          uid: 'duplicate-end',
+        }),
+    (raw) =>
+      raw.gameLogs.data.data.at(-1).data.push({
+        uid: 'after-terminal',
+        type: 'gameStateChange',
+        log: '',
+        args: { id: 4, active_player: '2', type: 'activeplayer', args: {} },
+      }),
+  ])
+    assert.throws(
+      () => terminalPlayingCalendarWitness(terminalReentryFixture(mutate).index),
+      /terminal calendar|Network replay/,
+    );
+});
+
+test('terminal reentry needs live legal begging and both original choice boundaries before closure', () => {
+  const f = terminalReentryFixture();
+  assert.equal(f.enter().failure, null);
+  assert.equal(f.applyBeg().failure, null);
+  assert.equal(f.calendar.finish().reentries[0].effectMatched, true);
+  assert.equal(f.calendar.finish().reentries[0].choicesMatched, false);
+  f.observeBeg();
+  f.calendar.bindChoices(f.choices);
+  assert.equal(f.calendar.finish().reentries[0].choicesMatched, false);
+  f.advance();
+  f.observePlace();
+  f.calendar.bindChoices(f.choices);
+  assert.equal(f.calendar.finish().reentries[0].choicesMatched, true);
+  const closed = f.close();
+  assert.equal(closed.result.failure, null);
+  assert.equal(f.calendar.finish().allObligationsClosed, true);
+  assert.ok(
+    proveBoundTerminalCoordinates({
+      index: f.index,
+      ...closed,
+      evidence: f.calendar.terminalClosure(),
+    }),
+  );
+  const evidence = f.choices.boundaryEvidence(31);
+  const unknown = terminalReentryFixture();
+  unknown.enter();
+  unknown.applyBeg();
+  unknown.advance();
+  unknown.calendar.bindChoices({ boundaryEvidence: () => structuredClone(evidence) });
+  assert.equal(unknown.close().result.failure.includes('did not close'), true);
+  assert.equal(unknown.calendar.finish().allObligationsClosed, false);
+});
+
+test('terminal reentry rejects changed original effects and invalid native begging without dropping decisions', () => {
+  for (const mutate of [
+    (f) => (f.group(31).entries[0].uid += 'changed'),
+    (f) => (f.group(31).entries.at(-1).args.args.corn = '9'),
+    (f) => (f.beg.legalRows = []),
+    (f) => (f.beg.after.players[1].resources.corn = 3),
+    (f) => f.temple.after.players[1].temples.chaac++,
+    (f) => (f.beg.row = { ...f.beg.row, action: { type: 'skip' } }),
+  ]) {
+    const f = terminalReentryFixture();
+    f.enter();
+    mutate(f);
+    assert.ok(f.applyBeg().failure);
+    assert.equal(f.calendar.finish().allObligationsClosed, false);
+  }
+  const f = terminalReentryFixture((raw) =>
+    raw.gameLogs.data.data
+      .find((p) => p.move_id === '31')
+      .data.splice(1, 0, {
+        uid: 'unknown-effect',
+        type: 'takeGoods',
+        log: '',
+        args: { player_id: '2', type: 'wood', quantity: 1 },
+      }),
+  );
+  f.enter();
+  assert.ok(f.applyBeg().failure);
+  const pending = terminalReentryFixture();
+  pending.enter();
+  pending.applyBeg();
+  pending.advance();
+  assert.ok(pending.close().result.failure);
+  assert.equal(pending.calendar.terminalClosure(), null);
+});
+
+test('terminal reentry keeps later action quotes and native turn order binding', () => {
+  const changed = terminalReentryFixture(
+    (raw) =>
+      (raw.gameLogs.data.data.find((p) => p.move_id === '31').data.at(-1).args.args.places.uxmal =
+        1),
+  );
+  changed.enter();
+  changed.applyBeg();
+  changed.observeBeg();
+  changed.advance();
+  changed.observePlace();
+  changed.calendar.bindChoices(changed.choices);
+  assert.equal(changed.choices.finish().boundaries.find((b) => b.moveId === 31).verified, false);
+  assert.ok(changed.close().result.failure);
+  const effect = terminalReentryFixture(
+    (raw) => (raw.gameLogs.data.data.find((p) => p.move_id === '31').data[1].args.quantity = 2),
+  );
+  effect.enter();
+  assert.ok(effect.applyBeg().failure);
+  const actor = terminalReentryFixture();
+  actor.enter();
+  actor.applyBeg();
+  const result = actor.calendar.compare(
+    {
+      group: actor.group(32),
+      native: actor.begged,
+      transitions: [
+        {
+          actor: 2,
+          action: { type: 'endTurn' },
+          before: actor.begged,
+          after: actor.next,
+        },
+      ],
+    },
+    { ledger: { day: 27 }, native: actor.next },
+  );
+  assert.match(result.failure, /actor order/);
+});
+
+test('terminal reentry live choice evidence cannot cross contexts or outlive changed source', () => {
+  const run = () => {
+    const f = terminalReentryFixture();
+    f.enter();
+    f.applyBeg();
+    f.observeBeg();
+    f.advance();
+    f.observePlace();
+    return f;
+  };
+  const other = run(),
+    foreign = run();
+  foreign.calendar.bindChoices(other.choices);
+  assert.ok(foreign.close().result.failure);
+  const local = run();
+  local.calendar.bindChoices(local.choices);
+  const closed = local.close();
+  const evidence = local.calendar.terminalClosure();
+  assert.ok(evidence);
+  local.group(31).entries.at(-1).args.args.corn = '1';
+  assert.equal(local.calendar.terminalClosure(), null);
+  assert.equal(proveBoundTerminalCoordinates({ index: local.index, ...closed, evidence }), null);
+  assert.equal(local.calendar.finish().allObligationsClosed, false);
+});
+
+test('terminal reentry choice evidence must match the actual native response frames', () => {
+  const f = terminalReentryFixture();
+  f.enter();
+  f.applyBeg();
+  f.advance();
+  const otherState = (state) => {
+    const result = structuredClone(state);
+    result.players[0].resources.wood++;
+    return result;
+  };
+  const operation = (op) => ({
+    ...structuredClone(op),
+    entry: op.entry,
+    before: otherState(op.before),
+    after: otherState(op.after),
+  });
+  const foreign = createObservedChoices({
+    index: f.index,
+    initialMoveId: 30,
+    sourceToNative: f.seats,
+    mapCard: (x) => x,
+    initialBoundary: f.initialBoundary,
+  });
+  foreign.observe({
+    group: f.group(31),
+    before: otherState(f.entered),
+    after: otherState(f.begged),
+    operations: [operation(f.beg), operation(f.temple)],
+    boundary: f.choiceBoundary(31, 1, f.begged, [f.place.row]),
+    audit: [],
+    publicResultMatched: true,
+  });
+  foreign.observe({
+    group: f.group(32),
+    before: otherState(f.begged),
+    after: otherState(f.next),
+    operations: [operation(f.place), operation(f.end)],
+    boundary: f.choiceBoundary(32, 2, f.next, [f.place.row]),
+    audit: [],
+    publicResultMatched: true,
+  });
+  assert.ok(foreign.boundaryEvidence(30));
+  assert.ok(foreign.boundaryEvidence(31));
+  f.calendar.bindChoices(foreign);
+  assert.equal(f.calendar.finish().reentries[0].choicesMatched, false);
+  assert.ok(f.close().result.failure);
 });

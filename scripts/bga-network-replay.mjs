@@ -2235,6 +2235,7 @@ export function replayNetworkPrefix(
           },
           ageTwoRefillEvidence,
           recordSteps: record.steps,
+          choiceOperations,
         },
         terminalArguments:
           native().phase === 'finished'
@@ -2556,6 +2557,7 @@ export function replayNetworkPrefix(
           sourceBefore: semanticContext.source,
           sourceAfter: ledger,
         });
+        semanticComparison.bindCalendarChoices(observedChoices);
         successfulGroups.push(group.moveId);
         continue;
       }
@@ -2619,6 +2621,7 @@ export function replayNetworkPrefix(
         sourceBefore: semanticContext.source,
         sourceAfter: ledger,
       });
+      semanticComparison.bindCalendarChoices(observedChoices);
       successfulGroups.push(group.moveId);
     } catch (error) {
       let failureContext = null,

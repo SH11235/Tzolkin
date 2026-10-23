@@ -32,6 +32,35 @@ const ref = (n) => ({
   packetIndex: n.packetIndex,
   notificationIndex: n.notificationIndex,
 });
+const boundaryEvidence = new WeakMap();
+export function verifiedObservedChoiceBoundary(index, evidence) {
+  const bound = boundaryEvidence.get(evidence);
+  const sequence = originalNetworkSequence(index);
+  if (
+    !bound ||
+    bound.index !== index ||
+    !sequence ||
+    bound.proofs.get(bound.boundary.moveId) !== bound.result ||
+    bound.result.verified !== true ||
+    !same(bound.result, bound.snapshot) ||
+    !sequence.groups.some(
+      ({ group, original }) => group === bound.group && same(group, original),
+    ) ||
+    !bound.group.entries.includes(bound.entry) ||
+    !same(bound.entry.args.args, bound.boundary.args)
+  )
+    return null;
+  return {
+    moveId: bound.boundary.moveId,
+    source: ref(bound.entry),
+    args: clone(bound.boundary.args),
+    sourceActor: bound.boundary.sourceActor,
+    actor: bound.boundary.actor,
+    responseMoveId: bound.result.responseMoveId,
+    nativeBefore: clone(bound.nativeBefore),
+    nativeAfter: clone(bound.nativeAfter),
+  };
+}
 export const choicePublicState = (state) =>
   Object.fromEntries(
     Object.entries(state)
@@ -476,7 +505,8 @@ export function createObservedChoices({
   const sequence = originalNetworkSequence(index),
     originals = new Map(sequence?.groups.map((x) => [x.group, x.original]) ?? []),
     proofs = new Map(),
-    operationEvidence = [];
+    operationEvidence = [],
+    issuedBoundaries = new Map();
   const capturedOperations = [],
     deferredTechnologies = [],
     consumedImmediateBuildingRewards = new Set();
@@ -493,6 +523,7 @@ export function createObservedChoices({
       reason,
       ...extra,
     });
+    issuedBoundaries.delete(b.moveId);
   };
   const pass = (b, kind, group, ops, extra = {}) => {
     if (proofs.get(b.moveId)?.verified === false) return;
@@ -507,6 +538,35 @@ export function createObservedChoices({
       nativeSteps: ops.map((o) => o.step),
       ...extra,
     });
+    const sourceGroup = sequence?.groups.find(({ group }) => group.moveId === b.moveId)?.group;
+    const entry = sourceGroup?.entries.findLast(
+      (n) => n.type === 'gameStateChange' && Number(n.args.id) === 4,
+    );
+    if (
+      b.stateId === 4 &&
+      b.name === 'playerTurn' &&
+      ops.length > 0 &&
+      entry &&
+      trusted(sourceGroup, entry) &&
+      entry.args.type === 'activeplayer' &&
+      String(entry.args.active_player) === b.sourceActor &&
+      same(entry.args.args, b.args)
+    ) {
+      const result = proofs.get(b.moveId);
+      const evidence = Object.freeze({ schema: 'tzolkin-observed-player-boundary-v1' });
+      boundaryEvidence.set(evidence, {
+        index,
+        group: sourceGroup,
+        entry,
+        boundary: clone(b),
+        result,
+        snapshot: clone(result),
+        proofs,
+        nativeBefore: clone(ops[0].before),
+        nativeAfter: clone(ops.at(-1).after),
+      });
+      issuedBoundaries.set(b.moveId, evidence);
+    }
   };
   function trusted(group, entry) {
     const p = originalPacketEntry(entry);
@@ -1186,5 +1246,5 @@ export function createObservedChoices({
       teacherCertified: false,
     };
   }
-  return { observe, finish };
+  return { observe, finish, boundaryEvidence: (moveId) => issuedBoundaries.get(moveId) ?? null };
 }

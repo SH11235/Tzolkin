@@ -1,5 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { originalNetworkSequence, originalPacketEntry } from './bga-network.mjs';
+import { begChoiceProof } from './bga-network-compound-choices.mjs';
+import { verifiedObservedChoiceBoundary } from './bga-network-observed-choices.mjs';
 
 // Only live proofs retain the binding to original entries and applied transitions.
 const terminalClosures = new WeakMap();
@@ -60,8 +62,48 @@ export function terminalPlayingCalendarWitness(index) {
   if (terminal.length !== 1) fail('terminal calendar requires one original terminal boundary');
   const end = terminal[0],
     segment = timeline.slice(startIndex, timeline.indexOf(end) + 1);
-  const starts = segment.filter((n) => isState(n, 4)),
-    ends = segment.filter((n) => isState(n, 90));
+  const turns = [];
+  let open = null;
+  for (const n of segment) {
+    if (
+      open &&
+      n.type === 'gameStateChange' &&
+      n.args.active_player != null &&
+      String(n.args.active_player) !== open.actor
+    )
+      fail('terminal calendar changes actor before the matching turn end');
+    if (isState(n, 4)) {
+      const actor = String(n.args.active_player);
+      if (!open) {
+        open = { actor, start: n, end: null, reentries: [] };
+        turns.push(open);
+      } else {
+        if (
+          actor !== open.actor ||
+          typeof n.uid !== 'string' ||
+          !n.uid.length ||
+          segment.filter((e) => e.uid === n.uid).length !== 1 ||
+          !Number.isSafeInteger(n.packetIndex) ||
+          !Number.isSafeInteger(n.notificationIndex) ||
+          n.args.type !== 'activeplayer' ||
+          !n.args.args ||
+          typeof n.args.args !== 'object'
+        )
+          fail('terminal calendar reentry lacks its same-actor original decision boundary');
+        open.reentries.push(n);
+      }
+    } else if (isState(n, 90)) {
+      if (!open || String(n.args.active_player) !== open.actor)
+        fail('terminal calendar turn end has no matching open actor');
+      open.end = n;
+      open = null;
+    } else if ([91, 92, 99].some((id) => isState(n, id)) && open) {
+      fail('terminal calendar crosses an unfinished actor turn');
+    }
+  }
+  if (open) fail('terminal calendar actor turn remains open');
+  const starts = turns.map((turn) => turn.start),
+    ends = turns.map((turn) => turn.end);
   const meals = segment.filter((n) => isState(n, 92)),
     rotations = segment.filter((n) => n.type === 'rotateWheel');
   const priorMeals = timeline.slice(0, startIndex).filter((n) => isState(n, 92));
@@ -138,6 +180,20 @@ export function terminalPlayingCalendarWitness(index) {
     priorFeeding: priorMeals.map(ref),
     turnStarts: starts.map(ref),
     turnEnds: ends.map(ref),
+    ...(turns.some((turn) => turn.reentries.length)
+      ? {
+          turnIntervals: turns.map((turn) => ({
+            sourceActor: turn.actor,
+            start: ref(turn.start),
+            end: ref(turn.end),
+            reentries: turn.reentries.map((n) => ({
+              ...ref(n),
+              args: copy(n.args),
+              sourceOrder: segment.indexOf(n),
+            })),
+          })),
+        }
+      : {}),
     finalFeeding: ref(meal),
     finalRotation: ref(lastRotation),
     terminal: ref(end),
@@ -189,9 +245,21 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
   const sequence = originalNetworkSequence(index);
   const witness = terminalPlayingCalendarWitness(index);
   const initialSource = copy(index.initial);
+  const reentries = (witness?.turnIntervals ?? []).flatMap((turn, position) =>
+    turn.reentries.map((entry, i) => ({
+      sourceActor: turn.sourceActor,
+      position,
+      previous: i ? turn.reentries[i - 1] : turn.start,
+      entry,
+      end: turn.end,
+      effectMatched: false,
+      choices: null,
+    })),
+  );
   let obligation = null;
   let terminalClosure = null;
   let failure = null;
+  const responses = new Map();
   const reject = (message) => {
     failure ??= message;
   };
@@ -210,11 +278,54 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
     return packet?.rawSha256 === index.rawSha256 &&
       packet.packetType === 'resend' &&
       packet.tableId === index.tableId &&
-      entry.channel === `/table/t${index.tableId}`
+      entry.channel === `/table/t${index.tableId}` &&
+      (!ref.args || isDeepStrictEqual(entry.args, ref.args))
       ? entry
       : null;
   };
-  function compare(context, { ledger, native }) {
+  const reentriesClosed = () =>
+    reentries.every(
+      (row) =>
+        row.effectMatched &&
+        row.choices?.every((proof) => verifiedObservedChoiceBoundary(index, proof)),
+    );
+  function bindChoices(choices) {
+    for (const row of reentries.filter((r) => r.effectMatched && !r.choices)) {
+      const tokens = [
+        choices.boundaryEvidence(row.previous.moveId),
+        choices.boundaryEvidence(row.entry.moveId),
+      ];
+      const [before, after] = tokens.map((proof) => verifiedObservedChoiceBoundary(index, proof));
+      const begResponse = before && responses.get(before.responseMoveId),
+        choiceResponse = after && responses.get(after.responseMoveId);
+      const reference = (n) => ({
+        uid: n.uid,
+        packetIndex: n.packetIndex,
+        notificationIndex: n.notificationIndex,
+      });
+      if (
+        before &&
+        after &&
+        before.sourceActor === row.sourceActor &&
+        after.sourceActor === row.sourceActor &&
+        before.actor === obligation.nativeActorOrder[row.position] &&
+        after.actor === before.actor &&
+        isDeepStrictEqual(before.source, reference(row.previous)) &&
+        isDeepStrictEqual(after.source, reference(row.entry)) &&
+        before.responseMoveId === row.entry.moveId &&
+        after.responseMoveId > row.entry.moveId &&
+        after.responseMoveId <= row.end.moveId &&
+        begResponse &&
+        choiceResponse &&
+        isDeepStrictEqual(before.nativeBefore, begResponse.before) &&
+        isDeepStrictEqual(before.nativeAfter, begResponse.after) &&
+        isDeepStrictEqual(after.nativeBefore, choiceResponse.before) &&
+        isDeepStrictEqual(after.nativeAfter, choiceResponse.after)
+      )
+        row.choices = tokens;
+    }
+  }
+  function compare(context, { ledger, native, operations = [] }) {
     const fields = [],
       evidence = [];
     if (!witness) return { fields, evidence, failure };
@@ -227,6 +338,7 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
         ...witness.priorFeeding,
         ...witness.turnStarts,
         ...witness.turnEnds,
+        ...reentries.map((row) => row.entry),
         witness.finalFeeding,
         witness.finalRotation,
         witness.terminal,
@@ -273,6 +385,13 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
       }
     }
     if (!obligation || failure) return { fields, evidence, failure };
+    const withoutLog = (state) =>
+      Object.fromEntries(Object.entries(state).filter(([key]) => key !== 'log'));
+    if (reentries.length)
+      responses.set(group.moveId, {
+        before: copy(withoutLog(context.native)),
+        after: copy(withoutLog(native)),
+      });
     if (group.moveId > witness.terminal.moveId) {
       if (!obligation.closed || transitions.length)
         reject('native operations continue beyond the original final calendar');
@@ -280,6 +399,34 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
     }
     if (group.moveId < witness.terminal.moveId && native.phase !== 'playing')
       reject('native final-playing cycle ends before the original terminal');
+    for (const row of reentries.filter((r) => r.entry.moveId === group.moveId)) {
+      const actor = obligation.nativeActorOrder[row.position];
+      const beg = operations[0],
+        temple = operations[1];
+      const canonical = (state) =>
+        Object.fromEntries(Object.entries(state).filter(([key]) => key !== 'log'));
+      if (
+        row.effectMatched ||
+        !original(row.entry) ||
+        !original(row.previous) ||
+        operations.length !== 2 ||
+        beg?.row.action.type !== 'beg' ||
+        beg.actor !== actor ||
+        beg.observationActor !== actor ||
+        beg.sourceActor !== row.sourceActor ||
+        beg.before.phase !== 'playing' ||
+        beg.before.round !== witness.nativePlayingRound ||
+        beg.before.currentPlayer !== actor ||
+        beg.before.turnIndex !== row.position ||
+        !isDeepStrictEqual(beg.before.turnOrder, obligation.nativeActorOrder) ||
+        !beg.legalRows.some((legal) => isDeepStrictEqual(legal, beg.row)) ||
+        !isDeepStrictEqual(beg.before, canonical(context.native)) ||
+        !begChoiceProof({ operation: beg, operations, group, owner: row.sourceActor, index }) ||
+        !isDeepStrictEqual(temple.after, canonical(native))
+      )
+        reject('final-playing decision reentry has no bound legal begging effect');
+      else row.effectMatched = true;
+    }
     const sourceEnds = witness.turnEnds.filter((r) => r.moveId === group.moveId);
     const nativeEnds = transitions.filter((t) => t.action.type === 'endTurn');
     if (sourceEnds.length !== nativeEnds.length)
@@ -329,6 +476,7 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
         ledger.day !== witness.sourceFinalDay ||
         !isDeepStrictEqual(native.foodDays, [8, 14, 21, 27]) ||
         !isDeepStrictEqual(obligation.completedActors, obligation.nativeActorOrder) ||
+        !reentriesClosed() ||
         !lastTransition ||
         !isDeepStrictEqual(lastTransition.after, native) ||
         !finalRotation ||
@@ -353,6 +501,7 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
           witness: copy(witness),
           native: copy(native),
           nativeActorOrder: copy(obligation.completedActors),
+          reentryChoices: reentries.flatMap((row) => row.choices ?? []),
         });
         evidence.push({
           type: 'terminalPlayingCalendarClosure',
@@ -368,11 +517,25 @@ export function createTerminalCalendarComparison({ index, sourceToNative }) {
   }
   return {
     compare,
-    terminalClosure: () => (failure ? null : terminalClosure),
+    bindChoices,
+    terminalClosure: () => (failure || !reentriesClosed() ? null : terminalClosure),
     finish: () => ({
       obligation: copy(obligation),
       failure,
-      allObligationsClosed: !failure && (!obligation || obligation.closed),
+      allObligationsClosed: !failure && (!obligation || (obligation.closed && reentriesClosed())),
+      ...(reentries.length
+        ? {
+            reentries: reentries.map((row) => ({
+              previous: copy(row.previous),
+              entry: copy(row.entry),
+              end: copy(row.end),
+              effectMatched: row.effectMatched,
+              choicesMatched: !!row.choices?.every((proof) =>
+                verifiedObservedChoiceBoundary(index, proof),
+              ),
+            })),
+          }
+        : {}),
     }),
   };
 }
@@ -382,6 +545,7 @@ export function proveBoundTerminalCoordinates({ index, group, ledger, native, ev
   const sequence = originalNetworkSequence(index);
   if (
     !closed ||
+    !closed.reentryChoices.every((proof) => verifiedObservedChoiceBoundary(index, proof)) ||
     closed.index !== index ||
     closed.group !== group ||
     closed.rawSha256 !== index.rawSha256 ||
