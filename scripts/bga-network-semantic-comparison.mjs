@@ -319,7 +319,11 @@ export function createSemanticComparison({
             })
           : null;
         let finalInput = null;
-        if (!followingFood && receipts.length && finalFoodCandidate(context, native)) {
+        if (
+          !followingFood &&
+          receipts.length &&
+          finalFoodCandidate(context, native, { allowClaimantLastTurn: true })
+        ) {
           finalInput = { context, ledger, native, observation, claim: c, timingState };
           const proof = finalFood.prove(finalInput);
           if (proof && finalFood.verify(proof, finalInput)) followingFood = proof;

@@ -77,10 +77,11 @@ const identities = (input) => [
   ...input.context.transitions.flatMap((t) => [t, t.before, t.after, t.legalActions]),
 ];
 
-export function finalFoodCandidate(context, native) {
+export function finalFoodCandidate(context, native, { allowClaimantLastTurn = false } = {}) {
   return (
     context.native.round === 27 &&
-    [3, 4].includes(context.native.players.length) &&
+    (context.native.players.length === 4 ||
+      (allowClaimantLastTurn && context.native.players.length === 3)) &&
     native.phase === 'playing' &&
     native.pending?.task.type === 'rotation' &&
     context.group.entries.some((n) => n.type === 'finalScoring' && Array.isArray(n.args))
@@ -158,7 +159,7 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
   function validate(input) {
     const { context, ledger, native, observation, claim } = input;
     const { group, source, native: before, transitions } = context;
-    requireProof(finalFoodCandidate(context, native));
+    requireProof(finalFoodCandidate(context, native, { allowClaimantLastTurn: !zeroCorn }));
     requireProof(
       input.timingState?.rewardsOpen === false && input.timingState?.rotationOpen === false,
     );
@@ -483,7 +484,8 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
     };
   }
   function prove(input) {
-    if (!finalFoodCandidate(input.context, input.native)) return null;
+    if (!finalFoodCandidate(input.context, input.native, { allowClaimantLastTurn: !zeroCorn }))
+      return null;
     const snapshot = clone(input),
       refs = identities(input),
       claimSnapshot = clone(claimValue(input.claim));

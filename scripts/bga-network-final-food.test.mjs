@@ -16,6 +16,7 @@ import {
   createZeroCornFinalFoodProof,
   proveZeroCornTerminalCoordinates,
   proveClaimantLastTerminalCoordinates,
+  finalFoodCandidate,
 } from './bga-network-final-food.mjs';
 import { createSemanticComparison } from './bga-network-semantic-comparison.mjs';
 import { sourceFeedingWitnesses } from './bga-network-feeding.mjs';
@@ -418,7 +419,9 @@ function fixture(
     observation: { actor: claimantLastTurn ? 0 : 1, legalActions: [endRow] },
     transitions: [transition],
   };
-  const claimEntry = index.groups.find((g) => g.moveId === (claimantLastTurn ? 5 : 3)).entries[0];
+  const claimEntry = index.groups
+    .flatMap((g) => g.entries)
+    .find((n) => n.type === 'placeWorker' && n.args.place === 'startingPlayer');
   const claim = {
     sourceOwner: '1',
     owner: 0,
@@ -722,6 +725,54 @@ test('last claimant binds the original wheel and refuses mismatched or missing f
     change(a);
     assert.throws(() => f.factory.close(proof, a.context, a.ledger, a.native, a.selected));
   }
+});
+
+test('last claimant requires the adjacent claim and preserves the three-player zero-corn route', () => {
+  const adjacent = fixture(undefined, { claimantLastTurn: true });
+  assert.ok(adjacent.factory.prove(adjacent.input));
+  const earlier = fixture(
+    (raw) => {
+      const packets = raw.gameLogs.data.data;
+      [packets[2].data[0], packets[4].data[0]] = [packets[4].data[0], packets[2].data[0]];
+    },
+    { claimantLastTurn: true },
+  );
+  assert.equal(earlier.factory.prove(earlier.input), null);
+  const zero = fixture(undefined, { claimantLastTurn: true, zeroCorn: true });
+  assert.equal(finalFoodCandidate(zero.input.context, zero.input.native), false);
+  assert.equal(
+    finalFoodCandidate(adjacent.input.context, adjacent.input.native, {
+      allowClaimantLastTurn: true,
+    }),
+    true,
+  );
+  assert.equal(zero.factory.prove(zero.input), null);
+  assert.doesNotThrow(() => publicCaller(zero));
+});
+
+test('last claimant rejects next-group identity replacement after issuing the pending proof', () => {
+  for (const stage of ['bind', 'close'])
+    for (const change of [
+      (f) => {
+        f.index.groups[f.index.groups.length - 1] = clone(f.index.groups.at(-1));
+      },
+      (f) => {
+        f.index.groups.at(-1).entries[0] = clone(f.index.groups.at(-1).entries[0]);
+      },
+      (f) => {
+        f.index.groups.at(-1).entries[0].args.side = 0;
+      },
+    ]) {
+      const f = fixture(undefined, { claimantLastTurn: true });
+      const proof = settle(f, f.factory.prove(f.input));
+      if (stage === 'close') f.factory.bindLegacy(proof, f.input.context, oldWitness(f));
+      const a = actual(f, proof);
+      change(f);
+      if (stage === 'bind')
+        assert.throws(() => f.factory.bindLegacy(proof, f.input.context, oldWitness(f)));
+      else assert.throws(() => f.factory.close(proof, a.context, a.ledger, a.native, a.selected));
+      assert.equal(proof.closed, false);
+    }
 });
 
 test('final food proves all players, tied temple awards and exact pending receipt differences', () => {
