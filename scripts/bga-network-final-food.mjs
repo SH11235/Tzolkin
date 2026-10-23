@@ -80,7 +80,7 @@ const identities = (input) => [
 export function finalFoodCandidate(context, native) {
   return (
     context.native.round === 27 &&
-    context.native.players.length === 4 &&
+    [3, 4].includes(context.native.players.length) &&
     native.phase === 'playing' &&
     native.pending?.task.type === 'rotation' &&
     context.group.entries.some((n) => n.type === 'finalScoring' && Array.isArray(n.args))
@@ -176,14 +176,28 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
         before.age === 2 &&
         before.pending === null,
     );
+    const claimantLastTurn =
+      !zeroCorn &&
+      sourceToNative.size === 3 &&
+      before.players.length === 3 &&
+      before.turnOrder.length === 3 &&
+      new Set(before.turnOrder).size === 3 &&
+      before.turnOrder.every((actor) => Number.isSafeInteger(actor) && actor >= 0 && actor < 3) &&
+      same([...sourceToNative.values()].sort(), [0, 1, 2]) &&
+      before.turnIndex === 2 &&
+      before.turnOrder[2] === claim.owner &&
+      before.currentPlayer === claim.owner &&
+      integer(claim.amount) > 0 &&
+      before.accumulatedCorn === claim.amount;
     requireProof(
-      sourceToNative.size === 4 &&
-        before.turnOrder.length === 4 &&
-        before.turnIndex === 3 &&
-        before.currentPlayer !== claim.owner &&
-        before.firstPlayerClaimed === claim.owner &&
-        before.accumulatedCorn === 0,
+      claimantLastTurn ||
+        (sourceToNative.size === 4 &&
+          before.turnOrder.length === 4 &&
+          before.turnIndex === 3 &&
+          before.currentPlayer !== claim.owner &&
+          before.accumulatedCorn === 0),
     );
+    requireProof(before.firstPlayerClaimed === claim.owner);
     requireProof(same(before.foodDays, [8, 14, 21]) && transitions.length === 1);
     const transition = transitions[0];
     requireProof(
@@ -296,13 +310,19 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
         String(originalClaim.args.player_id) === claim.sourceOwner &&
         String(originalClaim.args.worker_id) === claim.worker,
     );
+    if (claimantLastTurn)
+      requireProof(index.groups[index.groups.indexOf(group) - 1]?.entries.includes(originalClaim));
     for (const snapshot of [source, ledger]) {
       const worker = snapshot.workers.get(claim.worker);
       requireProof(
         worker?.place === 'startingPlayer' && String(worker.player) === claim.sourceOwner,
       );
     }
-    if (!zeroCorn) requireProof(same(claim.nativeResources, before.players[claim.owner].resources));
+    if (!zeroCorn) {
+      const received = clone(before.players[claim.owner].resources);
+      if (claimantLastTurn) received.corn += claim.amount;
+      requireProof(same(claim.nativeResources, received));
+    }
     const events = sourceFeedingWitnesses(index).filter((event) => event.moveId === group.moveId);
     requireProof(
       events.length === 1 &&
@@ -385,7 +405,9 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
       );
       const available = clone(p.resources);
       if (actor === claim.owner) available.corn += claim.amount;
-      requireProof(same(available, nativePlayer.resources));
+      const nativeAvailable = clone(nativePlayer.resources);
+      if (claimantLastTurn && actor === claim.owner) nativeAvailable.corn += claim.amount;
+      requireProof(same(available, nativeAvailable));
       const { free, fed, cost, unfed } = foodCost(nativePlayer, available.corn);
       const original = events[0].receipts.find((row) => row.sourceActorId === id);
       requireProof(
@@ -429,6 +451,7 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
     }
     Object.assign(expected, {
       currentPlayer: claim.owner,
+      accumulatedCorn: 0,
       pending: {
         title: 'スタートプレイヤー：カレンダーを進める',
         task: { type: 'rotation' },
@@ -439,6 +462,7 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
     requireProof(same(canonical(expected), canonical(native)) && same(initial, prepared));
     return {
       type: zeroCorn ? 'postReceiptZeroCornFinalTemples' : 'postReceiptFinalFoodTemples',
+      claimantLastTurn,
       header: ref(header),
       end: ref(states[4]),
       receiptUid: receipt.uid,
@@ -577,9 +601,39 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
       legacyBound: false,
       closed: false,
     };
+    let claimantRotation = null;
+    if (food.claimantLastTurn) {
+      const next = index.groups[index.groups.indexOf(context.group) + 1];
+      const original = originalNetworkSequence(index)?.groups.find((row) => row.group === next);
+      requireProof(original && same(next, original.original));
+      assertFinalScoringResolutionGroup(next);
+      const rotations = next.entries.filter((n) => n.type === 'rotateWheel');
+      const flips = next.entries.filter((n) => n.type === 'flipBoard');
+      requireProof(
+        next.entries.every(publicEntry) &&
+          new Set(next.entries.map((n) => n.uid)).size === next.entries.length &&
+          next.entries.every(
+            (n, i) =>
+              n.packetIndex === next.entries[0].packetIndex &&
+              n.notificationIndex === next.entries[0].notificationIndex + i,
+          ),
+      );
+      requireProof(
+        rotations.length === 1 &&
+          rotations[0].args.twice === 1 &&
+          Number(rotations[0].args.day) === 28 &&
+          String(rotations[0].args.player_id) === claim.sourceOwner &&
+          flips.length === 1 &&
+          flips[0].args.side === 1 &&
+          String(flips[0].args.player_id) === claim.sourceOwner &&
+          next.entries.indexOf(flips[0]) < next.entries.indexOf(rotations[0]),
+      );
+      claimantRotation = { group: next, original: clone(next), entries: [...next.entries] };
+    }
     pendingBindings.set(proof, {
       issuer,
       zeroCorn,
+      claimantRotation,
       input,
       context: clone(context),
       refs: bound.refs,
@@ -609,6 +663,14 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
         same(sourceToNative, preparedMapping),
     );
     requireProof(identities(bound.input).every((value, i) => value === bound.refs[i]));
+    if (bound.claimantRotation) {
+      const rotation = bound.claimantRotation;
+      requireProof(
+        index.groups[index.groups.indexOf(bound.input.context.group) + 1] === rotation.group &&
+          same(rotation.group, rotation.original) &&
+          rotation.group.entries.every((entry, i) => entry === rotation.entries[i]),
+      );
+    }
     requireProof(
       originalNetworkSequence(index)?.groups.some(
         (row) => row.group === bound.input.context.group && same(row.original, row.group),
@@ -636,12 +698,14 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
     );
     assertFinalScoringResolutionGroup(context.group);
     const rotations = context.group.entries.filter((n) => n.type === 'rotateWheel');
+    const doubleAdvance = zeroCorn || bound.claimantRotation !== null;
+    if (bound.claimantRotation) requireProof(context.group === bound.claimantRotation.group);
     const transition = context.transitions[0];
     requireProof(
       context.transitions.length === 1 &&
         selected.length === 1 &&
-        rotations[0].args.twice === (zeroCorn ? 1 : 0) &&
-        ledger.day === (zeroCorn ? 28 : 27) &&
+        rotations[0].args.twice === (doubleAdvance ? 1 : 0) &&
+        ledger.day === (doubleAdvance ? 28 : 27) &&
         ledger.stateId === 99 &&
         index.initial.gamestates[99]?.type === 'manager' &&
         context.source.day === 26 &&
@@ -649,7 +713,7 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
         selected[0].actor === bound.claimRef.owner &&
         transition.actor === bound.claimRef.owner &&
         transition.action.type === 'rotate' &&
-        transition.action.days === (zeroCorn ? 2 : 1) &&
+        transition.action.days === (doubleAdvance ? 2 : 1) &&
         transition.step === selected[0].step &&
         same(transition.action, selected[0].action) &&
         same(canonical(context.native), canonical(bound.native)) &&
@@ -661,7 +725,7 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
         native.round === 27,
     );
     const flips = context.group.entries.filter((n) => n.type === 'flipBoard');
-    if (zeroCorn) {
+    if (doubleAdvance) {
       requireProof(
         flips.length === 1 &&
           flips[0].args.side === 1 &&
@@ -675,6 +739,19 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
     bindFinalScoringProjections(proof.witness, bound.native, [{ snapshot: { state: native } }]);
     requireProof(native.finalScores.length === proof.components.length);
     for (const component of proof.components) {
+      if (bound.claimantRotation) {
+        const previous = bound.native.players[component.actor];
+        requireProof(
+          same(
+            {
+              ...native.players[component.actor],
+              score: previous.score,
+              doubleAdvanceAvailable: previous.doubleAdvanceAvailable,
+            },
+            previous,
+          ),
+        );
+      }
       const rows = native.finalScores.filter((row) => row.playerId === component.actor);
       requireProof(
         rows.length === 1 &&
@@ -684,7 +761,7 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
       );
       requireProof(
         native.players[component.actor].doubleAdvanceAvailable ===
-          (zeroCorn && component.actor === bound.claimRef.owner
+          (doubleAdvance && component.actor === bound.claimRef.owner
             ? false
             : bound.native.players[component.actor].doubleAdvanceAvailable),
       );
@@ -707,7 +784,7 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
     requireProof(same(gears, native.gears));
     proof.closed = true;
     bound.proof = clone(proof);
-    if (zeroCorn)
+    if (doubleAdvance)
       bound.closure = {
         index,
         group: context.group,
@@ -727,10 +804,19 @@ function createFoodProof({ index, initial, initialMoveId, sourceToNative }, zero
   return { prove, verify: verifyProof, issue, bindLegacy, close };
 }
 
-export function proveZeroCornTerminalCoordinates({ index, group, ledger, native, evidence }) {
+export function proveZeroCornTerminalCoordinates(input) {
+  return proveFoodTerminalCoordinates(input, true);
+}
+
+export function proveClaimantLastTerminalCoordinates(input) {
+  return proveFoodTerminalCoordinates(input, false);
+}
+
+function proveFoodTerminalCoordinates({ index, group, ledger, native, evidence }, zeroCorn) {
   const bound = pendingBindings.get(evidence),
     closed = bound?.closure;
-  if (!bound?.zeroCorn || !closed) return null;
+  if (!bound || !closed || (zeroCorn ? !bound.zeroCorn : bound.zeroCorn || !bound.claimantRotation))
+    return null;
   try {
     closed.check();
     requireProof(

@@ -40,6 +40,7 @@ export function createSemanticComparison({
   const finalFactory = (proof) =>
     proof.food.type === 'postReceiptZeroCornFinalTemples' ? zeroCornFinal : finalFood;
   let closedZeroCornFinal = null;
+  let closedClaimantLastFinal = null;
   const day14Food = createDay14FoodProof({
     index,
     initial,
@@ -560,6 +561,8 @@ export function createSemanticComparison({
               );
               if (c.pendingFinalScore.food.type === 'postReceiptZeroCornFinalTemples')
                 closedZeroCornFinal = c.pendingFinalScore;
+              if (c.pendingFinalScore.food.claimantLastTurn)
+                closedClaimantLastFinal = c.pendingFinalScore;
             } catch (error) {
               poisoned = true;
               reject(error.message);
@@ -671,5 +674,6 @@ export function createSemanticComparison({
     },
     terminalCalendarEvidence: calendarComparison.terminalClosure,
     zeroCornFinalEvidence: () => (failure || poisoned ? null : closedZeroCornFinal),
+    claimantLastFinalEvidence: () => (failure || poisoned ? null : closedClaimantLastFinal),
   };
 }

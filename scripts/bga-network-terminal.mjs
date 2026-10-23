@@ -3,7 +3,10 @@ import { classifyDecisionState } from './bga-network-decision-boundary.mjs';
 import { proveBoundTerminalCoordinates } from './bga-network-semantic-calendar.mjs';
 import { prepareTerminalScoreSettlement } from './bga-network-terminal-settlement.mjs';
 import { terminalComponentGate } from './bga-network-terminal-components.mjs';
-import { proveZeroCornTerminalCoordinates } from './bga-network-final-food.mjs';
+import {
+  proveZeroCornTerminalCoordinates,
+  proveClaimantLastTerminalCoordinates,
+} from './bga-network-final-food.mjs';
 
 const clone = structuredClone;
 const materials = ['corn', 'wood', 'stone', 'gold', 'skull'];
@@ -160,6 +163,7 @@ export function inspectTerminalProjection({
   terminalDisplayCheckpoint,
   terminalCalendarEvidence = null,
   zeroCornFinalEvidence = null,
+  claimantLastFinalEvidence = null,
   context = null,
   catalog,
 }) {
@@ -211,6 +215,19 @@ export function inspectTerminalProjection({
     if (zero) {
       calendar.matched = true;
       calendar.boundZeroCornDoubleAdvance = zero;
+    }
+  }
+  if (!calendar.matched) {
+    const claimant = proveClaimantLastTerminalCoordinates({
+      index,
+      group,
+      ledger,
+      native,
+      evidence: claimantLastFinalEvidence,
+    });
+    if (claimant) {
+      calendar.matched = true;
+      calendar.boundClaimantLastDoubleAdvance = claimant;
     }
   }
   if (!calendar.matched) failures.push('terminalCalendarCoordinatesNotEstablished');
@@ -325,6 +342,7 @@ export function comparePublicBoundary({
         context,
         terminalCalendarEvidence: comparison.terminalCalendarEvidence(),
         zeroCornFinalEvidence: comparison.zeroCornFinalEvidence?.() ?? null,
+        claimantLastFinalEvidence: comparison.claimantLastFinalEvidence?.() ?? null,
       })
     : null;
   if (terminalValidation?.completed) {
