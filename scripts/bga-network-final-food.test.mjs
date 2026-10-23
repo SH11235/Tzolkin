@@ -1452,6 +1452,10 @@ test('mandatory claimant components require the live closed proof and consume it
       c.args.context = clone(c.args.context);
     },
     (c) => {
+      c.args.context = clone(c.args.context);
+      c.args.context.transitions[0].before.turnOrder.reverse();
+    },
+    (c) => {
       c.args.claimantLastFinalEvidence = lastTerminalCase().proof;
     },
     (c) => {

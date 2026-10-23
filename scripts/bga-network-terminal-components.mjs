@@ -353,14 +353,15 @@ export function terminalComponentGate(input) {
       before.firstPlayerClaimed &&
     finishedFeeding?.before.firstPlayerClaimed !== null;
   if (
-    claimed &&
-    before.players.length === 3 &&
-    before.pending?.task.type === 'rotation' &&
-    Array.isArray(before.turnOrder) &&
-    before.turnIndex === before.turnOrder.length - 1 &&
-    before.turnOrder.at(-1) === before.firstPlayerClaimed &&
-    before.currentPlayer === before.firstPlayerClaimed &&
-    sourceClaim.amount > 0
+    (input.claimantLastFinalEvidence !== null && input.claimantLastFinalEvidence !== undefined) ||
+    (claimed &&
+      before.players.length === 3 &&
+      before.pending?.task.type === 'rotation' &&
+      Array.isArray(before.turnOrder) &&
+      before.turnIndex === before.turnOrder.length - 1 &&
+      before.turnOrder.at(-1) === before.firstPlayerClaimed &&
+      before.currentPlayer === before.firstPlayerClaimed &&
+      sourceClaim.amount > 0)
   )
     return (
       consumeClaimantLastTerminalComponents({
