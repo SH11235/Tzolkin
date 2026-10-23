@@ -380,6 +380,14 @@ test('four-player settlement rejects missing components and foreign component pr
       i.native.players[3].score++;
     },
     (i) => {
+      i.native.players[3].id = 0;
+    },
+    (i) => {
+      i.context.transitions[0].after.players.push(
+        structuredClone(i.context.transitions[0].after.players[3]),
+      );
+    },
+    (i) => {
       i.native.finalScores[3].resourcePoints++;
       i.native.finalScores[3].skullPoints--;
     },

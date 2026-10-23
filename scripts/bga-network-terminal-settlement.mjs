@@ -121,6 +121,16 @@ function validate({ index, context, ledger, native, sourceToNative, catalog }) {
     );
   const fed = end.after;
   const owner = before.firstPlayerClaimed;
+  check(
+    [fed, native].every(
+      (state) =>
+        state.players.length === playerCount &&
+        same(
+          state.players.map((p) => p.id),
+          before.players.map((p) => p.id),
+        ),
+    ),
+  );
   check(owner !== null && end.actor === before.currentPlayer && rotation.actor === owner);
   check(
     fed.phase === 'playing' &&
