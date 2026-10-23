@@ -164,6 +164,7 @@ export function inspectTerminalProjection({
   terminalCalendarEvidence = null,
   zeroCornFinalEvidence = null,
   claimantLastFinalEvidence = null,
+  terminalScoreSettlement = null,
   context = null,
   catalog,
 }) {
@@ -267,6 +268,7 @@ export function inspectTerminalProjection({
     catalog,
     feedingTransitions,
     claimantLastFinalEvidence,
+    terminalScoreSettlement,
   });
   if (!components.matched) failures.push('terminalComponentsNotEstablished');
   const scores = [];
@@ -341,6 +343,7 @@ export function comparePublicBoundary({
     ? inspectTerminalProjection({
         ...terminalArguments,
         context,
+        terminalScoreSettlement,
         terminalCalendarEvidence: comparison.terminalCalendarEvidence(),
         zeroCornFinalEvidence: comparison.zeroCornFinalEvidence?.() ?? null,
         claimantLastFinalEvidence: comparison.claimantLastFinalEvidence?.() ?? null,

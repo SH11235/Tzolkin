@@ -29,7 +29,7 @@
     "bga:network-replay": "node scripts/bga-network-cli.mjs",
     "bga:network-handoff": "node scripts/bga-network-pipeline.mjs",
     "bga:network-teacher": "node scripts/bga-network-teacher.mjs",
-    "test:bga": "node --experimental-test-module-mocks --test scripts/bga-network-monument-components.test.mjs scripts/bga-network-terminal-components.test.mjs scripts/bga-network-final-food.test.mjs scripts/bga-network-empty-building.test.mjs scripts/bga-network-day14-feeding.test.mjs scripts/bga-network-decision-boundary.test.mjs scripts/bga-network-teacher.test.mjs scripts/bga-network-pipeline.test.mjs scripts/bga-network-replay.test.mjs scripts/bga-network.test.mjs scripts/bga-import.test.mjs scripts/bga-replay.test.mjs scripts/bga-qualify.test.mjs scripts/bga-decode.test.mjs scripts/bga-playing-project.test.mjs",
+    "test:bga": "node --experimental-test-module-mocks --test scripts/bga-network-client-profile.test.mjs scripts/bga-network-monument-components.test.mjs scripts/bga-network-terminal-components.test.mjs scripts/bga-network-final-food.test.mjs scripts/bga-network-empty-building.test.mjs scripts/bga-network-day14-feeding.test.mjs scripts/bga-network-decision-boundary.test.mjs scripts/bga-network-teacher.test.mjs scripts/bga-network-pipeline.test.mjs scripts/bga-network-replay.test.mjs scripts/bga-network.test.mjs scripts/bga-import.test.mjs scripts/bga-replay.test.mjs scripts/bga-qualify.test.mjs scripts/bga-decode.test.mjs scripts/bga-playing-project.test.mjs",
     "bga:import": "node scripts/bga-import.mjs",
     "bga:compare": "node scripts/bga-compare.mjs",
     "bga:replay": "node scripts/bga-replay.mjs",

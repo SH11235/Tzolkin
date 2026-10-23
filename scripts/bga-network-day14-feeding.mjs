@@ -279,10 +279,6 @@ export function createDay14FoodProof({ index, initial, initialMoveId, sourceToNa
       return { effect, caption };
     });
     const awards = templeLeaderAwards(source.players, catalog.TEMPLE_TRACKS, 1);
-    requireProof(
-      awards.length === Object.keys(catalog.TEMPLE_TRACKS).length &&
-        awards.every((row) => row.winnerCount === 1),
-    );
     const leaders = awards.map((row) => [row.sourceActor, row.temple, row.points]);
     requireProof(
       same(

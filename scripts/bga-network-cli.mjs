@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { coreDispatcher } from './bga-replay.mjs';
 import {
   assertNetworkClockContract,
+  bindArchiveClient,
   inspectArchiveClient,
   parseNetworkReplay,
 } from './bga-network.mjs';
@@ -69,11 +70,13 @@ export function convertNetworkInputs(
   dispatch,
 ) {
   if (!['prepare', 'replay'].includes(mode)) throw new Error('Unsupported conversion mode');
-  const clientContract = inspectArchiveClient(studioBytes, gameBytes);
+  const inspectedClient = inspectArchiveClient(studioBytes, gameBytes);
   const index = parseNetworkReplay(bytes);
+  const clientContract = bindArchiveClient(index, inspectedClient);
   assertNetworkClockContract(index, clientContract);
   if (mode === 'prepare') {
     const prepared = deriveNetworkInitial(index);
+    assertNetworkClockContract(index, clientContract);
     const inspected = dispatch({
       operation: 'publicInspect',
       state: prepared.witnesses.initial,

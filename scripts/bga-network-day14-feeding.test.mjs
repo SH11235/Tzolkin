@@ -7,7 +7,7 @@ import { createSemanticComparison } from './bga-network-semantic-comparison.mjs'
 import { comparePublicBoundary } from './bga-network-terminal.mjs';
 
 const clone = structuredClone;
-function fixture(changeRaw = () => {}) {
+function fixture(changeRaw = () => {}, tied = false) {
   const sourceToNative = new Map(['1', '2', '3', '4'].map((id, actor) => [id, actor]));
   let uid = 0;
   const n = (type, args) => ({ uid: String(++uid), type, args, log: '' });
@@ -159,13 +159,14 @@ function fixture(changeRaw = () => {}) {
               i === 0 ? { ...entry, args: { ...entry.args, points: -9 } } : entry,
             ),
             state(94),
-            ...score('2', 6, 'templeLeader', { temple: 'chaac' }),
+            ...score('2', tied ? 3 : 6, 'templeLeader', { temple: 'chaac' }),
+            ...(tied ? score('4', 3, 'templeLeader', { temple: 'chaac' }) : []),
             ...score('1', 2, 'templeLeader', { temple: 'quetzalcoatl' }),
             ...score('2', 4, 'templeLeader', { temple: 'kukulcan' }),
             ...score('1', 5, 'templeScore'),
             ...score('2', 11, 'templeScore'),
             ...score('3', -3, 'templeScore'),
-            ...score('4', -1, 'templeScore'),
+            ...score('4', tied ? 4 : -1, 'templeScore'),
             n('resetAllBuildings', { buildings: resetCards }),
             state(95),
           ]),
@@ -182,7 +183,7 @@ function fixture(changeRaw = () => {}) {
     { chaac: -1, quetzalcoatl: 1, kukulkan: 3 },
     { chaac: 2, quetzalcoatl: 0, kukulkan: 4 },
     { chaac: -1, quetzalcoatl: -1, kukulkan: 0 },
-    { chaac: -1, quetzalcoatl: 0, kukulkan: 0 },
+    { chaac: tied ? 2 : -1, quetzalcoatl: 0, kukulkan: 0 },
   ];
   const players = [0, 1, 2, 3].map((id) => ({
     id,
@@ -268,7 +269,7 @@ function fixture(changeRaw = () => {}) {
   });
   Object.values(ledger.players).forEach((p, actor) => {
     p.resources.corn = 0;
-    p.score = [7, 28, 17, 20][actor];
+    p.score = [7, tied ? 25 : 28, 17, tied ? 28 : 20][actor];
   });
   const native = clone(before);
   Object.assign(native, {
@@ -286,8 +287,8 @@ function fixture(changeRaw = () => {}) {
   });
   native.players.forEach((p, actor) => {
     p.resources.corn = 0;
-    p.score = [7, 28, 17, 20][actor];
-    p.templePoints = [5, 11, -3, -1][actor];
+    p.score = [7, tied ? 25 : 28, 17, tied ? 28 : 20][actor];
+    p.templePoints = [5, 11, -3, tied ? 4 : -1][actor];
   });
   const endRow = { action: { type: 'endTurn' }, move: { type: 'endTurn' } };
   const observation = {
@@ -360,6 +361,46 @@ test('day14 proof separates signed temple awards, food losses and source market 
   );
   assert.equal(proof.marketReset.deckEvidence.initialAge1Deck, 8);
   assert.equal(proof.marketReset.deckEvidence.afterCurrentDeck, 12);
+});
+
+test('day14 tied leaders require every independently derived half bonus', () => {
+  const f = fixture(() => {}, true);
+  const proof = f.factory.prove(f.input);
+  assert.ok(proof);
+  assert.deepEqual(
+    proof.perPlayerResults.map((p) => p.leaderBonus),
+    [2, 7, 0, 3],
+  );
+  for (const change of [
+    (rows) => {
+      const caption = rows.find((n) => n.type === 'templeLeader' && n.args.player_id === '4');
+      rows.splice(rows.indexOf(caption) - 1, 2);
+    },
+    (rows) => {
+      const caption = rows.find((n) => n.type === 'templeLeader' && n.args.player_id === '4');
+      caption.args.player_id = '3';
+      rows[rows.indexOf(caption) - 1].args.player_id = '3';
+    },
+    (rows) => {
+      const captions = rows.filter((n) => n.type === 'templeLeader' && n.args.temple === 'chaac');
+      captions.forEach((n, i) => {
+        n.args.points += i === 0 ? 1 : -1;
+        rows[rows.indexOf(n) - 1].args.points = n.args.points;
+      });
+    },
+    (rows) => {
+      const caption = rows.find((n) => n.type === 'templeLeader' && n.args.player_id === '4');
+      rows.splice(
+        rows.indexOf(caption) + 1,
+        0,
+        { ...clone(rows[rows.indexOf(caption) - 1]), uid: 'extra-leader-effect' },
+        { ...clone(caption), uid: 'extra-leader-caption' },
+      );
+    },
+  ]) {
+    const invalid = fixture((raw, rows) => change(rows), true);
+    assert.equal(invalid.factory.prove(invalid.input), null);
+  }
 });
 
 test('day14 source component corruption cannot cancel into an accepted total', () => {
