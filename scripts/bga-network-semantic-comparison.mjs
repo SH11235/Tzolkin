@@ -125,6 +125,8 @@ export function createSemanticComparison({
       timingState,
       ageTwoRefillEvidence,
       recordSteps,
+      choiceOperations = [],
+      terminalChoiceEvidence = null,
     },
   ) {
     if (poisoned) throw new Error(failure ?? 'Final receipt composition failed');
@@ -606,7 +608,12 @@ export function createSemanticComparison({
     if (building.failure) reject(building.failure);
     for (const field of building.fields) allowed.add(field);
     evidence.push(...building.evidence);
-    const calendar = calendarComparison.compare(context, { ledger, native });
+    const calendar = calendarComparison.compare(context, {
+      ledger,
+      native,
+      operations: choiceOperations,
+      terminalChoiceEvidence,
+    });
     if (calendar.failure) reject(calendar.failure);
     for (const field of calendar.fields) allowed.add(field);
     evidence.push(...calendar.evidence);
@@ -665,6 +672,7 @@ export function createSemanticComparison({
     applied,
     compare,
     finish,
+    bindCalendarChoices: (choices) => calendarComparison.bindChoices(choices),
     bindSource95Legacy(context, witness) {
       if (!claim?.pendingFinalScore) return;
       try {
