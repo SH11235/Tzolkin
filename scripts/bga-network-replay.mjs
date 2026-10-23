@@ -1046,6 +1046,13 @@ export function replayNetworkPrefix(
 ) {
   assertNetworkClockContract(index, clientContract);
   const clusters = inspectCancellationClusters(index, clientContract);
+  if (clientContract?.interpretationProfile === 'retained-http') {
+    const nativeDispatch = dispatch;
+    dispatch = (request) => {
+      assertNetworkClockContract(index, clientContract);
+      return nativeDispatch(request);
+    };
+  }
   if (
     initial.phase !== 'playing' ||
     initial.version !== 1 ||

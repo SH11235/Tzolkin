@@ -31,7 +31,16 @@ const REVIEWED_CLIENT_PAIRS = new Set([
   'd56aab925f1744ac59d759a10e3cd10b0ea332fa80db6550994267fd6eed36e5:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
   'baed273fc0196acab27ec71e65755ea1524785ebbafc96ebc9fad548ccd9a363:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326',
 ]);
+const RETAINED_HTTP_PAIRS = new Set(
+  [
+    '8237d5dbf770423c94105c3c2e0f56494485c88a650c2eee90c7538b77b1ba41',
+    '18095ed3ff794243a5a2f4080b0ba6ea348cda07160e54903d1304c30671787d',
+    '46a3699663c0d3debd6256b3ac36f32c759808d80dae587a15d1d700340499c4',
+  ].map((studio) => `${studio}:e00b9901089706b391093157ec8b315e1bba13b2843d7a9333d38f523ce67326`),
+);
 const validatedContracts = new WeakSet();
+const retainedContracts = new WeakMap();
+const retainedSources = new WeakMap();
 const finalScoringCaptions = new WeakMap();
 const harvestEntries = new WeakMap();
 const architectureEntries = new WeakMap();
@@ -190,7 +199,8 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
   const studioSha256 = sha(studioBytes);
   const gameSha256 = sha(gameBytes);
   const legacyUiDelivery = LEGACY_STUDIOS.has(studioSha256);
-  if (!REVIEWED_CLIENT_PAIRS.has(`${studioSha256}:${gameSha256}`))
+  const retainedHttp = RETAINED_HTTP_PAIRS.has(`${studioSha256}:${gameSha256}`);
+  if (!retainedHttp && !REVIEWED_CLIENT_PAIRS.has(`${studioSha256}:${gameSha256}`))
     fail('unreviewed archive client version');
   const studio = studioBytes.toString('utf8');
   const game = gameBytes.toString('utf8');
@@ -227,6 +237,16 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
     gameSha256,
     cancellationType: 'undoRestoreDISAB',
     scope: 'unchanged archive start-turn captions only; no server deletion claim',
+    ...(retainedHttp
+      ? {
+          interpretationProfile: 'retained-http',
+          originalUiDispatchEquivalence: 'notEstablished',
+          decisionTimeFeatureEquivalence: 'notEstablished',
+          historicalTransportDependencies: 'unknown',
+          deliveryScope:
+            'Retained HTTP order only; every selected decision and public result still requires verification.',
+        }
+      : {}),
     ...(legacyUiDelivery
       ? {
           originalUiDispatchEquivalence: 'notEstablished',
@@ -236,10 +256,137 @@ export function inspectArchiveClient(studioBytes, gameBytes) {
       : {}),
   });
   validatedContracts.add(contract);
+  if (retainedHttp) retainedContracts.set(contract, { index: null });
   return contract;
 }
 
+function sourceReferences(index) {
+  if (
+    !Array.isArray(index?.entries) ||
+    !Array.isArray(index?.groups) ||
+    index.groups.some((group) => !Array.isArray(group?.entries))
+  )
+    return null;
+  return [
+    index.initial,
+    index.entries,
+    index.groups,
+    ...index.entries,
+    ...index.groups.flatMap((group) => [group, group.entries, ...group.entries]),
+  ];
+}
+
+function authenticRetainedSource(index) {
+  const source = retainedSources.get(index),
+    original = originalSequences.get(index);
+  const references = sourceReferences(index);
+  if (
+    !source ||
+    !original ||
+    !references ||
+    !isDeepStrictEqual(index, original.snapshot) ||
+    references.length !== source.references.length ||
+    references.some((value, i) => value !== source.references[i])
+  )
+    fail('retained HTTP profile requires its unchanged original source index');
+  return source;
+}
+
+function unsupportedDeliveryMetadata(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    Object.entries(value).some(
+      ([key, child]) =>
+        ['_notified_privately', 'prevpacket', 'dependencies'].includes(key) ||
+        unsupportedDeliveryMetadata(child),
+    )
+  );
+}
+
+function assertRetainedPacketConditions(index) {
+  const { packets } = authenticRetainedSource(index);
+  const players = Object.keys(index.initial.players),
+    table = `/table/t${index.tableId}`;
+  keys(index.initial.notifications, ['last_packet_id', 'move_nbr'], 'retained HTTP checkpoint');
+  const distribution = packets.findIndex((packet) =>
+    packet.data.some((entry) => entry.type === 'wealthTiles'),
+  );
+  if (distribution < 0) fail('retained HTTP profile requires original wealth distribution');
+  const owners = new Set(),
+    uids = new Set();
+  let previousPacket = 0,
+    previousMove = 0;
+  for (const [position, packet] of packets.entries()) {
+    keys(
+      packet,
+      ['channel', 'table_id', 'packet_id', 'packet_type', 'move_id', 'time', 'data'],
+      'retained HTTP packet',
+    );
+    const packetId = integer(packet.packet_id, 'retained packet ID', 1),
+      moveId = integer(packet.move_id, 'retained move ID', 1);
+    if (packet.packet_type !== 'resend' || packetId <= previousPacket || moveId < previousMove)
+      fail('retained HTTP packet order or kind is unsupported');
+    previousPacket = packetId;
+    previousMove = moveId;
+    for (const entry of packet.data) {
+      if (
+        !Object.hasOwn(CLASSIFICATION, entry.type) ||
+        ['timeJokerUsed', 'wakeupPlayers', 'resetInterfaceWithAllDatas'].includes(entry.type) ||
+        unsupportedDeliveryMetadata(entry.args) ||
+        uids.has(entry.uid)
+      )
+        fail('retained HTTP notification or dependency metadata is unsupported');
+      uids.add(entry.uid);
+      if (packet.channel === table && Object.hasOwn(entry, 'synchro'))
+        fail('retained HTTP public synchronization is unsupported');
+    }
+    if (packet.channel === table) continue;
+    const owner = players.find((id) => packet.channel === `/player/p${id}`),
+      next = packets[position + 1];
+    if (
+      !owner ||
+      owners.has(owner) ||
+      position >= distribution ||
+      packet.data.length !== 1 ||
+      packet.data[0].type !== 'chooseWealthTiles' ||
+      packet.data[0].synchro !== 0 ||
+      next?.channel !== table ||
+      Number(next.move_id) !== moveId
+    )
+      fail('retained HTTP private setup or following public packet is unsupported');
+    owners.add(owner);
+  }
+  if (owners.size !== players.length || !owners.has(index.viewer))
+    fail('retained HTTP private setup coverage is incomplete');
+}
+
+export function bindArchiveClient(index, contract) {
+  if (!validatedContracts.has(contract)) fail('binding needs an observed archive client contract');
+  const profile = retainedContracts.get(contract);
+  if (!profile) return contract;
+  if (profile.index) {
+    if (profile.index !== index) fail('retained HTTP contract belongs to a different source index');
+    authenticRetainedSource(index);
+    return contract;
+  }
+  assertRetainedPacketConditions(index);
+  const bound = Object.freeze({ ...contract, sourceRawSha256: index.rawSha256 });
+  validatedContracts.add(bound);
+  retainedContracts.set(bound, { index });
+  return bound;
+}
+
+function assertRetainedBinding(index, contract) {
+  const profile = retainedContracts.get(contract);
+  if (!profile && contract?.interpretationProfile !== 'retained-http') return;
+  if (!validatedContracts.has(contract) || profile?.index !== index)
+    fail('retained HTTP profile needs its source-bound observed client contract');
+  authenticRetainedSource(index);
+}
+
 export function assertNetworkClockContract(index, contract) {
+  assertRetainedBinding(index, contract);
   const entries = index.entries ?? index.groups.flatMap((group) => group.entries);
   if (!entries.some((n) => n.type === 'timeJokerUsed') && !index.clockCaptionEntries?.length)
     return;
@@ -625,6 +772,11 @@ export function parseNetworkReplay(bytes) {
     groups,
   };
   originalSequences.set(index, { snapshot: structuredClone(index) });
+  retainedSources.set(index, {
+    // Public entries contain cloned arguments, so these parsed packets remain private.
+    packets,
+    references: sourceReferences(index),
+  });
   return index;
 }
 

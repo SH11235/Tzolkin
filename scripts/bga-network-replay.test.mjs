@@ -303,6 +303,7 @@ test('automatic architecture corn binds one exact build, receipt and complete ou
 mock.module(new URL('./bga-network.mjs', import.meta.url).href, {
   // Keep the option supported by the declared Node 24.0 minimum.
   namedExports: {
+    bindArchiveClient: (_index, contract) => contract,
     assertNetworkClockContract,
     parseNetworkReplay,
     originalFinalScoringCaption,
