@@ -5,6 +5,8 @@ use tzolkin_core::observation::{HarvestKind, Observation, PublicPlayer, TypedAct
 use tzolkin_core::prophecies::ProphecyId;
 use tzolkin_core::tribes::TribeId;
 use tzolkin_core::*;
+mod timed_corn;
+pub(crate) use timed_corn::TimedCornContext;
 
 /// Closed scoring revisions. V1 preserves the historical food-day rule;
 /// ordinary entry points use V2.

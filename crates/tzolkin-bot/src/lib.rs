@@ -13,6 +13,7 @@ pub const MONUMENT_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-monument-aligned
 pub const RESOURCE_ALIGNED_POLICY_VERSION: &str = "heuristic-resource-aligned-v1";
 pub const RESOURCE_ALIGNED_V2_POLICY_VERSION: &str = "heuristic-resource-aligned-v2";
 pub const RESOURCE_ALIGNED_V3_POLICY_VERSION: &str = "heuristic-resource-aligned-v3";
+pub const TIMED_CORN_POLICY_VERSION: &str = "heuristic-timed-corn-v1";
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Decision {
@@ -132,6 +133,16 @@ pub fn choose_move_resource_aligned_v3(observation: &Observation) -> Result<Deci
                 .score(observation, action, &weights)
         },
     )
+}
+
+pub fn choose_move_timed_corn(observation: &Observation) -> Result<Decision, String> {
+    let weights = policy::HeuristicWeights::default();
+    let context = std::cell::OnceCell::new();
+    choose_scored(observation, &weights, TIMED_CORN_POLICY_VERSION, |action| {
+        context
+            .get_or_init(|| policy::TimedCornContext::new(observation, &weights))
+            .score(observation, action, &weights)
+    })
 }
 
 fn choose_scored(
