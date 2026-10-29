@@ -993,6 +993,7 @@ pub(crate) struct IndexedFeedingEvent {
 #[serde(rename_all = "camelCase")]
 pub struct AppliedInvestmentCounters {
     pub player_id: usize,
+    pub beg_actions: u64,
     pub paid_technology: [u64; 4],
     pub paid_tikal1: [u64; 4],
     pub paid_tikal3: [u64; 4],
@@ -1062,6 +1063,9 @@ impl AppliedGameInvestments {
         let previous = &before.players[actor];
         let next = &after.players[actor];
         let counts = &mut self.players[actor];
+        if matches!(chosen, TypedAction::Beg) {
+            counts.beg_actions += 1;
+        }
         let context = &mut self.contexts[actor];
         for (i, technology) in TECHNOLOGY_IDS.into_iter().enumerate() {
             counts.technology_level_increments[i] +=

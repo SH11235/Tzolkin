@@ -347,6 +347,36 @@ impl TimedCornContext {
             .fold(idle, f64::max)
     }
 
+    pub(crate) fn score_beg_aligned(
+        &self,
+        o: &Observation,
+        action: &TypedAction,
+        w: &HeuristicWeights,
+    ) -> f64 {
+        if !self.enabled || !matches!(action, TypedAction::Beg) {
+            return self.score(o, action, w);
+        }
+        let gain = (3 - o.players[o.actor].resources[0]).max(0);
+        let received = project(
+            o,
+            0,
+            Some(Receipt {
+                turn: 0,
+                cost: 0,
+                corn: gain,
+                worker: false,
+            }),
+            o.first_player_claimed == Some(o.actor),
+            1,
+            w.corn_base,
+        );
+        received.map_or(-1_000_000.0, |received| {
+            13.0 + 0.3 * o.turn.count as f64 + gain as f64 * w.corn_base
+                - w.temple_step
+                - (received.cost - self.baseline)
+        })
+    }
+
     pub(crate) fn score(&self, o: &Observation, action: &TypedAction, w: &HeuristicWeights) -> f64 {
         if !self.enabled {
             return self.base.score(o, action, w);
@@ -463,6 +493,35 @@ mod tests {
         state.players[0].feed_all = false;
         state.players[0].feed_discount = 0;
         observe(&state, 0).unwrap()
+    }
+
+    #[test]
+    fn beg_alignment_preserves_anchor_and_counts_only_net_receipt_once() {
+        let w = HeuristicWeights::default();
+        for (corn, expected) in [(0, 12.7), (1, 12.0), (2, 9.7)] {
+            let o = observation(7, corn);
+            let context = TimedCornContext::new(&o, &w);
+            assert!(context.enabled);
+            let action = TypedAction::Beg;
+            assert!((context.score_beg_aligned(&o, &action, &w) - expected).abs() < 1e-12);
+            for row in &o.legal_actions {
+                if !matches!(row.action, TypedAction::Beg) {
+                    assert_eq!(
+                        context.score_beg_aligned(&o, &row.action, &w).to_bits(),
+                        context.score(&o, &row.action, &w).to_bits()
+                    );
+                }
+            }
+        }
+        let far = observation(1, 0);
+        let context = TimedCornContext::new(&far, &w);
+        assert!(!context.enabled);
+        for row in &far.legal_actions {
+            assert_eq!(
+                context.score_beg_aligned(&far, &row.action, &w).to_bits(),
+                context.score(&far, &row.action, &w).to_bits()
+            );
+        }
     }
 
     #[test]

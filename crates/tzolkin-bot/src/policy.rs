@@ -3309,6 +3309,10 @@ pub fn score_action_resource_aligned_v3(
     ResourceRouteContext::new_v3(o, w).score(o, a, w)
 }
 
+pub fn score_action_timed_corn_beg(o: &Observation, a: &TypedAction, w: &HeuristicWeights) -> f64 {
+    TimedCornContext::new(o, w).score_beg_aligned(o, a, w)
+}
+
 fn score_action_for_profile(
     o: &Observation,
     a: &TypedAction,

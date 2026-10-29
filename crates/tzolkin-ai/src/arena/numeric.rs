@@ -635,6 +635,7 @@ pub enum AppProfile {
     ResourceAlignedV2,
     ResourceAlignedV3,
     TimedCornV1,
+    TimedCornBegV1,
 }
 impl AppProfile {
     pub fn policy_version(self) -> &'static str {
@@ -645,6 +646,7 @@ impl AppProfile {
             Self::ResourceAlignedV2 => tzolkin_bot::RESOURCE_ALIGNED_V2_POLICY_VERSION,
             Self::ResourceAlignedV3 => tzolkin_bot::RESOURCE_ALIGNED_V3_POLICY_VERSION,
             Self::TimedCornV1 => tzolkin_bot::TIMED_CORN_POLICY_VERSION,
+            Self::TimedCornBegV1 => tzolkin_bot::TIMED_CORN_BEG_POLICY_VERSION,
         }
     }
     fn choose_move(self, observation: &Observation) -> Result<Decision, String> {
@@ -655,6 +657,7 @@ impl AppProfile {
             Self::ResourceAlignedV2 => tzolkin_bot::choose_move_resource_aligned_v2(observation),
             Self::ResourceAlignedV3 => tzolkin_bot::choose_move_resource_aligned_v3(observation),
             Self::TimedCornV1 => tzolkin_bot::choose_move_timed_corn(observation),
+            Self::TimedCornBegV1 => tzolkin_bot::choose_move_timed_corn_beg(observation),
         }
     }
 }
@@ -3755,6 +3758,42 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn applied_beg_counter_counts_request_not_descent() {
+        let mut begging =
+            tzolkin_core::create_game(vec!["A".into(), "B".into(), "C".into()], 17, false).unwrap();
+        begging.phase = Phase::Playing;
+        begging.players[0]
+            .resources
+            .insert(tzolkin_core::Resource::Corn, 1);
+        let mut counts = replay::AppliedGameInvestments::new(3);
+        let pending = tzolkin_core::apply_move(&begging, tzolkin_core::GameMove::Beg).unwrap();
+        counts.record_applied(
+            &begging,
+            &pending,
+            &tzolkin_core::observation::TypedAction::Beg,
+        );
+        assert_eq!(counts.players[0].beg_actions, 1);
+        let observation = observe(&pending, 0).unwrap();
+        let choice = observation
+            .legal_actions
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.action,
+                    tzolkin_core::observation::TypedAction::Temple { direction: -1, .. }
+                )
+            })
+            .unwrap();
+        let finished = tzolkin_core::apply_move(&pending, choice.r#move.clone()).unwrap();
+        counts.record_applied(&pending, &finished, &choice.action);
+        assert_eq!(counts.players[0].beg_actions, 1);
+        assert_eq!(
+            finished.players[0].resources[&tzolkin_core::Resource::Corn],
+            3
+        );
+    }
+
+    #[test]
     fn numeric_validation_preflight_and_failed_arm_discard_only_game_history() {
         for players in [3, 4] {
             let config = NumericArenaConfig {
@@ -4799,6 +4838,7 @@ pub(super) mod tests {
                 AppProfile::ResourceAlignedV2,
                 AppProfile::ResourceAlignedV3,
                 AppProfile::TimedCornV1,
+                AppProfile::TimedCornBegV1,
             ] {
                 let expected = match profile {
                     AppProfile::FoodAlignedV2 => {
@@ -4817,6 +4857,9 @@ pub(super) mod tests {
                         tzolkin_bot::choose_move_resource_aligned_v3(observation)?
                     }
                     AppProfile::TimedCornV1 => tzolkin_bot::choose_move_timed_corn(observation)?,
+                    AppProfile::TimedCornBegV1 => {
+                        tzolkin_bot::choose_move_timed_corn_beg(observation)?
+                    }
                 };
                 let mut roles = (0..observation.players.len())
                     .map(|_| Role::App(profile))
